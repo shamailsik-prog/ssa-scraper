@@ -1,0 +1,6 @@
+# ScrapeGraph-specific additions to the corpus service requirements.
+# Resolve and pin exact compatible versions during the build and test phase.
+scrapegraph-py>=2.1.0
+# Self-hosted/private extraction is optional and must be pinned to a tested compatible version
+# when enabled in deployment:
+# scrapegraphai==<tested-compatible-version>
