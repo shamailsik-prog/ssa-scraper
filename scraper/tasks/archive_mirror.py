@@ -15,8 +15,10 @@ async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
         mirror = ArchiveMirror(db)
         result = await mirror.mirror_pending(limit)
         statutes = await mirror.mirror_statutes()
+        instruments = await mirror.mirror_instruments()
         await db.commit()
         result["statutes"] = statutes
+        result["instruments"] = instruments
         return result
 
 

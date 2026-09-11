@@ -1,6 +1,7 @@
 # ScrapeGraph-specific additions to the corpus service requirements.
-# Resolve and pin exact compatible versions during the build and test phase.
-scrapegraph-py>=2.1.0
-# Self-hosted/private extraction is optional and must be pinned to a tested compatible version
-# when enabled in deployment:
-# scrapegraphai==<tested-compatible-version>
+# Resolved and pinned during the build/test phase (see requirements.txt, which is the installed set):
+#   PyPI's newest scrapegraph-py line is 1.47.x; no 2.x release exists yet, so the '>=2.1.0' target of the
+#   amendment cannot be satisfied. The SDK surface is isolated in scraper/extractors/scrapegraph_managed.py.
+scrapegraph-py==1.47.0,<2
+# Self-hosted/private extraction is optional (requirements-local-ai.txt):
+# scrapegraphai==1.76.0

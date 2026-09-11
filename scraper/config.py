@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     RECONNECT_SECONDS: int = Field(default=30)
     VOLUME_END_GAP: int = Field(default=40, description="Tier 1: consecutive misses that close a reporter volume.")
     SEARCH_MAP_STALE_FAILURES: int = Field(default=5)
+    LOGIN_DELAY_MIN: float = Field(default=4.0, description="Seconds between login-session page fetches (minimum).")
+    LOGIN_DELAY_MAX: float = Field(default=9.0, description="Seconds between login-session page fetches (maximum).")
+    PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
+    PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
     LOGIN_SESSION_CONCURRENCY: int = Field(default=1)
     MIRROR_LOGIN_SESSION_ROWS: bool = Field(default=False, description="Whether login_session judgments may be mirrored to archive targets.")
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
@@ -303,6 +307,10 @@ class Settings(BaseSettings):
         if self.SGAI_MODE == "scrapegraph_local" and self.SGAI_ENABLED and not (self.SGAI_LOCAL_LLM_BASE_URL and self.SGAI_LOCAL_LLM_MODEL):
             if not self.SGAI_FAIL_OPEN_TO_DETERMINISTIC:
                 raise ValueError("scrapegraph_local selected without SGAI_LOCAL_LLM_BASE_URL/SGAI_LOCAL_LLM_MODEL and fail-open disabled")
+        if self.LOGIN_DELAY_MIN < 0 or self.LOGIN_DELAY_MAX < self.LOGIN_DELAY_MIN:
+            raise ValueError("LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
+        if self.PAGES_PER_HOUR <= 0 or self.PAGES_PER_DAY <= 0:
+            raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
         if self.LOGIN_SESSION_CONCURRENCY != 1:
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1")
         if self.EMBEDDING_DIM <= 0:

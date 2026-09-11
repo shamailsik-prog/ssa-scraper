@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -51,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
+TIER4_HIGH_YIELD_TERMS = 10
+
+
+class PacingBudgetExceeded(RuntimeError):
+    """PAGES_PER_HOUR / PAGES_PER_DAY spent; the run pauses and Beat resumes it later."""
 DEFAULT_VOCABULARY = []  # firm value: seeded from PLS_TIER3_VOCABULARY or the dashboard; never invented here
 
 
@@ -89,6 +95,13 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=2, query_key=key, query_json={"statute": st.short_name or st.name, "section": sec.section_number}, cursor_json={"page": 1}, priority=50))
             counts["tier2"] += 1
             existing.add((2, key))
+    high_yield = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.tier == 3, CrawlFrontier.yield_count > 0).order_by(CrawlFrontier.yield_count.desc()).limit(TIER4_HIGH_YIELD_TERMS))).scalars().all()
+    for hy in high_yield:
+        key = f"t4:vocab:{hy.query_json.get('keyword', '').lower()}"
+        if (4, key) not in existing and hy.query_json.get("keyword"):
+            db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key, query_json={"keyword": hy.query_json["keyword"], "daily": True}, cursor_json={"page": 1}, priority=5, next_run_at=now))
+            counts["tier4"] += 1
+            existing.add((4, key))
     for term in settings.tier3_vocabulary or DEFAULT_VOCABULARY:
         key = f"t3:{term.lower()}"
         if (3, key) not in existing:
@@ -149,7 +162,32 @@ class PakistanLawSitePipeline:
         self.local_engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
         self.redis_client = redis_client
         self.job_id = job_id
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False}
+        self.sleep = sleep
+        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+
+    # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
+    async def _charge_page(self) -> None:
+        """Count one login-session page against the hourly and daily budgets, then pace."""
+        now = datetime.now(timezone.utc)
+        cfg = dict(self.source.config_json or {})
+        pacing = dict(cfg.get("pacing") or {})
+        hour_key = now.strftime("%Y-%m-%dT%H")
+        day_key = now.strftime("%Y-%m-%d")
+        if pacing.get("hour") != hour_key:
+            pacing["hour"], pacing["hour_pages"] = hour_key, 0
+        if pacing.get("day") != day_key:
+            pacing["day"], pacing["day_pages"] = day_key, 0
+        pacing["hour_pages"] = int(pacing.get("hour_pages", 0)) + 1
+        pacing["day_pages"] = int(pacing.get("day_pages", 0)) + 1
+        cfg["pacing"] = pacing
+        self.source.config_json = cfg
+        self.stats["pages_charged"] += 1
+        await self.db.flush()
+        if pacing["day_pages"] > settings.PAGES_PER_DAY:
+            raise PacingBudgetExceeded(f"PAGES_PER_DAY={settings.PAGES_PER_DAY} spent for {day_key}")
+        if pacing["hour_pages"] > settings.PAGES_PER_HOUR:
+            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={settings.PAGES_PER_HOUR} spent for {hour_key}")
+        await self.sleep(random.uniform(settings.LOGIN_DELAY_MIN, settings.LOGIN_DELAY_MAX))
 
     # ---------------------------------------------------------------- guards
     def _assert_permitted(self) -> None:
@@ -181,6 +219,7 @@ class PakistanLawSitePipeline:
             raise_for_verdict(page)
             return page
 
+        await self._charge_page()
         return await self.runner.run(op)
 
     async def fetch_detail(self, url: str) -> PageResult:
@@ -189,6 +228,7 @@ class PakistanLawSitePipeline:
             raise_for_verdict(page)
             return page
 
+        await self._charge_page()
         return await self.runner.run(op)
 
     async def download(self, url: str) -> bytes:
@@ -409,6 +449,13 @@ class PakistanLawSitePipeline:
                     fr.status = "pending"
                     fr.last_error = f"disconnected: {exc}"
                     self.stats["paused"] = True
+                    await self.db.flush()
+                    return self.stats
+                except PacingBudgetExceeded as exc:
+                    fr.status = "pending"
+                    fr.last_error = f"pacing: {exc}"
+                    self.stats["pacing_paused"] = True
+                    logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
                     await self.db.flush()
                     return self.stats
                 await lock.refresh()

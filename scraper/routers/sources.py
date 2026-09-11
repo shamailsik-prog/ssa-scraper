@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scraper.config import EXTRACTION_MODES, settings
 from scraper.database import get_db
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
-from scraper.models import BrowserSessionSlot, ExtractionAudit, ScraperSource, SgaiUsageDaily
+from scraper.models import BrowserSessionSlot, ExtractionAudit, Judgment, ScraperSource, SgaiUsageDaily
 from scraper.routers.auth import require_admin
 
 router = APIRouter(prefix="/admin/sources", tags=["sources"], dependencies=[Depends(require_admin)])
@@ -83,6 +83,8 @@ async def source_view(db: AsyncSession, s: ScraperSource, local_engine: Optional
         "last_scraped_at": s.last_scraped_at.isoformat() if s.last_scraped_at else None,
         "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
         "last_error": s.last_error,
+        "next_scrape_at": s.next_scrape_at.isoformat() if s.next_scrape_at else None,
+        "records_today": (await db.execute(select(func.count()).select_from(Judgment).where(Judgment.source_name == s.source_name, Judgment.promoted_at >= datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)))).scalar(),
         "total_pages_scraped": s.total_pages_scraped,
         "total_records_extracted": s.total_records_extracted,
         "extraction": {

@@ -24,6 +24,9 @@ in the running service depends on an MCP client being connected.
 
 ## Setup (engineer's machine, not the repository)
 
+A template lives at `mcp/scrapegraph.example.json` (`python -m scrapegraph_mcp.server` with the key taken
+from the engineer's environment). Either form below is equivalent.
+
 Cursor — `~/.cursor/mcp.json`:
 
 ```json

@@ -48,8 +48,11 @@ def slug(s: Optional[str], limit: int = 80) -> str:
 
 
 def judgment_prefix(j: Judgment) -> str:
+    """Citations/<reporter>/<year>/<citation> for reported judgments; Unreported/<court>/<year>/<citation> otherwise."""
+    if j.reporter and j.year:
+        return f"Citations/{slug(j.reporter, 20)}/{j.year}/{slug(j.canonical_citation)}"
     court = slug(j.court_name or "Unknown_Court", 40)
-    return f"Judgments/{court}/{j.year or 'unknown'}/{slug(j.canonical_citation)}"
+    return f"Unreported/{court}/{j.year or 'unknown'}/{slug(j.canonical_citation)}"
 
 
 def target_config(t: ArchiveTarget) -> Dict[str, Any]:
@@ -252,7 +255,7 @@ class ArchiveMirror:
                 continue
             n = 0
             for ver, sec, st in rows:
-                key = f"Statutes/{slug(st.name)}/{slug(sec.section_number, 40)}/v{ver.version_no}.txt"
+                key = f"Statutes/{slug(st.jurisdiction or 'Federal', 30)}/{slug(st.name)}/{slug(sec.section_number, 40)}/v{ver.version_no}.txt"
                 try:
                     status = await self._write(t, adapter, {"key": key, "data": ver.section_text.encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=ver.source_provenance_id)
                     n += status == "written"
@@ -260,6 +263,38 @@ class ArchiveMirror:
                     logger.warning("archive %s: %s failed: %s", t.name, key, exc)
             out[t.name] = n
         return out
+
+    async def mirror_instruments(self, limit: int = 500) -> Dict[str, Any]:
+        from scraper.models import Instrument
+
+        targets = await self.targets()
+        rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()).limit(limit))).scalars().all()
+        out: Dict[str, int] = {}
+        for t in targets:
+            try:
+                adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
+            except Exception as exc:
+                t.last_error = f"adapter init: {exc}"[:2000]
+                continue
+            n = 0
+            for inst in rows:
+                year = inst.date.year if inst.date else "undated"
+                key = f"Instruments/{year}/{slug(inst.title or inst.number or str(inst.id), 100)}_{inst.full_text_hash[:10] if inst.full_text_hash else str(inst.id)[:8]}.txt"
+                try:
+                    status = await self._write(t, adapter, {"key": key, "data": (inst.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=inst.source_provenance_id)
+                    n += status == "written"
+                except Exception as exc:
+                    logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+            out[t.name] = n
+        return out
+
+    async def test_target(self, t: ArchiveTarget) -> Dict[str, Any]:
+        """Operator 'test' control: instantiate the adapter and list the index folder; nothing is written."""
+        try:
+            adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
+            return await asyncio.to_thread(adapter.check)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
 
     # ------------------------------------------------------------------ reconcile
     async def reconcile(self) -> Dict[str, Any]:
