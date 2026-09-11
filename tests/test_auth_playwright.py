@@ -211,7 +211,7 @@ async def test_pipeline_refuses_when_lock_held(db, login_source, monkeypatch):
     other = SessionLock("PakistanLawSite", r)
     await other.acquire()
     try:
-        pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), redis_client=r)
+        pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), redis_client=r, sleep=_nosleep)
         with pytest.raises(SessionLockHeld):
             await pipeline.run()
     finally:
@@ -239,7 +239,7 @@ async def test_tier1_volume_closes_after_40_misses_and_frontier_is_truth(db, log
     sc = _script_with_results(3)
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
     stats = await pipeline.run(max_queries=5, max_probes_per_volume=100)
     await db.commit()
     await r.aclose()
@@ -283,7 +283,7 @@ async def test_same_judgment_via_tier1_and_tier2_is_one_staging_row(db, login_so
     sc.default_search = search
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
     stats = await pipeline.run(max_queries=10, max_probes_per_volume=10)
     await db.commit()
     await r.aclose()
@@ -306,7 +306,7 @@ async def test_search_map_goes_stale_after_five_parse_failures(db, login_source,
     sc.default_search = lambda values, browser: PageResult(url="https://www.pakistanlawsite.com/r", html="<html><body><a href='/logout'>Logout</a><div>layout changed completely</div></body></html>")
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
     await pipeline.run(max_queries=1, max_probes_per_volume=6)
     await db.commit()
     await r.aclose()

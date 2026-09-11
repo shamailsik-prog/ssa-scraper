@@ -10,7 +10,7 @@ Branch: `claude/scrapegraphai-mcp-plugins-0dh85u`. Base inventory taken on 10 Se
 | `SIKANDER_AI_SCRAPER_SCRAPEGRAPH_INTEGRATED_MASTER_COMMAND.md` (Amendment D-15) | — | **Present** (operator upload, two identical copies) |
 | `CURSOR_COMMAND_SCRAPER_REPO.md` | Amendment §25 step 2 | **Present** (pushed to this branch, commit `0723247`) |
 | `FINAL_SCRAPER_PROMPT_3.md` (governing corpus contract) | Amendment §25 step 1, §22, §23, §24 | **ABSENT** — not in this repository, not in any of the owner's six GitHub repositories, not in the uploads |
-| `SIKANDER_AI_Scraper_Plain_English_11Sep2026.pdf` | Amendment §25 step 3 | **ABSENT** |
+| `SIKANDER_AI_Scraper_Plain_English_11Sep2026.pdf` | Amendment §25 step 3 | **ABSENT as PDF**; the operator pushed `docs/SIKANDER_AI_Scraper_Plain_English_REFERENCE.md` (its textual counterpart) mid-build, commit `8de7151`. Applied: archive layout `Citations/<reporter>/<year>`, `Unreported/<court>/<year>`, `Statutes/<jurisdiction>/<Act>`, `Instruments/<year>`, `_index/`; pacing guards `LOGIN_DELAY_MIN/MAX`, `PAGES_PER_HOUR/DAY`; Tier 4 re-checks high-yield vocabulary; dashboard last/next run, saved today, found/estimated/missing, archive test control. |
 | `docs/blackletter-annex-b-conformance.md` (claude-code-workspace, commit `9d5e25d`) | Not named by the amendment, but it records Layer 17 Annex B corrections B-1…B-10 against the earlier build | **Present** — used as the authoritative statement of the contract tables and source list |
 
 ### Decision recorded
@@ -23,6 +23,8 @@ implemented; nothing in the reconstruction is presented as the verbatim governin
 Where the governing text would have supplied a firm value (subscribed reporters, earliest
 year, region, mirror targets, credentials) the value is left blank, shown as NOT CONFIGURED,
 and the most conservative default is used and logged, exactly as the Cursor command directs.
+
+Also pushed mid-build (commit range `326d143..8de7151`): `CLAUDE_CLOUD_START_HERE.md`, `SCRAPEGRAPH_PACKAGE_README.md`, `scrapegraph.env.example`, `requirements-scrapegraph.txt`, `mcp/scrapegraph.example.json`, and the master command itself. `requirements-scrapegraph.txt` asked for `scrapegraph-py>=2.1.0`; no 2.x exists on PyPI, so it is pinned to the tested 1.47.0 and the file records why.
 
 ## 1. EXISTING (copied from `claude-code-workspace/blackletter`, PR #1, commit `6fd9466`)
 

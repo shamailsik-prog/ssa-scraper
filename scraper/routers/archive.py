@@ -73,8 +73,17 @@ async def mirror_now(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     mirror = ArchiveMirror(db)
     result = await mirror.mirror_pending()
     result["statutes"] = await mirror.mirror_statutes()
+    result["instruments"] = await mirror.mirror_instruments()
     await db.commit()
     return result
+
+
+@router.post("/targets/{name}/test")
+async def test_target(name: str, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    t = (await db.execute(select(ArchiveTarget).where(ArchiveTarget.name == name))).scalars().first()
+    if t is None:
+        raise HTTPException(404, "target not found")
+    return {"name": t.name, **(await ArchiveMirror(db).test_target(t))}
 
 
 @router.post("/reconcile")

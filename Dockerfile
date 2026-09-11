@@ -21,6 +21,10 @@ RUN apt-get update \
 
 COPY requirements.txt requirements-local-ai.txt ./
 
+# Chromium is installed into the image by default. Build with --build-arg INSTALL_BROWSERS=0 only on a
+# build host that cannot reach the Playwright CDN; mount a browser at PLAYWRIGHT_EXECUTABLE_PATH instead.
+ARG INSTALL_BROWSERS=1
+
 # Optional corporate/chambers proxy CA (TLS-inspecting proxies):
 #   docker build --secret id=extra_ca,src=/path/to/proxy-ca.crt -t corpus-service:local .
 # The secret is never written into an image layer.
@@ -29,7 +33,7 @@ RUN --mount=type=secret,id=extra_ca,target=/run/secrets/extra_ca,required=false 
         cp /run/secrets/extra_ca /usr/local/share/ca-certificates/extra-ca.crt && update-ca-certificates; \
     fi \
     && pip install --no-cache-dir -r requirements.txt \
-    && playwright install --with-deps chromium
+    && if [ "$INSTALL_BROWSERS" = "1" ]; then playwright install --with-deps chromium; fi
 
 # Optional local/private AI engine library (build with --build-arg LOCAL_AI=1).
 ARG LOCAL_AI=0

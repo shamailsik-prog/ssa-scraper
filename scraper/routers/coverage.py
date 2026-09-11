@@ -30,7 +30,7 @@ async def coverage(source: Optional[str] = None, db: AsyncSession = Depends(get_
     if source:
         vq = vq.where(CrawlCoverage.source_name == source)
     volumes = [
-        {"source": v.source_name, "reporter": v.reporter, "year": v.year, "state": v.volume_state, "highest_page_seen": v.highest_page_seen, "next_page_to_probe": v.next_page_to_probe, "consecutive_misses": v.consecutive_misses, "judgments_found": v.judgments_found, "closed_at": v.closed_at.isoformat() if v.closed_at else None}
+        {"source": v.source_name, "reporter": v.reporter, "year": v.year, "state": v.volume_state, "highest_page_seen": v.highest_page_seen, "next_page_to_probe": v.next_page_to_probe, "consecutive_misses": v.consecutive_misses, "judgments_found": v.judgments_found, "estimated_total": (v.highest_page_seen if v.volume_state == "closed" else max(v.highest_page_seen, v.next_page_to_probe)), "missing_estimate": max(0, (v.highest_page_seen if v.volume_state == "closed" else max(v.highest_page_seen, v.next_page_to_probe)) - v.judgments_found), "closed_at": v.closed_at.isoformat() if v.closed_at else None}
         for v in (await db.execute(vq.order_by(CrawlCoverage.reporter, CrawlCoverage.year.desc()))).scalars().all()
     ]
     per_source = (await db.execute(select(Judgment.source_name, func.count()).group_by(Judgment.source_name))).all()
