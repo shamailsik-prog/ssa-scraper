@@ -58,6 +58,21 @@ async def test_discovered_url_gets_local_policy_check(db, source, fixture_server
             await fetcher.get(fixture_server.url("/private/judgment2.html"))
 
 
+async def test_robots_disallow_retires_frontier_without_halting(db, source, fixture_server):
+    fixture_server.add("/robots.txt", "User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+    blocked = fixture_server.add("/private/judgment2.html", judgment_html("PLD 2024 SC 12"))
+    row = CrawlFrontier(source_name=source.source_name, tier=0, query_key=f"judgment:{blocked}", query_json={"kind": "judgment", "url": blocked}, cursor_json={}, priority=50)
+    db.add(row)
+    await db.flush()
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        pipeline = PublicPipeline(db, source, fetcher=fetcher)
+        result = await pipeline._drain_one(row)
+    assert result == "ok"
+    assert row.status == "retired"
+    assert source.state != "HALTED"
+    assert pipeline.stats["rejected_urls"] == 1 and pipeline.stats["halted"] is False
+
+
 # --------------------------------------------------------------------------- 26
 async def test_injection_text_is_data_and_schema_unchanged(db, source):
     client = FakeManagedClient(result={"citations": ["PLD 2024 SC 101"], "owned": True, "extractor_confidence": 0.9})

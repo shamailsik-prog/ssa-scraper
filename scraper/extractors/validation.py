@@ -122,7 +122,7 @@ def reconcile_judgment(
     court_raw = out.get("court")
     if ai and ai.get("court") and not court_raw:
         cand = str(ai["court"])
-        if _norm_ws(cand) in _norm_ws(raw_text) or court_in_directory(cand, court_directory):
+        if _norm_ws(cand) in _norm_ws(raw_text):
             court_raw = cand
         else:
             conflicts.append({"field": "court", "ai": cand, "reason": "not in source evidence"})
@@ -341,7 +341,7 @@ def reconcile_instrument(*, deterministic: Dict[str, Any], ai: Optional[Dict[str
     if ai:
         for k in ("type", "number", "title", "gazette_ref", "affected_statute"):
             if ai.get(k) and not out.get(k):
-                if _norm_ws(str(ai[k]))[:30] in norm_raw or k == "type":
+                if _norm_ws(str(ai[k]))[:30] in norm_raw:
                     out[k] = ai[k]
                 else:
                     conflicts.append({"field": k, "ai": ai[k], "reason": "not in raw"})

@@ -117,7 +117,13 @@ class PublicPipeline:
         assert self.fetcher is not None
         try:
             res = await self.fetcher.get(url)
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            raise
         except ExplicitBlock as exc:
+            if exc.kind == "robots_disallow":
+                self.stats["rejected_urls"] += 1
+                raise URLPolicyError(str(exc))
             await self.halt(str(exc))
             raise
         self.stats["fetched"] += 1
@@ -257,6 +263,9 @@ class PublicPipeline:
                 fr.status = "done"
                 fr.last_error = None
                 fr.last_run_at = datetime.now(timezone.utc)
+        except URLPolicyError as exc:
+            fr.status = "retired"
+            fr.last_error = str(exc)[:1000]
         except ExplicitBlock:
             fr.status = "pending"
             await self.db.flush()

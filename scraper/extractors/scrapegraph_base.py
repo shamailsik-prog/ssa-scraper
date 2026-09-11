@@ -198,7 +198,15 @@ async def usage_row(db: AsyncSession, engine_mode: str, source_name: str = "*") 
 
 async def managed_credits_used_today(db: AsyncSession) -> float:
     today = datetime.now(timezone.utc).date()
-    rows = (await db.execute(select(SgaiUsageDaily).where(SgaiUsageDaily.day == today, SgaiUsageDaily.engine_mode == "managed"))).scalars().all()
+    rows = (
+        await db.execute(
+            select(SgaiUsageDaily).where(
+                SgaiUsageDaily.day == today,
+                SgaiUsageDaily.engine_mode == "managed",
+                SgaiUsageDaily.source_name == "*",
+            )
+        )
+    ).scalars().all()
     return float(sum(r.credits for r in rows)) + float(sum(r.calls for r in rows if r.credits == 0))
 
 

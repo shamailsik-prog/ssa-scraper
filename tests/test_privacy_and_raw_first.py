@@ -158,6 +158,17 @@ async def test_daily_credit_cap_reached_continues_deterministic(db, source, monk
     assert len(client.calls) == 1
 
 
+async def test_daily_credit_cap_counts_only_aggregate_row(db, source, monkeypatch):
+    monkeypatch.setattr(settings, "SGAI_DAILY_CREDIT_CAP", 2)
+    client = FakeManagedClient(result=AI_RESULT)
+    extractor = HybridExtractor(db, source, force_ai=True, managed=managed_with(client))
+    o1 = await extractor.extract_judgment(html=JUDGMENT_HTML, content_hash="k" * 64)
+    o2 = await extractor.extract_judgment(html=JUDGMENT_HTML.replace("101", "102"), content_hash="l" * 64)
+    o3 = await extractor.extract_judgment(html=JUDGMENT_HTML.replace("101", "103"), content_hash="m" * 64)
+    assert o1.ai_status == "ok" and o2.ai_status == "ok"
+    assert o3.ai_status == "budget_exhausted"
+
+
 # --------------------------------------------------------------------------- 15
 async def test_circuit_breaker_open_continues_deterministic(db, source, monkeypatch):
     monkeypatch.setattr(settings, "SGAI_CIRCUIT_BREAKER_FAILURES", 2)
@@ -196,6 +207,15 @@ async def test_managed_unavailable_falls_back_to_deterministic(db, source):
     assert o.ai_status == "ai_failed" and o.engine == "deterministic" and o.data["citations"] == ["PLD 2024 SC 101"]
     usage = (await db.execute(select(SgaiUsageDaily).where(SgaiUsageDaily.source_name == "*"))).scalars().first()
     assert usage.failures == 1
+
+
+async def test_managed_text_input_uses_payload_not_refetch_url(db, source):
+    client = FakeManagedClient(result=AI_RESULT)
+    extractor = HybridExtractor(db, source, force_ai=True, managed=managed_with(client))
+    o = await extractor.extract_judgment(text=JUDGMENT_TEXT, source_meta={"url": "https://www.supremecourt.gov.pk/case/101"}, content_hash="n" * 64)
+    assert o.ai_status == "ok"
+    sent = client.calls[0]
+    assert "website_markdown" in sent and "website_url" not in sent
 
 
 async def test_local_engine_ok_for_login_session_on_prem_only(db, login_source):

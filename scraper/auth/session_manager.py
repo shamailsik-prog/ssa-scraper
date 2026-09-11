@@ -118,7 +118,16 @@ class SessionLock:
     async def refresh(self) -> None:
         if self._held:
             r = await self._client()
-            await r.expire(self.key, LOCK_TTL_SECONDS)
+            ok = await r.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1,
+                self.key,
+                self._token,
+                str(LOCK_TTL_SECONDS),
+            )
+            if int(ok or 0) != 1:
+                self._held = False
+                raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
 
     async def release(self) -> None:
         if not self._held:

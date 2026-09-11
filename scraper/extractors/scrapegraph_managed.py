@@ -55,6 +55,8 @@ class ManagedScrapeGraphEngine(BaseScrapeGraphEngine):
             kwargs["website_html"] = payload_text
         elif input_kind == "markdown":
             kwargs["website_markdown"] = payload_text
+        elif input_kind == "text":
+            kwargs["website_markdown"] = payload_text
         elif url:
             kwargs["website_url"] = url
         else:
