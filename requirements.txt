@@ -1,0 +1,45 @@
+# SIKANDER AI corpus service — pinned after dependency resolution and the full test run (Python 3.12+; tested on 3.11/3.12)
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+sqlalchemy[asyncio]==2.0.52
+asyncpg==0.31.0
+alembic==1.19.2
+celery[redis]==5.6.3
+redis==6.4.0
+httpx==0.28.1
+beautifulsoup4==4.15.0
+lxml==6.1.3
+playwright==1.62.0
+pdfplumber==0.11.10
+pytesseract==0.3.13
+pillow==12.3.0
+cryptography==50.0.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-multipart==0.0.32
+reportlab==5.0.1
+python-dateutil==2.9.0.post0
+pgvector==0.5.0
+jinja2==3.1.6
+aiofiles==25.1.0
+boto3==1.43.91
+paramiko==5.0.0
+smbprotocol==1.17.0
+dropbox==12.2.1
+google-api-python-client==2.200.0
+google-auth==2.58.0
+websockets==17.1
+
+# ScrapeGraphAI managed API SDK (Amendment §16). PyPI's newest line at build time is 1.47.x; no 2.x is
+# published yet. The adapter in scraper/extractors/scrapegraph_managed.py isolates the SDK surface so the
+# v2 rename is a one-file change. Constrained to the tested major version.
+scrapegraph-py==1.47.0,<2
+
+# Optional: open-source scrapegraphai for the local/private engine (SGAI_LOCAL_LLM_PROVIDER=scrapegraphai).
+# Not installed by default: the local engine talks to Ollama / any OpenAI-compatible on-prem endpoint directly.
+# Enable with: pip install -r requirements-local-ai.txt
+
+# Tests
+pytest==9.1.1
+pytest-asyncio==1.4.0

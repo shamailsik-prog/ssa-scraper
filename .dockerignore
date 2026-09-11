@@ -1,0 +1,13 @@
+.git
+.env
+live
+raw
+state
+blackletter_state
+__pycache__
+.pytest_cache
+*.pyc
+tests
+docs
+CURSOR_COMMAND_SCRAPER_REPO.md
+CORRECTION_LOG.md

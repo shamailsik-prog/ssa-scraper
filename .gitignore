@@ -1,0 +1,11 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+live/
+raw/
+state/
+blackletter_state/
+*.log
+.venv/
+venv/

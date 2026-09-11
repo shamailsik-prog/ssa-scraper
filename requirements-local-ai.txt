@@ -1,0 +1,4 @@
+# Optional open-source ScrapeGraphAI library for SGAI_LOCAL_LLM_PROVIDER=scrapegraphai (local/private engine).
+# Pinned to the last version verified against the local engine adapter; install inside the worker image only when
+# local AI extraction is enabled for this deployment (docker compose --profile local-ai).
+scrapegraphai==1.76.0

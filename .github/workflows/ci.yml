@@ -1,0 +1,58 @@
+name: corpus-service-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: legal
+          POSTGRES_PASSWORD: legal
+          POSTGRES_DB: legal_scraper
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U legal -d legal_scraper"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper
+      REDIS_URL: redis://localhost:6379/0
+      SIKANDER_READER_PASSWORD: readerpw
+      CORPUS_WRITER_PASSWORD: writerpw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: System packages (Tesseract for OCR tests)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr fonts-dejavu-core
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+      - name: Byte-compile
+        run: python -m compileall -q scraper migrations
+      - name: Forbidden-pattern scan (no stubs, no secrets, no bypass logic)
+        run: bash scripts/guard_scan.sh
+      - name: Tests against PostgreSQL + Redis
+        run: pytest -q
+      - name: Validate compose file
+        run: |
+          cp .env.example .env
+          docker compose config -q
