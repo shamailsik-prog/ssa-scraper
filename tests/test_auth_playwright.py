@@ -1,0 +1,327 @@
+"""Auth / Playwright (tests 16–21) and the four-tier PakistanLawSite pipeline (Cursor command §4)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime
+
+import pytest
+import redis.asyncio as aioredis
+from sqlalchemy import func, select
+
+from scraper.auth.session_manager import BrowserDisconnected, ContinuityRunner, PageResult, SessionLock, SessionLockHeld, SessionManager, raise_for_verdict
+from scraper.config import settings
+from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperStaging, SearchFormMap
+from scraper.security import ExplicitBlock, VerificationRequired
+from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
+from scraper.tasks.promotion import promote_staging_records
+from scraper.tasks.search_map import map_search_form
+from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
+
+STATE = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+
+
+async def _activate(db, source, slots=(1,)):
+    mgr = SessionManager(db, source)
+    for n in slots:
+        await mgr.save_storage_state(n, STATE, by="test")
+    source.state = "ACTIVE"
+    await db.commit()
+    return mgr
+
+
+def _script_with_results(n_hits: int, citation_prefix="PLD 2024 SC"):
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), search_form_html())
+
+    def search(values, browser):
+        page_no = int(values.get("page") or 0)
+        if 1 <= page_no <= n_hits:
+            cit = f"{citation_prefix} {page_no}"
+            return PageResult(url="https://www.pakistanlawsite.com/r", html=results_html([(cit, f"Party {page_no} versus State", "Supreme Court", f"https://www.pakistanlawsite.com/case/{page_no}")]))
+        return PageResult(url="https://www.pakistanlawsite.com/r", html=results_html([]))
+
+    sc.default_search = search
+    for i in range(1, n_hits + 1):
+        sc.page(("goto", f"https://www.pakistanlawsite.com/case/{i}"), judgment_html(f"{citation_prefix} {i}", title=f"Party {i} versus State"))
+    return sc
+
+
+# --------------------------------------------------------------------------- 16
+async def test_human_login_stores_encrypted_storage_state(db, login_source):
+    mgr = SessionManager(db, login_source)
+    slot = await mgr.save_storage_state(1, STATE, by="advocate")
+    assert slot.state == "ACTIVE" and slot.storage_state_encrypted.startswith("gAAAA")
+    assert "abc" not in slot.storage_state_encrypted
+    assert mgr.load_storage_state(slot) == STATE
+    assert login_source.state == "ACTIVE"
+
+
+async def test_human_login_browser_stream_and_completion(db, login_source, fixture_server):
+    """Real Playwright: a streamed login page, frames arrive, credentials typed by the 'human',
+    completion exports storage state into the slot. No password ever reaches the service."""
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add("/login", LOGIN_PAGE)
+    fixture_server.add("/home", "<html><body><a href='/logout'>Logout</a><h1>Welcome</h1></body></html>")
+    reg = LoginSessionRegistry()
+    sess = await reg.start("PakistanLawSite", 2, fixture_server.url("/login"), started_by="advocate")
+    try:
+        frame = await sess.next_frame(timeout=15)
+        assert frame is not None and frame["type"] == "frame" and frame["data"]
+        status = await sess.is_authenticated()
+        assert status["authenticated"] is False  # password field present → not yet logged in
+        await sess.input_event({"kind": "navigate", "url": fixture_server.url("/home")})
+        await sess._page.evaluate("() => { document.cookie = 'sid=humanlogin; path=/'; localStorage.setItem('k','v'); }")
+        result = await reg.complete("PakistanLawSite", SessionManager(db, login_source))
+        assert result["stored"] is True and result["slot"] == 2
+        slot = (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.slot_number == 2))).scalars().first()
+        state = json.loads(settings.decrypt_value(slot.storage_state_encrypted))
+        assert any(c["name"] == "sid" and c["value"] == "humanlogin" for c in state["cookies"])
+        with pytest.raises(Exception):
+            await sess.input_event({"kind": "navigate", "url": "https://evil.example.com/"})
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
+# --------------------------------------------------------------------------- 17
+async def test_verification_page_marks_needs_human_login_without_solving(db, login_source):
+    mgr = await _activate(db, login_source)
+    sc = BrowserScript()
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/9"), VERIFICATION_PAGE)
+    runner = ContinuityRunner(mgr, sc.factory(), sleep=_nosleep)
+
+    async def op(browser):
+        page = await browser.goto("https://www.pakistanlawsite.com/case/9")
+        raise_for_verdict(page)
+        return page
+
+    with pytest.raises(VerificationRequired):
+        await runner.run(op)
+    slot = await mgr.slot(1)
+    assert slot.state == "NEEDS_HUMAN_LOGIN"
+    assert login_source.state == "PAUSED"
+    notes = (await db.execute(select(Notification.code))).scalars().all()
+    assert "NEEDS_HUMAN_LOGIN" in notes
+    assert all(("captcha" not in (k[0] if isinstance(k, tuple) else str(k)).lower()) for k, _ in sc.log)  # nothing attempted to solve
+
+
+# --------------------------------------------------------------------------- 18
+async def test_disconnect_waits_30s_reconnects_same_slot_same_cursor(db, login_source):
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    sc = BrowserScript()
+    key = ("goto", "https://www.pakistanlawsite.com/case/5")
+    sc.page(key, judgment_html("PLD 2024 SC 5"))
+    sc.fail_once(key, BrowserDisconnected("socket hang up"))
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    runner = ContinuityRunner(mgr, sc.factory(), sleep=fake_sleep)
+    cursor = {"page_no": 5, "row_index": 0}
+    seen_cursors = []
+
+    async def op(browser):
+        seen_cursors.append(dict(cursor))
+        return await browser.goto(f"https://www.pakistanlawsite.com/case/{cursor['page_no']}")
+
+    page = await runner.run(op)
+    assert page.status == 200
+    assert slept == [30]
+    slots_used = [slot for (_k, slot) in sc.log]
+    assert slots_used == [1, 1]  # same slot both times
+    assert seen_cursors == [cursor, cursor]  # same cursor, never page one
+    assert (await mgr.slot(1)).reconnect_count == 1
+
+
+# --------------------------------------------------------------------------- 19
+async def test_reconnect_failure_uses_alternate_slot_same_cursor(db, login_source):
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    sc = BrowserScript()
+    key = ("goto", "https://www.pakistanlawsite.com/case/7")
+    sc.page(key, judgment_html("PLD 2024 SC 7"))
+    sc.fail_once(key, BrowserDisconnected("first"))
+    sc.fail_once(key, BrowserDisconnected("reconnect failed too"))
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    runner = ContinuityRunner(mgr, sc.factory(), sleep=fake_sleep)
+    cursor = {"page_no": 7}
+
+    async def op(browser):
+        return await browser.goto(f"https://www.pakistanlawsite.com/case/{cursor['page_no']}")
+
+    page = await runner.run(op)
+    assert page.status == 200 and slept == [30]
+    assert [slot for (_k, slot) in sc.log] == [1, 1, 2]
+    assert (login_source.config_json or {}).get("current_slot") == 2
+    # no automatic recovery to the primary afterwards (no try_recover_primary)
+    cur = await mgr.current_slot()
+    assert cur.slot_number == 2
+
+
+# --------------------------------------------------------------------------- 20
+@pytest.mark.parametrize("html,status", [(BLOCK_PAGE, 200), ("<html><body>Forbidden</body></html>", 403), ("<html><body>automated access detected</body></html>", 200)])
+async def test_explicit_block_halts_without_slot_switch(db, login_source, html, status):
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    sc = BrowserScript()
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/1"), html, status=status)
+    runner = ContinuityRunner(mgr, sc.factory(), sleep=_nosleep)
+
+    async def op(browser):
+        page = await browser.goto("https://www.pakistanlawsite.com/case/1")
+        raise_for_verdict(page)
+        return page
+
+    with pytest.raises(ExplicitBlock):
+        await runner.run(op)
+    assert login_source.state == "HALTED" and login_source.requires_admin_review
+    assert (await mgr.slot(1)).state == "HALTED"
+    assert (await mgr.slot(2)).state == "ACTIVE"  # alternate untouched: no bypass attempted
+    assert [slot for (_k, slot) in sc.log] == [1]
+    codes = (await db.execute(select(Notification.code))).scalars().all()
+    assert "SOURCE_HALTED" in codes
+
+
+# --------------------------------------------------------------------------- 21
+async def test_second_concurrent_login_session_worker_refused():
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    lock1 = SessionLock("PakistanLawSite", r)
+    lock2 = SessionLock("PakistanLawSite", r)
+    await lock1.acquire()
+    try:
+        with pytest.raises(SessionLockHeld):
+            await lock2.acquire()
+    finally:
+        await lock1.release()
+    await lock2.acquire()
+    await lock2.release()
+    await r.aclose()
+
+
+async def test_pipeline_refuses_when_lock_held(db, login_source, monkeypatch):
+    await _activate(db, login_source)
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    other = SessionLock("PakistanLawSite", r)
+    await other.acquire()
+    try:
+        pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), redis_client=r)
+        with pytest.raises(SessionLockHeld):
+            await pipeline.run()
+    finally:
+        await other.release()
+        await r.aclose()
+
+
+# --------------------------------------------------------------------------- search map (6.3) and tiers (6.4 / 6.5)
+async def test_search_form_map_deterministic_and_verified(db, login_source):
+    m = await map_search_form(db, login_source, search_form_html())
+    assert m.map_version == 1 and m.verified_against_dom and m.mapped_by == "deterministic"
+    assert set(m.fields) >= {"reporter", "year", "page", "keyword", "submit"}
+    assert m.result_layout["row_selector"] == "table#results tr" and m.result_layout["columns"] == {"citation": 0, "title": 1, "court": 2}
+    vals = build_values({"fields": m.fields}, {"reporter": "PLD", "year": 2024}, {"page_no": 3})
+    assert vals == {"reporter": "PLD", "year": "2024", "page": "3"}
+    m2 = await map_search_form(db, login_source, search_form_html())
+    assert m2.map_version == 2 and not m.is_active
+
+
+async def test_tier1_volume_closes_after_40_misses_and_frontier_is_truth(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", datetime.now().year)
+    monkeypatch.setattr(settings, "VOLUME_END_GAP", 40)
+    await _activate(db, login_source)
+    sc = _script_with_results(3)
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=100)
+    await db.commit()
+    await r.aclose()
+    year = datetime.now().year
+    cov = (await db.execute(select(CrawlCoverage).where(CrawlCoverage.reporter == "PLD", CrawlCoverage.year == year))).scalars().first()
+    assert cov.volume_state == "closed" and cov.consecutive_misses == 40 and cov.highest_page_seen == 3 and cov.judgments_found == 3
+    fr = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.tier == 1))).scalars().first()
+    assert fr.status == "done" and fr.cursor_json["page_no"] == 44
+    staged = (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar()
+    assert staged == 3 and stats["volumes_closed"] == 1
+    # Tier 4 row was seeded for the current year
+    assert (await db.execute(select(CrawlFrontier).where(CrawlFrontier.tier == 4))).scalars().first() is not None
+    # promotion yields exactly three judgments with the Tier-1 route preserved on provenance
+    counts = await promote_staging_records()
+    assert counts["promoted"] == 3
+    async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as db2:
+        assert (await db2.execute(select(func.count()).select_from(Judgment))).scalar() == 3
+
+
+async def test_same_judgment_via_tier1_and_tier2_is_one_staging_row(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", datetime.now().year)
+    monkeypatch.setattr(settings, "VOLUME_END_GAP", 2)
+    await _activate(db, login_source)
+    sc = _script_with_results(1)
+    # Tier 2 query (statute 302 PPC) returns the same judgment
+    from scraper.models import Statute, StatuteSection
+
+    st = Statute(name="Pakistan Penal Code, 1860", short_name="PPC")
+    db.add(st)
+    await db.flush()
+    db.add(StatuteSection(statute_id=st.id, section_number="302"))
+    await db.commit()
+    original_search = sc.default_search
+
+    def search(values, browser):
+        if values.get("keyword", "").startswith("PPC section 302") or values.get("statute"):
+            return PageResult(url="https://www.pakistanlawsite.com/r", html=results_html([("PLD 2024 SC 1", "Party 1 versus State", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
+        return original_search(values, browser)
+
+    sc.default_search = search
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    stats = await pipeline.run(max_queries=10, max_probes_per_volume=10)
+    await db.commit()
+    await r.aclose()
+    assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
+    assert stats["duplicates"] >= 1
+    from scraper.models import SourceProvenance
+
+    prov = (await db.execute(select(SourceProvenance).where(SourceProvenance.content_kind == "html", SourceProvenance.source_url.like("%/case/1")))).scalars().first()
+    tiers = {route.get("tier") for route in prov.routes}
+    assert {1, 2} <= tiers
+
+
+async def test_search_map_goes_stale_after_five_parse_failures(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", datetime.now().year)
+    monkeypatch.setattr(settings, "VOLUME_END_GAP", 40)
+    await _activate(db, login_source)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), search_form_html())
+    sc.default_search = lambda values, browser: PageResult(url="https://www.pakistanlawsite.com/r", html="<html><body><a href='/logout'>Logout</a><div>layout changed completely</div></body></html>")
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r)
+    await pipeline.run(max_queries=1, max_probes_per_volume=6)
+    await db.commit()
+    await r.aclose()
+    m = (await db.execute(select(SearchFormMap).where(SearchFormMap.is_active.is_(True)))).scalars().first()
+    assert m.stale and m.consecutive_parse_failures >= 5
+    codes = (await db.execute(select(Notification.code))).scalars().all()
+    assert "search_map_stale" in codes
+
+
+async def test_login_scraping_disabled_outside_chambers(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "ENVIRONMENT", "cloud")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory())
+    with pytest.raises(PermissionError):
+        await pipeline.run()
+
+
+async def _nosleep(_s):
+    return None

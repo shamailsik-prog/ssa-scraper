@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIKANDER AI Corpus Console</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#f6f4ef; --panel:#fff; --ink:#1c1a17; --muted:#6b665e; --line:#dcd7cc; --accent:#7a1f1f; --ok:#1f6f43; --warn:#9a6b00; --bad:#a12626; --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 Georgia,"Times New Roman",serif; }
+  header { display:flex; align-items:baseline; justify-content:space-between; padding:14px 24px; border-bottom:2px solid var(--accent); background:var(--panel); gap:12px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  nav { display:flex; gap:4px; padding:8px 24px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  nav button { font:inherit; padding:6px 12px; border:1px solid var(--line); background:#faf9f6; border-radius:4px; cursor:pointer; }
+  nav button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  main { max-width:1280px; margin:0 auto; padding:18px 24px 40px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:18px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px 14px; }
+  .tile .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .tile .value { font-size:24px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums; }
+  .tile .value.small { font-size:14px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:14px 16px; margin-bottom:16px; }
+  section h2 { margin:0 0 10px; font-size:14px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:normal; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  td.mono, pre { font-family:var(--mono); font-size:12px; }
+  pre { margin:0; max-height:360px; overflow:auto; background:#faf9f6; border:1px solid var(--line); padding:10px; white-space:pre-wrap; }
+  button.act { font:inherit; font-size:12px; padding:4px 10px; border-radius:4px; border:1px solid var(--line); background:var(--panel); cursor:pointer; }
+  button.act.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  input, select { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:4px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; border:1px solid var(--line); }
+  .badge.ACTIVE{color:var(--ok)} .badge.PAUSED,.badge.NEEDS_HUMAN_LOGIN{color:var(--warn)} .badge.HALTED,.badge.DISABLED{color:var(--bad)}
+  .hidden { display:none; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:900px){ .grid2{grid-template-columns:1fr;} }
+  #loginCanvas { border:1px solid var(--line); width:100%; max-width:1280px; background:#000; cursor:crosshair; }
+  .note { color:var(--muted); font-size:12px; }
+  .nc { color:var(--warn); font-family:var(--mono); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>SIKANDER AI — Corpus Console</h1><div class="sub">Operational status only. The application reads the corpus through <span class="mono">sikander_reader</span>; nothing here exposes a secret.</div></div>
+  <div><label class="note">Admin key <input id="apikey" type="password" placeholder="X-API-Key" autocomplete="off"></label> <button class="act primary" onclick="saveKey()">Connect</button> <span id="conn" class="note"></span></div>
+</header>
+<nav>
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="sources">Sources</button>
+  <button data-tab="coverage">Coverage</button>
+  <button data-tab="review">Review queue</button>
+  <button data-tab="check">Check viewer</button>
+  <button data-tab="archive">Archive storage</button>
+  <button data-tab="scrapegraph">ScrapeGraph</button>
+  <button data-tab="login">Human login</button>
+  <button data-tab="ops">Jobs · Errors · Notifications</button>
+</nav>
+<main>
+  <div id="tab-overview">
+    <div class="tiles" id="tiles"></div>
+    <section><h2>Not configured (firm values)</h2><div id="notconf" class="nc"></div></section>
+    <section><h2>Read-only connection</h2><div id="reader"></div></section>
+  </div>
+  <div id="tab-sources" class="hidden">
+    <section><h2>Sources</h2><div id="sourcesTbl"></div></section>
+    <section><h2>Extraction settings</h2>
+      <div>Source <select id="esSource"></select> Mode <select id="esMode"><option>deterministic</option><option>hybrid</option><option>scrapegraph_managed</option><option>scrapegraph_local</option></select>
+      AI <select id="esAi"><option value="true">enabled</option><option value="false">disabled</option></select> Min confidence <input id="esConf" type="number" step="0.01" min="0" max="1" style="width:80px"> Schema v <input id="esSchema" type="number" min="1" style="width:60px">
+      <button class="act primary" onclick="saveExtraction()">Save</button> <span id="esMsg" class="note"></span></div></section>
+  </div>
+  <div id="tab-coverage" class="hidden">
+    <section><h2>PakistanLawSite tiers</h2><div id="tiers"></div></section>
+    <section><h2>Reporter volumes (Tier 1) — VOLUME_END_GAP <span id="veg"></span></h2><div id="volumes"></div></section>
+    <section><h2>Search form maps</h2><div id="maps"></div></section>
+    <section><h2>Frontier (latest)</h2><div id="frontier"></div></section>
+  </div>
+  <div id="tab-review" class="hidden"><section><h2>Review queue</h2><div id="reviewTbl"></div></section></div>
+  <div id="tab-check" class="hidden">
+    <section><h2>Check viewer</h2><div>Staging id <input id="checkId" style="width:340px"> <button class="act primary" onclick="loadCheck()">Open</button></div>
+      <div class="grid2" style="margin-top:12px"><div><h2>Raw source text</h2><pre id="checkRaw"></pre></div><div><h2>Deterministic · AI · Reconciled</h2><pre id="checkJson"></pre></div></div>
+      <h2 style="margin-top:12px">Extraction audit</h2><div id="checkAudit"></div></section>
+  </div>
+  <div id="tab-archive" class="hidden">
+    <section><h2>Archive targets</h2><div id="archiveTbl"></div>
+      <div style="margin-top:10px"><button class="act" onclick="post('/admin/archive/mirror').then(r=>alert(JSON.stringify(r)))">Mirror now</button> <button class="act" onclick="post('/admin/archive/reconcile').then(r=>alert(JSON.stringify(r)))">Reconcile storage</button></div></section>
+    <section><h2>Add / update target</h2>
+      <div>Name <input id="atName"> Type <select id="atType"><option>local_path</option><option>s3_compatible</option><option>sftp</option><option>smb</option><option>dropbox</option><option>google_drive</option><option>onedrive</option></select> Root <input id="atRoot"> Config JSON (encrypted at rest) <input id="atCfg" style="width:320px" placeholder='{"path":"/archive"}'> Mirror login-session rows <input id="atLogin" type="checkbox"> <button class="act primary" onclick="saveTarget()">Save</button></div></section>
+  </div>
+  <div id="tab-scrapegraph" class="hidden">
+    <section><h2>ScrapeGraph status</h2><pre id="sgStatus"></pre><div style="margin-top:8px"><button class="act" onclick="post('/admin/scrapegraph/test-public?extraction_type=judgment').then(r=>{document.getElementById('sgTest').textContent=JSON.stringify(r,null,2)})">Test public URL (managed)</button></div><pre id="sgTest"></pre></section>
+    <section><h2>Usage (7 days)</h2><div id="sgUsage"></div></section>
+  </div>
+  <div id="tab-login" class="hidden">
+    <section><h2>Human login — PakistanLawSite</h2>
+      <p class="note">A server-side browser opens the login page and is streamed here. You type the username, password and any verification yourself; the service never sees or stores them. When the site shows you as logged in, press <b>Complete</b>: cookies and local storage are encrypted and saved to the chosen slot, and scraping continues headless inside that session. CAPTCHA or verification pages are never solved by code.</p>
+      <div>Slot <select id="loginSlot"><option value="1">1 (primary)</option><option value="2">2 (alternate)</option></select> <button class="act primary" onclick="startLogin()">Start login</button> <button class="act" onclick="completeLogin()">Complete</button> <button class="act" onclick="cancelLogin()">Cancel</button> <span id="loginMsg" class="note"></span></div>
+      <div id="slots" style="margin:10px 0"></div>
+      <canvas id="loginCanvas" width="1280" height="800" tabindex="0"></canvas>
+    </section>
+  </div>
+  <div id="tab-ops" class="hidden">
+    <section><h2>Notifications</h2><div id="notifs"></div></section>
+    <section><h2>Jobs</h2><div id="jobsTbl"></div></section>
+    <section><h2>Errors</h2><pre id="errors"></pre></section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let KEY = sessionStorage.getItem('corpus_admin_key') || '';
+$('apikey').value = KEY;
+function saveKey(){ KEY = $('apikey').value; sessionStorage.setItem('corpus_admin_key', KEY); refresh(); }
+async function get(url){ const r = await fetch(url,{headers:{'X-API-Key':KEY}}); if(!r.ok){ throw new Error(r.status+' '+url);} return r.json(); }
+async function post(url, body){ const r = await fetch(url,{method:'POST',headers:{'X-API-Key':KEY,'Content-Type':'application/json'},body: body?JSON.stringify(body):undefined}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.detail||r.status); return j; }
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function table(rows, cols){ if(!rows||!rows.length) return '<p class="note">none</p>'; return '<table><tr>'+cols.map(c=>'<th>'+esc(c.label||c.key)+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map(c=>'<td class="'+(c.cls||'')+'">'+(c.render?c.render(r):esc(typeof r[c.key]==='object'?JSON.stringify(r[c.key]):r[c.key]))+'</td>').join('')+'</tr>').join('')+'</table>'; }
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('main > div').forEach(d=>d.classList.add('hidden'));$('tab-'+b.dataset.tab).classList.remove('hidden');refresh();});
+function tile(label,value,cls){ return '<div class="tile"><div class="label">'+esc(label)+'</div><div class="value '+(cls||'')+'">'+esc(value)+'</div></div>'; }
+async function refresh(){
+  try{
+    const h = await (await fetch('/health')).json();
+    $('conn').textContent = KEY ? 'key set' : 'enter admin key';
+    $('tiles').innerHTML = tile('Status',h.status,h.status==='ok'?'ok':'bad')+tile('DB',h.db_connected?'connected':'down',h.db_connected?'ok':'bad')+tile('Redis',h.redis_connected?'connected':'down',h.redis_connected?'ok':'bad')+tile('Judgments',h.judgments??'-')+tile('Statutes',h.statutes??'-')+tile('Sections',h.statute_sections??'-')+tile('Review open',h.review_queue_open??'-',(h.review_queue_open||0)>0?'warn':'')+tile('Login scraping',h.login_scraping_permitted?'permitted (chambers)':'not permitted',h.login_scraping_permitted?'ok':'warn')+tile('Embedding identity',h.embedding_identity_ok?'ok':'MISMATCH',h.embedding_identity_ok?'ok':'bad');
+    $('notconf').textContent = (h.not_configured||[]).join('   ') || 'all firm values configured';
+    $('reader').innerHTML = '<table><tr><th>role</th><th>status</th><th>exists in PostgreSQL</th></tr><tr><td class="mono">'+esc(h.read_only_role?.name)+'</td><td>'+esc(h.read_only_role?.status)+'</td><td>'+esc(h.read_only_role?.exists)+'</td></tr></table><p class="note">SELECT on contract tables only; staging, session state, extraction audit and archive configuration are revoked.</p>';
+  }catch(e){ $('conn').textContent = 'health unavailable'; }
+  if(!KEY) return;
+  const tab = document.querySelector('nav button.active').dataset.tab;
+  try{
+    if(tab==='sources'){ const s = await get('/admin/sources'); window._sources=s;
+      $('sourcesTbl').innerHTML = table(s,[{key:'source_name',label:'source'},{key:'access_method',label:'access'},{key:'state',render:r=>'<span class="badge '+r.state+'">'+esc(r.state)+'</span>'+(r.state_reason?'<div class="note">'+esc(r.state_reason)+'</div>':'')},
+        {key:'extraction',label:'extraction',render:r=>esc(r.extraction.mode)+' → '+esc(r.extraction.effective_engine)+'<div class="note">ScrapeGraph '+esc(r.extraction.scrapegraph)+' · schema v'+esc(r.extraction.schema_version)+(r.extraction.local_model_status?' · local '+esc(r.extraction.local_model_status):'')+'</div>'},
+        {key:'ai',label:'AI today',render:r=>'managed '+r.extraction.managed_calls_today+' ('+r.extraction.managed_credits_today+' cr) · local '+r.extraction.local_calls_today+' · cache '+r.extraction.cache_hits_today+'<div class="note">success '+(r.extraction.ai_success_rate_today??'-')+' · conflicts '+r.extraction.ai_validation_conflicts_today+(r.extraction.last_ai_error?' · last error: '+esc(r.extraction.last_ai_error):'')+'</div>'},
+        {key:'slots',label:'slots',render:r=>r.slots?r.slots.map(x=>'slot '+x.slot+' <span class="badge '+x.state+'">'+esc(x.state)+'</span>').join('<br>'):'-'},
+        {key:'last_success_at',label:'last success'},{key:'total_records_extracted',label:'records',cls:'num'},
+        {key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/sources/'+r.source_name+'/trigger\').then(()=>refresh()).catch(e=>alert(e))">Run</button> '+(r.state==='HALTED'?'<button class="act" onclick="reenable(\''+r.source_name+'\')">Re-enable (review)</button>':(r.state==='PAUSED'?'<button class="act" onclick="post(\'/admin/sources/'+r.source_name+'/state\',{action:\'resume\'}).then(refresh)">Resume</button>':'<button class="act" onclick="post(\'/admin/sources/'+r.source_name+'/state\',{action:\'pause\'}).then(refresh)">Pause</button>'))}]);
+      $('esSource').innerHTML = s.map(x=>'<option>'+esc(x.source_name)+'</option>').join('');
+    }
+    if(tab==='coverage'){ const c = await get('/admin/coverage'); $('veg').textContent=c.volume_end_gap;
+      const trows=[]; for(const [src,t] of Object.entries(c.tiers)) for(const [tier,v] of Object.entries(t)) trows.push({src,tier,...v});
+      $('tiers').innerHTML = '<p class="note">Subscribed reporters: '+esc(JSON.stringify(c.subscribed_reporters))+' · earliest year: '+esc(c.earliest_year)+'</p>'+table(trows,[{key:'src'},{key:'tier'},{key:'pending',cls:'num'},{key:'in_progress',cls:'num'},{key:'done',cls:'num'},{key:'retired',cls:'num'},{key:'stale',cls:'num'},{key:'yield',cls:'num'}]);
+      $('volumes').innerHTML = table(c.volumes,[{key:'reporter'},{key:'year'},{key:'state'},{key:'highest_page_seen',cls:'num'},{key:'next_page_to_probe',cls:'num'},{key:'consecutive_misses',cls:'num'},{key:'judgments_found',cls:'num'},{key:'closed_at'}]);
+      $('maps').innerHTML = table(c.search_maps,[{key:'source'},{key:'version'},{key:'stale'},{key:'consecutive_parse_failures',cls:'num'},{key:'mapped_by'},{key:'fields'},{key:'mapped_at'}]);
+      const f = await get('/admin/coverage/frontier?limit=100'); $('frontier').innerHTML = table(f,[{key:'source'},{key:'tier'},{key:'query_key'},{key:'cursor'},{key:'status'},{key:'yield',cls:'num'},{key:'slot'},{key:'last_error'}]);
+    }
+    if(tab==='review'){ const q = await get('/admin/review'); $('reviewTbl').innerHTML = table(q,[{key:'kind'},{key:'source'},{key:'citation'},{key:'title'},{key:'reason'},{key:'confidence'},{key:'created_at'},{key:'a',label:'',render:r=>'<button class="act" onclick="openCheck(\''+(r.staging_id||r.statutes_staging_id||'')+'\')">Check</button> <button class="act primary" onclick="resolve(\''+r.id+'\',\'promoted\')">Promote</button> <button class="act" onclick="resolve(\''+r.id+'\',\'rejected\')">Reject</button>'}]); }
+    if(tab==='archive'){ const a = await get('/admin/archive'); $('archiveTbl').innerHTML = '<p class="note">Deployment flag MIRROR_LOGIN_SESSION_ROWS = '+a.mirror_login_session_rows_deployment_flag+'</p>'+table(a.targets,[{key:'name'},{key:'type'},{key:'enabled'},{key:'root'},{key:'mirror_login_session_rows',label:'login rows'},{key:'objects_written',cls:'num'},{key:'objects_failed',cls:'num'},{key:'bytes_written',cls:'num'},{key:'last_ok_at'},{key:'last_reconciled_at'},{key:'last_error'}]); }
+    if(tab==='scrapegraph'){ $('sgStatus').textContent = JSON.stringify(await get('/admin/scrapegraph/status'),null,2); const u = await get('/admin/scrapegraph/usage'); $('sgUsage').innerHTML = table(u,[{key:'day'},{key:'engine'},{key:'source'},{key:'calls',cls:'num'},{key:'credits',cls:'num'},{key:'cache_hits',cls:'num'},{key:'successes',cls:'num'},{key:'failures',cls:'num'},{key:'conflicts',cls:'num'}]); }
+    if(tab==='login'){ const s = await get('/admin/sessions/PakistanLawSite'); $('slots').innerHTML = '<p class="note">Source '+esc(s.state)+(s.state_reason?' — '+esc(s.state_reason):'')+' · login scraping '+(s.login_scraping_permitted?'permitted':'NOT permitted (ENVIRONMENT must be chambers)')+' · current slot '+esc(s.current_slot)+'</p>'+table(s.slots,[{key:'slot'},{key:'role'},{key:'state',render:r=>'<span class="badge '+r.state+'">'+esc(r.state)+'</span>'},{key:'reason'},{key:'logged_in_at'},{key:'last_used_at'},{key:'reconnects',cls:'num'},{key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/pause\').then(refresh)">Pause</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/resume\').then(refresh).catch(e=>alert(e))">Resume</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/clear\').then(refresh)">Clear</button>'}]); }
+    if(tab==='ops'){ const n = await get('/admin/notifications'); $('notifs').innerHTML = table(n,[{key:'level'},{key:'code'},{key:'source'},{key:'message'},{key:'created_at'},{key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/notifications/'+r.id+'/ack\').then(refresh)">Ack</button>'}]);
+      const j = await get('/admin/jobs'); $('jobsTbl').innerHTML = table(j,[{key:'source'},{key:'status'},{key:'started_at'},{key:'finished_at'},{key:'pages',cls:'num'},{key:'extracted',cls:'num'},{key:'quarantined',cls:'num'},{key:'error'}]);
+      $('errors').textContent = JSON.stringify(await get('/admin/errors'),null,2); }
+  }catch(e){ $('conn').textContent = 'error: '+e.message; }
+}
+async function saveExtraction(){ try{ const r = await post('/admin/sources/'+$('esSource').value+'/extraction-settings',{extraction_mode:$('esMode').value, ai_extract_enabled:$('esAi').value==='true', extraction_min_confidence: $('esConf').value?parseFloat($('esConf').value):null, scrapegraph_schema_version: $('esSchema').value?parseInt($('esSchema').value):null}); $('esMsg').textContent='saved: '+r.extraction.mode+' → '+r.extraction.effective_engine; refresh(); }catch(e){ $('esMsg').textContent='error: '+e.message; } }
+async function reenable(name){ const by = prompt('Block reviewed by (name):'); if(!by) return; const reason = prompt('Review note:')||''; try{ await post('/admin/sources/'+name+'/state',{action:'re_enable',reviewed_by:by,reason}); refresh(); }catch(e){ alert(e.message); } }
+async function resolve(id,res){ const reviewer = prompt('Reviewer name:'); if(!reviewer) return; try{ await post('/admin/review/'+id+'/resolve',{resolution:res,reviewer}); refresh(); }catch(e){ alert(e.message); } }
+function openCheck(id){ document.querySelector('nav button[data-tab=check]').click(); $('checkId').value=id; loadCheck(); }
+async function loadCheck(){ try{ const c = await get('/admin/check/'+$('checkId').value); $('checkRaw').textContent = c.raw_text||''; $('checkJson').textContent = JSON.stringify({status:c.status,confidence:c.confidence,engine:c.extraction_engine,quarantine_reason:c.quarantine_reason,validation_errors:c.validation_errors,deterministic:c.deterministic,ai:c.ai,reconciled:c.reconciled,provenance:c.provenance},null,2); $('checkAudit').innerHTML = table(c.audit,[{key:'extractor'},{key:'ai_mode'},{key:'status'},{key:'schema_version'},{key:'conflicts'},{key:'validation_errors'},{key:'credits',cls:'num'},{key:'elapsed_ms',cls:'num'},{key:'created_at'}]); }catch(e){ alert(e.message); } }
+async function saveTarget(){ let cfg=null; try{ cfg = $('atCfg').value?JSON.parse($('atCfg').value):null; }catch(e){ alert('config must be JSON'); return; } try{ await post('/admin/archive/targets',{name:$('atName').value,target_type:$('atType').value,root_path:$('atRoot').value,config:cfg,mirror_login_session_rows:$('atLogin').checked}); $('atCfg').value=''; refresh(); }catch(e){ alert(e.message); } }
+/* ---- human login stream ---- */
+let ws=null; const canvas=$('loginCanvas'), ctx=canvas.getContext('2d'); let vw=1280, vh=800;
+async function startLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/start',{slot:parseInt($('loginSlot').value)}); $('loginMsg').textContent='browser open on slot '+r.slot+'; type your credentials in the frame'; connectStream(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
+function connectStream(){ if(ws) ws.close(); const proto = location.protocol==='https:'?'wss':'ws'; ws = new WebSocket(proto+'://'+location.host+'/admin/sessions/PakistanLawSite/login/stream?key='+encodeURIComponent(KEY));
+  ws.onmessage = ev=>{ const m = JSON.parse(ev.data); if(m.type==='frame'){ const img = new Image(); img.onload=()=>{ vw=img.width; vh=img.height; canvas.width=vw; canvas.height=vh; ctx.drawImage(img,0,0); }; img.src='data:image/jpeg;base64,'+m.data; } else if(m.type==='status'){ $('loginMsg').textContent = (m.authenticated?'authenticated — press Complete':'not yet authenticated ('+m.verdict+')')+' @ '+m.url; } else if(m.type==='error'){ $('loginMsg').textContent='error: '+m.message; } };
+  ws.onclose=()=>{ $('loginMsg').textContent += ' · stream closed'; };
+  const send = o=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); };
+  const pos = e=>{ const r = canvas.getBoundingClientRect(); return {x:(e.clientX-r.left)*vw/r.width, y:(e.clientY-r.top)*vh/r.height}; };
+  canvas.onmousemove = e=>{ const p=pos(e); send({kind:'mouse',type:'mouseMoved',...p}); };
+  canvas.onmousedown = e=>{ const p=pos(e); canvas.focus(); send({kind:'mouse',type:'mousePressed',button:'left',clickCount:1,...p}); };
+  canvas.onmouseup = e=>{ const p=pos(e); send({kind:'mouse',type:'mouseReleased',button:'left',clickCount:1,...p}); };
+  canvas.onwheel = e=>{ e.preventDefault(); const p=pos(e); send({kind:'mouse',type:'mouseWheel',deltaX:e.deltaX,deltaY:e.deltaY,...p}); };
+  canvas.onkeydown = e=>{ e.preventDefault(); const text = e.key.length===1?e.key:undefined; send({kind:'key',type:text?'keyDown':'rawKeyDown',key:e.key,code:e.code,text,unmodifiedText:text,windowsVirtualKeyCode:e.keyCode,nativeVirtualKeyCode:e.keyCode,modifiers:(e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0)}); };
+  canvas.onkeyup = e=>{ e.preventDefault(); send({kind:'key',type:'keyUp',key:e.key,code:e.code,windowsVirtualKeyCode:e.keyCode,nativeVirtualKeyCode:e.keyCode}); };
+  setInterval(()=>send({kind:'status'}), 4000);
+}
+async function completeLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/complete'); $('loginMsg').textContent = r.stored?'stored encrypted storage state in slot '+r.slot+' — slot ACTIVE':'not authenticated yet ('+r.verdict+' '+(r.detail||'')+')'; if(r.stored && ws) ws.close(); refresh(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
+async function cancelLogin(){ await post('/admin/sessions/PakistanLawSite/login/cancel'); if(ws) ws.close(); $('loginMsg').textContent='cancelled'; }
+refresh(); setInterval(refresh, 15000);
+</script>
+</body>
+</html>

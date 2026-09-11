@@ -1,0 +1,131 @@
+x-app: &app
+  image: corpus-service:local
+  build: .
+  env_file: .env
+  volumes:
+    - ./live:/app/live
+    - ./raw:/app/raw
+    - ./state:/app/state
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    command: uvicorn scraper.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); sys.exit(0 if d.get('db_connected') else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # Login-session sources: ONE worker, concurrency 1, its own queue (Amendment §9).
+  worker-scraper:
+    <<: *app
+    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@scraper-login@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  # Public sources and maintenance (promotion, treatment, archive mirror, dispatch).
+  worker-public:
+    <<: *app
+    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@scraper-public@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  worker-embed:
+    <<: *app
+    command: celery -A scraper.tasks.celery_app worker -Q embeddings --concurrency=1 -n embed@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@embed@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  celery-beat:
+    <<: *app
+    command: celery -A scraper.tasks.celery_app beat --loglevel=INFO --pidfile=/app/state/celerybeat.pid --schedule=/app/state/celerybeat-schedule
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/state/celerybeat.pid && kill -0 $(cat /app/state/celerybeat.pid)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  celery-flower:
+    <<: *app
+    command: celery -A scraper.tasks.celery_app flower --port=5555 --url_prefix=flower
+    expose:
+      - "5555"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5555/flower/healthcheck', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-legal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal}
+      POSTGRES_DB: ${POSTGRES_DB:-legal_scraper}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-legal} -d ${POSTGRES_DB:-legal_scraper}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # Optional on-prem model for the LOCAL ScrapeGraph engine and local treatment residue.
+  # Start with: docker compose --profile local-ai up -d ; then set SGAI_LOCAL_LLM_BASE_URL=http://ollama:11434
+  # and SGAI_LOCAL_LLM_MODEL=<pulled model>. The main stack starts without this profile.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-ai"]
+    volumes:
+      - ollamadata:/root/.ollama
+    expose:
+      - "11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  ollamadata:
