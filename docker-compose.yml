@@ -31,7 +31,7 @@ services:
     <<: *app
     command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
     healthcheck:
-      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@scraper-login@$(hostname) --timeout 10 | grep -q pong"]
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-login@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
       timeout: 15s
       retries: 5
@@ -42,7 +42,7 @@ services:
     <<: *app
     command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO
     healthcheck:
-      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@scraper-public@$(hostname) --timeout 10 | grep -q pong"]
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-public@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
       timeout: 15s
       retries: 5
@@ -52,7 +52,7 @@ services:
     <<: *app
     command: celery -A scraper.tasks.celery_app worker -Q embeddings --concurrency=1 -n embed@%h --loglevel=INFO
     healthcheck:
-      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d celery@embed@$(hostname) --timeout 10 | grep -q pong"]
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d embed@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
       timeout: 15s
       retries: 5
