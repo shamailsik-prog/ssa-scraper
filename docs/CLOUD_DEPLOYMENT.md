@@ -26,7 +26,22 @@ once).
 
 ## 2. Install
 
-SSH in as root (or a sudo user) and run one command:
+SSH in as root (or a sudo user).
+
+**If the repository is private** (it is, at the time of writing), GitHub needs a token to hand
+out the code. Create one at GitHub → Settings → Developer settings → Fine-grained tokens: repository
+access limited to `ssa-scraper`, permission *Contents: Read-only*, expiry as you prefer. Then:
+
+```bash
+read -rsp "GitHub token: " GH_TOKEN; echo; export GH_TOKEN
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \
+  | sudo -E bash -s -- --domain corpus.yourfirm.pk --reporters PLD,SCMR,CLC,PLC,MLD,YLR,PCrLJ --earliest-year 1990 --region Frankfurt
+```
+
+The token is used only to download and later update the code; it is never written to disk.
+
+**If the repository is public**, the same command without the token lines:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \
@@ -47,7 +62,7 @@ All flags are optional. The script:
 The script never asks for PakistanLawSite credentials. Those are typed by you into the streamed
 browser on the dashboard's **Human login** tab, and the service never sees them.
 
-Re-running the same command later updates the code and restarts the stack; `.env` is kept.
+Re-running the same command later (with the token lines again while private) updates the code and restarts the stack; `.env` is kept.
 
 ## 3. First use
 
