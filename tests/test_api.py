@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import json
 
 from sqlalchemy import select
@@ -164,3 +166,24 @@ def test_archive_target_config_is_encrypted_and_never_echoed(client, admin_heade
     body = client.get("/admin/archive", headers=admin_headers).text
     assert "verysecretvalue" not in body and "AKIAAAAA" not in body
     assert client.post("/admin/archive/targets", json={"name": "x", "target_type": "ftp"}, headers=admin_headers).status_code == 422
+
+
+def test_login_stream_websocket_requires_key_and_open_session(client, admin_headers):
+    """The human-login stream is a WebSocket: a wrong key is refused before accept, a right key with
+    no login session open closes with 4404, and neither path may raise inside the server."""
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect) as bad:
+        with client.websocket_connect("/admin/sessions/PakistanLawSite/login/stream?key=wrong"):
+            pass
+    assert bad.value.code == 4401
+    key = admin_headers["X-API-Key"]
+    with pytest.raises(WebSocketDisconnect) as none_open:
+        with client.websocket_connect(f"/admin/sessions/PakistanLawSite/login/stream?key={key}"):
+            pass
+    assert none_open.value.code == 4404
+    with pytest.raises(WebSocketDisconnect) as via_header:
+        with client.websocket_connect("/admin/sessions/PakistanLawSite/login/stream", headers=admin_headers):
+            pass
+    assert via_header.value.code == 4404
+

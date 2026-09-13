@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     APP_ENV: Literal["development", "staging", "production"] = Field(default="production")
     ENVIRONMENT: str = Field(
         default="cloud",
-        description="Deployment class. Login scraping is lawful for this service only when 'chambers'.",
+        description="Deployment class. 'chambers' = the firm's own trusted host (chambers PC or a firm-controlled cloud server); login-session scraping runs only there.",
     )
     PROJECT_NAME: str = Field(default="SIKANDER AI Corpus Service")
     API_V1_PREFIX: str = Field(default="/api/v1")
