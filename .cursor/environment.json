@@ -1,0 +1,41 @@
+{
+  "name": "SIKANDER AI Corpus Service",
+  "install": "bash .cursor/install.sh",
+  "start": "bash .cursor/start.sh",
+  "terminals": [
+    {
+      "name": "api",
+      "command": "bash .cursor/svc.sh uvicorn scraper.main:app --host 0.0.0.0 --port 8000 --proxy-headers",
+      "description": "FastAPI app + operator dashboard (http://localhost:8000). Applies migrations, roles and seed data at startup."
+    },
+    {
+      "name": "worker-public",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO",
+      "description": "Celery worker for public sources and maintenance (promotion, treatment, archive, dispatch)."
+    },
+    {
+      "name": "worker-scraper",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO",
+      "description": "Celery worker for the login_session queue (PakistanLawSite); concurrency 1."
+    },
+    {
+      "name": "worker-embed",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q embeddings --concurrency=1 -n embed@%h --loglevel=INFO",
+      "description": "Celery worker for the embeddings queue."
+    },
+    {
+      "name": "celery-beat",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app beat --loglevel=INFO --pidfile=/tmp/celerybeat.pid --schedule=/tmp/celerybeat-schedule",
+      "description": "Celery Beat scheduler (dispatch, promotion, embeddings, archive, treatment)."
+    },
+    {
+      "name": "celery-flower",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app flower --port=5555 --url_prefix=flower",
+      "description": "Flower Celery monitoring UI (http://localhost:5555/flower)."
+    }
+  ],
+  "ports": [
+    { "name": "api", "port": 8000 },
+    { "name": "flower", "port": 5555 }
+  ]
+}
