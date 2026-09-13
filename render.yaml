@@ -1,0 +1,138 @@
+# Render Blueprint for the SIKANDER AI corpus service.
+# Maps the docker-compose stack to Render managed resources:
+#   api          -> web service (Dockerfile)         (was: api)
+#   worker       -> background worker (Dockerfile)    (was: worker-public + worker-embed)
+#   beat         -> background worker (Celery Beat)   (was: celery-beat)
+#   sikander-db  -> managed PostgreSQL 16 + pgvector  (was: postgres)
+#   sikander-kv  -> Key Value (Redis-compatible)      (was: redis)
+#
+# Notes:
+#  * This is a cloud (non-chambers) deployment: ENVIRONMENT=cloud and
+#    ALLOW_LOGIN_SCRAPING=false, so the login_session worker (PakistanLawSite) and
+#    Flower are intentionally omitted. Add them later if you run a chambers deployment.
+#  * Render's managed Postgres user is not a superuser and cannot CREATE ROLE, so leave
+#    SIKANDER_READER_PASSWORD / CORPUS_WRITER_PASSWORD blank here. Create the read-only
+#    sikander_reader role manually (or on a self-hosted Postgres) when you wire SIKANDER AI.
+#  * Render's filesystem is ephemeral; raw/live/state under /app are reset on each deploy.
+#    Attach a disk or an object-storage archive target before relying on local preservation.
+#  * DATABASE_URL from Render is `postgresql://...`; the dockerCommand normalizes it to the
+#    `postgresql+asyncpg://` form the app's async engine requires.
+
+envVarGroups:
+  - name: sikander-config
+    envVars:
+      # Required Fernet key (urlsafe base64, 32 bytes). Generate and paste in the Dashboard:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      - key: ENCRYPTION_KEY
+        sync: false
+      # Random secrets Render can generate.
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: SECRET_KEY
+        generateValue: true
+      # Core deployment posture.
+      - key: APP_ENV
+        value: production
+      - key: ENVIRONMENT
+        value: cloud
+      - key: ALLOW_LOGIN_SCRAPING
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TIMEZONE
+        value: Asia/Karachi
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/pw-browsers
+      # Optional API keys — leave blank until needed (blank = NOT CONFIGURED, conservative behaviour).
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SGAI_API_KEY
+        sync: false
+
+databases:
+  - name: sikander-db
+    databaseName: legal_scraper
+    user: legal
+    plan: free               # free Postgres expires after 30 days; upgrade for production
+    region: oregon
+    postgresMajorVersion: "16"
+
+services:
+  # ------------------------------------------------------------------ API + dashboard
+  - type: web
+    name: sikander-api
+    runtime: docker
+    plan: starter            # Playwright/Chromium + Tesseract image needs >512MB; free may OOM
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    dockerCommand: |-
+      sh -lc 'case "$DATABASE_URL" in postgresql+asyncpg://*) ;; postgresql://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgresql://}";; postgres://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgres://}";; esac; exec uvicorn scraper.main:app --host 0.0.0.0 --port "${PORT:-8000}" --proxy-headers'
+    envVars:
+      - fromGroup: sikander-config
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sikander-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sikander-kv
+          property: connectionString
+
+  # ------------------------------------------------------------------ Celery worker
+  # Public sources, maintenance (promotion, treatment, archive, dispatch) and embeddings.
+  - type: worker
+    name: sikander-worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    dockerCommand: |-
+      sh -lc 'case "$DATABASE_URL" in postgresql+asyncpg://*) ;; postgresql://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgresql://}";; postgres://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgres://}";; esac; exec celery -A scraper.tasks.celery_app worker -Q scraper,maintenance,embeddings --concurrency=2 -n worker@%h --loglevel=INFO'
+    envVars:
+      - fromGroup: sikander-config
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sikander-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sikander-kv
+          property: connectionString
+
+  # ------------------------------------------------------------------ Celery Beat
+  - type: worker
+    name: sikander-beat
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    dockerCommand: |-
+      sh -lc 'case "$DATABASE_URL" in postgresql+asyncpg://*) ;; postgresql://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgresql://}";; postgres://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgres://}";; esac; exec celery -A scraper.tasks.celery_app beat --loglevel=INFO --pidfile=/tmp/celerybeat.pid --schedule=/tmp/celerybeat-schedule'
+    envVars:
+      - fromGroup: sikander-config
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sikander-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sikander-kv
+          property: connectionString
+
+  # ------------------------------------------------------------------ Key Value (Redis)
+  - type: keyvalue
+    name: sikander-kv
+    plan: free               # 25MB; upgrade for production broker/result throughput
+    region: oregon
+    maxmemoryPolicy: noeviction   # never drop queued Celery tasks/results
+    ipAllowList: []               # internal-only (no public access)
