@@ -90,6 +90,18 @@ deterministic fallback is then in force for PakistanLawSite.
 
 ## How to start
 
+**Cloud server (recommended)** — one command on a fresh Ubuntu/Debian server, HTTPS included:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \
+  | sudo bash -s -- --domain corpus.example.com --reporters PLD,SCMR,CLC --earliest-year 1990 --region Frankfurt
+```
+
+See `docs/CLOUD_DEPLOYMENT.md` for server sizing and first use. The server the firm controls is
+the trusted host (`ENVIRONMENT=chambers`): login-session scraping runs only there.
+
+**Local machine**
+
 ```bash
 git clone <this repository> && cd <repo>
 ./deploy.sh            # installs Docker if needed, writes .env with fresh keys, builds, starts
@@ -99,14 +111,15 @@ docker compose up -d --build
 curl -s localhost:8000/health
 ```
 
-Then open `http://<host>:8000/dashboard`, enter the `ADMIN_API_KEY`, and:
+Then open the dashboard (`https://<domain>/dashboard` on the cloud, `http://localhost:8000/dashboard`
+locally), enter the `ADMIN_API_KEY`, and:
 
 1. **Overview** — check *Not configured*: set `DEPLOY_REGION`, `PLS_SUBSCRIBED_REPORTERS`,
    `PLS_EARLIEST_YEAR`, `SGAI_API_KEY` (public sources), `SGAI_LOCAL_LLM_BASE_URL/MODEL`
    (PakistanLawSite AI assist), `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` (embeddings) in `.env`
    as the firm decides. Blank values stay conservative.
 2. **Human login** — start a login on slot 1, log in inside the stream, press *Complete*.
-3. **Sources** — *Run* PakistanLawSite (chambers only) and any public source; Beat also dispatches
+3. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source; Beat also dispatches
    on schedule. Extraction mode, AI enable and confidence threshold are per source.
 4. **Coverage** — tiers, reporter volumes, search maps, frontier.
 5. **Review queue / Check viewer** — promote or reject quarantined records with the raw text, the

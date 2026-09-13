@@ -18,7 +18,8 @@ services:
     <<: *app
     command: uvicorn scraper.main:app --host 0.0.0.0 --port 8000 --proxy-headers
     ports:
-      - "8000:8000"
+      # API_BIND=127.0.0.1 in .env (cloud overlay) keeps port 8000 off the public interface.
+      - "${API_BIND:-0.0.0.0}:8000:8000"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); sys.exit(0 if d.get('db_connected') else 1)\""]
       interval: 15s

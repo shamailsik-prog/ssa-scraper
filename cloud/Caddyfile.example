@@ -1,0 +1,23 @@
+# Copy to state/Caddyfile (cloud/install.sh writes it for you).
+#
+# --- With a domain name pointing at the server (recommended): automatic Let's Encrypt certificate.
+# corpus.example.com {
+#     encode gzip
+#     reverse_proxy api:8000
+# }
+#
+# --- Without a domain (IP address only): Caddy issues its own certificate for the server's IP.
+#     The browser warns once; accept it. Traffic is still encrypted. Replace 203.0.113.10 with the
+#     server's public IP (cloud/install.sh fills it in).
+{
+    # Browsers connecting by IP send no server name; serve the IP certificate by default.
+    default_sni 203.0.113.10
+}
+https://203.0.113.10, https://localhost {
+    tls internal
+    encode gzip
+    reverse_proxy api:8000
+}
+http:// {
+    redir https://{host}{uri} permanent
+}
