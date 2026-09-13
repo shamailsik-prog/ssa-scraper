@@ -17,7 +17,7 @@ from scraper.fetchers import HttpFetcher, record_provenance, stage_judgment
 from scraper.models import ArchiveObject, ArchiveTarget, CrawlFrontier, Judgment, ScraperStaging, SourceProvenance
 from scraper.parsers.pdf_writer import RENDERED_COPY_LABEL, is_rendered_copy, render_judgment_pdf_bytes
 from scraper.parsers.text_cleaner import clean_html
-from scraper.security import ExplicitBlock, URLPolicyError, check_url_policy, classify_response, contains_secret, robots_allows, scrub_secrets
+from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy, classify_response, contains_secret, reset_robots_cache, robots_allows, scrub_secrets
 from scraper.storage.adapters import LocalPathAdapter, ObjectExists
 from scraper.storage.archive import ArchiveMirror, judgment_prefix
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
@@ -56,6 +56,48 @@ async def test_discovered_url_gets_local_policy_check(db, source, fixture_server
         assert not robots_allows(fixture_server.url("/private/judgment2.html"))
         with pytest.raises(ExplicitBlock):
             await fetcher.get(fixture_server.url("/private/judgment2.html"))
+
+
+async def test_robots_disallow_retires_frontier_without_halting(db, source, fixture_server):
+    fixture_server.add("/robots.txt", "User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+    blocked = fixture_server.add("/private/judgment2.html", judgment_html("PLD 2024 SC 12"))
+    row = CrawlFrontier(source_name=source.source_name, tier=0, query_key=f"judgment:{blocked}", query_json={"kind": "judgment", "url": blocked}, cursor_json={}, priority=50)
+    db.add(row)
+    await db.flush()
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        pipeline = PublicPipeline(db, source, fetcher=fetcher)
+        result = await pipeline._drain_one(row)
+    assert result == "ok"
+    assert row.status == "retired"
+    assert source.state != "HALTED"
+    assert pipeline.stats["rejected_urls"] == 1 and pipeline.stats["halted"] is False
+
+
+async def test_robots_5xx_defers_frontier_item_and_recovers(db, source, fixture_server):
+    """A 5xx on robots.txt is a temporary disallow (RFC 9309): the URL is deferred, not retired, the source is
+    not halted, no attempt is spent, and the item is processed once robots.txt is reachable again."""
+    fixture_server.add("/robots.txt", "", status=503)
+    target = fixture_server.add("/judgment3.html", judgment_html("PLD 2024 SC 13"))
+    with pytest.raises(RobotsUnavailable):
+        robots_allows(target)
+    with pytest.raises(RobotsUnavailable):  # the unavailable verdict is cached briefly; still not a denial
+        robots_allows(target)
+    row = CrawlFrontier(source_name=source.source_name, tier=0, query_key=f"judgment:{target}", query_json={"kind": "judgment", "url": target}, cursor_json={}, priority=50)
+    db.add(row)
+    await db.flush()
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        pipeline = PublicPipeline(db, source, fetcher=fetcher)
+        assert await pipeline._drain_one(row) == "ok"
+        assert row.status == "pending" and row.attempts == 0
+        assert "robots.txt unavailable" in row.last_error and "503" in row.last_error
+        assert source.state != "HALTED"
+        assert pipeline.stats == {**pipeline.stats, "deferred": 1, "rejected_urls": 0, "errors": 0, "halted": False}
+        # robots.txt comes back: the same item now fetches and stages
+        fixture_server.add("/robots.txt", "User-agent: *\nDisallow: /private/\n", content_type="text/plain")
+        reset_robots_cache()
+        assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "done" and row.attempts == 1
+    assert pipeline.stats["fetched"] == 1 and pipeline.stats["staged"] == 1
 
 
 # --------------------------------------------------------------------------- 26

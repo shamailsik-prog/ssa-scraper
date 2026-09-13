@@ -204,6 +204,35 @@ async def test_second_concurrent_login_session_worker_refused():
     await r.aclose()
 
 
+async def test_lock_refresh_requires_same_owner_token():
+    r = aioredis.from_url(settings.REDIS_URL)
+    key = "corpus:login_session_lock:PakistanLawSite"
+    await r.delete(key)
+    lock = SessionLock("PakistanLawSite", r)
+    await lock.acquire()
+    try:
+        await r.set(key, "other-worker-token", ex=3600)
+        with pytest.raises(SessionLockHeld):
+            await lock.refresh()
+    finally:
+        await r.delete(key)
+        await r.aclose()
+
+
+async def test_charge_page_refreshes_lock_heartbeat(db, login_source):
+    await _activate(db, login_source)
+    calls = {"refresh": 0}
+
+    class DummyLock:
+        async def refresh(self):
+            calls["refresh"] += 1
+
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    pipeline._session_lock = DummyLock()
+    await pipeline._charge_page()
+    assert calls["refresh"] == 1
+
+
 async def test_pipeline_refuses_when_lock_held(db, login_source, monkeypatch):
     await _activate(db, login_source)
     r = aioredis.from_url(settings.REDIS_URL)

@@ -48,6 +48,12 @@ class VerificationRequired(RuntimeError):
     """A verification / CAPTCHA / login page was reached. Caller marks NEEDS_HUMAN_LOGIN."""
 
 
+class RobotsUnavailable(RuntimeError):
+    """robots.txt could not be fetched (HTTP 5xx or network failure). RFC 9309 treats this as a
+    temporary complete disallow: the caller defers the URL and retries later. It is neither an
+    explicit block (no HALT) nor a policy rejection (no retire)."""
+
+
 METADATA_HOSTS = {
     "metadata.google.internal",
     "metadata",
@@ -198,11 +204,14 @@ def check_url_policy(
 # --------------------------------------------------------------------------- robots
 _ROBOTS_CACHE: Dict[str, tuple] = {}
 _ROBOTS_TTL = 6 * 3600
+_ROBOTS_UNAVAILABLE_TTL = 300  # re-check an unreachable robots.txt after five minutes, not six hours
+_ROBOTS_UNAVAILABLE = object()
 
 
 def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> bool:
-    """True when robots.txt for the URL's host permits the path. Failures to fetch robots.txt
-    are treated as 'allowed' only when the file is genuinely absent (404); network errors deny."""
+    """True when robots.txt for the URL's host permits the path. A genuinely absent file (404)
+    allows everything; other 4xx answers deny. A 5xx or a network failure raises
+    RobotsUnavailable so the caller defers the URL instead of retiring it or halting the source."""
     if not settings.SCRAPER_RESPECT_ROBOTS:
         return True
     ua = user_agent or settings.SCRAPER_USER_AGENT
@@ -210,12 +219,17 @@ def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> b
     base = f"{parts.scheme}://{parts.netloc}"
     now = time.time()
     cached = _ROBOTS_CACHE.get(base)
-    if cached and now - cached[1] < _ROBOTS_TTL:
+    if cached and cached[0] is _ROBOTS_UNAVAILABLE and now - cached[1] < _ROBOTS_UNAVAILABLE_TTL:
+        raise RobotsUnavailable(f"robots.txt unavailable for {base} (HTTP {cached[2]}); deferred, retry later")
+    if cached and cached[0] is not _ROBOTS_UNAVAILABLE and now - cached[1] < _ROBOTS_TTL:
         rp = cached[0]
     else:
         rp = urllib.robotparser.RobotFileParser()
         robots_url = base + "/robots.txt"
         text_body, status = (fetcher or _fetch_robots_sync)(robots_url)
+        if status >= 500:
+            _ROBOTS_CACHE[base] = (_ROBOTS_UNAVAILABLE, now, status)
+            raise RobotsUnavailable(f"robots.txt unavailable for {base} (HTTP {status}); deferred, retry later")
         if status == 404 or (status == 200 and not text_body.strip()):
             rp.parse([])  # nothing disallowed
         elif status == 200:

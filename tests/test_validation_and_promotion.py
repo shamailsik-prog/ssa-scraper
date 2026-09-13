@@ -8,14 +8,14 @@ from sqlalchemy import func, select
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
-from scraper.extractors.validation import reconcile_judgment
+from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment
 from scraper.models import Citation, Judgment, QuarantineQueue, ScraperStaging, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks.promotion import promote_judgment_staging
 from scraper.tasks.treatment import classify_deterministic, classify_judgment
-from tests.fixtures import JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
+from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
 COURTS = {"supreme court of pakistan": "Supreme Court of Pakistan", "sc": "Supreme Court of Pakistan", "supreme court": "Supreme Court of Pakistan", "lahore high court": "Lahore High Court", "lhc": "Lahore High Court"}
 
@@ -49,6 +49,18 @@ def test_ai_court_and_date_without_evidence_rejected():
     det2["decision_date"] = None
     out2 = reconcile_judgment(deterministic=det2, ai=ai2, raw_text=clean_html(JUDGMENT_HTML), court_directory=COURTS, min_confidence=0.85)
     assert out2.data["decision_date"] == "2024-03-12"
+    # court names that map through the directory still need raw-text evidence
+    det3 = _det()
+    det3["court"] = None
+    out3 = reconcile_judgment(
+        deterministic=det3,
+        ai={"court": "Lahore High Court", "extractor_confidence": 0.9},
+        raw_text=clean_html(JUDGMENT_HTML),
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out3.data["court"] is None
+    assert any(c["field"] == "court" for c in out3.conflicts)
 
 
 # --------------------------------------------------------------------------- 10
@@ -135,6 +147,14 @@ def test_bench_parsing_size_and_type():
     assert larger.bench_size == 7 and larger.conflict
     single = parse_bench("Before Mr. Justice Ayesha A. Malik\n\nPetitioner versus Respondent")
     assert single.bench_size == 1 and single.bench_type == "single"
+
+
+def test_instrument_type_requires_raw_evidence():
+    det = {"type": None, "full_text": INSTRUMENT_TEXT, "extractor_confidence": 0.7}
+    ai = {"type": "ordinance", "extractor_confidence": 0.95}
+    out = reconcile_instrument(deterministic=det, ai=ai, raw_text=INSTRUMENT_TEXT, min_confidence=0.5)
+    assert out.data.get("type") is None
+    assert any(c["field"] == "type" for c in out.conflicts)
 
 
 # --------------------------------------------------------------------------- treatment (B-7)

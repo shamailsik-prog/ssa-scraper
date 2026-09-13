@@ -163,11 +163,14 @@ class PakistanLawSitePipeline:
         self.redis_client = redis_client
         self.job_id = job_id
         self.sleep = sleep
+        self._session_lock: Optional[SessionLock] = None
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
 
     # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
     async def _charge_page(self) -> None:
         """Count one login-session page against the hourly and daily budgets, then pace."""
+        if self._session_lock is not None:
+            await self._session_lock.refresh()
         now = datetime.now(timezone.utc)
         cfg = dict(self.source.config_json or {})
         pacing = dict(cfg.get("pacing") or {})
@@ -407,6 +410,7 @@ class PakistanLawSitePipeline:
             logger.warning("refusing to start: another login-session worker holds the lock")
             raise
         try:
+            self._session_lock = lock
             slot = await self.manager.current_slot()
             if slot is None:
                 await self.manager.pause_source("no ACTIVE slot: human login required")
@@ -465,6 +469,7 @@ class PakistanLawSitePipeline:
             await self.db.flush()
             return self.stats
         finally:
+            self._session_lock = None
             await self.runner.close()
             await lock.release()
 

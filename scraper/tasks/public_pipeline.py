@@ -30,7 +30,7 @@ from scraper.fetchers import FetchResult, HttpFetcher, pdf_text_with_ocr, record
 from scraper.models import CrawlFrontier, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
-from scraper.security import ExplicitBlock, URLPolicyError, check_url_policy
+from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class PublicPipeline:
         self.managed = managed
         self.local = local
         self.job_id = job_id
-        self.stats = {"discovered": 0, "fetched": 0, "staged": 0, "duplicates": 0, "quarantined": 0, "rejected_urls": 0, "halted": False, "errors": 0}
+        self.stats = {"discovered": 0, "fetched": 0, "staged": 0, "duplicates": 0, "quarantined": 0, "rejected_urls": 0, "deferred": 0, "halted": False, "errors": 0}
 
     def _extractor(self, prov_id=None, staging_id=None) -> HybridExtractor:
         kwargs = {"provenance_id": prov_id, "staging_id": staging_id}
@@ -117,7 +117,13 @@ class PublicPipeline:
         assert self.fetcher is not None
         try:
             res = await self.fetcher.get(url)
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            raise
         except ExplicitBlock as exc:
+            if exc.kind == "robots_disallow":
+                self.stats["rejected_urls"] += 1
+                raise URLPolicyError(str(exc))
             await self.halt(str(exc))
             raise
         self.stats["fetched"] += 1
@@ -257,6 +263,15 @@ class PublicPipeline:
                 fr.status = "done"
                 fr.last_error = None
                 fr.last_run_at = datetime.now(timezone.utc)
+        except URLPolicyError as exc:
+            fr.status = "retired"
+            fr.last_error = str(exc)[:1000]
+        except RobotsUnavailable as exc:
+            # transient (robots.txt 5xx / unreachable): keep the item, do not spend an attempt on it
+            fr.status = "pending"
+            fr.attempts -= 1
+            fr.last_error = str(exc)[:1000]
+            self.stats["deferred"] += 1
         except ExplicitBlock:
             fr.status = "pending"
             await self.db.flush()
