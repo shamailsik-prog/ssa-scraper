@@ -7,10 +7,12 @@ if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com |
 if [ ! -f .env ]; then
   cp .env.example .env
   python3 - <<'PY'
-import re, secrets
-from cryptography.fernet import Fernet
+import base64, os, re, secrets
+# A Fernet key is 32 random bytes, url-safe base64 encoded; generated with the standard library so the
+# host needs nothing beyond python3 (the cryptography package lives inside the image, not on the host).
+fernet_key = base64.urlsafe_b64encode(os.urandom(32)).decode()
 s = open(".env").read()
-s = re.sub(r"^ENCRYPTION_KEY=.*$", "ENCRYPTION_KEY=" + Fernet.generate_key().decode(), s, flags=re.M)
+s = re.sub(r"^ENCRYPTION_KEY=.*$", "ENCRYPTION_KEY=" + fernet_key, s, flags=re.M)
 s = re.sub(r"^ADMIN_API_KEY=.*$", "ADMIN_API_KEY=" + secrets.token_hex(32), s, flags=re.M)
 s = re.sub(r"^SECRET_KEY=.*$", "SECRET_KEY=" + secrets.token_hex(32), s, flags=re.M)
 s = re.sub(r"^SIKANDER_READER_PASSWORD=.*$", "SIKANDER_READER_PASSWORD=" + secrets.token_urlsafe(24), s, flags=re.M)

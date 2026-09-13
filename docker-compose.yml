@@ -26,9 +26,14 @@ services:
       retries: 10
       start_period: 40s
 
+  # Workers and Beat depend on the API being healthy: the API applies migrations, roles and seed data at
+  # startup, so no task can run against a database whose tables do not exist yet (first-boot race).
   # Login-session sources: ONE worker, concurrency 1, its own queue (Amendment §9).
   worker-scraper:
     <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
     command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-login@$(hostname) --timeout 10 | grep -q pong"]
@@ -40,6 +45,9 @@ services:
   # Public sources and maintenance (promotion, treatment, archive mirror, dispatch).
   worker-public:
     <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
     command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-public@$(hostname) --timeout 10 | grep -q pong"]
@@ -50,6 +58,9 @@ services:
 
   worker-embed:
     <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
     command: celery -A scraper.tasks.celery_app worker -Q embeddings --concurrency=1 -n embed@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d embed@$(hostname) --timeout 10 | grep -q pong"]
@@ -60,6 +71,9 @@ services:
 
   celery-beat:
     <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
     command: celery -A scraper.tasks.celery_app beat --loglevel=INFO --pidfile=/app/state/celerybeat.pid --schedule=/app/state/celerybeat-schedule
     healthcheck:
       test: ["CMD-SHELL", "test -f /app/state/celerybeat.pid && kill -0 $(cat /app/state/celerybeat.pid)"]
@@ -70,6 +84,9 @@ services:
 
   celery-flower:
     <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
     command: celery -A scraper.tasks.celery_app flower --port=5555 --url_prefix=flower
     expose:
       - "5555"
