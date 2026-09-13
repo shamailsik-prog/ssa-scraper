@@ -56,6 +56,7 @@ databases:
     plan: free               # free Postgres expires after 30 days; upgrade for production
     region: oregon
     postgresMajorVersion: "16"
+    ipAllowList: []          # internal-only (no public access)
 
 services:
   # ------------------------------------------------------------------ API + dashboard
