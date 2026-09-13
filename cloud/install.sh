@@ -7,6 +7,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \
 #     | sudo bash -s -- --domain corpus.example.com --reporters PLD,SCMR,CLC --earliest-year 1990 --region Frankfurt
 #
+# While the repository is PRIVATE, GitHub needs a token (fine-grained, this repository, Contents: read):
+#
+#   read -rsp "GitHub token: " GH_TOKEN; echo; export GH_TOKEN
+#   curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+#     https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \
+#     | sudo -E bash -s -- --domain corpus.example.com --reporters PLD,SCMR,CLC --earliest-year 1990 --region Frankfurt
+#
+# The token is used only for the clone/update over HTTPS and is never written to disk.
 # Every flag is optional. Without --domain the dashboard is served on https://<server-ip>/ with a
 # self-signed certificate. The script never asks for site credentials: PakistanLawSite login is done
 # by a human inside the streamed browser on the dashboard. The ScrapeGraph key is read from a hidden
@@ -27,7 +35,7 @@ SKIP_DOCKER=0
 SKIP_FIREWALL=0
 PREPARE_ONLY=0
 
-usage() { sed -n '2,16p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,24p' "$0"; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN="$2"; shift 2;;
@@ -71,15 +79,22 @@ docker compose version >/dev/null 2>&1 || die "docker compose plugin missing (in
 if command -v systemctl >/dev/null 2>&1 && [ "$SKIP_DOCKER" = 0 ]; then systemctl enable --now docker >/dev/null 2>&1 || true; fi
 
 # ---------------------------------------------------------------- code
+# GH_TOKEN (optional) authenticates the clone/update of a private repository. It is passed as a
+# per-command header, so it is never stored in .git/config or anywhere on disk.
+GIT=(git)
+if [ -n "${GH_TOKEN:-}" ]; then
+  GIT=(git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer $GH_TOKEN")
+fi
 if [ -d "$DIR/.git" ]; then
   log "Updating code in $DIR ($BRANCH)"
-  git -C "$DIR" fetch -q origin "$BRANCH"
+  "${GIT[@]}" -C "$DIR" fetch -q origin "$BRANCH"
   git -C "$DIR" checkout -q "$BRANCH"
-  git -C "$DIR" pull -q --ff-only origin "$BRANCH"
+  "${GIT[@]}" -C "$DIR" pull -q --ff-only origin "$BRANCH"
 else
   log "Cloning $REPO ($BRANCH) into $DIR"
-  git clone -q -b "$BRANCH" "$REPO" "$DIR"
+  "${GIT[@]}" clone -q -b "$BRANCH" "$REPO" "$DIR" || die "clone failed. If the repository is private, export GH_TOKEN (see the header of this script) and re-run."
 fi
+unset GH_TOKEN
 cd "$DIR"
 mkdir -p live raw state
 
@@ -211,7 +226,7 @@ cat <<EOF
    4. Sources — public courts start on their own schedule; PakistanLawSite starts
                   once a slot is ACTIVE.
 
- Update later:   curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh | sudo bash
+ Update later:   re-run the same install command (add the GH_TOKEN lines again while the repository is private)
  Logs:           cd $DIR && docker compose logs -f --tail=100
 ============================================================================
 EOF

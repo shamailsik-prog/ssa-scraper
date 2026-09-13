@@ -97,7 +97,8 @@ curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cl
   | sudo bash -s -- --domain corpus.example.com --reporters PLD,SCMR,CLC --earliest-year 1990 --region Frankfurt
 ```
 
-See `docs/CLOUD_DEPLOYMENT.md` for server sizing and first use. The server the firm controls is
+While the repository is private, prefix the download with a read-only GitHub token as shown in
+`docs/CLOUD_DEPLOYMENT.md`, which also covers server sizing and first use. The server the firm controls is
 the trusted host (`ENVIRONMENT=chambers`): login-session scraping runs only there.
 
 **Local machine**
