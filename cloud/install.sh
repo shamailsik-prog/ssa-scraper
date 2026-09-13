@@ -152,6 +152,28 @@ else
   log "Keeping existing .env"
 fi
 
+# Reuse a previously configured domain on updates unless --domain overrides it.
+if [ -z "$DOMAIN" ] && [ -f .env ]; then
+  DOMAIN="$(python3 - <<'PY'
+import re
+s = open(".env").read()
+m = re.search(r"^DASHBOARD_DOMAIN=(.*)$", s, flags=re.M)
+print(m.group(1) if m else "")
+PY
+)"
+fi
+if [ -n "$DOMAIN" ] && [ -f .env ]; then
+  DOMAIN="$DOMAIN" python3 - <<'PY'
+import os, re
+s = open(".env").read()
+line = "DASHBOARD_DOMAIN=" + os.environ["DOMAIN"]
+s, n = re.subn(r"^DASHBOARD_DOMAIN=.*$", line, s, flags=re.M)
+if n == 0:
+    s += ("" if s.endswith("\n") else "\n") + line + "\n"
+open(".env", "w").write(s)
+PY
+fi
+
 # ---------------------------------------------------------------- reverse proxy
 log "Writing state/Caddyfile"
 if [ -n "$DOMAIN" ]; then
@@ -198,6 +220,10 @@ fi
 # ---------------------------------------------------------------- start
 log "Building the image and starting the stack (first build downloads Chromium; allow 5–10 minutes)"
 docker compose up -d --build
+if docker compose config --services | grep -qx 'caddy'; then
+  log "Recreating caddy so state/Caddyfile changes are applied"
+  docker compose up -d --no-deps --force-recreate caddy
+fi
 
 log "Waiting for the API to report healthy"
 for i in $(seq 1 60); do
