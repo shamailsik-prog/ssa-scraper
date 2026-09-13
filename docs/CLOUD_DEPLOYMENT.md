@@ -26,6 +26,25 @@ once).
 
 ## 2. Install
 
+### Option A — from GitHub, no terminal (recommended)
+
+The repository carries a workflow that rents the server and installs everything for you.
+
+1. Create a DigitalOcean account and, under **API → Tokens**, generate a personal access token with
+   read and write scopes. Copy it once; DigitalOcean will not show it again.
+2. In this repository: **Settings → Secrets and variables → Actions → New repository secret**,
+   name `DO_TOKEN`, paste the token. Optionally add `SGAI_API_KEY` the same way.
+3. **Actions → deploy-cloud → Run workflow.** Choose the region and server size, optionally a DNS
+   name, your reporters and earliest year. Press *Run workflow*.
+4. After ten to fifteen minutes the run's **Summary** shows the dashboard address and the admin key.
+
+Re-running the workflow updates the code on the same server and keeps its data and `.env`. The
+workflow derives its SSH deploy key from `DO_TOKEN`, so no private key is stored anywhere; if you
+rotate the token, the next run registers a new key and, for an existing server, you add it once
+under the droplet's access settings or recreate the droplet.
+
+### Option B — from a terminal on the server
+
 SSH in as root (or a sudo user).
 
 **If the repository is private** (it is, at the time of writing), GitHub needs a token to hand
