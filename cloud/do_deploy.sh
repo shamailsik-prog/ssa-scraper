@@ -95,7 +95,7 @@ ssh "${SSH_OPTS[@]}" "root@$IP" true || die "SSH to root@$IP failed. If this dro
 # A new droplet runs cloud-init and unattended-upgrades for a few minutes after boot; they hold the apt
 # lock. Wait for them here so the git install below and the installer do not fail on the lock.
 log "Waiting for the server's first-boot setup to finish"
-ssh "${SSH_OPTS[@]}" "root@$IP" 'command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1; for i in $(seq 1 120); do if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 && ! pgrep -f unattended-upgrade >/dev/null 2>&1; then exit 0; fi; sleep 5; done; exit 0'
+ssh "${SSH_OPTS[@]}" "root@$IP" 'command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1; for i in $(seq 1 120); do if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 && ! pgrep -f '"'"'[u]nattended-upgrade([[:space:]]|$)'"'"' >/dev/null 2>&1; then exit 0; fi; sleep 5; done; exit 0'
 
 # ---------------------------------------------------------------- upload the code and install
 log "Uploading the repository"
@@ -122,7 +122,7 @@ fi
 # ---------------------------------------------------------------- result
 ADMIN_KEY="$(ssh "${SSH_OPTS[@]}" "root@$IP" "grep '^ADMIN_API_KEY=' /opt/ssa-scraper/.env | cut -d= -f2-")"
 if [ -n "$DOMAIN" ]; then URL="https://$DOMAIN/dashboard"; NOTE=""; else URL="https://$IP/dashboard"; NOTE=" (self-signed certificate: accept the browser warning once)"; fi
-HEALTH="$(ssh "${SSH_OPTS[@]}" "root@$IP" "curl -sk https://127.0.0.1/health" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status"), "· db", d.get("db_connected"), "· redis", d.get("redis_connected"), "· login scraping", d.get("login_scraping_permitted"))' 2>/dev/null || echo unknown)"
+HEALTH="$(ssh "${SSH_OPTS[@]}" "root@$IP" "curl -fsS http://127.0.0.1:8000/health" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status"), "· db", d.get("db_connected"), "· redis", d.get("redis_connected"), "· login scraping", d.get("login_scraping_permitted"))' 2>/dev/null || echo unknown)"
 
 log "Done. Dashboard: $URL$NOTE"
 if [ -n "${SUMMARY_FILE:-}" ]; then
