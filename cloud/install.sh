@@ -60,9 +60,26 @@ die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 case "$BRANCH$DIR$DOMAIN$REPORTERS$EARLIEST$REGION" in *[\'\"\;\`]*) die "quotes, semicolons and backticks are not allowed in options";; esac
 
 # ---------------------------------------------------------------- packages
+# A freshly created server runs cloud-init and unattended-upgrades during its first minutes; both hold
+# the apt lock. Wait for them rather than fail with "Could not get lock".
+wait_for_apt() {
+  if command -v cloud-init >/dev/null 2>&1; then cloud-init status --wait >/dev/null 2>&1 || true; fi
+  local i
+  for i in $(seq 1 120); do
+    if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 \
+       && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 \
+       && ! pgrep -f unattended-upgrade >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$i" = 1 ] && printf 'waiting for the system package manager to finish its first-boot work...\n'
+    sleep 5
+  done
+  return 0
+}
 log "Installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 if command -v apt-get >/dev/null 2>&1; then
+  wait_for_apt
   apt-get update -qq
   apt-get install -y -qq curl git ca-certificates python3 ufw >/dev/null
 else
