@@ -1,0 +1,37 @@
+name: admin-link
+
+# Prints a one-click login link for the corpus dashboard (https://<server>/dashboard#key=<admin key>).
+# Requires the DO_TOKEN repository secret and a server created by deploy-cloud.
+# The link appears in the job log and summary: use it once, then delete the run's logs.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq openssh-client >/dev/null
+          python3 -m pip install --quiet cryptography
+
+      - name: Read the admin key from the server and print the login link
+        env:
+          DO_TOKEN: ${{ secrets.DO_TOKEN }}
+          SUMMARY_FILE: ${{ github.step_summary }}
+        run: |
+          test -n "$DO_TOKEN" || { echo "::error::Repository secret DO_TOKEN is not set (Settings → Secrets and variables → Actions)"; exit 1; }
+          bash cloud/do_admin_link.sh
