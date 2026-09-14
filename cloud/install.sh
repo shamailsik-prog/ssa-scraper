@@ -68,7 +68,7 @@ wait_for_apt() {
   for i in $(seq 1 120); do
     if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 \
        && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 \
-       && ! pgrep -f unattended-upgrade >/dev/null 2>&1; then
+       && ! pgrep -f '[u]nattended-upgrade([[:space:]]|$)' >/dev/null 2>&1; then
       return 0
     fi
     [ "$i" = 1 ] && printf 'waiting for the system package manager to finish its first-boot work...\n'

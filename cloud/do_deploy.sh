@@ -95,7 +95,7 @@ ssh "${SSH_OPTS[@]}" "root@$IP" true || die "SSH to root@$IP failed. If this dro
 # A new droplet runs cloud-init and unattended-upgrades for a few minutes after boot; they hold the apt
 # lock. Wait for them here so the git install below and the installer do not fail on the lock.
 log "Waiting for the server's first-boot setup to finish"
-ssh "${SSH_OPTS[@]}" "root@$IP" 'command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1; for i in $(seq 1 120); do if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 && ! pgrep -f unattended-upgrade >/dev/null 2>&1; then exit 0; fi; sleep 5; done; exit 0'
+ssh "${SSH_OPTS[@]}" "root@$IP" 'command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1; for i in $(seq 1 120); do if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 && ! pgrep -f '"'"'[u]nattended-upgrade([[:space:]]|$)'"'"' >/dev/null 2>&1; then exit 0; fi; sleep 5; done; exit 0'
 
 # ---------------------------------------------------------------- upload the code and install
 log "Uploading the repository"
