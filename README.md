@@ -90,7 +90,11 @@ deterministic fallback is then in force for PakistanLawSite.
 
 ## How to start
 
-**Cloud server (recommended)** — one command on a fresh Ubuntu/Debian server, HTTPS included:
+**Cloud server, no terminal** — add a DigitalOcean API token as the repository secret `DO_TOKEN`,
+then run the **deploy-cloud** workflow from the Actions tab; the summary shows the dashboard address
+and admin key. Details in `docs/CLOUD_DEPLOYMENT.md`.
+
+**Cloud server, from a terminal** — one command on a fresh Ubuntu/Debian server, HTTPS included:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shamailsik-prog/ssa-scraper/main/cloud/install.sh \

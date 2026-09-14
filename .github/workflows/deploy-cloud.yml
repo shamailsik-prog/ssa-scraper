@@ -1,0 +1,72 @@
+name: deploy-cloud
+
+# Creates (or updates) the corpus server on DigitalOcean and installs the service on it.
+# Required repository secret: DO_TOKEN (DigitalOcean API token, read/write).
+# Optional repository secret: SGAI_API_KEY (ScrapeGraph key; written to the server's .env, never printed).
+# Run it from the Actions tab ("Run workflow"). The dashboard address and admin key appear in the job summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_region:
+        description: "DigitalOcean region (fra1 Frankfurt, lon1 London, ams3 Amsterdam, sgp1 Singapore, blr1 Bangalore)"
+        default: fra1
+        required: true
+      do_size:
+        description: "Droplet size (s-2vcpu-4gb ≈ $24/month, s-4vcpu-8gb ≈ $48/month)"
+        default: s-2vcpu-4gb
+        required: true
+      domain:
+        description: "DNS name pointing at the server (optional; leave blank to use the IP with a self-signed certificate)"
+        default: ""
+        required: false
+      reporters:
+        description: "PakistanLawSite reporters you subscribe to"
+        default: "PLD,SCMR,CLC,PLC,MLD,YLR,PCrLJ"
+        required: false
+      earliest_year:
+        description: "Earliest year your subscription reaches"
+        default: "1990"
+        required: false
+      deploy_region_label:
+        description: "Recorded as DEPLOY_REGION (data-residency note)"
+        default: "Frankfurt"
+        required: false
+
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq openssh-client >/dev/null
+          python3 -m pip install --quiet cryptography
+
+      - name: Create or update the server and install the service
+        env:
+          DO_TOKEN: ${{ secrets.DO_TOKEN }}
+          SGAI_API_KEY: ${{ secrets.SGAI_API_KEY }}
+          DO_REGION: ${{ inputs.do_region }}
+          DO_SIZE: ${{ inputs.do_size }}
+          DOMAIN: ${{ inputs.domain }}
+          REPORTERS: ${{ inputs.reporters }}
+          EARLIEST_YEAR: ${{ inputs.earliest_year }}
+          DEPLOY_REGION_LABEL: ${{ inputs.deploy_region_label }}
+          SUMMARY_FILE: ${{ github.step_summary }}
+        run: |
+          test -n "$DO_TOKEN" || { echo "::error::Repository secret DO_TOKEN is not set (Settings → Secrets and variables → Actions)"; exit 1; }
+          bash cloud/do_deploy.sh
