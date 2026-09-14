@@ -92,6 +92,11 @@ for i in $(seq 1 40); do
 done
 ssh "${SSH_OPTS[@]}" "root@$IP" true || die "SSH to root@$IP failed. If this droplet predates the current DO_TOKEN, the derived deploy key differs: add the key '$KEY_NAME' to the server or recreate the droplet."
 
+# A new droplet runs cloud-init and unattended-upgrades for a few minutes after boot; they hold the apt
+# lock. Wait for them here so the git install below and the installer do not fail on the lock.
+log "Waiting for the server's first-boot setup to finish"
+ssh "${SSH_OPTS[@]}" "root@$IP" 'command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1; for i in $(seq 1 120); do if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1 && ! pgrep -f unattended-upgrade >/dev/null 2>&1; then exit 0; fi; sleep 5; done; exit 0'
+
 # ---------------------------------------------------------------- upload the code and install
 log "Uploading the repository"
 BRANCH="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
