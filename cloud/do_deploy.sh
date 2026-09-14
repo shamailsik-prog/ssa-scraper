@@ -122,7 +122,7 @@ fi
 # ---------------------------------------------------------------- result
 ADMIN_KEY="$(ssh "${SSH_OPTS[@]}" "root@$IP" "grep '^ADMIN_API_KEY=' /opt/ssa-scraper/.env | cut -d= -f2-")"
 if [ -n "$DOMAIN" ]; then URL="https://$DOMAIN/dashboard"; NOTE=""; else URL="https://$IP/dashboard"; NOTE=" (self-signed certificate: accept the browser warning once)"; fi
-HEALTH="$(ssh "${SSH_OPTS[@]}" "root@$IP" "curl -sk https://127.0.0.1/health" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status"), "· db", d.get("db_connected"), "· redis", d.get("redis_connected"), "· login scraping", d.get("login_scraping_permitted"))' 2>/dev/null || echo unknown)"
+HEALTH="$(ssh "${SSH_OPTS[@]}" "root@$IP" "curl -fsS http://127.0.0.1:8000/health" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status"), "· db", d.get("db_connected"), "· redis", d.get("redis_connected"), "· login scraping", d.get("login_scraping_permitted"))' 2>/dev/null || echo unknown)"
 
 log "Done. Dashboard: $URL$NOTE"
 if [ -n "${SUMMARY_FILE:-}" ]; then
