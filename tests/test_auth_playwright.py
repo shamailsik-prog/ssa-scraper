@@ -111,7 +111,7 @@ async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_ser
             return await sess.input_event({"kind": "mouse", "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
 
         info = await tap(150, 115)
-        assert info["editable"] and info["label"] == "User Name" and "value" not in info
+        assert info["editable"] and info["label"] == "u" and "value" not in info
         await sess.input_event({"kind": "text", "text": "advox"})
         await sess.input_event({"kind": "press", "key": "Backspace"})
         await sess.input_event({"kind": "text", "text": "legal"})

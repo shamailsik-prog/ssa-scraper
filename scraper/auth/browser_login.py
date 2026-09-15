@@ -159,7 +159,8 @@ class LoginSession:
             return await self._page.evaluate(
                 """() => { const a = document.activeElement; if (!a || a === document.body) return {tag: null};
                   const t = (a.getAttribute('type') || (a.tagName === 'TEXTAREA' ? 'textarea' : '')).toLowerCase();
-                  const label = a.getAttribute('placeholder') || a.getAttribute('aria-label') || a.getAttribute('name') || a.id || '';
+                  const lab = (a.labels && a.labels[0]) ? a.labels[0].textContent.trim() : '';
+                  const label = a.getAttribute('aria-label') || lab || a.getAttribute('name') || a.id || a.getAttribute('title') || '';
                   const editable = ['INPUT','TEXTAREA'].includes(a.tagName) && !['checkbox','radio','submit','button','hidden','file'].includes(t) || a.isContentEditable;
                   return {tag: a.tagName.toLowerCase(), input_type: t, label: String(label).slice(0, 60), editable: !!editable}; }"""
             )
