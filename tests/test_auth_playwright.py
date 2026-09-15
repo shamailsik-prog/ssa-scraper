@@ -103,6 +103,8 @@ async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_ser
     try:
         assert sess.viewport == {"width": 480, "height": 800}
         assert await reg.start("PakistanLawSite", 1, fixture_server.url("/login")) is sess
+        assert await reg.start("PakistanLawSite", 1, fixture_server.url("/login"), viewport={"width": 1280, "height": 800}) is sess
+        assert sess.viewport == {"width": 1280, "height": 800} and sess._page.viewport_size == {"width": 1280, "height": 800}
         assert await sess.next_frame(timeout=15) is not None
 
         async def tap(x, y):
@@ -115,7 +117,7 @@ async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_ser
         await sess.input_event({"kind": "text", "text": "advox"})
         await sess.input_event({"kind": "press", "key": "Backspace"})
         await sess.input_event({"kind": "text", "text": "legal"})
-        info = await tap(150, 175)
+        info = await sess.input_event({"kind": "press", "key": "Tab"})  # Tab moves focus: the dashboard must learn it is now a password field
         assert info["input_type"] == "password"
         await sess.input_event({"kind": "text", "text": "secret1"})
         await sess.input_event({"kind": "press", "key": "Enter"})

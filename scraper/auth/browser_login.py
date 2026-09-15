@@ -142,6 +142,8 @@ class LoginSession:
                 down["unmodifiedText"] = text
             await self._cdp.send("Input.dispatchKeyEvent", down)
             await self._cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": name, "code": name, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+            if name in ("Tab", "Enter"):  # focus may have moved (Tab) or the page may have submitted (Enter)
+                info = await self.focused_element()
         elif kind == "navigate":
             from urllib.parse import urlsplit
 
@@ -176,6 +178,18 @@ class LoginSession:
         ok = verdict.kind == "ok" and (has_logout or not has_password)
         return {"authenticated": ok, "verdict": verdict.kind, "detail": verdict.detail, "url": self._page.url}
 
+    async def resize(self, viewport: Dict[str, int]) -> None:
+        """Change the streamed browser's size (operator switched between phone and desktop layout)."""
+        if viewport == self.viewport:
+            return
+        self.viewport = dict(viewport)
+        await self._page.set_viewport_size(self.viewport)
+        try:
+            await self._cdp.send("Page.stopScreencast")
+        except Exception:
+            pass
+        await self._cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 60, "maxWidth": self.viewport["width"], "maxHeight": self.viewport["height"], "everyNthFrame": 2})
+
     async def export_storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state()
 
@@ -206,19 +220,22 @@ class LoginSessionRegistry:
         """Open a browser for the human login. If one is already open for this source and slot (the
         operator reloaded the dashboard or lost the connection), it is reused rather than refused; a
         different slot replaces the open one."""
+        wanted = None
+        if viewport:
+            wanted = {"width": max(320, min(1920, int(viewport.get("width", 1280)))), "height": max(480, min(1600, int(viewport.get("height", 800))))}
         async with self._lock:
             existing = self._sessions.get(source_name)
             if existing is not None and existing.status != "closed":
                 if existing.slot_number == slot_number:
                     existing.status = "awaiting_human"
+                    if wanted:
+                        await existing.resize(wanted)
                     return existing
                 await existing.close()
                 self._sessions.pop(source_name, None)
             sess = LoginSession(source_name=source_name, slot_number=slot_number, login_url=login_url, started_by=started_by)
-            if viewport:
-                w = max(320, min(1920, int(viewport.get("width", 1280))))
-                h = max(480, min(1600, int(viewport.get("height", 800))))
-                sess.viewport = {"width": w, "height": h}
+            if wanted:
+                sess.viewport = wanted
             await sess.start()
             self._sessions[source_name] = sess
             return sess
