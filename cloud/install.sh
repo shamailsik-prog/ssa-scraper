@@ -104,9 +104,12 @@ if [ -n "${GH_TOKEN:-}" ]; then
 fi
 if [ -d "$DIR/.git" ]; then
   log "Updating code in $DIR ($BRANCH)"
+  # The service checkout is not a working copy anyone edits: make it exactly the fetched commit,
+  # even when the branch history was rewritten (squash merges, rebased deploy branches).
+  # .env, state/, raw/ and live/ are untracked and untouched.
+  git -C "$DIR" remote set-url origin "$REPO"
   "${GIT[@]}" -C "$DIR" fetch -q origin "$BRANCH"
-  git -C "$DIR" checkout -q "$BRANCH"
-  "${GIT[@]}" -C "$DIR" pull -q --ff-only origin "$BRANCH"
+  git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD
 else
   log "Cloning $REPO ($BRANCH) into $DIR"
   "${GIT[@]}" clone -q -b "$BRANCH" "$REPO" "$DIR" || die "clone failed. If the repository is private, export GH_TOKEN (see the header of this script) and re-run."

@@ -85,6 +85,52 @@ async def test_human_login_browser_stream_and_completion(db, login_source, fixtu
         await reg.cancel("PakistanLawSite")
 
 
+async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_server):
+    """Phones have no hardware keyboard: the dashboard sends text and named keys, and learns which
+    field has focus after each tap (type and label only, never a value). Reopening the login for the
+    same slot reuses the open browser; a different slot replaces it."""
+    from scraper.auth.browser_login import LoginSessionError, LoginSessionRegistry
+
+    fixture_server.add(
+        "/login",
+        "<html><body style='margin:0'><form onsubmit=\"document.getElementById('out').textContent='submitted:'+u.value+'/'+p.value;return false;\">"
+        "<input id=u name=u placeholder='User Name' style='position:absolute;left:100px;top:100px;width:200px;height:30px'>"
+        "<input id=p name=p type=password placeholder='Password' style='position:absolute;left:100px;top:160px;width:200px;height:30px'>"
+        "<button type=submit style='position:absolute;left:100px;top:220px'>Sign in</button></form><div id=out></div></body></html>",
+    )
+    reg = LoginSessionRegistry()
+    sess = await reg.start("PakistanLawSite", 1, fixture_server.url("/login"), viewport={"width": 480, "height": 800})
+    try:
+        assert sess.viewport == {"width": 480, "height": 800}
+        assert await reg.start("PakistanLawSite", 1, fixture_server.url("/login")) is sess
+        assert await reg.start("PakistanLawSite", 1, fixture_server.url("/login"), viewport={"width": 1280, "height": 800}) is sess
+        assert sess.viewport == {"width": 1280, "height": 800} and sess._page.viewport_size == {"width": 1280, "height": 800}
+        assert await sess.next_frame(timeout=15) is not None
+
+        async def tap(x, y):
+            await sess.input_event({"kind": "mouse", "type": "mouseMoved", "x": x, "y": y})
+            await sess.input_event({"kind": "mouse", "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+            return await sess.input_event({"kind": "mouse", "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+
+        info = await tap(150, 115)
+        assert info["editable"] and info["label"] == "u" and "value" not in info
+        await sess.input_event({"kind": "text", "text": "advox"})
+        await sess.input_event({"kind": "press", "key": "Backspace"})
+        await sess.input_event({"kind": "text", "text": "legal"})
+        info = await sess.input_event({"kind": "press", "key": "Tab"})  # Tab moves focus: the dashboard must learn it is now a password field
+        assert info["input_type"] == "password"
+        await sess.input_event({"kind": "text", "text": "secret1"})
+        await sess.input_event({"kind": "press", "key": "Enter"})
+        await sess._page.wait_for_timeout(300)
+        assert await sess._page.evaluate("() => [u.value, p.value, document.getElementById('out').textContent]") == ["advolegal", "secret1", "submitted:advolegal/secret1"]
+        with pytest.raises(LoginSessionError):
+            await sess.input_event({"kind": "press", "key": "F13"})
+        other = await reg.start("PakistanLawSite", 2, fixture_server.url("/login"))
+        assert other is not sess and sess.status == "closed"
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
 # --------------------------------------------------------------------------- 17
 async def test_verification_page_marks_needs_human_login_without_solving(db, login_source):
     mgr = await _activate(db, login_source)

@@ -34,6 +34,10 @@ router = APIRouter(prefix="/admin/sessions", tags=["sessions"])
 class StartLogin(BaseModel):
     slot: int = Field(default=1, ge=1, le=2)
     started_by: str = "operator"
+    # Size of the streamed browser. A phone-sized viewport makes the site render its mobile layout,
+    # so the stream fits a phone screen and fields are large enough to tap.
+    viewport_width: Optional[int] = Field(default=None, ge=320, le=1920)
+    viewport_height: Optional[int] = Field(default=None, ge=480, le=1600)
 
 
 async def _source(db: AsyncSession, name: str) -> ScraperSource:
@@ -65,11 +69,12 @@ async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(
         raise HTTPException(409, "ENCRYPTION_KEY is NOT CONFIGURED; storage state cannot be encrypted")
     if s.state == "HALTED":
         raise HTTPException(409, f"source is HALTED: {s.state_reason}; re-enable after admin review first")
+    viewport = {"width": body.viewport_width, "height": body.viewport_height} if body.viewport_width and body.viewport_height else None
     try:
-        sess = await registry.start(source, body.slot, settings.PLS_LOGIN_URL if source == "PakistanLawSite" else s.source_url, started_by=body.started_by)
+        sess = await registry.start(source, body.slot, settings.PLS_LOGIN_URL if source == "PakistanLawSite" else s.source_url, started_by=body.started_by, viewport=viewport)
     except LoginSessionError as exc:
         raise HTTPException(409, str(exc))
-    return {"status": sess.status, "slot": sess.slot_number, "stream": f"/admin/sessions/{source}/login/stream", "note": "type credentials in the streamed browser; the service never sees them"}
+    return {"status": sess.status, "slot": sess.slot_number, "viewport": sess.viewport, "stream": f"/admin/sessions/{source}/login/stream", "note": "type credentials in the streamed browser; the service never sees them"}
 
 
 @router.websocket("/{source}/login/stream")
@@ -81,6 +86,7 @@ async def login_stream(websocket: WebSocket, source: str):
         await websocket.close(code=4404)
         return
     await websocket.accept()
+    await sess.snapshot()  # a static page emits no screencast frame; show the operator something at once
 
     async def pump_frames():
         while sess.status not in ("closed",):
@@ -98,9 +104,11 @@ async def login_stream(websocket: WebSocket, source: str):
                 event = json.loads(msg)
             except json.JSONDecodeError:
                 continue
-            if event.get("kind") in ("mouse", "key", "navigate"):
+            if event.get("kind") in ("mouse", "key", "text", "press", "navigate"):
                 try:
-                    await sess.input_event(event)
+                    info = await sess.input_event(event)
+                    if info is not None:
+                        await websocket.send_text(json.dumps({"type": "focus", **info}))
                 except LoginSessionError as exc:
                     await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
                 except Exception as exc:
