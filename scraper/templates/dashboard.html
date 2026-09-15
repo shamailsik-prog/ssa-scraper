@@ -37,7 +37,12 @@
   .badge.ACTIVE{color:var(--ok)} .badge.PAUSED,.badge.NEEDS_HUMAN_LOGIN{color:var(--warn)} .badge.HALTED,.badge.DISABLED{color:var(--bad)}
   .hidden { display:none; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:900px){ .grid2{grid-template-columns:1fr;} }
-  #loginCanvas { border:1px solid var(--line); width:100%; max-width:1280px; background:#000; cursor:crosshair; }
+  #loginCanvas { border:1px solid var(--line); width:100%; max-width:1280px; background:#000; cursor:crosshair; touch-action:none; display:block; }
+  #loginCanvas.phone { max-width:480px; }
+  .kbdrow { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:8px 0; }
+  .kbdrow input { flex:1 1 220px; min-width:0; font-size:16px; }   /* 16px stops iOS zooming into the box */
+  .kbdrow button.act { font-size:14px; padding:6px 12px; }
+  #loginFocus { font-family:var(--mono); }
   .note { color:var(--muted); font-size:12px; }
   .nc { color:var(--warn); font-family:var(--mono); font-size:12px; }
 </style>
@@ -96,9 +101,20 @@
   <div id="tab-login" class="hidden">
     <section><h2>Human login — PakistanLawSite</h2>
       <p class="note">A server-side browser opens the login page and is streamed here. You type the username, password and any verification yourself; the service never sees or stores them. When the site shows you as logged in, press <b>Complete</b>: cookies and local storage are encrypted and saved to the chosen slot, and scraping continues headless inside that session. CAPTCHA or verification pages are never solved by code.</p>
-      <div>Slot <select id="loginSlot"><option value="1">1 (primary)</option><option value="2">2 (alternate)</option></select> <button class="act primary" onclick="startLogin()">Start login</button> <button class="act" onclick="completeLogin()">Complete</button> <button class="act" onclick="cancelLogin()">Cancel</button> <span id="loginMsg" class="note"></span></div>
+      <p class="note">PakistanLawSite allows one login per account at a time. If it shows <b>Logout From All Devices</b>, you are still logged in somewhere else (another browser or phone): enter the username and password again in that box and it logs you in here. Tick <b>I Agree with the Terms and Conditions</b> before <b>Sign in</b>, or the site refuses the form.</p>
+      <div>Slot <select id="loginSlot"><option value="1">1 (primary)</option><option value="2">2 (alternate)</option></select>
+        Layout <select id="loginLayout"><option value="auto">auto</option><option value="phone">phone (480×800)</option><option value="desktop">desktop (1280×800)</option></select>
+        <button class="act primary" onclick="startLogin()">Start login</button> <button class="act" onclick="completeLogin()">Complete</button> <button class="act" onclick="cancelLogin()">Cancel</button> <span id="loginMsg" class="note"></span></div>
       <div id="slots" style="margin:10px 0"></div>
       <canvas id="loginCanvas" width="1280" height="800" tabindex="0"></canvas>
+      <div class="kbdrow">
+        <input id="loginKbd" type="text" placeholder="Tap a field in the page above, then type here" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="text">
+        <button class="act" onclick="pressKey('Enter')">Enter</button>
+        <button class="act" onclick="pressKey('Backspace')">⌫</button>
+        <button class="act" onclick="pressKey('Tab')">Tab</button>
+        <span class="note">typing into: <span id="loginFocus">nothing yet</span></span>
+      </div>
+      <p class="note">Everything you type in the box goes straight into the field you tapped on the page; it never touches this service. On a computer you can also click the page and type directly.</p>
     </section>
   </div>
   <div id="tab-ops" class="hidden">
@@ -169,18 +185,40 @@ async function loadCheck(){ try{ const c = await get('/admin/check/'+$('checkId'
 async function saveTarget(){ let cfg=null; try{ cfg = $('atCfg').value?JSON.parse($('atCfg').value):null; }catch(e){ alert('config must be JSON'); return; } try{ await post('/admin/archive/targets',{name:$('atName').value,target_type:$('atType').value,root_path:$('atRoot').value,config:cfg,mirror_login_session_rows:$('atLogin').checked}); $('atCfg').value=''; refresh(); }catch(e){ alert(e.message); } }
 /* ---- human login stream ---- */
 let ws=null; const canvas=$('loginCanvas'), ctx=canvas.getContext('2d'); let vw=1280, vh=800;
-async function startLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/start',{slot:parseInt($('loginSlot').value)}); $('loginMsg').textContent='browser open on slot '+r.slot+'; type your credentials in the frame'; connectStream(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
+const kbd=$('loginKbd'); let kbdSent=''; let statusTimer=null;
+const isPhone = ()=> window.innerWidth < 700 || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+function chosenViewport(){ const l=$('loginLayout').value; const phone = l==='phone' || (l==='auto' && isPhone()); canvas.classList.toggle('phone', phone); return phone?{viewport_width:480,viewport_height:800}:{viewport_width:1280,viewport_height:800}; }
+async function startLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/start',{slot:parseInt($('loginSlot').value),...chosenViewport()}); $('loginMsg').textContent='browser open on slot '+r.slot+'; tap a field in the page, then type'; connectStream(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
+const send = o=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); };
+function pressKey(name){ send({kind:'press',key:name}); if(name==='Enter'||name==='Tab'){ kbd.value=''; kbdSent=''; } else if(name==='Backspace' && kbdSent){ kbdSent=kbdSent.slice(0,-1); kbd.value=kbdSent; } kbd.focus(); }
 function connectStream(){ if(ws) ws.close(); const proto = location.protocol==='https:'?'wss':'ws'; ws = new WebSocket(proto+'://'+location.host+'/admin/sessions/PakistanLawSite/login/stream?key='+encodeURIComponent(KEY));
-  ws.onmessage = ev=>{ const m = JSON.parse(ev.data); if(m.type==='frame'){ const img = new Image(); img.onload=()=>{ vw=img.width; vh=img.height; canvas.width=vw; canvas.height=vh; ctx.drawImage(img,0,0); }; img.src='data:image/jpeg;base64,'+m.data; } else if(m.type==='status'){ $('loginMsg').textContent = (m.authenticated?'authenticated — press Complete':'not yet authenticated ('+m.verdict+')')+' @ '+m.url; } else if(m.type==='error'){ $('loginMsg').textContent='error: '+m.message; } };
-  ws.onclose=()=>{ $('loginMsg').textContent += ' · stream closed'; };
-  const send = o=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); };
+  ws.onmessage = ev=>{ const m = JSON.parse(ev.data);
+    if(m.type==='frame'){ const img = new Image(); img.onload=()=>{ vw=img.width; vh=img.height; canvas.width=vw; canvas.height=vh; ctx.drawImage(img,0,0); }; img.src='data:image/jpeg;base64,'+m.data; }
+    else if(m.type==='status'){ $('loginMsg').textContent = (m.authenticated?'logged in — press Complete':'not logged in yet ('+m.verdict+')')+' @ '+m.url; }
+    else if(m.type==='focus'){ const editable = !!m.editable; $('loginFocus').textContent = m.tag ? (editable ? (m.input_type||m.tag)+(m.label?' "'+m.label+'"':'') : (m.tag+(m.label?' "'+m.label+'"':'')+' (not a text field)')) : 'nothing'; kbd.type = (m.input_type==='password')?'password':'text'; kbd.value=''; kbdSent=''; if(editable) kbd.focus(); }
+    else if(m.type==='error'){ $('loginMsg').textContent='error: '+m.message; } };
+  ws.onopen=()=>{ if(statusTimer) clearInterval(statusTimer); statusTimer=setInterval(()=>send({kind:'status'}), 6000); };
+  ws.onclose=()=>{ $('loginMsg').textContent += ' · stream closed'; if(statusTimer){ clearInterval(statusTimer); statusTimer=null; } };
   const pos = e=>{ const r = canvas.getBoundingClientRect(); return {x:(e.clientX-r.left)*vw/r.width, y:(e.clientY-r.top)*vh/r.height}; };
   canvas.onmousemove = e=>{ const p=pos(e); send({kind:'mouse',type:'mouseMoved',...p}); };
-  canvas.onmousedown = e=>{ const p=pos(e); canvas.focus(); send({kind:'mouse',type:'mousePressed',button:'left',clickCount:1,...p}); };
-  canvas.onmouseup = e=>{ const p=pos(e); send({kind:'mouse',type:'mouseReleased',button:'left',clickCount:1,...p}); };
+  canvas.onmousedown = e=>{ e.preventDefault(); const p=pos(e); send({kind:'mouse',type:'mouseMoved',...p}); send({kind:'mouse',type:'mousePressed',button:'left',clickCount:1,...p}); };
+  canvas.onmouseup = e=>{ e.preventDefault(); const p=pos(e); send({kind:'mouse',type:'mouseReleased',button:'left',clickCount:1,...p}); kbd.focus(); };
   canvas.onwheel = e=>{ e.preventDefault(); const p=pos(e); send({kind:'mouse',type:'mouseWheel',deltaX:e.deltaX,deltaY:e.deltaY,...p}); };
+  /* touch: a tap is a click at the touch point; focusing the typing box inside the same gesture opens the phone keyboard */
+  let touchPt=null;
+  canvas.ontouchstart = e=>{ e.preventDefault(); const t=e.changedTouches[0]; touchPt=pos(t); send({kind:'mouse',type:'mouseMoved',...touchPt}); send({kind:'mouse',type:'mousePressed',button:'left',clickCount:1,...touchPt}); };
+  canvas.ontouchmove = e=>{ e.preventDefault(); };
+  canvas.ontouchend = e=>{ e.preventDefault(); const t=e.changedTouches[0]; const p=touchPt||pos(t); send({kind:'mouse',type:'mouseReleased',button:'left',clickCount:1,...p}); touchPt=null; kbd.focus(); };
+  /* hardware keyboard on the canvas itself (desktop) */
   canvas.onkeydown = e=>{ e.preventDefault(); const text = e.key.length===1?e.key:undefined; send({kind:'key',type:text?'keyDown':'rawKeyDown',key:e.key,code:e.code,text,unmodifiedText:text,windowsVirtualKeyCode:e.keyCode,nativeVirtualKeyCode:e.keyCode,modifiers:(e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0)}); };
   canvas.onkeyup = e=>{ e.preventDefault(); send({kind:'key',type:'keyUp',key:e.key,code:e.code,windowsVirtualKeyCode:e.keyCode,nativeVirtualKeyCode:e.keyCode}); };
+  /* typing box: mirrors the field being typed into; differences are forwarded as text or backspaces */
+  kbd.oninput = ()=>{ const v = kbd.value; if(v===kbdSent) return;
+    if(v.startsWith(kbdSent)){ send({kind:'text',text:v.slice(kbdSent.length)}); }
+    else if(kbdSent.startsWith(v)){ for(let i=0;i<kbdSent.length-v.length;i++) send({kind:'press',key:'Backspace'}); }
+    else { for(let i=0;i<kbdSent.length;i++) send({kind:'press',key:'Backspace'}); if(v) send({kind:'text',text:v}); }
+    kbdSent=v; };
+  kbd.onkeydown = e=>{ if(e.key==='Enter'||e.key==='Tab'||e.key==='Escape'||(e.key==='Backspace'&&!kbd.value)||e.key.startsWith('Arrow')){ e.preventDefault(); pressKey(e.key); } };
   setInterval(()=>send({kind:'status'}), 4000);
 }
 async function completeLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/complete'); $('loginMsg').textContent = r.stored?'stored encrypted storage state in slot '+r.slot+' — slot ACTIVE':'not authenticated yet ('+r.verdict+' '+(r.detail||'')+')'; if(r.stored && ws) ws.close(); refresh(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }

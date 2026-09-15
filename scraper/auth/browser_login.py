@@ -30,6 +30,15 @@ class LoginSessionError(RuntimeError):
     pass
 
 
+# Named keys the dashboard's typing box sends (phones have no hardware keyboard and their on-screen
+# keyboards do not produce usable key events, so the dashboard sends text and named keys instead).
+NAMED_KEYS: Dict[str, tuple] = {
+    "Enter": (13, "\r"), "Tab": (9, None), "Backspace": (8, None), "Delete": (46, None), "Escape": (27, None),
+    "ArrowLeft": (37, None), "ArrowUp": (38, None), "ArrowRight": (39, None), "ArrowDown": (40, None),
+    "Home": (36, None), "End": (35, None), "PageUp": (33, None), "PageDown": (34, None),
+}
+
+
 @dataclass
 class LoginSession:
     source_name: str
@@ -86,10 +95,17 @@ class LoginSession:
         except asyncio.TimeoutError:
             return None
 
-    async def input_event(self, event: Dict[str, Any]) -> None:
-        """Replay an operator input event. Accepted: mouse {type: mousePressed|mouseReleased|mouseMoved|mouseWheel, x, y, button, clickCount, deltaX, deltaY};
-        key {type: keyDown|keyUp|char, key, code, text, modifiers}; navigate {url} (same host only)."""
+    async def input_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Replay an operator input event. Accepted:
+        mouse {type: mousePressed|mouseReleased|mouseMoved|mouseWheel, x, y, button, clickCount, deltaX, deltaY};
+        key {type: keyDown|keyUp|char, key, code, text, modifiers} (hardware keyboards);
+        text {text} inserts a string into the focused element (on-screen keyboards, paste);
+        press {key} presses one named key (Enter, Tab, Backspace, ...);
+        navigate {url} (same host only).
+        Returns a description of the focused element after a click, so the dashboard can show what
+        the operator is typing into (and mask its own typing box for password fields)."""
         kind = event.get("kind")
+        info: Optional[Dict[str, Any]] = None
         if kind == "mouse":
             await self._cdp.send(
                 "Input.dispatchMouseEvent",
@@ -103,12 +119,29 @@ class LoginSession:
                     "deltaY": float(event.get("deltaY", 0)),
                 },
             )
+            if event.get("type") == "mouseReleased":
+                info = await self.focused_element()
         elif kind == "key":
             payload = {"type": event.get("type", "keyDown"), "modifiers": int(event.get("modifiers", 0))}
             for k in ("key", "code", "text", "unmodifiedText", "windowsVirtualKeyCode", "nativeVirtualKeyCode"):
                 if event.get(k) is not None:
                     payload[k] = event[k]
             await self._cdp.send("Input.dispatchKeyEvent", payload)
+        elif kind == "text":
+            text = str(event.get("text", ""))[:2000]
+            if text:
+                await self._cdp.send("Input.insertText", {"text": text})
+        elif kind == "press":
+            name = str(event.get("key", ""))
+            if name not in NAMED_KEYS:
+                raise LoginSessionError(f"unknown key {name!r}")
+            vk, text = NAMED_KEYS[name]
+            down: Dict[str, Any] = {"type": "keyDown" if text else "rawKeyDown", "key": name, "code": name, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+            if text:
+                down["text"] = text
+                down["unmodifiedText"] = text
+            await self._cdp.send("Input.dispatchKeyEvent", down)
+            await self._cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": name, "code": name, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
         elif kind == "navigate":
             from urllib.parse import urlsplit
 
@@ -117,6 +150,21 @@ class LoginSession:
                 raise LoginSessionError("navigation outside the source host is not permitted")
             await self._page.goto(target, wait_until="domcontentloaded")
         self.last_url = self._page.url
+        return info
+
+    async def focused_element(self) -> Dict[str, Any]:
+        """Tag, input type and label of the element that currently has focus in the page. Values are
+        never read: only what kind of field it is, so the operator knows where their typing goes."""
+        try:
+            return await self._page.evaluate(
+                """() => { const a = document.activeElement; if (!a || a === document.body) return {tag: null};
+                  const t = (a.getAttribute('type') || (a.tagName === 'TEXTAREA' ? 'textarea' : '')).toLowerCase();
+                  const label = a.getAttribute('placeholder') || a.getAttribute('aria-label') || a.getAttribute('name') || a.id || '';
+                  const editable = ['INPUT','TEXTAREA'].includes(a.tagName) && !['checkbox','radio','submit','button','hidden','file'].includes(t) || a.isContentEditable;
+                  return {tag: a.tagName.toLowerCase(), input_type: t, label: String(label).slice(0, 60), editable: !!editable}; }"""
+            )
+        except Exception as exc:  # page navigating, frame detached, ...
+            return {"tag": None, "error": str(exc)[:80]}
 
     async def is_authenticated(self) -> Dict[str, Any]:
         html = await self._page.content()
@@ -153,11 +201,23 @@ class LoginSessionRegistry:
         self._sessions: Dict[str, LoginSession] = {}
         self._lock = asyncio.Lock()
 
-    async def start(self, source_name: str, slot_number: int, login_url: str, started_by: str = "operator") -> LoginSession:
+    async def start(self, source_name: str, slot_number: int, login_url: str, started_by: str = "operator", viewport: Optional[Dict[str, int]] = None) -> LoginSession:
+        """Open a browser for the human login. If one is already open for this source and slot (the
+        operator reloaded the dashboard or lost the connection), it is reused rather than refused; a
+        different slot replaces the open one."""
         async with self._lock:
-            if source_name in self._sessions and self._sessions[source_name].status != "closed":
-                raise LoginSessionError(f"a human-login session for {source_name} is already open")
+            existing = self._sessions.get(source_name)
+            if existing is not None and existing.status != "closed":
+                if existing.slot_number == slot_number:
+                    existing.status = "awaiting_human"
+                    return existing
+                await existing.close()
+                self._sessions.pop(source_name, None)
             sess = LoginSession(source_name=source_name, slot_number=slot_number, login_url=login_url, started_by=started_by)
+            if viewport:
+                w = max(320, min(1920, int(viewport.get("width", 1280))))
+                h = max(480, min(1600, int(viewport.get("height", 800))))
+                sess.viewport = {"width": w, "height": h}
             await sess.start()
             self._sessions[source_name] = sess
             return sess

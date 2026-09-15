@@ -1,0 +1,43 @@
+name: server-logs
+
+# Prints recent service logs from the corpus server (docker compose ps + the last lines of the chosen
+# services), with 64-hex secrets scrubbed. Requires the DO_TOKEN repository secret and a server
+# created by deploy-cloud.
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Services to show (space-separated: api worker-scraper worker-public worker-embed celery-beat caddy postgres redis)"
+        default: "api worker-scraper"
+        required: false
+      lines:
+        description: "Lines per service"
+        default: "300"
+        required: false
+
+jobs:
+  logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq openssh-client >/dev/null
+          python3 -m pip install --quiet cryptography
+
+      - name: Print server logs
+        env:
+          DO_TOKEN: ${{ secrets.DO_TOKEN }}
+          SERVICES: ${{ inputs.services }}
+          LINES: ${{ inputs.lines }}
+        run: |
+          test -n "$DO_TOKEN" || { echo "::error::Repository secret DO_TOKEN is not set (Settings → Secrets and variables → Actions)"; exit 1; }
+          bash cloud/do_server_logs.sh

@@ -89,9 +89,19 @@ Re-running the same command later (with the token lines again while private) upd
 2. **Overview → Not configured**: anything listed there is a value in `/opt/ssa-scraper/.env`
    (`SGAI_API_KEY`, `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` for embeddings, and so on). After
    editing: `cd /opt/ssa-scraper && docker compose up -d`.
-3. **Human login**: choose slot 1, **Start login**, type your PakistanLawSite username and password
-   into the streamed browser, then **Complete**. Repeat on slot 2 if you want the alternate slot
-   ready. Both slots are optional until you want PakistanLawSite coverage.
+3. **Human login**: choose slot 1, **Start login**, tap the username field in the streamed page,
+   type in the box under the picture (on a phone the keyboard opens there; on a computer you can
+   also type straight into the picture), tap the password field, type, tick **I Agree with the
+   Terms and Conditions**, tap **Sign in**, then **Complete**. The box shows which field you are
+   typing into and masks itself for passwords; what you type goes only to the page. Repeat on slot 2
+   if you want the alternate slot ready. Both slots are optional until you want PakistanLawSite
+   coverage.
+
+   PakistanLawSite allows one login per account at a time. If the page shows **Logout From All
+   Devices**, the account is still logged in elsewhere (your own browser or phone): enter the
+   username and password once more in that box and the site logs you in here instead. Keep this in
+   mind while the scraper runs: logging in to the site yourself with the same account ends the
+   scraper's session (the slot shows NEEDS_HUMAN_LOGIN and you repeat this step).
 4. **Archive storage**: add a target (a bucket, Dropbox, Google Drive, OneDrive, SFTP, SMB or a
    folder on the server). Configuration is encrypted at rest.
 5. **Sources**: public courts, PakistanCode, the legislatures and the Gazette run on their own
