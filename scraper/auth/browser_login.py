@@ -81,7 +81,17 @@ class LoginSession:
             self.frames.put_nowait(frame)
         except asyncio.QueueFull:
             pass
-        asyncio.create_task(self._ack(params.get("sessionId")))
+        if params.get("sessionId") is not None:
+            asyncio.create_task(self._ack(params.get("sessionId")))
+
+    async def snapshot(self) -> None:
+        """Capture the current page as one frame. The screencast only emits when the page repaints,
+        so a static page shows nothing to an operator who (re)connects or resizes; this fills that gap."""
+        try:
+            shot = await self._cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 60})
+            self._on_frame({"data": shot.get("data"), "metadata": {"deviceWidth": self.viewport["width"], "deviceHeight": self.viewport["height"]}})
+        except Exception as exc:  # page navigating; the next real frame will follow
+            logger.debug("snapshot skipped: %s", exc)
 
     async def _ack(self, session_id) -> None:
         try:
@@ -183,12 +193,15 @@ class LoginSession:
         if viewport == self.viewport:
             return
         self.viewport = dict(viewport)
-        await self._page.set_viewport_size(self.viewport)
+        # Restart the screencast at the new size first, then resize: the repaint the resize causes is
+        # then the first frame of the new stream (a static page paints nothing on its own).
         try:
             await self._cdp.send("Page.stopScreencast")
         except Exception:
             pass
         await self._cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 60, "maxWidth": self.viewport["width"], "maxHeight": self.viewport["height"], "everyNthFrame": 2})
+        await self._page.set_viewport_size(self.viewport)
+        await self.snapshot()
 
     async def export_storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state()

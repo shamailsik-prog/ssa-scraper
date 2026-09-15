@@ -86,6 +86,7 @@ async def login_stream(websocket: WebSocket, source: str):
         await websocket.close(code=4404)
         return
     await websocket.accept()
+    await sess.snapshot()  # a static page emits no screencast frame; show the operator something at once
 
     async def pump_frames():
         while sess.status not in ("closed",):
