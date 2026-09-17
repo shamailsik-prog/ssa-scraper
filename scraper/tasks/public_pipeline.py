@@ -259,12 +259,12 @@ class PublicPipeline:
             if res.verdict.kind in ("verification", "login"):
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
-            elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
-                fr.status = "retired"
-                fr.last_error = "missing %PDF signature for judgment document URL"
             elif res.status_code >= 400:
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"
+            elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
+                fr.status = "retired"
+                fr.last_error = "missing %PDF signature for judgment document URL"
             else:
                 if kind == "judgment":
                     await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})

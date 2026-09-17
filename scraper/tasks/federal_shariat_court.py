@@ -140,10 +140,10 @@ def _classify_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
     text_hint = DOC_HINT_RE.search(hint or "")
     if is_pdf and (in_judgment_dir or url_hint or text_hint):
         return "judgment"
+    if "alljud.php" in path or re.search(r"/judnew\d*\.html$", path) or LISTING_PATH_RE.search(path) or re.search(r"/judgments/page/\d+/?$", path) or ("page=" in query and "alljud.php" in path):
+        return "listing"
     if in_judgment_dir and not path.endswith((".html", ".php", "/")):
         return "judgment"
-    if "alljud.php" in path or re.search(r"/judnew\d*\.html$", path) or LISTING_PATH_RE.search(path) or ("page=" in query and "alljud.php" in path):
-        return "listing"
     return None
 
 
