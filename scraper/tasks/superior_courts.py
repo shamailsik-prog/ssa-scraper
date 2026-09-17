@@ -37,4 +37,8 @@ def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
 
 
 async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
+    if source.source_name == "FederalShariatCourt":
+        from scraper.tasks.federal_shariat_court import scrape_federal_shariat_court
+
+        return await scrape_federal_shariat_court(source, db, **kwargs)
     return await run_public_source(db, source, seed_listings=listings_for(source), **kwargs)

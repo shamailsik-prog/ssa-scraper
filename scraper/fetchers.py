@@ -48,6 +48,15 @@ def canonical_text_hash(text: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
+def has_pdf_signature(content: bytes) -> bool:
+    """True when the payload looks like a real PDF (`%PDF` in the first KB)."""
+    if not content:
+        return False
+    head = content[:1024]
+    # Some servers prepend whitespace or a UTF-8 BOM before the PDF header.
+    return head.lstrip().startswith(PDF_MAGIC) or PDF_MAGIC in head
+
+
 @dataclass
 class FetchResult:
     url: str
