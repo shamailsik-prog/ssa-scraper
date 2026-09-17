@@ -138,6 +138,23 @@ class PublicPipeline:
         self.stats["fetched"] += 1
         return res
 
+    async def post_form(self, url: str, *, data: Dict[str, str]) -> FetchResult:
+        """Submit a form POST under the same policy guards as GET fetches."""
+        assert self.fetcher is not None
+        try:
+            res = await self.fetcher.post_form(url, data=data)
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            raise
+        except ExplicitBlock as exc:
+            if exc.kind == "robots_disallow":
+                self.stats["rejected_urls"] += 1
+                raise URLPolicyError(str(exc))
+            await self.halt(str(exc))
+            raise
+        self.stats["fetched"] += 1
+        return res
+
     async def halt(self, reason: str) -> None:
         self.source.state = "HALTED"
         self.source.state_reason = reason[:1000]

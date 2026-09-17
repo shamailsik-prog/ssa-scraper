@@ -130,7 +130,15 @@ class HttpFetcher:
         hi = (self.source.request_delay_max_ms or 2500) / 1000.0
         await asyncio.sleep(random.uniform(lo, max(lo, hi)))
 
-    async def get(self, url: str, *, max_bytes: Optional[int] = None, headers: Optional[Dict[str, str]] = None) -> FetchResult:
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        max_bytes: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
         assert self._client is not None, "use 'async with HttpFetcher(...)'"
         safe = self._check(url)
         attempts = max(1, settings.SCRAPER_RETRY_ATTEMPTS)
@@ -139,7 +147,7 @@ class HttpFetcher:
         for attempt in range(attempts):
             started = datetime.now(timezone.utc)
             try:
-                async with self._client.stream("GET", safe, headers=headers) as resp:
+                async with self._client.stream(method, safe, headers=headers, data=data) as resp:
                     chunks = bytearray()
                     async for chunk in resp.aiter_bytes(64 * 1024):
                         chunks.extend(chunk)
@@ -172,7 +180,23 @@ class HttpFetcher:
                 last_exc = exc
                 if attempt + 1 < attempts:
                     await asyncio.sleep(settings.SCRAPER_RETRY_BACKOFF * (2**attempt))
-        raise RuntimeError(f"fetch failed for {safe}: {last_exc}")
+        raise RuntimeError(f"{method} failed for {safe}: {last_exc}")
+
+    async def get(self, url: str, *, max_bytes: Optional[int] = None, headers: Optional[Dict[str, str]] = None) -> FetchResult:
+        return await self._request("GET", url, max_bytes=max_bytes, headers=headers)
+
+    async def post_form(
+        self,
+        url: str,
+        *,
+        data: Dict[str, str],
+        max_bytes: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
+        req_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if headers:
+            req_headers.update(headers)
+        return await self._request("POST", url, max_bytes=max_bytes, headers=req_headers, data=data)
 
 
 # --------------------------------------------------------------------------- raw preservation
