@@ -1,6 +1,6 @@
 """
-Superior-court PUBLIC sources (Annex B-2): Supreme Court, Lahore, Sindh, Peshawar, Balochistan
-and Islamabad High Courts, Federal Shariat Court.
+Superior-court PUBLIC sources (Annex B-2): Supreme Court, Lahore, Sindh, Peshawar, Balochistan,
+Islamabad and Azad Jammu & Kashmir High Courts, Federal Shariat Court.
 
 Each court is a set of listing URLs. Listings are fetched under robots + allow-list, judgment
 documents (PDF or HTML) are written into crawl_frontier, and the shared PublicPipeline applies
@@ -24,6 +24,7 @@ DEFAULT_LISTINGS: Dict[str, List[str]] = {
     "PeshawarHighCourt": ["https://www.peshawarhighcourt.gov.pk/app/site/judgments"],
     "BalochistanHighCourt": ["https://bhc.gov.pk/judgments"],
     "IslamabadHighCourt": ["https://mis.ihc.gov.pk/judgments", "https://www.ihc.gov.pk/judgments"],
+    "AJKHighCourt": ["https://ajkhighcourt.gok.pk/important-judgments", "https://ajkhighcourt.gok.pk/important-judgments?judgment_tab=previous"],
     "FederalShariatCourt": ["https://www.federalshariatcourt.gov.pk/en/judgments/"],
 }
 
@@ -41,4 +42,8 @@ async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwarg
         from scraper.tasks.federal_shariat_court import scrape_federal_shariat_court
 
         return await scrape_federal_shariat_court(source, db, **kwargs)
+    if source.source_name == "AJKHighCourt":
+        from scraper.tasks.ajk_high_court import scrape_ajk_high_court
+
+        return await scrape_ajk_high_court(source, db, **kwargs)
     return await run_public_source(db, source, seed_listings=listings_for(source), **kwargs)

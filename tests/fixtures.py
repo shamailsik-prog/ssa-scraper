@@ -131,6 +131,7 @@ class FixtureServer:
 
     def __init__(self):
         self.routes: Dict[str, Tuple[int, str, bytes]] = {}
+        self.post_routes: Dict[str, Tuple[int, str, bytes]] = {}
         self.hits: List[str] = []
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -138,6 +139,11 @@ class FixtureServer:
     def add(self, path: str, body, status: int = 200, content_type: str = "text/html; charset=utf-8") -> str:
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.routes[path] = (status, content_type, data)
+        return self.url(path)
+
+    def add_post(self, path: str, body, status: int = 200, content_type: str = "text/html; charset=utf-8") -> str:
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.post_routes[path] = (status, content_type, data)
         return self.url(path)
 
     def url(self, path: str) -> str:
@@ -148,12 +154,27 @@ class FixtureServer:
         return self._server.server_address[1]
 
     def start(self) -> None:
-        routes, hits = self.routes, self.hits
+        routes, post_routes, hits = self.routes, self.post_routes, self.hits
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 hits.append(self.path)
                 if self.path in routes:
+                    status, ctype, data = routes[self.path]
+                else:
+                    status, ctype, data = 404, "text/plain", b"not found"
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):  # noqa: N802
+                _ = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                hits.append(f"POST {self.path}")
+                if self.path in post_routes:
+                    status, ctype, data = post_routes[self.path]
+                elif self.path in routes:
                     status, ctype, data = routes[self.path]
                 else:
                     status, ctype, data = 404, "text/plain", b"not found"
