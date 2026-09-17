@@ -15,8 +15,8 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urljoin
+from typing import Any, Dict, Iterable, List, Optional, Type
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from sqlalchemy import select
@@ -26,7 +26,7 @@ from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
-from scraper.fetchers import FetchResult, HttpFetcher, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute
+from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute
 from scraper.models import CrawlFrontier, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -46,6 +46,15 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if isinstance(out.get(k), str) and len(out[k]) > 2000:
             out[k] = out[k][:2000] + f"…[{len(d[k])} chars in raw_text]"
     return out
+
+
+def _url_looks_like_pdf(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    parts = urlsplit(url)
+    path = (parts.path or "").lower()
+    query = (parts.query or "").lower()
+    return path.endswith(".pdf") or ".pdf" in path or "format=pdf" in query
 
 
 class PublicPipeline:
@@ -250,6 +259,9 @@ class PublicPipeline:
             if res.verdict.kind in ("verification", "login"):
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
+            elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
+                fr.status = "retired"
+                fr.last_error = "missing %PDF signature for judgment document URL"
             elif res.status_code >= 400:
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"
@@ -320,11 +332,12 @@ async def run_public_source(
     managed=None,
     local=None,
     job_id=None,
+    pipeline_cls: Type[PublicPipeline] = PublicPipeline,
 ) -> Dict[str, Any]:
     """Generic public-source run: seed listing URLs into the frontier, then drain."""
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": source.state, "reason": source.state_reason}
-    pipeline = PublicPipeline(db, source, fetcher=fetcher, managed=managed, local=local, job_id=job_id)
+    pipeline = pipeline_cls(db, source, fetcher=fetcher, managed=managed, local=local, job_id=job_id)
     for item in seed_listings:
         url = item["url"]
         try:
