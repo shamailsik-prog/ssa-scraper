@@ -246,6 +246,18 @@ SOURCE_SEED = [
         168,
         "hybrid",
     ),
+    (
+        "GBAssembly",
+        "Gilgit-Baltistan Law Department",
+        "https://gilgitbaltistan.gov.pk/pages/acts",
+        "public",
+        ["gilgitbaltistan.gov.pk", "www.gilgitbaltistan.gov.pk"],
+        False,
+        True,
+        False,
+        168,
+        "hybrid",
+    ),
     ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "http://pcp.gov.pk/Download", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
 ]
 
