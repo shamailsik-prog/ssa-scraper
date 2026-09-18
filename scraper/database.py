@@ -221,7 +221,7 @@ SOURCE_SEED = [
     ("Senate", "Senate of Pakistan", "https://senate.gov.pk/en/legislation.php", "public", ["senate.gov.pk", "www.senate.gov.pk"], False, True, True, 168, "hybrid"),
     ("PunjabAssembly", "Provincial Assembly of the Punjab", "https://www.pap.gov.pk/acts", "public", ["www.pap.gov.pk", "pap.gov.pk", "punjablaws.gov.pk", "www.punjablaws.gov.pk"], False, True, True, 168, "hybrid"),
     ("SindhAssembly", "Provincial Assembly of Sindh", "https://www.pas.gov.pk/index.php/acts", "public", ["www.pas.gov.pk", "pas.gov.pk", "sindhlaws.gov.pk", "www.sindhlaws.gov.pk"], False, True, True, 168, "hybrid"),
-    ("KPAssembly", "Provincial Assembly of Khyber Pakhtunkhwa", "https://www.pakp.gov.pk/acts/", "public", ["www.pakp.gov.pk", "pakp.gov.pk", "kpcode.kp.gov.pk"], False, True, True, 168, "hybrid"),
+    ("KPAssembly", "Provincial Assembly of Khyber Pakhtunkhwa", "https://www.pakp.gov.pk/act/", "public", ["www.pakp.gov.pk", "pakp.gov.pk", "kpcode.kp.gov.pk"], False, True, True, 168, "hybrid"),
     ("BalochistanAssembly", "Provincial Assembly of Balochistan", "https://www.pabalochistan.gov.pk/acts", "public", ["www.pabalochistan.gov.pk", "pabalochistan.gov.pk"], False, True, True, 168, "hybrid"),
     ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "https://www.pcp.gov.pk/gazette", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
 ]
@@ -269,6 +269,9 @@ async def seed_data() -> None:
                 lhc.allow_list = merged_allow
             if not (lhc.source_url or "").startswith("https://opc.lhc.gov.pk/"):
                 lhc.source_url = "https://opc.lhc.gov.pk/Relevant_Laws.aspx"
+        kp = existing_source_rows.get("KPAssembly")
+        if kp is not None and (kp.source_url or "").startswith("https://www.pakp.gov.pk/acts"):
+            kp.source_url = "https://www.pakp.gov.pk/act/"
         slots = {(s.source_name, s.slot_number) for s in (await db.execute(select(BrowserSessionSlot))).scalars().all()}
         for n in (1, 2):
             if ("PakistanLawSite", n) not in slots:
