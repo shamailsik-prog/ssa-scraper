@@ -10,7 +10,7 @@ from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
-from scraper.models import Citation, Instrument, Judgment, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
+from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
@@ -260,6 +260,113 @@ async def test_instrument_promotion_fails_closed_on_bad_mentions_payload(db):
     ).scalars().first()
     assert q is not None
     assert "citation_mentions must be a list" in (q.reason or "")
+
+
+async def test_instrument_relation_graph_persists_verified_edges_with_provenance(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    target = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        NOTIFICATION
+        S.R.O. 123(I)/2024
+        Dated 20th January 2024
+        """,
+        "http://127.0.0.1/target-notification.pdf",
+    )
+    assert target is not None
+
+    source_instrument = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXII of 2025
+        This Act is amended by S.R.O. 123(I)/2024 for immediate effect.
+        The substituted provision shall be read with Pakistan Penal Code, 1860.
+        """,
+        "http://127.0.0.1/source-act.pdf",
+    )
+    assert source_instrument is not None
+
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
+        )
+    ).scalars().all()
+    assert len(edges) >= 2
+    amended = [e for e in edges if e.relation_type == "amended_by"]
+    read_with = [e for e in edges if e.relation_type == "read_with"]
+    assert len(amended) == 1
+    assert amended[0].target_instrument_id == target.id
+    assert amended[0].source_provenance_id == source_instrument.source_provenance_id
+    assert "amended by" in (amended[0].evidence_snippet or "").lower()
+    assert len(read_with) == 1
+    assert read_with[0].target_statute_id is not None
+    assert "read with" in (read_with[0].evidence_snippet or "").lower()
+
+
+async def test_instrument_relation_graph_fails_closed_for_unresolved_targets(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXIII of 2025
+    This Act stands superseded by Ordinance No. IX of 2025.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/unresolved-edge.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    staging = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/unresolved-edge.pdf",
+        kind="instrument",
+    )
+    out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": "http://127.0.0.1/unresolved-edge.pdf"}, content_hash=prov.content_hash)
+    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    assert await promote_statute_staging(db, staging) == "promoted"
+    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == inst.id),
+        )
+    ).scalars().all()
+    assert edges == []
 
 
 # --------------------------------------------------------------------------- treatment (B-7)
