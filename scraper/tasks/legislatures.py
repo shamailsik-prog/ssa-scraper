@@ -38,6 +38,9 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
         {"url": "https://na.gov.pk/en/bills-15.php?status=pass", "target_kind": "instrument"},
         {"url": "https://na.gov.pk/en/bills-15.php?status=majlis", "target_kind": "instrument"},
         {"url": "https://na.gov.pk/en/bills-15.php?type=4", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-passed.php", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-passed.php?type=1", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-passed.php?type=2", "target_kind": "instrument"},
     ],
     "Senate": [
         {"url": "https://senate.gov.pk/en/acts.php?id=-1&catid=186&subcatid=285&cattitle=Acts", "target_kind": "statute"},
@@ -82,7 +85,7 @@ PAKP_DETAIL_PATH_RE = re.compile(r"(?i)^/act/[^/?#]+/?$")
 NA_HOST = "na.gov.pk"
 NA_HOST_ALIASES = (NA_HOST, "www.na.gov.pk")
 NA_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
-NA_LISTING_PATH_RE = re.compile(r"(?i)^/en/(acts-tenure|acts|bills|bills-15)\.php$")
+NA_LISTING_PATH_RE = re.compile(r"(?i)^/en/(acts-tenure|acts|bills|bills-15|bills-passed)\.php$")
 NA_DETAIL_PATH_RE = re.compile(r"(?i)^/en/(bill|bill-detail|bill-details|act-detail|act-details|detail|details)\.php$")
 SENATE_HOST = "senate.gov.pk"
 SENATE_HOST_ALIASES = (SENATE_HOST, "www.senate.gov.pk")
@@ -1553,7 +1556,7 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
             return "detail"
         if path.endswith(("/acts-tenure.php", "/acts.php")):
             return "acts"
-        if path.endswith(("/bills.php", "/bills-15.php")):
+        if path.endswith(("/bills.php", "/bills-15.php", "/bills-passed.php")):
             status = (qs.get("status", [""])[0] or "").lower()
             btype = (qs.get("type", [""])[0] or "").lower()
             if btype == "4":
