@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import UUID
 
@@ -28,6 +28,7 @@ from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
+    CorpusMetadata,
     Court,
     EmbeddingQueue,
     Instrument,
@@ -465,11 +466,12 @@ def _instrument_row_keys(row: Instrument) -> set[str]:
         key = _instrument_reference_key(row.number)
         if key:
             keys.add(key)
-    for mention in row.citation_mentions or []:
-        if not isinstance(mention, dict):
-            continue
+    if keys:
+        return keys
+    first_mention = next((m for m in (row.citation_mentions or []) if isinstance(m, dict)), None)
+    if first_mention:
         for field in ("normalized", "raw"):
-            key = _instrument_reference_key(str(mention.get(field) or ""))
+            key = _instrument_reference_key(str(first_mention.get(field) or ""))
             if key:
                 keys.add(key)
     return keys
@@ -480,10 +482,10 @@ def _instrument_row_signatures(row: Instrument) -> set[tuple[str, str, int]]:
     direct = _instrument_signature(row.number)
     if direct:
         signatures.add(direct)
-    for mention in row.citation_mentions or []:
-        if not isinstance(mention, dict):
-            continue
-        sig = _mention_signature(mention)
+        return signatures
+    first_mention = next((m for m in (row.citation_mentions or []) if isinstance(m, dict)), None)
+    if first_mention:
+        sig = _mention_signature(first_mention)
         if sig:
             signatures.add(sig)
     return signatures
@@ -570,6 +572,102 @@ async def _sync_instrument_relation_edges(db: AsyncSession, inst: Instrument) ->
             )
         )
     await db.flush()
+
+
+# --------------------------------------------------------------------------- relation reconciliation
+def _positive_int(value: Any, *, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+async def reconcile_instrument_relations(
+    *,
+    limit: Optional[int] = None,
+    lookback_hours: Optional[int] = None,
+) -> Dict[str, int]:
+    effective_limit = _positive_int(limit, fallback=settings.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE)
+    effective_lookback = _positive_int(lookback_hours, fallback=settings.INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=effective_lookback)
+    counts = {
+        "scanned": 0,
+        "processed": 0,
+        "failed": 0,
+        "edges_before": 0,
+        "edges_after": 0,
+        "edges_added": 0,
+        "edges_removed": 0,
+    }
+    offset_key = "instrument_relation_reconcile_offset"
+    async with SessionLocal() as db:
+        filters = (
+            Instrument.created_at >= cutoff,
+            (Instrument.citation_mentions.isnot(None)) | (Instrument.statute_mentions.isnot(None)),
+        )
+        total = (
+            await db.execute(
+                select(func.count()).select_from(Instrument).where(*filters)
+            )
+        ).scalar() or 0
+        instrument_ids = []
+        if total > 0:
+            cursor = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == offset_key))).scalars().first()
+            if cursor is None:
+                cursor = CorpusMetadata(key=offset_key, value="0")
+                db.add(cursor)
+                await db.flush()
+            try:
+                offset = int(cursor.value)
+            except (TypeError, ValueError):
+                offset = 0
+            offset = max(offset, 0) % int(total)
+            base_query = (
+                select(Instrument.id)
+                .where(*filters)
+                .order_by(Instrument.created_at.desc(), Instrument.id.desc())
+            )
+            instrument_ids = (await db.execute(base_query.offset(offset).limit(effective_limit))).scalars().all()
+            if len(instrument_ids) < effective_limit and total > len(instrument_ids):
+                wrap_ids = (await db.execute(base_query.limit(effective_limit - len(instrument_ids)))).scalars().all()
+                instrument_ids.extend(wrap_ids)
+            cursor.value = str((offset + len(instrument_ids)) % int(total))
+        counts["scanned"] = len(instrument_ids)
+        for inst_id in instrument_ids:
+            inst = (await db.execute(select(Instrument).where(Instrument.id == inst_id))).scalars().first()
+            if inst is None:
+                continue
+            try:
+                before = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentRelation)
+                        .where(InstrumentRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
+                await _sync_instrument_relation_edges(db, inst)
+                after = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentRelation)
+                        .where(InstrumentRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
+                counts["processed"] += 1
+                counts["edges_before"] += int(before)
+                counts["edges_after"] += int(after)
+                if after >= before:
+                    counts["edges_added"] += int(after - before)
+                else:
+                    counts["edges_removed"] += int(before - after)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                counts["failed"] += 1
+                logger.exception("relation reconcile failed for instrument %s", inst_id)
+        await db.commit()
+    return counts
 
 
 async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
@@ -830,3 +928,8 @@ async def resolve_quarantine(db: AsyncSession, item: QuarantineQueue, *, reviewe
 @shared_task(name="scraper.tasks.promotion.promote_staging_records")
 def promote_staging_records_task(limit: int = 200):
     return run_async(promote_staging_records(limit))
+
+
+@shared_task(name="scraper.tasks.promotion.reconcile_instrument_relations")
+def reconcile_instrument_relations_task(limit: Optional[int] = None, lookback_hours: Optional[int] = None):
+    return run_async(reconcile_instrument_relations(limit=limit, lookback_hours=lookback_hours))

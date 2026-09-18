@@ -88,6 +88,13 @@ settings validator refuses any other combination.
 Every service has a health check. The main stack starts without the `local-ai` profile; the
 deterministic fallback is then in force for PakistanLawSite.
 
+`celery-beat` now also runs a bounded relation reconciliation pass (`scraper.tasks.promotion.reconcile_instrument_relations`) so late-arriving instrument targets can backfill `instrument_relation` edges without relaxing fail-closed resolution.
+For an on-demand run, call:
+
+```bash
+python -c "from scraper.tasks.promotion import reconcile_instrument_relations; from scraper.database import run_async; print(run_async(reconcile_instrument_relations()))"
+```
+
 ## How to start
 
 **Cloud server, no terminal** — add a DigitalOcean API token as the repository secret `DO_TOKEN`,
