@@ -187,6 +187,11 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             continue
         p = _parse_citation_parts(c)
         db.add(Citation(judgment_id=j.id, citation_string=c, raw_string=c, reporter=p["reporter"], year=p["year"], page=p["page"], is_primary=(i == 0), source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
+    await db.flush()
+    # Keep judgment citation graph in sync at promotion time; late links are reconciled by maintenance.
+    from scraper.tasks.treatment import sync_judgment_citation_relations
+
+    await sync_judgment_citation_relations(db, j)
     await _ensure_judges(db, data.get("judge_names"), court)
     if prov is not None:
         prov.promoted_table = "judgment"

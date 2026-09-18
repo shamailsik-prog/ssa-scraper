@@ -413,6 +413,41 @@ class InstrumentRelation(Base):
     created_at: Mapped[datetime] = _created()
 
 
+class JudgmentCitationRelation(Base):
+    __tablename__ = "judgment_citation_relation"
+    __table_args__ = (
+        Index("ix_judgment_citation_relation_source", "source_judgment_id"),
+        Index("ix_judgment_citation_relation_target_judgment", "target_judgment_id"),
+        Index("ix_judgment_citation_relation_target_key", "target_citation_key"),
+        UniqueConstraint(
+            "source_judgment_id",
+            "target_citation_key",
+            "span_start",
+            "span_end",
+            name="uq_judgment_citation_relation_edge",
+        ),
+        CheckConstraint(
+            "resolution_status IN ('linked','ambiguous','unresolved')",
+            name="ck_judgment_citation_relation_status",
+        ),
+        CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_judgment_citation_relation_span"),
+        CheckConstraint("char_length(evidence_snippet) <= 500", name="ck_judgment_citation_relation_evidence_500"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_judgment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False)
+    target_judgment_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="SET NULL"))
+    target_citation_raw: Mapped[str] = mapped_column(String(300), nullable=False)
+    target_citation_normalized: Mapped[str] = mapped_column(String(200), nullable=False)
+    target_citation_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    resolution_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unresolved", server_default=text("'unresolved'"))
+    span_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    span_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_snippet: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_provenance_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("source_provenance.id", ondelete="SET NULL"))
+    source_url: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+
 class ScraperSource(Base):
     __tablename__ = "scraper_sources"
     __table_args__ = (

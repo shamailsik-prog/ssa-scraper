@@ -45,6 +45,7 @@ app.conf.update(
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
+        "scraper.tasks.treatment.reconcile_judgment_citation_relations": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
@@ -69,6 +70,15 @@ if settings.TREATMENT_RECONCILE_ENABLED:
         "kwargs": {
             "lookback_hours": settings.TREATMENT_RECONCILE_LOOKBACK_HOURS,
             "batch_size": settings.TREATMENT_RECONCILE_BATCH_SIZE,
+        },
+    }
+if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
+    app.conf.beat_schedule["reconcile-judgment-citation-relations"] = {
+        "task": "scraper.tasks.treatment.reconcile_judgment_citation_relations",
+        "schedule": settings.JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS,
+        "kwargs": {
+            "lookback_hours": settings.JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS,
+            "batch_size": settings.JUDGMENT_CITATION_RECONCILE_BATCH_SIZE,
         },
     }
 logger.info("Celery configured: queues scraper/login_session/embeddings/maintenance; beat %s", list(app.conf.beat_schedule))

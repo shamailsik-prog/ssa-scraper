@@ -12,13 +12,13 @@ from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
-from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
+from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
-from scraper.tasks.treatment import classify_deterministic, classify_judgment, reconcile_treatment_citation_links
+from scraper.tasks.treatment import classify_deterministic, classify_judgment, reconcile_judgment_citation_relations, reconcile_treatment_citation_links
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
 COURTS = {"supreme court of pakistan": "Supreme Court of Pakistan", "sc": "Supreme Court of Pakistan", "supreme court": "Supreme Court of Pakistan", "lahore high court": "Lahore High Court", "lhc": "Lahore High Court"}
@@ -727,6 +727,81 @@ async def test_instrument_relation_reconcile_continues_after_rollback(db, monkey
     counts = await reconcile_instrument_relations(limit=2, lookback_hours=24)
     assert counts["failed"] == 1
     assert counts["processed"] == 1
+
+
+async def test_judgment_citation_relation_graph_persists_spans_and_stable_keys(db, source):
+    async def _promote(html: str, url: str) -> Judgment:
+        prov = await record_provenance(db, source=source, url=url, content=html.encode(), content_kind="html")
+        st = await stage_judgment(db, source=source, prov=prov, raw_html=html, raw_text=clean_html(html), url=url)
+        out = await HybridExtractor(db, source).extract_judgment(html=html, text=st.raw_text, content_hash=prov.content_hash)
+        st.reconciled_json, st.status, st.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_judgment_staging(db, st) == "promoted"
+        return (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+
+    target = await _promote(judgment_html("PLD 2019 SC 1", title="Target Case versus Federation"), "http://127.0.0.1/target")
+    source_row = await _promote(JUDGMENT_HTML, "http://127.0.0.1/source")
+    assert target is not None and source_row is not None
+
+    edges = (
+        await db.execute(
+            select(JudgmentCitationRelation).where(JudgmentCitationRelation.source_judgment_id == source_row.id).order_by(JudgmentCitationRelation.span_start.asc())
+        )
+    ).scalars().all()
+    assert len(edges) >= 3
+
+    pld_edges = [e for e in edges if e.target_citation_key == "PLD:2019:SC:1"]
+    assert len(pld_edges) >= 2
+    assert all(e.target_judgment_id == target.id and e.resolution_status == "linked" for e in pld_edges)
+    assert any(source_row.full_text[e.span_start : e.span_end] == "PLD 2019 SC 1" for e in pld_edges)
+
+    scmr_edges = [e for e in edges if e.target_citation_key == "SCMR:2015:-:100"]
+    assert len(scmr_edges) >= 2
+    assert all(e.target_judgment_id is None and e.resolution_status == "unresolved" for e in scmr_edges)
+
+
+async def test_judgment_citation_relation_reconcile_backfills_late_targets_and_is_idempotent(db, source):
+    async def _promote(html: str, url: str) -> Judgment:
+        prov = await record_provenance(db, source=source, url=url, content=html.encode(), content_kind="html")
+        st = await stage_judgment(db, source=source, prov=prov, raw_html=html, raw_text=clean_html(html), url=url)
+        out = await HybridExtractor(db, source).extract_judgment(html=html, text=st.raw_text, content_hash=prov.content_hash)
+        st.reconciled_json, st.status, st.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_judgment_staging(db, st) == "promoted"
+        return (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+
+    source_row = await _promote(JUDGMENT_HTML, "http://127.0.0.1/source-first")
+    assert source_row is not None
+    unresolved_before = (
+        await db.execute(
+            select(JudgmentCitationRelation).where(
+                JudgmentCitationRelation.source_judgment_id == source_row.id,
+                JudgmentCitationRelation.target_citation_key == "PLD:2019:SC:1",
+                JudgmentCitationRelation.resolution_status == "unresolved",
+            )
+        )
+    ).scalars().all()
+    assert unresolved_before
+
+    target = await _promote(judgment_html("PLD 2019 SC 1", title="Late Linked Case versus Province"), "http://127.0.0.1/target-late")
+    assert target is not None
+    await db.commit()
+
+    first = await reconcile_judgment_citation_relations(lookback_hours=24 * 365, batch_size=50)
+    assert first["processed"] >= 1
+    linked_edges = (
+        await db.execute(
+            select(JudgmentCitationRelation).where(
+                JudgmentCitationRelation.source_judgment_id == source_row.id,
+                JudgmentCitationRelation.target_citation_key == "PLD:2019:SC:1",
+                JudgmentCitationRelation.resolution_status == "linked",
+            )
+        )
+    ).scalars().all()
+    assert linked_edges
+    assert all(edge.target_judgment_id == target.id for edge in linked_edges)
+
+    second = await reconcile_judgment_citation_relations(lookback_hours=24 * 365, batch_size=50)
+    assert second["edges_added"] == 0
+    assert second["edges_removed"] == 0
 
 
 # --------------------------------------------------------------------------- treatment (B-7)

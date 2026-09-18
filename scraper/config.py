@@ -208,6 +208,22 @@ class Settings(BaseSettings):
     TREATMENT_RECONCILE_LOOKBACK_HOURS: int = Field(default=168, description="Only unresolved treatments newer than this lookback are scanned.")
     TREATMENT_RECONCILE_BATCH_SIZE: int = Field(default=500, description="Maximum unresolved treatments scanned per reconcile pass.")
     TREATMENT_RECONCILE_INTERVAL_SECONDS: int = Field(default=3600, description="Celery beat interval for treatment citation-link reconciliation.")
+    JUDGMENT_CITATION_RECONCILE_ENABLED: bool = Field(
+        default=True,
+        description="Run periodic reconciliation for judgment citation graph edges extracted from judgment text.",
+    )
+    JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS: int = Field(
+        default=168,
+        description="Only judgments newer than this lookback are scanned for citation-edge reconciliation.",
+    )
+    JUDGMENT_CITATION_RECONCILE_BATCH_SIZE: int = Field(
+        default=300,
+        description="Maximum judgments scanned per judgment citation relation reconciliation pass.",
+    )
+    JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS: int = Field(
+        default=3600,
+        description="Celery beat interval for judgment citation relation reconciliation.",
+    )
 
     # ----------------------------------------------------------- scrapegraph
     SGAI_ENABLED: bool = Field(default=True)
@@ -255,6 +271,9 @@ class Settings(BaseSettings):
         "TREATMENT_RECONCILE_LOOKBACK_HOURS",
         "TREATMENT_RECONCILE_BATCH_SIZE",
         "TREATMENT_RECONCILE_INTERVAL_SECONDS",
+        "JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS",
+        "JUDGMENT_CITATION_RECONCILE_BATCH_SIZE",
+        "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS",
         mode="before",
     )
     @classmethod
@@ -350,6 +369,15 @@ class Settings(BaseSettings):
             or self.TREATMENT_RECONCILE_INTERVAL_SECONDS <= 0
         ):
             raise ValueError("TREATMENT_RECONCILE_LOOKBACK_HOURS, TREATMENT_RECONCILE_BATCH_SIZE and TREATMENT_RECONCILE_INTERVAL_SECONDS must be positive")
+        if (
+            self.JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS <= 0
+            or self.JUDGMENT_CITATION_RECONCILE_BATCH_SIZE <= 0
+            or self.JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS <= 0
+        ):
+            raise ValueError(
+                "JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS, JUDGMENT_CITATION_RECONCILE_BATCH_SIZE and "
+                "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS must be positive"
+            )
         if self.PLS_USER or self.PLS_PASS.get_secret_value() or self.PLS_USER_B or self.PLS_PASS_B.get_secret_value():
             logger.warning("PLS_USER/PLS_PASS are deprecated and ignored: PakistanLawSite uses human login only")
         # legacy aliases
