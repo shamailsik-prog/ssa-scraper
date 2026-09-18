@@ -147,6 +147,27 @@ class NasirLawSitePipeline(PublicPipeline):
                 default_target_kind=default_target_kind,
             )
         else:
+            listing_path = (urlsplit(res.final_url).path or "").lower()
+            if LEGACY_REPORTER_LISTING_PATH_RE.search(listing_path):
+                base_meta = dict(inherited_meta)
+                base_meta.setdefault("detail_url", res.final_url)
+                base_meta.setdefault("source_section", _source_section_for_url(res.final_url))
+                base_meta["target_kind"] = self._target_kind_for_detail(
+                    detail_url=res.final_url,
+                    hint="",
+                    default_target_kind=base_meta.get("target_kind", default_target_kind),
+                    source_section=base_meta.get("source_section", ""),
+                )
+                self._merge_doc(
+                    docs,
+                    res.final_url,
+                    {
+                        **base_meta,
+                        "detail_fetch": "html_detail_page",
+                        "discovery_channel": "detail-page-self",
+                        "document_format": "html",
+                    },
+                )
             self._collect_listing_links(
                 html_text=res.text,
                 base_url=res.final_url,
@@ -287,10 +308,10 @@ class NasirLawSitePipeline(PublicPipeline):
             docs,
             detail_url,
             {
+                **base_meta,
                 "detail_fetch": "html_detail_page",
                 "discovery_channel": "detail-page-self",
                 "document_format": "html",
-                **base_meta,
             },
         )
 
