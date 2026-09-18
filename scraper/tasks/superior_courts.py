@@ -21,7 +21,7 @@ from scraper.tasks.public_pipeline import run_public_source
 DEFAULT_LISTINGS: Dict[str, List[str]] = {
     "SupremeCourt": ["https://www.supremecourt.gov.pk/judgements/", "https://www.supremecourt.gov.pk/judgement-search/"],
     "LahoreHighCourt": ["https://sys.lhc.gov.pk/appjudgments/", "https://sys.lhc.gov.pk/appjudgments/Reported"],
-    "SindhHighCourt": ["https://caselaw.shc.gov.pk/caselaw/view-file/", "https://www.shc.gov.pk/judgments"],
+    "SindhHighCourt": ["https://caselaw.shc.gov.pk/caselaw/public/home", "https://caselaw.shc.gov.pk/caselaw/public/rpt-afr"],
     "PeshawarHighCourt": ["https://www.peshawarhighcourt.gov.pk/app/site/judgments"],
     "BalochistanHighCourt": ["https://bhc.gov.pk/judgments"],
     "IslamabadHighCourt": ["https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=0"],
@@ -56,6 +56,10 @@ async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwarg
         from scraper.tasks.federal_shariat_court import scrape_federal_shariat_court
 
         return await scrape_federal_shariat_court(source, db, **kwargs)
+    if source.source_name == "SindhHighCourt":
+        from scraper.tasks.sindh_high_court import scrape_sindh_high_court
+
+        return await scrape_sindh_high_court(source, db, **kwargs)
     if source.source_name == "AJKHighCourt":
         from scraper.tasks.ajk_high_court import scrape_ajk_high_court
 
