@@ -267,7 +267,7 @@ INSTRUMENT_MENTION_PATTERNS: Dict[str, re.Pattern] = {
         \s*(?:No\.?\s*)?
         (?P<number>[A-Z0-9]+(?:\s*\([A-Z0-9]+\))?)
         \s*(?:/|of)\s*
-        (?P<year>19\d{2}|20\d{2})
+        (?P<year>18\d{2}|19\d{2}|20\d{2})
         \b
         """,
         re.IGNORECASE | re.VERBOSE,
@@ -278,7 +278,7 @@ INSTRUMENT_MENTION_PATTERNS: Dict[str, re.Pattern] = {
         Act\s+No\.?\s*
         (?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)
         \s+of\s+
-        (?P<year>19\d{2}|20\d{2})
+        (?P<year>18\d{2}|19\d{2}|20\d{2})
         \b
         """,
         re.IGNORECASE | re.VERBOSE,
@@ -289,7 +289,7 @@ INSTRUMENT_MENTION_PATTERNS: Dict[str, re.Pattern] = {
         Ordinance\s+No\.?\s*
         (?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)
         \s+of\s+
-        (?P<year>19\d{2}|20\d{2})
+        (?P<year>18\d{2}|19\d{2}|20\d{2})
         \b
         """,
         re.IGNORECASE | re.VERBOSE,
@@ -300,15 +300,14 @@ STATUTE_NAME_WITH_YEAR_PATTERN = re.compile(
     r"""
     \b
     (?P<name>
-        [A-Z][A-Za-z0-9\s\-\&\.'/,()]{3,140}?
-        \s+
+        [A-Z][A-Za-z0-9 \-\&\.'/,()]{3,140}?
         (?:Act|Ordinance|Code|Rules|Regulations|Order|Constitution)
     )
     \s*,?\s*
-    (?P<year>19\d{2}|20\d{2})
+    (?P<year>18\d{2}|19\d{2}|20\d{2})
     \b
     """,
-    re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -351,6 +350,8 @@ def _normalized_statute_key(name: str) -> str:
     key = (name or "").strip().lower()
     key = re.sub(r"[.,()]", "", key)
     key = re.sub(r"\s+", " ", key)
+    key = re.sub(r"^(?:in|under|of|to)\s+the\s+", "", key)
+    key = re.sub(r"^the\s+", "", key)
     return key
 
 
@@ -365,7 +366,7 @@ def canonicalise_statute_name(name: Optional[str], year: Optional[int] = None) -
     if canonical is None:
         cleaned = re.sub(r"\s+", " ", name.strip().strip(".,;"))
         canonical = cleaned
-    if year and re.search(r"\b(19|20)\d{2}\b", canonical) is None:
+    if year and re.search(r"\b(18|19|20)\d{2}\b", canonical) is None:
         canonical = f"{canonical}, {year}"
     return canonical
 
@@ -707,7 +708,7 @@ def extract_instrument_mentions(text: str) -> List[Dict[str, Any]]:
                 year = int(match.group("year"))
             except (TypeError, ValueError):
                 continue
-            if year < 1947 or year > 2035:
+            if year < 1800 or year > 2035:
                 continue
             raw = match.group(0).strip()
             number = _normalise_mention_number(match.group("number"))
@@ -739,7 +740,7 @@ def extract_statute_mentions(text: str) -> List[Dict[str, Any]]:
         raw = match.group(0).strip()
         raw_name = re.sub(r"\s+", " ", match.group("name").strip())
         year = int(match.group("year"))
-        if year < 1947 or year > 2035:
+        if year < 1800 or year > 2035:
             continue
         canonical = canonicalise_statute_name(raw_name, year)
         span = (match.start(), match.end())
@@ -757,6 +758,7 @@ def extract_statute_mentions(text: str) -> List[Dict[str, Any]]:
             }
         )
 
+    named = [m for m in mentions if m.get("canonical_statute_name") and isinstance(m.get("span"), tuple)]
     for hit in extract_statutes(text):
         statute_name = hit.get("act_name") or hit.get("act") or hit.get("source")
         if not statute_name and hit.get("type") == "ARTICLE":
@@ -764,10 +766,20 @@ def extract_statute_mentions(text: str) -> List[Dict[str, Any]]:
         section_number = hit.get("section") or hit.get("article") or hit.get("rule")
         year = hit.get("year")
         canonical = canonicalise_statute_name(str(statute_name), year) if statute_name else None
+        span = hit.get("span") or (0, 0)
+        if not canonical and section_number:
+            nearest = None
+            for candidate in named:
+                cspan = candidate.get("span")
+                if not isinstance(cspan, tuple):
+                    continue
+                if cspan[0] <= span[0] and (span[0] - cspan[0]) <= 200:
+                    nearest = candidate
+            if nearest:
+                canonical = nearest.get("canonical_statute_name")
         if not canonical and not section_number:
             continue
-        span = hit.get("span") or (0, 0)
-        normalized = canonical or str(statute_name)
+        normalized = canonical or str(statute_name or "")
         if section_number:
             normalized = f"{normalized} §{section_number}" if normalized else f"§{section_number}"
         mentions.append(

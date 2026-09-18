@@ -224,7 +224,7 @@ def _validated_mentions_payload(
                 y = int(year)
             except (TypeError, ValueError):
                 return [], f"{field_name} year must be an integer"
-            if y < 1947 or y > 2035:
+            if y < 1800 or y > 2035:
                 return [], f"{field_name} year out of accepted range"
             item = {**item, "year": y}
         span = item.get("span")

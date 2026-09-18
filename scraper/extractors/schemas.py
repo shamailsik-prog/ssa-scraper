@@ -8,7 +8,7 @@ as the output contract.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date as date_type
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -36,7 +36,7 @@ class JudgmentExtraction(_Strict):
     judge_names: List[str] = Field(default_factory=list)
     bench_size: Optional[int] = None
     bench_type: Optional[Literal["single", "division", "full", "larger"]] = None
-    decision_date: Optional[date] = None
+    decision_date: Optional[date_type] = None
     year: Optional[int] = None
     full_text_candidate: Optional[str] = None
     headnotes: Optional[str] = None
@@ -68,8 +68,8 @@ class StatuteSectionExtraction(_Strict):
     section_text: Optional[str] = None
     chapter: Optional[str] = None
     year_enacted: Optional[int] = None
-    effective_from: Optional[date] = None
-    effective_to: Optional[date] = None
+    effective_from: Optional[date_type] = None
+    effective_to: Optional[date_type] = None
     amending_instrument: Optional[str] = None
     jurisdiction: Optional[str] = None
     field_evidence: Dict[str, str] = Field(default_factory=dict)
@@ -92,7 +92,7 @@ class StatuteExtraction(_Strict):
 class InstrumentExtraction(_Strict):
     type: Optional[str] = None
     number: Optional[str] = None
-    date: Optional[date] = None
+    date: Optional[date_type] = None
     title: Optional[str] = None
     gazette_ref: Optional[str] = None
     full_text: Optional[str] = None

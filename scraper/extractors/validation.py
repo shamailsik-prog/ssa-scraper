@@ -369,7 +369,7 @@ def _valid_instrument_mentions(
             except (TypeError, ValueError):
                 conflicts.append({"field": field_name, "ai": item, "reason": "year is not an integer"})
                 continue
-            if y < 1947 or y > 2035:
+            if y < 1800 or y > 2035:
                 conflicts.append({"field": field_name, "ai": item, "reason": "year out of accepted range"})
                 continue
         out.append(item)
