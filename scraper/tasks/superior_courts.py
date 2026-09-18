@@ -26,7 +26,7 @@ DEFAULT_LISTINGS: Dict[str, List[str]] = {
         "https://www.peshawarhighcourt.gov.pk/app/site/47/c/All_the_Referred,Reported_Judgments.html",
         "https://www.peshawarhighcourt.gov.pk/PHCCMS/reportedJudgments.php",
     ],
-    "BalochistanHighCourt": ["https://bhc.gov.pk/judgments"],
+    "BalochistanHighCourt": ["https://bhc.gov.pk/resources/judgments", "https://bhc.gov.pk/judgments"],
     "IslamabadHighCourt": ["https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=0"],
     "AJKHighCourt": ["https://ajkhighcourt.gok.pk/important-judgments", "https://ajkhighcourt.gok.pk/important-judgments?judgment_tab=previous"],
     "AJKSupremeCourt": [
@@ -87,4 +87,8 @@ async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwarg
         from scraper.tasks.lahore_high_court import scrape_lahore_high_court
 
         return await scrape_lahore_high_court(source, db, **kwargs)
+    if source.source_name == "BalochistanHighCourt":
+        from scraper.tasks.balochistan_high_court import scrape_balochistan_high_court
+
+        return await scrape_balochistan_high_court(source, db, **kwargs)
     return await run_public_source(db, source, seed_listings=listings_for(source), **kwargs)
