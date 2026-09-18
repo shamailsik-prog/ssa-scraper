@@ -617,6 +617,9 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 "act_passed_on",
                 "act_assented_on",
                 "act_type",
+                "detail_category",
+                "detail_department",
+                "detail_specific_category",
                 "detail_url",
                 "detail_title",
                 "document_format",
@@ -1214,7 +1217,11 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
 
     @staticmethod
     def _is_kpcode_url(url: str) -> bool:
-        return (urlsplit(url).hostname or "").lower() in KPCODE_HOST_ALIASES
+        host = (urlsplit(url).hostname or "").lower()
+        if host in KPCODE_HOST_ALIASES:
+            return True
+        path = (urlsplit(url).path or "").lower()
+        return path.startswith("/homepage/") or path.startswith("/uploads/")
 
     def _collect_structured_listing_rows(
         self,
@@ -1483,7 +1490,11 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
         soup = BeautifulSoup(html_text or "", "html.parser")
         base_meta = dict(inherited_meta)
         base_meta.setdefault("detail_url", base_url)
-        base_meta.setdefault("source_section", self._kpcode_source_section_for_url(base_url))
+        detail_section = self._kpcode_source_section_for_url(base_url)
+        if detail_section in ("rules", "laws"):
+            base_meta["source_section"] = detail_section
+        else:
+            base_meta.setdefault("source_section", detail_section)
         base_meta.setdefault("detail_fetch", "kpcode_detail_download")
 
         title = self._extract_kpcode_detail_title(soup)
@@ -1589,14 +1600,13 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
             return
 
         host = (urlsplit(safe).hostname or "").lower()
-        if host in KPCODE_HOST_ALIASES:
-            kind = _classify_kpcode_discovered_url(safe)
-        else:
+        kind = _classify_kpcode_discovered_url(safe)
+        if kind is None:
             kind = _classify_pakp_discovered_url(safe)
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
-            if host in KPCODE_HOST_ALIASES:
+            if KPCODE_DOC_RE.search(path):
                 pdf_kind = "uploads-file" if path.startswith("/uploads/") else "direct-file"
             else:
                 pdf_kind = "wp-content-uploads-file" if path.startswith("/wp-content/uploads/") else "direct-file"
