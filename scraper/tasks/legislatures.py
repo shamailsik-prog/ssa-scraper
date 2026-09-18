@@ -595,6 +595,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         if depth >= max_depth:
             return
         for nurl, nmeta in listings.items():
+            next_target_kind = str(nmeta.get("target_kind") or target_kind)
             key = f"listing:{nurl}"
             exists = (
                 await self.db.execute(
@@ -633,7 +634,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                         query_json={
                             "kind": "listing",
                             "url": nurl,
-                            "target_kind": target_kind,
+                            "target_kind": next_target_kind,
                             "depth": depth + 1,
                             "route": route,
                             "meta": nmeta,
@@ -800,6 +801,22 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         )
         return has_title and has_lawish
 
+    @staticmethod
+    def _balochistan_code_target_kind(*, act_type: str, title: str, fallback: str) -> str:
+        """Infer statute vs instrument for Balochistan Code rows/detail pages."""
+        default_kind = fallback if fallback in ("statute", "instrument") else "statute"
+        lowered_type = (act_type or "").lower()
+        lowered_title = (title or "").lower()
+        if re.search(r"\b(act|law|statute)\b", lowered_type):
+            return "statute"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_type):
+            return "instrument"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
+        if re.search(r"\b(act|law|statute)\b", lowered_title):
+            return "statute"
+        return default_kind
+
     def _add_balochistan_code_row_provenance(
         self,
         *,
@@ -838,6 +855,11 @@ class BalochistanAssemblyPipeline(PublicPipeline):
             year_match = YEAR_RE.search(title or "") or YEAR_RE.search(row_meta.get("act_no", ""))
             if year_match:
                 row_meta["act_year"] = year_match.group(0)
+        row_meta["target_kind"] = self._balochistan_code_target_kind(
+            act_type=str(row_meta.get("act_type", "")),
+            title=str(row_meta.get("act_title", "")),
+            fallback=str(row_meta.get("target_kind") or "statute"),
+        )
 
     def _collect_balochistan_code_detail_document_links(
         self,
@@ -874,6 +896,11 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 base_meta["act_type"] = value[:80]
             if "act_year" not in base_meta and YEAR_RE.search(value):
                 base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+        base_meta["target_kind"] = self._balochistan_code_target_kind(
+            act_type=str(base_meta.get("act_type", "")),
+            title=str(base_meta.get("act_title") or detail_title),
+            fallback=str(base_meta.get("target_kind") or "statute"),
+        )
 
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
