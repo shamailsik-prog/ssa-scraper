@@ -8,7 +8,7 @@ from scraper.tasks.legislatures import listings_for, normalize_pas_public_url, s
 from tests.fixtures import text_pdf_bytes
 
 
-async def _sindh_assembly_source(db, fixture_server, listings):
+async def _sindh_assembly_source(db, fixture_server, listings, *, target_kind="statute"):
     source = (
         await db.execute(
             select(ScraperSource).where(
@@ -21,7 +21,7 @@ async def _sindh_assembly_source(db, fixture_server, listings):
     source.crawl_max_depth = 2
     source.config_json = {
         "listings": [fixture_server.url(path) for path in listings],
-        "target_kind": "statute",
+        "target_kind": target_kind,
     }
     await db.commit()
     return source
@@ -47,7 +47,7 @@ def test_normalize_pas_public_url_normalizes_details_and_uploads_paths():
     assert sindhlaws_detail == "https://sindhlaws.gov.pk/GazetteDetail.aspx?X=ACT&Year=2026"
 
 
-async def test_sindh_default_listings_include_pas_and_sindhlaws_seed_urls(db):
+async def test_sindh_default_listings_include_pas_and_sindhlaws_section_seed_kinds(db):
     source = (
         await db.execute(
             select(ScraperSource).where(
@@ -58,9 +58,68 @@ async def test_sindh_default_listings_include_pas_and_sindhlaws_seed_urls(db):
     source.config_json = {}
     await db.commit()
 
-    listing_urls = {row["url"] for row in listings_for(source)}
-    assert "https://www.pas.gov.pk/index.php/acts" in listing_urls
-    assert "https://sindhlaws.gov.pk/" in listing_urls
+    listing_map = {row["url"]: row["target_kind"] for row in listings_for(source)}
+    assert listing_map["https://www.pas.gov.pk/index.php/acts"] == "statute"
+    assert listing_map["https://sindhlaws.gov.pk/"] == "statute"
+    assert listing_map["https://sindhlaws.gov.pk/Gazette.aspx?pg=ACT"] == "statute"
+    assert listing_map["https://sindhlaws.gov.pk/Gazette.aspx?pg=ORDINANCE"] == "instrument"
+    assert listing_map["https://sindhlaws.gov.pk/Gazette.aspx?pg=BILLS"] == "instrument"
+
+
+async def test_sindhlaws_root_listing_overrides_target_kind_by_section(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/",
+        """
+        <html><body>
+          <a href="/Gazette.aspx?pg=ACT">Acts</a>
+          <a href="/Gazette.aspx?pg=ORDINANCE">Ordinances</a>
+          <a href="/Gazette.aspx?pg=BILLS">Bills</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/Gazette.aspx?pg=ACT", "<html><body></body></html>")
+    fixture_server.add("/Gazette.aspx?pg=ORDINANCE", "<html><body></body></html>")
+    fixture_server.add("/Gazette.aspx?pg=BILLS", "<html><body></body></html>")
+
+    source = await _sindh_assembly_source(db, fixture_server, ["/"], target_kind="statute")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=25)
+    await db.commit()
+
+    assert stats["halted"] is False
+
+    act_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"listing:{fixture_server.url('/Gazette.aspx?pg=ACT')}",
+            )
+        )
+    ).scalars().first()
+    ordinance_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"listing:{fixture_server.url('/Gazette.aspx?pg=ORDINANCE')}",
+            )
+        )
+    ).scalars().first()
+    bills_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"listing:{fixture_server.url('/Gazette.aspx?pg=BILLS')}",
+            )
+        )
+    ).scalars().first()
+
+    assert act_row is not None
+    assert ordinance_row is not None
+    assert bills_row is not None
+    assert act_row.query_json["target_kind"] == "statute"
+    assert ordinance_row.query_json["target_kind"] == "instrument"
+    assert bills_row.query_json["target_kind"] == "instrument"
 
 
 async def test_sindh_assembly_listing_rows_route_detail_docs_with_provenance(db, fixture_server):
@@ -337,6 +396,91 @@ async def test_sindhlaws_listing_fans_out_to_detail_and_documents_with_provenanc
     assert "CONSTITUTIONAL BENCHES OF HIGH COURT OF SINDH" in prov.route_json["act_title"]
 
 
+async def test_sindhlaws_ordinance_listing_fanout_persists_instrument_kind(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/",
+        """
+        <html><body><a href="/Gazette.aspx?pg=ORDINANCE">Ordinances</a></body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Gazette.aspx?pg=ORDINANCE",
+        """
+        <html><body><a href="/GazetteDetail.aspx?X=ORDINANCE&Year=2026">2026</a></body></html>
+        """,
+    )
+    fixture_server.add(
+        "/GazetteDetail.aspx?X=ORDINANCE&Year=2026",
+        """
+        <html><body>
+          <table>
+            <tbody>
+              <tr>
+                <td>III</td>
+                <td>SINDH PUBLIC ORDER ORDINANCE, 2026</td>
+                <td><a href="/setup/publications/PUB-26-ORD-003.pdf">Download</a></td>
+                <td>Mar 12, 2026</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/setup/publications/PUB-26-ORD-003.pdf",
+        text_pdf_bytes("SINDH PUBLIC ORDER ORDINANCE, 2026"),
+        content_type="application/pdf",
+    )
+
+    source = await _sindh_assembly_source(db, fixture_server, ["/"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=60)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/Gazette.aspx?pg=ORDINANCE" in fixture_server.hits
+    assert "/GazetteDetail.aspx?X=ORDINANCE&Year=2026" in fixture_server.hits
+    assert "/setup/publications/PUB-26-ORD-003.pdf" in fixture_server.hits
+
+    pdf_url = fixture_server.url("/setup/publications/PUB-26-ORD-003.pdf")
+    instrument_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"instrument:{pdf_url}",
+            )
+        )
+    ).scalars().first()
+    statute_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"statute:{pdf_url}",
+            )
+        )
+    ).scalars().first()
+    assert statute_row is None
+    assert instrument_row is not None
+    assert instrument_row.query_json["kind"] == "instrument"
+    assert instrument_row.query_json["route"]["source_section"] == "ordinances"
+    assert instrument_row.query_json["route"]["act_type"] == "ordinance"
+    assert instrument_row.query_json["route"]["detail_url"].endswith("/GazetteDetail.aspx?X=ORDINANCE&Year=2026")
+
+    prov = (
+        await db.execute(
+            select(SourceProvenance).where(
+                SourceProvenance.source_name == "SindhAssembly",
+                SourceProvenance.source_url == pdf_url,
+                SourceProvenance.content_kind == "pdf",
+            )
+        )
+    ).scalars().first()
+    assert prov is not None
+    assert prov.route_json["source_section"] == "ordinances"
+    assert prov.route_json["act_type"] == "ordinance"
+
+
 async def test_sindhlaws_pdf_signature_gate_retires_non_pdf_candidate(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(
@@ -388,6 +532,56 @@ async def test_sindhlaws_pdf_signature_gate_retires_non_pdf_candidate(db, fixtur
     assert row is not None
     assert row.status == "retired"
     assert "missing %PDF signature for statute document URL" in (row.last_error or "")
+
+
+async def test_sindhlaws_ordinance_non_pdf_candidate_fails_closed_as_instrument(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add("/", "<html><body><a href='/Gazette.aspx?pg=ORDINANCE'>Ordinances</a></body></html>")
+    fixture_server.add(
+        "/Gazette.aspx?pg=ORDINANCE",
+        "<html><body><a href='/GazetteDetail.aspx?X=ORDINANCE&Year=2026'>2026</a></body></html>",
+    )
+    fixture_server.add(
+        "/GazetteDetail.aspx?X=ORDINANCE&Year=2026",
+        """
+        <html><body>
+          <table>
+            <tbody>
+              <tr><td>V</td><td>FAKE ORDINANCE, 2026</td><td><a href="/setup/publications/fake-ordinance.pdf">Download</a></td><td>Mar 14, 2026</td></tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/setup/publications/fake-ordinance.pdf", "<html>not-a-pdf</html>", content_type="application/pdf")
+
+    source = await _sindh_assembly_source(db, fixture_server, ["/"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    staged = (
+        await db.execute(
+            select(func.count())
+            .select_from(StatutesStaging)
+            .where(StatutesStaging.source_name == "SindhAssembly")
+        )
+    ).scalar()
+    assert staged == 0
+
+    document_url = fixture_server.url("/setup/publications/fake-ordinance.pdf")
+    row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert row is not None
+    assert row.status == "retired"
+    assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
 
 
 async def test_sindhlaws_rerun_is_idempotent_without_duplicate_frontier_keys(db, fixture_server):
@@ -453,3 +647,57 @@ async def test_sindhlaws_rerun_is_idempotent_without_duplicate_frontier_keys(db,
         )
     ).scalar()
     assert total == len(set(keys_after))
+
+
+async def test_sindhlaws_ordinance_rerun_remains_idempotent_with_instrument_key(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add("/", "<html><body><a href='/Gazette.aspx?pg=ORDINANCE'>Ordinances</a></body></html>")
+    fixture_server.add(
+        "/Gazette.aspx?pg=ORDINANCE",
+        "<html><body><a href='/GazetteDetail.aspx?X=ORDINANCE&Year=2025'>2025</a></body></html>",
+    )
+    fixture_server.add(
+        "/GazetteDetail.aspx?X=ORDINANCE&Year=2025",
+        """
+        <html><body>
+          <table>
+            <tbody>
+              <tr><td>IX</td><td>SINDH SAMPLE ORDINANCE, 2025</td><td><a href="/setup/publications/PUB-25-ORD-009.pdf">Download</a></td><td>Sep 2, 2025</td></tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/setup/publications/PUB-25-ORD-009.pdf", text_pdf_bytes("SINDH SAMPLE ORDINANCE, 2025"), content_type="application/pdf")
+
+    source = await _sindh_assembly_source(db, fixture_server, ["/"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    keys_before = (
+        await db.execute(
+            select(CrawlFrontier.query_key).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+            )
+        )
+    ).scalars().all()
+
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    keys_after = (
+        await db.execute(
+            select(CrawlFrontier.query_key).where(
+                CrawlFrontier.source_name == "SindhAssembly",
+            )
+        )
+    ).scalars().all()
+
+    assert len(keys_before) == len(keys_after)
+    assert set(keys_before) == set(keys_after)
+
+    doc_url = fixture_server.url("/setup/publications/PUB-25-ORD-009.pdf")
+    assert f"instrument:{doc_url}" in set(keys_after)
+    assert f"statute:{doc_url}" not in set(keys_after)
