@@ -35,7 +35,7 @@ DEFAULT_LISTINGS = [
     "https://opc.lhc.gov.pk/Relevant_Laws.aspx",
 ]
 
-DOC_HINT_RE = re.compile(r"(?i)(judg|judgement|judgment|vs\b|\bv\.?\s|writ|petition|appeal|case|scmr|pld|clc|cld|mld|ylr|pdf)")
+DOC_HINT_RE = re.compile(r"(?i)(judg|judgement|judgment|vs\b|\bv\.?\s|writ|petition|appeal|case|scmr|pld|clc|cld|mld|ylr|wp[_-]|\bwp\b|crl)")
 LAW_HINT_RE = re.compile(r"(?i)(constitution|citizenship|opc\s*act|commission\s*act|act\s+\d{4})")
 DOC_EXCLUDE_RE = re.compile(r"(?i)(pendency|institution|disposal|summary)")
 WAYBACK_RE = re.compile(r"/web/\d+[a-z_]{0,6}/(https?://.+)$", re.I)
@@ -77,14 +77,12 @@ def normalize_lhc_public_url(raw: str, *, base_url: str) -> Optional[str]:
     joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
     parts = urlsplit(joined)
     host = (parts.hostname or "").lower()
-    if host and host not in PUBLIC_HOST_ALIASES:
-        return None
 
     scheme = parts.scheme or "https"
     if host == "sys.lhc.gov.pk":
         # sys.lhc.gov.pk is served over HTTP on many networks.
         scheme = "http"
-    elif host:
+    elif host in PUBLIC_HOST_ALIASES:
         scheme = "https"
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query = (parts.query or "").replace(" ", "%20")
@@ -144,7 +142,7 @@ def _is_judgment_pdf(url: str, *, hint_text: str) -> bool:
     if LAW_HINT_RE.search(clue_low) and not DOC_HINT_RE.search(clue_low):
         return False
     compact = re.sub(r"[^a-z0-9]+", "", clue_low)
-    if any(marker in compact for marker in ("scmr", "pld", "clc", "cld", "mld", "ylr", "vs")):
+    if any(marker in compact for marker in ("scmr", "pld", "clc", "cld", "mld", "ylr", "vs", "wp", "crl")):
         return True
     return bool(DOC_HINT_RE.search(clue_low))
 
@@ -164,7 +162,7 @@ def _looks_like_lhc_result_listing(url: str, html_text: str) -> bool:
     if not path.endswith("/relevant_laws.aspx"):
         return False
     low = (html_text or "").lower()
-    return "laws & judgements" in low and "<ol" in low and "pdf/" in low
+    return "<li" in low and ".pdf" in low
 
 
 class LahoreHighCourtPipeline(PublicPipeline):
