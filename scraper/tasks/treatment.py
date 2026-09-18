@@ -79,18 +79,18 @@ def _evidence_snippet(text: str, start: int, end: int, *, window: int = 70) -> s
     return _norm_ws(text[max(0, start - window) : min(len(text), end + window)])
 
 
-def _citation_target_key(cited_citation: Optional[str]) -> Optional[str]:
-    hits = extract_citations(cited_citation or "")
-    if not hits:
-        return None
-    hit = hits[0]
+def _citation_target_key(hit: Dict[str, Any]) -> Optional[str]:
     reporter = str(hit.get("reporter") or "").upper()
     year = hit.get("year")
     page = str(hit.get("page") or "").upper()
     if not reporter or not year or not page:
         return None
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        return None
     court = re.sub(r"[^A-Z0-9]+", "", str(hit.get("court") or "").upper()) or "-"
-    return f"{reporter}:{int(year)}:{court}:{page}"
+    return f"{reporter}:{year}:{court}:{page}"
 
 
 def _collect_citation_mentions(text: str) -> List[Dict[str, Any]]:
@@ -100,10 +100,11 @@ def _collect_citation_mentions(text: str) -> List[Dict[str, Any]]:
         normalized = str(hit.get("normalized") or normalise_citation(raw)).strip()
         if not raw or not normalized:
             continue
-        key = _citation_target_key(normalized)
+        key = _citation_target_key(hit)
         if not key:
             continue
-        spans = [m.span() for m in re.finditer(re.escape(raw), text)] or [tuple(hit.get("span") or (0, 0))]
+        span_pattern = re.compile(rf"{re.escape(raw)}(?!\w)")
+        spans = [m.span() for m in span_pattern.finditer(text)] or [tuple(hit.get("span") or (0, 0))]
         for span in spans:
             try:
                 start, end = int(span[0]), int(span[1])
