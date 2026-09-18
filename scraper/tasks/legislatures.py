@@ -63,6 +63,9 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
     "GazetteOfPakistan": [
         {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
         {"url": "http://pcp.gov.pk/WeeklyNitifications", "target_kind": "instrument"},
+        {"url": "http://pcp.gov.pk/WeeklyNotifications", "target_kind": "instrument"},
+        {"url": "http://pcp.gov.pk/gazette", "target_kind": "instrument"},
+        {"url": "http://pcp.gov.pk/gazette/", "target_kind": "instrument"},
     ],
 }
 
@@ -112,7 +115,7 @@ SENATE_DETAIL_PATH_RE = re.compile(r"(?i)^/en/essence\.php$")
 PCP_HOST = "pcp.gov.pk"
 PCP_HOST_ALIASES = (PCP_HOST, "www.pcp.gov.pk")
 PCP_DOC_RE = re.compile(r"(?i)^/siteimage/downloads/.+\.(pdf|doc|docx|html?)$")
-PCP_LISTING_PATH_RE = re.compile(r"(?i)^/(download|weeklynitifications|gazette)/?$")
+PCP_LISTING_PATH_RE = re.compile(r"(?i)^/(download|weeklynitifications|weeklynotifications|gazette)/?$")
 PCP_DETAIL_PATH_RE = re.compile(r"(?i)^/detail/[^/?#]+/?$")
 
 
@@ -2715,7 +2718,7 @@ class GazetteOfPakistanPipeline(BalochistanAssemblyPipeline):
         path = (urlsplit(url).path or "").lower()
         if path.endswith("/download"):
             return "download_notifications"
-        if path.endswith("/weeklynitifications"):
+        if path.endswith("/weeklynitifications") or path.endswith("/weeklynotifications"):
             return "weekly_notifications"
         if PCP_DETAIL_PATH_RE.search(path):
             return "detail"
