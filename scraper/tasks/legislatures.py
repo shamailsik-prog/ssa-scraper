@@ -816,7 +816,7 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
     def _is_punjablaws_detail_listing(url: str) -> bool:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
-        if host not in PUNJABLAWS_HOST_ALIASES:
+        if host not in PUNJABLAWS_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
             return False
         path = (parts.path or "/").lower()
         if PUNJABLAWS_LISTING_PATH_RE.search(path):
@@ -884,7 +884,8 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         docs: Dict[str, Dict[str, Any]],
         listings: Dict[str, Dict[str, Any]],
     ) -> None:
-        if (urlsplit(base_url).hostname or "").lower() not in PUNJABLAWS_HOST_ALIASES:
+        host = (urlsplit(base_url).hostname or "").lower()
+        if host not in PUNJABLAWS_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
             return
         soup = BeautifulSoup(html_text or "", "html.parser")
         row_index = 0
@@ -1120,13 +1121,14 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
             host = (urlsplit(safe).hostname or "").lower()
+            host_is_punjablaws_like = host in PUNJABLAWS_HOST_ALIASES or host in ("127.0.0.1", "localhost")
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
             meta = {
                 "discovery_hint": hint[:240],
                 "pdf_endpoint_kind": (
                     "uploads-acts-file"
                     if path.startswith("/uploads/acts/")
-                    else ("punjablaws-download-file" if host in PUNJABLAWS_HOST_ALIASES and "/download" in path else "direct-file")
+                    else ("punjablaws-download-file" if host_is_punjablaws_like and "/download" in path else "direct-file")
                 ),
                 **route_meta,
             }
