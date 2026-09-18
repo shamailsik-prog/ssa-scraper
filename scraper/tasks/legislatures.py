@@ -80,6 +80,9 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
     "BalochistanAssembly": [
         {"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"},
         {"url": "https://balochistancode.gob.pk/laws_rules.aspx?opento=1&wise=srbdl", "target_kind": "statute"},
+        {"url": "https://www.pabalochistan.gov.pk/ordinance-laid", "target_kind": "instrument"},
+        {"url": "https://www.pabalochistan.gov.pk/bills", "target_kind": "instrument"},
+        {"url": "https://www.pabalochistan.gov.pk/notifications", "target_kind": "instrument"},
     ],
     "GazetteOfPakistan": [
         {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
@@ -97,7 +100,7 @@ PAB_HOST_ALIASES = (PAB_HOST, "www.pabalochistan.gov.pk")
 BALOCHISTAN_CODE_HOST = "balochistancode.gob.pk"
 BALOCHISTAN_CODE_HOST_ALIASES = (BALOCHISTAN_CODE_HOST, f"www.{BALOCHISTAN_CODE_HOST}")
 STORAGE_DOC_RE = re.compile(r"(?i)^/storage/\d+/.+\.(pdf|doc|docx)$")
-PAB_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|public/acts/?|index\.php/acts/?|public/index\.php/acts/?)$")
+PAB_LISTING_PATH_RE = re.compile(r"(?i)^/(?:public/)?(?:index\.php/)?(?:acts?|ordinance-laid|bills?|notifications?)/?$")
 BALOCHISTAN_CODE_DOC_RE = re.compile(r"(?i)^/.+\.(pdf|doc|docx)$")
 BALOCHISTAN_CODE_LISTING_PATH_RE = re.compile(r"(?i)^/(|home\.aspx|laws_rules\.aspx)$")
 BALOCHISTAN_CODE_DETAIL_PATH_RE = re.compile(r"(?i)^/document\.aspx$")
@@ -604,11 +607,20 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 },
             )
         else:
+            page_source_section = self._pab_source_section_for_url(res.final_url)
+            inherited_meta.setdefault("source_section", page_source_section)
             self._collect_structured_act_rows(
                 html_text=res.text,
                 base_url=res.final_url,
                 docs=docs,
             )
+            if page_source_section != "acts":
+                self._collect_direct_document_links(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    route_meta=inherited_meta,
+                )
             self._collect_listing_links(
                 html_text=res.text,
                 base_url=res.final_url,
@@ -742,6 +754,17 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                             listings={},
                             route_meta=row_meta,
                         )
+
+    @staticmethod
+    def _pab_source_section_for_url(url: str) -> str:
+        path = (urlsplit(url).path or "/").lower()
+        if "ordinance-laid" in path:
+            return "ordinances"
+        if "bill" in path:
+            return "bills"
+        if "notification" in path:
+            return "notifications"
+        return "acts"
 
     @staticmethod
     def _is_balochistan_code_url(url: str) -> bool:
@@ -964,6 +987,25 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 base_url=base_url,
                 docs={},
                 listings=listings,
+                route_meta=dict(route_meta or {}),
+            )
+
+    def _collect_direct_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        route_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
                 route_meta=dict(route_meta or {}),
             )
 
