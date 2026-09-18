@@ -92,6 +92,11 @@ PAS_HOST_ALIASES = (PAS_HOST, "www.pas.gov.pk")
 PAS_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|doc|docx|html?)$")
 PAS_LISTING_PATH_RE = re.compile(r"(?i)^/index\.php/acts/?$")
 PAS_DETAIL_PATH_RE = re.compile(r"(?i)^/index\.php/acts/details/\d+/\d+/?$")
+SINDHLAWS_HOST = "sindhlaws.gov.pk"
+SINDHLAWS_HOST_ALIASES = (SINDHLAWS_HOST, f"www.{SINDHLAWS_HOST}")
+SINDHLAWS_DOC_RE = re.compile(r"(?i)^/setup/(publications|library)/.+\.(pdf|doc|docx|html?)$")
+SINDHLAWS_LISTING_PATH_RE = re.compile(r"(?i)^/(|index\.aspx|gazette\.aspx|library\.aspx)$")
+SINDHLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/gazettedetail\.aspx$")
 PAKP_HOST = "pakp.gov.pk"
 PAKP_HOST_ALIASES = (PAKP_HOST, "www.pakp.gov.pk")
 PAKP_ACT_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx|html?)$")
@@ -202,7 +207,7 @@ def normalize_punjab_public_url(raw: str, *, base_url: str) -> Optional[str]:
 
 
 def normalize_pas_public_url(raw: str, *, base_url: str) -> Optional[str]:
-    """Normalize discovered candidates onto official public PAS hosts."""
+    """Normalize discovered candidates onto official public Sindh hosts."""
     if not raw:
         return None
     candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
@@ -220,6 +225,9 @@ def normalize_pas_public_url(raw: str, *, base_url: str) -> Optional[str]:
     if host in PAS_HOST_ALIASES:
         scheme = "https"
         netloc = PAS_HOST + (f":{parts.port}" if parts.port else "")
+    elif host in SINDHLAWS_HOST_ALIASES:
+        scheme = "https"
+        netloc = SINDHLAWS_HOST + (f":{parts.port}" if parts.port else "")
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query = (parts.query or "").replace(" ", "%20")
     return urlunsplit((scheme, netloc, path, query, ""))
@@ -390,10 +398,32 @@ def _classify_punjab_discovered_url(url: str, *, hint_text: str = "") -> Optiona
 
 
 def _classify_pas_discovered_url(url: str) -> Optional[str]:
-    path = (urlsplit(url).path or "/").lower()
-    if PAS_ACT_DOC_RE.search(path):
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    host = (parts.hostname or "").lower()
+    query = (parts.query or "").lower()
+    host_is_local_fixture = host in ("127.0.0.1", "localhost")
+    if host in PAS_HOST_ALIASES or (host_is_local_fixture and (PAS_ACT_DOC_RE.search(path) or PAS_LISTING_PATH_RE.search(path) or PAS_DETAIL_PATH_RE.search(path))):
+        if PAS_ACT_DOC_RE.search(path):
+            return "document"
+        if PAS_LISTING_PATH_RE.search(path) or PAS_DETAIL_PATH_RE.search(path):
+            return "listing"
+    if host not in SINDHLAWS_HOST_ALIASES and not host_is_local_fixture:
+        return None
+    if SINDHLAWS_DOC_RE.search(path):
         return "document"
-    if PAS_LISTING_PATH_RE.search(path) or PAS_DETAIL_PATH_RE.search(path):
+    if SINDHLAWS_DETAIL_PATH_RE.search(path):
+        if "x=" in query and "year=" in query:
+            return "listing"
+        if host_is_local_fixture:
+            return "listing"
+    if SINDHLAWS_LISTING_PATH_RE.search(path):
+        if path == "/gazette.aspx":
+            if any(f"pg={section}" in query for section in ("act", "ordinance", "bills")):
+                return "listing"
+            if host_is_local_fixture:
+                return "listing"
+            return None
         return "listing"
     return None
 
@@ -1213,7 +1243,7 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
 
 
 class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
-    """Source-specific extraction for PAS listing rows + detail-page act file routing."""
+    """Source-specific extraction for PAS + SindhLaws listing/detail document routing."""
 
     async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
         depth = int(fr.query_json.get("depth", 0))
@@ -1236,6 +1266,12 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                 base_url=res.final_url,
                 listings=listings,
             )
+            self._collect_sindhlaws_listing_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+                inherited_meta=inherited_meta,
+            )
 
         added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
         self.stats["discovered"] += added
@@ -1257,6 +1293,8 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                 route = {"listing": res.final_url}
                 for key_name in (
                     "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
                     "result_index",
                     "source_section",
                     "act_year",
@@ -1264,7 +1302,9 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                     "act_title",
                     "act_passed_on",
                     "act_assented_on",
+                    "act_type",
                     "detail_url",
+                    "detail_title",
                 ):
                     if key_name in nmeta:
                         route[key_name] = nmeta[key_name]
@@ -1290,7 +1330,58 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
 
     @staticmethod
     def _is_detail_listing(url: str) -> bool:
-        return PAS_DETAIL_PATH_RE.search((urlsplit(url).path or "").lower()) is not None
+        parts = urlsplit(url)
+        path = (parts.path or "").lower()
+        host = (parts.hostname or "").lower()
+        host_is_local_fixture = host in ("127.0.0.1", "localhost")
+        if PAS_DETAIL_PATH_RE.search(path):
+            return True
+        if (host in SINDHLAWS_HOST_ALIASES or host_is_local_fixture) and SINDHLAWS_DETAIL_PATH_RE.search(path):
+            return True
+        return False
+
+    @staticmethod
+    def _sindhlaws_source_section(url: str) -> Optional[str]:
+        parts = urlsplit(url)
+        query = {key.lower(): value for key, value in parse_qs(parts.query or "").items()}
+        section_raw = ""
+        if query.get("pg"):
+            section_raw = str(query["pg"][0])
+        elif query.get("x"):
+            section_raw = str(query["x"][0])
+        section = section_raw.strip().lower()
+        if section == "act":
+            return "acts"
+        if section == "ordinance":
+            return "ordinances"
+        if section in ("bill", "bills"):
+            return "bills"
+        return None
+
+    @staticmethod
+    def _sindhlaws_year(url: str) -> Optional[str]:
+        parts = urlsplit(url)
+        query = {key.lower(): value for key, value in parse_qs(parts.query or "").items()}
+        year = (query.get("year") or [""])[0]
+        year_text = str(year).strip()
+        if YEAR_RE.fullmatch(year_text):
+            return year_text
+        return None
+
+    @staticmethod
+    def _is_sindhlaws_listing(url: str) -> bool:
+        parts = urlsplit(url)
+        path = (parts.path or "/").lower()
+        host = (parts.hostname or "").lower()
+        host_is_local_fixture = host in ("127.0.0.1", "localhost")
+        if host not in SINDHLAWS_HOST_ALIASES and not host_is_local_fixture:
+            return False
+        if not SINDHLAWS_LISTING_PATH_RE.search(path):
+            return False
+        if path == "/gazette.aspx":
+            query = (parts.query or "").lower()
+            return any(f"pg={section}" in query for section in ("act", "ordinance", "bills")) or host_is_local_fixture
+        return True
 
     def _collect_structured_listing_rows(self, *, html_text: str, base_url: str, listings: Dict[str, Dict[str, Any]]) -> None:
         soup = BeautifulSoup(html_text or "", "html.parser")
@@ -1381,6 +1472,14 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         docs: Dict[str, Dict[str, Any]],
         inherited_meta: Dict[str, Any],
     ) -> None:
+        if self._is_sindhlaws_detail_listing(base_url):
+            self._collect_sindhlaws_detail_document_links(
+                html_text=html_text,
+                base_url=base_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+            return
         soup = BeautifulSoup(html_text or "", "html.parser")
         detail_title = (soup.select_one("h2.act-title") or soup.select_one("h1") or soup.select_one("title"))
         detail_title_text = detail_title.get_text(" ", strip=True)[:280] if detail_title else ""
@@ -1417,6 +1516,118 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
             route_meta["discovery_channel"] = "act-detail-file-link"
             self._capture_candidate(raw=a.get("href", ""), hint=hint, base_url=base_url, docs=docs, listings={}, route_meta=route_meta)
 
+    @staticmethod
+    def _is_sindhlaws_detail_listing(url: str) -> bool:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        host_is_local_fixture = host in ("127.0.0.1", "localhost")
+        if host not in SINDHLAWS_HOST_ALIASES and not host_is_local_fixture:
+            return False
+        return SINDHLAWS_DETAIL_PATH_RE.search((parts.path or "").lower()) is not None
+
+    def _collect_sindhlaws_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        if not self._is_sindhlaws_listing(base_url):
+            return
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "")
+            if not href:
+                continue
+            row_index += 1
+            joined = urljoin(base_url, href)
+            section = self._sindhlaws_source_section(joined) or self._sindhlaws_source_section(base_url) or inherited_meta.get("source_section") or "acts"
+            route_meta: Dict[str, Any] = {
+                **inherited_meta,
+                "listing_fetch": "gazette_navigation",
+                "discovery_channel": "gazette-navigation-link",
+                "result_index": row_index,
+                "source_section": section,
+            }
+            year = self._sindhlaws_year(joined)
+            if year:
+                route_meta["act_year"] = year
+                route_meta["discovery_channel"] = "gazette-year-link"
+                route_meta["listing_fetch"] = "gazette_year_grid"
+            if self._is_sindhlaws_detail_listing(joined):
+                route_meta.setdefault("detail_url", joined)
+            self._capture_candidate(
+                raw=href,
+                hint=anchor.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs={},
+                listings=listings,
+                route_meta=route_meta,
+            )
+
+    def _collect_sindhlaws_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        section = self._sindhlaws_source_section(base_url) or inherited_meta.get("source_section") or "acts"
+        detail_year = self._sindhlaws_year(base_url)
+        base_meta = dict(inherited_meta)
+        base_meta["detail_url"] = base_url
+        base_meta.setdefault("source_section", section)
+        if detail_year and "act_year" not in base_meta:
+            base_meta["act_year"] = detail_year
+        if detail_title:
+            base_meta.setdefault("detail_title", detail_title)
+
+        row_index = 0
+        for row in soup.select("table tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            link = row.find("a", href=True)
+            if link is None:
+                continue
+            row_index += 1
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "gazette_detail_table"
+            route_meta["discovery_channel"] = "gazette-detail-row"
+            route_meta["result_index"] = row_index
+
+            serial = cells[0].get_text(" ", strip=True)
+            if serial and "act_no" not in route_meta:
+                route_meta["act_no"] = serial[:80]
+            title = cells[1].get_text(" ", strip=True)
+            if title:
+                route_meta["act_title"] = title[:280]
+                if "act_year" not in route_meta and YEAR_RE.search(title):
+                    route_meta["act_year"] = YEAR_RE.search(title).group(0)  # type: ignore[union-attr]
+            if len(cells) > 3:
+                publication_date = cells[3].get_text(" ", strip=True)
+                if publication_date:
+                    route_meta.setdefault("act_passed_on", publication_date[:40])
+                    if "act_year" not in route_meta and YEAR_RE.search(publication_date):
+                        route_meta["act_year"] = YEAR_RE.search(publication_date).group(0)  # type: ignore[union-attr]
+            if "act_type" not in route_meta:
+                route_meta["act_type"] = "act" if section == "acts" else section.rstrip("s")
+
+            self._capture_candidate(
+                raw=link.get("href", ""),
+                hint=link.get_text(" ", strip=True)[:240] or title[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
     def _capture_candidate(
         self,
         *,
@@ -1445,9 +1656,17 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            if path.startswith("/uploads/acts/"):
+                pdf_endpoint_kind = "uploads-acts-file"
+            elif path.startswith("/setup/publications/"):
+                pdf_endpoint_kind = "setup-publications-file"
+            elif path.startswith("/setup/library/"):
+                pdf_endpoint_kind = "setup-library-file"
+            else:
+                pdf_endpoint_kind = "direct-file"
             meta = {
                 "discovery_hint": hint[:240],
-                "pdf_endpoint_kind": "uploads-acts-file" if path.startswith("/uploads/acts/") else "direct-file",
+                "pdf_endpoint_kind": pdf_endpoint_kind,
                 **route_meta,
             }
             if ext and "document_format" not in meta:
