@@ -47,11 +47,14 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
     "Senate": [
         {"url": "https://senate.gov.pk/en/acts.php?id=-1&catid=186&subcatid=285&cattitle=Acts", "target_kind": "statute"},
         {"url": "https://senate.gov.pk/en/ordinance.php?id=-1&catid=186&subcatid=304&cattitle=Ordinances", "target_kind": "instrument"},
-        {"url": "https://senate.gov.pk/en/pbs.php?&catid=186&subcatid=276&leftcatid=278&cattitle=Bills", "target_kind": "instrument"},
-        {"url": "https://senate.gov.pk/en/pbna.php?&catid=186&subcatid=276&leftcatid=278&cattitle=Bills", "target_kind": "instrument"},
-        {"url": "https://senate.gov.pk/en/gbs.php?&catid=186&subcatid=276&leftcatid=279&cattitle=Bills", "target_kind": "instrument"},
-        {"url": "https://senate.gov.pk/en/gbna.php?&catid=186&subcatid=276&leftcatid=279&cattitle=Bills", "target_kind": "instrument"},
-        {"url": "https://senate.gov.pk/en/bs.php?&catid=186&subcatid=276&leftcatid=368&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/bills.php?id=-1&catid=186&subcatid=276&leftcatid=278&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/bills.php?id=-1&catid=186&subcatid=276&leftcatid=279&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/bills.php?id=-1&catid=186&subcatid=276&leftcatid=368&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/pbs.php?catid=186&subcatid=276&leftcatid=278&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/pbna.php?catid=186&subcatid=276&leftcatid=278&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/gbs.php?catid=186&subcatid=276&leftcatid=279&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/gbna.php?catid=186&subcatid=276&leftcatid=279&cattitle=Bills", "target_kind": "instrument"},
+        {"url": "https://senate.gov.pk/en/bs.php?catid=186&subcatid=276&leftcatid=368&cattitle=Bills", "target_kind": "instrument"},
     ],
     "PunjabAssembly": [{"url": "https://www.pap.gov.pk/acts", "target_kind": "statute"}, {"url": "https://punjablaws.gov.pk/index.html", "target_kind": "statute"}],
     "SindhAssembly": [{"url": "https://www.pas.gov.pk/index.php/acts", "target_kind": "statute"}, {"url": "https://sindhlaws.gov.pk/", "target_kind": "statute"}],
@@ -224,7 +227,7 @@ def normalize_senate_public_url(raw: str, *, base_url: str) -> Optional[str]:
         scheme = "https"
         netloc = SENATE_HOST + (f":{parts.port}" if parts.port else "")
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
-    query = (parts.query or "").replace(" ", "%20")
+    query = "&".join(part for part in re.split(r"[?&]+", (parts.query or "").replace(" ", "%20")) if part)
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
