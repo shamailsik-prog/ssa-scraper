@@ -382,11 +382,10 @@ async def test_instrument_section_relation_graph_extracts_amendment_operations(d
     THE GAZETTE OF PAKISTAN EXTRAORDINARY
     ACT No. XXVIII of 2025
     An Act further to amend the Pakistan Penal Code, 1860.
-    In the Pakistan Penal Code, 1860, section 302 shall be substituted.
+    2. Amendment of section 302 of the Pakistan Penal Code, 1860.- In the Pakistan Penal Code, 1860, for section 302, the following shall be substituted.
     In the Pakistan Penal Code, 1860, section 304 shall be omitted.
-    In the Pakistan Penal Code, 1860, section 299A shall be inserted after section 299.
+    In the Pakistan Penal Code, 1860, after section 299, the following new section shall be inserted, namely:— 299A.
     In the Pakistan Penal Code, 1860, section 500 is hereby repealed.
-    In the Pakistan Penal Code, 1860, section 302 shall be substituted.
     """
     prov = await record_provenance(
         db,
