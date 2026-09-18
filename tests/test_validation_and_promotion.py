@@ -16,7 +16,6 @@ from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, Q
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
-from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging
 from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
 from scraper.tasks.treatment import classify_deterministic, classify_judgment, reconcile_treatment_citation_links
