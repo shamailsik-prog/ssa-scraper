@@ -84,6 +84,11 @@ PAKP_HOST_ALIASES = (PAKP_HOST, "www.pakp.gov.pk")
 PAKP_ACT_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx|html?)$")
 PAKP_LISTING_PATH_RE = re.compile(r"(?i)^/(act|acts)/?$")
 PAKP_DETAIL_PATH_RE = re.compile(r"(?i)^/act/[^/?#]+/?$")
+KPCODE_HOST = "kpcode.kp.gov.pk"
+KPCODE_HOST_ALIASES = (KPCODE_HOST, "www.kpcode.kp.gov.pk")
+KPCODE_DOC_RE = re.compile(r"(?i)^/uploads/.+\.(pdf|doc|docx|html?)$")
+KPCODE_LAW_DETAIL_RE = re.compile(r"(?i)^/homepage/lawdetails/\d+/?$")
+KPCODE_RULE_DETAIL_RE = re.compile(r"(?i)^/homepage/ruledetails/\d+/?$")
 NA_HOST = "na.gov.pk"
 NA_HOST_ALIASES = (NA_HOST, "www.na.gov.pk")
 NA_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
@@ -204,6 +209,30 @@ def normalize_pakp_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_kpcode_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public KPCODE hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in KPCODE_HOST_ALIASES:
+        scheme = "https"
+        netloc = KPCODE_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def normalize_senate_public_url(raw: str, *, base_url: str) -> Optional[str]:
     """Normalize discovered candidates onto official public Senate hosts."""
     if not raw:
@@ -307,6 +336,25 @@ def _classify_pakp_discovered_url(url: str) -> Optional[str]:
     if PAKP_ACT_DOC_RE.search(path):
         return "document"
     if PAKP_LISTING_PATH_RE.search(path) or PAKP_DETAIL_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_kpcode_discovered_url(url: str) -> Optional[str]:
+    path = (urlsplit(url).path or "/").lower()
+    if KPCODE_DOC_RE.search(path):
+        return "document"
+    if path in ("/", "/homepage", "/homepage/"):
+        return "listing"
+    if KPCODE_LAW_DETAIL_RE.search(path) or KPCODE_RULE_DETAIL_RE.search(path):
+        return "listing"
+    if path.startswith("/homepage/list_all_law"):
+        return "listing"
+    if path.startswith(("/homepage/latest_more", "/homepage/recent_updated", "/homepage/most_view")):
+        return "listing"
+    if path.startswith(("/homepage/alphabetical", "/homepage/chronological", "/homepage/categorical", "/homepage/dept_wise", "/homepage/rules", "/homepage/urdu")):
+        return "listing"
+    if path.startswith(("/homepage/search_by_year/", "/homepage/search_by_category/", "/homepage/search_by_dept/", "/homepage/search_by_year_rule/")):
         return "listing"
     return None
 
@@ -541,7 +589,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
     ) -> int:
         added = 0
         for url, meta in docs.items():
-            kind = default_target_kind
+            kind = str(meta.get("target_kind") or default_target_kind)
             key = f"{kind}:{url}"
             exists = (
                 await self.db.execute(
@@ -1062,7 +1110,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
 
 
 class KPAssemblyPipeline(BalochistanAssemblyPipeline):
-    """Source-specific extraction for PAKP acts table rows + detail-page document routing."""
+    """Source-specific extraction for PAKP + KPCode statutes/rules detail-page document routing."""
 
     async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
         depth = int(fr.query_json.get("depth", 0))
@@ -1072,20 +1120,36 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
         listings: Dict[str, Dict[str, Any]] = {}
         inherited_meta = dict(fr.query_json.get("meta") or {})
 
-        if self._is_detail_listing(res.final_url):
-            self._collect_detail_document_links(
-                html_text=res.text,
-                base_url=res.final_url,
-                docs=docs,
-                inherited_meta=inherited_meta,
-            )
+        if self._is_kpcode_url(res.final_url):
+            if self._is_detail_listing(res.final_url):
+                self._collect_kpcode_detail_document_links(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    inherited_meta=inherited_meta,
+                )
+            else:
+                self._collect_kpcode_listing_rows(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    listings=listings,
+                )
         else:
-            self._collect_structured_listing_rows(
-                html_text=res.text,
-                base_url=res.final_url,
-                docs=docs,
-                listings=listings,
-            )
+            if self._is_detail_listing(res.final_url):
+                self._collect_detail_document_links(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    inherited_meta=inherited_meta,
+                )
+            else:
+                self._collect_structured_listing_rows(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    listings=listings,
+                )
 
         added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
         self.stats["discovered"] += added
@@ -1114,10 +1178,15 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
                     "act_title",
                     "act_passed_on",
                     "act_assented_on",
+                    "act_type",
                     "detail_url",
+                    "detail_category",
+                    "detail_department",
+                    "detail_specific_category",
                 ):
                     if key_name in nmeta:
                         route[key_name] = nmeta[key_name]
+                next_target_kind = nmeta.get("target_kind", target_kind)
                 self.db.add(
                     CrawlFrontier(
                         source_name=self.source.source_name,
@@ -1126,7 +1195,7 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
                         query_json={
                             "kind": "listing",
                             "url": nurl,
-                            "target_kind": target_kind,
+                            "target_kind": next_target_kind,
                             "depth": depth + 1,
                             "route": route,
                             "meta": nmeta,
@@ -1140,7 +1209,12 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
 
     @staticmethod
     def _is_detail_listing(url: str) -> bool:
-        return PAKP_DETAIL_PATH_RE.search((urlsplit(url).path or "").lower()) is not None
+        path = (urlsplit(url).path or "").lower()
+        return PAKP_DETAIL_PATH_RE.search(path) is not None or KPCODE_LAW_DETAIL_RE.search(path) is not None or KPCODE_RULE_DETAIL_RE.search(path) is not None
+
+    @staticmethod
+    def _is_kpcode_url(url: str) -> bool:
+        return (urlsplit(url).hostname or "").lower() in KPCODE_HOST_ALIASES
 
     def _collect_structured_listing_rows(
         self,
@@ -1293,6 +1367,197 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
                         route_meta=route_meta,
                     )
 
+    @staticmethod
+    def _kpcode_source_section_for_url(url: str) -> str:
+        path = (urlsplit(url).path or "").lower()
+        if "ruledetails" in path or path.startswith("/homepage/rules") or "/search_by_year_rule/" in path:
+            return "rules"
+        if "lawdetails" in path:
+            return "laws"
+        if path.startswith("/homepage/search_by_dept/"):
+            return "department"
+        if path.startswith("/homepage/search_by_category/"):
+            return "category"
+        if path.startswith("/homepage/search_by_year/"):
+            return "year"
+        if path.startswith("/homepage/urdu"):
+            return "urdu"
+        return "acts"
+
+    @staticmethod
+    def _kpcode_target_kind(*, source_section: str, title: str, category: str) -> str:
+        lowered = " ".join((source_section or "", title or "", category or "")).lower()
+        if any(token in lowered for token in ("ordinance", "rules", "rule", "regulation", "notification", "order", "by-law", "bye-law")):
+            return "instrument"
+        return "statute"
+
+    def _collect_kpcode_listing_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        source_section = self._kpcode_source_section_for_url(base_url)
+
+        for block in soup.select("div.artlist"):
+            link = block.select_one("a[href]")
+            if link is None:
+                continue
+            row_index += 1
+            title = link.get_text(" ", strip=True)
+            row_meta: Dict[str, Any] = {
+                "listing_fetch": "kpcode_artlist",
+                "discovery_channel": "kpcode-artlist-row",
+                "source_section": source_section,
+                "result_index": row_index,
+            }
+            if title:
+                row_meta["act_title"] = title[:280]
+                year_match = YEAR_RE.search(title)
+                if year_match:
+                    row_meta["act_year"] = year_match.group(0)
+            details_block = block.find_next_sibling("div", class_=re.compile(r"(?i)\bartdets\b"))
+            if details_block is not None:
+                self._add_kpcode_listing_details(row_meta=row_meta, details_text=details_block.get_text(" ", strip=True))
+            row_meta["target_kind"] = self._kpcode_target_kind(
+                source_section=source_section,
+                title=row_meta.get("act_title", ""),
+                category=row_meta.get("detail_category", ""),
+            )
+            self._capture_candidate(
+                raw=link.get("href", ""),
+                hint=title[:240],
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=row_meta,
+            )
+
+        for anchor in soup.select("a[href]"):
+            hint = anchor.get_text(" ", strip=True)
+            nav_meta: Dict[str, Any] = {
+                "listing_fetch": "kpcode_navigation_links",
+                "source_section": source_section,
+                "target_kind": self._kpcode_target_kind(source_section=source_section, title=hint, category=""),
+            }
+            self._capture_candidate(
+                raw=anchor.get("href", ""),
+                hint=hint[:240],
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=nav_meta,
+            )
+
+    @staticmethod
+    def _add_kpcode_listing_details(*, row_meta: Dict[str, Any], details_text: str) -> None:
+        parts = [p.strip() for p in (details_text or "").split("|") if p.strip()]
+        if parts:
+            row_meta["detail_department"] = parts[0][:160]
+        for part in parts:
+            lowered = part.lower()
+            if ("act no" in lowered or "ordinance no" in lowered or "rule no" in lowered) and "act_no" not in row_meta:
+                row_meta["act_no"] = part[:80]
+            if "promulgation date" in lowered:
+                _, _, rhs = part.partition(":")
+                value = (rhs or part).strip()
+                if value:
+                    row_meta["act_assented_on"] = value[:40]
+            if "year" in lowered and "act_year" not in row_meta:
+                year_match = YEAR_RE.search(part)
+                if year_match:
+                    row_meta["act_year"] = year_match.group(0)
+
+    def _collect_kpcode_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        base_meta.setdefault("source_section", self._kpcode_source_section_for_url(base_url))
+        base_meta.setdefault("detail_fetch", "kpcode_detail_download")
+
+        title = self._extract_kpcode_detail_title(soup)
+        if title:
+            base_meta.setdefault("act_title", title)
+            base_meta.setdefault("detail_title", title)
+            if "act_year" not in base_meta:
+                year_match = YEAR_RE.search(title)
+                if year_match:
+                    base_meta["act_year"] = year_match.group(0)
+
+        for row in soup.select("table tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower().strip(": ")
+            value = cells[1].get_text(" ", strip=True)
+            if not value:
+                continue
+            if "department" in label and "detail_department" not in base_meta:
+                base_meta["detail_department"] = value[:160]
+            elif "main category" in label and "detail_category" not in base_meta:
+                base_meta["detail_category"] = value[:80]
+                base_meta.setdefault("act_type", value[:80].lower())
+            elif "specific category" in label and "detail_specific_category" not in base_meta:
+                base_meta["detail_specific_category"] = value[:280]
+            elif "promulgation" in label and "act_assented_on" not in base_meta:
+                base_meta["act_assented_on"] = value[:40]
+            elif "year" in label and "act_year" not in base_meta:
+                year_match = YEAR_RE.search(value)
+                if year_match:
+                    base_meta["act_year"] = year_match.group(0)
+            if ("act no" in label or "ordinance no" in label or "rule no" in label) and "act_no" not in base_meta:
+                base_meta["act_no"] = value[:80]
+            if "act_year" not in base_meta:
+                year_match = YEAR_RE.search(value)
+                if year_match:
+                    base_meta["act_year"] = year_match.group(0)
+
+        base_meta["target_kind"] = self._kpcode_target_kind(
+            source_section=base_meta.get("source_section", ""),
+            title=base_meta.get("act_title", ""),
+            category=base_meta.get("detail_category", ""),
+        )
+
+        for a in soup.select("a[href]"):
+            route_meta = dict(base_meta)
+            route_meta["discovery_channel"] = "kpcode-detail-file-link"
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    @staticmethod
+    def _extract_kpcode_detail_title(soup: BeautifulSoup) -> str:
+        candidates: List[str] = []
+        for node in soup.select("h1, h2, h3, title"):
+            text = node.get_text(" ", strip=True)
+            if not text:
+                continue
+            lowered = text.lower()
+            if lowered == "khyber pakhtunkhwa code":
+                continue
+            candidates.append(text)
+        for text in candidates:
+            lowered = text.lower()
+            if any(token in lowered for token in (" act", "act ", "ordinance", "rules", "rule", "regulation", "notification", "code")):
+                return text[:280]
+        return candidates[0][:280] if candidates else ""
+
     def _capture_candidate(
         self,
         *,
@@ -1303,7 +1568,13 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
         listings: Dict[str, Dict[str, Any]],
         route_meta: Dict[str, Any],
     ) -> None:
-        normalized = normalize_pakp_public_url(raw, base_url=base_url)
+        base_host = (urlsplit(base_url).hostname or "").lower()
+        if base_host in KPCODE_HOST_ALIASES:
+            normalized = normalize_kpcode_public_url(raw, base_url=base_url)
+        elif base_host in PAKP_HOST_ALIASES:
+            normalized = normalize_pakp_public_url(raw, base_url=base_url)
+        else:
+            normalized = normalize_pakp_public_url(raw, base_url=base_url) or normalize_kpcode_public_url(raw, base_url=base_url)
         if not normalized:
             return
         try:
@@ -1317,19 +1588,33 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
             self.stats["rejected_urls"] += 1
             return
 
-        kind = _classify_pakp_discovered_url(safe)
+        host = (urlsplit(safe).hostname or "").lower()
+        if host in KPCODE_HOST_ALIASES:
+            kind = _classify_kpcode_discovered_url(safe)
+        else:
+            kind = _classify_pakp_discovered_url(safe)
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            if host in KPCODE_HOST_ALIASES:
+                pdf_kind = "uploads-file" if path.startswith("/uploads/") else "direct-file"
+            else:
+                pdf_kind = "wp-content-uploads-file" if path.startswith("/wp-content/uploads/") else "direct-file"
             meta = {
                 "discovery_hint": hint[:240],
-                "pdf_endpoint_kind": "wp-content-uploads-file" if path.startswith("/wp-content/uploads/") else "direct-file",
+                "pdf_endpoint_kind": pdf_kind,
                 **route_meta,
             }
             if ext and "document_format" not in meta:
                 meta["document_format"] = ext
             if ext == "pdf":
                 meta["expect_pdf"] = True
+            if "target_kind" not in meta:
+                meta["target_kind"] = self._kpcode_target_kind(
+                    source_section=meta.get("source_section", ""),
+                    title=meta.get("act_title", hint),
+                    category=meta.get("detail_category", ""),
+                )
             existing = docs.get(safe)
             if existing is None:
                 docs[safe] = meta
