@@ -155,11 +155,11 @@ class PublicPipeline:
         self.stats["fetched"] += 1
         return res
 
-    async def post_json(self, url: str, *, payload: Dict[str, Any]) -> FetchResult:
+    async def post_json(self, url: str, *, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> FetchResult:
         """Submit a JSON POST under the same policy guards as GET fetches."""
         assert self.fetcher is not None
         try:
-            res = await self.fetcher.post_json(url, payload=payload)
+            res = await self.fetcher.post_json(url, payload=payload, headers=headers)
         except URLPolicyError:
             self.stats["rejected_urls"] += 1
             raise
@@ -293,7 +293,9 @@ class PublicPipeline:
             if res.verdict.kind in ("verification", "login"):
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
-            elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
+            elif kind == "judgment" and (
+                _url_looks_like_pdf(url) or res.is_pdf or bool((fr.query_json.get("route") or {}).get("pdf_endpoint_kind"))
+            ) and not has_pdf_signature(res.content):
                 fr.status = "retired"
                 fr.last_error = "missing %PDF signature for judgment document URL"
             elif res.status_code >= 400:
