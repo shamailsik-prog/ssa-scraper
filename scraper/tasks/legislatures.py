@@ -69,6 +69,11 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
         {"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"},
         {"url": "https://balochistancode.gob.pk/laws_rules.aspx?opento=1&wise=srbdl", "target_kind": "statute"},
     ],
+    "AJKAssembly": [
+        {"url": "https://law.gok.pk/revised-volume/", "target_kind": "statute"},
+        {"url": "https://law.gok.pk/acts/", "target_kind": "statute"},
+        {"url": "https://law.gok.pk/ordinance/", "target_kind": "instrument"},
+    ],
     "GazetteOfPakistan": [
         {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
         {"url": "http://pcp.gov.pk/WeeklyNitifications", "target_kind": "instrument"},
@@ -136,6 +141,12 @@ PCP_HOST_ALIASES = (PCP_HOST, "www.pcp.gov.pk")
 PCP_DOC_RE = re.compile(r"(?i)^/siteimage/downloads/.+\.(pdf|doc|docx|html?)$")
 PCP_LISTING_PATH_RE = re.compile(r"(?i)^/(download|weeklynitifications|weeklynotifications|gazette)/?$")
 PCP_DETAIL_PATH_RE = re.compile(r"(?i)^/detail/[^/?#]+/?$")
+AJK_LAW_HOST = "law.gok.pk"
+AJK_LAW_HOST_ALIASES = (AJK_LAW_HOST, f"www.{AJK_LAW_HOST}")
+AJK_LAW_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx)$")
+AJK_LAW_LISTING_PATH_RE = re.compile(r"(?i)^/(|acts|ordinance|revised-volume|download)(?:/page/\d+)?/?$")
+AJK_LAW_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts|ordinance|revised-volume|download)/[^/?#]+/?$")
+AJK_LAW_LEGAL_HINT_RE = re.compile(r"(?i)\b(act|acts|ordinance|rule|rules|regulation|law|code|notification|amendment|bill|statute)\b")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -369,6 +380,30 @@ def normalize_pcp_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_ajk_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public AJK Law hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in AJK_LAW_HOST_ALIASES:
+        scheme = "https"
+        netloc = AJK_LAW_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def _classify_balochistan_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
     parts = urlsplit(url)
     path = (parts.path or "/").lower()
@@ -539,6 +574,24 @@ def _classify_pcp_discovered_url(url: str) -> Optional[str]:
         return "document"
     if PCP_LISTING_PATH_RE.search(path) or PCP_DETAIL_PATH_RE.search(path):
         return "listing"
+    return None
+
+
+def _classify_ajk_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    host = (parts.hostname or "").lower()
+    hint = (hint_text or "").lower()
+    host_is_local_fixture = host in ("127.0.0.1", "localhost")
+    if host not in AJK_LAW_HOST_ALIASES and not host_is_local_fixture:
+        return None
+    if AJK_LAW_DOC_RE.search(path):
+        return "document"
+    if AJK_LAW_LISTING_PATH_RE.search(path):
+        return "listing"
+    if AJK_LAW_DETAIL_PATH_RE.search(path):
+        if AJK_LAW_LEGAL_HINT_RE.search(path) or AJK_LAW_LEGAL_HINT_RE.search(hint) or YEAR_RE.search(path) or YEAR_RE.search(hint):
+            return "listing"
     return None
 
 
@@ -2025,6 +2078,363 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                 listings[safe].setdefault("detail_url", safe)
             else:
                 for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
+
+
+class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for AJK Law Department public acts/ordinances listings."""
+
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = str(fr.query_json.get("target_kind", "statute"))
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
+        source_section = inherited_meta.get("source_section") or self._ajk_source_section(res.final_url) or "acts"
+
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("source_section", source_section)
+        base_meta.setdefault(
+            "target_kind",
+            self._ajk_target_kind(
+                source_section=str(base_meta.get("source_section") or source_section),
+                title=str(base_meta.get("act_title") or ""),
+                fallback=target_kind,
+            ),
+        )
+
+        if self._is_ajk_detail_listing(res.final_url):
+            self._collect_ajk_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=base_meta,
+            )
+        else:
+            self._collect_ajk_listing_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+                inherited_meta=base_meta,
+            )
+
+        self._collect_listing_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            docs=docs,
+            listings=listings,
+            inherited_meta={
+                "listing_fetch": "navigation_links",
+                "discovery_channel": "navigation-link",
+                **base_meta,
+            },
+        )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            next_target_kind = str(nmeta.get("target_kind") or target_kind)
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
+                    "result_index",
+                    "source_section",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_type",
+                    "detail_url",
+                    "detail_title",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": next_target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    @staticmethod
+    def _ajk_source_section(url: str) -> Optional[str]:
+        path = (urlsplit(url).path or "/").lower()
+        if path.startswith("/ordinance"):
+            return "ordinance"
+        if path.startswith("/download"):
+            return "download"
+        if path.startswith("/revised-volume"):
+            return "revised_volume"
+        if path.startswith("/acts") or path == "/":
+            return "acts"
+        return None
+
+    @staticmethod
+    def _is_ajk_detail_listing(url: str) -> bool:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if host not in AJK_LAW_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
+            return False
+        path = (parts.path or "/").lower()
+        if AJK_LAW_LISTING_PATH_RE.search(path):
+            return False
+        return AJK_LAW_DETAIL_PATH_RE.search(path) is not None
+
+    @staticmethod
+    def _ajk_target_kind(*, source_section: str, title: str, fallback: str) -> str:
+        default_kind = fallback if fallback in ("statute", "instrument") else "statute"
+        section = (source_section or "").lower()
+        lowered_title = (title or "").lower()
+        if section in ("ordinance", "download"):
+            return "instrument"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
+        if re.search(r"\b(act|acts|law|code|statute)\b", lowered_title):
+            return "statute"
+        if section == "acts":
+            return "statute"
+        return default_kind
+
+    @staticmethod
+    def _looks_like_ajk_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_title = any("title" in h or "act title" in h or "name" in h for h in headers)
+        has_lawish = any("act" in h or "ordinance" in h or "law" in h or "year" in h or "no" in h for h in headers)
+        return has_title and has_lawish
+
+    def _collect_ajk_listing_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        base_section = self._ajk_source_section(base_url) or str(inherited_meta.get("source_section") or "acts")
+        listing_fetch = "revised_volume_table" if base_section == "revised_volume" else "acts_table"
+
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_ajk_table(headers):
+                continue
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                link = tr.find("a", href=True)
+                if link is None:
+                    continue
+                row_index += 1
+                title = link.get_text(" ", strip=True) or cells[min(len(cells) - 1, 1)].get_text(" ", strip=True)
+                row_meta: Dict[str, Any] = {
+                    **inherited_meta,
+                    "listing_fetch": listing_fetch,
+                    "discovery_channel": "ajk-table-row",
+                    "result_index": row_index,
+                    "source_section": base_section,
+                }
+
+                if title:
+                    row_meta["act_title"] = title[:280]
+                for idx, header in enumerate(headers):
+                    if idx >= len(cells):
+                        continue
+                    value = cells[idx].get_text(" ", strip=True)
+                    if not value:
+                        continue
+                    if ("act no" in header or "act no." in header or "ordinance no" in header) and "act_no" not in row_meta:
+                        row_meta["act_no"] = value[:80]
+                    elif "year" in header and "act_year" not in row_meta and YEAR_RE.search(value):
+                        row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+                    elif ("date" in header or "passed" in header) and "act_passed_on" not in row_meta:
+                        row_meta["act_passed_on"] = value[:40]
+                    elif ("type" in header or "category" in header) and "act_type" not in row_meta:
+                        row_meta["act_type"] = value[:80]
+
+                if "act_type" not in row_meta:
+                    if "ordinance" in title.lower():
+                        row_meta["act_type"] = "ordinance"
+                    elif "rule" in title.lower():
+                        row_meta["act_type"] = "rules"
+                    elif "act" in title.lower():
+                        row_meta["act_type"] = "act"
+
+                row_meta["target_kind"] = self._ajk_target_kind(
+                    source_section=str(row_meta.get("source_section") or base_section),
+                    title=str(row_meta.get("act_title") or title),
+                    fallback=str(row_meta.get("target_kind") or "statute"),
+                )
+                self._capture_candidate(
+                    raw=link.get("href", ""),
+                    hint=title[:240],
+                    base_url=base_url,
+                    docs=docs,
+                    listings=listings,
+                    route_meta=row_meta,
+                )
+
+    def _collect_ajk_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        section = self._ajk_source_section(base_url) or str(inherited_meta.get("source_section") or "acts")
+        base_meta = dict(inherited_meta)
+        base_meta["detail_url"] = base_url
+        base_meta.setdefault("source_section", section)
+        if detail_title:
+            base_meta.setdefault("detail_title", detail_title)
+            base_meta.setdefault("act_title", detail_title)
+        base_meta["target_kind"] = self._ajk_target_kind(
+            source_section=str(base_meta.get("source_section") or section),
+            title=str(base_meta.get("act_title") or detail_title),
+            fallback=str(base_meta.get("target_kind") or "statute"),
+        )
+
+        for a in soup.find_all("a", href=True):
+            hint = a.get_text(" ", strip=True)[:240] or base_meta.get("act_title", "")[:240]
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "detail_file_link"
+            route_meta["discovery_channel"] = "detail-file-link"
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=hint,
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    def _collect_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=dict(inherited_meta),
+            )
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_ajk_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_ajk_discovered_url(safe, hint_text=hint)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            section = str(route_meta.get("source_section") or self._ajk_source_section(base_url) or "acts")
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "wp-content-uploads-file" if path.startswith("/wp-content/uploads/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            meta["target_kind"] = self._ajk_target_kind(
+                source_section=section,
+                title=str(meta.get("act_title") or hint),
+                fallback=str(meta.get("target_kind") or "statute"),
+            )
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            listing_meta = dict(route_meta)
+            section = self._ajk_source_section(safe) or self._ajk_source_section(base_url) or str(listing_meta.get("source_section") or "acts")
+            listing_meta["source_section"] = section
+            listing_meta["target_kind"] = self._ajk_target_kind(
+                source_section=str(listing_meta.get("source_section") or section),
+                title=str(listing_meta.get("act_title") or hint),
+                fallback=str(listing_meta.get("target_kind") or "statute"),
+            )
+            if self._is_ajk_detail_listing(safe):
+                listing_meta.setdefault("detail_url", safe)
+            if safe not in listings:
+                listings[safe] = listing_meta
+            else:
+                for key, value in listing_meta.items():
                     if key not in listings[safe] and value not in ("", None):
                         listings[safe][key] = value
 
@@ -3619,6 +4029,8 @@ async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) 
     pipeline_cls = PublicPipeline
     if source.source_name == "BalochistanAssembly":
         pipeline_cls = BalochistanAssemblyPipeline
+    elif source.source_name == "AJKAssembly":
+        pipeline_cls = AJKAssemblyPipeline
     elif source.source_name == "PunjabAssembly":
         pipeline_cls = PunjabAssemblyPipeline
     elif source.source_name == "SindhAssembly":
