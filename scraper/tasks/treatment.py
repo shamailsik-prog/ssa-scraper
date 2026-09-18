@@ -19,12 +19,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from celery import shared_task
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.models import TREATMENT_LABELS, Citation, Judgment, QuarantineQueue, Treatment
+from scraper.models import (
+    TREATMENT_LABELS,
+    Citation,
+    CorpusMetadata,
+    Judgment,
+    JudgmentCitationRelation,
+    QuarantineQueue,
+    Treatment,
+)
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.security import is_login_session, wrap_as_data
 
@@ -61,6 +69,119 @@ def _best_rule(text: str) -> Optional[Tuple[str, float]]:
 
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.;!?])\s+(?=[A-Z\"'(])")
+
+
+def _norm_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _evidence_snippet(text: str, start: int, end: int, *, window: int = 70) -> str:
+    return _norm_ws(text[max(0, start - window) : min(len(text), end + window)])
+
+
+def _citation_target_key(cited_citation: Optional[str]) -> Optional[str]:
+    hits = extract_citations(cited_citation or "")
+    if not hits:
+        return None
+    hit = hits[0]
+    reporter = str(hit.get("reporter") or "").upper()
+    year = hit.get("year")
+    page = str(hit.get("page") or "").upper()
+    if not reporter or not year or not page:
+        return None
+    court = re.sub(r"[^A-Z0-9]+", "", str(hit.get("court") or "").upper()) or "-"
+    return f"{reporter}:{int(year)}:{court}:{page}"
+
+
+def _collect_citation_mentions(text: str) -> List[Dict[str, Any]]:
+    mentions: List[Dict[str, Any]] = []
+    for hit in extract_citations(text):
+        raw = str(hit.get("raw") or "").strip()
+        normalized = str(hit.get("normalized") or normalise_citation(raw)).strip()
+        if not raw or not normalized:
+            continue
+        key = _citation_target_key(normalized)
+        if not key:
+            continue
+        spans = [m.span() for m in re.finditer(re.escape(raw), text)] or [tuple(hit.get("span") or (0, 0))]
+        for span in spans:
+            try:
+                start, end = int(span[0]), int(span[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if start < 0 or end <= start or end > len(text):
+                continue
+            mentions.append(
+                {
+                    "raw": raw,
+                    "normalized": normalized,
+                    "target_key": key,
+                    "span_start": start,
+                    "span_end": end,
+                    "evidence_snippet": _evidence_snippet(text, start, end),
+                }
+            )
+    mentions.sort(key=lambda row: (row["span_start"], row["span_end"], row["target_key"]))
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in mentions:
+        dedupe_key = (row["target_key"], row["span_start"], row["span_end"])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(row)
+    return deduped
+
+
+async def _source_citation_keys(db: AsyncSession, judgment: Judgment) -> set[str]:
+    own = {normalise_citation(judgment.canonical_citation)}
+    own.update(
+        normalise_citation(cit)
+        for cit in (await db.execute(select(Citation.citation_string).where(Citation.judgment_id == judgment.id))).scalars().all()
+    )
+    return {c for c in own if c}
+
+
+async def sync_judgment_citation_relations(db: AsyncSession, judgment: Judgment) -> Dict[str, int]:
+    counts = {"edges": 0, "linked": 0, "ambiguous": 0, "unresolved": 0, "skipped_self": 0, "skipped_invalid": 0}
+    text = judgment.full_text or ""
+    await db.execute(delete(JudgmentCitationRelation).where(JudgmentCitationRelation.source_judgment_id == judgment.id))
+    if not text:
+        await db.flush()
+        return counts
+    own_citations = await _source_citation_keys(db, judgment)
+    for mention in _collect_citation_mentions(text):
+        normalized = mention["normalized"]
+        if normalized in own_citations:
+            counts["skipped_self"] += 1
+            continue
+        target_key = mention["target_key"]
+        if not target_key:
+            counts["skipped_invalid"] += 1
+            continue
+        resolved_id, status = await _resolve_cited_judgment_id(db, normalized)
+        if status == "linked" and (resolved_id is None or resolved_id == judgment.id):
+            counts["skipped_self"] += 1
+            continue
+        db.add(
+            JudgmentCitationRelation(
+                source_judgment_id=judgment.id,
+                target_judgment_id=resolved_id if status == "linked" else None,
+                target_citation_raw=mention["raw"][:300],
+                target_citation_normalized=normalized[:200],
+                target_citation_key=target_key[:120],
+                resolution_status=status[:20],
+                span_start=int(mention["span_start"]),
+                span_end=int(mention["span_end"]),
+                evidence_snippet=mention["evidence_snippet"][:500],
+                source_provenance_id=judgment.source_provenance_id,
+                source_url=judgment.source_url,
+            )
+        )
+        counts["edges"] += 1
+        counts[status] += 1
+    await db.flush()
+    return counts
 
 
 def citing_sentence(text: str, start: int, end: int) -> str:
@@ -245,6 +366,88 @@ async def reconcile_treatment_citation_links(*, lookback_hours: Optional[int] = 
     return totals
 
 
+async def reconcile_judgment_citation_relations(*, lookback_hours: Optional[int] = None, batch_size: Optional[int] = None) -> Dict[str, int]:
+    lookback = max(1, int(lookback_hours if lookback_hours is not None else settings.JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS))
+    batch = max(1, int(batch_size if batch_size is not None else settings.JUDGMENT_CITATION_RECONCILE_BATCH_SIZE))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback)
+    totals = {
+        "scanned": 0,
+        "processed": 0,
+        "failed": 0,
+        "edges_before": 0,
+        "edges_after": 0,
+        "edges_added": 0,
+        "edges_removed": 0,
+        "linked": 0,
+        "ambiguous": 0,
+        "unresolved": 0,
+        "skipped_self": 0,
+        "skipped_invalid": 0,
+    }
+    offset_key = "judgment_citation_relation_reconcile_offset"
+    async with SessionLocal() as db:
+        filters = (
+            Judgment.created_at >= cutoff,
+            Judgment.full_text.is_not(None),
+        )
+        total = (await db.execute(select(func.count()).select_from(Judgment).where(*filters))).scalar() or 0
+        judgment_ids: List[Any] = []
+        if total > 0:
+            cursor = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == offset_key))).scalars().first()
+            if cursor is None:
+                cursor = CorpusMetadata(key=offset_key, value="0")
+                db.add(cursor)
+                await db.flush()
+            try:
+                offset = int(cursor.value)
+            except (TypeError, ValueError):
+                offset = 0
+            offset = max(offset, 0) % int(total)
+            base_query = select(Judgment.id).where(*filters).order_by(Judgment.created_at.desc(), Judgment.id.desc())
+            judgment_ids = (await db.execute(base_query.offset(offset).limit(batch))).scalars().all()
+            if len(judgment_ids) < batch and total > len(judgment_ids):
+                wrap_ids = (await db.execute(base_query.limit(batch - len(judgment_ids)))).scalars().all()
+                judgment_ids.extend(wrap_ids)
+            cursor.value = str((offset + len(judgment_ids)) % int(total))
+        totals["scanned"] = len(judgment_ids)
+        for judgment_id in judgment_ids:
+            judgment = (await db.execute(select(Judgment).where(Judgment.id == judgment_id))).scalars().first()
+            if judgment is None:
+                continue
+            try:
+                before = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(JudgmentCitationRelation)
+                        .where(JudgmentCitationRelation.source_judgment_id == judgment.id)
+                    )
+                ).scalar() or 0
+                stats = await sync_judgment_citation_relations(db, judgment)
+                after = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(JudgmentCitationRelation)
+                        .where(JudgmentCitationRelation.source_judgment_id == judgment.id)
+                    )
+                ).scalar() or 0
+                totals["processed"] += 1
+                totals["edges_before"] += int(before)
+                totals["edges_after"] += int(after)
+                if after >= before:
+                    totals["edges_added"] += int(after - before)
+                else:
+                    totals["edges_removed"] += int(before - after)
+                for key in ("linked", "ambiguous", "unresolved", "skipped_self", "skipped_invalid"):
+                    totals[key] += int(stats[key])
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                totals["failed"] += 1
+                logger.exception("judgment citation relation reconcile failed for judgment %s", judgment.id)
+        await db.commit()
+    return totals
+
+
 @shared_task(name="scraper.tasks.treatment.classify_treatment")
 def classify_treatment_task(limit: int = 200):
     return run_async(classify_treatment(limit))
@@ -253,3 +456,8 @@ def classify_treatment_task(limit: int = 200):
 @shared_task(name="scraper.tasks.treatment.reconcile_treatment_citation_links")
 def reconcile_treatment_citation_links_task(lookback_hours: Optional[int] = None, batch_size: Optional[int] = None):
     return run_async(reconcile_treatment_citation_links(lookback_hours=lookback_hours, batch_size=batch_size))
+
+
+@shared_task(name="scraper.tasks.treatment.reconcile_judgment_citation_relations")
+def reconcile_judgment_citation_relations_task(lookback_hours: Optional[int] = None, batch_size: Optional[int] = None):
+    return run_async(reconcile_judgment_citation_relations(lookback_hours=lookback_hours, batch_size=batch_size))
