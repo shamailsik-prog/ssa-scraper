@@ -4,11 +4,11 @@ from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
-from scraper.tasks.legislatures import normalize_kpcode_public_url, normalize_pakp_public_url, scrape_legislature
+from scraper.tasks.legislatures import listings_for, normalize_kpcode_public_url, normalize_pakp_public_url, scrape_legislature
 from tests.fixtures import text_pdf_bytes
 
 
-async def _kp_assembly_source(db, fixture_server, listings):
+async def _kp_assembly_source(db, fixture_server, listings, *, target_kind: str = "statute"):
     source = (
         await db.execute(
             select(ScraperSource).where(
@@ -21,10 +21,29 @@ async def _kp_assembly_source(db, fixture_server, listings):
     source.crawl_max_depth = 2
     source.config_json = {
         "listings": [fixture_server.url(path) for path in listings],
-        "target_kind": "statute",
+        "target_kind": target_kind,
     }
     await db.commit()
     return source
+
+
+async def test_kp_default_listings_include_instrument_section_seeds(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(
+                ScraperSource.source_name == "KPAssembly",
+            )
+        )
+    ).scalars().first()
+    source.config_json = {}
+    await db.commit()
+
+    listing_map = {row["url"]: row["target_kind"] for row in listings_for(source)}
+    assert listing_map["https://www.pakp.gov.pk/act/"] == "statute"
+    assert listing_map["https://kpcode.kp.gov.pk/"] == "statute"
+    assert listing_map["https://kpcode.kp.gov.pk/homepage/rules"] == "instrument"
+    assert listing_map["https://www.pakp.gov.pk/bill/"] == "instrument"
+    assert listing_map["https://www.pakp.gov.pk/all-bills/"] == "instrument"
 
 
 def test_normalize_pakp_public_url_handles_relative_act_and_upload_links():
@@ -173,6 +192,99 @@ async def test_kp_assembly_table_rows_route_detail_and_direct_docs_with_provenan
     assert pdf_prov is not None
     assert pdf_prov.route_json["act_title"] == "The Khyber Pakhtunkhwa Finance Act, 2026"
     assert pdf_prov.route_json["document_format"] == "pdf"
+
+
+async def test_pakp_bill_seed_routes_detail_and_pdf_as_instrument(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/bill/",
+        """
+        <html><body>
+          <table>
+            <thead>
+              <tr><th>Sr. #</th><th>Introduction Date</th><th>Title</th><th>Mover</th><th>Department</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td>25 Aug 2026</td>
+                <td><a href="/bill/the-khyber-pakhtunkhwa-health-care-commission-amendment-bill-2026/">The Khyber Pakhtunkhwa Health Care Commission (Amendment) Bill, 2026</a></td>
+                <td>Minister Health</td>
+                <td>Health</td>
+                <td>Introduced</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/bill/the-khyber-pakhtunkhwa-health-care-commission-amendment-bill-2026/",
+        """
+        <html><body>
+          <div class="sinpost-content">
+            <h1>The Khyber Pakhtunkhwa Health Care Commission (Amendment) Bill, 2026</h1>
+            <div class="row leg-row">
+              <div class="col-lg-3"><span class="act-title">Bill #:</span></div>
+              <div class="col-lg-9"><span class="act-info">KP Bill No. XVI of 2026</span></div>
+            </div>
+            <div class="row leg-row">
+              <div class="col-lg-3"><span class="act-title">Bill Document:</span></div>
+              <div class="col-lg-9"><span class="act-info"><a href="/wp-content/uploads/2026/09/kp-health-commission-amendment-bill-2026.pdf">Download Bill PDF</a></span></div>
+            </div>
+          </div>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/wp-content/uploads/2026/09/kp-health-commission-amendment-bill-2026.pdf",
+        text_pdf_bytes("Khyber Pakhtunkhwa Health Care Commission (Amendment) Bill, 2026"),
+        content_type="application/pdf",
+    )
+
+    source = await _kp_assembly_source(db, fixture_server, ["/bill/"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/bill/the-khyber-pakhtunkhwa-health-care-commission-amendment-bill-2026/" in fixture_server.hits
+    assert "/wp-content/uploads/2026/09/kp-health-commission-amendment-bill-2026.pdf" in fixture_server.hits
+
+    detail_url = fixture_server.url("/bill/the-khyber-pakhtunkhwa-health-care-commission-amendment-bill-2026/")
+    detail_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_row is not None
+    assert detail_row.query_json["target_kind"] == "instrument"
+    assert detail_row.query_json["meta"]["source_section"] == "bills"
+
+    document_url = fixture_server.url("/wp-content/uploads/2026/09/kp-health-commission-amendment-bill-2026.pdf")
+    instrument_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    statute_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"statute:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert instrument_row is not None
+    assert statute_row is None
+    assert instrument_row.query_json["expect_pdf"] is True
+    assert instrument_row.query_json["route"]["source_section"] == "bills"
 
 
 async def test_kp_assembly_pdf_signature_gate_retires_non_pdf_candidate(db, fixture_server):
@@ -352,10 +464,80 @@ async def test_kpcode_listing_and_rule_detail_route_statute_and_instrument_docs(
     assert instrument_prov.route_json["detail_url"].endswith("/homepage/RuleDetails/1311")
 
 
-async def test_kpcode_pdf_signature_gate_retires_non_pdf_rule_download(db, fixture_server):
+async def test_kpcode_rules_seed_fans_out_instrument_document(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(
-        "/homepage/list_all_law",
+        "/homepage/rules",
+        """
+        <html><body>
+          <div class="artlist"><a href="/homepage/RuleDetails/1500">Khyber Pakhtunkhwa Sample Rules, 2026</a></div>
+          <div class="artdets">Revenue Department | Rule No. 5 of 2026 | Year: 2026</div>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/homepage/RuleDetails/1500",
+        """
+        <html><body>
+          <h2>Khyber Pakhtunkhwa Sample Rules, 2026</h2>
+          <table>
+            <tr><th>Main Category:</th><td>Rules</td></tr>
+            <tr><th>Year</th><td>2026</td></tr>
+          </table>
+          <a href="/uploads/kp-sample-rules-2026.pdf">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/uploads/kp-sample-rules-2026.pdf", text_pdf_bytes("Khyber Pakhtunkhwa Sample Rules, 2026"), content_type="application/pdf")
+
+    source = await _kp_assembly_source(db, fixture_server, ["/homepage/rules"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/homepage/RuleDetails/1500" in fixture_server.hits
+    assert "/uploads/kp-sample-rules-2026.pdf" in fixture_server.hits
+
+    detail_url = fixture_server.url("/homepage/RuleDetails/1500")
+    detail_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_row is not None
+    assert detail_row.query_json["target_kind"] == "instrument"
+    assert detail_row.query_json["meta"]["source_section"] == "rules"
+
+    document_url = fixture_server.url("/uploads/kp-sample-rules-2026.pdf")
+    instrument_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    statute_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "KPAssembly",
+                CrawlFrontier.query_key == f"statute:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert instrument_row is not None
+    assert statute_row is None
+    assert instrument_row.query_json["route"]["source_section"] == "rules"
+
+
+async def test_kpcode_rules_seed_non_pdf_candidate_fails_closed_as_instrument(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/homepage/rules",
         """
         <html><body>
           <div class="artlist"><a href="/homepage/RuleDetails/1400">Fake Rules Listing</a></div>
@@ -378,7 +560,7 @@ async def test_kpcode_pdf_signature_gate_retires_non_pdf_rule_download(db, fixtu
     )
     fixture_server.add("/uploads/fake-rules-2026.pdf", "<html>not-a-pdf</html>", content_type="application/pdf")
 
-    source = await _kp_assembly_source(db, fixture_server, ["/homepage/list_all_law"])
+    source = await _kp_assembly_source(db, fixture_server, ["/homepage/rules"], target_kind="instrument")
     async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
         stats = await scrape_legislature(source, db, fetcher=fetcher, limit=30)
     await db.commit()
@@ -405,3 +587,65 @@ async def test_kpcode_pdf_signature_gate_retires_non_pdf_rule_download(db, fixtu
     assert row is not None
     assert row.status == "retired"
     assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
+
+
+async def test_kpcode_rules_seed_rerun_remains_idempotent_with_instrument_key(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/homepage/rules",
+        """
+        <html><body>
+          <div class="artlist"><a href="/homepage/RuleDetails/1600">Khyber Pakhtunkhwa Energy Rules, 2025</a></div>
+          <div class="artdets">Energy Department | Rule No. IX of 2025 | Year: 2025</div>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/homepage/RuleDetails/1600",
+        """
+        <html><body>
+          <h2>Khyber Pakhtunkhwa Energy Rules, 2025</h2>
+          <table>
+            <tr><th>Main Category:</th><td>Rules</td></tr>
+            <tr><th>Year</th><td>2025</td></tr>
+          </table>
+          <a href="/uploads/kp-energy-rules-2025.pdf">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/uploads/kp-energy-rules-2025.pdf",
+        text_pdf_bytes("Khyber Pakhtunkhwa Energy Rules, 2025"),
+        content_type="application/pdf",
+    )
+
+    source = await _kp_assembly_source(db, fixture_server, ["/homepage/rules"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    keys_before = (
+        await db.execute(
+            select(CrawlFrontier.query_key).where(
+                CrawlFrontier.source_name == "KPAssembly",
+            )
+        )
+    ).scalars().all()
+
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    keys_after = (
+        await db.execute(
+            select(CrawlFrontier.query_key).where(
+                CrawlFrontier.source_name == "KPAssembly",
+            )
+        )
+    ).scalars().all()
+
+    assert len(keys_before) == len(keys_after)
+    assert set(keys_before) == set(keys_after)
+    document_url = fixture_server.url("/uploads/kp-energy-rules-2025.pdf")
+    assert f"instrument:{document_url}" in set(keys_after)
+    assert f"statute:{document_url}" not in set(keys_after)
