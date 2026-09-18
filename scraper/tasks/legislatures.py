@@ -799,10 +799,15 @@ class BalochistanAssemblyPipeline(PublicPipeline):
     def _balochistan_code_target_kind(*, act_type: str, title: str, fallback: str) -> str:
         """Infer statute vs instrument for Balochistan Code rows/detail pages."""
         default_kind = fallback if fallback in ("statute", "instrument") else "statute"
-        lowered = " ".join((act_type or "", title or "")).lower()
-        if re.search(r"\b(ordinance|rules?|regulation|notification|order|by-law|bye-law)\b", lowered):
+        lowered_type = (act_type or "").lower()
+        lowered_title = (title or "").lower()
+        if re.search(r"\b(act|law|statute)\b", lowered_type):
+            return "statute"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_type):
             return "instrument"
-        if re.search(r"\b(act|law|statute)\b", lowered):
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
+        if re.search(r"\b(act|law|statute)\b", lowered_title):
             return "statute"
         return default_kind
 
