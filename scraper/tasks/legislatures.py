@@ -44,6 +44,10 @@ PAB_HOST_ALIASES = (PAB_HOST, "www.pabalochistan.gov.pk")
 STORAGE_DOC_RE = re.compile(r"(?i)^/storage/\d+/.+\.(pdf|doc|docx)$")
 LISTING_PATH_RE = re.compile(r"(?i)^/acts/?$")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+PAP_HOST = "pap.gov.pk"
+PAP_HOST_ALIASES = (PAP_HOST, "www.pap.gov.pk")
+PAP_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|html?)$")
+PAP_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|en/about-assembly/parliamentary-privileges/?)$")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -77,11 +81,44 @@ def normalize_pab_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_pap_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public PAP hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in PAP_HOST_ALIASES:
+        scheme = "https"
+        netloc = PAP_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def _classify_discovered_url(url: str) -> Optional[str]:
     path = (urlsplit(url).path or "/").lower()
     if STORAGE_DOC_RE.search(path):
         return "document"
     if LISTING_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_pap_discovered_url(url: str) -> Optional[str]:
+    path = (urlsplit(url).path or "/").lower()
+    if PAP_ACT_DOC_RE.search(path):
+        return "document"
+    if PAP_LISTING_PATH_RE.search(path):
         return "listing"
     return None
 
@@ -383,6 +420,158 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         return "ok"
 
 
+class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for PAP acts tables and direct document links."""
+
+    def _collect_structured_act_rows(self, *, html_text: str, base_url: str, docs: Dict[str, Dict[str, Any]]) -> None:  # type: ignore[override]
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_acts_table(headers):
+                continue
+
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                link = self._row_link(cells, headers)
+                if link is None:
+                    continue
+
+                row_index += 1
+                href = link.get("href", "")
+                title = link.get_text(" ", strip=True) or cells[min(len(cells) - 1, 1)].get_text(" ", strip=True)
+                ext = (urlsplit(href).path.rsplit(".", 1)[-1].lower() if "." in (urlsplit(href).path or "") else "")
+
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": "acts_table",
+                    "discovery_channel": "acts-table-row",
+                    "result_index": row_index,
+                    "source_section": "acts",
+                }
+                self._add_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
+
+                if ext:
+                    row_meta["document_format"] = ext
+                    if ext == "pdf":
+                        row_meta["expect_pdf"] = True
+                self._capture_candidate(
+                    raw=href,
+                    hint=title[:240],
+                    base_url=base_url,
+                    docs=docs,
+                    listings=[],
+                    route_meta=row_meta,
+                )
+
+    @staticmethod
+    def _looks_like_acts_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_no = any("act no" in h or "act number" in h or "act #" in h for h in headers)
+        has_title = any("act title" in h or h == "title" for h in headers)
+        return has_no and has_title
+
+    @staticmethod
+    def _row_link(cells: List[Any], headers: List[str]):
+        title_idx = next((i for i, h in enumerate(headers) if "act title" in h or h == "title"), None)
+        if title_idx is not None and title_idx < len(cells):
+            link = cells[title_idx].find("a", href=True)
+            if link is not None:
+                return link
+        for cell in cells:
+            link = cell.find("a", href=True)
+            if link is not None:
+                return link
+        return None
+
+    def _add_row_provenance(self, *, row_meta: Dict[str, Any], cells: List[Any], headers: List[str], title: str) -> None:
+        act_no_idx = next((i for i, h in enumerate(headers) if "act no" in h or "act number" in h or "act #" in h), None)
+        if act_no_idx is not None and act_no_idx < len(cells):
+            act_no = cells[act_no_idx].get_text(" ", strip=True)[:40]
+            if act_no:
+                row_meta["act_no"] = act_no
+
+        if title:
+            row_meta["act_title"] = title[:280]
+
+        for idx, header in enumerate(headers):
+            if idx >= len(cells):
+                continue
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
+                continue
+            if "passed" in header:
+                row_meta["act_passed_on"] = value[:40]
+            elif "assent" in header:
+                row_meta["act_assented_on"] = value[:40]
+            elif "type" in header:
+                row_meta["act_type"] = value[:80]
+            elif "year" in header and YEAR_RE.search(value):
+                row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        if "act_year" not in row_meta:
+            year_match = YEAR_RE.search(title or "")
+            if year_match:
+                row_meta["act_year"] = year_match.group(0)
+
+    def _capture_candidate(  # type: ignore[override]
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: List[str],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_pap_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_pap_discovered_url(safe)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "uploads-acts-file" if path.startswith("/uploads/acts/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            listings.append(safe)
+
+
 async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
-    pipeline_cls = BalochistanAssemblyPipeline if source.source_name == "BalochistanAssembly" else PublicPipeline
+    pipeline_cls = PublicPipeline
+    if source.source_name == "BalochistanAssembly":
+        pipeline_cls = BalochistanAssemblyPipeline
+    elif source.source_name == "PunjabAssembly":
+        pipeline_cls = PunjabAssemblyPipeline
     return await run_public_source(db, source, seed_listings=listings_for(source), pipeline_cls=pipeline_cls, **kwargs)
