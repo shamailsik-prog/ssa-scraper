@@ -10,7 +10,7 @@ CONTRACT TABLES (Layer 17 Annex A; the only tables `sikander_reader` may SELECT)
 INTERNAL TABLES (never granted to the reader role):
     scraper_sources, scraper_jobs, scraper_staging, statutes_staging, quarantine_queue,
     embedding_queue, browser_session_slots, search_form_map, crawl_frontier, crawl_coverage,
-    extraction_audit, scrapegraph_cache, archive_targets, archive_objects, sgai_usage_daily,
+    extraction_audit, scrapegraph_cache, instrument_relation, archive_targets, archive_objects, sgai_usage_daily,
     notifications, schema_migrations
 
 The vector dimension is read from EMBEDDING_DIM (Annex B-6); the model/dimension pair is
@@ -376,6 +376,43 @@ class CorpusMetadata(Base):
 # =============================================================================
 # INTERNAL TABLES
 # =============================================================================
+class InstrumentRelation(Base):
+    __tablename__ = "instrument_relation"
+    __table_args__ = (
+        Index("ix_instrument_relation_source", "source_instrument_id"),
+        Index("ix_instrument_relation_target_instrument", "target_instrument_id"),
+        Index("ix_instrument_relation_target_statute", "target_statute_id"),
+        UniqueConstraint(
+            "source_instrument_id",
+            "relation_type",
+            "target_instrument_id",
+            "target_statute_id",
+            "span_start",
+            "span_end",
+            name="uq_instrument_relation_edge",
+        ),
+        CheckConstraint(
+            "target_instrument_id IS NOT NULL OR target_statute_id IS NOT NULL",
+            name="ck_instrument_relation_target_present",
+        ),
+        CheckConstraint("char_length(evidence_snippet) <= 500", name="ck_instrument_relation_evidence_500"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_instrument_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("instrument.id", ondelete="CASCADE"), nullable=False)
+    target_instrument_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("instrument.id", ondelete="SET NULL"))
+    target_statute_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("statute.id", ondelete="SET NULL"))
+    relation_type: Mapped[str] = mapped_column(String(40), nullable=False, comment="amended_by|superseded_by|read_with")
+    relation_phrase: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_mention_raw: Mapped[str] = mapped_column(String(300), nullable=False)
+    target_mention_normalized: Mapped[str] = mapped_column(String(300), nullable=False)
+    span_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    span_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_snippet: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_provenance_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("source_provenance.id", ondelete="SET NULL"))
+    source_url: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+
 class ScraperSource(Base):
     __tablename__ = "scraper_sources"
     __table_args__ = (

@@ -17,9 +17,10 @@ import logging
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from celery import shared_task
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -30,6 +31,7 @@ from scraper.models import (
     Court,
     EmbeddingQueue,
     Instrument,
+    InstrumentRelation,
     Judge,
     Judgment,
     QuarantineQueue,
@@ -283,6 +285,293 @@ async def _resolve_statute_link(
     return statute
 
 
+RELATION_PATTERNS = (
+    ("amended_by", re.compile(r"(?i)\b(?:as\s+)?amended\s+by\b"), {"instrument"}),
+    ("superseded_by", re.compile(r"(?i)\b(?:is\s+)?superseded\s+by\b"), {"instrument"}),
+    ("read_with", re.compile(r"(?i)\bread\s+with\b"), {"instrument", "statute"}),
+)
+
+SRO_SIGNATURE_RE = re.compile(
+    r"(?i)\bS\.?\s*R\.?\s*O\.?\s*(?:No\.?\s*)?(?P<number>[A-Z0-9]+(?:\s*\([A-Z0-9]+\))?)\s*(?:/|of)\s*(?P<year>18\d{2}|19\d{2}|20\d{2})\b"
+)
+ACT_SIGNATURE_RE = re.compile(
+    r"(?i)\bAct\s+No\.?\s*(?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)\s+of\s+(?P<year>18\d{2}|19\d{2}|20\d{2})\b"
+)
+ORD_SIGNATURE_RE = re.compile(
+    r"(?i)\bOrdinance\s+No\.?\s*(?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)\s+of\s+(?P<year>18\d{2}|19\d{2}|20\d{2})\b"
+)
+
+
+def _valid_span(payload: Dict[str, Any]) -> Optional[tuple[int, int]]:
+    span = payload.get("span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return None
+    try:
+        start = int(span[0])
+        end = int(span[1])
+    except (TypeError, ValueError):
+        return None
+    if start < 0 or end <= start:
+        return None
+    return start, end
+
+
+def _norm_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _snippet(text: str, start: int, end: int, window: int = 60) -> str:
+    return _norm_ws(text[max(0, start - window) : min(len(text), end + window)])
+
+
+def _relation_window_end(text: str, start: int, max_chars: int = 260) -> int:
+    segment = text[start : start + max_chars]
+    boundary = re.search(r"[.;\n]", segment)
+    if boundary:
+        return start + boundary.start()
+    return min(len(text), start + max_chars)
+
+
+def _instrument_reference_key(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    base = re.sub(r"[^a-z0-9]+", "", value.lower())
+    for prefix in ("actno", "ordinanceno", "sro", "notification"):
+        if base.startswith(prefix):
+            return base[len(prefix) :]
+    return base
+
+
+def _instrument_signature(value: Optional[str]) -> Optional[tuple[str, str, int]]:
+    if not value:
+        return None
+    for kind, pattern in (("sro", SRO_SIGNATURE_RE), ("act_no", ACT_SIGNATURE_RE), ("ordinance_no", ORD_SIGNATURE_RE)):
+        match = pattern.search(value)
+        if not match:
+            continue
+        try:
+            year = int(match.group("year"))
+        except (TypeError, ValueError):
+            continue
+        number = re.sub(r"\s+", "", match.group("number").upper())
+        return kind, number, year
+    return None
+
+
+def _mention_signature(mention: Dict[str, Any]) -> Optional[tuple[str, str, int]]:
+    mtype = str(mention.get("mention_type") or "").strip().lower()
+    if mtype not in {"sro", "act_no", "ordinance_no"}:
+        mtype = ""
+    try:
+        year = int(mention.get("year"))
+    except (TypeError, ValueError):
+        year = None
+    number = str(mention.get("number") or "").strip()
+    if mtype and year and number:
+        return mtype, re.sub(r"\s+", "", number.upper()), year
+    return _instrument_signature(str(mention.get("normalized") or mention.get("raw") or ""))
+
+
+def _collect_relation_candidates(
+    *,
+    text: str,
+    citation_mentions: list[Dict[str, Any]],
+    statute_mentions: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    targets: list[Dict[str, Any]] = []
+    for mention in citation_mentions:
+        if not isinstance(mention, dict):
+            continue
+        span = _valid_span(mention)
+        normalized = str(mention.get("normalized") or "").strip()
+        raw = str(mention.get("raw") or "").strip()
+        if span is None or not normalized or not raw:
+            continue
+        targets.append(
+            {
+                "target_kind": "instrument",
+                "span": span,
+                "raw": raw,
+                "normalized": normalized,
+                "mention_type": mention.get("mention_type"),
+                "number": mention.get("number"),
+                "year": mention.get("year"),
+            }
+        )
+    for mention in statute_mentions:
+        if not isinstance(mention, dict):
+            continue
+        span = _valid_span(mention)
+        normalized = str(mention.get("normalized") or mention.get("canonical_statute_name") or "").strip()
+        raw = str(mention.get("raw") or "").strip()
+        if span is None or not normalized or not raw:
+            continue
+        targets.append(
+            {
+                "target_kind": "statute",
+                "span": span,
+                "raw": raw,
+                "normalized": normalized,
+                "linked_statute_id": mention.get("linked_statute_id"),
+                "canonical_statute_name": mention.get("canonical_statute_name"),
+            }
+        )
+    targets.sort(key=lambda row: row["span"][0])
+    edges: list[Dict[str, Any]] = []
+    seen = set()
+    for relation_type, pattern, allowed_targets in RELATION_PATTERNS:
+        for match in pattern.finditer(text):
+            end_limit = _relation_window_end(text, match.end())
+            for target in targets:
+                start, end = target["span"]
+                if target["target_kind"] not in allowed_targets:
+                    continue
+                if end <= match.end() or start > end_limit:
+                    continue
+                if target["target_kind"] == "instrument" and start < match.end():
+                    continue
+                row = {
+                    "relation_type": relation_type,
+                    "relation_phrase": _norm_ws(match.group(0).lower()),
+                    "target_kind": target["target_kind"],
+                    "target_mention_raw": target["raw"],
+                    "target_mention_normalized": target["normalized"],
+                    "target_mention_type": target.get("mention_type"),
+                    "target_number": target.get("number"),
+                    "target_year": target.get("year"),
+                    "linked_statute_id": target.get("linked_statute_id"),
+                    "canonical_statute_name": target.get("canonical_statute_name"),
+                    "span_start": match.start(),
+                    "span_end": end,
+                    "evidence_snippet": _snippet(text, match.start(), end),
+                }
+                dedupe_key = (
+                    row["relation_type"],
+                    row["target_kind"],
+                    row["target_mention_normalized"],
+                    row["span_start"],
+                    row["span_end"],
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                edges.append(row)
+    return edges
+
+
+def _instrument_row_keys(row: Instrument) -> set[str]:
+    keys: set[str] = set()
+    if row.number:
+        key = _instrument_reference_key(row.number)
+        if key:
+            keys.add(key)
+    for mention in row.citation_mentions or []:
+        if not isinstance(mention, dict):
+            continue
+        for field in ("normalized", "raw"):
+            key = _instrument_reference_key(str(mention.get(field) or ""))
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _instrument_row_signatures(row: Instrument) -> set[tuple[str, str, int]]:
+    signatures: set[tuple[str, str, int]] = set()
+    direct = _instrument_signature(row.number)
+    if direct:
+        signatures.add(direct)
+    for mention in row.citation_mentions or []:
+        if not isinstance(mention, dict):
+            continue
+        sig = _mention_signature(mention)
+        if sig:
+            signatures.add(sig)
+    return signatures
+
+
+async def _resolve_target_instrument(db: AsyncSession, *, source_instrument_id, target: Dict[str, Any]) -> Optional[Instrument]:
+    mention_key = _instrument_reference_key(target.get("target_mention_normalized"))
+    mention_signature = _mention_signature(
+        {
+            "mention_type": target.get("target_mention_type"),
+            "number": target.get("target_number"),
+            "year": target.get("target_year"),
+            "normalized": target.get("target_mention_normalized"),
+            "raw": target.get("target_mention_raw"),
+        }
+    )
+    candidates = []
+    for row in (await db.execute(select(Instrument).where(Instrument.id != source_instrument_id))).scalars().all():
+        sig_match = mention_signature and mention_signature in _instrument_row_signatures(row)
+        key_match = bool(mention_key and mention_key in _instrument_row_keys(row))
+        if sig_match or key_match:
+            candidates.append(row)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+async def _resolve_target_statute_id(db: AsyncSession, target: Dict[str, Any]):
+    linked_id = target.get("linked_statute_id")
+    if linked_id:
+        try:
+            parsed = UUID(str(linked_id))
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            statute = (await db.execute(select(Statute).where(Statute.id == parsed))).scalars().first()
+            if statute is not None:
+                return statute.id
+    canonical_name = str(target.get("canonical_statute_name") or "").strip()
+    if canonical_name:
+        statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
+        if statute is not None:
+            return statute.id
+    return None
+
+
+async def _sync_instrument_relation_edges(db: AsyncSession, inst: Instrument) -> None:
+    text = inst.full_text or ""
+    citation_mentions = inst.citation_mentions if isinstance(inst.citation_mentions, list) else []
+    statute_mentions = inst.statute_mentions if isinstance(inst.statute_mentions, list) else []
+    candidates = _collect_relation_candidates(
+        text=text,
+        citation_mentions=citation_mentions,
+        statute_mentions=statute_mentions,
+    )
+    await db.execute(delete(InstrumentRelation).where(InstrumentRelation.source_instrument_id == inst.id))
+    for edge in candidates:
+        target_instrument_id = None
+        target_statute_id = None
+        if edge["target_kind"] == "instrument":
+            target_inst = await _resolve_target_instrument(db, source_instrument_id=inst.id, target=edge)
+            if target_inst is None or target_inst.id == inst.id:
+                continue  # fail-closed: unresolved/ambiguous target instrument
+            target_instrument_id = target_inst.id
+            target_statute_id = target_inst.affected_statute_id
+        else:
+            target_statute_id = await _resolve_target_statute_id(db, edge)
+            if target_statute_id is None:
+                continue  # fail-closed: statute endpoint could not be canonically resolved
+        db.add(
+            InstrumentRelation(
+                source_instrument_id=inst.id,
+                target_instrument_id=target_instrument_id,
+                target_statute_id=target_statute_id,
+                relation_type=str(edge["relation_type"])[:40],
+                relation_phrase=str(edge["relation_phrase"])[:120],
+                target_mention_raw=str(edge["target_mention_raw"])[:300],
+                target_mention_normalized=str(edge["target_mention_normalized"])[:300],
+                span_start=int(edge["span_start"]),
+                span_end=int(edge["span_end"]),
+                evidence_snippet=str(edge["evidence_snippet"])[:500],
+                source_provenance_id=inst.source_provenance_id,
+                source_url=inst.source_url,
+            )
+        )
+    await db.flush()
+
+
 async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
     data = st.reconciled_json or {}
     if st.status == "quarantined" and not force:
@@ -375,6 +664,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         )
         db.add(inst)
         await db.flush()
+        await _sync_instrument_relation_edges(db, inst)
         if prov is not None:
             prov.promoted_table, prov.promoted_id = "instrument", inst.id
         st.status, st.promoted_to_id = "promoted", inst.id
