@@ -445,6 +445,16 @@ class PakistanCodePipeline(PublicPipeline):
         listings: Dict[str, Dict[str, Any]],
         route_meta: Dict[str, Any],
     ) -> None:
+        endpoint_kind: Optional[str] = None
+        joined_raw = html.unescape(str(raw or "")).strip()
+        if joined_raw:
+            if not joined_raw.lower().startswith(("http://", "https://")):
+                joined_raw = urljoin(base_url, joined_raw)
+            viewer_pdf = _extract_viewer_pdf_url(joined_raw)
+            if viewer_pdf:
+                raw = viewer_pdf
+                endpoint_kind = "viewerjs-pdf-embed"
+
         normalized = normalize_pakistancode_public_url(raw, base_url=base_url)
         if not normalized:
             return
@@ -458,12 +468,6 @@ class PakistanCodePipeline(PublicPipeline):
         except URLPolicyError:
             self.stats["rejected_urls"] += 1
             return
-
-        endpoint_kind: Optional[str] = None
-        viewer_pdf = _extract_viewer_pdf_url(safe)
-        if viewer_pdf:
-            safe = viewer_pdf
-            endpoint_kind = "viewerjs-pdf-embed"
 
         kind = _classify_discovered_url(safe)
         if kind == "document":
