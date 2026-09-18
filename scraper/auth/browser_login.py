@@ -70,6 +70,9 @@ class LoginSession:
         await self._cdp.send("Page.enable")
         await self._cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 60, "maxWidth": self.viewport["width"], "maxHeight": self.viewport["height"], "everyNthFrame": 2})
         await self._page.goto(self.login_url, wait_until="domcontentloaded")
+        # Static login pages may not repaint after load, so push one explicit frame
+        # to avoid `next_frame()` timing out on first operator connect.
+        await self.snapshot()
         self.last_url = self._page.url
         self.status = "awaiting_human"
 
