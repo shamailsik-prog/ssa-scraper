@@ -195,7 +195,7 @@ async def test_fsc_orders_table_non_pdf_is_retired_with_route_metadata(db, fixtu
             <tr>
               <td>1.</td>
               <td>13.06.2020</td>
-              <td><a href="https://www.federalshariatcourt.gov.pk/wp-content/uploads/2020/03/Orders/Bad-Order.pdf">Broken order</a></td>
+              <td><a href="/wp-content/uploads/2020/03/Orders/Bad-Order.pdf">Broken order</a></td>
             </tr>
           </table>
         </body></html>

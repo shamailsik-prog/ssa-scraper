@@ -199,13 +199,24 @@ class FederalShariatCourtPipeline(PublicPipeline):
         max_depth = int(self.source.crawl_max_depth or 2)
         docs: Dict[str, Dict[str, Any]] = {}
         listings: List[str] = []
+        is_alljud_table = _looks_like_alljud_table(res.final_url, res.text)
+        is_orders_table = _looks_like_orders_table(res.final_url, res.text)
 
         for raw, channel, hint in _iter_discovery_candidates(res.text):
-            self._capture_candidate(raw=raw, hint=hint, channel=channel, base_url=res.final_url, docs=docs, listings=listings, route_meta={})
+            self._capture_candidate(
+                raw=raw,
+                hint=hint,
+                channel=channel,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+                route_meta={},
+                allow_judgment_capture=not (is_alljud_table or is_orders_table),
+            )
 
-        if _looks_like_alljud_table(res.final_url, res.text):
+        if is_alljud_table:
             self._collect_alljud_table_docs(html_text=res.text, base_url=res.final_url, docs=docs)
-        if _looks_like_orders_table(res.final_url, res.text):
+        if is_orders_table:
             self._collect_orders_table_docs(html_text=res.text, base_url=res.final_url, docs=docs)
 
         added = await self._enqueue_judgments_with_meta(docs, listing_url=res.final_url)
@@ -328,6 +339,7 @@ class FederalShariatCourtPipeline(PublicPipeline):
         docs: Dict[str, Dict[str, Any]],
         listings: List[str],
         route_meta: Dict[str, Any],
+        allow_judgment_capture: bool = True,
     ) -> None:
         normalized = normalize_fsc_public_url(raw, base_url=base_url)
         if not normalized:
@@ -343,7 +355,7 @@ class FederalShariatCourtPipeline(PublicPipeline):
             self.stats["rejected_urls"] += 1
             return
         kind = _classify_discovered_url(safe, hint_text=hint)
-        if kind == "judgment":
+        if kind == "judgment" and allow_judgment_capture:
             path = urlsplit(safe).path or "/"
             if JUDGMENT_DIR_RE.search(path):
                 pdf_endpoint_kind = "judgments-dir"
