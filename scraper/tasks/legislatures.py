@@ -262,8 +262,10 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 for key, value in meta.items():
                     if key not in existing and value not in ("", None):
                         existing[key] = value
-        elif kind == "listing" and safe != base_url:
-            listings.append(safe)
+        elif kind == "listing":
+            normalized_base = normalize_pab_public_url(base_url, base_url=base_url) or base_url
+            if safe != normalized_base:
+                listings.append(safe)
 
     async def _enqueue_documents_with_meta(
         self,
@@ -343,15 +345,15 @@ class BalochistanAssemblyPipeline(PublicPipeline):
             if res.verdict.kind in ("verification", "login"):
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
-            elif expect_pdf and not has_pdf_signature(res.content):
-                fr.status = "retired"
-                fr.last_error = f"missing %PDF signature for {kind} document URL"
             elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
                 fr.status = "retired"
                 fr.last_error = "missing %PDF signature for judgment document URL"
             elif res.status_code >= 400:
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"
+            elif expect_pdf and not has_pdf_signature(res.content):
+                fr.status = "retired"
+                fr.last_error = f"missing %PDF signature for {kind} document URL"
             else:
                 if kind == "judgment":
                     await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
