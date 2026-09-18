@@ -470,6 +470,137 @@ async def test_punjablaws_mixed_section_fanout_preserves_statute_and_instrument_
     assert ordinance_doc_row.query_json["route"]["source_section"] == "ordinances"
 
 
+async def test_punjablaws_ordinance_listing_nav_link_to_act_remains_statute(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/ordinances/list-2026.html",
+        """
+        <html><body>
+          <a href="/acts/punjab-labor-act-2026">Punjab Labor Act, 2026</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/acts/punjab-labor-act-2026",
+        """
+        <html><body>
+          <h1>Punjab Labor Act, 2026</h1>
+          <a href="/downloads/punjab-labor-act-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/downloads/punjab-labor-act-2026.pdf", text_pdf_bytes("Punjab Labor Act, 2026"), content_type="application/pdf")
+
+    source = await _punjab_assembly_source(db, fixture_server, ["/ordinances/list-2026.html"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/acts/punjab-labor-act-2026" in fixture_server.hits
+    assert "/downloads/punjab-labor-act-2026.pdf" in fixture_server.hits
+
+    detail_url = fixture_server.url("/acts/punjab-labor-act-2026")
+    detail_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_row is not None
+    assert detail_row.query_json["target_kind"] == "statute"
+    assert detail_row.query_json["meta"]["source_section"] == "acts"
+
+    document_url = fixture_server.url("/downloads/punjab-labor-act-2026.pdf")
+    statute_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"statute:{document_url}",
+            )
+        )
+    ).scalars().first()
+    instrument_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert statute_row is not None
+    assert instrument_row is None
+    assert statute_row.query_json["route"]["source_section"] == "acts"
+
+
+async def test_punjablaws_bills_detail_listing_without_html_fans_out_documents(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/bills/list-2026.html",
+        """
+        <html><body>
+          <table>
+            <thead><tr><th>Law No.</th><th>Title</th><th>Year</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>VII</td>
+                <td><a href="/bills/punjab-green-bill-2026">Punjab Green Bill, 2026</a></td>
+                <td>2026</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/bills/punjab-green-bill-2026",
+        """
+        <html><body>
+          <h1>Punjab Green Bill, 2026</h1>
+          <a href="/downloads/punjab-green-bill-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/downloads/punjab-green-bill-2026.pdf", text_pdf_bytes("Punjab Green Bill, 2026"), content_type="application/pdf")
+
+    source = await _punjab_assembly_source(db, fixture_server, ["/bills/list-2026.html"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/bills/punjab-green-bill-2026" in fixture_server.hits
+    assert "/downloads/punjab-green-bill-2026.pdf" in fixture_server.hits
+
+    detail_url = fixture_server.url("/bills/punjab-green-bill-2026")
+    detail_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_row is not None
+    assert detail_row.query_json["target_kind"] == "instrument"
+    assert detail_row.query_json["meta"]["source_section"] == "bills"
+
+    document_url = fixture_server.url("/downloads/punjab-green-bill-2026.pdf")
+    doc_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert doc_row is not None
+    assert doc_row.query_json["route"]["detail_fetch"] == "detail_documents"
+    assert doc_row.query_json["route"]["source_section"] == "bills"
+
+
 async def test_punjab_assembly_pdf_signature_gate_retires_non_pdf_statute_link(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(

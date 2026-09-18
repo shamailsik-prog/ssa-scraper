@@ -98,7 +98,7 @@ PUNJABLAWS_HOST = "punjablaws.gov.pk"
 PUNJABLAWS_HOST_ALIASES = (PUNJABLAWS_HOST, f"www.{PUNJABLAWS_HOST}")
 PUNJABLAWS_DOC_RE = re.compile(r"(?i)^/.+\.(pdf|doc|docx)$")
 PUNJABLAWS_SECTION_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|codes?|ordinances?|rules?|bills?|notifications?)(?:/|$)")
-PUNJABLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|ordinances?|rules?|notifications?|codes?)/[^/?#]+(?:\.html?)?$")
+PUNJABLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|ordinances?|rules?|bills?|notifications?|codes?)/[^/?#]+(?:\.html?)?$")
 PUNJABLAWS_LISTING_PATH_RE = re.compile(r"(?i)^/(|index(?:\.html?)?|search(?:\.html?)?|all[-_]?laws?(?:\.html?)?)$")
 PUNJABLAWS_LEGAL_HINT_RE = re.compile(r"(?i)\b(act|ordinance|rule|rules|law|code|regulation|notification|bill|amendment)\b")
 PUNJABLAWS_NAV_HINT_RE = re.compile(r"(?i)\b(index|list|search|category|archive|home|contents?)\b")
@@ -1148,16 +1148,15 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             url=res.final_url,
         )
         page_target_kind = str(
-            inherited_meta.get("target_kind")
-            or self._punjablaws_target_kind(
+            self._punjablaws_target_kind(
                 source_section=page_source_section,
                 act_type=inherited_meta.get("act_type", ""),
                 title=inherited_meta.get("act_title") or inherited_meta.get("detail_title") or "",
                 url=res.final_url,
             )
         )
-        inherited_meta.setdefault("source_section", page_source_section)
-        inherited_meta.setdefault("target_kind", page_target_kind)
+        inherited_meta["source_section"] = page_source_section
+        inherited_meta["target_kind"] = page_target_kind
 
         if self._is_punjablaws_detail_listing(res.final_url):
             self._collect_punjablaws_detail_document_links(
@@ -1186,10 +1185,10 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             docs=docs,
             listings=listings,
             inherited_meta={
+                **inherited_meta,
                 "listing_fetch": "navigation_links",
                 "source_section": page_source_section,
                 "target_kind": page_target_kind,
-                **inherited_meta,
             },
         )
 
@@ -1281,12 +1280,14 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
 
     @classmethod
     def _punjablaws_source_section(cls, *, source_section: Any, act_type: Any, title: Any, url: str) -> str:
+        url_section = cls._punjablaws_source_section_for_url(url)
+        if url_section:
+            return url_section
         lowered = " ".join(
             (
                 str(source_section or ""),
                 str(act_type or ""),
                 str(title or ""),
-                cls._punjablaws_source_section_for_url(url) or "",
             )
         ).lower()
         if re.search(r"\bordinances?\b", lowered):
