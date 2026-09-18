@@ -41,7 +41,7 @@ from scraper.models import (
     StatutesStaging,
 )
 from scraper.parsers.bench_parser import normalise_judge_name
-from scraper.parsers.citation_extractor import extract_citations, normalise_citation
+from scraper.parsers.citation_extractor import canonicalise_statute_name, extract_citations, normalise_citation
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,89 @@ def _norm_section(n: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (n or "").strip()).rstrip(".")
 
 
+def _validated_mentions_payload(
+    value: Any,
+    *,
+    field_name: str,
+    required_keys: tuple[str, ...],
+) -> tuple[list[Dict[str, Any]], Optional[str]]:
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"{field_name} must be a list"
+    cleaned: list[Dict[str, Any]] = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict):
+            return [], f"{field_name} item must be an object"
+        missing = [k for k in required_keys if not item.get(k)]
+        if missing:
+            return [], f"{field_name} item missing keys: {', '.join(missing)}"
+        year = item.get("year")
+        if year is not None:
+            try:
+                y = int(year)
+            except (TypeError, ValueError):
+                return [], f"{field_name} year must be an integer"
+            if y < 1800 or y > 2035:
+                return [], f"{field_name} year out of accepted range"
+            item = {**item, "year": y}
+        span = item.get("span")
+        if span is not None:
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
+                return [], f"{field_name} span must be a two-item list"
+            try:
+                item = {**item, "span": [int(span[0]), int(span[1])]}
+            except (TypeError, ValueError):
+                return [], f"{field_name} span must contain integers"
+        dedupe_key = (
+            item.get("mention_type"),
+            item.get("normalized"),
+            item.get("section_number"),
+            item.get("year"),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        cleaned.append(item)
+    return cleaned, None
+
+
+def _instrument_statute_shape(name: str) -> tuple[Optional[str], Optional[int]]:
+    stype_match = re.search(r"(?i)\b(act|ordinance|rules|regulations|order|code|constitution)\b", name)
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", name)
+    stype = stype_match.group(1).lower() if stype_match else None
+    year = int(year_match.group(1)) if year_match else None
+    return stype, year
+
+
+async def _resolve_statute_link(
+    db: AsyncSession,
+    *,
+    canonical_name: str,
+    source_name: Optional[str],
+    source_url: Optional[str],
+    jurisdiction: Optional[str],
+) -> Statute:
+    statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
+    if statute is None:
+        statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
+    if statute is None:
+        stype, year = _instrument_statute_shape(canonical_name)
+        statute = Statute(
+            name=canonical_name,
+            short_name=canonical_name[:100],
+            jurisdiction=jurisdiction or "Federal",
+            statute_type=stype,
+            year_enacted=year,
+            source_name=source_name,
+            source_url=source_url,
+        )
+        db.add(statute)
+        await db.flush()
+    return statute
+
+
 async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
     data = st.reconciled_json or {}
     if st.status == "quarantined" and not force:
@@ -218,9 +301,59 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         if not data.get("type"):
             await _quarantine(db, st, "instrument type unknown", "instrument")
             return "quarantined"
+        citation_mentions, mention_error = _validated_mentions_payload(
+            data.get("citation_mentions"),
+            field_name="citation_mentions",
+            required_keys=("raw", "normalized", "mention_type"),
+        )
+        if mention_error:
+            await _quarantine(db, st, mention_error, "instrument")
+            return "quarantined"
+        statute_mentions, statute_mention_error = _validated_mentions_payload(
+            data.get("statute_mentions"),
+            field_name="statute_mentions",
+            required_keys=("raw", "normalized"),
+        )
+        if statute_mention_error:
+            await _quarantine(db, st, statute_mention_error, "instrument")
+            return "quarantined"
+        if data.get("affected_sections") is not None and not isinstance(data.get("affected_sections"), list):
+            await _quarantine(db, st, "affected_sections must be a list", "instrument")
+            return "quarantined"
         aff = None
+        linked_statute_mentions: list[Dict[str, Any]] = []
+        collected_sections = [str(s).strip() for s in (data.get("affected_sections") or []) if str(s).strip()]
         if data.get("affected_statute"):
-            aff = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{data['affected_statute'][:80]}%")))).scalars().first()
+            canonical = canonicalise_statute_name(str(data["affected_statute"])) or str(data["affected_statute"]).strip()
+            aff = await _resolve_statute_link(
+                db,
+                canonical_name=canonical,
+                source_name=st.source_name,
+                source_url=st.source_url,
+                jurisdiction=data.get("jurisdiction"),
+            )
+        for mention in statute_mentions:
+            raw_name = str(mention.get("canonical_statute_name") or mention.get("statute_name") or "").strip()
+            if not raw_name:
+                continue
+            canonical = canonicalise_statute_name(raw_name, mention.get("year")) or raw_name
+            linked = await _resolve_statute_link(
+                db,
+                canonical_name=canonical,
+                source_name=st.source_name,
+                source_url=st.source_url,
+                jurisdiction=data.get("jurisdiction"),
+            )
+            row = dict(mention)
+            row["canonical_statute_name"] = canonical
+            row["linked_statute_id"] = str(linked.id)
+            linked_statute_mentions.append(row)
+            section_number = row.get("section_number")
+            if section_number:
+                collected_sections.append(str(section_number))
+            if aff is None:
+                aff = linked
+        collected_sections = [s for s in dict.fromkeys(collected_sections) if s]
         dd = data.get("date")
         inst = Instrument(
             type=str(data["type"])[:40],
@@ -231,8 +364,10 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             full_text=text,
             full_text_hash=h,
             affected_statute_id=aff.id if aff else None,
-            affected_statute_name=data.get("affected_statute"),
-            affected_sections=data.get("affected_sections") or [],
+            affected_statute_name=aff.name if aff else (canonicalise_statute_name(data.get("affected_statute")) if data.get("affected_statute") else None),
+            affected_sections=collected_sections,
+            citation_mentions=citation_mentions,
+            statute_mentions=linked_statute_mentions,
             jurisdiction=data.get("jurisdiction"),
             source_name=st.source_name,
             source_url=st.source_url,

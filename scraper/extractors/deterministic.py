@@ -17,7 +17,15 @@ from bs4 import BeautifulSoup
 
 from scraper.extractors.schemas import JudgmentExtraction, StatuteExtraction, InstrumentExtraction, SearchResultExtraction, SearchFormMapExtraction
 from scraper.parsers.bench_parser import parse_bench
-from scraper.parsers.citation_extractor import extract_citations, extract_statutes, normalise_citation, score_confidence
+from scraper.parsers.citation_extractor import (
+    canonicalise_statute_name,
+    extract_citations,
+    extract_instrument_mentions,
+    extract_statute_mentions,
+    extract_statutes,
+    normalise_citation,
+    score_confidence,
+)
 from scraper.parsers.statute_parser import detect_statute_name, split_into_sections
 from scraper.parsers.text_cleaner import clean_html
 
@@ -313,6 +321,22 @@ def extract_instrument_deterministic(*, html: Optional[str], text: Optional[str]
     if ma:
         affected = ma.group(1).strip(" ,")
         evidence["affected_statute"] = ma.group(0)
+    citation_mentions = extract_instrument_mentions(raw_text[:50000])
+    statute_mentions = extract_statute_mentions(raw_text[:50000])
+    for s in statute_mentions:
+        sec = s.get("section_number")
+        if sec:
+            aff_secs.append(str(sec))
+        if affected is None and s.get("canonical_statute_name"):
+            affected = str(s.get("canonical_statute_name"))
+            evidence.setdefault("affected_statute", s.get("raw", "")[:200])
+    if affected:
+        affected = canonicalise_statute_name(affected) or affected
+    if not number and citation_mentions:
+        first = citation_mentions[0]
+        if first.get("normalized"):
+            number = str(first["normalized"])
+            evidence.setdefault("number", first.get("raw", "")[:120])
     for s in extract_statutes(raw_text[:50000]):
         sec = s.get("section") or s.get("article")
         if sec:
@@ -327,6 +351,8 @@ def extract_instrument_deterministic(*, html: Optional[str], text: Optional[str]
         full_text=raw_text,
         affected_statute=affected,
         affected_sections=list(dict.fromkeys(aff_secs))[:200],
+        citation_mentions=citation_mentions[:200],
+        statute_mentions=statute_mentions[:300],
         field_evidence=evidence,
         extractor_confidence=conf,
     )

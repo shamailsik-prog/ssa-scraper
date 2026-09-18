@@ -357,6 +357,8 @@ class Instrument(Base):
     affected_statute_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("statute.id", ondelete="SET NULL"))
     affected_statute_name: Mapped[Optional[str]] = mapped_column(String(1000))
     affected_sections: Mapped[Optional[list]] = mapped_column(JSONB)
+    citation_mentions: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{raw, normalized, mention_type, number, year, span, source_snippet}]")
+    statute_mentions: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{raw, canonical_statute_name, section_number, year, linked_statute_id}]")
     jurisdiction: Mapped[Optional[str]] = mapped_column(String(50))
     source_name: Mapped[Optional[str]] = mapped_column(String(100))
     source_url: Mapped[Optional[str]] = mapped_column(Text)
