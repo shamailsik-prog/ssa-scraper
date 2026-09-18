@@ -48,6 +48,11 @@ PAP_HOST = "pap.gov.pk"
 PAP_HOST_ALIASES = (PAP_HOST, "www.pap.gov.pk")
 PAP_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|html?)$")
 PAP_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|en/about-assembly/parliamentary-privileges/?)$")
+PAS_HOST = "pas.gov.pk"
+PAS_HOST_ALIASES = (PAS_HOST, "www.pas.gov.pk")
+PAS_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|doc|docx|html?)$")
+PAS_LISTING_PATH_RE = re.compile(r"(?i)^/index\.php/acts/?$")
+PAS_DETAIL_PATH_RE = re.compile(r"(?i)^/index\.php/acts/details/\d+/\d+/?$")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -105,6 +110,30 @@ def normalize_pap_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_pas_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public PAS hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in PAS_HOST_ALIASES:
+        scheme = "https"
+        netloc = PAS_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def _classify_discovered_url(url: str) -> Optional[str]:
     path = (urlsplit(url).path or "/").lower()
     if STORAGE_DOC_RE.search(path):
@@ -119,6 +148,15 @@ def _classify_pap_discovered_url(url: str) -> Optional[str]:
     if PAP_ACT_DOC_RE.search(path):
         return "document"
     if PAP_LISTING_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_pas_discovered_url(url: str) -> Optional[str]:
+    path = (urlsplit(url).path or "/").lower()
+    if PAS_ACT_DOC_RE.search(path):
+        return "document"
+    if PAS_LISTING_PATH_RE.search(path) or PAS_DETAIL_PATH_RE.search(path):
         return "listing"
     return None
 
@@ -328,6 +366,8 @@ class BalochistanAssemblyPipeline(PublicPipeline):
             route: Dict[str, Any] = {"listing": listing_url}
             for key_name in (
                 "listing_fetch",
+                "detail_fetch",
+                "discovery_channel",
                 "result_index",
                 "source_section",
                 "tenure",
@@ -337,6 +377,8 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 "act_passed_on",
                 "act_assented_on",
                 "act_type",
+                "detail_url",
+                "detail_title",
                 "document_format",
                 "pdf_endpoint_kind",
             ):
@@ -568,10 +610,271 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             listings.append(safe)
 
 
+class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for PAS listing rows + detail-page act file routing."""
+
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = fr.query_json.get("target_kind", "statute")
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
+
+        if self._is_detail_listing(res.final_url):
+            self._collect_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+        else:
+            self._collect_structured_listing_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+            )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "result_index",
+                    "source_section",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_assented_on",
+                    "detail_url",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    @staticmethod
+    def _is_detail_listing(url: str) -> bool:
+        return PAS_DETAIL_PATH_RE.search((urlsplit(url).path or "").lower()) is not None
+
+    def _collect_structured_listing_rows(self, *, html_text: str, base_url: str, listings: Dict[str, Dict[str, Any]]) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_listing_table(headers):
+                continue
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                link = self._detail_link(cells, headers)
+                if link is None:
+                    continue
+                row_index += 1
+                title = link.get("title", "").strip() or link.get_text(" ", strip=True) or cells[1].get_text(" ", strip=True)
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": "acts_table",
+                    "discovery_channel": "acts-table-row",
+                    "source_section": "acts",
+                    "result_index": row_index,
+                }
+                self._add_listing_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
+                self._capture_candidate(raw=link.get("href", ""), hint=title[:240], base_url=base_url, docs={}, listings=listings, route_meta=row_meta)
+
+    @staticmethod
+    def _looks_like_listing_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_no = any("act no" in h for h in headers)
+        has_title = any("title" in h for h in headers)
+        return has_no and has_title
+
+    @staticmethod
+    def _detail_link(cells: List[Any], headers: List[str]):
+        title_idx = next((i for i, h in enumerate(headers) if "title" in h), None)
+        if title_idx is not None and title_idx < len(cells):
+            link = cells[title_idx].find("a", href=True)
+            if link is not None:
+                return link
+        for cell in cells:
+            link = cell.find("a", href=True)
+            if link is not None:
+                return link
+        return None
+
+    def _add_listing_row_provenance(self, *, row_meta: Dict[str, Any], cells: List[Any], headers: List[str], title: str) -> None:
+        act_no_idx = next((i for i, h in enumerate(headers) if "act no" in h), None)
+        if act_no_idx is not None and act_no_idx < len(cells):
+            act_no = cells[act_no_idx].get_text(" ", strip=True)[:80]
+            if act_no:
+                row_meta["act_no"] = act_no
+
+        if title:
+            row_meta["act_title"] = title[:280]
+
+        for idx, header in enumerate(headers):
+            if idx >= len(cells):
+                continue
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
+                continue
+            if "passing" in header:
+                row_meta["act_passed_on"] = value[:40]
+                if "act_year" not in row_meta and YEAR_RE.search(value):
+                    row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+            elif "governor" in header or "assent" in header:
+                row_meta["act_assented_on"] = value[:40]
+                if "act_year" not in row_meta and YEAR_RE.search(value):
+                    row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+            elif "year" in header and YEAR_RE.search(value):
+                row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        if "act_year" not in row_meta:
+            year_match = YEAR_RE.search(title or "") or YEAR_RE.search(row_meta.get("act_no", ""))
+            if year_match:
+                row_meta["act_year"] = year_match.group(0)
+
+    def _collect_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title = (soup.select_one("h2.act-title") or soup.select_one("h1") or soup.select_one("title"))
+        detail_title_text = detail_title.get_text(" ", strip=True)[:280] if detail_title else ""
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        if detail_title_text and not base_meta.get("act_title"):
+            base_meta["act_title"] = detail_title_text
+        if detail_title_text:
+            base_meta["detail_title"] = detail_title_text
+
+        for p in soup.select("p"):
+            label_node = p.find("label")
+            if label_node is None:
+                continue
+            label = label_node.get_text(" ", strip=True).lower()
+            value = p.get_text(" ", strip=True).replace(label_node.get_text(" ", strip=True), "", 1).strip(" :")
+            if not value:
+                continue
+            if "act no" in label and "act_no" not in base_meta:
+                base_meta["act_no"] = value[:80]
+            elif ("passed on" in label or "date of passing" in label) and "act_passed_on" not in base_meta:
+                base_meta["act_passed_on"] = value[:40]
+            elif ("assent" in label or "enforcement" in label) and "act_assented_on" not in base_meta:
+                base_meta["act_assented_on"] = value[:40]
+            elif "subject" in label and "act_type" not in base_meta:
+                base_meta["act_type"] = value[:80]
+            if "act_year" not in base_meta and YEAR_RE.search(value):
+                base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        for a in soup.find_all("a", href=True):
+            hint = a.get_text(" ", strip=True)[:240]
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "act_files_section"
+            route_meta["discovery_channel"] = "act-detail-file-link"
+            self._capture_candidate(raw=a.get("href", ""), hint=hint, base_url=base_url, docs=docs, listings={}, route_meta=route_meta)
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_pas_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_pas_discovered_url(safe)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "uploads-acts-file" if path.startswith("/uploads/acts/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            if safe not in listings:
+                listings[safe] = dict(route_meta)
+                listings[safe].setdefault("detail_url", safe)
+            else:
+                for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
+
+
 async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
     pipeline_cls = PublicPipeline
     if source.source_name == "BalochistanAssembly":
         pipeline_cls = BalochistanAssemblyPipeline
     elif source.source_name == "PunjabAssembly":
         pipeline_cls = PunjabAssemblyPipeline
+    elif source.source_name == "SindhAssembly":
+        pipeline_cls = SindhAssemblyPipeline
     return await run_public_source(db, source, seed_listings=listings_for(source), pipeline_cls=pipeline_cls, **kwargs)
