@@ -189,12 +189,12 @@ async def test_bhc_portal_api_fanout_discovers_downloadpdf_judgments_with_route(
         """
         <html><body>
           <div id="__nuxt"></div>
-          <link rel="preload" href="/_nuxt/app.js" as="script">
+          <link rel="preload" href="/_nuxt/app.abc123-def.js" as="script">
         </body></html>
         """,
     )
     fixture_server.add(
-        "/_nuxt/app.js",
+        "/_nuxt/app.abc123-def.js",
         'window.__STORE__={guestAuthData:{email:"guest@bhc.gov.pk",password:"public-guest-password"}};',
         content_type="application/javascript",
     )

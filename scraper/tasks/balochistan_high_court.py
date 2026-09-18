@@ -57,7 +57,7 @@ ABS_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
 REL_DOC_RE = re.compile(r"(?i)(/?media/judgments/[^\"'<>\s]+?\.pdf(?:\?[^\"'<>\s]*)?)")
 REL_LISTING_RE = re.compile(r"(?i)(/?(?:ur/)?resources/judgments(?:/[^\"'<>\s]*)?)")
 REL_PORTAL_API_RE = re.compile(r"(?i)(/?v2/(?:judges|judgments|downloadpdf/[^\"'<>\s]+))")
-PORTAL_BUNDLE_RE = re.compile(r"(?i)(?:href|src)=\"([^\"]*?/_nuxt/[A-Za-z0-9]+\.js)\"")
+PORTAL_BUNDLE_RE = re.compile(r"(?i)(?:href|src)=\"([^\"]*?/_nuxt/[A-Za-z0-9._-]+\.js)\"")
 PORTAL_GUEST_RE = re.compile(
     r"""guestAuthData\s*:\s*\{\s*email\s*:\s*["']([^"']+)["']\s*,\s*password\s*:\s*["']([^"']+)["']""",
     re.I,
