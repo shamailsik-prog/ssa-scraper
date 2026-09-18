@@ -70,7 +70,13 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
         {"url": "https://sindhlaws.gov.pk/Gazette.aspx?pg=ORDINANCE", "target_kind": "instrument"},
         {"url": "https://sindhlaws.gov.pk/Gazette.aspx?pg=BILLS", "target_kind": "instrument"},
     ],
-    "KPAssembly": [{"url": "https://www.pakp.gov.pk/act/", "target_kind": "statute"}, {"url": "https://kpcode.kp.gov.pk/", "target_kind": "statute"}],
+    "KPAssembly": [
+        {"url": "https://www.pakp.gov.pk/act/", "target_kind": "statute"},
+        {"url": "https://kpcode.kp.gov.pk/", "target_kind": "statute"},
+        {"url": "https://kpcode.kp.gov.pk/homepage/rules", "target_kind": "instrument"},
+        {"url": "https://www.pakp.gov.pk/bill/", "target_kind": "instrument"},
+        {"url": "https://www.pakp.gov.pk/all-bills/", "target_kind": "instrument"},
+    ],
     "BalochistanAssembly": [
         {"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"},
         {"url": "https://balochistancode.gob.pk/laws_rules.aspx?opento=1&wise=srbdl", "target_kind": "statute"},
@@ -121,8 +127,8 @@ SINDHLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/gazettedetail\.aspx$")
 PAKP_HOST = "pakp.gov.pk"
 PAKP_HOST_ALIASES = (PAKP_HOST, "www.pakp.gov.pk")
 PAKP_ACT_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx|html?)$")
-PAKP_LISTING_PATH_RE = re.compile(r"(?i)^/(act|acts)/?$")
-PAKP_DETAIL_PATH_RE = re.compile(r"(?i)^/act/[^/?#]+/?$")
+PAKP_LISTING_PATH_RE = re.compile(r"(?i)^/(act|acts|bill|bills|all-bills|government-bills|private-bills|past-bills)/?$")
+PAKP_DETAIL_PATH_RE = re.compile(r"(?i)^/(act|bill)/[^/?#]+/?$")
 KPCODE_HOST = "kpcode.kp.gov.pk"
 KPCODE_HOST_ALIASES = (KPCODE_HOST, "www.kpcode.kp.gov.pk")
 KPCODE_DOC_RE = re.compile(r"(?i)^/uploads/.+\.(pdf|doc|docx|html?)$")
@@ -2290,6 +2296,8 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
     ) -> None:
         soup = BeautifulSoup(html_text or "", "html.parser")
         row_index = 0
+        source_section = self._pakp_source_section_for_url(base_url)
+        section_target_kind = "instrument" if source_section in ("bills", "ordinances") else "statute"
         for table in soup.select("table"):
             headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
             if not headers:
@@ -2314,7 +2322,8 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
                 row_meta: Dict[str, Any] = {
                     "listing_fetch": "acts_table",
                     "discovery_channel": "acts-table-row",
-                    "source_section": "acts",
+                    "source_section": source_section,
+                    "target_kind": section_target_kind,
                     "result_index": row_index,
                 }
                 self._add_listing_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
@@ -2334,8 +2343,10 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
         if not headers:
             return False
         has_act_no = any("act #" in h or "act no" in h or "act number" in h for h in headers)
+        has_bill_no = any("bill #" in h or "bill no" in h or "bill number" in h for h in headers)
+        has_bill_context = any("introduction date" in h or "mover" in h or "status" in h for h in headers)
         has_title = any("title" in h for h in headers)
-        return has_act_no and has_title
+        return has_title and (has_act_no or has_bill_no or has_bill_context)
 
     @staticmethod
     def _title_link(cells: List[Any], headers: List[str]):
@@ -2451,9 +2462,18 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
     @staticmethod
     def _kpcode_target_kind(*, source_section: str, title: str, category: str) -> str:
         lowered = " ".join((source_section or "", title or "", category or "")).lower()
-        if any(token in lowered for token in ("ordinance", "rules", "rule", "regulation", "notification", "order", "by-law", "bye-law")):
+        if any(token in lowered for token in ("ordinance", "rules", "rule", "regulation", "notification", "order", "bill", "by-law", "bye-law")):
             return "instrument"
         return "statute"
+
+    @staticmethod
+    def _pakp_source_section_for_url(url: str) -> str:
+        path = (urlsplit(url).path or "/").lower()
+        if path.startswith(("/bill", "/bills", "/all-bills", "/government-bills", "/private-bills", "/past-bills")):
+            return "bills"
+        if path.startswith("/ordinance"):
+            return "ordinances"
+        return "acts"
 
     def _collect_kpcode_listing_rows(
         self,
