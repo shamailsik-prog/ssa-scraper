@@ -214,7 +214,21 @@ def normalize_punjab_public_url(raw: str, *, base_url: str) -> Optional[str]:
         candidate = "https:" + candidate
     if candidate.lower().startswith("www."):
         candidate = "https://" + candidate
-    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    if candidate.lower().startswith(("http://", "https://")):
+        joined = candidate
+    else:
+        join_base = base_url
+        base_parts = urlsplit(base_url)
+        base_host = (base_parts.hostname or "").lower()
+        base_path = base_parts.path or "/"
+        if (
+            base_host in PUNJABLAWS_HOST_ALIASES
+            and not candidate.startswith(("/", "?"))
+            and not base_path.endswith("/")
+            and PUNJABLAWS_SECTION_PATH_RE.fullmatch(base_path)
+        ):
+            join_base = urlunsplit((base_parts.scheme, base_parts.netloc, f"{base_path}/", base_parts.query, ""))
+        joined = urljoin(join_base, candidate)
     parts = urlsplit(joined)
     host = (parts.hostname or "").lower()
     scheme = parts.scheme or "https"

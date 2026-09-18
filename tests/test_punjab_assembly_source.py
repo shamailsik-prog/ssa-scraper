@@ -62,6 +62,14 @@ def test_normalize_punjab_public_url_canonicalizes_punjablaws_host():
     assert rel == "https://punjablaws.gov.pk/acts/punjab%20green%20act%202025"
 
 
+def test_normalize_punjab_public_url_keeps_relative_links_under_section_hubs():
+    rel = normalize_punjab_public_url(
+        "list-2026.html",
+        base_url="https://punjablaws.gov.pk/rules",
+    )
+    assert rel == "https://punjablaws.gov.pk/rules/list-2026.html"
+
+
 async def test_punjablaws_root_listing_overrides_target_kind_by_section(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(
