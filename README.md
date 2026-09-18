@@ -197,7 +197,7 @@ scraper/fetchers.py          HTTP fetch, raw preservation  scraper/tasks/superio
                                                           scraper/tasks/supreme_appellate_court_gb.py  SAC-GB listings + anchor/data/script discovery
                                                           scraper/tasks/federal_shariat_court.py  FSC multi-page + anchor/data/script discovery
 scraper/security.py          allow-list, SSRF, robots,     scraper/tasks/pakistancode.py     PakistanCode statutes
-                             block detection, scrubbing    scraper/tasks/legislatures.py     NA, Senate, 4 assemblies, Gazette (Senate + PAKP + PAB + PAP + PAS source-specific table/detail direct-doc routing with row metadata + %PDF gate)
+                             block detection, scrubbing    scraper/tasks/legislatures.py     NA, Senate, 4 assemblies, Gazette (NA + Senate + PAKP + PAB + PAP + PAS source-specific table/detail direct-doc routing with row metadata + %PDF gate)
 scraper/auth/session_manager.py  slots, lock, reconnect    scraper/tasks/nasirlawsite.py     NasirLawSite
 scraper/auth/browser_login.py    streamed human login      scraper/tasks/promotion.py        validate, dedupe, promote
 scraper/parsers/*            deterministic legal parsers   scraper/tasks/treatment.py        treatment classification

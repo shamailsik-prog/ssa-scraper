@@ -14,7 +14,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from sqlalchemy import select
@@ -28,7 +28,17 @@ from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
-    "NationalAssembly": [{"url": "https://na.gov.pk/en/legis.php", "target_kind": "instrument"}, {"url": "https://na.gov.pk/en/acts-tenure.php", "target_kind": "statute"}],
+    "NationalAssembly": [
+        {"url": "https://na.gov.pk/en/acts-tenure.php", "target_kind": "statute"},
+        {"url": "https://na.gov.pk/en/bills.php?type=1", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills.php?type=2", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills.php?status=pass", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills.php?status=majlis", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills.php?type=4", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-15.php?status=pass", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-15.php?status=majlis", "target_kind": "instrument"},
+        {"url": "https://na.gov.pk/en/bills-15.php?type=4", "target_kind": "instrument"},
+    ],
     "Senate": [
         {"url": "https://senate.gov.pk/en/acts.php?id=-1&catid=186&subcatid=285&cattitle=Acts", "target_kind": "statute"},
         {"url": "https://senate.gov.pk/en/ordinance.php?id=-1&catid=186&subcatid=304&cattitle=Ordinances", "target_kind": "instrument"},
@@ -66,6 +76,10 @@ PAKP_HOST_ALIASES = (PAKP_HOST, "www.pakp.gov.pk")
 PAKP_ACT_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx|html?)$")
 PAKP_LISTING_PATH_RE = re.compile(r"(?i)^/(act|acts)/?$")
 PAKP_DETAIL_PATH_RE = re.compile(r"(?i)^/act/[^/?#]+/?$")
+NA_HOST = "na.gov.pk"
+NA_HOST_ALIASES = (NA_HOST, "www.na.gov.pk")
+NA_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
+NA_LISTING_PATH_RE = re.compile(r"(?i)^/en/(acts-tenure|acts|bills|bills-15)\.php$")
 SENATE_HOST = "senate.gov.pk"
 SENATE_HOST_ALIASES = (SENATE_HOST, "www.senate.gov.pk")
 SENATE_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
@@ -200,6 +214,30 @@ def normalize_senate_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_na_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public NA hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in NA_HOST_ALIASES:
+        scheme = "https"
+        netloc = NA_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def _classify_discovered_url(url: str) -> Optional[str]:
     path = (urlsplit(url).path or "/").lower()
     if STORAGE_DOC_RE.search(path):
@@ -241,6 +279,15 @@ def _classify_senate_discovered_url(url: str) -> Optional[str]:
     if SENATE_DOC_RE.search(path):
         return "document"
     if SENATE_LISTING_PATH_RE.search(path) or SENATE_DETAIL_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_na_discovered_url(url: str) -> Optional[str]:
+    path = (urlsplit(url).path or "/").lower()
+    if NA_DOC_RE.search(path):
+        return "document"
+    if NA_LISTING_PATH_RE.search(path):
         return "listing"
     return None
 
@@ -1239,6 +1286,264 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
                         listings[safe][key] = value
 
 
+class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for NA acts/bills tables and direct document links."""
+
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = fr.query_json.get("target_kind", "instrument")
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+
+        self._collect_structured_listing_rows(
+            html_text=res.text,
+            base_url=res.final_url,
+            docs=docs,
+        )
+        self._collect_listing_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            listings=listings,
+            inherited_meta={
+                "listing_fetch": "navigation_links",
+                "source_section": self._source_section_for_url(res.final_url),
+            },
+        )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "result_index",
+                    "source_section",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_assented_on",
+                    "act_type",
+                    "detail_url",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    def _collect_structured_listing_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_legislation_table(headers):
+                continue
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                links = tr.find_all("a", href=True)
+                if not links:
+                    continue
+
+                row_index += 1
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": "legislation_table",
+                    "discovery_channel": "legislation-table-row",
+                    "source_section": self._source_section_for_url(base_url),
+                    "result_index": row_index,
+                }
+                self._add_row_provenance(row_meta=row_meta, cells=cells, headers=headers)
+                for link in links:
+                    hint = link.get_text(" ", strip=True)[:240]
+                    self._capture_candidate(
+                        raw=link.get("href", ""),
+                        hint=hint,
+                        base_url=base_url,
+                        docs=docs,
+                        listings={},
+                        route_meta=row_meta,
+                    )
+
+    @staticmethod
+    def _looks_like_legislation_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_title = any("title" in h for h in headers)
+        has_date = any("date" in h for h in headers)
+        has_sr = any("sr no" in h or "s. no" in h for h in headers)
+        return has_title and has_date and has_sr
+
+    def _add_row_provenance(self, *, row_meta: Dict[str, Any], cells: List[Any], headers: List[str]) -> None:
+        title_idx = next((i for i, h in enumerate(headers) if "title" in h), None)
+        if title_idx is not None and title_idx < len(cells):
+            title = cells[title_idx].get_text(" ", strip=True)[:280]
+            if title:
+                row_meta["act_title"] = title
+
+        date_idx = next((i for i, h in enumerate(headers) if "date" in h), None)
+        if date_idx is not None and date_idx < len(cells):
+            date_value = cells[date_idx].get_text(" ", strip=True)[:40]
+            if date_value:
+                row_meta["act_passed_on"] = date_value
+                if YEAR_RE.search(date_value):
+                    row_meta["act_year"] = YEAR_RE.search(date_value).group(0)  # type: ignore[union-attr]
+
+        sr_idx = next((i for i, h in enumerate(headers) if "sr no" in h or "s. no" in h), None)
+        if sr_idx is not None and sr_idx < len(cells):
+            sr = cells[sr_idx].get_text(" ", strip=True)[:40]
+            if sr:
+                row_meta["act_no"] = sr
+
+        title = row_meta.get("act_title", "")
+        if title and "act_no" in row_meta:
+            no_match = re.search(r"\b(?:act|ordinance)\s*no\.?\s*([^\),;]+)", title, re.IGNORECASE)
+            if no_match:
+                row_meta["act_no"] = no_match.group(1).strip()[:80]
+        if title and "act_year" not in row_meta:
+            year_match = YEAR_RE.search(title)
+            if year_match:
+                row_meta["act_year"] = year_match.group(0)
+
+        section = row_meta.get("source_section")
+        if section == "ordinances":
+            row_meta["act_type"] = "ordinance"
+        elif section == "bills":
+            row_meta["act_type"] = "bill"
+        elif section == "acts":
+            row_meta["act_type"] = "act"
+
+    def _collect_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs={},
+                listings=listings,
+                route_meta=inherited_meta,
+            )
+
+    @staticmethod
+    def _source_section_for_url(url: str) -> str:
+        parts = urlsplit(url)
+        path = (parts.path or "").lower()
+        qs = parse_qs(parts.query or "")
+        if path.endswith(("/acts-tenure.php", "/acts.php")):
+            return "acts"
+        if path.endswith(("/bills.php", "/bills-15.php")):
+            status = (qs.get("status", [""])[0] or "").lower()
+            btype = (qs.get("type", [""])[0] or "").lower()
+            if btype == "4":
+                return "ordinances"
+            if status in ("pass", "majlis") or btype in ("1", "2", "3"):
+                return "bills"
+            return "bills"
+        return "legislation"
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_na_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_na_discovered_url(safe)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "uploads-documents-file" if path.startswith("/uploads/documents/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            if safe not in listings:
+                listings[safe] = dict(route_meta)
+                listings[safe].setdefault("detail_url", safe)
+            else:
+                for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
+
+
 class SenatePipeline(BalochistanAssemblyPipeline):
     """Source-specific extraction for Senate legislation tables + detail-page document routing."""
 
@@ -1540,6 +1845,8 @@ async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) 
         pipeline_cls = SindhAssemblyPipeline
     elif source.source_name == "KPAssembly":
         pipeline_cls = KPAssemblyPipeline
+    elif source.source_name == "NationalAssembly":
+        pipeline_cls = NationalAssemblyPipeline
     elif source.source_name == "Senate":
         pipeline_cls = SenatePipeline
     return await run_public_source(db, source, seed_listings=listings_for(source), pipeline_cls=pipeline_cls, **kwargs)
