@@ -425,6 +425,7 @@ async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db)
     )
     assert target_instrument is not None
 
+    await db.commit()
     counts = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
     assert counts["processed"] >= 1
     edges = (
@@ -493,7 +494,9 @@ async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db)
         "http://127.0.0.1/ambiguous-target-b.pdf",
     )
 
-    await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    await db.commit()
+    counts = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    assert counts["processed"] >= 1
     edges = (
         await db.execute(
             select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
@@ -550,6 +553,7 @@ async def test_instrument_relation_reconcile_is_idempotent_on_rerun(db):
         "http://127.0.0.1/idempotent-target.pdf",
     )
 
+    await db.commit()
     first = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
     second = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
     edges = (
