@@ -1343,7 +1343,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
     @staticmethod
     def _sindhlaws_source_section(url: str) -> Optional[str]:
         parts = urlsplit(url)
-        query = parse_qs(parts.query or "")
+        query = {key.lower(): value for key, value in parse_qs(parts.query or "").items()}
         section_raw = ""
         if query.get("pg"):
             section_raw = str(query["pg"][0])
@@ -1361,7 +1361,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
     @staticmethod
     def _sindhlaws_year(url: str) -> Optional[str]:
         parts = urlsplit(url)
-        query = parse_qs(parts.query or "")
+        query = {key.lower(): value for key, value in parse_qs(parts.query or "").items()}
         year = (query.get("year") or [""])[0]
         year_text = str(year).strip()
         if YEAR_RE.fullmatch(year_text):
@@ -1581,7 +1581,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         section = self._sindhlaws_source_section(base_url) or inherited_meta.get("source_section") or "acts"
         detail_year = self._sindhlaws_year(base_url)
         base_meta = dict(inherited_meta)
-        base_meta.setdefault("detail_url", base_url)
+        base_meta["detail_url"] = base_url
         base_meta.setdefault("source_section", section)
         if detail_year and "act_year" not in base_meta:
             base_meta["act_year"] = detail_year
