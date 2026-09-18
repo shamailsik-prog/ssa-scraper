@@ -574,14 +574,18 @@ class IslamabadHighCourtPipeline(PublicPipeline):
             return
         kind = _classify_discovered_url(safe, hint_text=hint)
         if kind == "judgment":
-            docs.setdefault(
-                safe,
-                {
-                    "discovery_channel": channel,
-                    "discovery_hint": hint[:240],
-                    **route_meta,
-                },
-            )
+            meta = {
+                "discovery_channel": channel,
+                "discovery_hint": hint[:240],
+                **route_meta,
+            }
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
         elif kind == "listing" and safe != base_url:
             listings.append(safe)
             detail_pdf = _candidate_from_detail_query(safe, base_url=base_url)
