@@ -97,6 +97,7 @@ PAP_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|en/about-assembly/parliamentary
 PUNJABLAWS_HOST = "punjablaws.gov.pk"
 PUNJABLAWS_HOST_ALIASES = (PUNJABLAWS_HOST, f"www.{PUNJABLAWS_HOST}")
 PUNJABLAWS_DOC_RE = re.compile(r"(?i)^/.+\.(pdf|doc|docx)$")
+PUNJABLAWS_SECTION_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|codes?|ordinances?|rules?|bills?|notifications?)(?:/|$)")
 PUNJABLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|ordinances?|rules?|notifications?|codes?)/[^/?#]+(?:\.html?)?$")
 PUNJABLAWS_LISTING_PATH_RE = re.compile(r"(?i)^/(|index(?:\.html?)?|search(?:\.html?)?|all[-_]?laws?(?:\.html?)?)$")
 PUNJABLAWS_LEGAL_HINT_RE = re.compile(r"(?i)\b(act|ordinance|rule|rules|law|code|regulation|notification|bill|amendment)\b")
@@ -1140,6 +1141,23 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         docs: Dict[str, Dict[str, Any]] = {}
         listings: Dict[str, Dict[str, Any]] = {}
         inherited_meta = dict(fr.query_json.get("meta") or {})
+        page_source_section = self._punjablaws_source_section(
+            source_section=inherited_meta.get("source_section"),
+            act_type=inherited_meta.get("act_type", ""),
+            title=inherited_meta.get("act_title") or inherited_meta.get("detail_title") or "",
+            url=res.final_url,
+        )
+        page_target_kind = str(
+            inherited_meta.get("target_kind")
+            or self._punjablaws_target_kind(
+                source_section=page_source_section,
+                act_type=inherited_meta.get("act_type", ""),
+                title=inherited_meta.get("act_title") or inherited_meta.get("detail_title") or "",
+                url=res.final_url,
+            )
+        )
+        inherited_meta.setdefault("source_section", page_source_section)
+        inherited_meta.setdefault("target_kind", page_target_kind)
 
         if self._is_punjablaws_detail_listing(res.final_url):
             self._collect_punjablaws_detail_document_links(
@@ -1169,7 +1187,8 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             listings=listings,
             inherited_meta={
                 "listing_fetch": "navigation_links",
-                "source_section": "acts",
+                "source_section": page_source_section,
+                "target_kind": page_target_kind,
                 **inherited_meta,
             },
         )
@@ -1191,6 +1210,7 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                 )
             ).scalars().first()
             if exists is None:
+                next_target_kind = str(nmeta.get("target_kind") or target_kind)
                 route = {"listing": res.final_url}
                 for key_name in (
                     "listing_fetch",
@@ -1217,7 +1237,7 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                         query_json={
                             "kind": "listing",
                             "url": nurl,
-                            "target_kind": target_kind,
+                            "target_kind": next_target_kind,
                             "depth": depth + 1,
                             "route": route,
                             "meta": nmeta,
@@ -1239,6 +1259,57 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         if PUNJABLAWS_LISTING_PATH_RE.search(path):
             return False
         return PUNJABLAWS_DETAIL_PATH_RE.search(path) is not None
+
+    @staticmethod
+    def _punjablaws_source_section_for_url(url: str) -> Optional[str]:
+        path = (urlsplit(url).path or "/").lower()
+        match = PUNJABLAWS_SECTION_PATH_RE.search(path)
+        if not match:
+            return None
+        section = match.group(1).lower()
+        if section.startswith(("ordinance",)):
+            return "ordinances"
+        if section.startswith(("rule",)):
+            return "rules"
+        if section.startswith(("bill",)):
+            return "bills"
+        if section.startswith(("notification",)):
+            return "notifications"
+        if section.startswith(("act", "law", "code")):
+            return "acts"
+        return None
+
+    @classmethod
+    def _punjablaws_source_section(cls, *, source_section: Any, act_type: Any, title: Any, url: str) -> str:
+        lowered = " ".join(
+            (
+                str(source_section or ""),
+                str(act_type or ""),
+                str(title or ""),
+                cls._punjablaws_source_section_for_url(url) or "",
+            )
+        ).lower()
+        if re.search(r"\bordinances?\b", lowered):
+            return "ordinances"
+        if re.search(r"\brules?\b", lowered):
+            return "rules"
+        if re.search(r"\bbills?\b", lowered):
+            return "bills"
+        if re.search(r"\bnotifications?\b", lowered):
+            return "notifications"
+        return "acts"
+
+    @classmethod
+    def _punjablaws_target_kind(cls, *, source_section: Any, act_type: Any, title: Any, url: str) -> str:
+        normalized_section = cls._punjablaws_source_section(
+            source_section=source_section,
+            act_type=act_type,
+            title=title,
+            url=url,
+        )
+        if normalized_section in ("ordinances", "rules", "bills", "notifications"):
+            return "instrument"
+        return "statute"
 
     def _collect_structured_act_rows(
         self,
@@ -1304,6 +1375,12 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         host = (urlsplit(base_url).hostname or "").lower()
         if host not in PUNJABLAWS_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
             return
+        source_section = self._punjablaws_source_section(
+            source_section=self._punjablaws_source_section_for_url(base_url),
+            act_type="",
+            title="",
+            url=base_url,
+        )
         soup = BeautifulSoup(html_text or "", "html.parser")
         row_index = 0
         for table in soup.select("table"):
@@ -1329,10 +1406,16 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                 row_meta: Dict[str, Any] = {
                     "listing_fetch": "punjablaws_table",
                     "discovery_channel": "punjablaws-table-row",
-                    "source_section": "acts",
+                    "source_section": source_section,
                     "result_index": row_index,
                 }
                 self._add_punjablaws_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
+                row_meta["target_kind"] = self._punjablaws_target_kind(
+                    source_section=row_meta.get("source_section"),
+                    act_type=row_meta.get("act_type", ""),
+                    title=row_meta.get("act_title", "") or title,
+                    url=base_url,
+                )
                 self._capture_candidate(
                     raw=link.get("href", ""),
                     hint=title[:240],
@@ -1445,6 +1528,15 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
         detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
         base_meta = dict(inherited_meta)
+        base_meta.setdefault(
+            "source_section",
+            self._punjablaws_source_section(
+                source_section=inherited_meta.get("source_section"),
+                act_type=inherited_meta.get("act_type", ""),
+                title=detail_title or inherited_meta.get("act_title") or "",
+                url=base_url,
+            ),
+        )
         base_meta.setdefault("detail_url", base_url)
         if detail_title:
             base_meta.setdefault("detail_title", detail_title)
@@ -1477,6 +1569,18 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                 base_meta["act_type"] = value[:80]
             if "act_year" not in base_meta and YEAR_RE.search(value):
                 base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+        base_meta["source_section"] = self._punjablaws_source_section(
+            source_section=base_meta.get("source_section"),
+            act_type=base_meta.get("act_type", ""),
+            title=base_meta.get("act_title") or detail_title,
+            url=base_url,
+        )
+        base_meta["target_kind"] = self._punjablaws_target_kind(
+            source_section=base_meta.get("source_section"),
+            act_type=base_meta.get("act_type", ""),
+            title=base_meta.get("act_title") or detail_title,
+            url=base_url,
+        )
         for a in soup.find_all("a", href=True):
             route_meta = dict(base_meta)
             route_meta["detail_fetch"] = "detail_documents"
@@ -1535,6 +1639,21 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             return
 
         kind = _classify_punjab_discovered_url(safe, hint_text=hint)
+        inferred_source_section = self._punjablaws_source_section(
+            source_section=route_meta.get("source_section"),
+            act_type=route_meta.get("act_type", ""),
+            title=route_meta.get("act_title") or route_meta.get("detail_title") or hint,
+            url=safe,
+        )
+        inferred_target_kind = self._punjablaws_target_kind(
+            source_section=inferred_source_section,
+            act_type=route_meta.get("act_type", ""),
+            title=route_meta.get("act_title") or route_meta.get("detail_title") or hint,
+            url=safe,
+        )
+        enriched_route_meta = dict(route_meta)
+        enriched_route_meta["source_section"] = inferred_source_section
+        enriched_route_meta["target_kind"] = inferred_target_kind
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
             host = (urlsplit(safe).hostname or "").lower()
@@ -1547,7 +1666,7 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                     if path.startswith("/uploads/acts/")
                     else ("punjablaws-download-file" if host_is_punjablaws_like and "/download" in path else "direct-file")
                 ),
-                **route_meta,
+                **enriched_route_meta,
             }
             if ext and "document_format" not in meta:
                 meta["document_format"] = ext
@@ -1562,10 +1681,10 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                         existing[key] = value
         elif kind == "listing" and safe != base_url:
             if safe not in listings:
-                listings[safe] = dict(route_meta)
+                listings[safe] = dict(enriched_route_meta)
                 listings[safe].setdefault("detail_url", safe)
             else:
-                for key, value in route_meta.items():
+                for key, value in enriched_route_meta.items():
                     if key not in listings[safe] and value not in ("", None):
                         listings[safe][key] = value
 
