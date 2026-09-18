@@ -41,6 +41,9 @@ async def test_punjab_default_listings_include_pap_and_punjablaws_seeds(db):
     listing_map = {row["url"]: row["target_kind"] for row in listings_for(source)}
     assert listing_map["https://www.pap.gov.pk/acts"] == "statute"
     assert listing_map["https://punjablaws.gov.pk/index.html"] == "statute"
+    assert listing_map["https://punjablaws.gov.pk/ordinances"] == "instrument"
+    assert listing_map["https://punjablaws.gov.pk/rules"] == "instrument"
+    assert listing_map["https://punjablaws.gov.pk/bills"] == "instrument"
 
 
 def test_normalize_pap_public_url_handles_relative_uploads_path():
@@ -601,6 +604,81 @@ async def test_punjablaws_bills_detail_listing_without_html_fans_out_documents(d
     assert doc_row.query_json["route"]["source_section"] == "bills"
 
 
+async def test_punjablaws_rules_seed_fans_out_instrument_document(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/rules/list-2026.html",
+        """
+        <html><body>
+          <table>
+            <thead><tr><th>Law No.</th><th>Title</th><th>Year</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>XI</td>
+                <td><a href="/rules/punjab-sample-rules-2026">Punjab Sample Rules, 2026</a></td>
+                <td>2026</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/rules/punjab-sample-rules-2026",
+        """
+        <html><body>
+          <h1>Punjab Sample Rules, 2026</h1>
+          <a href="/downloads/punjab-sample-rules-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/downloads/punjab-sample-rules-2026.pdf", text_pdf_bytes("Punjab Sample Rules, 2026"), content_type="application/pdf")
+
+    source = await _punjab_assembly_source(db, fixture_server, ["/rules/list-2026.html"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/rules/punjab-sample-rules-2026" in fixture_server.hits
+    assert "/downloads/punjab-sample-rules-2026.pdf" in fixture_server.hits
+
+    detail_url = fixture_server.url("/rules/punjab-sample-rules-2026")
+    detail_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_row is not None
+    assert detail_row.query_json["target_kind"] == "instrument"
+    assert detail_row.query_json["meta"]["source_section"] == "rules"
+
+    document_url = fixture_server.url("/downloads/punjab-sample-rules-2026.pdf")
+    doc_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    statute_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PunjabAssembly",
+                CrawlFrontier.query_key == f"statute:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert doc_row is not None
+    assert statute_row is None
+    assert doc_row.query_json["route"]["detail_fetch"] == "detail_documents"
+    assert doc_row.query_json["route"]["source_section"] == "rules"
+
+
 async def test_punjab_assembly_pdf_signature_gate_retires_non_pdf_statute_link(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(
@@ -652,14 +730,8 @@ async def test_punjab_assembly_pdf_signature_gate_retires_non_pdf_statute_link(d
     assert "missing %PDF signature for statute document URL" in (row.last_error or "")
 
 
-async def test_punjablaws_ordinance_non_pdf_candidate_fails_closed_as_instrument(db, fixture_server):
+async def test_punjablaws_ordinance_seed_non_pdf_candidate_fails_closed_as_instrument(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
-    fixture_server.add(
-        "/index.html",
-        """
-        <html><body><a href="/ordinances/list-2026.html">Ordinances</a></body></html>
-        """,
-    )
     fixture_server.add(
         "/ordinances/list-2026.html",
         """
@@ -679,7 +751,7 @@ async def test_punjablaws_ordinance_non_pdf_candidate_fails_closed_as_instrument
     )
     fixture_server.add("/downloads/fake-punjab-ordinance.pdf", "<html>not-a-pdf</html>", content_type="application/pdf")
 
-    source = await _punjab_assembly_source(db, fixture_server, ["/index.html"])
+    source = await _punjab_assembly_source(db, fixture_server, ["/ordinances/list-2026.html"])
     async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
         stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
     await db.commit()
@@ -708,14 +780,8 @@ async def test_punjablaws_ordinance_non_pdf_candidate_fails_closed_as_instrument
     assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
 
 
-async def test_punjablaws_ordinance_rerun_remains_idempotent_with_instrument_key(db, fixture_server):
+async def test_punjablaws_ordinance_seed_rerun_remains_idempotent_with_instrument_key(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
-    fixture_server.add(
-        "/index.html",
-        """
-        <html><body><a href="/ordinances/list-2025.html">Ordinances</a></body></html>
-        """,
-    )
     fixture_server.add(
         "/ordinances/list-2025.html",
         """
@@ -739,7 +805,7 @@ async def test_punjablaws_ordinance_rerun_remains_idempotent_with_instrument_key
         content_type="application/pdf",
     )
 
-    source = await _punjab_assembly_source(db, fixture_server, ["/index.html"])
+    source = await _punjab_assembly_source(db, fixture_server, ["/ordinances/list-2025.html"])
     async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
         await scrape_legislature(source, db, fetcher=fetcher, limit=50)
     await db.commit()
