@@ -234,6 +234,18 @@ SOURCE_SEED = [
         168,
         "hybrid",
     ),
+    (
+        "AJKAssembly",
+        "Azad Jammu and Kashmir Law Department",
+        "https://law.gok.pk/revised-volume/",
+        "public",
+        ["law.gok.pk", "www.law.gok.pk"],
+        False,
+        True,
+        True,
+        168,
+        "hybrid",
+    ),
     ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "http://pcp.gov.pk/Download", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
 ]
 

@@ -38,7 +38,7 @@ def test_admin_routes_require_key(client, admin_headers):
 
 def test_sources_view_has_no_credential_card_and_shows_slots(client, admin_headers):
     rows = client.get("/admin/sources", headers=admin_headers).json()
-    assert len(rows) == 20
+    assert len(rows) == 21
     pls = next(r for r in rows if r["source_name"] == "PakistanLawSite")
     assert pls["access_method"] == "login_session" and len(pls["slots"]) == 2 and pls["state"] == "PAUSED"
     assert "credential" not in json.dumps(pls).lower()
@@ -54,6 +54,7 @@ def test_sources_view_has_no_credential_card_and_shows_slots(client, admin_heade
         "FederalShariatCourt",
         "GazetteOfPakistan",
         "PunjabAssembly",
+        "AJKAssembly",
     } <= {r["source_name"] for r in rows}
 
 
