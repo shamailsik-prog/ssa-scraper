@@ -59,7 +59,10 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
     "PunjabAssembly": [{"url": "https://www.pap.gov.pk/acts", "target_kind": "statute"}, {"url": "https://punjablaws.gov.pk/index.html", "target_kind": "statute"}],
     "SindhAssembly": [{"url": "https://www.pas.gov.pk/index.php/acts", "target_kind": "statute"}, {"url": "https://sindhlaws.gov.pk/", "target_kind": "statute"}],
     "KPAssembly": [{"url": "https://www.pakp.gov.pk/act/", "target_kind": "statute"}, {"url": "https://kpcode.kp.gov.pk/", "target_kind": "statute"}],
-    "BalochistanAssembly": [{"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"}],
+    "BalochistanAssembly": [
+        {"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"},
+        {"url": "https://balochistancode.gob.pk/laws_rules.aspx?opento=1&wise=srbdl", "target_kind": "statute"},
+    ],
     "GazetteOfPakistan": [
         {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
         {"url": "http://pcp.gov.pk/WeeklyNitifications", "target_kind": "instrument"},
@@ -73,8 +76,13 @@ LEGISLATURE_SOURCES = tuple(DEFAULT_LISTINGS.keys())
 
 PAB_HOST = "pabalochistan.gov.pk"
 PAB_HOST_ALIASES = (PAB_HOST, "www.pabalochistan.gov.pk")
+BALOCHISTAN_CODE_HOST = "balochistancode.gob.pk"
+BALOCHISTAN_CODE_HOST_ALIASES = (BALOCHISTAN_CODE_HOST, f"www.{BALOCHISTAN_CODE_HOST}")
 STORAGE_DOC_RE = re.compile(r"(?i)^/storage/\d+/.+\.(pdf|doc|docx)$")
-LISTING_PATH_RE = re.compile(r"(?i)^/acts/?$")
+PAB_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|public/acts/?|index\.php/acts/?|public/index\.php/acts/?)$")
+BALOCHISTAN_CODE_DOC_RE = re.compile(r"(?i)^/.+\.(pdf|doc|docx)$")
+BALOCHISTAN_CODE_LISTING_PATH_RE = re.compile(r"(?i)^/(|home\.aspx|laws_rules\.aspx)$")
+BALOCHISTAN_CODE_DETAIL_PATH_RE = re.compile(r"(?i)^/document\.aspx$")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 PAP_HOST = "pap.gov.pk"
 PAP_HOST_ALIASES = (PAP_HOST, "www.pap.gov.pk")
@@ -132,7 +140,7 @@ def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
 
 
 def normalize_pab_public_url(raw: str, *, base_url: str) -> Optional[str]:
-    """Normalize discovered candidates onto official public PAB hosts."""
+    """Normalize discovered candidates onto official public Balochistan hosts."""
     if not raw:
         return None
     candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
@@ -150,6 +158,9 @@ def normalize_pab_public_url(raw: str, *, base_url: str) -> Optional[str]:
     if host in PAB_HOST_ALIASES:
         scheme = "https"
         netloc = PAB_HOST + (f":{parts.port}" if parts.port else "")
+    elif host in BALOCHISTAN_CODE_HOST_ALIASES:
+        scheme = "https"
+        netloc = BALOCHISTAN_CODE_HOST + (f":{parts.port}" if parts.port else "")
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query = (parts.query or "").replace(" ", "%20")
     return urlunsplit((scheme, netloc, path, query, ""))
@@ -352,12 +363,39 @@ def normalize_pcp_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
-def _classify_discovered_url(url: str) -> Optional[str]:
-    path = (urlsplit(url).path or "/").lower()
-    if STORAGE_DOC_RE.search(path):
+def _classify_balochistan_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    host = (parts.hostname or "").lower()
+    query = (parts.query or "").lower()
+    hint = (hint_text or "").lower()
+    host_is_local_fixture = host in ("127.0.0.1", "localhost")
+
+    if host in PAB_HOST_ALIASES or (host_is_local_fixture and (STORAGE_DOC_RE.search(path) or PAB_LISTING_PATH_RE.search(path))):
+        if STORAGE_DOC_RE.search(path):
+            return "document"
+        if PAB_LISTING_PATH_RE.search(path):
+            return "listing"
+        return None
+
+    if host not in BALOCHISTAN_CODE_HOST_ALIASES and not host_is_local_fixture:
+        return None
+    if BALOCHISTAN_CODE_DOC_RE.search(path):
         return "document"
-    if LISTING_PATH_RE.search(path):
+    if "wise=download" in query or "download" in path:
+        return "document"
+    if BALOCHISTAN_CODE_LISTING_PATH_RE.search(path):
         return "listing"
+    if BALOCHISTAN_CODE_DETAIL_PATH_RE.search(path):
+        if "opendoc" in query:
+            return "listing"
+        qs = parse_qs(parts.query or "")
+        for key in ("docid", "docc", "id", "lawid"):
+            values = qs.get(key) or []
+            if any(str(v).strip() for v in values):
+                return "listing"
+        if "act" in hint or "law" in hint or "ordinance" in hint or "rule" in hint:
+            return "listing"
     return None
 
 
@@ -499,32 +537,58 @@ def _classify_pcp_discovered_url(url: str) -> Optional[str]:
 
 
 class BalochistanAssemblyPipeline(PublicPipeline):
-    """Source-specific extraction for PAB acts tables and direct document links."""
+    """Source-specific extraction for PAB acts + Balochistan Code laws portal documents."""
 
     async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
         depth = int(fr.query_json.get("depth", 0))
         max_depth = int(self.source.crawl_max_depth or 2)
         target_kind = fr.query_json.get("target_kind", "statute")
         docs: Dict[str, Dict[str, Any]] = {}
-        listings: List[str] = []
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
 
-        self._collect_structured_act_rows(
-            html_text=res.text,
-            base_url=res.final_url,
-            docs=docs,
-        )
-        self._collect_listing_links(
-            html_text=res.text,
-            base_url=res.final_url,
-            listings=listings,
-        )
+        if self._is_balochistan_code_detail_listing(res.final_url):
+            self._collect_balochistan_code_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+        elif self._is_balochistan_code_url(res.final_url):
+            self._collect_balochistan_code_listing_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+            )
+            self._collect_listing_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+                route_meta={
+                    "listing_fetch": "navigation_links",
+                    "source_section": inherited_meta.get("source_section", "laws_portal"),
+                    **inherited_meta,
+                },
+            )
+        else:
+            self._collect_structured_act_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+            )
+            self._collect_listing_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+                route_meta=inherited_meta,
+            )
 
         added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
         self.stats["discovered"] += added
 
         if depth >= max_depth:
             return
-        for nurl in list(dict.fromkeys(listings)):
+        for nurl, nmeta in listings.items():
             key = f"listing:{nurl}"
             exists = (
                 await self.db.execute(
@@ -536,16 +600,43 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 )
             ).scalars().first()
             if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
+                    "result_index",
+                    "source_section",
+                    "tenure",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_assented_on",
+                    "act_type",
+                    "detail_url",
+                    "detail_title",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
                 self.db.add(
                     CrawlFrontier(
                         source_name=self.source.source_name,
                         tier=0,
                         query_key=key,
-                        query_json={"kind": "listing", "url": nurl, "target_kind": target_kind, "depth": depth + 1},
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
                         cursor_json={},
                         priority=40,
                     )
                 )
+                self.stats["discovered"] += 1
         await self.db.flush()
 
     def _collect_structured_act_rows(self, *, html_text: str, base_url: str, docs: Dict[str, Dict[str, Any]]) -> None:
@@ -614,11 +705,197 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                             hint=title[:240],
                             base_url=base_url,
                             docs=docs,
-                            listings=[],
+                            listings={},
                             route_meta=row_meta,
                         )
 
-    def _collect_listing_links(self, *, html_text: str, base_url: str, listings: List[str]) -> None:
+    @staticmethod
+    def _is_balochistan_code_url(url: str) -> bool:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if host in BALOCHISTAN_CODE_HOST_ALIASES:
+            return True
+        if host not in ("127.0.0.1", "localhost"):
+            return False
+        path = (parts.path or "/").lower()
+        query = (parts.query or "").lower()
+        return bool(
+            BALOCHISTAN_CODE_LISTING_PATH_RE.search(path)
+            or BALOCHISTAN_CODE_DETAIL_PATH_RE.search(path)
+            or "wise=" in query
+        )
+
+    def _is_balochistan_code_detail_listing(self, url: str) -> bool:
+        parts = urlsplit(url)
+        if not self._is_balochistan_code_url(url):
+            return False
+        path = (parts.path or "/").lower()
+        if not BALOCHISTAN_CODE_DETAIL_PATH_RE.search(path):
+            return False
+        query = (parts.query or "").lower()
+        if "opendoc" in query:
+            return True
+        qs = parse_qs(parts.query or "")
+        return any(any(str(v).strip() for v in (qs.get(key) or [])) for key in ("docid", "docc", "id", "lawid"))
+
+    def _collect_balochistan_code_listing_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        listings: Dict[str, Dict[str, Any]],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_balochistan_code_table(headers):
+                continue
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                link = None
+                for cell in cells:
+                    link = cell.find("a", href=True)
+                    if link is not None:
+                        break
+                if link is None:
+                    continue
+                row_index += 1
+                title = link.get_text(" ", strip=True) or cells[min(len(cells) - 1, 1)].get_text(" ", strip=True)
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": "balochistancode_table",
+                    "discovery_channel": "balochistancode-table-row",
+                    "source_section": "laws_portal",
+                    "result_index": row_index,
+                }
+                self._add_balochistan_code_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
+                self._capture_candidate(
+                    raw=link.get("href", ""),
+                    hint=title[:240],
+                    base_url=base_url,
+                    docs={},
+                    listings=listings,
+                    route_meta=row_meta,
+                )
+
+    @staticmethod
+    def _looks_like_balochistan_code_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_title = any("title" in h or "subject" in h or "name" in h for h in headers)
+        has_lawish = any(
+            "law" in h or "act" in h or "ordinance" in h or "rule" in h or "year" in h or "no" in h
+            for h in headers
+        )
+        return has_title and has_lawish
+
+    def _add_balochistan_code_row_provenance(
+        self,
+        *,
+        row_meta: Dict[str, Any],
+        cells: List[Any],
+        headers: List[str],
+        title: str,
+    ) -> None:
+        if title:
+            row_meta["act_title"] = title[:280]
+        for idx, header in enumerate(headers):
+            if idx >= len(cells):
+                continue
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
+                continue
+            if ("act no" in header or "law no" in header or "no." in header or header == "no") and "act_no" not in row_meta:
+                row_meta["act_no"] = value[:80]
+            elif "year" in header and "act_year" not in row_meta and YEAR_RE.search(value):
+                row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+            elif ("promulg" in header or "passed" in header or "date" in header) and "act_passed_on" not in row_meta:
+                row_meta["act_passed_on"] = value[:40]
+            elif ("type" in header or "category" in header) and "act_type" not in row_meta:
+                row_meta["act_type"] = value[:80]
+        if "act_type" not in row_meta and title:
+            low = title.lower()
+            if "ordinance" in low:
+                row_meta["act_type"] = "ordinance"
+            elif "rule" in low:
+                row_meta["act_type"] = "rules"
+            elif "act" in low:
+                row_meta["act_type"] = "act"
+            elif "law" in low:
+                row_meta["act_type"] = "law"
+        if "act_year" not in row_meta:
+            year_match = YEAR_RE.search(title or "") or YEAR_RE.search(row_meta.get("act_no", ""))
+            if year_match:
+                row_meta["act_year"] = year_match.group(0)
+
+    def _collect_balochistan_code_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        if detail_title:
+            base_meta.setdefault("detail_title", detail_title)
+            base_meta.setdefault("act_title", detail_title)
+            if "act_year" not in base_meta and YEAR_RE.search(detail_title):
+                base_meta["act_year"] = YEAR_RE.search(detail_title).group(0)  # type: ignore[union-attr]
+
+        for row in soup.select("table tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower()
+            value = cells[1].get_text(" ", strip=True)
+            if not value:
+                continue
+            if ("act no" in label or "law no" in label) and "act_no" not in base_meta:
+                base_meta["act_no"] = value[:80]
+            elif ("promulgation" in label or "passed" in label or "date of passing" in label) and "act_passed_on" not in base_meta:
+                base_meta["act_passed_on"] = value[:40]
+            elif ("type" in label or "category" in label) and "act_type" not in base_meta:
+                base_meta["act_type"] = value[:80]
+            if "act_year" not in base_meta and YEAR_RE.search(value):
+                base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            hint = a.get_text(" ", strip=True)[:240] or base_meta.get("act_title", "")[:240]
+            low = f"{href} {hint}".lower()
+            if not ("download" in low or ".pdf" in low or "wise=download" in low):
+                continue
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "balochistancode_detail_download"
+            route_meta["discovery_channel"] = "balochistancode-detail-file-link"
+            route_meta.setdefault("source_section", "laws_portal")
+            self._capture_candidate(
+                raw=href,
+                hint=hint,
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    def _collect_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
         soup = BeautifulSoup(html_text or "", "html.parser")
         for a in soup.find_all("a", href=True):
             self._capture_candidate(
@@ -627,7 +904,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 base_url=base_url,
                 docs={},
                 listings=listings,
-                route_meta={},
+                route_meta=dict(route_meta or {}),
             )
 
     def _capture_candidate(
@@ -637,7 +914,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         hint: str,
         base_url: str,
         docs: Dict[str, Dict[str, Any]],
-        listings: List[str],
+        listings: Dict[str, Dict[str, Any]],
         route_meta: Dict[str, Any],
     ) -> None:
         normalized = normalize_pab_public_url(raw, base_url=base_url)
@@ -654,19 +931,31 @@ class BalochistanAssemblyPipeline(PublicPipeline):
             self.stats["rejected_urls"] += 1
             return
 
-        kind = _classify_discovered_url(safe)
+        kind = _classify_balochistan_discovered_url(safe, hint_text=hint)
         if kind == "document":
-            path = (urlsplit(safe).path or "").lower()
+            parts = urlsplit(safe)
+            path = (parts.path or "").lower()
+            host = (parts.hostname or "").lower()
+            query = (parts.query or "").lower()
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            is_balochistan_code_download = (
+                host in BALOCHISTAN_CODE_HOST_ALIASES or host in ("127.0.0.1", "localhost")
+            ) and ("wise=download" in query or "download" in path)
             meta = {
                 "discovery_hint": hint[:240],
-                "pdf_endpoint_kind": "storage-file" if path.startswith("/storage/") else "direct-file",
+                "pdf_endpoint_kind": (
+                    "storage-file"
+                    if path.startswith("/storage/")
+                    else ("balochistancode-download-file" if is_balochistan_code_download else "direct-file")
+                ),
                 **route_meta,
             }
             if ext and "document_format" not in meta:
                 meta["document_format"] = ext
-            if ext == "pdf":
+            if ext == "pdf" or (is_balochistan_code_download and "expect_pdf" not in meta):
                 meta["expect_pdf"] = True
+                if "document_format" not in meta:
+                    meta["document_format"] = "pdf"
             existing = docs.get(safe)
             if existing is None:
                 docs[safe] = meta
@@ -675,7 +964,13 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                     if key not in existing and value not in ("", None):
                         existing[key] = value
         elif kind == "listing" and safe != base_url:
-            listings.append(safe)
+            if safe not in listings:
+                listings[safe] = dict(route_meta)
+                listings[safe].setdefault("detail_url", safe)
+            else:
+                for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
 
     async def _enqueue_documents_with_meta(
         self,
@@ -748,8 +1043,8 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         """
         Process one frontier row with PDF-signature gating for statute/instrument PDFs.
 
-        Balochistan Assembly serves direct `/storage/...pdf` links; these must fail closed when
-        the payload does not contain the PDF magic signature.
+        Balochistan statutes may arrive from direct `/storage/...pdf` links or Balochistan Code
+        download endpoints; both paths must fail closed when the payload is not a real PDF.
         """
         fr.status = "in_progress"
         fr.attempts += 1
