@@ -57,7 +57,13 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
         {"url": "https://senate.gov.pk/en/bs.php?catid=186&subcatid=276&leftcatid=368&cattitle=Bills", "target_kind": "instrument"},
     ],
     "PunjabAssembly": [{"url": "https://www.pap.gov.pk/acts", "target_kind": "statute"}, {"url": "https://punjablaws.gov.pk/index.html", "target_kind": "statute"}],
-    "SindhAssembly": [{"url": "https://www.pas.gov.pk/index.php/acts", "target_kind": "statute"}, {"url": "https://sindhlaws.gov.pk/", "target_kind": "statute"}],
+    "SindhAssembly": [
+        {"url": "https://www.pas.gov.pk/index.php/acts", "target_kind": "statute"},
+        {"url": "https://sindhlaws.gov.pk/", "target_kind": "statute"},
+        {"url": "https://sindhlaws.gov.pk/Gazette.aspx?pg=ACT", "target_kind": "statute"},
+        {"url": "https://sindhlaws.gov.pk/Gazette.aspx?pg=ORDINANCE", "target_kind": "instrument"},
+        {"url": "https://sindhlaws.gov.pk/Gazette.aspx?pg=BILLS", "target_kind": "instrument"},
+    ],
     "KPAssembly": [{"url": "https://www.pakp.gov.pk/act/", "target_kind": "statute"}, {"url": "https://kpcode.kp.gov.pk/", "target_kind": "statute"}],
     "BalochistanAssembly": [
         {"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"},
@@ -1603,6 +1609,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                 ):
                     if key_name in nmeta:
                         route[key_name] = nmeta[key_name]
+                next_target_kind = nmeta.get("target_kind", target_kind)
                 self.db.add(
                     CrawlFrontier(
                         source_name=self.source.source_name,
@@ -1611,7 +1618,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                         query_json={
                             "kind": "listing",
                             "url": nurl,
-                            "target_kind": target_kind,
+                            "target_kind": next_target_kind,
                             "depth": depth + 1,
                             "route": route,
                             "meta": nmeta,
@@ -1652,6 +1659,12 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         if section in ("bill", "bills"):
             return "bills"
         return None
+
+    @staticmethod
+    def _sindhlaws_target_kind(source_section: Optional[str]) -> str:
+        if str(source_section or "").strip().lower() in ("ordinances", "bills"):
+            return "instrument"
+        return "statute"
 
     @staticmethod
     def _sindhlaws_year(url: str) -> Optional[str]:
@@ -1701,6 +1714,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
                     "listing_fetch": "acts_table",
                     "discovery_channel": "acts-table-row",
                     "source_section": "acts",
+                    "target_kind": "statute",
                     "result_index": row_index,
                 }
                 self._add_listing_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
@@ -1839,12 +1853,14 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
             row_index += 1
             joined = urljoin(base_url, href)
             section = self._sindhlaws_source_section(joined) or self._sindhlaws_source_section(base_url) or inherited_meta.get("source_section") or "acts"
+            target_kind = self._sindhlaws_target_kind(section)
             route_meta: Dict[str, Any] = {
                 **inherited_meta,
                 "listing_fetch": "gazette_navigation",
                 "discovery_channel": "gazette-navigation-link",
                 "result_index": row_index,
                 "source_section": section,
+                "target_kind": target_kind,
             }
             year = self._sindhlaws_year(joined)
             if year:
@@ -1878,6 +1894,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         base_meta = dict(inherited_meta)
         base_meta["detail_url"] = base_url
         base_meta.setdefault("source_section", section)
+        base_meta.setdefault("target_kind", self._sindhlaws_target_kind(section))
         if detail_year and "act_year" not in base_meta:
             base_meta["act_year"] = detail_year
         if detail_title:
