@@ -52,7 +52,10 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
     "SindhAssembly": [{"url": "https://www.pas.gov.pk/index.php/acts", "target_kind": "statute"}, {"url": "https://sindhlaws.gov.pk/", "target_kind": "statute"}],
     "KPAssembly": [{"url": "https://www.pakp.gov.pk/act/", "target_kind": "statute"}, {"url": "https://kpcode.kp.gov.pk/", "target_kind": "statute"}],
     "BalochistanAssembly": [{"url": "https://www.pabalochistan.gov.pk/acts", "target_kind": "statute"}],
-    "GazetteOfPakistan": [{"url": "https://www.pcp.gov.pk/gazette", "target_kind": "instrument"}],
+    "GazetteOfPakistan": [
+        {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
+        {"url": "http://pcp.gov.pk/WeeklyNitifications", "target_kind": "instrument"},
+    ],
 }
 
 LEGISLATURE_SOURCES = tuple(DEFAULT_LISTINGS.keys())
@@ -85,6 +88,11 @@ SENATE_HOST_ALIASES = (SENATE_HOST, "www.senate.gov.pk")
 SENATE_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
 SENATE_LISTING_PATH_RE = re.compile(r"(?i)^/en/(acts|ordinance|bills|pbs|pbna|gbs|gbna|bs)\.php$")
 SENATE_DETAIL_PATH_RE = re.compile(r"(?i)^/en/essence\.php$")
+PCP_HOST = "pcp.gov.pk"
+PCP_HOST_ALIASES = (PCP_HOST, "www.pcp.gov.pk")
+PCP_DOC_RE = re.compile(r"(?i)^/siteimage/downloads/.+\.(pdf|doc|docx|html?)$")
+PCP_LISTING_PATH_RE = re.compile(r"(?i)^/(download|weeklynitifications|gazette)/?$")
+PCP_DETAIL_PATH_RE = re.compile(r"(?i)^/detail/[^/?#]+/?$")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -238,6 +246,29 @@ def normalize_na_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_pcp_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public PCP hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "http:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "http://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "http"
+    netloc = parts.netloc
+    if host in PCP_HOST_ALIASES:
+        netloc = PCP_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def _classify_discovered_url(url: str) -> Optional[str]:
     path = (urlsplit(url).path or "/").lower()
     if STORAGE_DOC_RE.search(path):
@@ -288,6 +319,15 @@ def _classify_na_discovered_url(url: str) -> Optional[str]:
     if NA_DOC_RE.search(path):
         return "document"
     if NA_LISTING_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_pcp_discovered_url(url: str) -> Optional[str]:
+    path = (urlsplit(url).path or "/").lower()
+    if PCP_DOC_RE.search(path):
+        return "document"
+    if PCP_LISTING_PATH_RE.search(path) or PCP_DETAIL_PATH_RE.search(path):
         return "listing"
     return None
 
@@ -1835,6 +1875,446 @@ class SenatePipeline(BalochistanAssemblyPipeline):
                         listings[safe][key] = value
 
 
+class GazetteOfPakistanPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for PCP Gazette listings and direct document links."""
+
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = fr.query_json.get("target_kind", "instrument")
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
+
+        if self._is_detail_listing(res.final_url):
+            self._collect_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+        else:
+            self._collect_structured_listing_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+            )
+
+        self._collect_listing_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            listings=listings,
+            inherited_meta={
+                "listing_fetch": "navigation_links",
+                "source_section": self._source_section_for_url(res.final_url),
+            },
+        )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
+                    "result_index",
+                    "source_section",
+                    "detail_url",
+                    "detail_title",
+                    "gazette_job_id",
+                    "gazette_department",
+                    "gazette_title",
+                    "gazette_date",
+                    "gazette_issue_no",
+                    "gazette_part",
+                    "gazette_active",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    @staticmethod
+    def _is_detail_listing(url: str) -> bool:
+        return PCP_DETAIL_PATH_RE.search((urlsplit(url).path or "").lower()) is not None
+
+    @staticmethod
+    def _source_section_for_url(url: str) -> str:
+        path = (urlsplit(url).path or "").lower()
+        if path.endswith("/download"):
+            return "download_notifications"
+        if path.endswith("/weeklynitifications"):
+            return "weekly_notifications"
+        if PCP_DETAIL_PATH_RE.search(path):
+            return "detail"
+        return "gazette"
+
+    def _collect_structured_listing_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            table_kind = self._table_kind(headers)
+            if not table_kind:
+                continue
+
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                links = tr.find_all("a", href=True)
+                if not links:
+                    continue
+
+                row_index += 1
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": f"{table_kind}_table",
+                    "discovery_channel": "gazette-table-row",
+                    "source_section": self._source_section_for_url(base_url),
+                    "result_index": row_index,
+                }
+                self._add_row_provenance(row_meta=row_meta, cells=cells, headers=headers, links=links, table_kind=table_kind)
+                for link in links:
+                    hint = link.get_text(" ", strip=True)[:240] or row_meta.get("gazette_title", "")[:240] or row_meta.get("gazette_job_id", "")[:240]
+                    self._capture_candidate(
+                        raw=link.get("href", ""),
+                        hint=hint,
+                        base_url=base_url,
+                        docs=docs,
+                        listings=listings,
+                        route_meta=row_meta,
+                    )
+
+    @staticmethod
+    def _table_kind(headers: List[str]) -> Optional[str]:
+        if not headers:
+            return None
+        if any("job id" in h for h in headers) and any("department" in h for h in headers) and any("download" in h for h in headers):
+            return "downloads"
+        if any("weekly issue" in h for h in headers) and any("download" in h for h in headers):
+            return "weekly"
+        return None
+
+    def _add_row_provenance(self, *, row_meta: Dict[str, Any], cells: List[Any], headers: List[str], links: List[Any], table_kind: str) -> None:
+        for idx, header in enumerate(headers):
+            if idx >= len(cells):
+                continue
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
+                continue
+
+            if "job id" in header:
+                row_meta["gazette_job_id"] = value[:120]
+            elif "department" in header:
+                row_meta["gazette_department"] = value[:160]
+            elif header == "title" or "title" in header:
+                row_meta["gazette_title"] = value[:280]
+                row_meta.setdefault("act_title", value[:280])
+            elif "weekly issue" in header:
+                row_meta["gazette_issue_no"] = value[:80]
+            elif "date" in header:
+                row_meta["gazette_date"] = value[:40]
+            elif "parts" in header:
+                row_meta["gazette_part"] = value[:40]
+            elif "active" in header:
+                row_meta["gazette_active"] = value[:16].lower() in ("true", "1", "yes")
+
+        title = row_meta.get("gazette_title") or row_meta.get("act_title") or ""
+        if title:
+            row_meta.setdefault("act_title", title)
+            row_meta.setdefault("act_type", self._infer_act_type(title))
+
+        for candidate in (title, row_meta.get("gazette_job_id", ""), row_meta.get("gazette_issue_no", ""), row_meta.get("gazette_date", "")):
+            if not row_meta.get("act_year") and candidate:
+                year_match = YEAR_RE.search(str(candidate))
+                if year_match:
+                    row_meta["act_year"] = year_match.group(0)
+
+        if not row_meta.get("gazette_part"):
+            part_hint = self._extract_part_hint(
+                row_meta.get("gazette_job_id", ""),
+                row_meta.get("gazette_title", ""),
+                *(a.get("href", "") for a in links),
+            )
+            if part_hint:
+                row_meta["gazette_part"] = part_hint
+
+        if table_kind == "weekly" and "act_type" not in row_meta:
+            row_meta["act_type"] = "gazette_notice"
+
+    def _collect_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        if detail_title:
+            base_meta.setdefault("detail_title", detail_title)
+            base_meta.setdefault("gazette_title", detail_title)
+            base_meta.setdefault("act_title", detail_title)
+            base_meta.setdefault("act_type", self._infer_act_type(detail_title))
+            year_match = YEAR_RE.search(detail_title)
+            if year_match and "act_year" not in base_meta:
+                base_meta["act_year"] = year_match.group(0)
+
+        for row in soup.select("table tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower()
+            value = cells[1].get_text(" ", strip=True)
+            if not value:
+                continue
+            if "job id" in label and "gazette_job_id" not in base_meta:
+                base_meta["gazette_job_id"] = value[:120]
+            elif "department" in label and "gazette_department" not in base_meta:
+                base_meta["gazette_department"] = value[:160]
+            elif "title" in label and "gazette_title" not in base_meta:
+                base_meta["gazette_title"] = value[:280]
+                base_meta.setdefault("act_title", value[:280])
+            elif "issue" in label and "gazette_issue_no" not in base_meta:
+                base_meta["gazette_issue_no"] = value[:80]
+            elif "part" in label and "gazette_part" not in base_meta:
+                base_meta["gazette_part"] = value[:40]
+            elif "date" in label and "gazette_date" not in base_meta:
+                base_meta["gazette_date"] = value[:40]
+
+            if "act_year" not in base_meta and YEAR_RE.search(value):
+                base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        for a in soup.find_all("a", href=True):
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "detail_documents"
+            route_meta["discovery_channel"] = "gazette-detail-file-link"
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240] or route_meta.get("gazette_title", "")[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    def _collect_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs={},
+                listings=listings,
+                route_meta=inherited_meta,
+            )
+
+    @staticmethod
+    def _infer_act_type(title: str) -> str:
+        lowered = (title or "").lower()
+        if "ordinance" in lowered:
+            return "ordinance"
+        if " act" in lowered or lowered.startswith("act "):
+            return "act"
+        if "rules" in lowered or "rule" in lowered:
+            return "rules"
+        if "bill" in lowered:
+            return "bill"
+        return "gazette_notice"
+
+    @staticmethod
+    def _extract_part_hint(*values: str) -> Optional[str]:
+        for value in values:
+            text = str(value or "")
+            part_match = re.search(r"(?i)\bpart[\s\-_]*([ivx0-9]+)\b", text)
+            if part_match:
+                return part_match.group(1).upper()
+            ex_match = re.search(r"(?i)\bex[\s\.-]*gaz[\s\.-]*([ivx0-9]+)\b", text)
+            if ex_match:
+                return ex_match.group(1).upper()
+        return None
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_pcp_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_pcp_discovered_url(safe)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "siteimage-downloads-file" if path.startswith("/siteimage/downloads/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            path = (urlsplit(safe).path or "").lower()
+            is_row_scoped = any(route_meta.get(k) for k in ("gazette_job_id", "gazette_issue_no", "gazette_title"))
+            if PCP_DETAIL_PATH_RE.search(path) and not is_row_scoped:
+                return
+            if safe not in listings:
+                listings[safe] = dict(route_meta)
+                listings[safe].setdefault("detail_url", safe)
+            else:
+                for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
+
+    async def _enqueue_documents_with_meta(
+        self,
+        docs: Dict[str, Dict[str, Any]],
+        *,
+        listing_url: str,
+        default_target_kind: str,
+    ) -> int:
+        added = 0
+        for url, meta in docs.items():
+            kind = default_target_kind
+            key = f"{kind}:{url}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is not None:
+                continue
+
+            route: Dict[str, Any] = {"listing": listing_url}
+            for key_name in (
+                "listing_fetch",
+                "detail_fetch",
+                "discovery_channel",
+                "result_index",
+                "source_section",
+                "detail_url",
+                "detail_title",
+                "gazette_job_id",
+                "gazette_department",
+                "gazette_title",
+                "gazette_date",
+                "gazette_issue_no",
+                "gazette_part",
+                "gazette_active",
+                "act_title",
+                "act_no",
+                "act_year",
+                "act_type",
+                "document_format",
+                "pdf_endpoint_kind",
+            ):
+                if key_name in meta:
+                    route[key_name] = meta[key_name]
+            self.db.add(
+                CrawlFrontier(
+                    source_name=self.source.source_name,
+                    tier=0,
+                    query_key=key,
+                    query_json={
+                        "kind": kind,
+                        "url": url,
+                        "route": route,
+                        "meta": meta,
+                        "expect_pdf": bool(meta.get("expect_pdf")),
+                    },
+                    cursor_json={},
+                    priority=50,
+                )
+            )
+            added += 1
+        await self.db.flush()
+        return added
+
+
 async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
     pipeline_cls = PublicPipeline
     if source.source_name == "BalochistanAssembly":
@@ -1849,4 +2329,6 @@ async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) 
         pipeline_cls = NationalAssemblyPipeline
     elif source.source_name == "Senate":
         pipeline_cls = SenatePipeline
+    elif source.source_name == "GazetteOfPakistan":
+        pipeline_cls = GazetteOfPakistanPipeline
     return await run_public_source(db, source, seed_listings=listings_for(source), pipeline_cls=pipeline_cls, **kwargs)

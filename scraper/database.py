@@ -223,7 +223,7 @@ SOURCE_SEED = [
     ("SindhAssembly", "Provincial Assembly of Sindh", "https://www.pas.gov.pk/index.php/acts", "public", ["www.pas.gov.pk", "pas.gov.pk", "sindhlaws.gov.pk", "www.sindhlaws.gov.pk"], False, True, True, 168, "hybrid"),
     ("KPAssembly", "Provincial Assembly of Khyber Pakhtunkhwa", "https://www.pakp.gov.pk/act/", "public", ["www.pakp.gov.pk", "pakp.gov.pk", "kpcode.kp.gov.pk"], False, True, True, 168, "hybrid"),
     ("BalochistanAssembly", "Provincial Assembly of Balochistan", "https://www.pabalochistan.gov.pk/acts", "public", ["www.pabalochistan.gov.pk", "pabalochistan.gov.pk"], False, True, True, 168, "hybrid"),
-    ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "https://www.pcp.gov.pk/gazette", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
+    ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "http://pcp.gov.pk/Download", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
 ]
 
 
@@ -278,6 +278,9 @@ async def seed_data() -> None:
         kp = existing_source_rows.get("KPAssembly")
         if kp is not None and (kp.source_url or "").startswith("https://www.pakp.gov.pk/acts"):
             kp.source_url = "https://www.pakp.gov.pk/act/"
+        gazette = existing_source_rows.get("GazetteOfPakistan")
+        if gazette is not None and ((gazette.source_url or "").startswith("https://www.pcp.gov.pk/gazette") or (gazette.source_url or "").startswith("http://www.pcp.gov.pk/gazette")):
+            gazette.source_url = "http://pcp.gov.pk/Download"
         slots = {(s.source_name, s.slot_number) for s in (await db.execute(select(BrowserSessionSlot))).scalars().all()}
         for n in (1, 2):
             if ("PakistanLawSite", n) not in slots:
