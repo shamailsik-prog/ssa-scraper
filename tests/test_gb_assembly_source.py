@@ -48,7 +48,7 @@ async def test_gb_acts_listing_fans_out_direct_pdfs_with_provenance(db, fixture_
         <html><body>
           <h1>Act Downloads</h1>
           <a href="/storage/downloads/gb-public-service-act-2024.pdf">GB Public Service Act 2024</a>
-          <a href="https://www.gilgitbaltistan.gov.pk/storage/downloads/gb-finance-act-2024.pdf">GB Finance Act 2024</a>
+          <a href="/storage/downloads/gb-finance-act-2024.pdf">GB Finance Act 2024</a>
           <a href="/pages/contact">Contact</a>
         </body></html>
         """,
