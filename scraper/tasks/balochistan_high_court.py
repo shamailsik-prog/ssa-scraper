@@ -35,17 +35,16 @@ DEFAULT_LISTINGS = [
     "https://bhc.gov.pk/judgments",
 ]
 
-DOC_HINT_RE = re.compile(r"(?i)(judg|judgement|judgment|order|case|appeal|petition|pld|mld|ylr|vs\\b|v\\.)")
-WAYBACK_RE = re.compile(r"/web/\\d+[a-z_]{0,6}/(https?://.+)$", re.I)
-ABS_URL_RE = re.compile(r"https?://[^\\s\"'<>]+", re.I)
-REL_DOC_RE = re.compile(r"(?i)(/?media/judgments/[^\"'<>\\s]+?\\.pdf(?:\\?[^\"'<>\\s]*)?)")
-REL_LISTING_RE = re.compile(r"(?i)(/?(?:ur/)?resources/judgments(?:/[^\"'<>\\s]*)?)")
-ROOT_LISTING_RE = re.compile(r"(?i)(/?(?:ur/)?judgments(?:/[^\"'<>\\s]*)?)")
+DOC_HINT_RE = re.compile(r"(?i)(judg|judgement|judgment|order|case|appeal|petition|pld|mld|ylr|vs\b|v\.)")
+WAYBACK_RE = re.compile(r"/web/\d+[a-z_]{0,6}/(https?://.+)$", re.I)
+ABS_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+REL_DOC_RE = re.compile(r"(?i)(/?media/judgments/[^\"'<>\s]+?\.pdf(?:\?[^\"'<>\s]*)?)")
+REL_LISTING_RE = re.compile(r"(?i)(/?(?:ur/)?resources/judgments(?:/[^\"'<>\s]*)?)")
 
 LISTING_PATH_RE = re.compile(r"(?i)^/(?:ur/)?resources/judgments(?:/.*)?/?$")
 ROOT_LISTING_PATH_RE = re.compile(r"(?i)^/(?:ur/)?judgments/?$")
-DOC_PATH_RE = re.compile(r"(?i)^/media/judgments/.+\\.pdf$")
-YEAR_RE = re.compile(r"\\b(19|20)\\d{2}\\b")
+DOC_PATH_RE = re.compile(r"(?i)^/media/judgments/.+\.pdf$")
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -70,8 +69,8 @@ def normalize_bhc_public_url(raw: str, *, base_url: str) -> Optional[str]:
         candidate = "/" + candidate
     if re.match(r"(?i)^(?:ur/)?resources/judgments", candidate):
         candidate = "/" + candidate
-    if re.match(r"(?i)^(?:ur/)?judgments(?:$|\\?)", candidate):
-        candidate = "/" + candidate
+    if re.match(r"(?i)^/?(?:ur/)?judgments(?:/?$|\?)", candidate):
+        candidate = candidate if candidate.startswith("/") else "/" + candidate
 
     joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
     parts = urlsplit(joined)
@@ -120,8 +119,6 @@ def _extract_embedded_candidates(blob: str) -> Iterable[str]:
     for u in REL_DOC_RE.findall(text):
         yield u.rstrip(");,")
     for u in REL_LISTING_RE.findall(text):
-        yield u.rstrip(");,")
-    for u in ROOT_LISTING_RE.findall(text):
         yield u.rstrip(");,")
 
 
