@@ -189,6 +189,7 @@ scraper/models.py            contract + internal tables    scraper/tasks/public_
 scraper/fetchers.py          HTTP fetch, raw preservation  scraper/tasks/superior_courts.py  superior-court dispatcher (SC, LHC, SHC, PHC, BHC, IHC, AJK HC, AJK SC, SAC-GB, FSC)
                                                           scraper/tasks/supreme_court.py         Supreme Court Pakistan listings + bounded POST result harvesting
                                                           scraper/tasks/ajk_high_court.py        AJK HC listing + POST result discovery
+                                                          scraper/tasks/lahore_high_court.py     LHC public result-list discovery + direct PDF routing
                                                           scraper/tasks/sindh_high_court.py      SHC caselaw result-grid + file-view discovery
                                                           scraper/tasks/peshawar_high_court.py   PHC reported-judgments POST discovery + direct PDF routing
                                                           scraper/tasks/ajk_supreme_court.py     AJK SC listings/posts + anchor/data/script discovery

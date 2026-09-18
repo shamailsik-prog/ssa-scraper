@@ -175,7 +175,7 @@ SOURCE_SEED = [
     ("NasirLawSite", "Nasir Law Site", "https://www.nasirlawsite.com", "public", ["www.nasirlawsite.com", "nasirlawsite.com"], True, True, False, 24, "hybrid"),
     ("PakistanCode", "Pakistan Code (Ministry of Law)", "https://pakistancode.gov.pk", "public", ["pakistancode.gov.pk", "www.pakistancode.gov.pk"], False, True, True, 48, "hybrid"),
     ("SupremeCourt", "Supreme Court of Pakistan", "https://www.supremecourt.gov.pk/judgements/", "public", ["www.supremecourt.gov.pk", "supremecourt.gov.pk"], True, False, False, 12, "hybrid"),
-    ("LahoreHighCourt", "Lahore High Court", "https://sys.lhc.gov.pk/appjudgments/", "public", ["sys.lhc.gov.pk", "lhc.gov.pk", "www.lhc.gov.pk"], True, False, False, 12, "hybrid"),
+    ("LahoreHighCourt", "Lahore High Court", "https://opc.lhc.gov.pk/Relevant_Laws.aspx", "public", ["opc.lhc.gov.pk", "sys.lhc.gov.pk", "lhc.gov.pk", "www.lhc.gov.pk"], True, False, False, 12, "hybrid"),
     ("SindhHighCourt", "High Court of Sindh", "https://www.shc.gov.pk", "public", ["www.shc.gov.pk", "shc.gov.pk", "caselaw.shc.gov.pk"], True, False, False, 12, "hybrid"),
     (
         "PeshawarHighCourt",
@@ -237,9 +237,9 @@ async def seed_data() -> None:
         for name, code, level, prov, city, aliases in COURT_SEED:
             if code not in existing_courts:
                 db.add(Court(name=name, short_code=code, court_level=level, jurisdiction_province=prov, city=city, aliases=aliases))
-        existing_sources = {s.source_name for s in (await db.execute(select(ScraperSource))).scalars().all()}
+        existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
-            if name in existing_sources:
+            if name in existing_source_rows:
                 continue
             db.add(
                 ScraperSource(
@@ -260,6 +260,15 @@ async def seed_data() -> None:
                     state_reason="Awaiting human login" if method == "login_session" else None,
                 )
             )
+        # Keep LHC source aligned with the connector defaults on existing databases.
+        lhc = existing_source_rows.get("LahoreHighCourt")
+        if lhc is not None:
+            current_allow = {h.lower() for h in (lhc.allow_list or [])}
+            merged_allow = list(dict.fromkeys((lhc.allow_list or []) + ["opc.lhc.gov.pk", "sys.lhc.gov.pk", "lhc.gov.pk", "www.lhc.gov.pk"]))
+            if current_allow != {h.lower() for h in merged_allow}:
+                lhc.allow_list = merged_allow
+            if not (lhc.source_url or "").startswith("https://opc.lhc.gov.pk/"):
+                lhc.source_url = "https://opc.lhc.gov.pk/Relevant_Laws.aspx"
         slots = {(s.source_name, s.slot_number) for s in (await db.execute(select(BrowserSessionSlot))).scalars().all()}
         for n in (1, 2):
             if ("PakistanLawSite", n) not in slots:
