@@ -99,7 +99,7 @@ def normalize_shc_public_url(raw: str, *, base_url: str) -> Optional[str]:
 
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query_items = parse_qs(parts.query or "", keep_blank_values=True)
-    query = urlencode(query_items, doseq=True, quote_via=quote, safe="/:,+%=")
+    query = urlencode(query_items, doseq=True, quote_via=quote, safe="/:,+%")
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
@@ -255,18 +255,24 @@ class SindhHighCourtPipeline(PublicPipeline):
                 docs={},
                 listings=listings,
             )
+        elif is_report_grid:
+            # Category/report grids are listing hubs; listing fan-out is windowed explicitly.
+            self._collect_from_html(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=[],
+            )
+            self._collect_report_grid_listings(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+            )
         else:
             self._collect_from_html(
                 html_text=res.text,
                 base_url=res.final_url,
                 docs=docs,
-                listings=listings,
-            )
-
-        if is_report_grid:
-            self._collect_report_grid_listings(
-                html_text=res.text,
-                base_url=res.final_url,
                 listings=listings,
             )
 
