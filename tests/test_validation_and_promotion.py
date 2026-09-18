@@ -18,7 +18,7 @@ from scraper.parsers.citation_extractor import extract_instrument_mentions, extr
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
-from scraper.tasks.treatment import classify_deterministic, classify_judgment
+from scraper.tasks.treatment import classify_deterministic, classify_judgment, reconcile_treatment_citation_links
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
 COURTS = {"supreme court of pakistan": "Supreme Court of Pakistan", "sc": "Supreme Court of Pakistan", "supreme court": "Supreme Court of Pakistan", "lahore high court": "Lahore High Court", "lhc": "Lahore High Court"}
@@ -758,6 +758,79 @@ async def test_treatment_rows_with_evidence_and_quarantine(db, source, monkeypat
     counts2 = await classify_judgment(db, j)
     assert counts2["quarantined"] >= 1
     assert (await db.execute(select(func.count()).select_from(QuarantineQueue).where(QuarantineQueue.kind == "treatment"))).scalar() >= 1
+
+
+async def test_treatment_reconcile_links_late_arriving_unique_and_is_idempotent(db):
+    citing = Judgment(canonical_citation="PLD 2026 SC 123", full_text="citing text")
+    db.add(citing)
+    await db.flush()
+    treatment = Treatment(
+        citing_judgment_id=citing.id,
+        cited_judgment_id=None,
+        cited_citation="PLD 2019 SC 1",
+        label="followed",
+        confidence=0.82,
+        evidence_passage="We have followed PLD 2019 SC 1.",
+        method="deterministic",
+    )
+    db.add(treatment)
+    await db.commit()
+
+    before_target = await reconcile_treatment_citation_links(lookback_hours=24, batch_size=10)
+    assert before_target["linked"] == 0
+    assert before_target["unresolved"] == 1
+
+    target = Judgment(canonical_citation="PLD 2019 SC 1", full_text="target text")
+    db.add(target)
+    await db.flush()
+    db.add(Citation(judgment_id=target.id, citation_string="PLD 2019 SC 1", raw_string="PLD 2019 SC 1", is_primary=True))
+    await db.commit()
+
+    linked = await reconcile_treatment_citation_links(lookback_hours=24, batch_size=10)
+    assert linked["linked"] == 1
+    assert linked["ambiguous"] == 0
+    assert linked["unresolved"] == 0
+
+    await db.refresh(treatment)
+    await db.refresh(target)
+    assert treatment.cited_judgment_id == target.id
+    assert target.citation_count == 1
+
+    rerun = await reconcile_treatment_citation_links(lookback_hours=24, batch_size=10)
+    assert rerun["scanned"] == 0
+    assert rerun["linked"] == 0
+    await db.refresh(treatment)
+    assert treatment.cited_judgment_id == target.id
+
+
+async def test_treatment_reconcile_skips_ambiguous_citation_matches(db):
+    citing = Judgment(canonical_citation="PLD 2026 SC 124", full_text="citing text")
+    db.add(citing)
+    await db.flush()
+    treatment = Treatment(
+        citing_judgment_id=citing.id,
+        cited_judgment_id=None,
+        cited_citation="PLD 2018 SC 50",
+        label="referred",
+        confidence=0.73,
+        evidence_passage="Reference made to PLD 2018 SC 50.",
+        method="deterministic",
+    )
+    db.add(treatment)
+
+    canonical_match = Judgment(canonical_citation="PLD 2018 SC 50", full_text="candidate A")
+    citation_match = Judgment(canonical_citation="PLD 2018 SC 500", full_text="candidate B")
+    db.add_all([canonical_match, citation_match])
+    await db.flush()
+    db.add(Citation(judgment_id=citation_match.id, citation_string="PLD 2018 SC 50", raw_string="PLD 2018 SC 50", is_primary=False))
+    await db.commit()
+
+    result = await reconcile_treatment_citation_links(lookback_hours=24, batch_size=10)
+    assert result["linked"] == 0
+    assert result["ambiguous"] == 1
+    assert result["unresolved"] == 0
+    await db.refresh(treatment)
+    assert treatment.cited_judgment_id is None
 
 
 # --------------------------------------------------------------------------- embeddings (B-6)
