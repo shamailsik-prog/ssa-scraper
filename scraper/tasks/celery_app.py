@@ -42,6 +42,7 @@ app.conf.update(
         "scraper.tasks.dispatcher.run_source_job": {"queue": "scraper"},
         "scraper.tasks.embeddings.process_embedding_queue": {"queue": "embeddings"},
         "scraper.tasks.promotion.promote_staging_records": {"queue": "maintenance"},
+        "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
@@ -50,6 +51,10 @@ app.conf.update(
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": 1800},
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900},
+        "reconcile-instrument-relations": {
+            "task": "scraper.tasks.promotion.reconcile_instrument_relations",
+            "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,
+        },
         "classify-treatment-nightly": {"task": "scraper.tasks.treatment.classify_treatment", "schedule": 86400},
         "process-embeddings": {"task": "scraper.tasks.embeddings.process_embedding_queue", "schedule": 300},
         "archive-mirror": {"task": "scraper.tasks.archive_mirror.mirror_pending", "schedule": 1800},

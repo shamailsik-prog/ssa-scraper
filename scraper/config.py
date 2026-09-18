@@ -124,6 +124,9 @@ class Settings(BaseSettings):
         default="SikanderCorpusBot/1.0 (+legal research corpus; contact via firm; honours robots.txt)"
     )
     SCRAPER_CONCURRENT_REQUESTS: int = Field(default=2)
+    INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE: int = Field(default=200)
+    INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS: int = Field(default=168)
+    INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS: int = Field(default=3600)
     SCRAPER_RESPECT_ROBOTS: bool = Field(default=True)
     PLAYWRIGHT_ENABLED: bool = Field(default=True)
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
@@ -233,7 +236,20 @@ class Settings(BaseSettings):
     def _blank_is_none(cls, v: Any) -> Any:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("PLS_EARLIEST_YEAR", "EMBEDDING_DIM", "OPENAI_EMBEDDING_DIMENSIONS", "SGAI_SCHEMA_VERSION", "SGAI_TIMEOUT_SECONDS", "SGAI_MAX_RETRIES", "VOLUME_END_GAP", "RECONNECT_SECONDS", mode="before")
+    @field_validator(
+        "PLS_EARLIEST_YEAR",
+        "EMBEDDING_DIM",
+        "OPENAI_EMBEDDING_DIMENSIONS",
+        "SGAI_SCHEMA_VERSION",
+        "SGAI_TIMEOUT_SECONDS",
+        "SGAI_MAX_RETRIES",
+        "VOLUME_END_GAP",
+        "RECONNECT_SECONDS",
+        "INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE",
+        "INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS",
+        "INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS",
+        mode="before",
+    )
     @classmethod
     def _blank_int_is_default(cls, v: Any, info) -> Any:
         if isinstance(v, str) and not v.strip():
@@ -315,6 +331,12 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1")
         if self.EMBEDDING_DIM <= 0:
             raise ValueError("EMBEDDING_DIM must be positive")
+        if self.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE <= 0:
+            raise ValueError("INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE must be positive")
+        if self.INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS <= 0:
+            raise ValueError("INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS must be positive")
+        if self.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS <= 0:
+            raise ValueError("INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS must be positive")
         if self.PLS_USER or self.PLS_PASS.get_secret_value() or self.PLS_USER_B or self.PLS_PASS_B.get_secret_value():
             logger.warning("PLS_USER/PLS_PASS are deprecated and ignored: PakistanLawSite uses human login only")
         # legacy aliases

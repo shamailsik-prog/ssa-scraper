@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import UUID
 
@@ -572,6 +572,78 @@ async def _sync_instrument_relation_edges(db: AsyncSession, inst: Instrument) ->
     await db.flush()
 
 
+# --------------------------------------------------------------------------- relation reconciliation
+def _positive_int(value: Any, *, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+async def reconcile_instrument_relations(
+    *,
+    limit: Optional[int] = None,
+    lookback_hours: Optional[int] = None,
+) -> Dict[str, int]:
+    effective_limit = _positive_int(limit, fallback=settings.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE)
+    effective_lookback = _positive_int(lookback_hours, fallback=settings.INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=effective_lookback)
+    counts = {
+        "scanned": 0,
+        "processed": 0,
+        "failed": 0,
+        "edges_before": 0,
+        "edges_after": 0,
+        "edges_added": 0,
+        "edges_removed": 0,
+    }
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Instrument)
+                .where(
+                    Instrument.created_at >= cutoff,
+                    (Instrument.citation_mentions.isnot(None)) | (Instrument.statute_mentions.isnot(None)),
+                )
+                .order_by(Instrument.created_at.desc())
+                .limit(effective_limit)
+            )
+        ).scalars().all()
+        counts["scanned"] = len(rows)
+        for inst in rows:
+            try:
+                before = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentRelation)
+                        .where(InstrumentRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
+                await _sync_instrument_relation_edges(db, inst)
+                after = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentRelation)
+                        .where(InstrumentRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
+                counts["processed"] += 1
+                counts["edges_before"] += int(before)
+                counts["edges_after"] += int(after)
+                if after >= before:
+                    counts["edges_added"] += int(after - before)
+                else:
+                    counts["edges_removed"] += int(before - after)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                counts["failed"] += 1
+                logger.exception("relation reconcile failed for instrument %s", inst.id)
+        await db.commit()
+    return counts
+
+
 async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
     data = st.reconciled_json or {}
     if st.status == "quarantined" and not force:
@@ -830,3 +902,8 @@ async def resolve_quarantine(db: AsyncSession, item: QuarantineQueue, *, reviewe
 @shared_task(name="scraper.tasks.promotion.promote_staging_records")
 def promote_staging_records_task(limit: int = 200):
     return run_async(promote_staging_records(limit))
+
+
+@shared_task(name="scraper.tasks.promotion.reconcile_instrument_relations")
+def reconcile_instrument_relations_task(limit: Optional[int] = None, lookback_hours: Optional[int] = None):
+    return run_async(reconcile_instrument_relations(limit=limit, lookback_hours=lookback_hours))

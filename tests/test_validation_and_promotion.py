@@ -14,7 +14,7 @@ from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, Q
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
-from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging
+from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
 from scraper.tasks.treatment import classify_deterministic, classify_judgment
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
@@ -367,6 +367,200 @@ async def test_instrument_relation_graph_fails_closed_for_unresolved_targets(db)
         )
     ).scalars().all()
     assert edges == []
+
+
+async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    source_instrument = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXV of 2025
+        This Act is amended by S.R.O. 456(I)/2025 with immediate effect.
+        """,
+        "http://127.0.0.1/reconcile-source.pdf",
+    )
+    assert source_instrument is not None
+    initial_edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
+        )
+    ).scalars().all()
+    assert initial_edges == []
+
+    target_instrument = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        NOTIFICATION
+        S.R.O. 456(I)/2025
+        Dated 20th July 2025
+        """,
+        "http://127.0.0.1/reconcile-target.pdf",
+    )
+    assert target_instrument is not None
+
+    counts = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    assert counts["processed"] >= 1
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
+        )
+    ).scalars().all()
+    amended = [e for e in edges if e.relation_type == "amended_by"]
+    assert len(amended) == 1
+    assert amended[0].target_instrument_id == target_instrument.id
+
+
+async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    source_instrument = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXVI of 2025
+        This Act stands superseded by Ordinance No. IX of 2025.
+        """,
+        "http://127.0.0.1/ambiguous-source.pdf",
+    )
+    assert source_instrument is not None
+
+    await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ORDINANCE No. IX of 2025
+        Dated 1st August 2025
+        """,
+        "http://127.0.0.1/ambiguous-target-a.pdf",
+    )
+    await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. II of 2026
+        For interpretive continuity this Act shall be read with Ordinance No. IX of 2025.
+        """,
+        "http://127.0.0.1/ambiguous-target-b.pdf",
+    )
+
+    await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
+        )
+    ).scalars().all()
+    assert edges == []
+
+
+async def test_instrument_relation_reconcile_is_idempotent_on_rerun(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    source_instrument = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXVII of 2025
+        This Act is amended by S.R.O. 789(I)/2025.
+        """,
+        "http://127.0.0.1/idempotent-source.pdf",
+    )
+    assert source_instrument is not None
+    await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        NOTIFICATION
+        S.R.O. 789(I)/2025
+        Dated 3rd August 2025
+        """,
+        "http://127.0.0.1/idempotent-target.pdf",
+    )
+
+    first = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    second = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
+        )
+    ).scalars().all()
+    assert len([e for e in edges if e.relation_type == "amended_by"]) == 1
+    assert first["processed"] >= 1
+    assert second["edges_added"] == 0
+    assert second["edges_removed"] == 0
 
 
 # --------------------------------------------------------------------------- treatment (B-7)
