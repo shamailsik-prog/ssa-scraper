@@ -173,7 +173,7 @@ SOURCE_SEED = [
     # name, display, url, access_method, allow_list, case_law, statutes, instruments, frequency_h, extraction_mode
     ("PakistanLawSite", "Pakistan Law Site (subscription)", "https://www.pakistanlawsite.com", "login_session", ["www.pakistanlawsite.com", "pakistanlawsite.com"], True, True, False, 24, "hybrid"),
     ("NasirLawSite", "Nasir Law Site", "https://www.nasirlawsite.com", "public", ["www.nasirlawsite.com", "nasirlawsite.com"], True, True, False, 24, "hybrid"),
-    ("PakistanCode", "Pakistan Code (Ministry of Law)", "https://pakistancode.gov.pk", "public", ["pakistancode.gov.pk", "www.pakistancode.gov.pk"], False, True, True, 48, "hybrid"),
+    ("PakistanCode", "Pakistan Code (Ministry of Law)", "https://pakistancode.gov.pk/english/index.php", "public", ["pakistancode.gov.pk", "www.pakistancode.gov.pk"], False, True, True, 48, "hybrid"),
     ("SupremeCourt", "Supreme Court of Pakistan", "https://www.supremecourt.gov.pk/judgements/", "public", ["www.supremecourt.gov.pk", "supremecourt.gov.pk"], True, False, False, 12, "hybrid"),
     ("LahoreHighCourt", "Lahore High Court", "https://opc.lhc.gov.pk/Relevant_Laws.aspx", "public", ["opc.lhc.gov.pk", "sys.lhc.gov.pk", "lhc.gov.pk", "www.lhc.gov.pk"], True, False, False, 12, "hybrid"),
     ("SindhHighCourt", "High Court of Sindh", "https://www.shc.gov.pk", "public", ["www.shc.gov.pk", "shc.gov.pk", "caselaw.shc.gov.pk"], True, False, False, 12, "hybrid"),
@@ -281,6 +281,18 @@ async def seed_data() -> None:
         gazette = existing_source_rows.get("GazetteOfPakistan")
         if gazette is not None and ((gazette.source_url or "").startswith("https://www.pcp.gov.pk/gazette") or (gazette.source_url or "").startswith("http://www.pcp.gov.pk/gazette")):
             gazette.source_url = "http://pcp.gov.pk/Download"
+        pakistan_code = existing_source_rows.get("PakistanCode")
+        if pakistan_code is not None:
+            if (pakistan_code.source_url or "").rstrip("/") == "https://pakistancode.gov.pk":
+                pakistan_code.source_url = "https://pakistancode.gov.pk/english/index.php"
+            old_listings = [
+                "https://pakistancode.gov.pk/english/LGu3ZBxW1-apaUY2Fqa-apaUY2Fqa-sg-jjjjjjjjjjjjj",
+                "https://pakistancode.gov.pk/federal",
+            ]
+            cfg = dict(pakistan_code.config_json or {})
+            if cfg.get("statute_urls") == old_listings:
+                cfg.pop("statute_urls", None)
+                pakistan_code.config_json = cfg
         slots = {(s.source_name, s.slot_number) for s in (await db.execute(select(BrowserSessionSlot))).scalars().all()}
         for n in (1, 2):
             if ("PakistanLawSite", n) not in slots:
