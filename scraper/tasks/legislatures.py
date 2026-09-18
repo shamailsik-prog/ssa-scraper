@@ -607,12 +607,20 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 },
             )
         else:
-            inherited_meta.setdefault("source_section", self._pab_source_section_for_url(res.final_url))
+            page_source_section = self._pab_source_section_for_url(res.final_url)
+            inherited_meta.setdefault("source_section", page_source_section)
             self._collect_structured_act_rows(
                 html_text=res.text,
                 base_url=res.final_url,
                 docs=docs,
             )
+            if page_source_section != "acts":
+                self._collect_direct_document_links(
+                    html_text=res.text,
+                    base_url=res.final_url,
+                    docs=docs,
+                    route_meta=inherited_meta,
+                )
             self._collect_listing_links(
                 html_text=res.text,
                 base_url=res.final_url,
@@ -979,6 +987,25 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 base_url=base_url,
                 docs={},
                 listings=listings,
+                route_meta=dict(route_meta or {}),
+            )
+
+    def _collect_direct_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        route_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
                 route_meta=dict(route_meta or {}),
             )
 
