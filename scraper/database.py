@@ -218,7 +218,7 @@ SOURCE_SEED = [
     ),
     ("FederalShariatCourt", "Federal Shariat Court", "https://www.federalshariatcourt.gov.pk/en/judgments/", "public", ["www.federalshariatcourt.gov.pk", "federalshariatcourt.gov.pk"], True, False, False, 24, "hybrid"),
     ("NationalAssembly", "National Assembly of Pakistan", "https://na.gov.pk/en/legis.php", "public", ["na.gov.pk", "www.na.gov.pk"], False, True, True, 168, "hybrid"),
-    ("Senate", "Senate of Pakistan", "https://senate.gov.pk/en/legislation.php", "public", ["senate.gov.pk", "www.senate.gov.pk"], False, True, True, 168, "hybrid"),
+    ("Senate", "Senate of Pakistan", "https://senate.gov.pk/en/acts.php?id=-1&catid=186&subcatid=285&cattitle=Acts", "public", ["senate.gov.pk", "www.senate.gov.pk"], False, True, True, 168, "hybrid"),
     ("PunjabAssembly", "Provincial Assembly of the Punjab", "https://www.pap.gov.pk/acts", "public", ["www.pap.gov.pk", "pap.gov.pk", "punjablaws.gov.pk", "www.punjablaws.gov.pk"], False, True, True, 168, "hybrid"),
     ("SindhAssembly", "Provincial Assembly of Sindh", "https://www.pas.gov.pk/index.php/acts", "public", ["www.pas.gov.pk", "pas.gov.pk", "sindhlaws.gov.pk", "www.sindhlaws.gov.pk"], False, True, True, 168, "hybrid"),
     ("KPAssembly", "Provincial Assembly of Khyber Pakhtunkhwa", "https://www.pakp.gov.pk/act/", "public", ["www.pakp.gov.pk", "pakp.gov.pk", "kpcode.kp.gov.pk"], False, True, True, 168, "hybrid"),
@@ -269,6 +269,9 @@ async def seed_data() -> None:
                 lhc.allow_list = merged_allow
             if not (lhc.source_url or "").startswith("https://opc.lhc.gov.pk/"):
                 lhc.source_url = "https://opc.lhc.gov.pk/Relevant_Laws.aspx"
+        senate = existing_source_rows.get("Senate")
+        if senate is not None and (senate.source_url or "").startswith("https://senate.gov.pk/en/legislation.php"):
+            senate.source_url = "https://senate.gov.pk/en/acts.php?id=-1&catid=186&subcatid=285&cattitle=Acts"
         kp = existing_source_rows.get("KPAssembly")
         if kp is not None and (kp.source_url or "").startswith("https://www.pakp.gov.pk/acts"):
             kp.source_url = "https://www.pakp.gov.pk/act/"
