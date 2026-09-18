@@ -44,6 +44,7 @@ app.conf.update(
         "scraper.tasks.promotion.promote_staging_records": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
+        "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
@@ -61,4 +62,13 @@ app.conf.update(
         "reconcile-storage": {"task": "scraper.tasks.archive_mirror.reconcile_storage", "schedule": 86400},
     },
 )
+if settings.TREATMENT_RECONCILE_ENABLED:
+    app.conf.beat_schedule["reconcile-treatment-citation-links"] = {
+        "task": "scraper.tasks.treatment.reconcile_treatment_citation_links",
+        "schedule": settings.TREATMENT_RECONCILE_INTERVAL_SECONDS,
+        "kwargs": {
+            "lookback_hours": settings.TREATMENT_RECONCILE_LOOKBACK_HOURS,
+            "batch_size": settings.TREATMENT_RECONCILE_BATCH_SIZE,
+        },
+    }
 logger.info("Celery configured: queues scraper/login_session/embeddings/maintenance; beat %s", list(app.conf.beat_schedule))

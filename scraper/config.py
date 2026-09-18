@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     LOCAL_TREATMENT_BASE_URL: str = Field(default="", description="On-prem OpenAI-compatible endpoint for login_session residue.")
     LOCAL_TREATMENT_MODEL: str = Field(default="")
     LOCAL_TREATMENT_API_KEY: SecretStr = Field(default=SecretStr(""))
+    TREATMENT_RECONCILE_ENABLED: bool = Field(default=True, description="Run periodic reconciliation for unresolved treatment citation links.")
+    TREATMENT_RECONCILE_LOOKBACK_HOURS: int = Field(default=168, description="Only unresolved treatments newer than this lookback are scanned.")
+    TREATMENT_RECONCILE_BATCH_SIZE: int = Field(default=500, description="Maximum unresolved treatments scanned per reconcile pass.")
+    TREATMENT_RECONCILE_INTERVAL_SECONDS: int = Field(default=3600, description="Celery beat interval for treatment citation-link reconciliation.")
 
     # ----------------------------------------------------------- scrapegraph
     SGAI_ENABLED: bool = Field(default=True)
@@ -248,6 +252,9 @@ class Settings(BaseSettings):
         "INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE",
         "INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS",
         "INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS",
+        "TREATMENT_RECONCILE_LOOKBACK_HOURS",
+        "TREATMENT_RECONCILE_BATCH_SIZE",
+        "TREATMENT_RECONCILE_INTERVAL_SECONDS",
         mode="before",
     )
     @classmethod
@@ -337,6 +344,12 @@ class Settings(BaseSettings):
             raise ValueError("INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS must be positive")
         if self.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS <= 0:
             raise ValueError("INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS must be positive")
+        if (
+            self.TREATMENT_RECONCILE_LOOKBACK_HOURS <= 0
+            or self.TREATMENT_RECONCILE_BATCH_SIZE <= 0
+            or self.TREATMENT_RECONCILE_INTERVAL_SECONDS <= 0
+        ):
+            raise ValueError("TREATMENT_RECONCILE_LOOKBACK_HOURS, TREATMENT_RECONCILE_BATCH_SIZE and TREATMENT_RECONCILE_INTERVAL_SECONDS must be positive")
         if self.PLS_USER or self.PLS_PASS.get_secret_value() or self.PLS_USER_B or self.PLS_PASS_B.get_secret_value():
             logger.warning("PLS_USER/PLS_PASS are deprecated and ignored: PakistanLawSite uses human login only")
         # legacy aliases

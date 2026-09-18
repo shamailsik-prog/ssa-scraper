@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -117,6 +118,30 @@ async def _model_classify(passage: str, *, login_session: bool) -> Optional[Tupl
     return None
 
 
+def _citation_lookup_keys(cited_citation: Optional[str]) -> List[str]:
+    raw = " ".join((cited_citation or "").split())
+    if not raw:
+        return []
+    normalized = normalise_citation(raw)
+    keys = [raw]
+    if normalized:
+        keys.append(normalized)
+    return list(dict.fromkeys(keys))
+
+
+async def _resolve_cited_judgment_id(db: AsyncSession, cited_citation: Optional[str]) -> Tuple[Optional[Any], str]:
+    keys = _citation_lookup_keys(cited_citation)
+    if not keys:
+        return None, "unresolved"
+    candidate_ids = set((await db.execute(select(Citation.judgment_id).where(Citation.citation_string.in_(keys)))).scalars().all())
+    candidate_ids.update((await db.execute(select(Judgment.id).where(Judgment.canonical_citation.in_(keys)))).scalars().all())
+    if len(candidate_ids) == 1:
+        return next(iter(candidate_ids)), "linked"
+    if len(candidate_ids) > 1:
+        return None, "ambiguous"
+    return None, "unresolved"
+
+
 async def classify_judgment(db: AsyncSession, j: Judgment) -> Dict[str, int]:
     counts = {"rows": 0, "quarantined": 0, "skipped": 0}
     text = j.full_text or ""
@@ -192,6 +217,39 @@ async def classify_treatment(limit: int = 200) -> Dict[str, int]:
     return totals
 
 
+async def reconcile_treatment_citation_links(*, lookback_hours: Optional[int] = None, batch_size: Optional[int] = None) -> Dict[str, int]:
+    lookback = max(1, int(lookback_hours if lookback_hours is not None else settings.TREATMENT_RECONCILE_LOOKBACK_HOURS))
+    batch = max(1, int(batch_size if batch_size is not None else settings.TREATMENT_RECONCILE_BATCH_SIZE))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback)
+    totals = {"scanned": 0, "linked": 0, "ambiguous": 0, "unresolved": 0, "citation_counts_refreshed": 0}
+    async with SessionLocal() as db:
+        q = (
+            select(Treatment)
+            .where(Treatment.cited_judgment_id.is_(None), Treatment.cited_citation.is_not(None), Treatment.created_at >= cutoff)
+            .order_by(Treatment.created_at.desc())
+            .limit(batch)
+        )
+        rows = (await db.execute(q)).scalars().all()
+        totals["scanned"] = len(rows)
+        for row in rows:
+            resolved_id, status = await _resolve_cited_judgment_id(db, row.cited_citation)
+            if status == "linked":
+                row.cited_judgment_id = resolved_id
+                totals["linked"] += 1
+            else:
+                totals[status] += 1
+        if totals["linked"]:
+            await db.flush()
+            totals["citation_counts_refreshed"] = await refresh_citation_counts(db)
+        await db.commit()
+    return totals
+
+
 @shared_task(name="scraper.tasks.treatment.classify_treatment")
 def classify_treatment_task(limit: int = 200):
     return run_async(classify_treatment(limit))
+
+
+@shared_task(name="scraper.tasks.treatment.reconcile_treatment_citation_links")
+def reconcile_treatment_citation_links_task(lookback_hours: Optional[int] = None, batch_size: Optional[int] = None):
+    return run_async(reconcile_treatment_citation_links(lookback_hours=lookback_hours, batch_size=batch_size))
