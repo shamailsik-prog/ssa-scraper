@@ -26,7 +26,7 @@ DEFAULT_LISTINGS: Dict[str, List[str]] = {
         "https://www.peshawarhighcourt.gov.pk/app/site/47/c/All_the_Referred,Reported_Judgments.html",
         "https://www.peshawarhighcourt.gov.pk/PHCCMS/reportedJudgments.php",
     ],
-    "BalochistanHighCourt": ["https://bhc.gov.pk/resources/judgments", "https://bhc.gov.pk/judgments"],
+    "BalochistanHighCourt": ["https://bhc.gov.pk/resources/judgments", "https://bhc.gov.pk/judgments", "https://portal.bhc.gov.pk/judgments"],
     "IslamabadHighCourt": ["https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=0"],
     "AJKHighCourt": ["https://ajkhighcourt.gok.pk/important-judgments", "https://ajkhighcourt.gok.pk/important-judgments?judgment_tab=previous"],
     "AJKSupremeCourt": [

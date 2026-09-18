@@ -189,7 +189,18 @@ SOURCE_SEED = [
         12,
         "hybrid",
     ),
-    ("BalochistanHighCourt", "High Court of Balochistan", "https://bhc.gov.pk/judgments", "public", ["bhc.gov.pk", "www.bhc.gov.pk"], True, False, False, 24, "hybrid"),
+    (
+        "BalochistanHighCourt",
+        "High Court of Balochistan",
+        "https://bhc.gov.pk/judgments",
+        "public",
+        ["bhc.gov.pk", "www.bhc.gov.pk", "portal.bhc.gov.pk", "api.bhc.gov.pk"],
+        True,
+        False,
+        False,
+        24,
+        "hybrid",
+    ),
     ("IslamabadHighCourt", "Islamabad High Court", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "public", ["mis.ihc.gov.pk", "ihc.gov.pk", "www.ihc.gov.pk"], True, False, False, 12, "hybrid"),
     ("AJKHighCourt", "Azad Jammu & Kashmir High Court", "https://ajkhighcourt.gok.pk/important-judgments", "public", ["ajkhighcourt.gok.pk", "www.ajkhighcourt.gok.pk"], True, False, False, 24, "hybrid"),
     (
@@ -304,6 +315,12 @@ async def seed_data() -> None:
                 lhc.allow_list = merged_allow
             if not (lhc.source_url or "").startswith("https://opc.lhc.gov.pk/"):
                 lhc.source_url = "https://opc.lhc.gov.pk/Relevant_Laws.aspx"
+        bhc = existing_source_rows.get("BalochistanHighCourt")
+        if bhc is not None:
+            current_allow = {h.lower() for h in (bhc.allow_list or [])}
+            merged_allow = list(dict.fromkeys((bhc.allow_list or []) + ["bhc.gov.pk", "www.bhc.gov.pk", "portal.bhc.gov.pk", "api.bhc.gov.pk"]))
+            if current_allow != {h.lower() for h in merged_allow}:
+                bhc.allow_list = merged_allow
         na = existing_source_rows.get("NationalAssembly")
         if na is not None and (na.source_url or "").startswith("https://na.gov.pk/en/legis.php"):
             na.source_url = "https://na.gov.pk/en/acts-tenure.php"
