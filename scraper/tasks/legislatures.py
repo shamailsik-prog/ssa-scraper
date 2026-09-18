@@ -2814,10 +2814,10 @@ class GBAssemblyPipeline(BalochistanAssemblyPipeline):
         lowered_title = (title or "").lower()
         if section in ("rules", "ordinances"):
             return "instrument"
-        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
-            return "instrument"
         if re.search(r"\b(act|acts|law|statute)\b", lowered_title):
             return "statute"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
         if section in ("acts", "laws"):
             return "statute"
         return default_kind
