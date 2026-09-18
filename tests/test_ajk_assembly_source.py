@@ -4,7 +4,12 @@ from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
-from scraper.tasks.legislatures import DEFAULT_LISTINGS, normalize_ajk_public_url, scrape_legislature
+from scraper.tasks.legislatures import (
+    AJKAssemblyPipeline,
+    DEFAULT_LISTINGS,
+    normalize_ajk_public_url,
+    scrape_legislature,
+)
 from tests.fixtures import text_pdf_bytes
 
 
@@ -43,6 +48,15 @@ def test_ajk_assembly_default_listings_include_law_department_seeds():
         "https://law.gok.pk/ordinance/",
     }
     assert expected.issubset(set(urls))
+
+
+def test_ajk_target_kind_treats_public_order_act_as_statute():
+    kind = AJKAssemblyPipeline._ajk_target_kind(
+        source_section="acts",
+        title="Maintenance of Public Order Act, 1960",
+        fallback="instrument",
+    )
+    assert kind == "statute"
 
 
 async def test_ajk_revised_volume_fans_out_detail_then_document_with_target_kinds(db, fixture_server):
@@ -304,3 +318,85 @@ async def test_ajk_assembly_detail_flow_is_idempotent_on_rerun(db, fixture_serve
         )
     ).scalar()
     assert document_count == 1
+
+
+async def test_ajk_detail_navigation_links_do_not_inherit_prior_title_or_kind(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/acts/",
+        """
+        <html><body>
+          <table>
+            <thead><tr><th>Act Title</th><th>Act No</th><th>Year</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><a href="/acts/sample-ordinance-2024/">Sample Ordinance, 2024</a></td>
+                <td>I</td>
+                <td>2024</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/acts/sample-ordinance-2024/",
+        """
+        <html><body>
+          <h2>Sample Ordinance, 2024</h2>
+          <a href="/wp-content/uploads/2024/01/sample-ordinance-2024.pdf">Download PDF</a>
+          <a href="/acts/the-actual-services-act-2020/">The Actual Services Act, 2020</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/acts/the-actual-services-act-2020/",
+        """
+        <html><body>
+          <h2>The Actual Services Act, 2020</h2>
+          <a href="/wp-content/uploads/2020/01/the-actual-services-act-2020.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/wp-content/uploads/2024/01/sample-ordinance-2024.pdf",
+        text_pdf_bytes("Sample Ordinance, 2024"),
+        content_type="application/pdf",
+    )
+    fixture_server.add(
+        "/wp-content/uploads/2020/01/the-actual-services-act-2020.pdf",
+        text_pdf_bytes("The Actual Services Act, 2020"),
+        content_type="application/pdf",
+    )
+
+    source = await _ajk_assembly_source(db, fixture_server, ["/acts/"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=90)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/acts/the-actual-services-act-2020/" in fixture_server.hits
+
+    next_detail_url = f"http://127.0.0.1:{fixture_server.port}/acts/the-actual-services-act-2020/"
+    next_detail = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "AJKAssembly",
+                CrawlFrontier.query_key == f"listing:{next_detail_url}",
+            )
+        )
+    ).scalars().first()
+    assert next_detail is not None
+    assert next_detail.query_json["target_kind"] == "statute"
+
+    next_doc_url = f"http://127.0.0.1:{fixture_server.port}/wp-content/uploads/2020/01/the-actual-services-act-2020.pdf"
+    next_doc = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "AJKAssembly",
+                CrawlFrontier.query_key == f"statute:{next_doc_url}",
+            )
+        )
+    ).scalars().first()
+    assert next_doc is not None
+    assert next_doc.query_json["route"]["act_title"] == "The Actual Services Act, 2020"

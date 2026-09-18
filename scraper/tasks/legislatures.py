@@ -2121,16 +2121,29 @@ class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
                 inherited_meta=base_meta,
             )
 
+        navigation_meta = {
+            "listing_fetch": "navigation_links",
+            "discovery_channel": "navigation-link",
+            **base_meta,
+        }
+        for key_name in (
+            "act_title",
+            "detail_title",
+            "act_no",
+            "act_year",
+            "act_passed_on",
+            "act_type",
+            "detail_url",
+            "target_kind",
+        ):
+            navigation_meta.pop(key_name, None)
+
         self._collect_listing_links(
             html_text=res.text,
             base_url=res.final_url,
             docs=docs,
             listings=listings,
-            inherited_meta={
-                "listing_fetch": "navigation_links",
-                "discovery_channel": "navigation-link",
-                **base_meta,
-            },
+            inherited_meta=navigation_meta,
         )
 
         added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
@@ -2219,10 +2232,10 @@ class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
         lowered_title = (title or "").lower()
         if section in ("ordinance", "download"):
             return "instrument"
-        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
-            return "instrument"
         if re.search(r"\b(act|acts|law|code|statute)\b", lowered_title):
             return "statute"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
         if section == "acts":
             return "statute"
         return default_kind
@@ -2328,8 +2341,8 @@ class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
         base_meta["detail_url"] = base_url
         base_meta.setdefault("source_section", section)
         if detail_title:
-            base_meta.setdefault("detail_title", detail_title)
-            base_meta.setdefault("act_title", detail_title)
+            base_meta["detail_title"] = detail_title
+            base_meta["act_title"] = detail_title
         base_meta["target_kind"] = self._ajk_target_kind(
             source_section=str(base_meta.get("source_section") or section),
             title=str(base_meta.get("act_title") or detail_title),
@@ -2426,7 +2439,7 @@ class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
             listing_meta["source_section"] = section
             listing_meta["target_kind"] = self._ajk_target_kind(
                 source_section=str(listing_meta.get("source_section") or section),
-                title=str(listing_meta.get("act_title") or hint),
+                title=str(hint or listing_meta.get("act_title") or ""),
                 fallback=str(listing_meta.get("target_kind") or "statute"),
             )
             if self._is_ajk_detail_listing(safe):
