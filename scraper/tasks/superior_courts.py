@@ -24,7 +24,7 @@ DEFAULT_LISTINGS: Dict[str, List[str]] = {
     "SindhHighCourt": ["https://caselaw.shc.gov.pk/caselaw/view-file/", "https://www.shc.gov.pk/judgments"],
     "PeshawarHighCourt": ["https://www.peshawarhighcourt.gov.pk/app/site/judgments"],
     "BalochistanHighCourt": ["https://bhc.gov.pk/judgments"],
-    "IslamabadHighCourt": ["https://mis.ihc.gov.pk/judgments", "https://www.ihc.gov.pk/judgments"],
+    "IslamabadHighCourt": ["https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=0"],
     "AJKHighCourt": ["https://ajkhighcourt.gok.pk/important-judgments", "https://ajkhighcourt.gok.pk/important-judgments?judgment_tab=previous"],
     "AJKSupremeCourt": [
         "https://ajksupremecourt.gok.pk/judgements-orders/",
@@ -68,4 +68,8 @@ async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwarg
         from scraper.tasks.supreme_appellate_court_gb import scrape_supreme_appellate_court_gb
 
         return await scrape_supreme_appellate_court_gb(source, db, **kwargs)
+    if source.source_name == "IslamabadHighCourt":
+        from scraper.tasks.islamabad_high_court import scrape_islamabad_high_court
+
+        return await scrape_islamabad_high_court(source, db, **kwargs)
     return await run_public_source(db, source, seed_listings=listings_for(source), **kwargs)

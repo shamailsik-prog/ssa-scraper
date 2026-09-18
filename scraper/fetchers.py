@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import pathlib
 import random
@@ -137,7 +138,7 @@ class HttpFetcher:
         *,
         max_bytes: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None,
-        data: Optional[Dict[str, str]] = None,
+        data: Optional[Any] = None,
     ) -> FetchResult:
         assert self._client is not None, "use 'async with HttpFetcher(...)'"
         safe = self._check(url)
@@ -197,6 +198,20 @@ class HttpFetcher:
         if headers:
             req_headers.update(headers)
         return await self._request("POST", url, max_bytes=max_bytes, headers=req_headers, data=data)
+
+    async def post_json(
+        self,
+        url: str,
+        *,
+        payload: Dict[str, Any],
+        max_bytes: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> FetchResult:
+        req_headers = {"Content-Type": "application/json; charset=utf-8"}
+        if headers:
+            req_headers.update(headers)
+        body = json.dumps(payload)
+        return await self._request("POST", url, max_bytes=max_bytes, headers=req_headers, data=body)
 
 
 # --------------------------------------------------------------------------- raw preservation

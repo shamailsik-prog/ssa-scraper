@@ -179,7 +179,7 @@ SOURCE_SEED = [
     ("SindhHighCourt", "High Court of Sindh", "https://www.shc.gov.pk", "public", ["www.shc.gov.pk", "shc.gov.pk", "caselaw.shc.gov.pk"], True, False, False, 12, "hybrid"),
     ("PeshawarHighCourt", "Peshawar High Court", "https://www.peshawarhighcourt.gov.pk/app/site/judgments", "public", ["www.peshawarhighcourt.gov.pk", "peshawarhighcourt.gov.pk"], True, False, False, 12, "hybrid"),
     ("BalochistanHighCourt", "High Court of Balochistan", "https://bhc.gov.pk/judgments", "public", ["bhc.gov.pk", "www.bhc.gov.pk"], True, False, False, 24, "hybrid"),
-    ("IslamabadHighCourt", "Islamabad High Court", "https://mis.ihc.gov.pk/judgments", "public", ["mis.ihc.gov.pk", "ihc.gov.pk", "www.ihc.gov.pk"], True, False, False, 12, "hybrid"),
+    ("IslamabadHighCourt", "Islamabad High Court", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "public", ["mis.ihc.gov.pk", "ihc.gov.pk", "www.ihc.gov.pk"], True, False, False, 12, "hybrid"),
     ("AJKHighCourt", "Azad Jammu & Kashmir High Court", "https://ajkhighcourt.gok.pk/important-judgments", "public", ["ajkhighcourt.gok.pk", "www.ajkhighcourt.gok.pk"], True, False, False, 24, "hybrid"),
     (
         "AJKSupremeCourt",
