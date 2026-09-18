@@ -9,11 +9,12 @@ from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
-from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment
-from scraper.models import Citation, Judgment, QuarantineQueue, ScraperStaging, Treatment
+from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
+from scraper.models import Citation, Instrument, Judgment, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
 from scraper.parsers.bench_parser import parse_bench
+from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
-from scraper.tasks.promotion import promote_judgment_staging
+from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging
 from scraper.tasks.treatment import classify_deterministic, classify_judgment
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
@@ -155,6 +156,110 @@ def test_instrument_type_requires_raw_evidence():
     out = reconcile_instrument(deterministic=det, ai=ai, raw_text=INSTRUMENT_TEXT, min_confidence=0.5)
     assert out.data.get("type") is None
     assert any(c["field"] == "type" for c in out.conflicts)
+
+
+def test_gazette_mention_extractors_normalize_core_patterns():
+    sample = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    S.R.O. 123(I)/2024 dated 19th January 2024
+    Act No. XXI of 2017
+    Ordinance No. VI of 2020
+    In the Pakistan Penal Code, 1860, section 302 shall be amended.
+    """
+    instrument_mentions = extract_instrument_mentions(sample)
+    normalized_instrument_mentions = {m["normalized"] for m in instrument_mentions}
+    assert "S.R.O. 123(I)/2024" in normalized_instrument_mentions
+    assert "Act No. XXI of 2017" in normalized_instrument_mentions
+    assert "Ordinance No. VI of 2020" in normalized_instrument_mentions
+
+    statute_mentions = extract_statute_mentions(sample)
+    assert any(m.get("canonical_statute_name") == "Pakistan Penal Code, 1860" for m in statute_mentions)
+    assert any(m.get("section_number") == "302" for m in statute_mentions)
+
+
+async def test_instrument_promotion_persists_and_links_mentions(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXI of 2017
+    S.R.O. 123(I)/2024
+    An Act further to amend the Pakistan Penal Code, 1860.
+    Criminal Law (Amendment) Act, 2017
+    Dated 25th March 2017
+    In the Pakistan Penal Code, 1860, in section 302, the words "as qisas" shall be substituted.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/gazette-mention.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/gazette-mention.pdf",
+        kind="instrument",
+    )
+    outcome = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": "http://127.0.0.1/gazette-mention.pdf"}, content_hash=prov.content_hash)
+    st.reconciled_json, st.status, st.confidence_score = outcome.data, "extracted", outcome.confidence
+    assert await promote_statute_staging(db, st) == "promoted"
+
+    inst = (await db.execute(select(Instrument).where(Instrument.id == st.promoted_to_id))).scalars().first()
+    assert inst is not None
+    assert any(m.get("normalized") == "Act No. XXI of 2017" for m in (inst.citation_mentions or []))
+    assert any(m.get("normalized") == "S.R.O. 123(I)/2024" for m in (inst.citation_mentions or []))
+    assert any(m.get("linked_statute_id") for m in (inst.statute_mentions or []))
+    assert inst.affected_statute_id is not None
+    assert inst.affected_statute_name == "Pakistan Penal Code, 1860"
+    assert "302" in (inst.affected_sections or [])
+
+
+async def test_instrument_promotion_fails_closed_on_bad_mentions_payload(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = "THE GAZETTE OF PAKISTAN EXTRAORDINARY\nAct No. XXI of 2017"
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/bad-mentions.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/bad-mentions.pdf",
+        kind="instrument",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "type": "act",
+        "full_text": text,
+        "citation_mentions": "Act No. XXI of 2017",
+    }
+    result = await promote_statute_staging(db, st)
+    assert result == "quarantined"
+    q = (
+        await db.execute(
+            select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id),
+        )
+    ).scalars().first()
+    assert q is not None
+    assert "citation_mentions must be a list" in (q.reason or "")
 
 
 # --------------------------------------------------------------------------- treatment (B-7)
