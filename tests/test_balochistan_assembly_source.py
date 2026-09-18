@@ -286,6 +286,194 @@ async def test_balochistan_laws_portal_listing_fans_out_detail_then_document_wit
     assert prov.route_json["act_no"] == "XV of 2010"
 
 
+async def test_balochistan_laws_portal_routes_ordinance_and_rules_to_instrument(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/laws_rules.aspx?opento=1&wise=srbdl",
+        """
+        <html><body>
+          <table>
+            <thead><tr><th>Law No.</th><th>Title</th><th>Year</th><th>Type</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>I of 2021</td>
+                <td><a href="/Document.aspx?docc=11&docid=21&wise=opendoc">Balochistan Tourism Act 2021</a></td>
+                <td>2021</td>
+                <td>Act</td>
+              </tr>
+              <tr>
+                <td>II of 2022</td>
+                <td><a href="/Document.aspx?docc=12&docid=22&wise=opendoc">Balochistan Markets Ordinance 2022</a></td>
+                <td>2022</td>
+                <td>Ordinance</td>
+              </tr>
+              <tr>
+                <td>III of 2023</td>
+                <td><a href="/Document.aspx?docc=13&docid=23&wise=opendoc">Balochistan Food Rules 2023</a></td>
+                <td>2023</td>
+                <td>Rules</td>
+              </tr>
+              <tr>
+                <td>IV of 2020</td>
+                <td><a href="/Document.aspx?docc=14&docid=24&wise=opendoc">Balochistan Fiscal Digest 2020</a></td>
+                <td>2020</td>
+                <td>Circular</td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=11&docid=21&wise=opendoc",
+        """
+        <html><body>
+          <h2>Balochistan Tourism Act 2021</h2>
+          <a href="/Document.aspx?docc=11&docid=21&wise=download">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=12&docid=22&wise=opendoc",
+        """
+        <html><body>
+          <h2>Balochistan Markets Ordinance 2022</h2>
+          <table><tr><th>Type</th><td>Ordinance</td></tr></table>
+          <a href="/Document.aspx?docc=12&docid=22&wise=download">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=13&docid=23&wise=opendoc",
+        """
+        <html><body>
+          <h2>Balochistan Food Rules 2023</h2>
+          <table><tr><th>Type</th><td>Rules</td></tr></table>
+          <a href="/Document.aspx?docc=13&docid=23&wise=download">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=14&docid=24&wise=opendoc",
+        """
+        <html><body>
+          <h2>Balochistan Fiscal Digest 2020</h2>
+          <table><tr><th>Type</th><td>Circular</td></tr></table>
+          <a href="/Document.aspx?docc=14&docid=24&wise=download">Download</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=11&docid=21&wise=download",
+        text_pdf_bytes("Balochistan Tourism Act 2021"),
+        content_type="application/pdf",
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=12&docid=22&wise=download",
+        text_pdf_bytes("Balochistan Markets Ordinance 2022"),
+        content_type="application/pdf",
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=13&docid=23&wise=download",
+        text_pdf_bytes("Balochistan Food Rules 2023"),
+        content_type="application/pdf",
+    )
+    fixture_server.add(
+        "/Document.aspx?docc=14&docid=24&wise=download",
+        text_pdf_bytes("Balochistan Fiscal Digest 2020"),
+        content_type="application/pdf",
+    )
+
+    source = await _balochistan_assembly_source(db, fixture_server, ["/laws_rules.aspx?opento=1&wise=srbdl"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=120)
+    await db.commit()
+
+    assert stats["halted"] is False
+
+    act_detail_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=11&docid=21&wise=opendoc"
+    ordinance_detail_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=12&docid=22&wise=opendoc"
+    rules_detail_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=13&docid=23&wise=opendoc"
+    unknown_detail_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=14&docid=24&wise=opendoc"
+
+    detail_rows = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key.in_(
+                    [
+                        f"listing:{act_detail_url}",
+                        f"listing:{ordinance_detail_url}",
+                        f"listing:{rules_detail_url}",
+                        f"listing:{unknown_detail_url}",
+                    ]
+                ),
+            )
+        )
+    ).scalars().all()
+    detail_by_url = {row.query_json["url"]: row for row in detail_rows}
+    assert detail_by_url[act_detail_url].query_json["target_kind"] == "statute"
+    assert detail_by_url[ordinance_detail_url].query_json["target_kind"] == "instrument"
+    assert detail_by_url[rules_detail_url].query_json["target_kind"] == "instrument"
+    assert detail_by_url[unknown_detail_url].query_json["target_kind"] == "statute"
+
+    act_doc_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=11&docid=21&wise=download"
+    ordinance_doc_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=12&docid=22&wise=download"
+    rules_doc_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=13&docid=23&wise=download"
+    unknown_doc_url = f"http://127.0.0.1:{fixture_server.port}/Document.aspx?docc=14&docid=24&wise=download"
+
+    act_doc = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key == f"statute:{act_doc_url}",
+            )
+        )
+    ).scalars().first()
+    ordinance_doc = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key == f"instrument:{ordinance_doc_url}",
+            )
+        )
+    ).scalars().first()
+    rules_doc = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key == f"instrument:{rules_doc_url}",
+            )
+        )
+    ).scalars().first()
+    unknown_doc = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key == f"statute:{unknown_doc_url}",
+            )
+        )
+    ).scalars().first()
+    assert act_doc is not None
+    assert ordinance_doc is not None
+    assert rules_doc is not None
+    assert unknown_doc is not None
+    assert ordinance_doc.query_json["route"]["detail_url"] == ordinance_detail_url
+    assert rules_doc.query_json["route"]["detail_url"] == rules_detail_url
+
+    statute_ordinance = (
+        await db.execute(
+            select(func.count())
+            .select_from(CrawlFrontier)
+            .where(
+                CrawlFrontier.source_name == "BalochistanAssembly",
+                CrawlFrontier.query_key == f"statute:{ordinance_doc_url}",
+            )
+        )
+    ).scalar()
+    assert statute_ordinance == 0
+
+
 async def test_balochistan_laws_portal_pdf_signature_gate_retires_non_pdf_download(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(
@@ -297,7 +485,7 @@ async def test_balochistan_laws_portal_pdf_signature_gate_retires_non_pdf_downlo
             <tbody>
               <tr>
                 <td>I of 2026</td>
-                <td><a href="/Document.aspx?docc=1&docid=2&wise=opendoc">Fake Balochistan Act 2026</a></td>
+                <td><a href="/Document.aspx?docc=1&docid=2&wise=opendoc">Fake Balochistan Ordinance 2026</a></td>
                 <td>2026</td>
               </tr>
             </tbody>
@@ -309,7 +497,8 @@ async def test_balochistan_laws_portal_pdf_signature_gate_retires_non_pdf_downlo
         "/Document.aspx?docc=1&docid=2&wise=opendoc",
         """
         <html><body>
-          <h2>Fake Balochistan Act 2026</h2>
+          <h2>Fake Balochistan Ordinance 2026</h2>
+          <table><tr><th>Type</th><td>Ordinance</td></tr></table>
           <a href="/Document.aspx?docc=1&docid=2&wise=download">Download</a>
         </body></html>
         """,
@@ -336,13 +525,13 @@ async def test_balochistan_laws_portal_pdf_signature_gate_retires_non_pdf_downlo
         await db.execute(
             select(CrawlFrontier).where(
                 CrawlFrontier.source_name == "BalochistanAssembly",
-                CrawlFrontier.query_key == f"statute:{document_url}",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
             )
         )
     ).scalars().first()
     assert row is not None
     assert row.status == "retired"
-    assert "missing %PDF signature for statute document URL" in (row.last_error or "")
+    assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
 
 
 async def test_balochistan_laws_portal_detail_flow_is_idempotent_on_rerun(db, fixture_server):
@@ -356,7 +545,7 @@ async def test_balochistan_laws_portal_detail_flow_is_idempotent_on_rerun(db, fi
             <tbody>
               <tr>
                 <td>XI of 2015</td>
-                <td><a href="/Document.aspx?docc=10&docid=20&wise=opendoc">Balochistan Idempotence Act 2015</a></td>
+                <td><a href="/Document.aspx?docc=10&docid=20&wise=opendoc">Balochistan Idempotence Rules 2015</a></td>
                 <td>2015</td>
               </tr>
             </tbody>
@@ -368,14 +557,15 @@ async def test_balochistan_laws_portal_detail_flow_is_idempotent_on_rerun(db, fi
         "/Document.aspx?docc=10&docid=20&wise=opendoc",
         """
         <html><body>
-          <h2>Balochistan Idempotence Act 2015</h2>
+          <h2>Balochistan Idempotence Rules 2015</h2>
+          <table><tr><th>Type</th><td>Rules</td></tr></table>
           <a href="/Document.aspx?docc=10&docid=20&wise=download">Download</a>
         </body></html>
         """,
     )
     fixture_server.add(
         "/Document.aspx?docc=10&docid=20&wise=download",
-        text_pdf_bytes("Balochistan Idempotence Act 2015"),
+        text_pdf_bytes("Balochistan Idempotence Rules 2015"),
         content_type="application/pdf",
     )
 
@@ -411,7 +601,7 @@ async def test_balochistan_laws_portal_detail_flow_is_idempotent_on_rerun(db, fi
             .select_from(CrawlFrontier)
             .where(
                 CrawlFrontier.source_name == "BalochistanAssembly",
-                CrawlFrontier.query_key == f"statute:{document_url}",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
             )
         )
     ).scalar()
