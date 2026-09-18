@@ -186,9 +186,10 @@ coverage, public discovery, prompt injection/SSRF, PDF/OCR, archive mirror and d
 scraper/config.py            settings + validators         scraper/tasks/pakistanlawsite.py  four tiers, continuity
 scraper/database.py          engine, migrations, roles     scraper/tasks/search_map.py       search-form map
 scraper/models.py            contract + internal tables    scraper/tasks/public_pipeline.py  shared public pipeline
-scraper/fetchers.py          HTTP fetch, raw preservation  scraper/tasks/superior_courts.py  SC, LHC, SHC, PHC, BHC, IHC, AJK HC, AJK SC, FSC
+scraper/fetchers.py          HTTP fetch, raw preservation  scraper/tasks/superior_courts.py  SC, LHC, SHC, PHC, BHC, IHC, AJK HC, AJK SC, SAC-GB, FSC
                                                           scraper/tasks/ajk_high_court.py        AJK HC listing + POST result discovery
                                                           scraper/tasks/ajk_supreme_court.py     AJK SC listings/posts + anchor/data/script discovery
+                                                          scraper/tasks/supreme_appellate_court_gb.py  SAC-GB listings + anchor/data/script discovery
                                                           scraper/tasks/federal_shariat_court.py  FSC multi-page + anchor/data/script discovery
 scraper/security.py          allow-list, SSRF, robots,     scraper/tasks/pakistancode.py     PakistanCode statutes
                              block detection, scrubbing    scraper/tasks/legislatures.py     NA, Senate, 4 assemblies, Gazette
