@@ -89,6 +89,9 @@ DEFAULT_LISTINGS: Dict[str, List[Dict[str, Any]]] = {
         {"url": "https://law.gok.pk/acts/", "target_kind": "statute"},
         {"url": "https://law.gok.pk/ordinance/", "target_kind": "instrument"},
     ],
+    "GBAssembly": [
+        {"url": "https://gilgitbaltistan.gov.pk/pages/acts", "target_kind": "statute"},
+    ],
     "GazetteOfPakistan": [
         {"url": "http://pcp.gov.pk/Download", "target_kind": "instrument"},
         {"url": "http://pcp.gov.pk/WeeklyNitifications", "target_kind": "instrument"},
@@ -163,6 +166,10 @@ AJK_LAW_DOC_RE = re.compile(r"(?i)^/wp-content/uploads/.+\.(pdf|doc|docx)$")
 AJK_LAW_LISTING_PATH_RE = re.compile(r"(?i)^/(|acts|ordinance|revised-volume|download)(?:/page/\d+)?/?$")
 AJK_LAW_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts|ordinance|revised-volume|download)/[^/?#]+/?$")
 AJK_LAW_LEGAL_HINT_RE = re.compile(r"(?i)\b(act|acts|ordinance|rule|rules|regulation|law|code|notification|amendment|bill|statute)\b")
+GB_GOV_HOST = "gilgitbaltistan.gov.pk"
+GB_GOV_HOST_ALIASES = (GB_GOV_HOST, f"www.{GB_GOV_HOST}")
+GB_GOV_DOC_RE = re.compile(r"(?i)^/storage/downloads/.+\.(pdf|doc|docx)$")
+GB_GOV_LISTING_PATH_RE = re.compile(r"(?i)^/pages/acts/?$")
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -410,6 +417,30 @@ def normalize_pcp_public_url(raw: str, *, base_url: str) -> Optional[str]:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def normalize_gb_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official public Gilgit-Baltistan hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in GB_GOV_HOST_ALIASES:
+        scheme = "https"
+        netloc = GB_GOV_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
 def normalize_ajk_public_url(raw: str, *, base_url: str) -> Optional[str]:
     """Normalize discovered candidates onto official public AJK Law hosts."""
     if not raw:
@@ -603,6 +634,20 @@ def _classify_pcp_discovered_url(url: str) -> Optional[str]:
     if PCP_DOC_RE.search(path):
         return "document"
     if PCP_LISTING_PATH_RE.search(path) or PCP_DETAIL_PATH_RE.search(path):
+        return "listing"
+    return None
+
+
+def _classify_gb_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    host = (parts.hostname or "").lower()
+    host_is_local_fixture = host in ("127.0.0.1", "localhost")
+    if host not in GB_GOV_HOST_ALIASES and not host_is_local_fixture:
+        return None
+    if GB_GOV_DOC_RE.search(path):
+        return "document"
+    if GB_GOV_LISTING_PATH_RE.search(path):
         return "listing"
     return None
 
@@ -2640,6 +2685,269 @@ class AJKAssemblyPipeline(BalochistanAssemblyPipeline):
                         listings[safe][key] = value
 
 
+class GBAssemblyPipeline(BalochistanAssemblyPipeline):
+    """Source-specific extraction for GB public acts document-direct listings."""
+
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = str(fr.query_json.get("target_kind", "statute"))
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
+
+        section = self._gb_source_section(res.final_url) or str(inherited_meta.get("source_section") or "acts")
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("source_section", section)
+        base_meta.setdefault(
+            "target_kind",
+            self._gb_target_kind(
+                source_section=str(base_meta.get("source_section") or section),
+                title=str(base_meta.get("act_title") or ""),
+                fallback=target_kind,
+            ),
+        )
+
+        self._collect_gb_document_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            docs=docs,
+            inherited_meta=base_meta,
+        )
+
+        navigation_meta = {
+            "listing_fetch": "navigation_links",
+            "discovery_channel": "navigation-link",
+            **base_meta,
+        }
+        for key_name in (
+            "act_title",
+            "detail_title",
+            "act_no",
+            "act_year",
+            "act_passed_on",
+            "act_type",
+            "detail_url",
+            "target_kind",
+        ):
+            navigation_meta.pop(key_name, None)
+        self._collect_gb_listing_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            docs=docs,
+            listings=listings,
+            inherited_meta=navigation_meta,
+        )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            next_target_kind = str(nmeta.get("target_kind") or target_kind)
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
+                    "result_index",
+                    "source_section",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_type",
+                    "detail_url",
+                    "detail_title",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": next_target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    @staticmethod
+    def _gb_source_section(url: str) -> Optional[str]:
+        path = (urlsplit(url).path or "/").lower()
+        if path.endswith("/ordinances"):
+            return "ordinances"
+        if path.endswith("/rules"):
+            return "rules"
+        if path.endswith("/laws"):
+            return "laws"
+        if path.endswith("/acts"):
+            return "acts"
+        return None
+
+    @staticmethod
+    def _gb_target_kind(*, source_section: str, title: str, fallback: str) -> str:
+        default_kind = fallback if fallback in ("statute", "instrument") else "statute"
+        section = (source_section or "").lower()
+        lowered_title = (title or "").lower()
+        if section in ("rules", "ordinances"):
+            return "instrument"
+        if re.search(r"\b(ordinance|rules?|regulations?|notification|order|by-law|bye-law)\b", lowered_title):
+            return "instrument"
+        if re.search(r"\b(act|acts|law|statute)\b", lowered_title):
+            return "statute"
+        if section in ("acts", "laws"):
+            return "statute"
+        return default_kind
+
+    def _collect_gb_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            hint = a.get_text(" ", strip=True)[:240]
+            lowered = f"{href} {hint}".lower()
+            if "/storage/downloads/" not in lowered and not any(ext in lowered for ext in (".pdf", ".doc", ".docx")):
+                continue
+            row_index += 1
+            route_meta = dict(inherited_meta)
+            route_meta["listing_fetch"] = "acts_document_links"
+            route_meta["discovery_channel"] = "acts-document-link"
+            route_meta["result_index"] = row_index
+            if hint:
+                route_meta.setdefault("act_title", hint[:280])
+                if "act_year" not in route_meta and YEAR_RE.search(hint):
+                    route_meta["act_year"] = YEAR_RE.search(hint).group(0)  # type: ignore[union-attr]
+            route_meta["target_kind"] = self._gb_target_kind(
+                source_section=str(route_meta.get("source_section") or self._gb_source_section(base_url) or "acts"),
+                title=str(route_meta.get("act_title") or hint),
+                fallback=str(route_meta.get("target_kind") or "statute"),
+            )
+            self._capture_candidate(
+                raw=href,
+                hint=hint,
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    def _collect_gb_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=dict(inherited_meta),
+            )
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        route_meta: Dict[str, Any],
+    ) -> None:
+        normalized = normalize_gb_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+
+        kind = _classify_gb_discovered_url(safe, hint_text=hint)
+        if kind == "document":
+            path = (urlsplit(safe).path or "").lower()
+            ext = path.rsplit(".", 1)[-1] if "." in path else ""
+            section = str(route_meta.get("source_section") or self._gb_source_section(base_url) or "acts")
+            meta = {
+                "discovery_hint": hint[:240],
+                "pdf_endpoint_kind": "storage-download-file" if path.startswith("/storage/downloads/") else "direct-file",
+                **route_meta,
+            }
+            if ext and "document_format" not in meta:
+                meta["document_format"] = ext
+            if ext == "pdf":
+                meta["expect_pdf"] = True
+            meta["target_kind"] = self._gb_target_kind(
+                source_section=section,
+                title=str(meta.get("act_title") or hint),
+                fallback=str(meta.get("target_kind") or "statute"),
+            )
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            listing_meta = dict(route_meta)
+            section = self._gb_source_section(safe) or self._gb_source_section(base_url) or str(listing_meta.get("source_section") or "acts")
+            listing_meta["source_section"] = section
+            listing_meta["target_kind"] = self._gb_target_kind(
+                source_section=section,
+                title=str(hint or listing_meta.get("act_title") or ""),
+                fallback=str(listing_meta.get("target_kind") or "statute"),
+            )
+            if safe not in listings:
+                listings[safe] = listing_meta
+            else:
+                for key, value in listing_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
+
+
 class KPAssemblyPipeline(BalochistanAssemblyPipeline):
     """Source-specific extraction for PAKP + KPCode statutes/rules detail-page document routing."""
 
@@ -4246,6 +4554,8 @@ async def scrape_legislature(source: ScraperSource, db: AsyncSession, **kwargs) 
         pipeline_cls = BalochistanAssemblyPipeline
     elif source.source_name == "AJKAssembly":
         pipeline_cls = AJKAssemblyPipeline
+    elif source.source_name == "GBAssembly":
+        pipeline_cls = GBAssemblyPipeline
     elif source.source_name == "PunjabAssembly":
         pipeline_cls = PunjabAssemblyPipeline
     elif source.source_name == "SindhAssembly":
