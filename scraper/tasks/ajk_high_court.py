@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from itertools import islice
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -38,6 +39,8 @@ DEFAULT_SEARCH_POSTS: List[Dict[str, str]] = [
     {"judgment_tab": "judgment", "cmbYear": "ALL", "cmbBench": "ALL", "cmbCategory": "ALL", "btnSearchJudgment": "Search"},
     {"judgment_tab": "previous", "cmbYear": "ALL", "cmbBench": "ALL", "cmbCategory": "ALL", "btnSearchJudgment": "Search"},
 ]
+DEFAULT_SEARCH_RESULT_PAGE_SIZE = 200
+DEFAULT_SEARCH_RESULT_MAX_PAGES = 2
 
 DOC_HINT_RE = re.compile(r"(?i)(judg|order|appeal|petition|case|writ)")
 WAYBACK_RE = re.compile(r"/web/\d+[a-z_]{0,6}/(https?://.+)$", re.I)
@@ -151,6 +154,41 @@ def _looks_like_search_listing(url: str, html_text: str) -> bool:
     return "id=\"fmcs\"" in low and "name=\"cmbyear\"" in low and "name=\"cmbbench\"" in low and "name=\"cmbcategory\"" in low
 
 
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        return default
+    return out if out > 0 else default
+
+
+def search_result_window_for(source: ScraperSource) -> Tuple[int, int]:
+    cfg = source.config_json or {}
+    page_size = _positive_int(cfg.get("search_result_page_size"), default=DEFAULT_SEARCH_RESULT_PAGE_SIZE)
+    max_pages = _positive_int(cfg.get("search_result_max_pages"), default=DEFAULT_SEARCH_RESULT_MAX_PAGES)
+    return (max(1, page_size), max(1, max_pages))
+
+
+def _windowed(items: Sequence[Any], *, page_size: int, max_pages: int) -> Iterator[Tuple[int, int, Any]]:
+    limit = page_size * max_pages
+    for idx, item in enumerate(islice(items, limit)):
+        yield ((idx // page_size) + 1, idx % page_size, item)
+
+
+def _clean_text(text: str, *, limit: int = 260) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()[:limit]
+
+
+def _search_results_rows(html_text: str) -> List[Any]:
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    for table in soup.find_all("table"):
+        classes = " ".join(table.get("class", [])).lower()
+        header_text = _clean_text(table.get_text(" ", strip=True), limit=800).lower()
+        if "court-table" in classes and "s.no" in header_text and "case title" in header_text and "judgment" in header_text:
+            return [row for row in table.find_all("tr") if row.find("a", href=True)]
+    return []
+
+
 def search_posts_for(source: ScraperSource) -> List[Dict[str, str]]:
     cfg = source.config_json or {}
     raw = cfg.get("search_posts")
@@ -196,12 +234,21 @@ class AJKHighCourtPipeline(PublicPipeline):
                     posted = await self.post_form(res.final_url, data=payload)
                 except URLPolicyError:
                     continue
+                route_meta = {"listing_fetch": "post_form", "search": safe_payload}
+                found_result_rows = self._collect_post_result_table_docs(
+                    html_text=posted.text,
+                    base_url=posted.final_url,
+                    docs=docs,
+                    listings=listings,
+                    route_meta=route_meta,
+                )
                 self._collect_from_html(
                     html_text=posted.text,
                     base_url=posted.final_url,
                     docs=docs,
                     listings=listings,
-                    route_meta={"listing_fetch": "post_form", "search": safe_payload},
+                    route_meta=route_meta,
+                    allow_judgment_capture=not found_result_rows,
                 )
 
         added = await self._enqueue_judgments_with_meta(docs, listing_url=res.final_url)
@@ -241,34 +288,111 @@ class AJKHighCourtPipeline(PublicPipeline):
         docs: Dict[str, Dict[str, Any]],
         listings: List[str],
         route_meta: Optional[Dict[str, Any]] = None,
+        allow_judgment_capture: bool = True,
     ) -> None:
         route_meta = route_meta or {}
         for raw, channel, hint in _iter_discovery_candidates(html_text):
-            normalized = normalize_ajk_public_url(raw, base_url=base_url)
-            if not normalized:
-                continue
-            try:
-                safe = check_url_policy(
-                    normalized,
-                    self.source.allow_list or [],
-                    document_cdn_hosts=self.source.document_cdn_hosts or [],
-                    allow_private_for_tests=_tests_allow_private(),
+            self._capture_candidate(
+                raw=raw,
+                hint=hint,
+                channel=channel,
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=route_meta,
+                allow_judgment_capture=allow_judgment_capture,
+            )
+
+    def _collect_post_result_table_docs(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: List[str],
+        route_meta: Dict[str, Any],
+    ) -> bool:
+        rows = _search_results_rows(html_text)
+        if not rows:
+            return False
+        page_size, max_pages = search_result_window_for(self.source)
+        for page, page_index, row in _windowed(rows, page_size=page_size, max_pages=max_pages):
+            cells = row.find_all("td")
+            serial = _clean_text(cells[0].get_text(" ", strip=True), limit=40) if len(cells) >= 1 else ""
+            case_no = _clean_text((row.select_one(".court-case-no") or cells[1]).get_text(" ", strip=True), limit=220) if len(cells) >= 2 else ""
+            title = _clean_text((row.select_one(".court-case-title") or cells[1]).get_text(" ", strip=True), limit=260) if len(cells) >= 2 else ""
+            category = _clean_text(cells[2].get_text(" ", strip=True), limit=80) if len(cells) >= 3 else ""
+            decision_date = _clean_text(cells[3].get_text(" ", strip=True), limit=40) if len(cells) >= 4 else ""
+            row_meta: Dict[str, Any] = {
+                **route_meta,
+                "result_window_page": page,
+                "result_window_index": page_index,
+                "result_window_page_size": page_size,
+                "result_window_max_pages": max_pages,
+            }
+            if serial:
+                row_meta["result_row_serial"] = serial
+            if case_no:
+                row_meta["result_case_no"] = case_no
+            if title:
+                row_meta["result_title"] = title
+            if category:
+                row_meta["result_category"] = category
+            if decision_date:
+                row_meta["result_decision_date"] = decision_date
+            for anchor in row.find_all("a", href=True):
+                self._capture_candidate(
+                    raw=anchor.get("href", ""),
+                    hint=f"result-row:{case_no or title or serial}",
+                    channel="result-table-row",
+                    base_url=base_url,
+                    docs=docs,
+                    listings=listings,
+                    route_meta=row_meta,
                 )
-            except URLPolicyError:
-                self.stats["rejected_urls"] += 1
-                continue
-            kind = _classify_discovered_url(safe, hint_text=hint)
-            if kind == "judgment":
-                docs.setdefault(
-                    safe,
-                    {
-                        "discovery_channel": channel,
-                        "discovery_hint": hint[:240],
-                        **route_meta,
-                    },
-                )
-            elif kind == "listing" and safe != base_url:
-                listings.append(safe)
+        return True
+
+    def _capture_candidate(
+        self,
+        *,
+        raw: str,
+        hint: str,
+        channel: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: List[str],
+        route_meta: Dict[str, Any],
+        allow_judgment_capture: bool = True,
+    ) -> None:
+        normalized = normalize_ajk_public_url(raw, base_url=base_url)
+        if not normalized:
+            return
+        try:
+            safe = check_url_policy(
+                normalized,
+                self.source.allow_list or [],
+                document_cdn_hosts=self.source.document_cdn_hosts or [],
+                allow_private_for_tests=_tests_allow_private(),
+            )
+        except URLPolicyError:
+            self.stats["rejected_urls"] += 1
+            return
+        kind = _classify_discovered_url(safe, hint_text=hint)
+        if kind == "judgment" and allow_judgment_capture:
+            meta = {
+                "discovery_channel": channel,
+                "discovery_hint": hint[:240],
+                **route_meta,
+            }
+            existing = docs.get(safe)
+            if existing is None:
+                docs[safe] = meta
+            else:
+                for key, value in meta.items():
+                    if key not in existing and value not in ("", None):
+                        existing[key] = value
+        elif kind == "listing" and safe != base_url:
+            listings.append(safe)
 
     async def _enqueue_judgments_with_meta(self, docs: Dict[str, Dict[str, Any]], *, listing_url: str) -> int:
         added = 0
@@ -285,11 +409,22 @@ class AJKHighCourtPipeline(PublicPipeline):
             ).scalars().first()
             if exists is not None:
                 continue
-            route = {"listing": listing_url}
-            if isinstance(meta.get("listing_fetch"), str):
-                route["listing_fetch"] = meta["listing_fetch"]
-            if isinstance(meta.get("search"), dict):
-                route["search"] = meta["search"]
+            route: Dict[str, Any] = {"listing": listing_url}
+            for key_name in (
+                "listing_fetch",
+                "search",
+                "result_window_page",
+                "result_window_index",
+                "result_window_page_size",
+                "result_window_max_pages",
+                "result_row_serial",
+                "result_case_no",
+                "result_title",
+                "result_category",
+                "result_decision_date",
+            ):
+                if key_name in meta:
+                    route[key_name] = meta[key_name]
             self.db.add(
                 CrawlFrontier(
                     source_name=self.source.source_name,
