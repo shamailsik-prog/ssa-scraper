@@ -159,6 +159,235 @@ async def test_national_assembly_ordinance_listing_routes_instrument_pdf(db, fix
     assert row.query_json["route"]["act_year"] == "2025"
 
 
+async def test_national_assembly_listing_fans_out_to_detail_and_harvests_document(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/en/bills.php?status=pass",
+        """
+        <html><body>
+          <table class="table_bill table-bordered table-hover">
+            <thead>
+              <tr><th>Sr No.</th><th>Date</th><th>Title</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>12.</td>
+                <td>Thursday, 20th August, 2026</td>
+                <td><a href="/en/bill-detail.php?bill_id=9001">The Defense Forces of Pakistan Bill, 2026</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/en/bill-detail.php?bill_id=9001",
+        """
+        <html><body>
+          <h1>The Defense Forces of Pakistan Act, 2026</h1>
+          <table>
+            <tr><th>Act No</th><td>XLVII of 2026</td></tr>
+            <tr><th>Date of Assent</th><td>August 20, 2026</td></tr>
+          </table>
+          <a href="/uploads/documents/detail-act-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/uploads/documents/detail-act-2026.pdf",
+        text_pdf_bytes("The Defense Forces of Pakistan Act, 2026"),
+        content_type="application/pdf",
+    )
+
+    source = await _national_assembly_source(db, fixture_server, ["/en/bills.php?status=pass"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=50)
+    await db.commit()
+
+    assert stats["halted"] is False
+    assert "/en/bill-detail.php?bill_id=9001" in fixture_server.hits
+    assert "/uploads/documents/detail-act-2026.pdf" in fixture_server.hits
+
+    detail_listing_url = f"http://127.0.0.1:{fixture_server.port}/en/bill-detail.php?bill_id=9001"
+    detail_listing_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "NationalAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_listing_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_listing_row is not None
+    assert detail_listing_row.query_json["meta"]["listing_fetch"] == "legislation_table"
+    assert detail_listing_row.query_json["meta"]["source_section"] == "bills"
+    assert detail_listing_row.query_json["meta"]["act_year"] == "2026"
+
+    detail_doc_url = f"http://127.0.0.1:{fixture_server.port}/uploads/documents/detail-act-2026.pdf"
+    detail_doc_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "NationalAssembly",
+                CrawlFrontier.query_key == f"instrument:{detail_doc_url}",
+            )
+        )
+    ).scalars().first()
+    assert detail_doc_row is not None
+    assert detail_doc_row.query_json["expect_pdf"] is True
+    assert detail_doc_row.query_json["route"]["detail_fetch"] == "detail_documents"
+    assert detail_doc_row.query_json["route"]["detail_url"].endswith("/en/bill-detail.php?bill_id=9001")
+    assert detail_doc_row.query_json["route"]["act_no"] == "XLVII of 2026"
+    assert detail_doc_row.query_json["route"]["act_title"].startswith("The Defense Forces of Pakistan Act")
+
+    detail_prov = (
+        await db.execute(
+            select(SourceProvenance).where(
+                SourceProvenance.source_name == "NationalAssembly",
+                SourceProvenance.source_url == detail_doc_url,
+                SourceProvenance.content_kind == "pdf",
+            )
+        )
+    ).scalars().first()
+    assert detail_prov is not None
+    assert detail_prov.route_json["detail_url"].endswith("/en/bill-detail.php?bill_id=9001")
+    assert detail_prov.route_json["act_title"].startswith("The Defense Forces of Pakistan Act")
+
+
+async def test_national_assembly_detail_pdf_signature_gate_retires_non_pdf_candidate(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/en/bills.php?status=pass",
+        """
+        <html><body>
+          <table class="table_bill table-bordered table-hover">
+            <thead>
+              <tr><th>Sr No.</th><th>Date</th><th>Title</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1.</td>
+                <td>Thursday, 20th August, 2026</td>
+                <td><a href="/en/bill-detail.php?bill_id=9101">The Fake Bill, 2026</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/en/bill-detail.php?bill_id=9101",
+        """
+        <html><body>
+          <h1>The Fake Bill, 2026</h1>
+          <a href="/uploads/documents/fake-detail-bill.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add("/uploads/documents/fake-detail-bill.pdf", "<html>not-a-pdf</html>", content_type="application/pdf")
+
+    source = await _national_assembly_source(db, fixture_server, ["/en/bills.php?status=pass"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_legislature(source, db, fetcher=fetcher, limit=40)
+    await db.commit()
+
+    assert stats["halted"] is False
+    staged = (
+        await db.execute(
+            select(func.count())
+            .select_from(StatutesStaging)
+            .where(StatutesStaging.source_name == "NationalAssembly")
+        )
+    ).scalar()
+    assert staged == 0
+
+    document_url = f"http://127.0.0.1:{fixture_server.port}/uploads/documents/fake-detail-bill.pdf"
+    row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "NationalAssembly",
+                CrawlFrontier.query_key == f"instrument:{document_url}",
+            )
+        )
+    ).scalars().first()
+    assert row is not None
+    assert row.status == "retired"
+    assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
+
+
+async def test_national_assembly_detail_flow_is_idempotent_on_rerun(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/en/bills.php?status=pass",
+        """
+        <html><body>
+          <table class="table_bill table-bordered table-hover">
+            <thead>
+              <tr><th>Sr No.</th><th>Date</th><th>Title</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>14.</td>
+                <td>Thursday, 20th August, 2026</td>
+                <td><a href="/en/bill-detail.php?bill_id=9201">The Idempotence Bill, 2026</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/en/bill-detail.php?bill_id=9201",
+        """
+        <html><body>
+          <h1>The Idempotence Bill, 2026</h1>
+          <a href="/uploads/documents/idempotence-bill.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/uploads/documents/idempotence-bill.pdf",
+        text_pdf_bytes("The Idempotence Bill, 2026"),
+        content_type="application/pdf",
+    )
+
+    source = await _national_assembly_source(db, fixture_server, ["/en/bills.php?status=pass"], target_kind="instrument")
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        first = await scrape_legislature(source, db, fetcher=fetcher, limit=40)
+    await db.commit()
+    assert first["halted"] is False
+
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        second = await scrape_legislature(source, db, fetcher=fetcher, limit=40)
+    await db.commit()
+    assert second["halted"] is False
+    assert second["discovered"] == 0
+
+    detail_listing_url = f"http://127.0.0.1:{fixture_server.port}/en/bill-detail.php?bill_id=9201"
+    detail_listing_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(CrawlFrontier)
+            .where(
+                CrawlFrontier.source_name == "NationalAssembly",
+                CrawlFrontier.query_key == f"listing:{detail_listing_url}",
+            )
+        )
+    ).scalar()
+    assert detail_listing_count == 1
+
+    detail_doc_url = f"http://127.0.0.1:{fixture_server.port}/uploads/documents/idempotence-bill.pdf"
+    detail_doc_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(CrawlFrontier)
+            .where(
+                CrawlFrontier.source_name == "NationalAssembly",
+                CrawlFrontier.query_key == f"instrument:{detail_doc_url}",
+            )
+        )
+    ).scalar()
+    assert detail_doc_count == 1
+
+
 async def test_national_assembly_pdf_signature_gate_retires_non_pdf_candidate(db, fixture_server):
     fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
     fixture_server.add(

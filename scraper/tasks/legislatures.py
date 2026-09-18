@@ -83,6 +83,7 @@ NA_HOST = "na.gov.pk"
 NA_HOST_ALIASES = (NA_HOST, "www.na.gov.pk")
 NA_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
 NA_LISTING_PATH_RE = re.compile(r"(?i)^/en/(acts-tenure|acts|bills|bills-15)\.php$")
+NA_DETAIL_PATH_RE = re.compile(r"(?i)^/en/(bill|bill-detail|bill-details|act-detail|act-details|detail|details)\.php$")
 SENATE_HOST = "senate.gov.pk"
 SENATE_HOST_ALIASES = (SENATE_HOST, "www.senate.gov.pk")
 SENATE_DOC_RE = re.compile(r"(?i)^/uploads/documents/.+\.(pdf|doc|docx|html?)$")
@@ -318,9 +319,24 @@ def _classify_na_discovered_url(url: str) -> Optional[str]:
     path = (urlsplit(url).path or "/").lower()
     if NA_DOC_RE.search(path):
         return "document"
-    if NA_LISTING_PATH_RE.search(path):
+    if NA_LISTING_PATH_RE.search(path) or _is_na_detail_discovered_url(url):
         return "listing"
     return None
+
+
+def _is_na_detail_discovered_url(url: str) -> bool:
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    if NA_DETAIL_PATH_RE.search(path):
+        return True
+    if path not in ("/en/acts-tenure.php", "/en/acts.php", "/en/bills.php", "/en/bills-15.php", "/en/bills-passed.php"):
+        return False
+    qs = parse_qs(parts.query or "")
+    for key in ("id", "bill_id", "act_id", "detail_id", "doc_id"):
+        values = qs.get(key) or []
+        if any(str(v).strip() for v in values):
+            return True
+    return False
 
 
 def _classify_pcp_discovered_url(url: str) -> Optional[str]:
@@ -1335,21 +1351,31 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
         target_kind = fr.query_json.get("target_kind", "instrument")
         docs: Dict[str, Dict[str, Any]] = {}
         listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
 
-        self._collect_structured_listing_rows(
-            html_text=res.text,
-            base_url=res.final_url,
-            docs=docs,
-        )
-        self._collect_listing_links(
-            html_text=res.text,
-            base_url=res.final_url,
-            listings=listings,
-            inherited_meta={
-                "listing_fetch": "navigation_links",
-                "source_section": self._source_section_for_url(res.final_url),
-            },
-        )
+        if self._is_detail_listing(res.final_url):
+            self._collect_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+        else:
+            self._collect_structured_listing_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+            )
+            self._collect_listing_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                listings=listings,
+                inherited_meta={
+                    "listing_fetch": "navigation_links",
+                    "source_section": self._source_section_for_url(res.final_url),
+                },
+            )
 
         added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
         self.stats["discovered"] += added
@@ -1403,12 +1429,17 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
                 self.stats["discovered"] += 1
         await self.db.flush()
 
+    @staticmethod
+    def _is_detail_listing(url: str) -> bool:
+        return _is_na_detail_discovered_url(url)
+
     def _collect_structured_listing_rows(
         self,
         *,
         html_text: str,
         base_url: str,
         docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
     ) -> None:
         soup = BeautifulSoup(html_text or "", "html.parser")
         row_index = 0
@@ -1442,7 +1473,7 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
                         hint=hint,
                         base_url=base_url,
                         docs=docs,
-                        listings={},
+                        listings=listings,
                         route_meta=row_meta,
                     )
 
@@ -1518,6 +1549,8 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
         parts = urlsplit(url)
         path = (parts.path or "").lower()
         qs = parse_qs(parts.query or "")
+        if _is_na_detail_discovered_url(url):
+            return "detail"
         if path.endswith(("/acts-tenure.php", "/acts.php")):
             return "acts"
         if path.endswith(("/bills.php", "/bills-15.php")):
@@ -1529,6 +1562,56 @@ class NationalAssemblyPipeline(BalochistanAssemblyPipeline):
                 return "bills"
             return "bills"
         return "legislation"
+
+    def _collect_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        if detail_title:
+            base_meta["act_title"] = detail_title
+            base_meta["detail_title"] = detail_title
+
+        for row in soup.select("table tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).strip(": ").lower()
+            value = cells[1].get_text(" ", strip=True)
+            if not value:
+                continue
+            current_act_no = str(base_meta.get("act_no", "")).strip()
+            if ("act #" in label or "act no" in label or "ordinance no" in label) and (
+                not current_act_no or re.fullmatch(r"\d+\.?", current_act_no)
+            ):
+                base_meta["act_no"] = value[:80]
+            elif ("passage" in label or "passed" in label or "date" == label) and "act_passed_on" not in base_meta:
+                base_meta["act_passed_on"] = value[:40]
+            elif ("enforcement" in label or "assent" in label or "promulgation" in label) and "act_assented_on" not in base_meta:
+                base_meta["act_assented_on"] = value[:40]
+            if "act_year" not in base_meta and YEAR_RE.search(value):
+                base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+
+        for a in soup.find_all("a", href=True):
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "detail_documents"
+            route_meta["discovery_channel"] = "act-detail-file-link"
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
 
     def _capture_candidate(
         self,
