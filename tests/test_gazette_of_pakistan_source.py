@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
-from scraper.tasks.legislatures import normalize_pcp_public_url, scrape_legislature
+from scraper.tasks.legislatures import GazetteOfPakistanPipeline, normalize_pcp_public_url, scrape_legislature
 from tests.fixtures import text_pdf_bytes
 
 
@@ -33,6 +33,11 @@ def test_normalize_pcp_public_url_handles_relative_download_path():
         base_url="http://www.pcp.gov.pk/Download",
     )
     assert rel == "http://pcp.gov.pk/SiteImage/Downloads/10172%20(22)%20Part-I.pdf"
+
+
+def test_gazette_source_section_handles_trailing_slash():
+    assert GazetteOfPakistanPipeline._source_section_for_url("http://pcp.gov.pk/Download/") == "download_notifications"
+    assert GazetteOfPakistanPipeline._source_section_for_url("http://pcp.gov.pk/WeeklyNitifications/") == "weekly_notifications"
 
 
 async def test_gazette_download_rows_route_direct_documents_with_row_provenance(db, fixture_server):

@@ -1973,7 +1973,7 @@ class GazetteOfPakistanPipeline(BalochistanAssemblyPipeline):
 
     @staticmethod
     def _source_section_for_url(url: str) -> str:
-        path = (urlsplit(url).path or "").lower()
+        path = (urlsplit(url).path or "").lower().rstrip("/")
         if path.endswith("/download"):
             return "download_notifications"
         if path.endswith("/weeklynitifications"):
