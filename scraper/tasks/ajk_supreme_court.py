@@ -83,10 +83,7 @@ def _clean_text(text: str, *, limit: int = 260) -> str:
 
 def _looks_like_wp_archive_listing(url: str, html_text: str) -> bool:
     parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
     path = (parts.path or "/").lower()
-    if host not in PUBLIC_HOST_ALIASES:
-        return False
     if not WP_ARCHIVE_PATH_RE.search(path):
         return False
     low = (html_text or "").lower()
@@ -95,9 +92,6 @@ def _looks_like_wp_archive_listing(url: str, html_text: str) -> bool:
 
 def _wp_archive_listing_page(url: str) -> Optional[int]:
     parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    if host not in PUBLIC_HOST_ALIASES:
-        return None
     path = (parts.path or "/").lower()
     m = WP_ARCHIVE_PAGE_RE.search(path)
     if m:
