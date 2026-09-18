@@ -28,6 +28,7 @@ from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
+    CorpusMetadata,
     Court,
     EmbeddingQueue,
     Instrument,
@@ -465,11 +466,12 @@ def _instrument_row_keys(row: Instrument) -> set[str]:
         key = _instrument_reference_key(row.number)
         if key:
             keys.add(key)
-    for mention in row.citation_mentions or []:
-        if not isinstance(mention, dict):
-            continue
+    if keys:
+        return keys
+    first_mention = next((m for m in (row.citation_mentions or []) if isinstance(m, dict)), None)
+    if first_mention:
         for field in ("normalized", "raw"):
-            key = _instrument_reference_key(str(mention.get(field) or ""))
+            key = _instrument_reference_key(str(first_mention.get(field) or ""))
             if key:
                 keys.add(key)
     return keys
@@ -480,10 +482,10 @@ def _instrument_row_signatures(row: Instrument) -> set[tuple[str, str, int]]:
     direct = _instrument_signature(row.number)
     if direct:
         signatures.add(direct)
-    for mention in row.citation_mentions or []:
-        if not isinstance(mention, dict):
-            continue
-        sig = _mention_signature(mention)
+        return signatures
+    first_mention = next((m for m in (row.citation_mentions or []) if isinstance(m, dict)), None)
+    if first_mention:
+        sig = _mention_signature(first_mention)
         if sig:
             signatures.add(sig)
     return signatures
@@ -598,20 +600,44 @@ async def reconcile_instrument_relations(
         "edges_added": 0,
         "edges_removed": 0,
     }
+    offset_key = "instrument_relation_reconcile_offset"
     async with SessionLocal() as db:
-        rows = (
+        filters = (
+            Instrument.created_at >= cutoff,
+            (Instrument.citation_mentions.isnot(None)) | (Instrument.statute_mentions.isnot(None)),
+        )
+        total = (
             await db.execute(
-                select(Instrument)
-                .where(
-                    Instrument.created_at >= cutoff,
-                    (Instrument.citation_mentions.isnot(None)) | (Instrument.statute_mentions.isnot(None)),
-                )
-                .order_by(Instrument.created_at.desc())
-                .limit(effective_limit)
+                select(func.count()).select_from(Instrument).where(*filters)
             )
-        ).scalars().all()
-        counts["scanned"] = len(rows)
-        for inst in rows:
+        ).scalar() or 0
+        instrument_ids = []
+        if total > 0:
+            cursor = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == offset_key))).scalars().first()
+            if cursor is None:
+                cursor = CorpusMetadata(key=offset_key, value="0")
+                db.add(cursor)
+                await db.flush()
+            try:
+                offset = int(cursor.value)
+            except (TypeError, ValueError):
+                offset = 0
+            offset = max(offset, 0) % int(total)
+            base_query = (
+                select(Instrument.id)
+                .where(*filters)
+                .order_by(Instrument.created_at.desc(), Instrument.id.desc())
+            )
+            instrument_ids = (await db.execute(base_query.offset(offset).limit(effective_limit))).scalars().all()
+            if len(instrument_ids) < effective_limit and total > len(instrument_ids):
+                wrap_ids = (await db.execute(base_query.limit(effective_limit - len(instrument_ids)))).scalars().all()
+                instrument_ids.extend(wrap_ids)
+            cursor.value = str((offset + len(instrument_ids)) % int(total))
+        counts["scanned"] = len(instrument_ids)
+        for inst_id in instrument_ids:
+            inst = (await db.execute(select(Instrument).where(Instrument.id == inst_id))).scalars().first()
+            if inst is None:
+                continue
             try:
                 before = (
                     await db.execute(
@@ -639,7 +665,7 @@ async def reconcile_instrument_relations(
             except Exception:
                 await db.rollback()
                 counts["failed"] += 1
-                logger.exception("relation reconcile failed for instrument %s", inst.id)
+                logger.exception("relation reconcile failed for instrument %s", inst_id)
         await db.commit()
     return counts
 

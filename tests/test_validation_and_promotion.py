@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
@@ -14,6 +16,7 @@ from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, Q
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
+from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
 from scraper.tasks.treatment import classify_deterministic, classify_judgment
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
@@ -477,7 +480,7 @@ async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db)
     )
     assert source_instrument is not None
 
-    await _promote(
+    target_a = await _promote(
         """
         THE GAZETTE OF PAKISTAN EXTRAORDINARY
         ORDINANCE No. IX of 2025
@@ -485,7 +488,8 @@ async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db)
         """,
         "http://127.0.0.1/ambiguous-target-a.pdf",
     )
-    await _promote(
+    assert target_a is not None
+    target_b = await _promote(
         """
         THE GAZETTE OF PAKISTAN EXTRAORDINARY
         ACT No. II of 2026
@@ -493,6 +497,7 @@ async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db)
         """,
         "http://127.0.0.1/ambiguous-target-b.pdf",
     )
+    assert target_b is not None
 
     await db.commit()
     counts = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
@@ -502,7 +507,10 @@ async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db)
             select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_instrument.id),
         )
     ).scalars().all()
-    assert edges == []
+    superseded = [e for e in edges if e.relation_type == "superseded_by"]
+    assert len(superseded) == 1
+    assert superseded[0].target_instrument_id == target_a.id
+    assert superseded[0].target_instrument_id != target_b.id
 
 
 async def test_instrument_relation_reconcile_is_idempotent_on_rerun(db):
@@ -565,6 +573,160 @@ async def test_instrument_relation_reconcile_is_idempotent_on_rerun(db):
     assert first["processed"] >= 1
     assert second["edges_added"] == 0
     assert second["edges_removed"] == 0
+
+
+async def test_instrument_relation_reconcile_rotates_through_limited_batch(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    await db.execute(update(Instrument).values(created_at=datetime.now(timezone.utc) - timedelta(days=10)))
+    await db.commit()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    source_a = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXX of 2025
+        This Act is amended by S.R.O. 901(I)/2025.
+        """,
+        "http://127.0.0.1/rotate-source-a.pdf",
+    )
+    source_b = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXXI of 2025
+        This Act is amended by S.R.O. 902(I)/2025.
+        """,
+        "http://127.0.0.1/rotate-source-b.pdf",
+    )
+    target_a = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        NOTIFICATION
+        S.R.O. 901(I)/2025
+        Dated 8th August 2025
+        """,
+        "http://127.0.0.1/rotate-target-a.pdf",
+    )
+    target_b = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        NOTIFICATION
+        S.R.O. 902(I)/2025
+        Dated 9th August 2025
+        """,
+        "http://127.0.0.1/rotate-target-b.pdf",
+    )
+    assert source_a is not None and source_b is not None and target_a is not None and target_b is not None
+    await db.commit()
+
+    for _ in range(5):
+        await reconcile_instrument_relations(limit=1, lookback_hours=24)
+
+    edges_a = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_a.id),
+        )
+    ).scalars().all()
+    edges_b = (
+        await db.execute(
+            select(InstrumentRelation).where(InstrumentRelation.source_instrument_id == source_b.id),
+        )
+    ).scalars().all()
+    amended_a = [e for e in edges_a if e.relation_type == "amended_by"]
+    amended_b = [e for e in edges_b if e.relation_type == "amended_by"]
+    assert len(amended_a) == 1
+    assert len(amended_b) == 1
+    assert amended_a[0].target_instrument_id == target_a.id
+    assert amended_b[0].target_instrument_id == target_b.id
+
+
+async def test_instrument_relation_reconcile_continues_after_rollback(db, monkeypatch):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    await db.execute(update(Instrument).values(created_at=datetime.now(timezone.utc) - timedelta(days=10)))
+    await db.commit()
+
+    async def _promote(text: str, url: str) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": url}, content_hash=prov.content_hash)
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    first = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXXII of 2025
+        This Act is amended by S.R.O. 999(I)/2025.
+        """,
+        "http://127.0.0.1/rollback-source-a.pdf",
+    )
+    second = await _promote(
+        """
+        THE GAZETTE OF PAKISTAN EXTRAORDINARY
+        ACT No. XXXIII of 2025
+        This Act is amended by S.R.O. 998(I)/2025.
+        """,
+        "http://127.0.0.1/rollback-source-b.pdf",
+    )
+    assert first is not None and second is not None
+    await db.commit()
+
+    original_sync = promotion_task_module._sync_instrument_relation_edges
+    calls = {"count": 0}
+
+    async def _fail_once(sync_db, inst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("simulated reconcile failure")
+        await original_sync(sync_db, inst)
+
+    monkeypatch.setattr(promotion_task_module, "_sync_instrument_relation_edges", _fail_once)
+    counts = await reconcile_instrument_relations(limit=2, lookback_hours=24)
+    assert counts["failed"] == 1
+    assert counts["processed"] == 1
 
 
 # --------------------------------------------------------------------------- treatment (B-7)
