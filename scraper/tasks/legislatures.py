@@ -74,6 +74,13 @@ PAP_HOST = "pap.gov.pk"
 PAP_HOST_ALIASES = (PAP_HOST, "www.pap.gov.pk")
 PAP_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|html?)$")
 PAP_LISTING_PATH_RE = re.compile(r"(?i)^/(acts/?|en/about-assembly/parliamentary-privileges/?)$")
+PUNJABLAWS_HOST = "punjablaws.gov.pk"
+PUNJABLAWS_HOST_ALIASES = (PUNJABLAWS_HOST, f"www.{PUNJABLAWS_HOST}")
+PUNJABLAWS_DOC_RE = re.compile(r"(?i)^/.+\.(pdf|doc|docx)$")
+PUNJABLAWS_DETAIL_PATH_RE = re.compile(r"(?i)^/(acts?|laws?|ordinances?|rules?|notifications?|codes?)/[^/?#]+(?:\.html?)?$")
+PUNJABLAWS_LISTING_PATH_RE = re.compile(r"(?i)^/(|index(?:\.html?)?|search(?:\.html?)?|all[-_]?laws?(?:\.html?)?)$")
+PUNJABLAWS_LEGAL_HINT_RE = re.compile(r"(?i)\b(act|ordinance|rule|rules|law|code|regulation|notification|bill|amendment)\b")
+PUNJABLAWS_NAV_HINT_RE = re.compile(r"(?i)\b(index|list|search|category|archive|home|contents?)\b")
 PAS_HOST = "pas.gov.pk"
 PAS_HOST_ALIASES = (PAS_HOST, "www.pas.gov.pk")
 PAS_ACT_DOC_RE = re.compile(r"(?i)^/uploads/acts/.+\.(pdf|doc|docx|html?)$")
@@ -151,6 +158,33 @@ def normalize_pap_public_url(raw: str, *, base_url: str) -> Optional[str]:
     if host in PAP_HOST_ALIASES:
         scheme = "https"
         netloc = PAP_HOST + (f":{parts.port}" if parts.port else "")
+    path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
+    query = (parts.query or "").replace(" ", "%20")
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def normalize_punjab_public_url(raw: str, *, base_url: str) -> Optional[str]:
+    """Normalize discovered candidates onto official Punjab Assembly / Punjab Laws hosts."""
+    if not raw:
+        return None
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    joined = candidate if candidate.lower().startswith(("http://", "https://")) else urljoin(base_url, candidate)
+    parts = urlsplit(joined)
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme or "https"
+    netloc = parts.netloc
+    if host in PAP_HOST_ALIASES:
+        scheme = "https"
+        netloc = PAP_HOST + (f":{parts.port}" if parts.port else "")
+    elif host in PUNJABLAWS_HOST_ALIASES:
+        scheme = "https"
+        netloc = PUNJABLAWS_HOST + (f":{parts.port}" if parts.port else "")
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query = (parts.query or "").replace(" ", "%20")
     return urlunsplit((scheme, netloc, path, query, ""))
@@ -290,6 +324,33 @@ def _classify_pap_discovered_url(url: str) -> Optional[str]:
         return "document"
     if PAP_LISTING_PATH_RE.search(path):
         return "listing"
+    return None
+
+
+def _classify_punjab_discovered_url(url: str, *, hint_text: str = "") -> Optional[str]:
+    parts = urlsplit(url)
+    path = (parts.path or "/").lower()
+    host = (parts.hostname or "").lower()
+    hint = (hint_text or "").lower()
+    host_is_local_fixture = host in ("127.0.0.1", "localhost")
+    if host in PAP_HOST_ALIASES or (host_is_local_fixture and (PAP_ACT_DOC_RE.search(path) or PAP_LISTING_PATH_RE.search(path))):
+        return _classify_pap_discovered_url(url)
+    if host not in PUNJABLAWS_HOST_ALIASES and not host_is_local_fixture:
+        return None
+    if PUNJABLAWS_DOC_RE.search(path):
+        return "document"
+    if "format=pdf" in (parts.query or "").lower():
+        return "document"
+    if PUNJABLAWS_LISTING_PATH_RE.search(path):
+        return "listing"
+    if PUNJABLAWS_DETAIL_PATH_RE.search(path):
+        if PUNJABLAWS_LEGAL_HINT_RE.search(path) or PUNJABLAWS_LEGAL_HINT_RE.search(hint) or YEAR_RE.search(path) or YEAR_RE.search(hint):
+            return "listing"
+    if path.endswith((".html", ".htm")):
+        if PUNJABLAWS_NAV_HINT_RE.search(path) or PUNJABLAWS_NAV_HINT_RE.search(hint):
+            return "listing"
+        if PUNJABLAWS_LEGAL_HINT_RE.search(path) or PUNJABLAWS_LEGAL_HINT_RE.search(hint) or YEAR_RE.search(path) or YEAR_RE.search(hint):
+            return "listing"
     return None
 
 
@@ -655,9 +716,123 @@ class BalochistanAssemblyPipeline(PublicPipeline):
 
 
 class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
-    """Source-specific extraction for PAP acts tables and direct document links."""
+    """Source-specific extraction for PAP + PunjabLaws listings, detail pages and document links."""
 
-    def _collect_structured_act_rows(self, *, html_text: str, base_url: str, docs: Dict[str, Dict[str, Any]]) -> None:  # type: ignore[override]
+    async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
+        depth = int(fr.query_json.get("depth", 0))
+        max_depth = int(self.source.crawl_max_depth or 2)
+        target_kind = fr.query_json.get("target_kind", "statute")
+        docs: Dict[str, Dict[str, Any]] = {}
+        listings: Dict[str, Dict[str, Any]] = {}
+        inherited_meta = dict(fr.query_json.get("meta") or {})
+
+        if self._is_punjablaws_detail_listing(res.final_url):
+            self._collect_punjablaws_detail_document_links(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                inherited_meta=inherited_meta,
+            )
+        else:
+            self._collect_structured_act_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+            )
+            self._collect_punjablaws_table_rows(
+                html_text=res.text,
+                base_url=res.final_url,
+                docs=docs,
+                listings=listings,
+            )
+
+        self._collect_listing_links(
+            html_text=res.text,
+            base_url=res.final_url,
+            docs=docs,
+            listings=listings,
+            inherited_meta={
+                "listing_fetch": "navigation_links",
+                "source_section": "acts",
+                **inherited_meta,
+            },
+        )
+
+        added = await self._enqueue_documents_with_meta(docs, listing_url=res.final_url, default_target_kind=target_kind)
+        self.stats["discovered"] += added
+
+        if depth >= max_depth:
+            return
+        for nurl, nmeta in listings.items():
+            key = f"listing:{nurl}"
+            exists = (
+                await self.db.execute(
+                    select(CrawlFrontier).where(
+                        CrawlFrontier.source_name == self.source.source_name,
+                        CrawlFrontier.tier == 0,
+                        CrawlFrontier.query_key == key,
+                    )
+                )
+            ).scalars().first()
+            if exists is None:
+                route = {"listing": res.final_url}
+                for key_name in (
+                    "listing_fetch",
+                    "detail_fetch",
+                    "discovery_channel",
+                    "result_index",
+                    "source_section",
+                    "act_year",
+                    "act_no",
+                    "act_title",
+                    "act_passed_on",
+                    "act_assented_on",
+                    "act_type",
+                    "detail_url",
+                    "detail_title",
+                ):
+                    if key_name in nmeta:
+                        route[key_name] = nmeta[key_name]
+                self.db.add(
+                    CrawlFrontier(
+                        source_name=self.source.source_name,
+                        tier=0,
+                        query_key=key,
+                        query_json={
+                            "kind": "listing",
+                            "url": nurl,
+                            "target_kind": target_kind,
+                            "depth": depth + 1,
+                            "route": route,
+                            "meta": nmeta,
+                        },
+                        cursor_json={},
+                        priority=40,
+                    )
+                )
+                self.stats["discovered"] += 1
+        await self.db.flush()
+
+    @staticmethod
+    def _is_punjablaws_detail_listing(url: str) -> bool:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if host not in PUNJABLAWS_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
+            return False
+        path = (parts.path or "/").lower()
+        if PUNJABLAWS_LISTING_PATH_RE.search(path):
+            return False
+        return PUNJABLAWS_DETAIL_PATH_RE.search(path) is not None
+
+    def _collect_structured_act_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:  # type: ignore[override]
         soup = BeautifulSoup(html_text or "", "html.parser")
         row_index = 0
 
@@ -699,9 +874,98 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                     hint=title[:240],
                     base_url=base_url,
                     docs=docs,
-                    listings=[],
+                    listings=(listings if listings is not None else {}),
                     route_meta=row_meta,
                 )
+
+    def _collect_punjablaws_table_rows(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+    ) -> None:
+        host = (urlsplit(base_url).hostname or "").lower()
+        if host not in PUNJABLAWS_HOST_ALIASES and host not in ("127.0.0.1", "localhost"):
+            return
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        row_index = 0
+        for table in soup.select("table"):
+            headers = [th.get_text(" ", strip=True).lower() for th in table.select("thead th")]
+            if not headers:
+                headers = [th.get_text(" ", strip=True).lower() for th in table.select("tr th")]
+            if not self._looks_like_punjablaws_table(headers):
+                continue
+            rows = table.select("tbody tr") or table.select("tr")
+            for tr in rows:
+                cells = tr.find_all("td")
+                if len(cells) < 2:
+                    continue
+                link = None
+                for cell in cells:
+                    link = cell.find("a", href=True)
+                    if link is not None:
+                        break
+                if link is None:
+                    continue
+                row_index += 1
+                title = link.get_text(" ", strip=True) or cells[min(len(cells) - 1, 1)].get_text(" ", strip=True)
+                row_meta: Dict[str, Any] = {
+                    "listing_fetch": "punjablaws_table",
+                    "discovery_channel": "punjablaws-table-row",
+                    "source_section": "acts",
+                    "result_index": row_index,
+                }
+                self._add_punjablaws_row_provenance(row_meta=row_meta, cells=cells, headers=headers, title=title)
+                self._capture_candidate(
+                    raw=link.get("href", ""),
+                    hint=title[:240],
+                    base_url=base_url,
+                    docs=docs,
+                    listings=listings,
+                    route_meta=row_meta,
+                )
+
+    @staticmethod
+    def _looks_like_punjablaws_table(headers: List[str]) -> bool:
+        if not headers:
+            return False
+        has_title = any("title" in h or "subject" in h or "name" in h for h in headers)
+        has_lawish_column = any("act" in h or "ordinance" in h or "rule" in h or "law" in h or "year" in h for h in headers)
+        return has_title and has_lawish_column
+
+    def _add_punjablaws_row_provenance(self, *, row_meta: Dict[str, Any], cells: List[Any], headers: List[str], title: str) -> None:
+        if title:
+            row_meta["act_title"] = title[:280]
+        for idx, header in enumerate(headers):
+            if idx >= len(cells):
+                continue
+            value = cells[idx].get_text(" ", strip=True)
+            if not value:
+                continue
+            if ("act no" in header or "law no" in header or "no." in header) and "act_no" not in row_meta:
+                row_meta["act_no"] = value[:80]
+            elif "year" in header and "act_year" not in row_meta and YEAR_RE.search(value):
+                row_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+            elif ("passed" in header or "date" in header) and "act_passed_on" not in row_meta:
+                row_meta["act_passed_on"] = value[:40]
+            elif "assent" in header and "act_assented_on" not in row_meta:
+                row_meta["act_assented_on"] = value[:40]
+            elif ("type" in header or "category" in header) and "act_type" not in row_meta:
+                row_meta["act_type"] = value[:80]
+        if "act_type" not in row_meta and title:
+            low = title.lower()
+            if "ordinance" in low:
+                row_meta["act_type"] = "ordinance"
+            elif "rule" in low:
+                row_meta["act_type"] = "rules"
+            elif "act" in low:
+                row_meta["act_type"] = "act"
+        if "act_year" not in row_meta:
+            year_match = YEAR_RE.search(title or "") or YEAR_RE.search(row_meta.get("act_no", ""))
+            if year_match:
+                row_meta["act_year"] = year_match.group(0)
 
     @staticmethod
     def _looks_like_acts_table(headers: List[str]) -> bool:
@@ -754,6 +1018,83 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             if year_match:
                 row_meta["act_year"] = year_match.group(0)
 
+    def _collect_punjablaws_detail_document_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        detail_title_node = soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")
+        detail_title = detail_title_node.get_text(" ", strip=True)[:280] if detail_title_node else ""
+        base_meta = dict(inherited_meta)
+        base_meta.setdefault("detail_url", base_url)
+        if detail_title:
+            base_meta.setdefault("detail_title", detail_title)
+            base_meta.setdefault("act_title", detail_title)
+            if "act_type" not in base_meta:
+                low = detail_title.lower()
+                if "ordinance" in low:
+                    base_meta["act_type"] = "ordinance"
+                elif "rule" in low:
+                    base_meta["act_type"] = "rules"
+                elif "act" in low:
+                    base_meta["act_type"] = "act"
+            if "act_year" not in base_meta and YEAR_RE.search(detail_title):
+                base_meta["act_year"] = YEAR_RE.search(detail_title).group(0)  # type: ignore[union-attr]
+        for row in soup.select("table tr"):
+            cells = row.find_all(["th", "td"])
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(" ", strip=True).lower()
+            value = cells[1].get_text(" ", strip=True)
+            if not value:
+                continue
+            if ("act no" in label or "law no" in label) and "act_no" not in base_meta:
+                base_meta["act_no"] = value[:80]
+            elif ("passed" in label or "date of passing" in label) and "act_passed_on" not in base_meta:
+                base_meta["act_passed_on"] = value[:40]
+            elif "assent" in label and "act_assented_on" not in base_meta:
+                base_meta["act_assented_on"] = value[:40]
+            elif ("type" in label or "category" in label) and "act_type" not in base_meta:
+                base_meta["act_type"] = value[:80]
+            if "act_year" not in base_meta and YEAR_RE.search(value):
+                base_meta["act_year"] = YEAR_RE.search(value).group(0)  # type: ignore[union-attr]
+        for a in soup.find_all("a", href=True):
+            route_meta = dict(base_meta)
+            route_meta["detail_fetch"] = "detail_documents"
+            route_meta["discovery_channel"] = "punjablaws-detail-file-link"
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240] or route_meta.get("act_title", "")[:240],
+                base_url=base_url,
+                docs=docs,
+                listings={},
+                route_meta=route_meta,
+            )
+
+    def _collect_listing_links(
+        self,
+        *,
+        html_text: str,
+        base_url: str,
+        docs: Dict[str, Dict[str, Any]],
+        listings: Dict[str, Dict[str, Any]],
+        inherited_meta: Dict[str, Any],
+    ) -> None:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            self._capture_candidate(
+                raw=a.get("href", ""),
+                hint=a.get_text(" ", strip=True)[:240],
+                base_url=base_url,
+                docs=docs,
+                listings=listings,
+                route_meta=inherited_meta,
+            )
+
     def _capture_candidate(  # type: ignore[override]
         self,
         *,
@@ -761,10 +1102,10 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
         hint: str,
         base_url: str,
         docs: Dict[str, Dict[str, Any]],
-        listings: List[str],
+        listings: Dict[str, Dict[str, Any]],
         route_meta: Dict[str, Any],
     ) -> None:
-        normalized = normalize_pap_public_url(raw, base_url=base_url)
+        normalized = normalize_punjab_public_url(raw, base_url=base_url)
         if not normalized:
             return
         try:
@@ -778,13 +1119,19 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
             self.stats["rejected_urls"] += 1
             return
 
-        kind = _classify_pap_discovered_url(safe)
+        kind = _classify_punjab_discovered_url(safe, hint_text=hint)
         if kind == "document":
             path = (urlsplit(safe).path or "").lower()
+            host = (urlsplit(safe).hostname or "").lower()
+            host_is_punjablaws_like = host in PUNJABLAWS_HOST_ALIASES or host in ("127.0.0.1", "localhost")
             ext = path.rsplit(".", 1)[-1] if "." in path else ""
             meta = {
                 "discovery_hint": hint[:240],
-                "pdf_endpoint_kind": "uploads-acts-file" if path.startswith("/uploads/acts/") else "direct-file",
+                "pdf_endpoint_kind": (
+                    "uploads-acts-file"
+                    if path.startswith("/uploads/acts/")
+                    else ("punjablaws-download-file" if host_is_punjablaws_like and "/download" in path else "direct-file")
+                ),
                 **route_meta,
             }
             if ext and "document_format" not in meta:
@@ -799,7 +1146,13 @@ class PunjabAssemblyPipeline(BalochistanAssemblyPipeline):
                     if key not in existing and value not in ("", None):
                         existing[key] = value
         elif kind == "listing" and safe != base_url:
-            listings.append(safe)
+            if safe not in listings:
+                listings[safe] = dict(route_meta)
+                listings[safe].setdefault("detail_url", safe)
+            else:
+                for key, value in route_meta.items():
+                    if key not in listings[safe] and value not in ("", None):
+                        listings[safe][key] = value
 
 
 class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
