@@ -332,12 +332,70 @@ def reconcile_statute(*, deterministic: Dict[str, Any], ai: Optional[Dict[str, A
 
 
 # --------------------------------------------------------------------------- instrument
+def _valid_instrument_mentions(
+    value: Any,
+    *,
+    required_keys: tuple[str, ...],
+    raw_text: str,
+    conflicts: List[Dict[str, Any]],
+    field_name: str,
+) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        conflicts.append({"field": field_name, "ai": type(value).__name__, "reason": "mentions payload must be a list"})
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            conflicts.append({"field": field_name, "ai": str(item)[:80], "reason": "mention must be an object"})
+            continue
+        missing = [k for k in required_keys if not item.get(k)]
+        if missing:
+            conflicts.append({"field": field_name, "ai": item, "reason": f"missing keys: {', '.join(missing)}"})
+            continue
+        raw = str(item.get("raw") or "")
+        normalized = str(item.get("normalized") or "")
+        if not raw or not normalized:
+            conflicts.append({"field": field_name, "ai": item, "reason": "raw/normalized cannot be empty"})
+            continue
+        if _norm_ws(raw) not in _norm_ws(raw_text) and _norm_ws(normalized) not in _norm_ws(raw_text):
+            conflicts.append({"field": field_name, "ai": normalized, "reason": "mention absent from raw text"})
+            continue
+        year = item.get("year")
+        if year is not None:
+            try:
+                y = int(year)
+            except (TypeError, ValueError):
+                conflicts.append({"field": field_name, "ai": item, "reason": "year is not an integer"})
+                continue
+            if y < 1947 or y > 2035:
+                conflicts.append({"field": field_name, "ai": item, "reason": "year out of accepted range"})
+                continue
+        out.append(item)
+    return out
+
+
 def reconcile_instrument(*, deterministic: Dict[str, Any], ai: Optional[Dict[str, Any]], raw_text: str, min_confidence: float) -> ValidationOutcome:
     conflicts: List[Dict[str, Any]] = []
     errors: List[str] = []
     out = dict(deterministic)
     out["full_text"] = raw_text
     norm_raw = _norm_ws(raw_text)
+    out["citation_mentions"] = _valid_instrument_mentions(
+        out.get("citation_mentions"),
+        required_keys=("raw", "normalized", "mention_type"),
+        raw_text=raw_text,
+        conflicts=conflicts,
+        field_name="citation_mentions",
+    )
+    out["statute_mentions"] = _valid_instrument_mentions(
+        out.get("statute_mentions"),
+        required_keys=("raw", "normalized"),
+        raw_text=raw_text,
+        conflicts=conflicts,
+        field_name="statute_mentions",
+    )
     if ai:
         for k in ("type", "number", "title", "gazette_ref", "affected_statute"):
             if ai.get(k) and not out.get(k):
@@ -361,6 +419,24 @@ def reconcile_instrument(*, deterministic: Dict[str, Any], ai: Optional[Dict[str
                     out.setdefault("affected_sections", []).append(s)
                 else:
                     conflicts.append({"field": "affected_sections", "ai": s, "reason": "not in raw"})
+        for mention in _valid_instrument_mentions(
+            ai.get("citation_mentions"),
+            required_keys=("raw", "normalized", "mention_type"),
+            raw_text=raw_text,
+            conflicts=conflicts,
+            field_name="citation_mentions",
+        ):
+            if mention not in out["citation_mentions"]:
+                out["citation_mentions"].append(mention)
+        for mention in _valid_instrument_mentions(
+            ai.get("statute_mentions"),
+            required_keys=("raw", "normalized"),
+            raw_text=raw_text,
+            conflicts=conflicts,
+            field_name="statute_mentions",
+        ):
+            if mention not in out["statute_mentions"]:
+                out["statute_mentions"].append(mention)
     conf = float(out.get("extractor_confidence") or 0.0)
     if ai and ai.get("extractor_confidence"):
         conf = max(conf, min(float(ai["extractor_confidence"]), conf + 0.2))

@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from scraper.parsers.statute_parser import KNOWN_STATUTES_MAP
+
 # ============================================================================
 # 8 CITATION PATTERNS - Pakistani Legal Reporters
 # ============================================================================
@@ -257,6 +259,58 @@ _STATUTE_ACT_CLEAN = re.compile(
     re.IGNORECASE,
 )
 
+INSTRUMENT_MENTION_PATTERNS: Dict[str, re.Pattern] = {
+    "SRO": re.compile(
+        r"""
+        \b
+        S\.?\s*R\.?\s*O\.?
+        \s*(?:No\.?\s*)?
+        (?P<number>[A-Z0-9]+(?:\s*\([A-Z0-9]+\))?)
+        \s*(?:/|of)\s*
+        (?P<year>19\d{2}|20\d{2})
+        \b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    "ACT_NO": re.compile(
+        r"""
+        \b
+        Act\s+No\.?\s*
+        (?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)
+        \s+of\s+
+        (?P<year>19\d{2}|20\d{2})
+        \b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    "ORDINANCE_NO": re.compile(
+        r"""
+        \b
+        Ordinance\s+No\.?\s*
+        (?P<number>[IVXLCDM]+|\d{1,5}[A-Z]?)
+        \s+of\s+
+        (?P<year>19\d{2}|20\d{2})
+        \b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+}
+
+STATUTE_NAME_WITH_YEAR_PATTERN = re.compile(
+    r"""
+    \b
+    (?P<name>
+        [A-Z][A-Za-z0-9\s\-\&\.'/,()]{3,140}?
+        \s+
+        (?:Act|Ordinance|Code|Rules|Regulations|Order|Constitution)
+    )
+    \s*,?\s*
+    (?P<year>19\d{2}|20\d{2})
+    \b
+    """,
+    re.VERBOSE,
+)
+
 
 # ============================================================================
 # Helpers
@@ -291,6 +345,75 @@ def _dedupe_citations(citations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             seen.add(dedup_key)
             unique.append(c)
     return unique
+
+
+def _normalized_statute_key(name: str) -> str:
+    key = (name or "").strip().lower()
+    key = re.sub(r"[.,()]", "", key)
+    key = re.sub(r"\s+", " ", key)
+    return key
+
+
+def canonicalise_statute_name(name: Optional[str], year: Optional[int] = None) -> Optional[str]:
+    if not name:
+        return None
+    key = _normalized_statute_key(name)
+    canonical = KNOWN_STATUTES_MAP.get(key)
+    if canonical is None:
+        key_without_year = re.sub(r"\s*,?\s*(19\d{2}|20\d{2})\s*$", "", key)
+        canonical = KNOWN_STATUTES_MAP.get(key_without_year)
+    if canonical is None:
+        cleaned = re.sub(r"\s+", " ", name.strip().strip(".,;"))
+        canonical = cleaned
+    if year and re.search(r"\b(19|20)\d{2}\b", canonical) is None:
+        canonical = f"{canonical}, {year}"
+    return canonical
+
+
+def _snippet(text: str, start: int, end: int, window: int = 60) -> str:
+    return re.sub(r"\s+", " ", text[max(0, start - window) : min(len(text), end + window)]).strip()
+
+
+def _normalise_mention_number(number: str) -> str:
+    value = re.sub(r"\s+", "", (number or "").upper())
+    value = re.sub(r"^\((.+)\)$", r"\1", value)
+    return value
+
+
+def _dedupe_mentions(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for item in sorted(items, key=lambda r: r.get("span", (0, 0))[0]):
+        key = (
+            item.get("mention_type"),
+            item.get("normalized"),
+            item.get("section_number"),
+            item.get("year"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def normalise_instrument_mention(raw: str, mention_type: str) -> str:
+    if not raw or not isinstance(raw, str):
+        return ""
+    stype = (mention_type or "").upper()
+    pattern = INSTRUMENT_MENTION_PATTERNS.get(stype)
+    if pattern is None:
+        return re.sub(r"\s+", " ", raw.strip())
+    match = pattern.search(raw)
+    if not match:
+        return re.sub(r"\s+", " ", raw.strip())
+    number = _normalise_mention_number(match.group("number"))
+    year = int(match.group("year"))
+    if stype == "SRO":
+        return f"S.R.O. {number}/{year}"
+    if stype == "ACT_NO":
+        return f"Act No. {number} of {year}"
+    return f"Ordinance No. {number} of {year}"
 
 
 # ============================================================================
@@ -569,6 +692,98 @@ def extract_statutes(text: str) -> List[Dict[str, Any]]:
             seen_norm.add(key)
             deduped.append(r)
     return deduped
+
+
+def extract_instrument_mentions(text: str) -> List[Dict[str, Any]]:
+    """
+    Extract Gazette-style instrument references (S.R.O., Act No., Ordinance No.).
+    """
+    if not text or not isinstance(text, str):
+        return []
+    mentions: List[Dict[str, Any]] = []
+    for raw_type, pattern in INSTRUMENT_MENTION_PATTERNS.items():
+        for match in pattern.finditer(text):
+            try:
+                year = int(match.group("year"))
+            except (TypeError, ValueError):
+                continue
+            if year < 1947 or year > 2035:
+                continue
+            raw = match.group(0).strip()
+            number = _normalise_mention_number(match.group("number"))
+            normalized = normalise_instrument_mention(raw, raw_type)
+            span = (match.start(), match.end())
+            mentions.append(
+                {
+                    "raw": raw,
+                    "mention_type": raw_type.lower(),
+                    "number": number,
+                    "year": year,
+                    "normalized": normalized,
+                    "span": span,
+                    "source_snippet": _snippet(text, span[0], span[1]),
+                }
+            )
+    return _dedupe_mentions(mentions)
+
+
+def extract_statute_mentions(text: str) -> List[Dict[str, Any]]:
+    """
+    Extract statute mentions with canonical names and optional section/article links.
+    """
+    if not text or not isinstance(text, str):
+        return []
+    mentions: List[Dict[str, Any]] = []
+
+    for match in STATUTE_NAME_WITH_YEAR_PATTERN.finditer(text):
+        raw = match.group(0).strip()
+        raw_name = re.sub(r"\s+", " ", match.group("name").strip())
+        year = int(match.group("year"))
+        if year < 1947 or year > 2035:
+            continue
+        canonical = canonicalise_statute_name(raw_name, year)
+        span = (match.start(), match.end())
+        mentions.append(
+            {
+                "raw": raw,
+                "mention_type": "name_year",
+                "statute_name": raw_name,
+                "canonical_statute_name": canonical,
+                "section_number": None,
+                "year": year,
+                "normalized": canonical or raw_name,
+                "span": span,
+                "source_snippet": _snippet(text, span[0], span[1]),
+            }
+        )
+
+    for hit in extract_statutes(text):
+        statute_name = hit.get("act_name") or hit.get("act") or hit.get("source")
+        if not statute_name and hit.get("type") == "ARTICLE":
+            statute_name = "Constitution of the Islamic Republic of Pakistan, 1973"
+        section_number = hit.get("section") or hit.get("article") or hit.get("rule")
+        year = hit.get("year")
+        canonical = canonicalise_statute_name(str(statute_name), year) if statute_name else None
+        if not canonical and not section_number:
+            continue
+        span = hit.get("span") or (0, 0)
+        normalized = canonical or str(statute_name)
+        if section_number:
+            normalized = f"{normalized} §{section_number}" if normalized else f"§{section_number}"
+        mentions.append(
+            {
+                "raw": hit.get("raw"),
+                "mention_type": hit.get("type", "statute_ref").lower(),
+                "statute_name": statute_name,
+                "canonical_statute_name": canonical,
+                "section_number": str(section_number) if section_number is not None else None,
+                "year": year,
+                "normalized": normalized,
+                "span": span,
+                "source_snippet": _snippet(text, span[0], span[1]),
+            }
+        )
+    return _dedupe_mentions(mentions)
 
 
 def score_confidence(fields_dict: Dict[str, Any]) -> float:

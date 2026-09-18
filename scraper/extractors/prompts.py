@@ -35,7 +35,8 @@ TASKS: Dict[str, str] = {
     ),
     "instrument": (
         "Task: extract one legislative or gazette instrument (act, ordinance, amendment, notification, rules, bill). full_text must be exact. "
-        "affected_statute and affected_sections only when the instrument names them."
+        "affected_statute and affected_sections only when the instrument names them. citation_mentions should capture S.R.O./Act No./Ordinance No. "
+        "references with normalized forms; statute_mentions should capture statute references with canonical names and section numbers when present."
     ),
     "result_rows": (
         "Task: extract the rows of a search-result table. One entry per result with the citation, title, court, date, detail link and PDF link "

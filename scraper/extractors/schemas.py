@@ -98,6 +98,8 @@ class InstrumentExtraction(_Strict):
     full_text: Optional[str] = None
     affected_statute: Optional[str] = None
     affected_sections: List[str] = Field(default_factory=list)
+    citation_mentions: List[Dict[str, Any]] = Field(default_factory=list)
+    statute_mentions: List[Dict[str, Any]] = Field(default_factory=list)
     field_evidence: Dict[str, str] = Field(default_factory=dict)
     extractor_confidence: float = 0.0
 
