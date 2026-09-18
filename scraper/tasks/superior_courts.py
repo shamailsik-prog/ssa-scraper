@@ -22,7 +22,10 @@ DEFAULT_LISTINGS: Dict[str, List[str]] = {
     "SupremeCourt": ["https://www.supremecourt.gov.pk/judgements/", "https://www.supremecourt.gov.pk/judgement-search/"],
     "LahoreHighCourt": ["https://sys.lhc.gov.pk/appjudgments/", "https://sys.lhc.gov.pk/appjudgments/Reported"],
     "SindhHighCourt": ["https://caselaw.shc.gov.pk/caselaw/public/home", "https://caselaw.shc.gov.pk/caselaw/public/rpt-afr"],
-    "PeshawarHighCourt": ["https://www.peshawarhighcourt.gov.pk/app/site/judgments"],
+    "PeshawarHighCourt": [
+        "https://www.peshawarhighcourt.gov.pk/app/site/47/c/All_the_Referred,Reported_Judgments.html",
+        "https://www.peshawarhighcourt.gov.pk/PHCCMS/reportedJudgments.php",
+    ],
     "BalochistanHighCourt": ["https://bhc.gov.pk/judgments"],
     "IslamabadHighCourt": ["https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=1", "https://mis.ihc.gov.pk/frmJgmnt.aspx?jgs=0"],
     "AJKHighCourt": ["https://ajkhighcourt.gok.pk/important-judgments", "https://ajkhighcourt.gok.pk/important-judgments?judgment_tab=previous"],
@@ -76,4 +79,8 @@ async def scrape_superior_court(source: ScraperSource, db: AsyncSession, **kwarg
         from scraper.tasks.islamabad_high_court import scrape_islamabad_high_court
 
         return await scrape_islamabad_high_court(source, db, **kwargs)
+    if source.source_name == "PeshawarHighCourt":
+        from scraper.tasks.peshawar_high_court import scrape_peshawar_high_court
+
+        return await scrape_peshawar_high_court(source, db, **kwargs)
     return await run_public_source(db, source, seed_listings=listings_for(source), **kwargs)

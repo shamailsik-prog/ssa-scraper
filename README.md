@@ -190,6 +190,7 @@ scraper/fetchers.py          HTTP fetch, raw preservation  scraper/tasks/superio
                                                           scraper/tasks/supreme_court.py         Supreme Court Pakistan listings + bounded POST result harvesting
                                                           scraper/tasks/ajk_high_court.py        AJK HC listing + POST result discovery
                                                           scraper/tasks/sindh_high_court.py      SHC caselaw result-grid + file-view discovery
+                                                          scraper/tasks/peshawar_high_court.py   PHC reported-judgments POST discovery + direct PDF routing
                                                           scraper/tasks/ajk_supreme_court.py     AJK SC listings/posts + anchor/data/script discovery
                                                           scraper/tasks/supreme_appellate_court_gb.py  SAC-GB listings + anchor/data/script discovery
                                                           scraper/tasks/federal_shariat_court.py  FSC multi-page + anchor/data/script discovery
