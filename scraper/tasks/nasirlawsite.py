@@ -351,6 +351,10 @@ class NasirLawSitePipeline(PublicPipeline):
 
     def _target_kind_for_detail(self, *, detail_url: str, hint: str, default_target_kind: str, source_section: str) -> str:
         path = (urlsplit(detail_url).path or "").lower()
+        if HISTORIC_ROOT_LISTING_PATH_RE.search(path) or LEGACY_REPORTER_LISTING_PATH_RE.search(path):
+            return "judgment"
+        if LAWS_ROOT_LISTING_PATH_RE.search(path):
+            return _infer_statute_target_kind(title=hint, source_section=source_section)
         if HISTORIC_DETAIL_PATH_RE.search(path):
             return "judgment"
         if LAWS_DETAIL_PATH_RE.search(path):
