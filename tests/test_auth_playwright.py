@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import datetime
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 import redis.asyncio as aioredis
@@ -624,22 +625,28 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     await _activate(db, login_source)
+    parsed = urlsplit(settings.PLS_SEARCH_URL)
+    expected_detail_url = f"{parsed.scheme}://{parsed.netloc}/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
     sc = BrowserScript()
     sc.page(
         ("goto", settings.PLS_SEARCH_URL),
         """
         <html><body><a href="/logout">Logout</a>
         <table id="archivedpatientGrid">
-          <thead><tr><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
           <tbody>
-            <tr><td>PLD 2024 SC 21</td><td>Alpha versus State</td><td>Supreme Court</td><td><a href="https://www.pakistanlawsite.com/case/21">Read</a></td></tr>
-            <tr><td>PLD 2024 SC 22</td><td>Beta versus State</td><td>Supreme Court</td><td><a href="https://www.pakistanlawsite.com/case/22">Read</a></td></tr>
+            <tr>
+              <td>1</td>
+              <td>PLD 2024 SC 247</td>
+              <td>Alpha versus State</td>
+              <td>Supreme Court</td>
+              <td><input type="button" casetypeid="2006K247" class="btn btn-success courtWiseSearchBtn" value="Read"></td>
+            </tr>
           </tbody>
         </table></body></html>
         """,
     )
-    sc.page(("goto", "https://www.pakistanlawsite.com/case/21"), judgment_html("PLD 2024 SC 21", title="Alpha versus State"))
-    sc.page(("goto", "https://www.pakistanlawsite.com/case/22"), judgment_html("PLD 2024 SC 22", title="Beta versus State"))
+    sc.page(("goto", expected_detail_url), judgment_html("PLD 2024 SC 247", title="Alpha versus State"))
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
     pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
@@ -647,8 +654,38 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     await db.commit()
     await r.aclose()
     assert stats["surface_mode"] == "citation_grid"
-    assert stats["rows"] == 2
-    assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 2
+    assert stats["rows"] == 1
+    assert stats["staged"] == 1
+    assert stats["url_less_skips"] == 0
+    assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
+
+
+async def test_pipeline_citation_grid_raises_when_rows_have_no_detail_urls(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        """
+        <html><body><a href="/logout">Logout</a>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>PLD 2024 SC 301</td><td>No URL Case</td><td>Supreme Court</td><td>Read</td></tr>
+          </tbody>
+        </table></body></html>
+        """,
+    )
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    with pytest.raises(RuntimeError, match="none had a detail URL"):
+        await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await r.aclose()
+    assert pipeline.stats["rows"] == 1
+    assert pipeline.stats["staged"] == 0
+    assert pipeline.stats["url_less_skips"] == 1
 
 
 async def test_login_scraping_disabled_outside_chambers(db, login_source, monkeypatch):

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -397,6 +397,17 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
                 row["pdf_url"] = row["pdf_url"] or href
             else:
                 row["detail_url"] = row["detail_url"] or href
+        if not row["detail_url"]:
+            read_control = tr.select_one("input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]")
+            case_type_id = (read_control.get("casetypeid") or "").strip() if read_control else ""
+            if not case_type_id:
+                m_case = re.search(r"casetypeid\s*=\s*['\"]?([^'\"\s>]+)", str(tr), flags=re.IGNORECASE)
+                if m_case:
+                    case_type_id = m_case.group(1).strip()
+            if case_type_id:
+                parsed = urlsplit(base_url or "")
+                origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+                row["detail_url"] = f"{origin}/Login/ReferenceCaseLawSearch?CaseName={quote(case_type_id)}&&court= &&Row=0 &&bookName=undefined"
         m = re.search(r"\b(\d{4}[A-Z]{1,3}\d{2,})\b", tr.decode())
         if m:
             row["case_id"] = m.group(1)

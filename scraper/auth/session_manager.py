@@ -371,6 +371,24 @@ class PlaywrightBrowser:
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
                     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
+                    const normalizedHeaders = headers.map((h) => h.toLowerCase().replace(/\\s+/g, ' ').trim());
+                    const pickIndex = (hints, fallbackIndex) => {
+                        for (let i = 0; i < normalizedHeaders.length; i += 1) {
+                            const header = normalizedHeaders[i];
+                            if (hints.some((hint) => header.includes(hint))) {
+                                return i;
+                            }
+                        }
+                        return fallbackIndex;
+                    };
+                    const nonReadIndexes = normalizedHeaders
+                        .map((h, idx) => ({ h, idx }))
+                        .filter((entry) => !entry.h.includes('read'))
+                        .map((entry) => entry.idx);
+                    const citationIdx = pickIndex(['citation'], nonReadIndexes[0] ?? 0);
+                    const titleIdx = pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1);
+                    const courtIdx = pickIndex(['court'], nonReadIndexes[2] ?? 2);
+                    const cellAt = (cells, idx) => (idx >= 0 && idx < cells.length ? (cells[idx] || '') : '');
                     const rows = [];
                     const trNodes = Array.from(table.querySelectorAll('tbody tr')).slice(0, maxRows);
                     for (const tr of trNodes) {
@@ -387,10 +405,23 @@ class PlaywrightBrowser:
                                 detailUrl = href;
                             }
                         }
+                        if (!detailUrl) {
+                            const readControl = tr.querySelector('input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]');
+                            let caseTypeId = (readControl && readControl.getAttribute('casetypeid')) ? readControl.getAttribute('casetypeid').trim() : '';
+                            if (!caseTypeId) {
+                                const idMatch = (tr.innerHTML || '').match(/casetypeid\\s*=\\s*['"]?([^'"\\s>]+)/i);
+                                if (idMatch && idMatch[1]) {
+                                    caseTypeId = idMatch[1].trim();
+                                }
+                            }
+                            if (caseTypeId) {
+                                detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&&court= &&Row=0 &&bookName=undefined`;
+                            }
+                        }
                         rows.push({
-                            citation: cells[0] || '',
-                            title: cells[1] || '',
-                            court: cells[2] || '',
+                            citation: cellAt(cells, citationIdx),
+                            title: cellAt(cells, titleIdx),
+                            court: cellAt(cells, courtIdx),
                             detail_url: detailUrl,
                             pdf_url: pdfUrl,
                         });
