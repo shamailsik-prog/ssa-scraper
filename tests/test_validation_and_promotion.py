@@ -17,8 +17,19 @@ from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks import promotion as promotion_task_module
-from scraper.tasks.promotion import promote_judgment_staging, promote_statute_staging, reconcile_instrument_relations
-from scraper.tasks.treatment import classify_deterministic, classify_judgment, reconcile_judgment_citation_relations, reconcile_treatment_citation_links
+from scraper.tasks.promotion import (
+    promote_judgment_staging,
+    promote_statute_staging,
+    reconcile_citation_statute_residual_smoke,
+    reconcile_instrument_relations,
+)
+from scraper.tasks.treatment import (
+    classify_deterministic,
+    classify_judgment,
+    reconcile_judgment_citation_relations,
+    reconcile_treatment_citation_links,
+    sync_judgment_citation_relations,
+)
 from tests.fixtures import INSTRUMENT_TEXT, JUDGMENT_HTML, JUDGMENT_TEXT, FakeManagedClient, judgment_html
 
 COURTS = {"supreme court of pakistan": "Supreme Court of Pakistan", "sc": "Supreme Court of Pakistan", "supreme court": "Supreme Court of Pakistan", "lahore high court": "Lahore High Court", "lhc": "Lahore High Court"}
@@ -1372,6 +1383,136 @@ async def test_judgment_citation_relation_reconcile_backfills_late_targets_and_i
     second = await reconcile_judgment_citation_relations(lookback_hours=24 * 365, batch_size=50)
     assert second["edges_added"] == 0
     assert second["edges_removed"] == 0
+
+
+async def test_reconcile_residual_smoke_dry_run_is_read_only(db):
+    source_judgment = Judgment(
+        canonical_citation="PLD 2026 SC 700",
+        full_text="Reference was made to PLD 2030 SC 777 in argument.",
+    )
+    db.add(source_judgment)
+    await db.flush()
+    await sync_judgment_citation_relations(db, source_judgment)
+    await db.commit()
+
+    unresolved_before = (
+        await db.execute(
+            select(func.count())
+            .select_from(JudgmentCitationRelation)
+            .where(JudgmentCitationRelation.resolution_status == "unresolved")
+        )
+    ).scalar() or 0
+    report = await reconcile_citation_statute_residual_smoke(run_reconcile=False)
+    unresolved_after = (
+        await db.execute(
+            select(func.count())
+            .select_from(JudgmentCitationRelation)
+            .where(JudgmentCitationRelation.resolution_status == "unresolved")
+        )
+    ).scalar() or 0
+
+    assert report["mode"] == "dry_run"
+    assert report["before"]["judgment_citation_unresolved"] >= 1
+    assert report["before"] == report["after"]
+    assert report["delta"]["total_unresolved_reduced"] == 0
+    assert unresolved_after == unresolved_before
+
+
+async def test_reconcile_residual_smoke_apply_reports_before_after_reduction(db):
+    citation_target = "PLD 2030 SC 777"
+    source_judgment = Judgment(
+        canonical_citation="PLD 2026 SC 701",
+        full_text=f"The Court relied upon {citation_target} for the controlling principle.",
+    )
+    db.add(source_judgment)
+    await db.flush()
+    await sync_judgment_citation_relations(db, source_judgment)
+
+    statute = Statute(
+        name="Constitution of Pakistan, 1973",
+        short_name="Constitution",
+        jurisdiction="Federal",
+        statute_type="constitution",
+    )
+    db.add(statute)
+    await db.flush()
+
+    instrument_text = "In the Constitution of Pakistan, 1973, Article 10A shall be substituted."
+    section_token = "Article 10A"
+    token_start = instrument_text.index(section_token)
+    token_end = token_start + len(section_token)
+    instrument = Instrument(
+        type="act",
+        number="Act No. I of 2026",
+        full_text=instrument_text,
+        full_text_hash=canonical_text_hash(instrument_text),
+        affected_statute_id=statute.id,
+        affected_statute_name=statute.name,
+        citation_mentions=[],
+        statute_mentions=[
+            {
+                "raw": section_token,
+                "normalized": statute.name,
+                "canonical_statute_name": statute.name,
+                "linked_statute_id": str(statute.id),
+                "section_number": section_token,
+                "span": [token_start, token_end],
+            }
+        ],
+        source_name="NasirLawSite",
+        source_url="http://127.0.0.1/residual-smoke-source.txt",
+    )
+    db.add(instrument)
+    await db.flush()
+    await promotion_task_module._sync_instrument_relation_edges(db, instrument)
+    await db.commit()
+
+    unresolved_section_before = (
+        await db.execute(
+            select(func.count())
+            .select_from(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.target_statute_section_id.is_(None))
+        )
+    ).scalar() or 0
+    assert unresolved_section_before >= 1
+
+    target_judgment = Judgment(canonical_citation=citation_target, full_text="Target judgment text.")
+    db.add(target_judgment)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=target_judgment.id,
+            citation_string=citation_target,
+            raw_string=citation_target,
+            is_primary=True,
+        )
+    )
+    db.add(
+        StatuteSection(
+            statute_id=statute.id,
+            section_number="10A",
+            section_title="Right to fair trial",
+            sort_key=1,
+        )
+    )
+    await db.commit()
+
+    report = await reconcile_citation_statute_residual_smoke(
+        run_reconcile=True,
+        lookback_hours=24 * 365,
+        instrument_limit=50,
+        judgment_batch_size=50,
+    )
+
+    assert report["mode"] == "apply"
+    assert report["before"]["judgment_citation_unresolved"] >= 1
+    assert report["before"]["instrument_section_unresolved"] >= 1
+    assert report["after"]["judgment_citation_unresolved"] < report["before"]["judgment_citation_unresolved"]
+    assert report["after"]["instrument_section_unresolved"] < report["before"]["instrument_section_unresolved"]
+    assert report["delta"]["judgment_citation_unresolved_reduced"] >= 1
+    assert report["delta"]["instrument_section_unresolved_reduced"] >= 1
+    assert "reconcile_instrument_relations" in report["runs"]
+    assert "reconcile_judgment_citation_relations" in report["runs"]
 
 
 # --------------------------------------------------------------------------- treatment (B-7)

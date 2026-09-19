@@ -36,6 +36,7 @@ from scraper.models import (
     InstrumentSectionRelation,
     Judge,
     Judgment,
+    JudgmentCitationRelation,
     QuarantineQueue,
     ScraperStaging,
     SourceProvenance,
@@ -1044,6 +1045,105 @@ async def reconcile_instrument_relations(
                 logger.exception("relation reconcile failed for instrument %s", inst_id)
         await db.commit()
     return counts
+
+
+async def _unresolved_relation_residual_counts(db: AsyncSession) -> Dict[str, int]:
+    judgment_unresolved = (
+        await db.execute(
+            select(func.count())
+            .select_from(JudgmentCitationRelation)
+            .where(JudgmentCitationRelation.resolution_status == "unresolved")
+        )
+    ).scalar() or 0
+    statute_section_unresolved = (
+        await db.execute(
+            select(func.count())
+            .select_from(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.target_statute_section_id.is_(None))
+        )
+    ).scalar() or 0
+    return {
+        "judgment_citation_unresolved": int(judgment_unresolved),
+        "instrument_section_unresolved": int(statute_section_unresolved),
+        "total_unresolved": int(judgment_unresolved) + int(statute_section_unresolved),
+    }
+
+
+async def reconcile_citation_statute_residual_smoke(
+    *,
+    lookback_hours: Optional[int] = None,
+    instrument_limit: Optional[int] = None,
+    judgment_batch_size: Optional[int] = None,
+    run_reconcile: bool = False,
+    fail_on_increase: bool = True,
+) -> Dict[str, Any]:
+    instrument_batch = _positive_int(
+        instrument_limit,
+        fallback=settings.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE,
+    )
+    instrument_lookback = _positive_int(
+        lookback_hours,
+        fallback=settings.INSTRUMENT_RELATION_RECONCILE_WINDOW_HOURS,
+    )
+    judgment_batch = _positive_int(
+        judgment_batch_size,
+        fallback=settings.JUDGMENT_CITATION_RECONCILE_BATCH_SIZE,
+    )
+    judgment_lookback = _positive_int(
+        lookback_hours,
+        fallback=settings.JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS,
+    )
+    async with SessionLocal() as db:
+        before = await _unresolved_relation_residual_counts(db)
+
+    result: Dict[str, Any] = {
+        "mode": "apply" if run_reconcile else "dry_run",
+        "before": before,
+        "after": dict(before),
+        "delta": {
+            "judgment_citation_unresolved_reduced": 0,
+            "instrument_section_unresolved_reduced": 0,
+            "total_unresolved_reduced": 0,
+        },
+        "runs": {},
+        "window": {
+            "instrument_lookback_hours": instrument_lookback,
+            "judgment_lookback_hours": judgment_lookback,
+            "instrument_limit": instrument_batch,
+            "judgment_batch_size": judgment_batch,
+        },
+    }
+    if run_reconcile:
+        instrument_counts = await reconcile_instrument_relations(
+            limit=instrument_batch,
+            lookback_hours=instrument_lookback,
+        )
+        from scraper.tasks.treatment import reconcile_judgment_citation_relations
+
+        judgment_counts = await reconcile_judgment_citation_relations(
+            lookback_hours=judgment_lookback,
+            batch_size=judgment_batch,
+        )
+        async with SessionLocal() as db:
+            after = await _unresolved_relation_residual_counts(db)
+        result["runs"] = {
+            "reconcile_instrument_relations": instrument_counts,
+            "reconcile_judgment_citation_relations": judgment_counts,
+        }
+        result["after"] = after
+        result["delta"] = {
+            "judgment_citation_unresolved_reduced": int(before["judgment_citation_unresolved"]) - int(after["judgment_citation_unresolved"]),
+            "instrument_section_unresolved_reduced": int(before["instrument_section_unresolved"]) - int(after["instrument_section_unresolved"]),
+            "total_unresolved_reduced": int(before["total_unresolved"]) - int(after["total_unresolved"]),
+        }
+        regressions = {
+            key: {"before": int(before[key]), "after": int(after[key])}
+            for key in ("judgment_citation_unresolved", "instrument_section_unresolved", "total_unresolved")
+            if int(after[key]) > int(before[key])
+        }
+        if fail_on_increase and regressions:
+            raise RuntimeError(f"residual smoke failed: unresolved counts increased {regressions}")
+    return result
 
 
 async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
