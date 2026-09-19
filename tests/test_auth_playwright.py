@@ -51,6 +51,15 @@ class _FakePage:
         self.html = html
         self.calls = []
         self.keyboard = SimpleNamespace(press=self._press)
+        self.dom_shape = {
+            "forms": 1,
+            "inputs": 2,
+            "has_archivedpatient_grid": False,
+            "archivedpatient_rows": 0,
+            "has_logout": True,
+            "body_preview": "ok",
+        }
+        self.archived_grid_snapshot = None
 
     async def goto(self, url, **kwargs):
         self.calls.append(("goto", url, kwargs))
@@ -82,6 +91,14 @@ class _FakePage:
     def expect_navigation(self, **kwargs):
         self.calls.append(("expect_navigation", kwargs))
         return _FakeNavigationWait(self)
+
+    async def evaluate(self, script, *args):
+        self.calls.append(("evaluate", script, args))
+        if "has_archivedpatient_grid" in script:
+            return dict(self.dom_shape)
+        if "archivedpatientGrid" in script:
+            return self.archived_grid_snapshot
+        return None
 
 
 async def _activate(db, source, slots=(1,)):
@@ -231,6 +248,41 @@ async def test_playwright_goto_uses_domcontentloaded_without_networkidle_wait():
     goto_call = next(c for c in page.calls if c[0] == "goto")
     assert goto_call[2]["wait_until"] == "domcontentloaded"
     assert goto_call[2]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
+
+
+async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_grid():
+    page = _FakePage(html="<html><body>oversized</body></html>")
+    page.dom_shape = {
+        "forms": 0,
+        "inputs": settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD + 100,
+        "has_archivedpatient_grid": True,
+        "archivedpatient_rows": 2,
+        "has_logout": True,
+        "body_preview": "citation table",
+    }
+    page.archived_grid_snapshot = {
+        "headers": ["Citation", "Title", "Court", "Read"],
+        "rows": [
+            {
+                "citation": "PLD 2024 SC 11",
+                "title": "A v B",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/11",
+                "pdf_url": None,
+            }
+        ],
+        "next_url": None,
+        "body_preview": "citation table",
+        "has_logout": True,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
+
+    assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
+    assert "id=\"archivedpatientGrid\"" in result.html
+    assert not any(call[0] == "content" for call in page.calls)
 
 
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
@@ -557,6 +609,37 @@ async def test_search_map_goes_stale_after_five_parse_failures(db, login_source,
     assert m.stale and m.consecutive_parse_failures >= 5
     codes = (await db.execute(select(Notification.code))).scalars().all()
     assert "search_map_stale" in codes
+
+
+async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        """
+        <html><body><a href="/logout">Logout</a>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody>
+            <tr><td>PLD 2024 SC 21</td><td>Alpha versus State</td><td>Supreme Court</td><td><a href="https://www.pakistanlawsite.com/case/21">Read</a></td></tr>
+            <tr><td>PLD 2024 SC 22</td><td>Beta versus State</td><td>Supreme Court</td><td><a href="https://www.pakistanlawsite.com/case/22">Read</a></td></tr>
+          </tbody>
+        </table></body></html>
+        """,
+    )
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/21"), judgment_html("PLD 2024 SC 21", title="Alpha versus State"))
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/22"), judgment_html("PLD 2024 SC 22", title="Beta versus State"))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["surface_mode"] == "citation_grid"
+    assert stats["rows"] == 2
+    assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 2
 
 
 async def test_login_scraping_disabled_outside_chambers(db, login_source, monkeypatch):

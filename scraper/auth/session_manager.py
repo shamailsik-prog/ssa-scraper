@@ -19,6 +19,7 @@ scripted fake in tests; both raise the same exceptions.
 from __future__ import annotations
 
 import asyncio
+import html
 import hashlib
 import json
 import logging
@@ -63,6 +64,7 @@ class PageResult:
     status: int = 200
     content_type: str = "text/html"
     pdf_bytes: Optional[bytes] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def classify(self):
         return classify_response(self.status, self.html, self.url)
@@ -322,6 +324,166 @@ class PlaywrightBrowser:
                 raise BrowserDisconnected(msg) from exc
             raise
 
+    @staticmethod
+    def _header_int(resp, name: str) -> Optional[int]:
+        if resp is None:
+            return None
+        raw = resp.headers.get(name) or resp.headers.get(name.lower())
+        if raw in (None, ""):
+            return None
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return None
+
+    async def _dom_shape(self) -> Dict[str, Any]:
+        return await self._wrap(
+            self._page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const grid = document.querySelector('#archivedpatientGrid');
+                    return {
+                        forms: document.forms ? document.forms.length : 0,
+                        inputs: document.querySelectorAll('input').length,
+                        has_archivedpatient_grid: Boolean(grid),
+                        archivedpatient_rows: grid ? grid.querySelectorAll('tbody tr').length : 0,
+                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
+                        body_preview: (body && body.innerText ? body.innerText : '').slice(0, 2500),
+                    };
+                }"""
+            )
+        )
+
+    async def _capture_archived_grid_snapshot(self) -> Optional[Dict[str, Any]]:
+        return await self._wrap(
+            self._page.evaluate(
+                """(maxRows) => {
+                    const table = document.querySelector('#archivedpatientGrid');
+                    if (!table) return null;
+                    const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
+                    const rows = [];
+                    const trNodes = Array.from(table.querySelectorAll('tbody tr')).slice(0, maxRows);
+                    for (const tr of trNodes) {
+                        const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+                        const anchors = Array.from(tr.querySelectorAll('a[href]'));
+                        let detailUrl = null;
+                        let pdfUrl = null;
+                        for (const a of anchors) {
+                            const href = a.href || '';
+                            if (!href) continue;
+                            if (!pdfUrl && href.toLowerCase().endsWith('.pdf')) {
+                                pdfUrl = href;
+                            } else if (!detailUrl) {
+                                detailUrl = href;
+                            }
+                        }
+                        rows.push({
+                            citation: cells[0] || '',
+                            title: cells[1] || '',
+                            court: cells[2] || '',
+                            detail_url: detailUrl,
+                            pdf_url: pdfUrl,
+                        });
+                    }
+                    const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
+                    const nextDisabled = nextLink ? (nextLink.classList.contains('disabled') || nextLink.parentElement?.classList.contains('disabled')) : true;
+                    return {
+                        headers,
+                        rows,
+                        next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
+                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2500),
+                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
+                    };
+                }""",
+                int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+            )
+        )
+
+    @staticmethod
+    def _render_compact_archived_grid_html(snapshot: Dict[str, Any]) -> str:
+        headers = snapshot.get("headers") or ["Citation", "Title", "Court", "Read"]
+        rows = snapshot.get("rows") or []
+        parts: List[str] = ["<html><body>"]
+        if snapshot.get("has_logout"):
+            parts.append("<a href=\"/logout\">Logout</a>")
+        parts.append("<table id=\"archivedpatientGrid\"><thead><tr>")
+        for h in headers:
+            parts.append(f"<th>{html.escape(str(h))}</th>")
+        parts.append("</tr></thead><tbody>")
+        for row in rows:
+            parts.append("<tr>")
+            parts.append(f"<td>{html.escape(str(row.get('citation') or ''))}</td>")
+            parts.append(f"<td>{html.escape(str(row.get('title') or ''))}</td>")
+            parts.append(f"<td>{html.escape(str(row.get('court') or ''))}</td>")
+            href = row.get("detail_url") or row.get("pdf_url")
+            if href:
+                parts.append(f"<td><a href=\"{html.escape(str(href), quote=True)}\">Read</a></td>")
+            else:
+                parts.append("<td></td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        if snapshot.get("next_url"):
+            parts.append(f"<a rel=\"next\" href=\"{html.escape(str(snapshot['next_url']), quote=True)}\">Next</a>")
+        preview = snapshot.get("body_preview") or ""
+        if preview:
+            parts.append(f"<div id=\"guard_preview\">{html.escape(str(preview))}</div>")
+        parts.append("</body></html>")
+        return "".join(parts)
+
+    @staticmethod
+    def _render_oversize_stub(dom: Dict[str, Any], *, content_length: Optional[int]) -> str:
+        preview = dom.get("body_preview") or ""
+        fields = [
+            ("inputs", dom.get("inputs", 0)),
+            ("forms", dom.get("forms", 0)),
+            ("content_length", content_length if content_length is not None else "unknown"),
+        ]
+        attrs = " ".join(f"data-{k}=\"{html.escape(str(v), quote=True)}\"" for k, v in fields)
+        return (
+            f"<html><body><div id=\"oversize_guard\" {attrs}>"
+            "oversized page skipped by Playwright guard"
+            "</div>"
+            f"<div id=\"guard_preview\">{html.escape(str(preview))}</div>"
+            "</body></html>"
+        )
+
+    async def _capture_html(self, *, resp=None) -> tuple[str, Dict[str, Any]]:
+        dom = await self._dom_shape()
+        content_length = self._header_int(resp, "content-length")
+        oversized = False
+        if content_length is not None and content_length >= settings.PLAYWRIGHT_MAX_HTML_BYTES:
+            oversized = True
+        if int(dom.get("inputs") or 0) >= settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD:
+            oversized = True
+        if oversized and bool(dom.get("has_archivedpatient_grid")):
+            snapshot = await self._capture_archived_grid_snapshot()
+            if snapshot:
+                html_compact = self._render_compact_archived_grid_html(snapshot)
+                return html_compact, {
+                    "content_guard": "archivedpatientGrid_compact",
+                    "inputs": int(dom.get("inputs") or 0),
+                    "forms": int(dom.get("forms") or 0),
+                    "content_length": content_length,
+                    "rows": len(snapshot.get("rows") or []),
+                    "row_cap": int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                }
+        if oversized:
+            logger.warning(
+                "oversized HTML guard tripped for slot=%s url=%s inputs=%s content_length=%s",
+                self.slot_number,
+                self._page.url,
+                dom.get("inputs"),
+                content_length,
+            )
+            stub = self._render_oversize_stub(dom, content_length=content_length)
+            return stub, {
+                "content_guard": "oversize_stub",
+                "inputs": int(dom.get("inputs") or 0),
+                "forms": int(dom.get("forms") or 0),
+                "content_length": content_length,
+            }
+        return await self._wrap(self._page.content()), {}
+
     async def goto(self, url: str) -> PageResult:
         resp = await self._wrap(
             self._page.goto(
@@ -330,10 +492,10 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
-        html = await self._wrap(self._page.content())
+        html_text, metadata = await self._capture_html(resp=resp)
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
-        return PageResult(url=self._page.url, html=html, status=status, content_type=ctype)
+        return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)
 
     async def _wait_for_post_submit_navigation(self, trigger) -> None:
         from playwright.async_api import TimeoutError as PWTimeoutError
@@ -373,8 +535,8 @@ class PlaywrightBrowser:
             await self._wait_for_post_submit_navigation(
                 lambda: self._page.keyboard.press("Enter")
             )
-        html = await self._wrap(self._page.content())
-        return PageResult(url=self._page.url, html=html, status=200)
+        html_text, metadata = await self._capture_html(resp=None)
+        return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
 
     async def download(self, url: str) -> bytes:
         resp = await self._wrap(self._context.request.get(url))
