@@ -167,6 +167,7 @@ try { KEY = localStorage.getItem('corpus_admin_key') || sessionStorage.getItem('
   if (m) { KEY = m[1]; try { localStorage.setItem('corpus_admin_key', KEY); } catch(e) {} history.replaceState(null, '', location.pathname + location.search); }
 })();
 $('apikey').value = KEY;
+let schedulerDirty = false;
 function saveKey(){ KEY = $('apikey').value.trim(); try { localStorage.setItem('corpus_admin_key', KEY); sessionStorage.setItem('corpus_admin_key', KEY); } catch(e) {} refresh(); }
 async function get(url){ const r = await fetch(url,{headers:{'X-API-Key':KEY}}); if(!r.ok){ throw new Error(r.status+' '+url);} return r.json(); }
 async function post(url, body){ const r = await fetch(url,{method:'POST',headers:{'X-API-Key':KEY,'Content-Type':'application/json'},body: body?JSON.stringify(body):undefined}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.detail||r.status); return j; }
@@ -217,6 +218,8 @@ async function refresh(){
       ]);
     }
     if(tab==='sources'){ const s = await get('/admin/sources'); window._sources=s;
+      const prevExtractionSource = $('esSource').value;
+      const prevSchedulerSource = $('scSource').value;
       $('sourcesTbl').innerHTML = table(s,[{key:'source_name',label:'source'},{key:'access_method',label:'access'},{key:'state',render:r=>'<span class="badge '+r.state+'">'+esc(r.state)+'</span>'+(r.state_reason?'<div class="note">'+esc(r.state_reason)+'</div>':'')},
         {key:'extraction',label:'extraction',render:r=>esc(r.extraction.mode)+' → '+esc(r.extraction.effective_engine)+'<div class="note">ScrapeGraph '+esc(r.extraction.scrapegraph)+' · schema v'+esc(r.extraction.schema_version)+(r.extraction.local_model_status?' · local '+esc(r.extraction.local_model_status):'')+'</div>'},
         {key:'scheduler',label:'cadence',render:r=>'update '+esc(r.scheduler.update_frequency_hours)+'h · backfill '+esc(r.scheduler.backfill_frequency_minutes)+'m · priority '+esc(r.scheduler.backfill_priority)+'<div class="note">mode-selected '+(r.scheduler.selected_for_mode?'yes':'no')+' · block-retry '+(r.scheduler.auto_retry_on_block?'on':'off')+'</div>'},
@@ -226,7 +229,9 @@ async function refresh(){
         {key:'a',label:'',render:r=>sourceActionButtons(r)}]);
       $('esSource').innerHTML = s.map(x=>'<option>'+esc(x.source_name)+'</option>').join('');
       $('scSource').innerHTML = s.map(x=>'<option>'+esc(x.source_name)+'</option>').join('');
-      applySchedulerForm();
+      if(prevExtractionSource && s.some(x=>x.source_name===prevExtractionSource)) $('esSource').value = prevExtractionSource;
+      if(prevSchedulerSource && s.some(x=>x.source_name===prevSchedulerSource)) $('scSource').value = prevSchedulerSource;
+      applySchedulerForm(!schedulerDirty);
     }
     if(tab==='coverage'){ const c = await get('/admin/coverage'); $('veg').textContent=c.volume_end_gap;
       const trows=[]; for(const [src,t] of Object.entries(c.tiers)) for(const [tier,v] of Object.entries(t)) trows.push({src,tier,...v});
@@ -260,7 +265,8 @@ Managed extraction configured: ${st.managed.api_key}; local model status: ${st.l
   }catch(e){ $('conn').textContent = 'error: '+e.message; }
 }
 async function saveExtraction(){ try{ const r = await post('/admin/sources/'+$('esSource').value+'/extraction-settings',{extraction_mode:$('esMode').value, ai_extract_enabled:$('esAi').value==='true', extraction_min_confidence: $('esConf').value?parseFloat($('esConf').value):null, scrapegraph_schema_version: $('esSchema').value?parseInt($('esSchema').value):null}); $('esMsg').textContent='saved: '+r.extraction.mode+' → '+r.extraction.effective_engine; refresh(); }catch(e){ $('esMsg').textContent='error: '+e.message; } }
-function applySchedulerForm(){
+function applySchedulerForm(force=false){
+  if(schedulerDirty && !force) return;
   const source = $('scSource').value;
   const row = (window._sources||[]).find(x=>x.source_name===source);
   if(!row) return;
@@ -288,6 +294,7 @@ async function saveScheduler(){
     };
     await post('/admin/sources/'+source+'/config', payload);
     $('scMsg').textContent = 'saved';
+    schedulerDirty = false;
     refresh();
   }catch(e){ $('scMsg').textContent = 'error: '+e.message; }
 }
@@ -304,7 +311,11 @@ async function setBackfillDone(){
   if(!$('hmReason').value) $('hmReason').value = 'backfill complete (manual)';
   await saveHarvestMode();
 }
-$('scSource').addEventListener('change', applySchedulerForm);
+$('scSource').addEventListener('change', ()=>{ schedulerDirty = false; applySchedulerForm(true); });
+for (const id of ['scUpdateH','scBackfillM','scPriority','scBackfillOn','scUpdateOn','scAutoRetry','scCooldown','scRetryMax']) {
+  $(id).addEventListener('input', ()=>{ schedulerDirty = true; });
+  $(id).addEventListener('change', ()=>{ schedulerDirty = true; });
+}
 async function reenable(name){ const by = prompt('Block reviewed by (name):'); if(!by) return; const reason = prompt('Review note:')||''; try{ await post('/admin/sources/'+name+'/state',{action:'re_enable',reviewed_by:by,reason}); refresh(); }catch(e){ alert(e.message); } }
 async function resolve(id,res){ const reviewer = prompt('Reviewer name:'); if(!reviewer) return; try{ await post('/admin/review/'+id+'/resolve',{resolution:res,reviewer}); refresh(); }catch(e){ alert(e.message); } }
 function openCheck(id){ document.querySelector('nav button[data-tab=check]').click(); $('checkId').value=id; loadCheck(); }
@@ -350,7 +361,7 @@ function connectStream(){ if(ws) ws.close(); const proto = location.protocol==='
 }
 async function completeLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/complete'); $('loginMsg').textContent = r.stored?'stored encrypted storage state in slot '+r.slot+' — slot ACTIVE':'not authenticated yet ('+r.verdict+' '+(r.detail||'')+')'; if(r.stored && ws) ws.close(); refresh(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
 async function cancelLogin(){ await post('/admin/sessions/PakistanLawSite/login/cancel'); if(ws) ws.close(); $('loginMsg').textContent='cancelled'; }
-refresh(); setInterval(refresh, 15000);
+refresh(); setInterval(()=>{ const tab = document.querySelector('nav button.active')?.dataset?.tab; if(tab==='sources'){ const a=document.activeElement; if(a && a.closest && a.closest('#tab-sources')) return; } refresh(); }, 15000);
 </script>
 </body>
 </html>
