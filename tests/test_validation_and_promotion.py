@@ -12,7 +12,7 @@ from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
-from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
+from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
@@ -428,6 +428,77 @@ async def test_instrument_section_relation_graph_extracts_amendment_operations(d
     assert all(edge.source_provenance_id == inst.source_provenance_id for edge in section_edges)
     assert any("shall be substituted" in (edge.evidence_snippet or "").lower() for edge in section_edges)
     assert any("is hereby repealed" in (edge.evidence_snippet or "").lower() for edge in section_edges)
+
+
+async def test_instrument_section_relation_graph_links_article_targets_to_statute_sections(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    statute = Statute(
+        name="Constitution of the Islamic Republic of Pakistan, 1973",
+        short_name="Constitution, 1973",
+        jurisdiction="Federal",
+        statute_type="constitution",
+        year_enacted=1973,
+        source_name="PakistanCode",
+    )
+    db.add(statute)
+    await db.flush()
+    article_section = StatuteSection(
+        statute_id=statute.id,
+        section_number="Article 10-A",
+        section_title="Right to fair trial",
+        sort_key=1,
+    )
+    db.add(article_section)
+    await db.flush()
+
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXX of 2025
+    An Act further to amend the Constitution of Pakistan, 1973.
+    In the Constitution of Pakistan, 1973, Article 10-A shall be substituted.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/article-ops.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    staging = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/article-ops.pdf",
+        kind="instrument",
+    )
+    out = await HybridExtractor(db, source).extract_instrument(
+        text=text,
+        source_meta={"url": "http://127.0.0.1/article-ops.pdf"},
+        content_hash=prov.content_hash,
+    )
+    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    assert await promote_statute_staging(db, staging) == "promoted"
+    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+    assert inst is not None
+
+    section_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.source_instrument_id == inst.id)
+            .order_by(InstrumentSectionRelation.target_section_key.asc()),
+        )
+    ).scalars().all()
+    assert len(section_edges) == 1
+    assert section_edges[0].amendment_operation == "substitute"
+    assert section_edges[0].target_section_key == "10A"
+    assert section_edges[0].target_statute_id == statute.id
+    assert section_edges[0].target_statute_section_id == article_section.id
 
 
 async def test_instrument_section_relation_graph_fails_closed_without_statute_target(db):
