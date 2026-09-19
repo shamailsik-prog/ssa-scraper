@@ -49,12 +49,10 @@ validators and tests.
 ### PakistanLawSite — human login and four tiers
 
 1. **Human login.** On the dashboard's *Human login* tab the service opens a server-side Chromium and
-   streams it to you. You can type credentials manually, or save username/password for slot 1 and
-   slot 2 (primary + alternate) so login can be re-established without retyping. Saved credentials
-   are encrypted at rest with `ENCRYPTION_KEY`, never echoed by admin APIs, and can be rotated by
-   overwriting or cleared per slot. On *Complete* it verifies the page is authenticated, encrypts
-   the browser storage state (cookies + localStorage) and keeps scraping headless inside that
-   session. CAPTCHA / verification pages are never solved by code.
+   streams it to you. You type the username, password and any verification yourself; the service
+   never sees or stores those credentials. On *Complete* it verifies the page is authenticated,
+   encrypts the browser storage state (cookies + localStorage) and keeps scraping headless inside
+   that session. CAPTCHA / verification pages are never solved by code.
 2. **Search-form map.** Playwright renders the search page; deterministic introspection (optionally
    refined by the LOCAL engine, always re-verified against the DOM) records fields, result layout,
    pagination and a DOM hash. Five consecutive unparseable result pages mark the map stale and alert.
@@ -138,9 +136,8 @@ locally), enter the `ADMIN_API_KEY`, and:
    `BACKFILL_LOGIN_DELAY_MIN/MAX`) and continuous source dispatch. Use **Backfill complete → switch
    to updates** (or let auto-switch run when frontier is drained and targets are met) to move to
    6-hour updates cadence.
-3. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2, then
-   use **Login with saved credentials** or manual login in the stream; press *Complete* once
-   authenticated. Fill slot 2 as well for dual-slot continuity during backfill.
+3. **Human login** — start a login in slot 1 and type credentials in the streamed browser; press
+   *Complete* once authenticated. Fill slot 2 as well for dual-slot continuity during backfill.
 4. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source. In *Scheduler /
    backfill controls* configure per-source update cadence, backfill cadence/priority, and optional
    block-cooldown retries for stubborn HTTP 403 sources (for example, NasirLawSite).
