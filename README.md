@@ -49,8 +49,9 @@ validators and tests.
 ### PakistanLawSite — human login and four tiers
 
 1. **Human login.** On the dashboard's *Human login* tab the service opens a server-side Chromium and
-   streams it to you. You type the username, password and any verification yourself; the service
-   never sees or stores those credentials. On *Complete* it verifies the page is authenticated,
+   streams it to you. You type the username, password and any verification yourself. By default this
+   is manual-only; optionally you can save slot credentials with the dashboard's encrypted credential
+   controls (never returned in plaintext). On *Complete* it verifies the page is authenticated,
    encrypts the browser storage state (cookies + localStorage) and keeps scraping headless inside
    that session. CAPTCHA / verification pages are never solved by code.
 2. **Search-form map.** Playwright renders the search page; deterministic introspection (optionally
@@ -138,6 +139,7 @@ locally), enter the `ADMIN_API_KEY`, and:
    6-hour updates cadence.
 3. **Human login** — start a login in slot 1 and type credentials in the streamed browser; press
    *Complete* once authenticated. Fill slot 2 as well for dual-slot continuity during backfill.
+   If useful for repeated reconnects, save encrypted credentials per slot in the same tab.
 4. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source. In *Scheduler /
    backfill controls* configure per-source update cadence, backfill cadence/priority, and optional
    block-cooldown retries for stubborn HTTP 403 sources (for example, NasirLawSite).

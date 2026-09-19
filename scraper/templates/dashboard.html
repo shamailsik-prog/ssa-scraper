@@ -133,11 +133,25 @@
   </div>
   <div id="tab-login" class="hidden">
     <section><h2>Human login — PakistanLawSite</h2>
-      <p class="note">A server-side browser opens the login page and is streamed here. You type the username, password and any verification yourself; the service never sees or stores them. When the site shows you as logged in, press <b>Complete</b>: cookies and local storage are encrypted and saved to the chosen slot, and scraping continues headless inside that session. CAPTCHA or verification pages are never solved by code.</p>
+      <p class="note">A server-side browser opens the login page and is streamed here. You type the username, password and any verification yourself. Typed credentials are not persisted unless you explicitly save them in the encrypted slot-credential controls below. When the site shows you as logged in, press <b>Complete</b>: cookies and local storage are encrypted and saved to the chosen slot, and scraping continues headless inside that session. CAPTCHA or verification pages are never solved by code.</p>
       <p class="note">PakistanLawSite allows one login per account at a time. If it shows <b>Logout From All Devices</b>, you are still logged in somewhere else (another browser or phone): enter the username and password again in that box and it logs you in here. Tick <b>I Agree with the Terms and Conditions</b> before <b>Sign in</b>, or the site refuses the form.</p>
       <div>Slot <select id="loginSlot"><option value="1">1 (primary)</option><option value="2">2 (alternate)</option></select>
         Layout <select id="loginLayout"><option value="auto">auto</option><option value="phone">phone (480×800)</option><option value="desktop">desktop (1280×800)</option></select>
+        <label><input id="loginUseSaved" type="checkbox" checked> use saved slot credentials</label>
+        <label><input id="loginAutoComplete" type="checkbox" checked> auto-submit for EMPTY slot</label>
         <button class="act primary" onclick="startLogin()">Start login</button> <button class="act" onclick="completeLogin()">Complete</button> <button class="act" onclick="cancelLogin()">Cancel</button> <span id="loginMsg" class="note"></span></div>
+      <div style="margin-top:10px">
+        <h2>Optional encrypted slot credentials</h2>
+        <p class="note">Store credentials encrypted per slot (never returned in plaintext). This is optional: you can still type credentials manually each time.</p>
+        <div>Slot <select id="credSlot"><option value="1">1 (primary)</option><option value="2">2 (alternate)</option></select>
+          Username <input id="credUser" autocomplete="off" style="width:220px">
+          Password <input id="credPass" type="password" autocomplete="new-password" style="width:220px">
+          <button class="act primary" onclick="saveLoginCredentials()">Save encrypted</button>
+          <button class="act" onclick="clearLoginCredentials()">Clear saved</button>
+          <span id="credMsg" class="note"></span>
+        </div>
+        <div id="credStatus" style="margin-top:8px"></div>
+      </div>
       <div id="slots" style="margin:10px 0"></div>
       <canvas id="loginCanvas" width="1280" height="800" tabindex="0"></canvas>
       <div class="kbdrow">
@@ -258,7 +272,12 @@ DigitalOcean server update (no secrets on command line):
   cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-scraper celery-beat
 
 Managed extraction configured: ${st.managed.api_key}; local model status: ${st.local.status}`; }
-    if(tab==='login'){ const s = await get('/admin/sessions/PakistanLawSite'); $('slots').innerHTML = '<p class="note">Source '+esc(s.state)+(s.state_reason?' — '+esc(s.state_reason):'')+' · login scraping '+(s.login_scraping_permitted?'permitted':'NOT permitted (ENVIRONMENT must be chambers)')+' · current slot '+esc(s.current_slot)+'</p>'+table(s.slots,[{key:'slot'},{key:'role'},{key:'state',render:r=>'<span class="badge '+r.state+'">'+esc(r.state)+'</span>'},{key:'reason'},{key:'logged_in_at'},{key:'last_used_at'},{key:'reconnects',cls:'num'},{key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/pause\').then(refresh)">Pause</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/resume\').then(refresh).catch(e=>alert(e))">Resume</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/clear\').then(refresh)">Clear</button>'}]); }
+    if(tab==='login'){
+      const s = await get('/admin/sessions/PakistanLawSite');
+      $('slots').innerHTML = '<p class="note">Source '+esc(s.state)+(s.state_reason?' — '+esc(s.state_reason):'')+' · login scraping '+(s.login_scraping_permitted?'permitted':'NOT permitted (ENVIRONMENT must be chambers)')+' · current slot '+esc(s.current_slot)+'</p>'+table(s.slots,[{key:'slot'},{key:'role'},{key:'state',render:r=>'<span class="badge '+r.state+'">'+esc(r.state)+'</span>'},{key:'reason'},{key:'logged_in_at'},{key:'last_used_at'},{key:'reconnects',cls:'num'},{key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/pause\').then(refresh)">Pause</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/resume\').then(refresh).catch(e=>alert(e))">Resume</button> <button class="act" onclick="post(\'/admin/sessions/PakistanLawSite/slots/'+r.slot+'/clear\').then(refresh)">Clear</button>'}]);
+      const c = await get('/admin/sessions/PakistanLawSite/credentials');
+      $('credStatus').innerHTML = table(c.slots||[],[{key:'slot'},{key:'role'},{key:'username'},{key:'password'},{key:'updated_at'},{key:'updated_by'}]);
+    }
     if(tab==='ops'){ const n = await get('/admin/notifications'); $('notifs').innerHTML = table(n,[{key:'level'},{key:'code'},{key:'source'},{key:'message'},{key:'created_at'},{key:'a',label:'',render:r=>'<button class="act" onclick="post(\'/admin/notifications/'+r.id+'/ack\').then(refresh)">Ack</button>'}]);
       const j = await get('/admin/jobs'); $('jobsTbl').innerHTML = table(j,[{key:'source'},{key:'status'},{key:'started_at'},{key:'finished_at'},{key:'pages',cls:'num'},{key:'extracted',cls:'num'},{key:'quarantined',cls:'num'},{key:'error'}]);
       $('errors').textContent = JSON.stringify(await get('/admin/errors'),null,2); }
@@ -311,6 +330,27 @@ async function setBackfillDone(){
   if(!$('hmReason').value) $('hmReason').value = 'backfill complete (manual)';
   await saveHarvestMode();
 }
+async function saveLoginCredentials(){
+  try{
+    const slot = parseInt($('credSlot').value,10);
+    const username = $('credUser').value.trim();
+    const password = $('credPass').value;
+    if(!username || !password){ $('credMsg').textContent = 'username and password required'; return; }
+    const r = await post('/admin/sessions/PakistanLawSite/credentials/'+slot,{username,password,saved_by:'operator'});
+    $('credPass').value = '';
+    $('credMsg').textContent = 'saved for slot '+r.slot;
+    refresh();
+  }catch(e){ $('credMsg').textContent = 'error: '+e.message; }
+}
+async function clearLoginCredentials(){
+  try{
+    const slot = parseInt($('credSlot').value,10);
+    await post('/admin/sessions/PakistanLawSite/credentials/'+slot+'/clear');
+    $('credPass').value = '';
+    $('credMsg').textContent = 'cleared for slot '+slot;
+    refresh();
+  }catch(e){ $('credMsg').textContent = 'error: '+e.message; }
+}
 $('scSource').addEventListener('change', ()=>{ schedulerDirty = false; applySchedulerForm(true); });
 for (const id of ['scUpdateH','scBackfillM','scPriority','scBackfillOn','scUpdateOn','scAutoRetry','scCooldown','scRetryMax']) {
   $(id).addEventListener('input', ()=>{ schedulerDirty = true; });
@@ -326,7 +366,7 @@ let ws=null; const canvas=$('loginCanvas'), ctx=canvas.getContext('2d'); let vw=
 const kbd=$('loginKbd'); let kbdSent=''; let statusTimer=null;
 const isPhone = ()=> window.innerWidth < 700 || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 function chosenViewport(){ const l=$('loginLayout').value; const phone = l==='phone' || (l==='auto' && isPhone()); canvas.classList.toggle('phone', phone); return phone?{viewport_width:480,viewport_height:800}:{viewport_width:1280,viewport_height:800}; }
-async function startLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/start',{slot:parseInt($('loginSlot').value),...chosenViewport()}); if(r.viewport){ vw=r.viewport.width; vh=r.viewport.height; canvas.classList.toggle('phone', vw<=600); } $('loginMsg').textContent='browser open on slot '+r.slot+'; tap a field in the page, then type'; connectStream(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
+async function startLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/start',{slot:parseInt($('loginSlot').value),use_saved_credentials:$('loginUseSaved').checked,auto_complete_if_empty:$('loginAutoComplete').checked,...chosenViewport()}); if(r.viewport){ vw=r.viewport.width; vh=r.viewport.height; canvas.classList.toggle('phone', vw<=600); } $('loginMsg').textContent='browser open on slot '+r.slot+'; tap a field in the page, then type'; connectStream(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
 const send = o=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); };
 function pressKey(name){ send({kind:'press',key:name}); if(name==='Enter'||name==='Tab'){ kbd.value=''; kbdSent=''; } else if(name==='Backspace' && kbdSent){ kbdSent=kbdSent.slice(0,-1); kbd.value=kbdSent; } kbd.focus(); }
 function connectStream(){ if(ws) ws.close(); const proto = location.protocol==='https:'?'wss':'ws'; ws = new WebSocket(proto+'://'+location.host+'/admin/sessions/PakistanLawSite/login/stream?key='+encodeURIComponent(KEY));
@@ -361,6 +401,8 @@ function connectStream(){ if(ws) ws.close(); const proto = location.protocol==='
 }
 async function completeLogin(){ try{ const r = await post('/admin/sessions/PakistanLawSite/login/complete'); $('loginMsg').textContent = r.stored?'stored encrypted storage state in slot '+r.slot+' — slot ACTIVE':'not authenticated yet ('+r.verdict+' '+(r.detail||'')+')'; if(r.stored && ws) ws.close(); refresh(); }catch(e){ $('loginMsg').textContent='error: '+e.message; } }
 async function cancelLogin(){ await post('/admin/sessions/PakistanLawSite/login/cancel'); if(ws) ws.close(); $('loginMsg').textContent='cancelled'; }
+$('loginSlot').addEventListener('change', ()=>{ $('credSlot').value = $('loginSlot').value; });
+$('credSlot').addEventListener('change', ()=>{ $('loginSlot').value = $('credSlot').value; });
 refresh(); setInterval(()=>{ const tab = document.querySelector('nav button.active')?.dataset?.tab; if(tab==='sources'){ const a=document.activeElement; if(a && a.closest && a.closest('#tab-sources')) return; } refresh(); }, 15000);
 </script>
 </body>

@@ -78,9 +78,10 @@ All flags are optional. The script:
 6. builds the image (Chromium is downloaded into it) and starts all services;
 7. prints the dashboard address and the admin key.
 
-The script never asks for PakistanLawSite credentials. Configure those only from the dashboard's
+The script never asks for PakistanLawSite credentials. Configure those from the dashboard's
 **Human login** tab on the trusted chambers host: type credentials manually in the streamed browser
-when a slot needs authentication. Username/password are not persisted by the service.
+when a slot needs authentication. If you enable saved credentials, they are stored encrypted per
+slot and are never returned in plaintext.
 
 Re-running the same command later (with the token lines again while private) updates the code and restarts the stack; `.env` is kept.
 
@@ -94,7 +95,8 @@ Re-running the same command later (with the token lines again while private) upd
    type in the box under the picture (on a phone the keyboard opens there; on a computer you can
    also type straight into the picture), tap the password field, type, tick **I Agree with the
    Terms and Conditions**, tap **Sign in**, then **Complete**. Repeat for slot 2 if you want both
-   slots ready for continuity.
+   slots ready for continuity. Optionally save encrypted slot credentials in the same tab to speed
+   up future re-logins.
 
    PakistanLawSite allows one login per account at a time. If the page shows **Logout From All
    Devices**, the account is still logged in elsewhere (your own browser or phone): enter the
