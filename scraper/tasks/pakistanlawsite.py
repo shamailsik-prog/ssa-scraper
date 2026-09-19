@@ -165,7 +165,7 @@ class PakistanLawSitePipeline:
         self.job_id = job_id
         self.sleep = sleep
         self._session_lock: Optional[SessionLock] = None
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
 
@@ -267,9 +267,20 @@ class PakistanLawSitePipeline:
         if not rows:
             self.stats["misses"] += 1
             return
+        staged_before = self.stats["staged"]
+        duplicates_before = self.stats["duplicates"]
+        url_less_skips = 0
         for idx, row in enumerate(rows):
             detail_url = row.get("detail_url") or row.get("pdf_url")
             if not detail_url:
+                url_less_skips += 1
+                self.stats["url_less_skips"] += 1
+                logger.warning(
+                    "PakistanLawSite citation-grid row missing detail URL; skipping row_index=%s citation=%r title=%r",
+                    idx,
+                    row.get("citation"),
+                    row.get("title"),
+                )
                 continue
             route = {
                 "tier": "citation_grid",
@@ -281,6 +292,23 @@ class PakistanLawSitePipeline:
             detail = await self.fetch_detail(detail_url)
             await self.preserve_and_extract(detail, route, row)
             await self.db.flush()
+        if url_less_skips:
+            logger.warning(
+                "PakistanLawSite citation-grid skipped %s/%s rows with no detail URL",
+                url_less_skips,
+                len(rows),
+            )
+        staged_delta = self.stats["staged"] - staged_before
+        if rows and staged_delta == 0:
+            duplicate_delta = self.stats["duplicates"] - duplicates_before
+            logger.warning(
+                "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s)",
+                len(rows),
+                duplicate_delta,
+                url_less_skips,
+            )
+            if url_less_skips >= len(rows):
+                raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
 
     # ---------------------------------------------------------------- one result page
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
