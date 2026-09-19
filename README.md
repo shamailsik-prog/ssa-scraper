@@ -206,6 +206,8 @@ bash scripts/guard_scan.sh      # no stubs, no secrets, no bypass logic
 The suite runs against a real PostgreSQL (pgvector) and Redis and covers privacy, raw-first,
 validation, cache/cost, human login (real Playwright), reconnect, block handling, four-tier
 coverage, public discovery, prompt injection/SSRF, PDF/OCR, archive mirror and database roles.
+For deployment continuity checks tied to harvest mode + dual-slot saved credentials, use
+`docs/DEPLOY_SMOKE_59_60.md`.
 
 ## Layout
 

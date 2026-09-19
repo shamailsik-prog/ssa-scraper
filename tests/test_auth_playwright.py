@@ -149,6 +149,15 @@ async def test_saved_credentials_encrypt_decrypt_round_trip(db, login_source):
     assert mgr.load_login_credentials(slot) is None
 
 
+async def test_saved_credentials_malformed_tokens_fail_closed(db, login_source):
+    mgr = SessionManager(db, login_source)
+    slot = await mgr.slot(1)
+    slot.login_username_encrypted = "not-a-fernet-token"
+    slot.login_password_encrypted = "also-not-a-token"
+    await db.flush()
+    assert mgr.load_login_credentials(slot) is None
+
+
 async def test_human_login_browser_stream_and_completion(db, login_source, fixture_server, monkeypatch):
     """Real Playwright: a streamed login page, frames arrive, credentials typed by the 'human',
     completion exports storage state into the slot. Passwords are never stored in plaintext."""
