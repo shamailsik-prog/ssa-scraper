@@ -204,11 +204,49 @@ class PakistanLawSitePipeline:
         if self.source.state in ("HALTED", "DISABLED"):
             raise PermissionError(f"source is {self.source.state}: {self.source.state_reason}")
 
+    @staticmethod
+    def _has_queryable_search_fields(search_map: Dict[str, Any]) -> bool:
+        fields = search_map.get("fields") or {}
+        return any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no"))
+
+    @staticmethod
+    def _is_citation_grid_surface(page: PageResult) -> bool:
+        marker = str((page.metadata or {}).get("content_guard") or "")
+        if marker == "archivedpatientGrid_compact":
+            return True
+        low = (page.html or "").lower()
+        return "id=\"archivedpatientgrid\"" in low or "id='archivedpatientgrid'" in low
+
+    @classmethod
+    def _is_citation_grid_map(cls, search_map: Dict[str, Any]) -> bool:
+        row_sel = str(((search_map.get("result_layout") or {}).get("row_selector") or "")).lower()
+        if "archivedpatientgrid" not in row_sel:
+            return False
+        return not cls._has_queryable_search_fields(search_map)
+
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
+        async def op(browser: Browser) -> PageResult:
+            page = await browser.goto(settings.PLS_SEARCH_URL)
+            raise_for_verdict(page)
+            return page
+
+        page = await self.runner.run(op)
         m = await active_map(self.db, SOURCE_NAME)
         if m is not None and not m.stale:
-            return map_as_dict(m)
+            cached = map_as_dict(m)
+            if self._is_citation_grid_surface(page):
+                if self._is_citation_grid_map(cached):
+                    return cached
+                logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
+            elif self._has_queryable_search_fields(cached):
+                return cached
+        m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
+        return map_as_dict(m)
+
+    async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
+        """Fallback when CitationSearch is an authenticated citation table, not a form."""
+        await self._charge_page()
 
         async def op(browser: Browser) -> PageResult:
             page = await browser.goto(settings.PLS_SEARCH_URL)
@@ -216,8 +254,33 @@ class PakistanLawSitePipeline:
             return page
 
         page = await self.runner.run(op)
-        m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
-        return map_as_dict(m)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
+        outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
+        rows = outcome.data.get("result_rows") or []
+        m = await active_map(self.db, SOURCE_NAME)
+        if m is not None:
+            await record_parse_result(self.db, m, ok=bool(rows), source_name=SOURCE_NAME)
+        self.stats["surface_mode"] = "citation_grid"
+        self.stats["queries"] += 1
+        self.stats["pages"] += 1
+        self.stats["rows"] += len(rows)
+        if not rows:
+            self.stats["misses"] += 1
+            return
+        for idx, row in enumerate(rows):
+            detail_url = row.get("detail_url") or row.get("pdf_url")
+            if not detail_url:
+                continue
+            route = {
+                "tier": "citation_grid",
+                "query": {"surface": "archivedpatientGrid"},
+                "cursor": {"row_index": idx},
+                "row_index": idx,
+                "slot": self.runner.browser.slot_number if self.runner.browser else None,
+            }
+            detail = await self.fetch_detail(detail_url)
+            await self.preserve_and_extract(detail, route, row)
+            await self.db.flush()
 
     # ---------------------------------------------------------------- one result page
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
@@ -430,8 +493,15 @@ class PakistanLawSitePipeline:
                 await self.manager.pause_source("no ACTIVE slot: human login required")
                 self.stats["paused"] = True
                 return self.stats
-            await seed_frontier(self.db, self.source)
             search_map = await self.ensure_search_map()
+            if self._is_citation_grid_map(search_map):
+                logger.info("PakistanLawSite using citation-grid surface mode (archivedpatientGrid)")
+                await self.run_citation_grid_surface(search_map)
+                self.source.last_scraped_at = datetime.now(timezone.utc)
+                self.source.last_success_at = self.source.last_scraped_at
+                await self.db.flush()
+                return self.stats
+            await seed_frontier(self.db, self.source)
             now = datetime.now(timezone.utc)
             q = (
                 select(CrawlFrontier)

@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
     PLAYWRIGHT_TIMEOUT_MS: int = Field(default=90000)
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
+    PLAYWRIGHT_MAX_HTML_BYTES: int = Field(default=2_000_000, description="Guard: skip full page.content() when HTML responses are larger than this many bytes.")
+    PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD: int = Field(default=5000, description="Guard: skip full page.content() when the DOM input count indicates a huge datatable surface.")
 
     # ------------------------------------------------- login-session sources
     ALLOW_LOGIN_SCRAPING: bool = Field(default=False)
@@ -178,6 +180,7 @@ class Settings(BaseSettings):
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
+    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=1200, description="Maximum rows to materialize from #archivedpatientGrid when oversized-page guard compacts HTML.")
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
@@ -304,6 +307,9 @@ class Settings(BaseSettings):
         "JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS",
         "JUDGMENT_CITATION_RECONCILE_BATCH_SIZE",
         "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS",
+        "PLAYWRIGHT_MAX_HTML_BYTES",
+        "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
+        "PLS_ARCHIVED_GRID_MAX_ROWS",
         mode="before",
     )
     @classmethod
@@ -391,8 +397,12 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.PAGES_PER_HOUR <= 0 or self.PAGES_PER_DAY <= 0:
             raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
+        if self.PLAYWRIGHT_MAX_HTML_BYTES <= 0 or self.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD <= 0:
+            raise ValueError("PLAYWRIGHT_MAX_HTML_BYTES and PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD must be positive")
         if self.LOGIN_SESSION_CONCURRENCY not in (1, 2):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:
