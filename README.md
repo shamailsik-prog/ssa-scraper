@@ -49,11 +49,12 @@ validators and tests.
 ### PakistanLawSite — human login and four tiers
 
 1. **Human login.** On the dashboard's *Human login* tab the service opens a server-side Chromium and
-   streams it to you. You type the username, password and any verification yourself. The service
-   never sees, stores or echoes the password. On *Complete* it verifies the page is authenticated,
-   encrypts the browser storage state (cookies + localStorage) with `ENCRYPTION_KEY` and stores it
-   in slot 1 or 2. Scraping then runs headless inside that session. CAPTCHA / verification pages are
-   never solved by code.
+   streams it to you. You can type credentials manually, or save username/password for slot 1 and
+   slot 2 (primary + alternate) so login can be re-established without retyping. Saved credentials
+   are encrypted at rest with `ENCRYPTION_KEY`, never echoed by admin APIs, and can be rotated by
+   overwriting or cleared per slot. On *Complete* it verifies the page is authenticated, encrypts
+   the browser storage state (cookies + localStorage) and keeps scraping headless inside that
+   session. CAPTCHA / verification pages are never solved by code.
 2. **Search-form map.** Playwright renders the search page; deterministic introspection (optionally
    refined by the LOCAL engine, always re-verified against the DOM) records fields, result layout,
    pagination and a DOM hash. Five consecutive unparseable result pages mark the map stale and alert.
@@ -130,7 +131,9 @@ locally), enter the `ADMIN_API_KEY`, and:
    `PLS_EARLIEST_YEAR`, `SGAI_API_KEY` (public sources), `SGAI_LOCAL_LLM_BASE_URL/MODEL`
    (PakistanLawSite AI assist), `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` (embeddings) in `.env`
    as the firm decides. Blank values stay conservative.
-2. **Human login** — start a login on slot 1, log in inside the stream, press *Complete*.
+2. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2,
+   then use **Login with saved credentials** or manual login in the stream; press *Complete* once
+   authenticated.
 3. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source; Beat also dispatches
    on schedule. Extraction mode, AI enable and confidence threshold are per source.
 4. **Coverage** — tiers, reporter volumes, search maps, frontier.

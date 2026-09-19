@@ -220,6 +220,33 @@ class SessionManager:
             raise NoActiveSlot(f"slot {slot.slot_number} has no storage state")
         return json.loads(settings.decrypt_value(slot.storage_state_encrypted))
 
+    async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
+        s = await self.slot(slot_number)
+        now = datetime.now(timezone.utc)
+        s.login_username_encrypted = settings.encrypt_value(username.strip())
+        s.login_password_encrypted = settings.encrypt_value(password)
+        s.login_credentials_updated_at = now
+        s.login_credentials_updated_by = by
+        await self.db.flush()
+        return s
+
+    def load_login_credentials(self, slot: BrowserSessionSlot) -> Optional[Dict[str, str]]:
+        if not slot.login_username_encrypted or not slot.login_password_encrypted:
+            return None
+        return {
+            "username": settings.decrypt_value(slot.login_username_encrypted),
+            "password": settings.decrypt_value(slot.login_password_encrypted),
+        }
+
+    async def clear_login_credentials(self, slot_number: int) -> BrowserSessionSlot:
+        s = await self.slot(slot_number)
+        s.login_username_encrypted = None
+        s.login_password_encrypted = None
+        s.login_credentials_updated_at = None
+        s.login_credentials_updated_by = None
+        await self.db.flush()
+        return s
+
     # ---------------------------------------------------------------- state transitions
     async def mark_needs_human_login(self, slot_number: int, reason: str) -> None:
         s = await self.slot(slot_number)
