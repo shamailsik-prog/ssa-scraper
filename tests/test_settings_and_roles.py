@@ -46,6 +46,8 @@ def test_login_session_concurrency_allows_up_to_two():
 
 def test_harvest_mode_settings_validate():
     assert Settings(**BASE, HARVEST_MODE="backfill")
+    assert Settings(**BASE, HARVEST_MODE=" BackFill ").HARVEST_MODE == "backfill"
+    assert Settings(**BASE, HARVEST_MODE="UPDATES").HARVEST_MODE == "updates"
     with pytest.raises(ValidationError):
         Settings(**BASE, HARVEST_MODE="turbo")
     with pytest.raises(ValidationError):

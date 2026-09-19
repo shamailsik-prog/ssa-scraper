@@ -141,6 +141,9 @@ Backups: the database lives in the `pgdata` volume, original documents under `ra
 encrypted session state in the database. Archive targets are the off-server copy; run
 **Reconcile storage** after restoring anything.
 
+For focused continuity checks after deploy (harvest mode, source controls, and encrypted dual-slot
+saved credentials), run the checklist in `docs/DEPLOY_SMOKE_59_60.md`.
+
 ## 5. What the overlay changes
 
 `docker-compose.cloud.yml` adds Caddy (ports 80/443) and `API_BIND=127.0.0.1` keeps port 8000 off

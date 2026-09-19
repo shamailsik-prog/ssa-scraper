@@ -170,6 +170,59 @@ def test_login_start_uses_saved_credentials_for_empty_slot(client, admin_headers
     assert r.json()["saved_credentials_used"] is True and r.json()["auto_complete_attempted"] is True
 
 
+def test_login_start_ignores_malformed_saved_credentials(client, admin_headers, monkeypatch):
+    from scraper.database import SessionLocal
+    from scraper.models import BrowserSessionSlot
+
+    client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": "slot1.user@example.com", "password": "TopSecret#1", "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+
+    async def corrupt_saved_credentials():
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(BrowserSessionSlot).where(
+                        BrowserSessionSlot.source_name == "PakistanLawSite",
+                        BrowserSessionSlot.slot_number == 1,
+                    )
+                )
+            ).scalars().first()
+            row.login_username_encrypted = "bad-token"
+            row.login_password_encrypted = "bad-token"
+            await db.commit()
+
+    run_async(corrupt_saved_credentials())
+    seen = {}
+
+    class DummySession:
+        status = "awaiting_human"
+        slot_number = 1
+        viewport = {"width": 1280, "height": 800}
+        last_autofill = None
+
+    async def fake_start(source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+        seen["source_name"] = source_name
+        seen["slot_number"] = slot_number
+        seen["saved_credentials"] = saved_credentials
+        seen["auto_complete"] = auto_complete
+        return DummySession()
+
+    monkeypatch.setattr("scraper.routers.sessions.registry.start", fake_start)
+    r = client.post(
+        "/admin/sessions/PakistanLawSite/login/start",
+        json={"slot": 1, "use_saved_credentials": True, "auto_complete_if_empty": True},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert seen["saved_credentials"] is None
+    assert seen["auto_complete"] is False
+    assert r.json()["saved_credentials_used"] is False
+    assert r.json()["auto_complete_attempted"] is False
+
+
 async def _seed_judgments(access_method="public"):
     from scraper.database import SessionLocal
     from scraper.models import ScraperSource

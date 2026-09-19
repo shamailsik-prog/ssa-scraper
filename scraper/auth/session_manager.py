@@ -233,10 +233,20 @@ class SessionManager:
     def load_login_credentials(self, slot: BrowserSessionSlot) -> Optional[Dict[str, str]]:
         if not slot.login_username_encrypted or not slot.login_password_encrypted:
             return None
-        return {
-            "username": settings.decrypt_value(slot.login_username_encrypted),
-            "password": settings.decrypt_value(slot.login_password_encrypted),
-        }
+        try:
+            username = settings.decrypt_value(slot.login_username_encrypted).strip()
+            password = settings.decrypt_value(slot.login_password_encrypted)
+        except Exception as exc:
+            logger.warning(
+                "Ignoring malformed saved credentials for %s slot %s: %s",
+                self.source.source_name,
+                slot.slot_number,
+                exc,
+            )
+            return None
+        if not username or not password:
+            return None
+        return {"username": username, "password": password}
 
     async def clear_login_credentials(self, slot_number: int) -> BrowserSessionSlot:
         s = await self.slot(slot_number)
