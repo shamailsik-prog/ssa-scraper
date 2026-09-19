@@ -29,7 +29,7 @@ services:
 
   # Workers and Beat depend on the API being healthy: the API applies migrations, roles and seed data at
   # startup, so no task can run against a database whose tables do not exist yet (first-boot race).
-  # Login-session sources queue. Set LOGIN_SESSION_CONCURRENCY in .env (1-2).
+  # Login-session sources queue. Keep LOGIN_SESSION_CONCURRENCY=1 in .env.
   worker-scraper:
     <<: *app
     depends_on:

@@ -111,7 +111,7 @@ Re-running the same command later (with the token lines again while private) upd
 6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for full-speed initial harvest.
    Backfill defaults are controlled by environment values such as:
    `BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`, `BACKFILL_LOGIN_DELAY_MIN/MAX`,
-   `BACKFILL_SOURCE_FREQUENCY_MINUTES`, and `BACKFILL_LOGIN_SESSION_CONCURRENCY`.
+   `BACKFILL_SOURCE_FREQUENCY_MINUTES`, and `BACKFILL_LOGIN_SESSION_CONCURRENCY` (keep it at `1`).
    When frontier is drained and your target counts are met, switch to `updates` mode from the
    dashboard (or let auto-switch do it) to run selected sources every six hours by default.
 7. **ScrapeGraph setup**: if `/admin/scrapegraph/status` shows `SGAI_API_KEY` as NOT CONFIGURED,

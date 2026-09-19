@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     LOGIN_DELAY_MAX: float = Field(default=9.0, description="Seconds between login-session page fetches (maximum).")
     PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
     PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
-    LOGIN_SESSION_CONCURRENCY: int = Field(default=1)
+    LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker concurrency. Must remain 1 (single active browser session).")
     HARVEST_MODE: str = Field(default="updates", description="Global scheduler mode: backfill (continuous) or updates (steady state).")
     HARVEST_AUTO_SWITCH: bool = Field(
         default=True,
@@ -164,7 +164,10 @@ class Settings(BaseSettings):
     BACKFILL_LOGIN_DELAY_MAX: float = Field(default=1.0, description="Backfill mode maximum delay between login-session page fetches.")
     BACKFILL_PAGES_PER_HOUR: int = Field(default=10000, description="Backfill mode login-session page budget per hour.")
     BACKFILL_PAGES_PER_DAY: int = Field(default=200000, description="Backfill mode login-session page budget per day.")
-    BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(default=2, description="Backfill-mode login-session worker concurrency target.")
+    BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(
+        default=1,
+        description="Backfill-mode login-session concurrency target. Must remain 1; dual slots are primary/alternate continuity, not parallel workers.",
+    )
     BLOCK_RETRY_COOLDOWN_MINUTES: int = Field(
         default=120,
         description="Default cooldown before a blocked public source is retried when auto-retry is enabled.",
@@ -391,14 +394,14 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.PAGES_PER_HOUR <= 0 or self.PAGES_PER_DAY <= 0:
             raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
-        if self.LOGIN_SESSION_CONCURRENCY not in (1, 2):
-            raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if self.LOGIN_SESSION_CONCURRENCY != 1:
+            raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:
             raise ValueError("BACKFILL_PAGES_PER_HOUR and BACKFILL_PAGES_PER_DAY must be positive")
-        if self.BACKFILL_LOGIN_SESSION_CONCURRENCY not in (1, 2):
-            raise ValueError("BACKFILL_LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if self.BACKFILL_LOGIN_SESSION_CONCURRENCY != 1:
+            raise ValueError("BACKFILL_LOGIN_SESSION_CONCURRENCY must be 1")
         if (
             self.DISPATCH_LOOP_SECONDS <= 0
             or self.UPDATE_CADENCE_HOURS <= 0

@@ -66,9 +66,9 @@ validators and tests.
    Never from page one; no automatic recovery to the primary. Verification/login expiry → slot
    `NEEDS_HUMAN_LOGIN`, notify, pause if no valid slot. HTTP 403 / "account suspended" / "automated
    access" / CAPTCHA → source **HALTED**, notify, no slot switch, no proxy, no stealth, admin review.
-5. Login-session worker concurrency is environment-controlled (`LOGIN_SESSION_CONCURRENCY`, 1–2).
-   Backfill profile defaults can target dual slots (`BACKFILL_LOGIN_SESSION_CONCURRENCY=2`), while
-   continuity safeguards still require explicit human login in each slot.
+5. Login-session worker concurrency stays single-session (`LOGIN_SESSION_CONCURRENCY=1`).
+   Dual slots are for primary/alternate continuity during long backfill runs, not parallel login
+   scraping workers. Each slot still needs explicit human login.
 
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
@@ -78,7 +78,7 @@ settings validator refuses any other combination.
 | service | role |
 |---|---|
 | `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
-| `worker-scraper` | Celery, queue `login_session`, concurrency from `LOGIN_SESSION_CONCURRENCY` (1–2) |
+| `worker-scraper` | Celery, queue `login_session`, single-session concurrency (`LOGIN_SESSION_CONCURRENCY=1`) |
 | `worker-public` | Celery, queues `scraper`, `maintenance` (public sources, promotion, treatment, archive, dispatch) |
 | `worker-embed` | Celery, queue `embeddings` |
 | `celery-beat` | schedules (see `scraper/tasks/celery_app.py`) |
