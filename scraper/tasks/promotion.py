@@ -206,7 +206,13 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
 
 # --------------------------------------------------------------------------- statutes / instruments
 def _norm_section(n: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (n or "").strip()).rstrip(".")
+    raw = re.sub(r"\s+", " ", (n or "").strip()).rstrip(".")
+    stable_key = _norm_section_key(raw)
+    # Store a stable canonical section identifier when one is available so
+    # amendment edges can resolve onto harvested statute sections reliably.
+    if stable_key:
+        return stable_key
+    return raw
 
 
 def _validated_mentions_payload(
@@ -306,14 +312,15 @@ AMENDMENT_OPERATION_MAP = {
     "omitted": "omit",
     "repealed": "repeal",
 }
+SECTION_TOKEN_PATTERN = r"\d+[A-Z]?(?:\s*[-/]\s*[0-9A-Z]+)?(?:\s*\(\s*[A-Z0-9]+\s*\))*"
 SECTION_REFERENCE_RE = re.compile(
-    r"(?i)\b(?:section|sections|article|rule)\s+(?P<section>\d+[A-Z]?(?:\([A-Z0-9]+\))?(?:[-/][0-9A-Z]+)?)\b"
+    rf"(?i)\b(?:section|sections|article|rule)\s+(?P<section>{SECTION_TOKEN_PATTERN})\b"
 )
 INSERT_BEFORE_TARGET_RE = re.compile(
-    r"(?i)\b(?:section|article|rule)\s+(?P<section>\d+[A-Z]?(?:\([A-Z0-9]+\))?(?:[-/][0-9A-Z]+)?)\s+(?:shall|may)\s+be\s+inserted\b"
+    rf"(?i)\b(?:section|article|rule)\s+(?P<section>{SECTION_TOKEN_PATTERN})\s+(?:shall|may)\s+be\s+inserted\b"
 )
 INSERT_NAMELY_SECTION_RE = re.compile(
-    r"(?i)\bnamely\s*[:\-–—]*\s*(?:the\s+following\s+new\s+section\s+)?(?:section\s+)?(?P<section>\d+[A-Z]?(?:[-/][0-9A-Z]+)?)\b"
+    rf"(?i)\bnamely\s*[:\-–—]*\s*(?:the\s+following\s+new\s+section\s+)?(?:section\s+)?(?P<section>{SECTION_TOKEN_PATTERN})\b"
 )
 MAX_AMENDMENT_SCAN_CHARS = 120_000
 MAX_AMENDMENT_SECTION_MENTIONS = 800
@@ -374,7 +381,11 @@ def _norm_section_key(value: Any) -> Optional[str]:
         return None
     if re.search(r"[,&]", raw):
         return None  # fail-closed: one edge requires one concrete section target.
-    cleaned = re.sub(r"\s+", "", raw).rstrip(".,;:")
+    cleaned = raw.replace("–", "-").replace("—", "-")
+    cleaned = re.sub(r"(?i)^(?:section|sec\.?|s\.?|article|art\.?|rule|r\.?)\s+", "", cleaned)
+    cleaned = re.sub(r"\s+", "", cleaned).rstrip(".,;:")
+    # Normalize frequent portal variants (e.g. "Article 10-A" vs "10A").
+    cleaned = re.sub(r"(?<=\d)-(?=[A-Z])", "", cleaned)
     if not cleaned or not re.search(r"\d", cleaned):
         return None
     return cleaned.upper()
