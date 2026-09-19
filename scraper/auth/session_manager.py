@@ -308,6 +308,7 @@ class PlaywrightBrowser:
         self._context = await self._browser.new_context(storage_state=self._storage_state, user_agent=None)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(settings.PLAYWRIGHT_TIMEOUT_MS)
+        self._page.set_default_navigation_timeout(settings.PLAYWRIGHT_TIMEOUT_MS)
         return self
 
     async def _wrap(self, coro):
@@ -322,12 +323,30 @@ class PlaywrightBrowser:
             raise
 
     async def goto(self, url: str) -> PageResult:
-        resp = await self._wrap(self._page.goto(url, wait_until="domcontentloaded"))
-        await self._wrap(self._page.wait_for_load_state("networkidle"))
+        resp = await self._wrap(
+            self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+            )
+        )
         html = await self._wrap(self._page.content())
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         return PageResult(url=self._page.url, html=html, status=status, content_type=ctype)
+
+    async def _wait_for_post_submit_navigation(self, trigger) -> None:
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        try:
+            async with self._page.expect_navigation(
+                wait_until="domcontentloaded",
+                timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+            ):
+                await self._wrap(trigger())
+        except PWTimeoutError:
+            # Some search surfaces update in-place without a full document navigation.
+            return
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         fields = search_map.get("fields") or {}
@@ -347,10 +366,13 @@ class PlaywrightBrowser:
                 await self._wrap(self._page.fill(sel, value))
         submit = fields.get("submit")
         if submit:
-            await self._wrap(self._page.click(submit["selector"]))
+            await self._wait_for_post_submit_navigation(
+                lambda: self._page.click(submit["selector"])
+            )
         else:
-            await self._wrap(self._page.keyboard.press("Enter"))
-        await self._wrap(self._page.wait_for_load_state("networkidle"))
+            await self._wait_for_post_submit_navigation(
+                lambda: self._page.keyboard.press("Enter")
+            )
         html = await self._wrap(self._page.content())
         return PageResult(url=self._page.url, html=html, status=200)
 

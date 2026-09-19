@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     SCRAPER_RESPECT_ROBOTS: bool = Field(default=True)
     PLAYWRIGHT_ENABLED: bool = Field(default=True)
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
-    PLAYWRIGHT_TIMEOUT_MS: int = Field(default=30000)
+    PLAYWRIGHT_TIMEOUT_MS: int = Field(default=90000)
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
 
     # ------------------------------------------------- login-session sources

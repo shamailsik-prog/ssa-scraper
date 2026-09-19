@@ -52,9 +52,11 @@ validators and tests.
    streams it to you. You can type credentials manually, or save username/password for slot 1 and
    slot 2 (primary + alternate) so login can be re-established without retyping. Saved credentials
    are encrypted at rest with `ENCRYPTION_KEY`, never echoed by admin APIs, and can be rotated by
-   overwriting or cleared per slot. On *Complete* it verifies the page is authenticated, encrypts
-   the browser storage state (cookies + localStorage) and keeps scraping headless inside that
-   session. CAPTCHA / verification pages are never solved by code.
+   overwriting or cleared per slot. On *Complete* it verifies the session can reach
+   `PLS_SEARCH_URL` (CitationSearch) without bouncing to `Login/MainPage`, then encrypts the
+   browser storage state (cookies + localStorage) and keeps scraping headless inside that session.
+   If previously saved slots came from a public MainPage (not CitationSearch), re-login once after
+   deploy so the slot is revalidated. CAPTCHA / verification pages are never solved by code.
 2. **Search-form map.** Playwright renders the search page; deterministic introspection (optionally
    refined by the LOCAL engine, always re-verified against the DOM) records fields, result layout,
    pagination and a DOM hash. Five consecutive unparseable result pages mark the map stale and alert.
@@ -71,6 +73,8 @@ validators and tests.
 
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
+For PakistanLawSite, use `PLAYWRIGHT_TIMEOUT_MS=90000` (default in `.env.example`) to tolerate
+slow CitationSearch responses on the live host.
 
 ## Services (docker-compose)
 
