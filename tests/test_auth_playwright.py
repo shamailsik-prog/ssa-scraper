@@ -5,12 +5,22 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 import redis.asyncio as aioredis
 from sqlalchemy import func, select
 
-from scraper.auth.session_manager import BrowserDisconnected, ContinuityRunner, PageResult, SessionLock, SessionLockHeld, SessionManager, raise_for_verdict
+from scraper.auth.session_manager import (
+    BrowserDisconnected,
+    ContinuityRunner,
+    PageResult,
+    PlaywrightBrowser,
+    SessionLock,
+    SessionLockHeld,
+    SessionManager,
+    raise_for_verdict,
+)
 from scraper.config import settings
 from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperStaging, SearchFormMap
 from scraper.security import ExplicitBlock, VerificationRequired
@@ -20,6 +30,58 @@ from scraper.tasks.search_map import map_search_form
 from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
 
 STATE = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+
+
+class _FakeNavigationWait:
+    def __init__(self, page):
+        self.page = page
+
+    async def __aenter__(self):
+        self.page.calls.append(("expect_navigation.enter",))
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.page.calls.append(("expect_navigation.exit",))
+        return False
+
+
+class _FakePage:
+    def __init__(self, html="<html><body>ok</body></html>", url="https://www.pakistanlawsite.com/Login/CitationSearch"):
+        self.url = url
+        self.html = html
+        self.calls = []
+        self.keyboard = SimpleNamespace(press=self._press)
+
+    async def goto(self, url, **kwargs):
+        self.calls.append(("goto", url, kwargs))
+        self.url = url
+        return SimpleNamespace(status=200, headers={"content-type": "text/html"})
+
+    async def content(self):
+        self.calls.append(("content",))
+        return self.html
+
+    async def click(self, selector):
+        self.calls.append(("click", selector))
+
+    async def fill(self, selector, value):
+        self.calls.append(("fill", selector, value))
+
+    async def select_option(self, selector, value):
+        self.calls.append(("select_option", selector, value))
+
+    async def check(self, selector):
+        self.calls.append(("check", selector))
+
+    async def uncheck(self, selector):
+        self.calls.append(("uncheck", selector))
+
+    async def _press(self, key):
+        self.calls.append(("press", key))
+
+    def expect_navigation(self, **kwargs):
+        self.calls.append(("expect_navigation", kwargs))
+        return _FakeNavigationWait(self)
 
 
 async def _activate(db, source, slots=(1,)):
@@ -70,13 +132,14 @@ async def test_saved_credentials_encrypt_decrypt_round_trip(db, login_source):
     assert mgr.load_login_credentials(slot) is None
 
 
-async def test_human_login_browser_stream_and_completion(db, login_source, fixture_server):
+async def test_human_login_browser_stream_and_completion(db, login_source, fixture_server, monkeypatch):
     """Real Playwright: a streamed login page, frames arrive, credentials typed by the 'human',
     completion exports storage state into the slot. Passwords are never stored in plaintext."""
     from scraper.auth.browser_login import LoginSessionRegistry
 
     fixture_server.add("/login", LOGIN_PAGE)
-    fixture_server.add("/home", "<html><body><a href='/logout'>Logout</a><h1>Welcome</h1></body></html>")
+    fixture_server.add("/Login/CitationSearch", search_form_html())
+    monkeypatch.setattr(settings, "PLS_SEARCH_URL", fixture_server.url("/Login/CitationSearch"))
     reg = LoginSessionRegistry()
     sess = await reg.start("PakistanLawSite", 2, fixture_server.url("/login"), started_by="advocate")
     try:
@@ -84,7 +147,7 @@ async def test_human_login_browser_stream_and_completion(db, login_source, fixtu
         assert frame is not None and frame["type"] == "frame" and frame["data"]
         status = await sess.is_authenticated()
         assert status["authenticated"] is False  # password field present → not yet logged in
-        await sess.input_event({"kind": "navigate", "url": fixture_server.url("/home")})
+        await sess.input_event({"kind": "navigate", "url": fixture_server.url("/Login/CitationSearch")})
         await sess._page.evaluate("() => { document.cookie = 'sid=humanlogin; path=/'; localStorage.setItem('k','v'); }")
         result = await reg.complete("PakistanLawSite", SessionManager(db, login_source))
         assert result["stored"] is True and result["slot"] == 2
@@ -121,6 +184,73 @@ async def test_human_login_autofills_saved_credentials_and_can_submit(fixture_se
         assert sess.last_autofill and sess.last_autofill["applied"] and sess.last_autofill["submitted"]
     finally:
         await reg.cancel("PakistanLawSite")
+
+
+async def test_is_authenticated_rejects_public_mainpage(fixture_server):
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add("/login", LOGIN_PAGE)
+    fixture_server.add(
+        "/Login/CitationSearch",
+        "<html><body><h1>MainPage</h1><a href='/Login/MainPage'>Sign in</a><form action='/Login/Login'><input name='Login.UserName'></form></body></html>",
+    )
+    reg = LoginSessionRegistry()
+    sess = await reg.start("PakistanLawSite", 1, fixture_server.url("/login"))
+    try:
+        check = await sess.is_authenticated_for(fixture_server.url("/Login/CitationSearch"))
+        assert check["authenticated"] is False
+        assert check["expected_match"] is True
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
+async def test_is_authenticated_accepts_citation_search_surface(fixture_server):
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add("/login", LOGIN_PAGE)
+    fixture_server.add("/Login/CitationSearch", search_form_html())
+    reg = LoginSessionRegistry()
+    sess = await reg.start("PakistanLawSite", 1, fixture_server.url("/login"))
+    try:
+        check = await sess.is_authenticated_for(fixture_server.url("/Login/CitationSearch"))
+        assert check["authenticated"] is True
+        assert check["expected_match"] is True
+        assert check["url"].endswith("/Login/CitationSearch")
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
+async def test_playwright_goto_uses_domcontentloaded_without_networkidle_wait():
+    page = _FakePage()
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
+
+    assert result.status == 200
+    goto_call = next(c for c in page.calls if c[0] == "goto")
+    assert goto_call[2]["wait_until"] == "domcontentloaded"
+    assert goto_call[2]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
+
+
+async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
+    page = _FakePage(html=results_html([("PLD 2024 SC 1", "Party v State", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+    search_map = {
+        "fields": {
+            "keyword": {"selector": "#keyword", "kind": "text"},
+            "submit": {"selector": "#submit", "kind": "button"},
+        }
+    }
+
+    result = await browser.submit_search(search_map, {"keyword": "test"})
+
+    assert result.url == page.url
+    assert ("fill", "#keyword", "test") in page.calls
+    nav_call = next(c for c in page.calls if c[0] == "expect_navigation")
+    assert nav_call[1]["wait_until"] == "domcontentloaded"
+    assert nav_call[1]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
 
 
 async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_server):

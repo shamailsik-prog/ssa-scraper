@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 from scraper.config import settings
 from scraper.security import classify_response
@@ -168,8 +169,6 @@ class LoginSession:
             if name in ("Tab", "Enter"):  # focus may have moved (Tab) or the page may have submitted (Enter)
                 info = await self.focused_element()
         elif kind == "navigate":
-            from urllib.parse import urlsplit
-
             target = str(event.get("url", ""))
             if urlsplit(target).hostname != urlsplit(self.login_url).hostname:
                 raise LoginSessionError("navigation outside the source host is not permitted")
@@ -193,13 +192,75 @@ class LoginSession:
             return {"tag": None, "error": str(exc)[:80]}
 
     async def is_authenticated(self) -> Dict[str, Any]:
+        return await self._auth_verdict()
+
+    async def _auth_verdict(self, expected_url: Optional[str] = None) -> Dict[str, Any]:
         html = await self._page.content()
-        verdict = classify_response(200, html, self._page.url)
+        current_url = self._page.url
+        verdict = classify_response(200, html, current_url)
         low = html.lower()
+        path = (urlsplit(current_url).path or "").lower()
+
         has_password = 'type="password"' in low or "type='password'" in low
+        has_login_form = any(
+            marker in low
+            for marker in (
+                "mainloginform",
+                "name=\"login.username\"",
+                "name='login.username'",
+                "name=\"login.password\"",
+                "name='login.password'",
+                "action=\"/login/login\"",
+                "action='/login/login'",
+                "id=\"login\"",
+                "id='login'",
+            )
+        )
         has_logout = "logout" in low or "log off" in low or "sign out" in low
-        ok = verdict.kind == "ok" and (has_logout or not has_password)
-        return {"authenticated": ok, "verdict": verdict.kind, "detail": verdict.detail, "url": self._page.url}
+        public_login_url = any(
+            piece in path
+            for piece in ("/login/mainpage", "/login/login", "/login/main", "/login/index")
+        )
+
+        expected_match = True
+        expected_path = ""
+        if expected_url:
+            expected_path = (urlsplit(expected_url).path or "").lower().rstrip("/")
+            current_path = path.rstrip("/")
+            expected_match = current_path == expected_path or current_path.startswith(expected_path + "/")
+
+        search_surface = "citationsearch" in path or "id=\"searchform\"" in low or "id='searchform'" in low
+        positive_auth_signal = has_logout or search_surface
+        blocked_by_login_surface = has_password or has_login_form or public_login_url
+        ok = verdict.kind == "ok" and positive_auth_signal and not blocked_by_login_surface and expected_match
+        return {
+            "authenticated": ok,
+            "verdict": verdict.kind,
+            "detail": verdict.detail,
+            "url": current_url,
+            "expected_url": expected_url,
+            "expected_match": expected_match,
+        }
+
+    async def is_authenticated_for(self, expected_url: str) -> Dict[str, Any]:
+        """Prove the session can reach an authenticated target URL without a login bounce."""
+        try:
+            await self._page.goto(
+                expected_url,
+                wait_until="domcontentloaded",
+                timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            return {
+                "authenticated": False,
+                "verdict": "navigation_error",
+                "detail": str(exc)[:300],
+                "url": self._page.url if self._page else None,
+                "expected_url": expected_url,
+                "expected_match": False,
+            }
+        self.last_url = self._page.url
+        return await self._auth_verdict(expected_url=expected_url)
 
     async def resize(self, viewport: Dict[str, int]) -> None:
         """Change the streamed browser's size (operator switched between phone and desktop layout)."""
@@ -389,7 +450,10 @@ class LoginSessionRegistry:
         sess = self.get(source_name)
         if sess is None:
             raise LoginSessionError("no open login session")
-        check = await sess.is_authenticated()
+        if source_name == "PakistanLawSite":
+            check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
+        else:
+            check = await sess.is_authenticated()
         if not check["authenticated"]:
             return {"stored": False, **check}
         state = await sess.export_storage_state()

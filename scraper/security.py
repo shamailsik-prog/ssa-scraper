@@ -271,6 +271,7 @@ class PageVerdict:
 def classify_response(status_code: Optional[int], body: str, final_url: str = "") -> PageVerdict:
     """Classify a fetched page. Explicit blocks become HALT conditions upstream."""
     low = (body or "")[:200_000].lower()
+    url_low = (final_url or "").lower()
     if status_code in (401,):
         return PageVerdict("login", "HTTP 401")
     if status_code in (403, 429, 451):
@@ -284,7 +285,9 @@ def classify_response(status_code: Optional[int], body: str, final_url: str = ""
     for marker in MULTILOGIN_MARKERS:
         if marker in low:
             return PageVerdict("multilogin", marker)
-    if "login" in (final_url or "").lower() and any(m in low for m in LOGIN_MARKERS):
+    if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
+        return PageVerdict("login", "login surface URL")
+    if "login" in url_low and any(m in low for m in LOGIN_MARKERS):
         return PageVerdict("login", "redirected to login")
     for marker in LOGIN_MARKERS:
         if marker in low and "logout" not in low and "log off" not in low:
