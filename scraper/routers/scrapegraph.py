@@ -57,6 +57,17 @@ async def status(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
         "fail_open_to_deterministic": settings.SGAI_FAIL_OPEN_TO_DETERMINISTIC,
         "public_test_url": settings.SGAI_PUBLIC_TEST_URL or "NOT CONFIGURED",
         "not_configured": [k for k in settings.not_configured() if k.startswith("SGAI")],
+        "setup": {
+            "required_env": ["SGAI_API_KEY", "SGAI_DAILY_CREDIT_CAP", "SGAI_PUBLIC_TEST_URL"],
+            "optional_local_env": ["SGAI_LOCAL_LLM_PROVIDER", "SGAI_LOCAL_LLM_BASE_URL", "SGAI_LOCAL_LLM_MODEL"],
+            "droplet_commands": [
+                "printf '%s' \"$SGAI_API_KEY\" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_API_KEY",
+                "printf '%s' \"2000\" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_DAILY_CREDIT_CAP",
+                "printf '%s' \"https://example.com/public-test\" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_PUBLIC_TEST_URL",
+                "cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-scraper celery-beat",
+            ],
+            "note": "Without SGAI_API_KEY, hybrid/managed extraction is skipped and deterministic extraction continues.",
+        },
         "mcp": "development/operator tooling only; not a runtime dependency (see docs/MCP_DEVELOPMENT.md)",
     }
 

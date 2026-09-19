@@ -15,8 +15,8 @@
     },
     {
       "name": "worker-scraper",
-      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO",
-      "description": "Celery worker for the login_session queue (PakistanLawSite); concurrency 1."
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=${LOGIN_SESSION_CONCURRENCY:-1} -n scraper-login@%h --loglevel=INFO",
+      "description": "Celery worker for the login_session queue (PakistanLawSite); concurrency from LOGIN_SESSION_CONCURRENCY."
     },
     {
       "name": "worker-embed",

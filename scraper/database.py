@@ -371,6 +371,10 @@ async def seed_data() -> None:
             "data_residency_note": settings.DATA_RESIDENCY_NOTE or "NOT CONFIGURED",
             "schema_contract": "annex-a-v1",
             "scrapegraph_schema_version": str(settings.SGAI_SCHEMA_VERSION),
+            "harvest_mode": settings.HARVEST_MODE,
+            "harvest_mode_changed_at": datetime.now(timezone.utc).isoformat(),
+            "harvest_mode_changed_by": "seed",
+            "harvest_mode_reason": "initial seed",
             "service_started_at": datetime.now(timezone.utc).isoformat(),
         }
         existing_meta = {m.key: m for m in (await db.execute(select(CorpusMetadata))).scalars().all()}
@@ -379,6 +383,8 @@ async def seed_data() -> None:
                 if k in ("embedding_model", "embedding_dim") and existing_meta[k].value != v:
                     # Do not silently change the recorded embedding identity; the embedding worker refuses to run.
                     logger.error("corpus_metadata %s=%s differs from configured %s; embedding worker will refuse", k, existing_meta[k].value, v)
+                    continue
+                if k in ("harvest_mode", "harvest_mode_changed_at", "harvest_mode_changed_by", "harvest_mode_reason"):
                     continue
                 existing_meta[k].value = v
             else:

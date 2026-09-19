@@ -33,6 +33,7 @@ KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "M
 ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", "sftp", "smb", "local_path")
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
+HARVEST_MODES = ("backfill", "updates")
 
 SECRET_FIELD_NAMES = (
     "ENCRYPTION_KEY",
@@ -93,6 +94,7 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: Optional[str] = Field(default=None)
     CELERY_RESULT_BACKEND: Optional[str] = Field(default=None)
     REDIS_CACHE_TTL_SECONDS: int = Field(default=3600)
+    DISPATCH_LOOP_SECONDS: int = Field(default=60, description="Celery Beat cadence for dispatch_due_sources.")
 
     # --------------------------------------------------------------- secrets
     ENCRYPTION_KEY: str = Field(default="", description="Fernet key for browser storage state and archive credentials. Required.")
@@ -143,6 +145,34 @@ class Settings(BaseSettings):
     PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
     PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
     LOGIN_SESSION_CONCURRENCY: int = Field(default=1)
+    HARVEST_MODE: str = Field(default="updates", description="Global scheduler mode: backfill (continuous) or updates (steady state).")
+    HARVEST_AUTO_SWITCH: bool = Field(
+        default=True,
+        description="When true, backfill mode automatically switches to updates after the frontier is drained and targets are met.",
+    )
+    UPDATE_CADENCE_HOURS: int = Field(default=6, description="Default per-source scrape interval in updates mode.")
+    BACKFILL_SOURCE_FREQUENCY_MINUTES: int = Field(default=15, description="Default per-source scrape interval in backfill mode.")
+    BACKFILL_TARGET_JUDGMENTS: int = Field(
+        default=0,
+        description="Optional backfill completion target; 0 means no judgment-count threshold is required.",
+    )
+    BACKFILL_TARGET_STATUTES: int = Field(
+        default=0,
+        description="Optional backfill completion target; 0 means no statute-count threshold is required.",
+    )
+    BACKFILL_LOGIN_DELAY_MIN: float = Field(default=0.4, description="Backfill mode minimum delay between login-session page fetches.")
+    BACKFILL_LOGIN_DELAY_MAX: float = Field(default=1.0, description="Backfill mode maximum delay between login-session page fetches.")
+    BACKFILL_PAGES_PER_HOUR: int = Field(default=10000, description="Backfill mode login-session page budget per hour.")
+    BACKFILL_PAGES_PER_DAY: int = Field(default=200000, description="Backfill mode login-session page budget per day.")
+    BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(default=2, description="Backfill-mode login-session worker concurrency target.")
+    BLOCK_RETRY_COOLDOWN_MINUTES: int = Field(
+        default=120,
+        description="Default cooldown before a blocked public source is retried when auto-retry is enabled.",
+    )
+    BLOCK_RETRY_MAX_ATTEMPTS: int = Field(
+        default=3,
+        description="Default number of cooldown retries for public-source explicit blocks before HALTED.",
+    )
     MIRROR_LOGIN_SESSION_ROWS: bool = Field(default=False, description="Whether login_session judgments may be mirrored to archive targets.")
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
@@ -325,6 +355,14 @@ class Settings(BaseSettings):
             raise ValueError(f"SGAI_MODE must be one of {EXTRACTION_MODES}")
         return v
 
+    @field_validator("HARVEST_MODE")
+    @classmethod
+    def _validate_harvest_mode(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in HARVEST_MODES:
+            raise ValueError(f"HARVEST_MODE must be one of {HARVEST_MODES}")
+        return v
+
     @field_validator("PLS_SUBSCRIBED_REPORTERS", "PLS_JOURNALS", "PLS_JOURNALS_B")
     @classmethod
     def _validate_reporters(cls, v: str) -> str:
@@ -353,8 +391,24 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.PAGES_PER_HOUR <= 0 or self.PAGES_PER_DAY <= 0:
             raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
-        if self.LOGIN_SESSION_CONCURRENCY != 1:
-            raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1")
+        if self.LOGIN_SESSION_CONCURRENCY not in (1, 2):
+            raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
+            raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
+        if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:
+            raise ValueError("BACKFILL_PAGES_PER_HOUR and BACKFILL_PAGES_PER_DAY must be positive")
+        if self.BACKFILL_LOGIN_SESSION_CONCURRENCY not in (1, 2):
+            raise ValueError("BACKFILL_LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if (
+            self.DISPATCH_LOOP_SECONDS <= 0
+            or self.UPDATE_CADENCE_HOURS <= 0
+            or self.BACKFILL_SOURCE_FREQUENCY_MINUTES <= 0
+            or self.BLOCK_RETRY_COOLDOWN_MINUTES <= 0
+            or self.BLOCK_RETRY_MAX_ATTEMPTS <= 0
+        ):
+            raise ValueError("dispatch, cadence, and block-retry settings must be positive")
+        if self.BACKFILL_TARGET_JUDGMENTS < 0 or self.BACKFILL_TARGET_STATUTES < 0:
+            raise ValueError("BACKFILL_TARGET_JUDGMENTS/STATUTES must be >= 0")
         if self.EMBEDDING_DIM <= 0:
             raise ValueError("EMBEDDING_DIM must be positive")
         if self.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE <= 0:

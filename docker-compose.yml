@@ -29,13 +29,13 @@ services:
 
   # Workers and Beat depend on the API being healthy: the API applies migrations, roles and seed data at
   # startup, so no task can run against a database whose tables do not exist yet (first-boot race).
-  # Login-session sources: ONE worker, concurrency 1, its own queue (Amendment §9).
+  # Login-session sources queue. Set LOGIN_SESSION_CONCURRENCY in .env (1-2).
   worker-scraper:
     <<: *app
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
+    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=${LOGIN_SESSION_CONCURRENCY:-1} -n scraper-login@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-login@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
