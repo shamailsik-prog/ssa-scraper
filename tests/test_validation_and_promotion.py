@@ -180,6 +180,13 @@ def test_gazette_mention_extractors_normalize_core_patterns():
     assert any(m.get("section_number") == "302" for m in statute_mentions)
 
 
+def test_section_key_normalizer_handles_article_and_rule_hyphen_variants():
+    assert promotion_task_module._norm_section_key("Article 10-A") == "10A"
+    assert promotion_task_module._norm_section_key("Article 10A") == "10A"
+    assert promotion_task_module._norm_section_key("Rule 3-A") == "3A"
+    assert promotion_task_module._norm_section_key("Rule 3A") == "3A"
+
+
 async def test_instrument_promotion_persists_and_links_mentions(db):
     source = (
         await db.execute(
@@ -499,6 +506,140 @@ async def test_instrument_section_relation_graph_links_article_targets_to_statut
     assert section_edges[0].target_section_key == "10A"
     assert section_edges[0].target_statute_id == statute.id
     assert section_edges[0].target_statute_section_id == article_section.id
+
+
+async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_variants(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "NasirLawSite"),
+        )
+    ).scalars().first()
+    assert source is not None
+
+    async def _promote_statute(*, statute_name: str, section_number: str, section_text: str, url: str) -> tuple[Statute, StatuteSection]:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=section_text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=section_text,
+            url=url,
+            kind="statute",
+        )
+        staging.status = "extracted"
+        staging.reconciled_json = {
+            "statute_name": statute_name,
+            "jurisdiction": "Federal",
+            "statute_type": "act",
+            "sections": [
+                {
+                    "section_number": section_number,
+                    "section_text": section_text,
+                    "section_title": "Sample section",
+                }
+            ],
+        }
+        assert await promote_statute_staging(db, staging) == "promoted"
+        statute = (
+            await db.execute(select(Statute).where(Statute.id == staging.promoted_to_id))
+        ).scalars().first()
+        section = (
+            await db.execute(
+                select(StatuteSection).where(StatuteSection.statute_id == statute.id),
+            )
+        ).scalars().first()
+        return statute, section
+
+    constitution, article_section = await _promote_statute(
+        statute_name="Constitution of the Islamic Republic of Pakistan, 1973",
+        section_number="Article 10-A",
+        section_text="Article 10-A.- Right to fair trial shall be protected.",
+        url="http://127.0.0.1/nasir-constitution.txt",
+    )
+    rules_statute, rule_section = await _promote_statute(
+        statute_name="Sample Compliance Rules, 2025",
+        section_number="Rule 3-A",
+        section_text="Rule 3-A.- Compliance procedure for sample licensing.",
+        url="http://127.0.0.1/nasir-rules.txt",
+    )
+    assert article_section.section_number == "10A"
+    assert rule_section.section_number == "3A"
+
+    async def _promote_instrument(text: str, url: str, *, affected_statute: str | None = None) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(
+            text=text,
+            source_meta={"url": url},
+            content_hash=prov.content_hash,
+        )
+        if affected_statute:
+            out.data["affected_statute"] = affected_statute
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (
+            await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))
+        ).scalars().first()
+
+    article_instrument = await _promote_instrument(
+        """
+        NOTIFICATION
+        In the Constitution of Pakistan, 1973, Article 10A shall be substituted.
+        """,
+        "http://127.0.0.1/nasir-article-amendment.txt",
+    )
+    article_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id == article_instrument.id,
+            )
+        )
+    ).scalars().all()
+    assert len(article_edges) == 1
+    assert article_edges[0].target_statute_id == constitution.id
+    assert article_edges[0].target_section_key == "10A"
+    assert article_edges[0].target_statute_section_id == article_section.id
+
+    rule_instrument = await _promote_instrument(
+        """
+        NOTIFICATION
+        In the Sample Compliance Rules, 2025, Rule 3A shall be omitted.
+        """,
+        "http://127.0.0.1/nasir-rule-amendment.txt",
+        affected_statute="Sample Compliance Rules, 2025",
+    )
+    rule_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id == rule_instrument.id,
+            )
+        )
+    ).scalars().all()
+    assert len(rule_edges) == 1
+    assert rule_edges[0].target_statute_id == rules_statute.id
+    assert rule_edges[0].target_section_key == "3A"
+    assert rule_edges[0].target_statute_section_id == rule_section.id
 
 
 async def test_instrument_section_relation_graph_fails_closed_without_statute_target(db):
