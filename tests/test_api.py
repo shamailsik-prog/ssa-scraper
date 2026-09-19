@@ -30,7 +30,19 @@ def test_health_and_dashboard(client):
 
 
 def test_admin_routes_require_key(client, admin_headers):
-    for path in ("/admin/sources", "/admin/coverage", "/admin/review", "/admin/archive", "/admin/scrapegraph/status", "/admin/scrapegraph/usage", "/admin/sessions/PakistanLawSite", "/admin/jobs", "/admin/notifications", "/admin/errors"):
+    for path in (
+        "/admin/sources",
+        "/admin/coverage",
+        "/admin/review",
+        "/admin/archive",
+        "/admin/scrapegraph/status",
+        "/admin/scrapegraph/usage",
+        "/admin/sessions/PakistanLawSite",
+        "/admin/sessions/PakistanLawSite/credentials",
+        "/admin/jobs",
+        "/admin/notifications",
+        "/admin/errors",
+    ):
         assert client.get(path).status_code == 401, path
         assert client.get(path, headers=admin_headers).status_code == 200, path
     assert client.get("/admin/sources", headers={"X-API-Key": "wrong"}).status_code == 401
@@ -98,6 +110,64 @@ def test_login_trigger_requires_chambers_and_active_slot(client, admin_headers, 
     s = client.get("/admin/sessions/PakistanLawSite", headers=admin_headers).json()
     assert s["login_scraping_permitted"] is False and [x["state"] for x in s["slots"]] == ["EMPTY", "EMPTY"]
     assert client.post("/admin/sessions/PakistanLawSite/slots/1/resume", headers=admin_headers).status_code == 409
+
+
+def test_saved_credentials_api_never_echoes_plaintext_password(client, admin_headers):
+    password = "Slot1-Top-Secret-Password!"
+    username = "slot1.user@example.com"
+    save = client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": username, "password": password, "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+    assert save.status_code == 200
+    body = json.dumps(save.json())
+    assert password not in body and username not in body
+    assert save.json()["username"] == "CONFIGURED" and save.json()["password"] == "CONFIGURED"
+
+    slots = client.get("/admin/sessions/PakistanLawSite", headers=admin_headers).json()
+    slots_dump = json.dumps(slots)
+    assert password not in slots_dump and username not in slots_dump
+    assert next(s for s in slots["slots"] if s["slot"] == 1)["credentials"]["password"] == "CONFIGURED"
+
+    creds = client.get("/admin/sessions/PakistanLawSite/credentials", headers=admin_headers).json()
+    creds_dump = json.dumps(creds)
+    assert password not in creds_dump and username not in creds_dump
+    assert next(s for s in creds["slots"] if s["slot"] == 1)["password"] == "CONFIGURED"
+
+
+def test_login_start_uses_saved_credentials_for_empty_slot(client, admin_headers, monkeypatch):
+    client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": "slot1.user@example.com", "password": "TopSecret#1", "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+    seen = {}
+
+    class DummySession:
+        status = "awaiting_human"
+        slot_number = 1
+        viewport = {"width": 1280, "height": 800}
+        last_autofill = {"applied": True, "submitted": True}
+
+    async def fake_start(source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+        seen["source_name"] = source_name
+        seen["slot_number"] = slot_number
+        seen["saved_credentials"] = saved_credentials
+        seen["auto_complete"] = auto_complete
+        return DummySession()
+
+    monkeypatch.setattr("scraper.routers.sessions.registry.start", fake_start)
+    r = client.post(
+        "/admin/sessions/PakistanLawSite/login/start",
+        json={"slot": 1, "use_saved_credentials": True, "auto_complete_if_empty": True},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert seen["source_name"] == "PakistanLawSite"
+    assert seen["saved_credentials"] == {"username": "slot1.user@example.com", "password": "TopSecret#1"}
+    assert seen["auto_complete"] is True
+    assert r.json()["saved_credentials_used"] is True and r.json()["auto_complete_attempted"] is True
 
 
 async def _seed_judgments(access_method="public"):

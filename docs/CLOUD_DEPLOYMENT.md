@@ -78,8 +78,9 @@ All flags are optional. The script:
 6. builds the image (Chromium is downloaded into it) and starts all services;
 7. prints the dashboard address and the admin key.
 
-The script never asks for PakistanLawSite credentials. Those are typed by you into the streamed
-browser on the dashboard's **Human login** tab, and the service never sees them.
+The script never asks for PakistanLawSite credentials. Configure those only from the dashboard's
+**Human login** tab on the trusted chambers host: either type manually each time, or save slot 1/2
+credentials encrypted at rest on the server so they can be reused.
 
 Re-running the same command later (with the token lines again while private) updates the code and restarts the stack; `.env` is kept.
 
@@ -89,13 +90,17 @@ Re-running the same command later (with the token lines again while private) upd
 2. **Overview → Not configured**: anything listed there is a value in `/opt/ssa-scraper/.env`
    (`SGAI_API_KEY`, `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` for embeddings, and so on). After
    editing: `cd /opt/ssa-scraper && docker compose up -d`.
-3. **Human login**: choose slot 1, **Start login**, tap the username field in the streamed page,
-   type in the box under the picture (on a phone the keyboard opens there; on a computer you can
-   also type straight into the picture), tap the password field, type, tick **I Agree with the
-   Terms and Conditions**, tap **Sign in**, then **Complete**. The box shows which field you are
-   typing into and masks itself for passwords; what you type goes only to the page. Repeat on slot 2
-   if you want the alternate slot ready. Both slots are optional until you want PakistanLawSite
-   coverage.
+3. **Human login**: optionally save encrypted credentials for slot 1 and slot 2 (primary/alternate)
+   first, then use **Login with saved credentials** to auto-fill (and auto-submit when the slot is
+   empty) or run a fully manual login stream. In manual mode, choose slot 1, **Start login**, tap
+   the username field in the streamed page, type in the box under the picture (on a phone the
+   keyboard opens there; on a computer you can also type straight into the picture), tap the
+   password field, type, tick **I Agree with the Terms and Conditions**, tap **Sign in**, then
+   **Complete**.
+
+   Security tradeoff: saved credentials reduce operator friction during TLS/IP interruptions but
+   keep decryptable credentials on the server. Use this only on a firm-controlled trusted host,
+   rotate by overwriting, and clear unused slots.
 
    PakistanLawSite allows one login per account at a time. If the page shows **Logout From All
    Devices**, the account is still logged in elsewhere (your own browser or phone): enter the

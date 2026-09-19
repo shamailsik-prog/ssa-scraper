@@ -58,9 +58,21 @@ async def test_human_login_stores_encrypted_storage_state(db, login_source):
     assert login_source.state == "ACTIVE"
 
 
+async def test_saved_credentials_encrypt_decrypt_round_trip(db, login_source):
+    mgr = SessionManager(db, login_source)
+    slot = await mgr.save_login_credentials(1, "advocate@example.com", "Sup3rSecret!", by="operator")
+    assert slot.login_username_encrypted and slot.login_username_encrypted.startswith("gAAAA")
+    assert slot.login_password_encrypted and slot.login_password_encrypted.startswith("gAAAA")
+    assert "advocate@example.com" not in slot.login_username_encrypted
+    assert "Sup3rSecret!" not in slot.login_password_encrypted
+    assert mgr.load_login_credentials(slot) == {"username": "advocate@example.com", "password": "Sup3rSecret!"}
+    await mgr.clear_login_credentials(1)
+    assert mgr.load_login_credentials(slot) is None
+
+
 async def test_human_login_browser_stream_and_completion(db, login_source, fixture_server):
     """Real Playwright: a streamed login page, frames arrive, credentials typed by the 'human',
-    completion exports storage state into the slot. No password ever reaches the service."""
+    completion exports storage state into the slot. Passwords are never stored in plaintext."""
     from scraper.auth.browser_login import LoginSessionRegistry
 
     fixture_server.add("/login", LOGIN_PAGE)
@@ -81,6 +93,32 @@ async def test_human_login_browser_stream_and_completion(db, login_source, fixtu
         assert any(c["name"] == "sid" and c["value"] == "humanlogin" for c in state["cookies"])
         with pytest.raises(Exception):
             await sess.input_event({"kind": "navigate", "url": "https://evil.example.com/"})
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
+async def test_human_login_autofills_saved_credentials_and_can_submit(fixture_server):
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add(
+        "/login",
+        "<html><body><form onsubmit=\"document.getElementById('out').textContent='ok:'+u.value+'/'+p.value;return false;\">"
+        "<input id=u name='Login.UserName'><input id=p name='Login.Password' type='password'>"
+        "<input id=terms type=checkbox name='agreeTerms'><button id=signin type=submit>Sign in</button></form><div id=out></div></body></html>",
+    )
+    reg = LoginSessionRegistry()
+    sess = await reg.start(
+        "PakistanLawSite",
+        1,
+        fixture_server.url("/login"),
+        saved_credentials={"username": "stored-user", "password": "stored-pass"},
+        auto_complete=True,
+    )
+    try:
+        await sess._page.wait_for_timeout(300)
+        data = await sess._page.evaluate("() => ({u: u.value, p: p.value, terms: terms.checked, out: document.getElementById('out').textContent})")
+        assert data == {"u": "stored-user", "p": "stored-pass", "terms": True, "out": "ok:stored-user/stored-pass"}
+        assert sess.last_autofill and sess.last_autofill["applied"] and sess.last_autofill["submitted"]
     finally:
         await reg.cancel("PakistanLawSite")
 
