@@ -1073,9 +1073,20 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         if data.get("affected_sections") is not None and not isinstance(data.get("affected_sections"), list):
             await _quarantine(db, st, "affected_sections must be a list", "instrument")
             return "quarantined"
+
+        def _normalized_section_identifier(value: Any) -> Optional[str]:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            return _norm_section(raw)
+
         aff = None
         linked_statute_mentions: list[Dict[str, Any]] = []
-        collected_sections = [str(s).strip() for s in (data.get("affected_sections") or []) if str(s).strip()]
+        collected_sections: list[str] = []
+        for section_value in data.get("affected_sections") or []:
+            normalized_section = _normalized_section_identifier(section_value)
+            if normalized_section:
+                collected_sections.append(normalized_section)
         if data.get("affected_statute"):
             canonical = canonicalise_statute_name(str(data["affected_statute"])) or str(data["affected_statute"]).strip()
             aff = await _resolve_statute_link(
@@ -1096,7 +1107,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 row["canonical_statute_name"] = aff.name
                 row["linked_statute_id"] = str(aff.id)
                 linked_statute_mentions.append(row)
-                section_number = str(row.get("section_number") or "").strip()
+                section_number = _normalized_section_identifier(row.get("section_number"))
                 if section_number:
                     collected_sections.append(section_number)
                 continue
@@ -1112,9 +1123,9 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             row["canonical_statute_name"] = canonical
             row["linked_statute_id"] = str(linked.id)
             linked_statute_mentions.append(row)
-            section_number = row.get("section_number")
+            section_number = _normalized_section_identifier(row.get("section_number"))
             if section_number:
-                collected_sections.append(str(section_number))
+                collected_sections.append(section_number)
             if aff is None:
                 aff = linked
         collected_sections = [s for s in dict.fromkeys(collected_sections) if s]
