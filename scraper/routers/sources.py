@@ -17,8 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import EXTRACTION_MODES, settings
 from scraper.database import get_db
+from scraper.harvest_mode import (
+    backfill_progress,
+    cadence_for_source,
+    get_harvest_mode,
+    set_harvest_mode,
+    source_backfill_priority,
+    source_selected_for_mode,
+)
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
-from scraper.models import BrowserSessionSlot, ExtractionAudit, Judgment, ScraperSource, SgaiUsageDaily
+from scraper.models import BrowserSessionSlot, CorpusMetadata, ExtractionAudit, Judgment, ScraperSource, SgaiUsageDaily
 from scraper.routers.auth import require_admin
 
 router = APIRouter(prefix="/admin/sources", tags=["sources"], dependencies=[Depends(require_admin)])
@@ -35,7 +43,7 @@ class ExtractionSettings(BaseModel):
 
 
 class StateChange(BaseModel):
-    action: str  # pause | resume | re_enable | disable
+    action: str  # pause | resume | retry_now | re_enable | clear_block_retry | disable | enable
     reason: Optional[str] = None
     reviewed_by: Optional[str] = None
 
@@ -46,7 +54,21 @@ class SourceConfig(BaseModel):
     allow_list: Optional[List[str]] = None
     document_cdn_hosts: Optional[List[str]] = None
     scrape_frequency_hours: Optional[int] = Field(default=None, ge=1)
+    update_frequency_hours: Optional[int] = Field(default=None, ge=1, le=168)
+    backfill_frequency_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    backfill_priority: Optional[int] = Field(default=None, ge=1, le=1000)
+    backfill_enabled: Optional[bool] = None
+    update_enabled: Optional[bool] = None
+    auto_retry_on_block: Optional[bool] = None
+    block_retry_cooldown_minutes: Optional[int] = Field(default=None, ge=1, le=2880)
+    block_retry_max_attempts: Optional[int] = Field(default=None, ge=1, le=100)
     is_active: Optional[bool] = None
+
+
+class HarvestModeBody(BaseModel):
+    mode: str = Field(description="backfill | updates")
+    changed_by: Optional[str] = None
+    reason: Optional[str] = None
 
 
 async def _source(db: AsyncSession, name: str) -> ScraperSource:
@@ -56,7 +78,12 @@ async def _source(db: AsyncSession, name: str) -> ScraperSource:
     return s
 
 
-async def source_view(db: AsyncSession, s: ScraperSource, local_engine: Optional[LocalScrapeGraphEngine] = None) -> Dict[str, Any]:
+async def source_view(
+    db: AsyncSession,
+    s: ScraperSource,
+    local_engine: Optional[LocalScrapeGraphEngine] = None,
+    mode: Optional[str] = None,
+) -> Dict[str, Any]:
     today = datetime.now(timezone.utc).date()
     usage = (await db.execute(select(SgaiUsageDaily).where(SgaiUsageDaily.day == today, SgaiUsageDaily.source_name == s.source_name))).scalars().all()
     managed = next((u for u in usage if u.engine_mode == "managed"), None)
@@ -66,6 +93,8 @@ async def source_view(db: AsyncSession, s: ScraperSource, local_engine: Optional
     conflicts = sum(u.conflicts for u in usage)
     cache_hits = sum(u.cache_hits for u in usage)
     last_err = (await db.execute(select(ExtractionAudit).where(ExtractionAudit.source_name == s.source_name, ExtractionAudit.status.not_in(["ok", "cache_hit"])).order_by(ExtractionAudit.created_at.desc()))).scalars().first()
+    cfg = dict(s.config_json or {})
+    mode = mode or await get_harvest_mode(db)
     view: Dict[str, Any] = {
         "source_name": s.source_name,
         "display_name": s.display_name,
@@ -87,6 +116,19 @@ async def source_view(db: AsyncSession, s: ScraperSource, local_engine: Optional
         "records_today": (await db.execute(select(func.count()).select_from(Judgment).where(Judgment.source_name == s.source_name, Judgment.promoted_at >= datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)))).scalar(),
         "total_pages_scraped": s.total_pages_scraped,
         "total_records_extracted": s.total_records_extracted,
+        "scheduler": {
+            "selected_for_mode": source_selected_for_mode(s, mode),
+            "update_enabled": bool(cfg.get("update_enabled", True)),
+            "update_frequency_hours": int(cfg.get("update_frequency_hours") or settings.UPDATE_CADENCE_HOURS),
+            "backfill_enabled": bool(cfg.get("backfill_enabled", True)),
+            "backfill_priority": int(cfg.get("backfill_priority", 100)),
+            "backfill_frequency_minutes": int(cfg.get("backfill_frequency_minutes") or settings.BACKFILL_SOURCE_FREQUENCY_MINUTES),
+            "effective_interval_minutes": cadence_for_source(s, mode),
+            "auto_retry_on_block": bool(cfg.get("auto_retry_on_block", False)),
+            "block_retry_cooldown_minutes": int(cfg.get("block_retry_cooldown_minutes") or settings.BLOCK_RETRY_COOLDOWN_MINUTES),
+            "block_retry_max_attempts": int(cfg.get("block_retry_max_attempts") or settings.BLOCK_RETRY_MAX_ATTEMPTS),
+            "block_retry_state": cfg.get("block_retry") or {},
+        },
         "extraction": {
             "mode": s.extraction_mode,
             "effective_engine": _effective_engine(s),
@@ -134,12 +176,96 @@ def _effective_engine(s: ScraperSource) -> str:
 @router.get("")
 async def list_sources(db: AsyncSession = Depends(get_db)) -> List[Dict[str, Any]]:
     engine = LocalScrapeGraphEngine()
-    return [await source_view(db, s, engine) for s in (await db.execute(select(ScraperSource).order_by(ScraperSource.source_name))).scalars().all()]
+    mode = await get_harvest_mode(db)
+    return [
+        await source_view(db, s, engine, mode=mode)
+        for s in (await db.execute(select(ScraperSource).order_by(ScraperSource.source_name))).scalars().all()
+    ]
+
+
+@router.get("/harvest-mode")
+async def harvest_mode_status(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    mode = await get_harvest_mode(db)
+    rows = (await db.execute(select(ScraperSource).where(ScraperSource.is_active.is_(True)).order_by(ScraperSource.source_name))).scalars().all()
+    selected = [s.source_name for s in rows if source_selected_for_mode(s, mode)]
+    progress = await backfill_progress(db, source_names=selected if mode == "backfill" else None)
+    metadata = {
+        m.key: m.value
+        for m in (
+            await db.execute(
+                select(CorpusMetadata).where(
+                    CorpusMetadata.key.in_(
+                        ["harvest_mode_changed_at", "harvest_mode_changed_by", "harvest_mode_reason"]
+                    )
+                )
+            )
+        ).scalars().all()
+    }
+
+    login_sources = [s for s in rows if s.access_method == "login_session" and source_selected_for_mode(s, mode)]
+    login_readiness: List[Dict[str, Any]] = []
+    for s in login_sources:
+        slots = (
+            await db.execute(
+                select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == s.source_name).order_by(BrowserSessionSlot.slot_number)
+            )
+        ).scalars().all()
+        login_readiness.append(
+            {
+                "source_name": s.source_name,
+                "state": s.state,
+                "slot_states": [{"slot": sl.slot_number, "state": sl.state, "reason": sl.state_reason} for sl in slots],
+                "blocked": [sl.slot_number for sl in slots if sl.state in ("EMPTY", "NEEDS_HUMAN_LOGIN", "HALTED")],
+            }
+        )
+
+    return {
+        "mode": mode,
+        "auto_switch": settings.HARVEST_AUTO_SWITCH,
+        "selected_sources": selected,
+        "dispatch_loop_seconds": settings.DISPATCH_LOOP_SECONDS,
+        "update_defaults": {"cadence_hours": settings.UPDATE_CADENCE_HOURS},
+        "backfill_defaults": {
+            "source_frequency_minutes": settings.BACKFILL_SOURCE_FREQUENCY_MINUTES,
+            "pages_per_hour": settings.BACKFILL_PAGES_PER_HOUR,
+            "pages_per_day": settings.BACKFILL_PAGES_PER_DAY,
+            "login_delay_min": settings.BACKFILL_LOGIN_DELAY_MIN,
+            "login_delay_max": settings.BACKFILL_LOGIN_DELAY_MAX,
+            "login_session_concurrency": settings.BACKFILL_LOGIN_SESSION_CONCURRENCY,
+        },
+        "progress": progress,
+        "last_change": {
+            "changed_at": metadata.get("harvest_mode_changed_at"),
+            "changed_by": metadata.get("harvest_mode_changed_by"),
+            "reason": metadata.get("harvest_mode_reason"),
+        },
+        "login_readiness": login_readiness,
+    }
+
+
+@router.post("/harvest-mode")
+async def set_mode(body: HarvestModeBody, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    mode = body.mode.strip().lower()
+    if mode not in ("backfill", "updates"):
+        raise HTTPException(422, "mode must be backfill|updates")
+    await set_harvest_mode(
+        db,
+        mode,  # type: ignore[arg-type]
+        changed_by=(body.changed_by or "dashboard"),
+        reason=(body.reason or ""),
+    )
+    if mode == "updates":
+        now = datetime.now(timezone.utc)
+        for s in (await db.execute(select(ScraperSource).where(ScraperSource.is_active.is_(True)))).scalars().all():
+            if source_selected_for_mode(s, "updates"):
+                s.next_scrape_at = now
+    await db.commit()
+    return await harvest_mode_status(db)
 
 
 @router.get("/{name}/status")
 async def status(name: str, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
-    return await source_view(db, await _source(db, name))
+    return await source_view(db, await _source(db, name), mode=await get_harvest_mode(db))
 
 
 @router.post("/{name}/trigger")
@@ -188,16 +314,48 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
         if s.state == "HALTED":
             raise HTTPException(409, "a HALTED source needs re_enable with reviewed_by")
         s.state, s.state_reason = "ACTIVE", None
+    elif body.action == "retry_now":
+        if s.state == "HALTED" and not body.reviewed_by:
+            raise HTTPException(422, "retry_now on HALTED sources requires reviewed_by")
+        s.state = "ACTIVE"
+        s.state_reason = f"retry requested by {body.reviewed_by or 'admin'}: {body.reason or ''}".strip()
+        s.requires_admin_review = False
+        s.next_scrape_at = now
+        cfg = dict(s.config_json or {})
+        cfg.pop("block_retry", None)
+        s.config_json = cfg
+        for sl in (
+            await db.execute(
+                select(BrowserSessionSlot).where(
+                    BrowserSessionSlot.source_name == s.source_name, BrowserSessionSlot.state == "HALTED"
+                )
+            )
+        ).scalars().all():
+            sl.state, sl.state_reason = (
+                "NEEDS_HUMAN_LOGIN",
+                "retry requested after block review; fresh human login required",
+            )
     elif body.action == "re_enable":
         if not body.reviewed_by:
             raise HTTPException(422, "re_enable requires reviewed_by (admin review of the block)")
         s.state, s.state_reason, s.requires_admin_review = "ACTIVE", f"re-enabled by {body.reviewed_by}: {body.reason or ''}", False
         for sl in (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == s.source_name, BrowserSessionSlot.state == "HALTED"))).scalars().all():
             sl.state, sl.state_reason = "NEEDS_HUMAN_LOGIN", "re-enabled after block review; fresh human login required"
+    elif body.action == "clear_block_retry":
+        cfg = dict(s.config_json or {})
+        cfg.pop("block_retry", None)
+        s.config_json = cfg
+        s.state_reason = body.reason or "block retry state cleared by admin"
     elif body.action == "disable":
         s.state, s.state_reason, s.is_active = "DISABLED", body.reason or "disabled by admin", False
+    elif body.action == "enable":
+        s.is_active = True
+        s.state = "ACTIVE"
+        s.state_reason = body.reason or "enabled by admin"
+        s.requires_admin_review = False
+        s.next_scrape_at = now
     else:
-        raise HTTPException(422, "action must be pause|resume|re_enable|disable")
+        raise HTTPException(422, "action must be pause|resume|retry_now|re_enable|clear_block_retry|disable|enable")
     s.state_changed_at = now
     await db.commit()
     return await source_view(db, s)
@@ -218,6 +376,24 @@ async def config(name: str, body: SourceConfig, db: AsyncSession = Depends(get_d
         s.document_cdn_hosts = [h.strip().lower() for h in body.document_cdn_hosts if h.strip()]
     if body.scrape_frequency_hours is not None:
         s.scrape_frequency_hours = body.scrape_frequency_hours
+    if body.update_frequency_hours is not None:
+        cfg["update_frequency_hours"] = int(body.update_frequency_hours)
+    if body.backfill_frequency_minutes is not None:
+        cfg["backfill_frequency_minutes"] = int(body.backfill_frequency_minutes)
+    if body.backfill_priority is not None:
+        cfg["backfill_priority"] = int(body.backfill_priority)
+    if body.backfill_enabled is not None:
+        cfg["backfill_enabled"] = bool(body.backfill_enabled)
+    if body.update_enabled is not None:
+        cfg["update_enabled"] = bool(body.update_enabled)
+    if body.auto_retry_on_block is not None:
+        cfg["auto_retry_on_block"] = bool(body.auto_retry_on_block)
+    if body.block_retry_cooldown_minutes is not None:
+        cfg["block_retry_cooldown_minutes"] = int(body.block_retry_cooldown_minutes)
+    if body.block_retry_max_attempts is not None:
+        cfg["block_retry_max_attempts"] = int(body.block_retry_max_attempts)
+    if cfg:
+        s.config_json = cfg
     if body.is_active is not None:
         s.is_active = body.is_active
     await db.commit()

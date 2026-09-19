@@ -67,7 +67,9 @@ validators and tests.
    Never from page one; no automatic recovery to the primary. Verification/login expiry → slot
    `NEEDS_HUMAN_LOGIN`, notify, pause if no valid slot. HTTP 403 / "account suspended" / "automated
    access" / CAPTCHA → source **HALTED**, notify, no slot switch, no proxy, no stealth, admin review.
-5. One login-session worker at a time (Redis lock; a second worker is refused).
+5. Login-session worker concurrency is environment-controlled (`LOGIN_SESSION_CONCURRENCY`, 1–2).
+   Backfill profile defaults can target dual slots (`BACKFILL_LOGIN_SESSION_CONCURRENCY=2`), while
+   continuity safeguards still require explicit human login in each slot.
 
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
@@ -77,7 +79,7 @@ settings validator refuses any other combination.
 | service | role |
 |---|---|
 | `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
-| `worker-scraper` | Celery, queue `login_session`, concurrency 1 (PakistanLawSite) |
+| `worker-scraper` | Celery, queue `login_session`, concurrency from `LOGIN_SESSION_CONCURRENCY` (1–2) |
 | `worker-public` | Celery, queues `scraper`, `maintenance` (public sources, promotion, treatment, archive, dispatch) |
 | `worker-embed` | Celery, queue `embeddings` |
 | `celery-beat` | schedules (see `scraper/tasks/celery_app.py`) |
@@ -131,18 +133,25 @@ locally), enter the `ADMIN_API_KEY`, and:
    `PLS_EARLIEST_YEAR`, `SGAI_API_KEY` (public sources), `SGAI_LOCAL_LLM_BASE_URL/MODEL`
    (PakistanLawSite AI assist), `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` (embeddings) in `.env`
    as the firm decides. Blank values stay conservative.
-2. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2,
-   then use **Login with saved credentials** or manual login in the stream; press *Complete* once
-   authenticated.
-3. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source; Beat also dispatches
-   on schedule. Extraction mode, AI enable and confidence threshold are per source.
-4. **Coverage** — tiers, reporter volumes, search maps, frontier.
-5. **Review queue / Check viewer** — promote or reject quarantined records with the raw text, the
+2. **Harvest mode** — in *Overview*, keep mode on **backfill** for initial download. This enables the
+   high-throughput pacing profile (`BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`,
+   `BACKFILL_LOGIN_DELAY_MIN/MAX`) and continuous source dispatch. Use **Backfill complete → switch
+   to updates** (or let auto-switch run when frontier is drained and targets are met) to move to
+   6-hour updates cadence.
+3. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2, then
+   use **Login with saved credentials** or manual login in the stream; press *Complete* once
+   authenticated. Fill slot 2 as well for dual-slot continuity during backfill.
+4. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source. In *Scheduler /
+   backfill controls* configure per-source update cadence, backfill cadence/priority, and optional
+   block-cooldown retries for stubborn HTTP 403 sources (for example, NasirLawSite).
+5. **Coverage** — tiers, reporter volumes, search maps, frontier.
+6. **Review queue / Check viewer** — promote or reject quarantined records with the raw text, the
    deterministic, AI and reconciled extractions and the audit trail side by side.
-6. **Archive storage** — add targets (`google_drive`, `dropbox`, `onedrive`, `s3_compatible`, `sftp`,
+7. **Archive storage** — add targets (`google_drive`, `dropbox`, `onedrive`, `s3_compatible`, `sftp`,
    `smb`, `local_path`); configuration is encrypted at rest and never echoed. *Mirror now* /
    *Reconcile storage*.
-7. **ScrapeGraph** — engine status, breakers, budget, usage ledger, public test URL.
+8. **ScrapeGraph** — engine status, breakers, budget, usage ledger, public test URL, and exact env
+   setup commands (`cloud/set_env.py`) for DigitalOcean droplet operators.
 
 Put the API behind TLS and network restrictions before exposing it; `/admin/*`, `/api/*` and the
 dashboard require `X-API-Key`.
@@ -175,6 +184,10 @@ Connection string for the application: `postgresql://sikander_reader:<SIKANDER_R
   (`SGAI_BUDGET_EXHAUSTED` → deterministic continues), timeout, retries, circuit breaker, fail-open.
 - Observability: `/admin/scrapegraph/status`, `/admin/scrapegraph/usage`,
   `/admin/scrapegraph/test-public` (configured PUBLIC URL only), `extraction_audit` table.
+- Runtime reminder: without `SGAI_API_KEY`, managed/hybrid extraction is disabled and deterministic
+  extraction remains active. Set keys on a droplet without exposing secrets on the command line:
+  `printf '%s' "$SGAI_API_KEY" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_API_KEY`, then
+  recreate API/worker/beat containers.
 - MCP is development tooling only: `docs/MCP_DEVELOPMENT.md`.
 
 ## Tests

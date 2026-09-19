@@ -51,7 +51,7 @@ app.conf.update(
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
     },
     beat_schedule={
-        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": 1800},
+        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900},
         "reconcile-instrument-relations": {
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",

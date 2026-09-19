@@ -1,14 +1,14 @@
 """
 Source orchestrator (Amendment §1). Routes a source job to its connector, records a scraper_jobs
 row, and enforces the state machine: HALTED/DISABLED/PAUSED sources are never run; login-session
-sources run only on the `login_session` queue (concurrency 1) and only when permitted.
+sources run only on the `login_session` queue.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from celery import shared_task
@@ -16,6 +16,15 @@ from sqlalchemy import select
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
+from scraper.harvest_mode import (
+    backfill_progress,
+    cadence_for_source,
+    get_harvest_mode,
+    selected_source_names,
+    set_harvest_mode,
+    source_backfill_priority,
+    source_selected_for_mode,
+)
 from scraper.models import ScraperJob, ScraperSource
 from scraper.notify import notify
 
@@ -102,8 +111,43 @@ async def dispatch_due_sources() -> Dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     queued = []
+    mode = settings.HARVEST_MODE
+    auto_switched = False
     async with SessionLocal() as db:
-        for s in (await db.execute(select(ScraperSource).where(ScraperSource.is_active.is_(True), ScraperSource.state == "ACTIVE"))).scalars().all():
+        mode = await get_harvest_mode(db)
+        if mode == "backfill" and settings.HARVEST_AUTO_SWITCH:
+            selected = await selected_source_names(db, "backfill")
+            progress = await backfill_progress(db, source_names=selected)
+            if progress["complete"]:
+                await set_harvest_mode(
+                    db,
+                    "updates",
+                    changed_by="system",
+                    reason=(
+                        "auto-switch: frontier drained"
+                        f", judgments={progress['judgments_total']}, statutes={progress['statutes_total']}"
+                    ),
+                )
+                await notify(
+                    db,
+                    level="info",
+                    code="HARVEST_MODE_SWITCHED",
+                    message="Backfill completion criteria met; switched to updates cadence.",
+                    source_name=None,
+                    details=progress,
+                )
+                mode = "updates"
+                auto_switched = True
+        rows = (
+            await db.execute(
+                select(ScraperSource).where(ScraperSource.is_active.is_(True), ScraperSource.state == "ACTIVE")
+            )
+        ).scalars().all()
+        if mode == "backfill":
+            rows.sort(key=source_backfill_priority)
+        for s in rows:
+            if not source_selected_for_mode(s, mode):
+                continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
                 continue
@@ -111,12 +155,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
-            from datetime import timedelta
-
-            s.next_scrape_at = now + timedelta(hours=s.scrape_frequency_hours or 24)
+            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
             queued.append(s.source_name)
         await db.commit()
-    return {"queued": queued}
+    return {"mode": mode, "auto_switched": auto_switched, "queued": queued}
 
 
 @shared_task(name="scraper.tasks.dispatcher.dispatch_due_sources")

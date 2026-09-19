@@ -112,6 +112,19 @@ Re-running the same command later (with the token lines again while private) upd
 5. **Sources**: public courts, PakistanCode, the legislatures and the Gazette run on their own
    schedule. The Supreme Court website's robots.txt disallows its judgment path; that source halts
    for your review as the contract requires.
+6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for full-speed initial harvest.
+   Backfill defaults are controlled by environment values such as:
+   `BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`, `BACKFILL_LOGIN_DELAY_MIN/MAX`,
+   `BACKFILL_SOURCE_FREQUENCY_MINUTES`, and `BACKFILL_LOGIN_SESSION_CONCURRENCY`.
+   When frontier is drained and your target counts are met, switch to `updates` mode from the
+   dashboard (or let auto-switch do it) to run selected sources every six hours by default.
+7. **ScrapeGraph setup**: if `/admin/scrapegraph/status` shows `SGAI_API_KEY` as NOT CONFIGURED,
+   managed/hybrid extraction will not run. Set the key on-server without putting it on a command
+   line:
+   `printf '%s' "$SGAI_API_KEY" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_API_KEY`.
+   Use the same helper for `SGAI_DAILY_CREDIT_CAP` and `SGAI_PUBLIC_TEST_URL`.
+   Then recreate runtime containers:
+   `cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-scraper celery-beat`.
 
 ## 4. Operating
 

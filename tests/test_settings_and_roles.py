@@ -38,9 +38,18 @@ def test_local_mode_without_endpoint_requires_fail_open():
     assert Settings(**BASE, SGAI_MODE="scrapegraph_local", SGAI_FAIL_OPEN_TO_DETERMINISTIC=True)
 
 
-def test_login_session_concurrency_is_one():
+def test_login_session_concurrency_allows_up_to_two():
+    assert Settings(**BASE, LOGIN_SESSION_CONCURRENCY=2)
     with pytest.raises(ValidationError):
-        Settings(**BASE, LOGIN_SESSION_CONCURRENCY=2)
+        Settings(**BASE, LOGIN_SESSION_CONCURRENCY=3)
+
+
+def test_harvest_mode_settings_validate():
+    assert Settings(**BASE, HARVEST_MODE="backfill")
+    with pytest.raises(ValidationError):
+        Settings(**BASE, HARVEST_MODE="turbo")
+    with pytest.raises(ValidationError):
+        Settings(**BASE, BACKFILL_LOGIN_SESSION_CONCURRENCY=3)
 
 
 def test_every_required_sgai_setting_exists():

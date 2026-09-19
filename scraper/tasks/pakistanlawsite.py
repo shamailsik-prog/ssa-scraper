@@ -42,6 +42,7 @@ from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
+from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import CrawlCoverage, CrawlFrontier, ScraperSource, StatuteSection, Statute
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -165,6 +166,8 @@ class PakistanLawSitePipeline:
         self.sleep = sleep
         self._session_lock: Optional[SessionLock] = None
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self.harvest_mode = "updates"
+        self.pacing_profile = login_pacing_profile("updates")
 
     # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
     async def _charge_page(self) -> None:
@@ -186,11 +189,13 @@ class PakistanLawSitePipeline:
         self.source.config_json = cfg
         self.stats["pages_charged"] += 1
         await self.db.flush()
-        if pacing["day_pages"] > settings.PAGES_PER_DAY:
-            raise PacingBudgetExceeded(f"PAGES_PER_DAY={settings.PAGES_PER_DAY} spent for {day_key}")
-        if pacing["hour_pages"] > settings.PAGES_PER_HOUR:
-            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={settings.PAGES_PER_HOUR} spent for {hour_key}")
-        await self.sleep(random.uniform(settings.LOGIN_DELAY_MIN, settings.LOGIN_DELAY_MAX))
+        pages_per_day = int(self.pacing_profile["pages_per_day"])
+        pages_per_hour = int(self.pacing_profile["pages_per_hour"])
+        if pacing["day_pages"] > pages_per_day:
+            raise PacingBudgetExceeded(f"PAGES_PER_DAY={pages_per_day} spent for {day_key}")
+        if pacing["hour_pages"] > pages_per_hour:
+            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={pages_per_hour} spent for {hour_key}")
+        await self.sleep(random.uniform(float(self.pacing_profile["login_delay_min"]), float(self.pacing_profile["login_delay_max"])))
 
     # ---------------------------------------------------------------- guards
     def _assert_permitted(self) -> None:
@@ -403,6 +408,15 @@ class PakistanLawSitePipeline:
     # ---------------------------------------------------------------- main loop
     async def run(self, *, max_queries: int = 20, max_probes_per_volume: int = 60) -> Dict[str, Any]:
         self._assert_permitted()
+        self.harvest_mode = await get_harvest_mode(self.db)
+        self.pacing_profile = login_pacing_profile(self.harvest_mode)
+        self.stats["harvest_mode"] = self.harvest_mode
+        self.stats["pacing_profile"] = {
+            "pages_per_hour": self.pacing_profile["pages_per_hour"],
+            "pages_per_day": self.pacing_profile["pages_per_day"],
+            "login_delay_min": self.pacing_profile["login_delay_min"],
+            "login_delay_max": self.pacing_profile["login_delay_max"],
+        }
         lock = SessionLock(SOURCE_NAME, self.redis_client)
         try:
             await lock.acquire()
