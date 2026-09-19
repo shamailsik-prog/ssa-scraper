@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from uuid import UUID
 
 from celery import shared_task
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -379,8 +379,9 @@ def _norm_section_key(value: Any) -> Optional[str]:
     raw = str(value or "").strip()
     if not raw:
         return None
-    if re.search(r"[,&]", raw):
-        return None  # fail-closed: one edge requires one concrete section target.
+    # Fail closed on list/range references: one graph edge must resolve to one concrete section.
+    if re.search(r"[,&]|\b(?:and|or|to)\b|[0-9A-Z]+\s*/\s*[0-9A-Z]+", raw, flags=re.I):
+        return None
     cleaned = raw.replace("–", "-").replace("—", "-")
     cleaned = re.sub(r"(?i)^(?:section|sec\.?|s\.?|article|art\.?|rule|r\.?)\s+", "", cleaned)
     cleaned = re.sub(r"\s+", "", cleaned).rstrip(".,;:")
@@ -948,10 +949,19 @@ async def reconcile_instrument_relations(
     }
     offset_key = "instrument_relation_reconcile_offset"
     async with SessionLocal() as db:
-        filters = (
+        base_recent_filter = and_(
             Instrument.created_at >= cutoff,
-            (Instrument.citation_mentions.isnot(None)) | (Instrument.statute_mentions.isnot(None)),
+            or_(Instrument.citation_mentions.isnot(None), Instrument.statute_mentions.isnot(None)),
         )
+        # Include unresolved section-link edges regardless of instrument age so late-arriving
+        # statute sections can backfill target_statute_section_id on the next reconcile pass.
+        unresolved_section_backfill_filter = exists(
+            select(InstrumentSectionRelation.id).where(
+                InstrumentSectionRelation.source_instrument_id == Instrument.id,
+                InstrumentSectionRelation.target_statute_section_id.is_(None),
+            )
+        )
+        filters = (or_(base_recent_filter, unresolved_section_backfill_filter),)
         total = (
             await db.execute(
                 select(func.count()).select_from(Instrument).where(*filters)

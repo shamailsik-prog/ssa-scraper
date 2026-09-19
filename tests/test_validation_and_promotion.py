@@ -755,22 +755,197 @@ async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db)
     assert amended[0].target_instrument_id == target_instrument.id
 
 
-async def test_instrument_section_relation_reconcile_backfills_and_is_idempotent(db):
+async def test_instrument_section_relation_reconcile_backfills_late_article_and_rule_targets(db):
     source = (
         await db.execute(
-            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+            select(ScraperSource).where(ScraperSource.source_name == "NasirLawSite"),
         )
     ).scalars().first()
+    assert source is not None
+
+    async def _promote_instrument(text: str, url: str, *, affected_statute: str | None = None) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        out = await HybridExtractor(db, source).extract_instrument(
+            text=text,
+            source_meta={"url": url},
+            content_hash=prov.content_hash,
+        )
+        if affected_statute:
+            out.data["affected_statute"] = affected_statute
+        staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (
+            await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))
+        ).scalars().first()
+
+    article_instrument = await _promote_instrument(
+        """
+        NOTIFICATION
+        In the Constitution of Pakistan, 1973, Article 10A shall be substituted.
+        """,
+        "http://127.0.0.1/reconcile-article-late-target.txt",
+    )
+    rule_instrument = await _promote_instrument(
+        """
+        NOTIFICATION
+        In the Sample Compliance Rules, 2025, Rule 3A shall be omitted.
+        """,
+        "http://127.0.0.1/reconcile-rule-late-target.txt",
+        affected_statute="Sample Compliance Rules, 2025",
+    )
+    assert article_instrument is not None and rule_instrument is not None
+
+    initial_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id.in_(
+                    [article_instrument.id, rule_instrument.id],
+                )
+            )
+        )
+    ).scalars().all()
+    assert len(initial_edges) == 2
+    edges_by_source = {edge.source_instrument_id: edge for edge in initial_edges}
+    article_edge = edges_by_source[article_instrument.id]
+    rule_edge = edges_by_source[rule_instrument.id]
+    assert article_edge.target_section_key == "10A"
+    assert rule_edge.target_section_key == "3A"
+    assert article_edge.target_statute_section_id is None
+    assert rule_edge.target_statute_section_id is None
+
+    old_created_at = datetime.now(timezone.utc) - timedelta(days=30)
+    await db.execute(
+        update(Instrument)
+        .where(Instrument.id.in_([article_instrument.id, rule_instrument.id]))
+        .values(created_at=old_created_at)
+    )
+
+    async def _promote_late_section(
+        *,
+        statute_name: str,
+        section_number: str,
+        section_text: str,
+        url: str,
+    ) -> StatuteSection:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=section_text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=section_text,
+            url=url,
+            kind="statute",
+        )
+        staging.status = "extracted"
+        staging.reconciled_json = {
+            "statute_name": statute_name,
+            "jurisdiction": "Federal",
+            "statute_type": "act",
+            "sections": [
+                {
+                    "section_number": section_number,
+                    "section_text": section_text,
+                    "section_title": "late-arriving section",
+                }
+            ],
+        }
+        assert await promote_statute_staging(db, staging) == "promoted"
+        statute = (
+            await db.execute(select(Statute).where(Statute.id == staging.promoted_to_id))
+        ).scalars().first()
+        key = promotion_task_module._norm_section(section_number)
+        return (
+            await db.execute(
+                select(StatuteSection).where(
+                    StatuteSection.statute_id == statute.id,
+                    StatuteSection.section_number == key,
+                )
+            )
+        ).scalars().first()
+
+    article_statute = (
+        await db.execute(select(Statute).where(Statute.id == article_edge.target_statute_id))
+    ).scalars().first()
+    rule_statute = (
+        await db.execute(select(Statute).where(Statute.id == rule_edge.target_statute_id))
+    ).scalars().first()
+    article_section = await _promote_late_section(
+        statute_name=article_statute.name,
+        section_number="Article 10-A",
+        section_text="Article 10-A.- Right to fair trial shall be ensured.",
+        url="http://127.0.0.1/reconcile-late-article-section.txt",
+    )
+    rule_section = await _promote_late_section(
+        statute_name=rule_statute.name,
+        section_number="Rule 3-A",
+        section_text="Rule 3-A.- Compliance procedure for renewals.",
+        url="http://127.0.0.1/reconcile-late-rule-section.txt",
+    )
+    assert article_section is not None and rule_section is not None
+    await db.commit()
+
+    first = await reconcile_instrument_relations(limit=50, lookback_hours=1)
+    assert first["processed"] >= 2
+    refreshed_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id.in_(
+                    [article_instrument.id, rule_instrument.id],
+                )
+            )
+        )
+    ).scalars().all()
+    refreshed_by_source = {edge.source_instrument_id: edge for edge in refreshed_edges}
+    assert refreshed_by_source[article_instrument.id].target_statute_section_id == article_section.id
+    assert refreshed_by_source[rule_instrument.id].target_statute_section_id == rule_section.id
+
+    second = await reconcile_instrument_relations(limit=50, lookback_hours=1)
+    assert second["section_edges_added"] == 0
+    assert second["section_edges_removed"] == 0
+
+
+async def test_instrument_section_relation_reconcile_skips_multi_target_section_mentions(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "NasirLawSite"),
+        )
+    ).scalars().first()
+    assert source is not None
+
     text = """
-    THE GAZETTE OF PAKISTAN EXTRAORDINARY
-    ACT No. XXXIV of 2025
-    An Act further to amend the Pakistan Penal Code, 1860.
-    In the Pakistan Penal Code, 1860, section 302 shall be substituted.
+    NOTIFICATION
+    ACT No. XL of 2025
+    In the Constitution of Pakistan, 1973, section 10A/10B shall be substituted.
     """
+    section_token = "10A/10B"
+    token_start = text.index(section_token)
+    token_end = token_start + len(section_token)
     prov = await record_provenance(
         db,
         source=source,
-        url="http://127.0.0.1/section-ops-reconcile.pdf",
+        url="http://127.0.0.1/multi-target-fail-closed.txt",
         content=text.encode("utf-8"),
         content_kind="text",
     )
@@ -780,30 +955,60 @@ async def test_instrument_section_relation_reconcile_backfills_and_is_idempotent
         prov=prov,
         raw_html=None,
         raw_text=text,
-        url="http://127.0.0.1/section-ops-reconcile.pdf",
+        url="http://127.0.0.1/multi-target-fail-closed.txt",
         kind="instrument",
     )
-    out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": "http://127.0.0.1/section-ops-reconcile.pdf"}, content_hash=prov.content_hash)
-    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    staging.status = "extracted"
+    staging.reconciled_json = {
+        "type": "act",
+        "number": "Act No. XL of 2025",
+        "full_text": text,
+        "affected_statute": "Constitution of Pakistan, 1973",
+        "citation_mentions": [
+            {
+                "raw": "Act No. XL of 2025",
+                "normalized": "Act No. XL of 2025",
+                "mention_type": "act_no",
+                "number": "XL",
+                "year": 2025,
+            }
+        ],
+        "statute_mentions": [
+            {
+                "raw": "section 10A/10B",
+                "normalized": "Constitution of Pakistan, 1973",
+                "canonical_statute_name": "Constitution of Pakistan, 1973",
+                "section_number": "10A/10B",
+                "span": [token_start, token_end],
+            }
+        ],
+    }
     assert await promote_statute_staging(db, staging) == "promoted"
-    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+    inst = (
+        await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))
+    ).scalars().first()
+    assert inst is not None
 
-    await db.execute(delete(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id))
-    await db.commit()
-
-    first = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
-    second = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
-    section_edges = (
+    before_edges = (
         await db.execute(
-            select(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id),
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id == inst.id,
+            )
         )
     ).scalars().all()
-    assert len(section_edges) == 1
-    assert section_edges[0].amendment_operation == "substitute"
-    assert section_edges[0].target_section_key == "302"
-    assert first["section_edges_added"] >= 1
-    assert second["section_edges_added"] == 0
-    assert second["section_edges_removed"] == 0
+    assert before_edges == []
+
+    await db.commit()
+    counts = await reconcile_instrument_relations(limit=20, lookback_hours=24 * 365)
+    assert counts["processed"] >= 1
+    after_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(
+                InstrumentSectionRelation.source_instrument_id == inst.id,
+            )
+        )
+    ).scalars().all()
+    assert after_edges == []
 
 
 async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db):
