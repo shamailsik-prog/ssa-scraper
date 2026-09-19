@@ -572,7 +572,7 @@ async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_va
     assert article_section.section_number == "10A"
     assert rule_section.section_number == "3A"
 
-    async def _promote_instrument(text: str, url: str) -> Instrument:
+    async def _promote_instrument(text: str, url: str, *, affected_statute: str | None = None) -> Instrument:
         prov = await record_provenance(
             db,
             source=source,
@@ -594,6 +594,8 @@ async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_va
             source_meta={"url": url},
             content_hash=prov.content_hash,
         )
+        if affected_statute:
+            out.data["affected_statute"] = affected_statute
         staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
         assert await promote_statute_staging(db, staging) == "promoted"
         return (
@@ -625,6 +627,7 @@ async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_va
         In the Sample Compliance Rules, 2025, Rule 3A shall be omitted.
         """,
         "http://127.0.0.1/nasir-rule-amendment.txt",
+        affected_statute="Sample Compliance Rules, 2025",
     )
     rule_edges = (
         await db.execute(
