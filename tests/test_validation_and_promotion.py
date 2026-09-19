@@ -5,14 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
-from scraper.models import Citation, Instrument, InstrumentRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
+from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
@@ -372,6 +372,108 @@ async def test_instrument_relation_graph_fails_closed_for_unresolved_targets(db)
     assert edges == []
 
 
+async def test_instrument_section_relation_graph_extracts_amendment_operations(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXVIII of 2025
+    An Act further to amend the Pakistan Penal Code, 1860.
+    2. Amendment of section 302 of the Pakistan Penal Code, 1860.- In the Pakistan Penal Code, 1860, for section 302, the following shall be substituted.
+    In the Pakistan Penal Code, 1860, section 304 shall be omitted.
+    In the Pakistan Penal Code, 1860, after section 299, the following new section shall be inserted, namely:— 299A.
+    In the Pakistan Penal Code, 1860, section 500 is hereby repealed.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/section-ops.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    staging = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/section-ops.pdf",
+        kind="instrument",
+    )
+    out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": "http://127.0.0.1/section-ops.pdf"}, content_hash=prov.content_hash)
+    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    assert await promote_statute_staging(db, staging) == "promoted"
+    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+    assert inst is not None
+
+    section_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.source_instrument_id == inst.id)
+            .order_by(InstrumentSectionRelation.amendment_operation.asc(), InstrumentSectionRelation.target_section_key.asc()),
+        )
+    ).scalars().all()
+    assert len(section_edges) == 4
+    observed = {(edge.amendment_operation, edge.target_section_key) for edge in section_edges}
+    assert observed == {
+        ("substitute", "302"),
+        ("omit", "304"),
+        ("insert", "299A"),
+        ("repeal", "500"),
+    }
+    assert all(edge.target_statute_id == inst.affected_statute_id for edge in section_edges)
+    assert all(edge.source_provenance_id == inst.source_provenance_id for edge in section_edges)
+    assert any("shall be substituted" in (edge.evidence_snippet or "").lower() for edge in section_edges)
+    assert any("is hereby repealed" in (edge.evidence_snippet or "").lower() for edge in section_edges)
+
+
+async def test_instrument_section_relation_graph_fails_closed_without_statute_target(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXIX of 2025
+    Section 10 shall be omitted.
+    Section 11 is hereby repealed.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/section-ops-no-statute.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    staging = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/section-ops-no-statute.pdf",
+        kind="instrument",
+    )
+    out = await HybridExtractor(db, source).extract_instrument(
+        text=text,
+        source_meta={"url": "http://127.0.0.1/section-ops-no-statute.pdf"},
+        content_hash=prov.content_hash,
+    )
+    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    assert await promote_statute_staging(db, staging) == "promoted"
+    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+    section_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id),
+        )
+    ).scalars().all()
+    assert section_edges == []
+
+
 async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db):
     source = (
         await db.execute(
@@ -439,6 +541,57 @@ async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db)
     amended = [e for e in edges if e.relation_type == "amended_by"]
     assert len(amended) == 1
     assert amended[0].target_instrument_id == target_instrument.id
+
+
+async def test_instrument_section_relation_reconcile_backfills_and_is_idempotent(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
+        )
+    ).scalars().first()
+    text = """
+    THE GAZETTE OF PAKISTAN EXTRAORDINARY
+    ACT No. XXXIV of 2025
+    An Act further to amend the Pakistan Penal Code, 1860.
+    In the Pakistan Penal Code, 1860, section 302 shall be substituted.
+    """
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/section-ops-reconcile.pdf",
+        content=text.encode("utf-8"),
+        content_kind="text",
+    )
+    staging = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=text,
+        url="http://127.0.0.1/section-ops-reconcile.pdf",
+        kind="instrument",
+    )
+    out = await HybridExtractor(db, source).extract_instrument(text=text, source_meta={"url": "http://127.0.0.1/section-ops-reconcile.pdf"}, content_hash=prov.content_hash)
+    staging.reconciled_json, staging.status, staging.confidence_score = out.data, "extracted", out.confidence
+    assert await promote_statute_staging(db, staging) == "promoted"
+    inst = (await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))).scalars().first()
+
+    await db.execute(delete(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id))
+    await db.commit()
+
+    first = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    second = await reconcile_instrument_relations(limit=100, lookback_hours=24 * 365)
+    section_edges = (
+        await db.execute(
+            select(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id),
+        )
+    ).scalars().all()
+    assert len(section_edges) == 1
+    assert section_edges[0].amendment_operation == "substitute"
+    assert section_edges[0].target_section_key == "302"
+    assert first["section_edges_added"] >= 1
+    assert second["section_edges_added"] == 0
+    assert second["section_edges_removed"] == 0
 
 
 async def test_instrument_relation_reconcile_keeps_ambiguous_targets_skipped(db):

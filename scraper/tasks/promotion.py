@@ -33,6 +33,7 @@ from scraper.models import (
     EmbeddingQueue,
     Instrument,
     InstrumentRelation,
+    InstrumentSectionRelation,
     Judge,
     Judgment,
     QuarantineQueue,
@@ -296,6 +297,26 @@ RELATION_PATTERNS = (
     ("superseded_by", re.compile(r"(?i)\b(?:is\s+)?superseded\s+by\b"), {"instrument"}),
     ("read_with", re.compile(r"(?i)\bread\s+with\b"), {"instrument", "statute"}),
 )
+AMENDMENT_OPERATION_RE = re.compile(
+    r"(?i)\b(?:(?:shall|may)\s+be|(?:is|are)\s+hereby|hereby|shall\s+stand\s+)?\s*(?P<lemma>inserted|substituted|omitted|repealed)\b"
+)
+AMENDMENT_OPERATION_MAP = {
+    "inserted": "insert",
+    "substituted": "substitute",
+    "omitted": "omit",
+    "repealed": "repeal",
+}
+SECTION_REFERENCE_RE = re.compile(
+    r"(?i)\b(?:section|sections|article|rule)\s+(?P<section>\d+[A-Z]?(?:\([A-Z0-9]+\))?(?:[-/][0-9A-Z]+)?)\b"
+)
+INSERT_BEFORE_TARGET_RE = re.compile(
+    r"(?i)\b(?:section|article|rule)\s+(?P<section>\d+[A-Z]?(?:\([A-Z0-9]+\))?(?:[-/][0-9A-Z]+)?)\s+(?:shall|may)\s+be\s+inserted\b"
+)
+INSERT_NAMELY_SECTION_RE = re.compile(
+    r"(?i)\bnamely\s*[:\-–—]*\s*(?:the\s+following\s+new\s+section\s+)?(?:section\s+)?(?P<section>\d+[A-Z]?(?:[-/][0-9A-Z]+)?)\b"
+)
+MAX_AMENDMENT_SCAN_CHARS = 120_000
+MAX_AMENDMENT_SECTION_MENTIONS = 800
 
 SRO_SIGNATURE_RE = re.compile(
     r"(?i)\bS\.?\s*R\.?\s*O\.?\s*(?:No\.?\s*)?(?P<number>[A-Z0-9]+(?:\s*\([A-Z0-9]+\))?)\s*(?:/|of)\s*(?P<year>18\d{2}|19\d{2}|20\d{2})\b"
@@ -336,6 +357,235 @@ def _relation_window_end(text: str, start: int, max_chars: int = 260) -> int:
     if boundary:
         return start + boundary.start()
     return min(len(text), start + max_chars)
+
+
+def _relation_window_start(text: str, end: int, max_chars: int = 220) -> int:
+    begin = max(0, end - max_chars)
+    segment = text[begin:end]
+    boundary_index = max(segment.rfind("."), segment.rfind(";"), segment.rfind("\n"))
+    if boundary_index >= 0:
+        return begin + boundary_index + 1
+    return begin
+
+
+def _norm_section_key(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.search(r"[,&]", raw):
+        return None  # fail-closed: one edge requires one concrete section target.
+    cleaned = re.sub(r"\s+", "", raw).rstrip(".,;:")
+    if not cleaned or not re.search(r"\d", cleaned):
+        return None
+    return cleaned.upper()
+
+
+def _collect_amendment_section_candidates(
+    *,
+    text: str,
+    statute_mentions: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    bounded_text = text[:MAX_AMENDMENT_SCAN_CHARS]
+    if not bounded_text:
+        return []
+    section_mentions: list[Dict[str, Any]] = []
+    for mention in statute_mentions[:MAX_AMENDMENT_SECTION_MENTIONS]:
+        if not isinstance(mention, dict):
+            continue
+        span = _valid_span(mention)
+        if span is None or span[1] > len(bounded_text):
+            continue
+        section_key = _norm_section_key(mention.get("section_number"))
+        if not section_key:
+            continue
+        raw = str(mention.get("raw") or "").strip()
+        if not raw:
+            continue
+        section_mentions.append(
+            {
+                "span": span,
+                "section_key": section_key,
+                "raw": raw,
+                "linked_statute_id": mention.get("linked_statute_id"),
+                "canonical_statute_name": mention.get("canonical_statute_name"),
+            }
+        )
+    linked_mentions = [
+        row
+        for row in section_mentions
+        if row.get("linked_statute_id") or row.get("canonical_statute_name")
+    ]
+
+    def _nearest_linked_context(span_start: int) -> tuple[Optional[Any], Optional[Any]]:
+        nearest = None
+        nearest_distance = None
+        for row in linked_mentions:
+            distance = abs(int(row["span"][0]) - span_start)
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                nearest = row
+        if nearest is not None and nearest_distance is not None and nearest_distance <= 260:
+            return nearest.get("linked_statute_id"), nearest.get("canonical_statute_name")
+        return None, None
+
+    seen_section_spans = {(int(row["span"][0]), int(row["span"][1]), row["section_key"]) for row in section_mentions}
+
+    def _append_synthetic_mention(*, span: tuple[int, int], section_value: str, raw: str) -> None:
+        section_key = _norm_section_key(section_value)
+        if not section_key:
+            return
+        dedupe = (int(span[0]), int(span[1]), section_key)
+        if dedupe in seen_section_spans:
+            return
+        linked_statute_id, canonical_statute_name = _nearest_linked_context(span[0])
+        section_mentions.append(
+            {
+                "span": span,
+                "section_key": section_key,
+                "raw": raw.strip(),
+                "linked_statute_id": linked_statute_id,
+                "canonical_statute_name": canonical_statute_name,
+            }
+        )
+        seen_section_spans.add(dedupe)
+
+    for match in SECTION_REFERENCE_RE.finditer(bounded_text):
+        section_value = str(match.group("section") or "").strip()
+        if not section_value:
+            continue
+        _append_synthetic_mention(
+            span=(match.start("section"), match.end("section")),
+            section_value=section_value,
+            raw=str(match.group(0) or section_value),
+        )
+    for match in INSERT_NAMELY_SECTION_RE.finditer(bounded_text):
+        section_value = str(match.group("section") or "").strip()
+        if not section_value:
+            continue
+        _append_synthetic_mention(
+            span=(match.start("section"), match.end("section")),
+            section_value=section_value,
+            raw=section_value,
+        )
+
+    if not section_mentions:
+        return []
+    section_mentions.sort(key=lambda row: row["span"][0])
+    edges: list[Dict[str, Any]] = []
+    seen = set()
+    for match in AMENDMENT_OPERATION_RE.finditer(bounded_text):
+        lemma = str(match.group("lemma") or "").lower()
+        operation = AMENDMENT_OPERATION_MAP.get(lemma)
+        if not operation:
+            continue
+        op_start, op_end = match.start(), match.end()
+        window_start = _relation_window_start(bounded_text, op_start)
+        window_end = _relation_window_end(bounded_text, op_end, max_chars=280)
+        before = [
+            row
+            for row in section_mentions
+            if window_start <= row["span"][0] and row["span"][1] <= op_start
+        ]
+        before.sort(key=lambda row: (op_start - row["span"][1], -(row["span"][1] - row["span"][0])))
+        after = [
+            row
+            for row in section_mentions
+            if op_end <= row["span"][0] and row["span"][1] <= window_end
+        ]
+        after.sort(key=lambda row: (row["span"][0] - op_end, row["span"][1] - row["span"][0]))
+
+        def _is_anchor_reference(row: Dict[str, Any]) -> bool:
+            prefix = bounded_text[max(0, row["span"][0] - 20) : row["span"][0]].lower()
+            return bool(re.search(r"\b(after|before)\s+(?:sections?|article|rule)?\s*$", prefix))
+
+        chosen = None
+        if operation == "insert":
+            explicit_section_key = None
+            explicit_section_span = None
+            before_slice_start = max(0, op_start - 220)
+            before_slice_end = min(len(bounded_text), op_end + 20)
+            explicit_before = INSERT_BEFORE_TARGET_RE.search(bounded_text[before_slice_start:before_slice_end])
+            if explicit_before:
+                explicit_section_key = _norm_section_key(explicit_before.group("section"))
+                explicit_section_span = (
+                    before_slice_start + explicit_before.start("section"),
+                    before_slice_start + explicit_before.end("section"),
+                )
+            else:
+                explicit_after = INSERT_NAMELY_SECTION_RE.search(
+                    bounded_text[op_end : min(len(bounded_text), op_end + 260)]
+                )
+                if explicit_after:
+                    explicit_section_key = _norm_section_key(explicit_after.group("section"))
+                    explicit_section_span = (
+                        op_end + explicit_after.start("section"),
+                        op_end + explicit_after.end("section"),
+                    )
+            if explicit_section_key:
+                matching_sections = [row for row in section_mentions if row["section_key"] == explicit_section_key]
+                if matching_sections:
+                    pivot = explicit_section_span[0] if explicit_section_span is not None else op_end
+                    matching_sections.sort(
+                        key=lambda row: (abs(row["span"][0] - pivot), abs(row["span"][1] - row["span"][0]))
+                    )
+                    chosen = matching_sections[0]
+            if chosen is None:
+                for row in after:
+                    if (row["span"][0] - op_end) <= 180 and not _is_anchor_reference(row):
+                        chosen = row
+                        break
+            if chosen is None:
+                for row in before:
+                    if (op_start - row["span"][1]) <= 180 and not _is_anchor_reference(row):
+                        chosen = row
+                        break
+
+        if chosen is None and before and (op_start - before[0]["span"][1]) <= 180:
+            chosen = before[0]
+        if chosen is None:
+            relaxed_after = [
+                row
+                for row in section_mentions
+                if op_end <= row["span"][0] and (row["span"][0] - op_end) <= 120
+            ]
+            relaxed_after.sort(key=lambda row: (row["span"][0] - op_end, row["span"][1] - row["span"][0]))
+            if relaxed_after:
+                chosen = relaxed_after[0]
+        if chosen is None:
+            relaxed_before = [
+                row
+                for row in section_mentions
+                if row["span"][1] <= op_start and (op_start - row["span"][1]) <= 180
+            ]
+            relaxed_before.sort(key=lambda row: (op_start - row["span"][1], -(row["span"][1] - row["span"][0])))
+            if relaxed_before:
+                chosen = relaxed_before[0]
+        if chosen is None:
+            continue
+        span_start = min(chosen["span"][0], op_start)
+        span_end = max(chosen["span"][1], op_end)
+        row = {
+            "amendment_operation": operation,
+            "relation_phrase": _norm_ws(match.group(0).lower()),
+            "target_mention_raw": chosen["raw"],
+            "target_section_key": chosen["section_key"],
+            "linked_statute_id": chosen.get("linked_statute_id"),
+            "canonical_statute_name": chosen.get("canonical_statute_name"),
+            "span_start": span_start,
+            "span_end": span_end,
+            "evidence_snippet": _snippet(bounded_text, span_start, span_end),
+        }
+        dedupe_key = (
+            row["amendment_operation"],
+            row["target_section_key"],
+            row["span_start"],
+            row["span_end"],
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        edges.append(row)
+    return edges
 
 
 def _instrument_reference_key(value: Optional[str]) -> str:
@@ -537,6 +787,81 @@ async def _resolve_target_statute_id(db: AsyncSession, target: Dict[str, Any]):
     return None
 
 
+async def _resolve_target_statute_section_id(
+    db: AsyncSession,
+    *,
+    target_statute_id,
+    target_section_key: str,
+):
+    section = (
+        await db.execute(
+            select(StatuteSection).where(
+                StatuteSection.statute_id == target_statute_id,
+                StatuteSection.section_number == target_section_key,
+            )
+        )
+    ).scalars().first()
+    if section is not None:
+        return section.id
+    # Relaxed fallback: spacing/punctuation differences between extractor and stored section.
+    for row in (await db.execute(select(StatuteSection).where(StatuteSection.statute_id == target_statute_id))).scalars().all():
+        if _norm_section_key(row.section_number) == target_section_key:
+            return row.id
+    return None
+
+
+async def _sync_instrument_section_relation_edges(db: AsyncSession, inst: Instrument) -> None:
+    text = inst.full_text or ""
+    statute_mentions = inst.statute_mentions if isinstance(inst.statute_mentions, list) else []
+    candidates = _collect_amendment_section_candidates(text=text, statute_mentions=statute_mentions)
+    await db.execute(delete(InstrumentSectionRelation).where(InstrumentSectionRelation.source_instrument_id == inst.id))
+    seen = set()
+    for edge in candidates:
+        target_statute_id = await _resolve_target_statute_id(db, edge)
+        if (
+            target_statute_id is None
+            and inst.affected_statute_id is not None
+            and not edge.get("linked_statute_id")
+            and not edge.get("canonical_statute_name")
+        ):
+            target_statute_id = inst.affected_statute_id
+        if target_statute_id is None:
+            continue  # fail-closed: unresolved statute target.
+        target_section_key = str(edge.get("target_section_key") or "").strip().upper()
+        if not target_section_key:
+            continue
+        dedupe_key = (
+            str(edge.get("amendment_operation") or ""),
+            str(target_statute_id),
+            target_section_key,
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        target_statute_section_id = await _resolve_target_statute_section_id(
+            db,
+            target_statute_id=target_statute_id,
+            target_section_key=target_section_key,
+        )
+        db.add(
+            InstrumentSectionRelation(
+                source_instrument_id=inst.id,
+                target_statute_id=target_statute_id,
+                target_statute_section_id=target_statute_section_id,
+                target_section_key=target_section_key[:120],
+                amendment_operation=str(edge["amendment_operation"])[:20],
+                relation_phrase=str(edge["relation_phrase"])[:120],
+                target_mention_raw=str(edge["target_mention_raw"])[:300],
+                span_start=int(edge["span_start"]),
+                span_end=int(edge["span_end"]),
+                evidence_snippet=str(edge["evidence_snippet"])[:500],
+                source_provenance_id=inst.source_provenance_id,
+                source_url=inst.source_url,
+            )
+        )
+    await db.flush()
+
+
 async def _sync_instrument_relation_edges(db: AsyncSession, inst: Instrument) -> None:
     text = inst.full_text or ""
     citation_mentions = inst.citation_mentions if isinstance(inst.citation_mentions, list) else []
@@ -576,6 +901,7 @@ async def _sync_instrument_relation_edges(db: AsyncSession, inst: Instrument) ->
                 source_url=inst.source_url,
             )
         )
+    await _sync_instrument_section_relation_edges(db, inst)
     await db.flush()
 
 
@@ -604,6 +930,10 @@ async def reconcile_instrument_relations(
         "edges_after": 0,
         "edges_added": 0,
         "edges_removed": 0,
+        "section_edges_before": 0,
+        "section_edges_after": 0,
+        "section_edges_added": 0,
+        "section_edges_removed": 0,
     }
     offset_key = "instrument_relation_reconcile_offset"
     async with SessionLocal() as db:
@@ -651,12 +981,26 @@ async def reconcile_instrument_relations(
                         .where(InstrumentRelation.source_instrument_id == inst.id)
                     )
                 ).scalar() or 0
+                section_before = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentSectionRelation)
+                        .where(InstrumentSectionRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
                 await _sync_instrument_relation_edges(db, inst)
                 after = (
                     await db.execute(
                         select(func.count())
                         .select_from(InstrumentRelation)
                         .where(InstrumentRelation.source_instrument_id == inst.id)
+                    )
+                ).scalar() or 0
+                section_after = (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(InstrumentSectionRelation)
+                        .where(InstrumentSectionRelation.source_instrument_id == inst.id)
                     )
                 ).scalar() or 0
                 counts["processed"] += 1
@@ -666,6 +1010,12 @@ async def reconcile_instrument_relations(
                     counts["edges_added"] += int(after - before)
                 else:
                     counts["edges_removed"] += int(before - after)
+                counts["section_edges_before"] += int(section_before)
+                counts["section_edges_after"] += int(section_after)
+                if section_after >= section_before:
+                    counts["section_edges_added"] += int(section_after - section_before)
+                else:
+                    counts["section_edges_removed"] += int(section_before - section_after)
                 await db.commit()
             except Exception:
                 await db.rollback()
@@ -727,6 +1077,17 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         for mention in statute_mentions:
             raw_name = str(mention.get("canonical_statute_name") or mention.get("statute_name") or "").strip()
             if not raw_name:
+                # Keep section-level mention spans when the instrument already has a resolved
+                # affected statute; this enables bounded amendment-op edge extraction later.
+                if aff is None or not mention.get("section_number"):
+                    continue
+                row = dict(mention)
+                row["canonical_statute_name"] = aff.name
+                row["linked_statute_id"] = str(aff.id)
+                linked_statute_mentions.append(row)
+                section_number = str(row.get("section_number") or "").strip()
+                if section_number:
+                    collected_sections.append(section_number)
                 continue
             canonical = canonicalise_statute_name(raw_name, mention.get("year")) or raw_name
             linked = await _resolve_statute_link(
