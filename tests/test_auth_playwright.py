@@ -317,6 +317,49 @@ async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_g
     assert not any(call[0] == "content" for call in page.calls)
 
 
+async def test_playwright_goto_passes_archived_grid_start_row_to_compact_snapshot():
+    page = _FakePage(html="<html><body>grid</body></html>")
+    page.dom_shape = {
+        "forms": 0,
+        "inputs": settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD + 1,
+        "has_archivedpatient_grid": True,
+        "archivedpatient_rows": 2,
+        "has_logout": True,
+        "body_preview": "citation table",
+    }
+    page.archived_grid_snapshot = {
+        "headers": ["Citation", "Title", "Court", "Read"],
+        "rows": [
+            {
+                "citation": "PLD 2024 SC 210",
+                "title": "A v C",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/210",
+                "pdf_url": None,
+            }
+        ],
+        "next_url": None,
+        "body_preview": "citation table",
+        "has_logout": True,
+        "total_rows": 20567,
+        "start_row": 200,
+        "requested_start_row": 200,
+        "seek_mode": "datatable",
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch", archived_grid_start_row=200)
+
+    snapshot_eval_call = next(
+        call for call in page.calls if call[0] == "evaluate" and "requested_start_row" in call[1]
+    )
+    assert snapshot_eval_call[2][1] == 200
+    assert result.metadata["start_row"] == 200
+    assert result.metadata["requested_start_row"] == 200
+    assert result.metadata["total_rows"] == 20567
+
+
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
     page = _FakePage(html=results_html([("PLD 2024 SC 1", "Party v State", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
     browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
@@ -777,6 +820,52 @@ async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_sou
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 4
 
 
+async def test_pipeline_citation_grid_cursor_advances_from_absolute_offset_past_200_rows(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    await _activate(db, login_source)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 200},
+    }
+    await db.commit()
+    rows = [
+        ("PLD 2024 SC 1201", "Case 1201", "Supreme Court", "https://www.pakistanlawsite.com/case/1201"),
+        ("PLD 2024 SC 1202", "Case 1202", "Supreme Court", "https://www.pakistanlawsite.com/case/1202"),
+        ("PLD 2024 SC 1203", "Case 1203", "Supreme Court", "https://www.pakistanlawsite.com/case/1203"),
+    ]
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda _browser: PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=_archived_grid_html(rows),
+        status=200,
+        metadata={"total_rows": 20567, "start_row": 200, "requested_start_row": 200, "seek_mode": "datatable"},
+    )
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    start_instances = len(FakeBrowser.instances)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/1201", "https://www.pakistanlawsite.com/case/1202"]
+    assert stats["citation_grid_offset"] == 200
+    assert stats["citation_grid_next_offset"] == 202
+    assert stats["staged"] > 0
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 202
+    assert len(FakeBrowser.instances) > start_instances
+    search_calls = [
+        call
+        for call in FakeBrowser.instances[start_instances].calls
+        if call[0] == "goto" and call[1] == settings.PLS_SEARCH_URL
+    ]
+    assert any(call[3].get("archived_grid_start_row") == 200 for call in search_calls)
+
+
 async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_end(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
@@ -903,11 +992,46 @@ async def test_pipeline_citation_grid_cursor_wraps_at_end(db, login_source, monk
     await db.commit()
     await r.aclose()
     detail_calls_run2 = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
-    assert detail_calls_run2 == ["https://www.pakistanlawsite.com/case/503", "https://www.pakistanlawsite.com/case/501"]
+    assert detail_calls_run2 == ["https://www.pakistanlawsite.com/case/503"]
     assert stats2["citation_grid_offset"] == 2
-    assert stats2["citation_grid_next_offset"] == 1
-    assert stats2["duplicates"] >= 1
-    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 1
+    assert stats2["citation_grid_next_offset"] == 0
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 0
+
+
+async def test_pipeline_citation_grid_cursor_wraps_only_after_absolute_total_rows_exhausted(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 5)
+    await _activate(db, login_source)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 20566},
+    }
+    await db.commit()
+    rows = [
+        ("PLD 2024 SC 20567", "Case 20567", "Supreme Court", "https://www.pakistanlawsite.com/case/20567"),
+    ]
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda _browser: PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=_archived_grid_html(rows),
+        status=200,
+        metadata={"total_rows": 20567, "start_row": 20566, "requested_start_row": 20566, "seek_mode": "datatable"},
+    )
+    sc.page(
+        ("goto", "https://www.pakistanlawsite.com/case/20567"),
+        judgment_html("PLD 2024 SC 20567", title="Case 20567"),
+    )
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["citation_grid_offset"] == 20566
+    assert stats["citation_grid_next_offset"] == 0
+    assert stats["staged"] == 1
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 0
 
 
 async def test_pipeline_citation_grid_raises_when_rows_have_no_detail_urls(db, login_source, monkeypatch):
