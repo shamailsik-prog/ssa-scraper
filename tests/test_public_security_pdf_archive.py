@@ -278,6 +278,47 @@ async def test_login_session_mirror_policy_flag_respected(db, source, tmp_path, 
     assert r3["summary"]["pol"]["written"] >= 3 and (root / judgment_prefix(j) / "judgment.txt").exists()
 
 
+async def test_http_fetcher_sets_browser_like_accept_headers(source):
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        assert fetcher._client is not None
+        headers = fetcher._client.headers
+        assert headers["User-Agent"] == settings.SCRAPER_USER_AGENT
+        assert headers["Accept"] == "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        assert headers["Accept-Language"] == "en-US,en;q=0.9"
+
+
+@pytest.mark.parametrize("initial_status", ["done", "retired"])
+async def test_run_public_source_refresh_reopens_finished_or_retired_seed(db, source, fixture_server, initial_status):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    listing_url = fixture_server.add("/refresh-seed", "<html><body>seed</body></html>")
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"listing:{listing_url}",
+        query_json={"kind": "listing", "url": listing_url, "target_kind": "judgment", "depth": 0},
+        cursor_json={},
+        priority=30,
+        status=initial_status,
+        attempts=2,
+        last_error="old error",
+    )
+    db.add(row)
+    await db.flush()
+
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        await run_public_source(
+            db,
+            source,
+            seed_listings=[{"url": listing_url, "target_kind": "judgment", "refresh": True}],
+            fetcher=fetcher,
+            limit=0,
+        )
+
+    assert row.status == "pending"
+    assert row.last_error is None
+    assert row.attempts == 0
+
+
 # --------------------------------------------------------------------------- public run end-to-end
 async def test_public_source_listing_to_promotion(db, source, fixture_server, monkeypatch):
     fixture_server.add("/robots.txt", "", status=404)
