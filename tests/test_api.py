@@ -82,10 +82,10 @@ def test_pls_status_shows_citation_grid_cursor_progress(client, admin_headers):
             cfg = dict(source.config_json or {})
             cfg["citation_grid_cursor"] = {
                 "row_offset": "17",
-                "offset_before": "14",
-                "offset_after": "17",
-                "staged_this_flush": "2",
-                "processed_rows": "3",
+                "last_start_offset": "14",
+                "last_take_count": "3",
+                "last_rows_seen": "90",
+                "last_total_rows": "120",
                 "updated_at": "2026-09-20T21:00:00+00:00",
             }
             source.config_json = cfg
@@ -97,7 +97,7 @@ def test_pls_status_shows_citation_grid_cursor_progress(client, admin_headers):
     assert progress["source_name"] == "PakistanLawSite"
     assert progress["job_key"] == "PakistanLawSite:archivedpatientGrid"
     assert progress["citation_grid_cursor"]["row_offset"] == 17
-    assert progress["last_flush"] == {"offset_before": 14, "offset_after": 17, "staged_this_flush": 2, "processed_rows": 3}
+    assert progress["last_flush"] == {"offset_before": 14, "offset_after": 17, "processed_rows": 3}
 
     rows = client.get("/admin/sources", headers=admin_headers).json()
     pls = next(r for r in rows if r["source_name"] == "PakistanLawSite")

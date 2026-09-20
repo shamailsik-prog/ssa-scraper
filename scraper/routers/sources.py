@@ -97,16 +97,20 @@ def _citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[
         "citation_grid_cursor": cursor_view,
     }
     last_flush: Dict[str, Any] = {}
+    last_start_offset = _to_int_or_none(cursor.get("last_start_offset"))
+    if last_start_offset is not None:
+        last_flush["offset_before"] = last_start_offset
+    if row_offset is not None:
+        last_flush["offset_after"] = row_offset
+    last_take_count = _to_int_or_none(cursor.get("last_take_count"))
+    if last_take_count is not None:
+        last_flush["processed_rows"] = last_take_count
     for field in ("offset_before", "offset_after", "staged_this_flush", "processed_rows"):
+        if field in last_flush:
+            continue
         parsed = _to_int_or_none(cursor.get(field))
         if parsed is not None:
             last_flush[field] = parsed
-    if "offset_after" not in last_flush and row_offset is not None:
-        last_flush["offset_after"] = row_offset
-    if "processed_rows" not in last_flush:
-        last_take_count = _to_int_or_none(cursor.get("last_take_count"))
-        if last_take_count is not None:
-            last_flush["processed_rows"] = last_take_count
     if last_flush:
         status["last_flush"] = last_flush
     return status
