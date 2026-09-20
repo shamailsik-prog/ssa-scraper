@@ -181,6 +181,14 @@ class Settings(BaseSettings):
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
     PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=1200, description="Maximum rows to materialize from #archivedpatientGrid when oversized-page guard compacts HTML.")
+    PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS: int = Field(
+        default=15000,
+        description="Hard timeout for compact archived-grid snapshot capture on oversized citation surfaces.",
+    )
+    PLS_ARCHIVED_GRID_BATCH_ROWS: int = Field(
+        default=120,
+        description="Rows extracted per Playwright evaluate() batch while compacting #archivedpatientGrid.",
+    )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
@@ -310,6 +318,8 @@ class Settings(BaseSettings):
         "PLAYWRIGHT_MAX_HTML_BYTES",
         "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
         "PLS_ARCHIVED_GRID_MAX_ROWS",
+        "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS",
+        "PLS_ARCHIVED_GRID_BATCH_ROWS",
         mode="before",
     )
     @classmethod
@@ -403,6 +413,10 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
+        if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS must be positive")
+        if self.PLS_ARCHIVED_GRID_BATCH_ROWS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_BATCH_ROWS must be positive")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:

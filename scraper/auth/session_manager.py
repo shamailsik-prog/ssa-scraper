@@ -364,10 +364,14 @@ class PlaywrightBrowser:
             )
         )
 
-    async def _capture_archived_grid_snapshot(self) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _snapshot_timeout_seconds() -> float:
+        return max(float(settings.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS) / 1000.0, 0.1)
+
+    async def _capture_archived_grid_meta(self) -> Optional[Dict[str, Any]]:
         return await self._wrap(
             self._page.evaluate(
-                """(maxRows) => {
+                """() => {
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
                     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
@@ -385,15 +389,47 @@ class PlaywrightBrowser:
                         .map((h, idx) => ({ h, idx }))
                         .filter((entry) => !entry.h.includes('read'))
                         .map((entry) => entry.idx);
-                    const citationIdx = pickIndex(['citation'], nonReadIndexes[0] ?? 0);
-                    const titleIdx = pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1);
-                    const courtIdx = pickIndex(['court'], nonReadIndexes[2] ?? 2);
+                    const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
+                    const nextDisabled = nextLink ? (nextLink.classList.contains('disabled') || nextLink.parentElement?.classList.contains('disabled')) : true;
+                    const bodyRows = (table.tBodies && table.tBodies[0] ? table.tBodies[0].rows : []);
+                    return {
+                        headers,
+                        row_count: bodyRows.length,
+                        citation_idx: pickIndex(['citation'], nonReadIndexes[0] ?? 0),
+                        title_idx: pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1),
+                        court_idx: pickIndex(['court'], nonReadIndexes[2] ?? 2),
+                        next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
+                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2500),
+                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
+                    };
+                }"""
+            )
+        )
+
+    async def _capture_archived_grid_batch(
+        self,
+        start: int,
+        end: int,
+        *,
+        citation_idx: int,
+        title_idx: int,
+        court_idx: int,
+    ) -> List[Dict[str, Any]]:
+        return await self._wrap(
+            self._page.evaluate(
+                """(start, end, citationIdx, titleIdx, courtIdx) => {
+                    const table = document.querySelector('#archivedpatientGrid');
+                    if (!table) return [];
+                    const bodyRows = (table.tBodies && table.tBodies[0] ? table.tBodies[0].rows : []);
+                    const capStart = Math.max(0, start || 0);
+                    const capEnd = Math.max(capStart, end || 0);
+                    const upper = Math.min(capEnd, bodyRows.length);
                     const cellAt = (cells, idx) => (idx >= 0 && idx < cells.length ? (cells[idx] || '') : '');
-                    const rows = [];
-                    const trNodes = Array.from(table.querySelectorAll('tbody tr')).slice(0, maxRows);
-                    for (const tr of trNodes) {
-                        const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
-                        const anchors = Array.from(tr.querySelectorAll('a[href]'));
+                    const out = [];
+                    for (let i = capStart; i < upper; i += 1) {
+                        const tr = bodyRows[i];
+                        const cells = Array.from(tr.cells || []).map((td) => (td.textContent || '').trim());
+                        const anchors = tr.querySelectorAll('a[href]');
                         let detailUrl = null;
                         let pdfUrl = null;
                         for (const a of anchors) {
@@ -409,7 +445,8 @@ class PlaywrightBrowser:
                             const readControl = tr.querySelector('input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]');
                             let caseTypeId = (readControl && readControl.getAttribute('casetypeid')) ? readControl.getAttribute('casetypeid').trim() : '';
                             if (!caseTypeId) {
-                                const idMatch = (tr.innerHTML || '').match(/casetypeid\\s*=\\s*['"]?([^'"\\s>]+)/i);
+                                const htmlSnippet = (tr.innerHTML || '').slice(0, 4000);
+                                const idMatch = htmlSnippet.match(/casetypeid\\s*=\\s*['"]?([^'"\\s>]+)/i);
                                 if (idMatch && idMatch[1]) {
                                     caseTypeId = idMatch[1].trim();
                                 }
@@ -418,7 +455,7 @@ class PlaywrightBrowser:
                                 detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&&court= &&Row=0 &&bookName=undefined`;
                             }
                         }
-                        rows.push({
+                        out.push({
                             citation: cellAt(cells, citationIdx),
                             title: cellAt(cells, titleIdx),
                             court: cellAt(cells, courtIdx),
@@ -426,19 +463,83 @@ class PlaywrightBrowser:
                             pdf_url: pdfUrl,
                         });
                     }
-                    const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
-                    const nextDisabled = nextLink ? (nextLink.classList.contains('disabled') || nextLink.parentElement?.classList.contains('disabled')) : true;
-                    return {
-                        headers,
-                        rows,
-                        next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
-                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2500),
-                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                    };
+                    return out;
                 }""",
-                int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                int(start),
+                int(end),
+                int(citation_idx),
+                int(title_idx),
+                int(court_idx),
             )
         )
+
+    async def _capture_archived_grid_snapshot(self) -> Optional[Dict[str, Any]]:
+        timeout_s = self._snapshot_timeout_seconds()
+        row_cap = int(settings.PLS_ARCHIVED_GRID_MAX_ROWS)
+        batch_rows = max(1, int(settings.PLS_ARCHIVED_GRID_BATCH_ROWS))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            meta = await asyncio.wait_for(self._capture_archived_grid_meta(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "archivedpatientGrid compact snapshot timed out before metadata for slot=%s url=%s timeout_ms=%s",
+                self.slot_number,
+                self._page.url,
+                settings.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS,
+            )
+            return None
+        if not meta:
+            return None
+        row_count = int(meta.get("row_count") or 0)
+        target_rows = min(row_count, row_cap)
+        rows: List[Dict[str, Any]] = []
+        timed_out = False
+        while len(rows) < target_rows:
+            remaining = timeout_s - (loop.time() - started)
+            if remaining <= 0:
+                timed_out = True
+                break
+            start = len(rows)
+            end = min(start + batch_rows, target_rows)
+            try:
+                batch = await asyncio.wait_for(
+                    self._capture_archived_grid_batch(
+                        start,
+                        end,
+                        citation_idx=int(meta.get("citation_idx") or 0),
+                        title_idx=int(meta.get("title_idx") or 1),
+                        court_idx=int(meta.get("court_idx") or 2),
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                break
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < (end - start):
+                break
+        if timed_out:
+            logger.warning(
+                "archivedpatientGrid compact snapshot timed out after %s/%s rows for slot=%s url=%s timeout_ms=%s",
+                len(rows),
+                target_rows,
+                self.slot_number,
+                self._page.url,
+                settings.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS,
+            )
+        return {
+            "headers": meta.get("headers") or [],
+            "rows": rows,
+            "row_count": row_count,
+            "row_cap": row_cap,
+            "next_url": meta.get("next_url"),
+            "body_preview": meta.get("body_preview"),
+            "has_logout": bool(meta.get("has_logout")),
+            "snapshot_timed_out": timed_out,
+        }
 
     @staticmethod
     def _render_compact_archived_grid_html(snapshot: Dict[str, Any]) -> str:
@@ -506,7 +607,10 @@ class PlaywrightBrowser:
                     "forms": int(dom.get("forms") or 0),
                     "content_length": content_length,
                     "rows": len(snapshot.get("rows") or []),
-                    "row_cap": int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                    "rows_available": int(snapshot.get("row_count") or 0),
+                    "row_cap": int(snapshot.get("row_cap") or settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                    "snapshot_timed_out": bool(snapshot.get("snapshot_timed_out")),
+                    "compact_rows": list(snapshot.get("rows") or []),
                 }
         if oversized:
             logger.warning(

@@ -254,9 +254,21 @@ class PakistanLawSitePipeline:
             return page
 
         page = await self.runner.run(op)
-        extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
-        outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
-        rows = outcome.data.get("result_rows") or []
+        rows: List[Dict[str, Any]]
+        compact_rows = (page.metadata or {}).get("compact_rows")
+        if isinstance(compact_rows, list):
+            rows = [dict(r) for r in compact_rows if isinstance(r, dict)]
+            logger.info(
+                "PakistanLawSite citation-grid compact snapshot rows=%s rows_available=%s row_cap=%s timed_out=%s",
+                len(rows),
+                (page.metadata or {}).get("rows_available"),
+                (page.metadata or {}).get("row_cap"),
+                bool((page.metadata or {}).get("snapshot_timed_out")),
+            )
+        else:
+            extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
+            outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
+            rows = outcome.data.get("result_rows") or []
         m = await active_map(self.db, SOURCE_NAME)
         if m is not None:
             await record_parse_result(self.db, m, ok=bool(rows), source_name=SOURCE_NAME)
@@ -267,6 +279,14 @@ class PakistanLawSitePipeline:
         if not rows:
             self.stats["misses"] += 1
             return
+        detail_candidates = sum(1 for row in rows if row.get("detail_url") or row.get("pdf_url"))
+        self.stats["detail_candidates"] = detail_candidates
+        self.stats.setdefault("details_started", 0)
+        logger.info(
+            "PakistanLawSite citation-grid starting detail fetches rows=%s detail_candidates=%s",
+            len(rows),
+            detail_candidates,
+        )
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
@@ -289,6 +309,16 @@ class PakistanLawSitePipeline:
                 "row_index": idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
+            self.stats["details_started"] += 1
+            if self.stats["details_started"] == 1 or self.stats["details_started"] % 25 == 0:
+                logger.info(
+                    "PakistanLawSite citation-grid detail progress started=%s/%s staged=%s duplicates=%s skipped_no_url=%s",
+                    self.stats["details_started"],
+                    detail_candidates,
+                    self.stats["staged"],
+                    self.stats["duplicates"],
+                    self.stats["url_less_skips"],
+                )
             detail = await self.fetch_detail(detail_url)
             await self.preserve_and_extract(detail, route, row)
             await self.db.flush()

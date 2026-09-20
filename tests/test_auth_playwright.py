@@ -97,6 +97,28 @@ class _FakePage:
         self.calls.append(("evaluate", script, args))
         if "has_archivedpatient_grid" in script:
             return dict(self.dom_shape)
+        if "citation_idx" in script and "row_count" in script:
+            if not self.archived_grid_snapshot:
+                return None
+            headers = list(self.archived_grid_snapshot.get("headers") or [])
+            rows = list(self.archived_grid_snapshot.get("rows") or [])
+            return {
+                "headers": headers,
+                "row_count": len(rows),
+                "citation_idx": 0,
+                "title_idx": 1,
+                "court_idx": 2,
+                "next_url": self.archived_grid_snapshot.get("next_url"),
+                "body_preview": self.archived_grid_snapshot.get("body_preview"),
+                "has_logout": bool(self.archived_grid_snapshot.get("has_logout")),
+            }
+        if "capStart" in script and "bodyRows" in script:
+            if not self.archived_grid_snapshot:
+                return []
+            start = int(args[0]) if args else 0
+            end = int(args[1]) if len(args) > 1 else len(self.archived_grid_snapshot.get("rows") or [])
+            rows = list(self.archived_grid_snapshot.get("rows") or [])
+            return rows[start:end]
         if "archivedpatientGrid" in script:
             return self.archived_grid_snapshot
         return None
@@ -292,6 +314,59 @@ async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_g
 
     assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
     assert "id=\"archivedpatientGrid\"" in result.html
+    assert not any(call[0] == "content" for call in page.calls)
+
+
+async def test_playwright_goto_compact_snapshot_timeout_returns_partial_rows(monkeypatch):
+    class _SlowBatchPage(_FakePage):
+        async def evaluate(self, script, *args):
+            if "capStart" in script and "bodyRows" in script and int(args[0]) >= 1:
+                await asyncio.sleep(0.05)
+            return await super().evaluate(script, *args)
+
+    monkeypatch.setattr(settings, "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS", 20)
+    monkeypatch.setattr(settings, "PLS_ARCHIVED_GRID_BATCH_ROWS", 1)
+    page = _SlowBatchPage(html="<html><body>oversized</body></html>")
+    page.dom_shape = {
+        "forms": 0,
+        "inputs": settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD + 100,
+        "has_archivedpatient_grid": True,
+        "archivedpatient_rows": 2,
+        "has_logout": True,
+        "body_preview": "citation table",
+    }
+    page.archived_grid_snapshot = {
+        "headers": ["Citation", "Title", "Court", "Read"],
+        "rows": [
+            {
+                "citation": "PLD 2024 SC 11",
+                "title": "A v B",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/11",
+                "pdf_url": None,
+            },
+            {
+                "citation": "PLD 2024 SC 12",
+                "title": "C v D",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/12",
+                "pdf_url": None,
+            },
+        ],
+        "next_url": None,
+        "body_preview": "citation table",
+        "has_logout": True,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
+
+    assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
+    assert result.metadata["snapshot_timed_out"] is True
+    assert result.metadata["rows"] == 1
+    assert "PLD 2024 SC 11" in result.html
+    assert "PLD 2024 SC 12" not in result.html
     assert not any(call[0] == "content" for call in page.calls)
 
 
