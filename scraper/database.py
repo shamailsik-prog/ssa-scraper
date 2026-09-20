@@ -302,6 +302,7 @@ async def seed_data() -> None:
                     extraction_mode=mode,
                     extraction_min_confidence=settings.SGAI_DEFAULT_MIN_CONFIDENCE,
                     scrapegraph_schema_version=settings.SGAI_SCHEMA_VERSION,
+                    crawl_max_pages=200 if name == "PakistanCode" else 50,
                     state="PAUSED" if method == "login_session" else "ACTIVE",
                     state_reason="Awaiting human login" if method == "login_session" else None,
                 )
@@ -348,6 +349,8 @@ async def seed_data() -> None:
         if pakistan_code is not None:
             if (pakistan_code.source_url or "").rstrip("/") == "https://pakistancode.gov.pk":
                 pakistan_code.source_url = "https://pakistancode.gov.pk/english/index.php"
+            if int(pakistan_code.crawl_max_pages or 0) < 200:
+                pakistan_code.crawl_max_pages = 200
             old_listings = [
                 "https://pakistancode.gov.pk/english/LGu3ZBxW1-apaUY2Fqa-apaUY2Fqa-sg-jjjjjjjjjjjjj",
                 "https://pakistancode.gov.pk/federal",

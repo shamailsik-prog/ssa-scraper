@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
-from scraper.tasks.pakistancode import normalize_pakistancode_public_url, scrape_pakistancode
+from scraper.tasks.pakistancode import _effective_crawl_limit, normalize_pakistancode_public_url, scrape_pakistancode
 from tests.fixtures import text_pdf_bytes
 
 
@@ -122,6 +122,7 @@ async def test_pakistancode_listing_and_detail_route_provenance_for_statutes_and
         )
     ).scalars().first()
     assert detail_row is not None
+    assert detail_row.priority == 80
     assert detail_row.query_json["meta"]["listing_fetch"] == "chronological_accordion"
     assert detail_row.query_json["meta"]["source_section"] == "federal_laws"
     assert detail_row.query_json["meta"]["act_no"] == "XLVII of 2026"
@@ -138,6 +139,7 @@ async def test_pakistancode_listing_and_detail_route_provenance_for_statutes_and
         )
     ).scalars().first()
     assert statute_doc_row is not None
+    assert statute_doc_row.priority == 10
     assert statute_doc_row.query_json["expect_pdf"] is True
     assert statute_doc_row.query_json["route"]["pdf_endpoint_kind"] == "pdffiles-direct"
     assert statute_doc_row.query_json["route"]["detail_fetch"] == "download_tab_link"
@@ -153,6 +155,7 @@ async def test_pakistancode_listing_and_detail_route_provenance_for_statutes_and
         )
     ).scalars().first()
     assert ord_doc_row is not None
+    assert ord_doc_row.priority == 10
     assert ord_doc_row.query_json["expect_pdf"] is True
     assert ord_doc_row.query_json["route"]["source_section"] == "ordinances"
     assert ord_doc_row.query_json["route"]["pdf_endpoint_kind"] == "viewerjs-pdf-embed"
@@ -231,3 +234,16 @@ async def test_pakistancode_pdf_signature_gate_retires_non_pdf_candidate(db, fix
     assert row is not None
     assert row.status == "retired"
     assert "missing %PDF signature for instrument document URL" in (row.last_error or "")
+
+
+async def test_pakistancode_effective_limit_enforces_floor_and_respects_explicit_limit(db, fixture_server):
+    source = await _pakistancode_source(db, fixture_server, ["/english/LGu0xBD.php"])
+    source.crawl_max_pages = 120
+    assert _effective_crawl_limit(source, None) == 200
+
+    source.crawl_max_pages = 260
+    assert _effective_crawl_limit(source, None) == 260
+
+    source.config_json = {**(source.config_json or {}), "crawl_max_pages": 310}
+    assert _effective_crawl_limit(source, None) == 310
+    assert _effective_crawl_limit(source, 75) == 75
