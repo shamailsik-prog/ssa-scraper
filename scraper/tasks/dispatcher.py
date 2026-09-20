@@ -57,7 +57,11 @@ async def _connector_for(source: ScraperSource):
 
 async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
     async with SessionLocal() as db:
-        source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == source_name))).scalars().first()
+        source = (
+            await db.execute(
+                select(ScraperSource).where(ScraperSource.source_name == source_name).with_for_update()
+            )
+        ).scalars().first()
         if source is None:
             return {"error": f"source {source_name} not found"}
         if not source.is_active or source.state in ("HALTED", "DISABLED"):
