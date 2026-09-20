@@ -402,6 +402,8 @@ class PakistanLawSitePipeline:
         for idx, row_idx in enumerate(selected_indexes):
             row = rows[row_idx]
             detail_url = row.get("detail_url") or row.get("pdf_url")
+            case_type_id = str(row.get("case_type_id") or "").strip()
+            absolute_row_index = snapshot_start_row + row_idx
             if not detail_url:
                 url_less_skips += 1
                 self.stats["url_less_skips"] += 1
@@ -432,16 +434,27 @@ class PakistanLawSitePipeline:
                 )
             route = {
                 "tier": "citation_grid",
-                "query": {"surface": "archivedpatientGrid"},
+                "query": {"surface": "archivedpatientGrid", "requested_detail_url": detail_url},
                 "cursor": {
                     "row_index": row_idx,
-                    "absolute_row_index": snapshot_start_row + row_idx,
+                    "absolute_row_index": absolute_row_index,
                 },
                 "row_index": row_idx,
-                "absolute_row_index": snapshot_start_row + row_idx,
+                "absolute_row_index": absolute_row_index,
+                "requested_detail_url": detail_url,
+                "requested_case_type_id": case_type_id or None,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
-            detail = await self.fetch_detail(detail_url)
+            if case_type_id:
+                detail, navigation_mode = await self.fetch_detail_from_citation_grid(
+                    case_type_id=case_type_id,
+                    fallback_url=detail_url,
+                    absolute_row_index=absolute_row_index,
+                )
+            else:
+                detail = await self.fetch_detail(detail_url)
+                navigation_mode = "goto"
+            route["detail_navigation_mode"] = navigation_mode
             result = await self.preserve_and_extract(detail, route, row)
             details_since_flush += 1
             if result == "staged":
@@ -507,6 +520,42 @@ class PakistanLawSitePipeline:
 
         await self._charge_page()
         return await self.runner.run(op)
+
+    async def fetch_detail_from_citation_grid(
+        self,
+        *,
+        case_type_id: str,
+        fallback_url: str,
+        absolute_row_index: int,
+    ) -> tuple[PageResult, str]:
+        """Prefer in-grid Read/courtWiseSearchBtn navigation for CitationSearch rows.
+
+        PakistanLawSite can redirect direct URL visits back to /login/check, while clicking the
+        row's casetypeid control within the active grid session keeps the authenticated flow.
+        """
+
+        async def op(browser: Browser) -> PageResult:
+            page = await browser.open_citation_grid_detail(
+                case_type_id,
+                archived_grid_start_row=absolute_row_index,
+                fallback_url=fallback_url,
+            )
+            raise_for_verdict(page)
+            return page
+
+        await self._charge_page()
+        try:
+            return await self.runner.run(op), "grid_click"
+        except Exception as exc:
+            logger.warning(
+                "PakistanLawSite citation-grid click navigation failed for casetypeid=%s row=%s; falling back to requested detail_url=%s (%s)",
+                case_type_id,
+                absolute_row_index,
+                fallback_url,
+                exc,
+            )
+            page = await self.fetch_detail(fallback_url)
+            return page, "goto_fallback"
 
     async def download(self, url: str) -> bytes:
         async def op(browser: Browser) -> bytes:

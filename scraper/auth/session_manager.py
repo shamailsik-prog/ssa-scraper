@@ -77,6 +77,8 @@ class Browser(Protocol):
 
     async def goto(self, url: str, **kwargs: Any) -> PageResult: ...
 
+    async def open_citation_grid_detail(self, case_type_id: str, **kwargs: Any) -> PageResult: ...
+
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult: ...
 
     async def download(self, url: str) -> bytes: ...
@@ -542,6 +544,12 @@ class PlaywrightBrowser:
                         for (let c = 0; c < tdNodes.length; c += 1) {
                             cells.push((tdNodes[c].textContent || '').trim());
                         }
+                        const readControl = tr.querySelector(
+                            'input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]'
+                        );
+                        const caseTypeId = readControl && readControl.getAttribute('casetypeid')
+                            ? readControl.getAttribute('casetypeid').trim()
+                            : '';
                         const anchors = tr.querySelectorAll('a[href]');
                         let detailUrl = null;
                         let pdfUrl = null;
@@ -565,12 +573,6 @@ class PlaywrightBrowser:
                             detailUrl = detailCandidates[0].href;
                         }
                         if (!detailUrl) {
-                            const readControl = tr.querySelector(
-                                'input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]'
-                            );
-                            const caseTypeId = readControl && readControl.getAttribute('casetypeid')
-                                ? readControl.getAttribute('casetypeid').trim()
-                                : '';
                             if (caseTypeId) {
                                 detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&court=&Row=0&bookName=undefined`;
                             }
@@ -579,6 +581,7 @@ class PlaywrightBrowser:
                             citation: cellAt(cells, citationIdx),
                             title: cellAt(cells, titleIdx),
                             court: cellAt(cells, courtIdx),
+                            case_type_id: caseTypeId || null,
                             detail_url: detailUrl,
                             pdf_url: pdfUrl,
                         });
@@ -653,8 +656,19 @@ class PlaywrightBrowser:
             parts.append(f"<td>{html.escape(str(row.get('title') or ''))}</td>")
             parts.append(f"<td>{html.escape(str(row.get('court') or ''))}</td>")
             href = row.get("detail_url") or row.get("pdf_url")
+            case_type_id = (row.get("case_type_id") or "").strip() if isinstance(row.get("case_type_id"), str) else ""
+            case_type_attr = f" data-case-type-id=\"{html.escape(case_type_id, quote=True)}\"" if case_type_id else ""
             if href:
-                parts.append(f"<td><a href=\"{html.escape(str(href), quote=True)}\">Read</a></td>")
+                parts.append(
+                    f"<td><a href=\"{html.escape(str(href), quote=True)}\"{case_type_attr}>Read</a></td>"
+                )
+            elif case_type_id:
+                parts.append(
+                    "<td>"
+                    f"<button type=\"button\" class=\"courtWiseSearchBtn\" casetypeid=\"{html.escape(case_type_id, quote=True)}\">"
+                    "Read</button>"
+                    "</td>"
+                )
             else:
                 parts.append("<td></td>")
             parts.append("</tr>")
@@ -757,6 +771,120 @@ class PlaywrightBrowser:
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)
+
+    async def open_citation_grid_detail(self, case_type_id: str, **kwargs: Any) -> PageResult:
+        """Open a citation-grid detail by clicking the in-page Read control for casetypeid.
+
+        This keeps PakistanLawSite navigation in the same authenticated CitationSearch surface,
+        which avoids login/check redirects seen with direct constructed-URL goto flows.
+        """
+        wanted = (case_type_id or "").strip()
+        if not wanted:
+            raise BrowserDisconnected("citation-grid detail click requested without case_type_id")
+        archived_grid_start_row = max(0, int(kwargs.get("archived_grid_start_row", 0) or 0))
+        await self._wrap(
+            self._page.goto(
+                settings.PLS_SEARCH_URL,
+                wait_until="domcontentloaded",
+                timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+            )
+        )
+        await self._wrap(
+            self._page.evaluate(
+                """async ({ startRow }) => {
+                    const toInt = (value, fallback = 0) => {
+                        const n = Number(value);
+                        if (!Number.isFinite(n)) return fallback;
+                        return Math.max(0, Math.floor(n));
+                    };
+                    const requestedStartRow = toInt(startRow, 0);
+                    const table = document.querySelector('#archivedpatientGrid');
+                    if (!table) return;
+                    try {
+                        const jq = window.jQuery || window.$;
+                        if (jq && jq.fn && jq.fn.dataTable) {
+                            let dt = null;
+                            try {
+                                dt = jq(table).DataTable();
+                            } catch (_dtError) {
+                                dt = null;
+                            }
+                            if (dt && typeof dt.page === 'function' && typeof dt.page.info === 'function') {
+                                const info = dt.page.info() || {};
+                                const pageLengthRaw = Number(info.length ?? dt.page.len());
+                                const pageLength = Number.isFinite(pageLengthRaw) && pageLengthRaw > 0 ? pageLengthRaw : 100;
+                                const recordsRaw = Number(info.recordsDisplay ?? info.recordsTotal);
+                                const boundedStart = Number.isFinite(recordsRaw) && recordsRaw > 0
+                                    ? Math.min(requestedStartRow, Math.max(recordsRaw - 1, 0))
+                                    : requestedStartRow;
+                                const targetPage = Math.floor(boundedStart / pageLength);
+                                await new Promise((resolve) => {
+                                    let done = false;
+                                    const finish = () => {
+                                        if (!done) {
+                                            done = true;
+                                            resolve();
+                                        }
+                                    };
+                                    try {
+                                        jq(table).one('draw.dt', finish);
+                                        dt.page(targetPage).draw(false);
+                                        setTimeout(finish, 1200);
+                                    } catch (_drawError) {
+                                        finish();
+                                    }
+                                });
+                            }
+                        }
+                    } catch (_seekError) {
+                        // best effort only: click lookup still runs against current DOM
+                    }
+                }""",
+                {"startRow": archived_grid_start_row},
+            )
+        )
+        found = await self._wrap(
+            self._page.evaluate(
+                """({ caseTypeId }) => {
+                    const wanted = String(caseTypeId || '').trim().toLowerCase();
+                    if (!wanted) return false;
+                    const controls = Array.from(
+                        document.querySelectorAll('input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]')
+                    );
+                    return controls.some((el) => String(el.getAttribute('casetypeid') || '').trim().toLowerCase() === wanted);
+                }""",
+                {"caseTypeId": wanted},
+            )
+        )
+        if not found:
+            raise BrowserDisconnected(f"citation-grid detail control missing for casetypeid={wanted}")
+        await self._wait_for_post_submit_navigation(
+            lambda: self._page.evaluate(
+                """({ caseTypeId }) => {
+                    const wanted = String(caseTypeId || '').trim().toLowerCase();
+                    const controls = Array.from(
+                        document.querySelectorAll('input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]')
+                    );
+                    const target = controls.find(
+                        (el) => String(el.getAttribute('casetypeid') || '').trim().toLowerCase() === wanted
+                    );
+                    if (!target) return false;
+                    if (typeof target.click === 'function') {
+                        target.click();
+                        return true;
+                    }
+                    return false;
+                }""",
+                {"caseTypeId": wanted},
+            )
+        )
+        html_text, metadata = await self._capture_html(resp=None)
+        return PageResult(
+            url=self._page.url,
+            html=html_text,
+            status=200,
+            metadata={**metadata, "requested_case_type_id": wanted, "navigation_mode": "grid_click"},
+        )
 
     async def _wait_for_post_submit_navigation(self, trigger) -> None:
         from playwright.async_api import TimeoutError as PWTimeoutError

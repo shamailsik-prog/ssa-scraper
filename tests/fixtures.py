@@ -216,6 +216,20 @@ class FakeBrowser:
         self.calls.append(("goto", url, self.slot_number, kwargs))
         return self.script.respond(("goto", url), self)
 
+    async def open_citation_grid_detail(self, case_type_id: str, **kwargs) -> PageResult:
+        self.calls.append(("grid_detail", case_type_id, self.slot_number, kwargs))
+        key = ("grid_detail", case_type_id)
+        if key in self.script.routes:
+            return self.script.respond(key, self)
+        fallback_url = kwargs.get("fallback_url")
+        if fallback_url:
+            return self.script.respond(("goto", fallback_url), self)
+        return PageResult(
+            url="https://www.pakistanlawsite.com/login/check",
+            html="<html><body><h1>login/check</h1></body></html>",
+            status=200,
+        )
+
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         key = ("search", tuple(sorted(values.items())))
         self.calls.append((key, self.slot_number))

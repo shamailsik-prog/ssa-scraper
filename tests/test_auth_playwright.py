@@ -768,7 +768,11 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
         </table></body></html>
         """,
     )
-    sc.page(("goto", expected_detail_url), judgment_html("PLD 2024 SC 247", title="Alpha versus State"))
+    sc.page(
+        ("grid_detail", "2006K247"),
+        judgment_html("PLD 2024 SC 247", title="Alpha versus State"),
+        url=expected_detail_url,
+    )
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
     pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
@@ -780,6 +784,13 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     assert stats["staged"] == 1
     assert stats["url_less_skips"] == 0
     assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
+    assert any(entry[0] == ("grid_detail", "2006K247") for entry in sc.log)
+    staged = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.id.desc()))).scalars().first()
+    assert staged is not None
+    route_json = staged.route_json or {}
+    assert route_json.get("requested_detail_url") == expected_detail_url
+    assert route_json.get("requested_case_type_id") == "2006K247"
+    assert route_json.get("detail_navigation_mode") == "grid_click"
 
 
 async def test_pipeline_citation_grid_prefers_real_detail_link_over_login_check_anchor(db, login_source, monkeypatch):
@@ -823,6 +834,7 @@ async def test_pipeline_citation_grid_prefers_real_detail_link_over_login_check_
     assert all("/login/check" not in call.lower() for call in detail_calls)
     staged = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.id.desc()))).scalars().first()
     assert staged is not None and staged.source_url == detail_url
+    assert (staged.route_json or {}).get("requested_detail_url") == detail_url
 
 
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):
