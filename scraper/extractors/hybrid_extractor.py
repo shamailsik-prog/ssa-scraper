@@ -253,7 +253,15 @@ class HybridExtractor:
             inp,
             deterministic,
             MANDATORY_JUDGMENT_FIELDS,
-            lambda d, a: reconcile_judgment(deterministic=d, ai=a, raw_text=raw_text, court_directory=directory, min_confidence=self.min_confidence),
+            lambda d, a: reconcile_judgment(
+                deterministic=d,
+                ai=a,
+                raw_text=raw_text,
+                source_url=(source_meta or {}).get("url"),
+                raw_html=html,
+                court_directory=directory,
+                min_confidence=self.min_confidence,
+            ),
         )
 
     async def extract_statute(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
