@@ -212,8 +212,8 @@ class FakeBrowser:
         self.closed = False
         FakeBrowser.instances.append(self)
 
-    async def goto(self, url: str) -> PageResult:
-        self.calls.append(("goto", url, self.slot_number))
+    async def goto(self, url: str, **kwargs) -> PageResult:
+        self.calls.append(("goto", url, self.slot_number, kwargs))
         return self.script.respond(("goto", url), self)
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
