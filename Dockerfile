@@ -41,7 +41,9 @@ RUN --mount=type=secret,id=extra_ca,target=/run/secrets/extra_ca,required=false 
     if [ "$LOCAL_AI" = "1" ]; then pip install --no-cache-dir -r requirements-local-ai.txt; fi
 
 COPY . .
-RUN mkdir -p /app/live /app/raw /app/state \
+COPY certs/RapidSSL_TLS_RSA_CA_G1.pem /usr/local/share/ca-certificates/rapidssl-tls-rsa-ca-g1.crt
+RUN update-ca-certificates \
+    && mkdir -p /app/live /app/raw /app/state \
     && python -m compileall -q scraper migrations
 
 EXPOSE 8000
