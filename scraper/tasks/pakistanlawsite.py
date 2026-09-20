@@ -304,18 +304,62 @@ class PakistanLawSitePipeline:
             total_rows = None
         start_offset = row_offset % row_count
         take_count = row_count if max_detail <= 0 else min(max_detail, row_count)
+        raw_flush_every = cfg.get("citation_grid_flush_every", getattr(settings, "PLS_CITATION_GRID_FLUSH_EVERY", 1))
+        try:
+            flush_every = int(raw_flush_every or 1)
+        except Exception:
+            flush_every = 1
+        flush_every = max(1, flush_every)
         selected_indexes = [((start_offset + i) % row_count) for i in range(take_count)]
         logger.info(
-            "PakistanLawSite citation-grid cursor start_offset=%s take_count=%s rows=%s total_rows=%s max_detail=%s",
+            "PakistanLawSite citation-grid cursor start_offset=%s take_count=%s rows=%s total_rows=%s max_detail=%s flush_every=%s",
             start_offset,
             take_count,
             row_count,
             total_rows,
             max_detail,
+            flush_every,
         )
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
+        self.stats["citation_grid_offset"] = start_offset
+        self.stats["citation_grid_rows_seen"] = row_count
+        details_since_flush = 0
+        staged_since_flush = 0
+        last_committed_offset = start_offset
+
+        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
+            nonlocal last_committed_offset
+            try:
+                offset_before = int(cursor.get("row_offset", last_committed_offset) or 0)
+            except Exception:
+                offset_before = last_committed_offset
+            cursor.update(
+                {
+                    "row_offset": next_offset,
+                    "last_start_offset": start_offset,
+                    "last_take_count": processed_rows,
+                    "last_rows_seen": row_count,
+                    "last_total_rows": total_rows,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            cfg["citation_grid_cursor"] = cursor
+            self.source.config_json = cfg
+            self.stats["citation_grid_next_offset"] = next_offset
+            await self.db.flush()
+            await self.db.commit()
+            logger.info(
+                "PakistanLawSite citation-grid flush offset_before=%s offset_after=%s staged_this_flush=%s details_this_flush=%s processed_rows=%s",
+                offset_before,
+                next_offset,
+                staged_this_flush,
+                details_this_flush,
+                processed_rows,
+            )
+            last_committed_offset = next_offset
+
         for idx, row_idx in enumerate(selected_indexes):
             row = rows[row_idx]
             detail_url = row.get("detail_url") or row.get("pdf_url")
@@ -345,8 +389,20 @@ class PakistanLawSitePipeline:
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
             detail = await self.fetch_detail(detail_url)
-            await self.preserve_and_extract(detail, route, row)
-            await self.db.flush()
+            result = await self.preserve_and_extract(detail, route, row)
+            details_since_flush += 1
+            if result == "staged":
+                staged_since_flush += 1
+            if details_since_flush >= flush_every or (idx + 1) == len(selected_indexes):
+                next_offset = (start_offset + idx + 1) % row_count
+                await flush_citation_grid_progress(
+                    next_offset,
+                    staged_this_flush=staged_since_flush,
+                    details_this_flush=details_since_flush,
+                    processed_rows=idx + 1,
+                )
+                details_since_flush = 0
+                staged_since_flush = 0
         if url_less_skips:
             logger.warning(
                 "PakistanLawSite citation-grid skipped %s/%s rows with no detail URL",
@@ -365,23 +421,15 @@ class PakistanLawSitePipeline:
             if url_less_skips >= len(selected_indexes):
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
         next_offset = (start_offset + take_count) % row_count
-        self.stats["citation_grid_offset"] = start_offset
-        self.stats["citation_grid_next_offset"] = next_offset
-        self.stats["citation_grid_rows_seen"] = row_count
-        cursor.update(
-            {
-                "row_offset": next_offset,
-                "last_start_offset": start_offset,
-                "last_take_count": take_count,
-                "last_rows_seen": row_count,
-                "last_total_rows": total_rows,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        cfg["citation_grid_cursor"] = cursor
-        self.source.config_json = cfg
+        if last_committed_offset != next_offset:
+            await flush_citation_grid_progress(
+                next_offset,
+                staged_this_flush=0,
+                details_this_flush=0,
+                processed_rows=take_count,
+            )
         logger.info(
-            "PakistanLawSite citation-grid cursor advanced start_offset=%s next_offset=%s wrap=%s",
+            "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",
             start_offset,
             next_offset,
             bool(next_offset < start_offset or (start_offset == 0 and take_count == row_count)),
