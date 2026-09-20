@@ -78,6 +78,40 @@ async def _source(db: AsyncSession, name: str) -> ScraperSource:
     return s
 
 
+def _to_int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cursor_raw = cfg.get("citation_grid_cursor")
+    cursor = dict(cursor_raw) if isinstance(cursor_raw, dict) else {}
+    row_offset = _to_int_or_none(cursor.get("row_offset"))
+    cursor_view = dict(cursor)
+    cursor_view["row_offset"] = row_offset if row_offset is not None else 0
+    status: Dict[str, Any] = {
+        "source_name": source_name,
+        "job_key": "PakistanLawSite:archivedpatientGrid",
+        "citation_grid_cursor": cursor_view,
+    }
+    last_flush: Dict[str, Any] = {}
+    for field in ("offset_before", "offset_after", "staged_this_flush", "processed_rows"):
+        parsed = _to_int_or_none(cursor.get(field))
+        if parsed is not None:
+            last_flush[field] = parsed
+    if "offset_after" not in last_flush and row_offset is not None:
+        last_flush["offset_after"] = row_offset
+    if "processed_rows" not in last_flush:
+        last_take_count = _to_int_or_none(cursor.get("last_take_count"))
+        if last_take_count is not None:
+            last_flush["processed_rows"] = last_take_count
+    if last_flush:
+        status["last_flush"] = last_flush
+    return status
+
+
 async def source_view(
     db: AsyncSession,
     s: ScraperSource,
@@ -154,6 +188,8 @@ async def source_view(
         ]
         view["current_slot"] = (s.config_json or {}).get("current_slot")
         view["not_configured"] = [k for k in settings.not_configured() if k.startswith("PLS_")]
+        if s.source_name == "PakistanLawSite":
+            view["citation_grid_progress"] = _citation_grid_progress_view(s.source_name, cfg)
     return view
 
 
