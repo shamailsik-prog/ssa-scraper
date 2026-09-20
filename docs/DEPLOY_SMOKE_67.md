@@ -25,7 +25,7 @@ curl -fsS http://127.0.0.1:8000/health
 ## 3) Dry-run residual report (read-only)
 
 ```bash
-python -c "import json; from scraper.database import run_async; from scraper.tasks.promotion import reconcile_citation_statute_residual_smoke; print(json.dumps(run_async(reconcile_citation_statute_residual_smoke(run_reconcile=False)), indent=2))"
+python -m scraper.tasks.residual_smoke_cli
 ```
 
 Expected:
@@ -34,13 +34,24 @@ Expected:
 - `"before"` equals `"after"`
 - all `*_reduced` deltas are `0`
 - optional compact unresolved triage buckets:
-  - `include_unresolved_breakdown=True`
-  - `unresolved_breakdown_top_n=<small N>` (default `5`) for `by_source_name` and unresolved key buckets
+  - `--include-unresolved-breakdown`
+  - `--unresolved-breakdown-top-n <small N>` (default `5`) for `by_source_name` and unresolved key buckets
+
+Example:
+
+```bash
+python -m scraper.tasks.residual_smoke_cli --include-unresolved-breakdown --unresolved-breakdown-top-n 5
+```
 
 ## 4) Apply reconcile + before→after residual reduction
 
 ```bash
-python -c "import json; from scraper.database import run_async; from scraper.tasks.promotion import reconcile_citation_statute_residual_smoke; print(json.dumps(run_async(reconcile_citation_statute_residual_smoke(run_reconcile=True, lookback_hours=168, instrument_limit=200, judgment_batch_size=200, fail_on_increase=True)), indent=2))"
+python -m scraper.tasks.residual_smoke_cli \
+  --apply \
+  --lookback-hours 168 \
+  --instrument-limit 200 \
+  --judgment-batch-size 200 \
+  --fail-on-increase
 ```
 
 Expected:
