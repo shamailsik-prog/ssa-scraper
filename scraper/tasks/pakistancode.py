@@ -44,6 +44,9 @@ DEFAULT_LISTINGS: List[Dict[str, str]] = [
     {"url": "https://pakistancode.gov.pk/english/LGu0xBD.php", "target_kind": "statute"},
     {"url": "https://pakistancode.gov.pk/english/LGu0xVD.php", "target_kind": "statute"},
 ]
+PAKISTANCODE_DOCUMENT_PRIORITY = 10
+PAKISTANCODE_LISTING_PRIORITY = 80
+PAKISTANCODE_MIN_CRAWL_MAX_PAGES = 200
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -59,6 +62,19 @@ def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
         if out:
             return out
     return [dict(item) for item in DEFAULT_LISTINGS]
+
+
+def _effective_crawl_limit(source: ScraperSource, explicit_limit: Optional[int]) -> int:
+    if explicit_limit is not None:
+        return max(1, int(explicit_limit))
+    cfg_limit = (source.config_json or {}).get("crawl_max_pages")
+    configured_limit = source.crawl_max_pages
+    if cfg_limit is not None:
+        try:
+            configured_limit = int(cfg_limit)
+        except (TypeError, ValueError):
+            pass
+    return max(PAKISTANCODE_MIN_CRAWL_MAX_PAGES, int(configured_limit or 0))
 
 
 def normalize_pakistancode_public_url(raw: str, *, base_url: str) -> Optional[str]:
@@ -213,7 +229,9 @@ class PakistanCodePipeline(PublicPipeline):
                             "meta": nmeta,
                         },
                         cursor_json={},
-                        priority=40,
+                        # public_pipeline.pending() drains lower priorities first (ASC),
+                        # so listing rows must stay behind document/PDF rows.
+                        priority=PAKISTANCODE_LISTING_PRIORITY,
                     )
                 )
                 self.stats["discovered"] += 1
@@ -565,7 +583,7 @@ class PakistanCodePipeline(PublicPipeline):
                         "expect_pdf": bool(meta.get("expect_pdf")),
                     },
                     cursor_json={},
-                    priority=50,
+                    priority=PAKISTANCODE_DOCUMENT_PRIORITY,
                 )
             )
             added += 1
@@ -621,10 +639,12 @@ class PakistanCodePipeline(PublicPipeline):
 
 
 async def scrape_pakistancode(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
+    opts = dict(kwargs)
+    opts["limit"] = _effective_crawl_limit(source, opts.get("limit"))
     return await run_public_source(
         db,
         source,
         seed_listings=listings_for(source),
         pipeline_cls=PakistanCodePipeline,
-        **kwargs,
+        **opts,
     )
