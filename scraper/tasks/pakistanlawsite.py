@@ -23,6 +23,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -227,12 +228,52 @@ class PakistanLawSitePipeline:
         return not cls._has_queryable_search_fields(search_map)
 
     @staticmethod
-    def _citation_grid_map_v1() -> Dict[str, Any]:
+    def _citation_grid_columns_from_html(page_html: str) -> Dict[str, int]:
+        soup = BeautifulSoup(page_html or "", "html.parser")
+        headers = [
+            th.get_text(" ", strip=True).lower()
+            for th in soup.select("table#archivedpatientGrid thead th")
+        ]
+        if not headers:
+            return {"citation": 0, "title": 1, "court": 2}
+
+        def _is_non_data_header(header: str) -> bool:
+            clean = " ".join((header or "").split())
+            if not clean:
+                return True
+            if clean == "#":
+                return True
+            if clean.isdigit():
+                return True
+            if "sr" in clean and "no" in clean:
+                return True
+            if "serial" in clean or "s no" in clean:
+                return True
+            return False
+
+        non_read_indexes = [idx for idx, header in enumerate(headers) if "read" not in header]
+        data_indexes = [idx for idx in non_read_indexes if not _is_non_data_header(headers[idx])]
+
+        def _pick_index(hints: List[str], fallback: int) -> int:
+            for idx, header in enumerate(headers):
+                if any(hint in header for hint in hints):
+                    return idx
+            return fallback
+
+        return {
+            "citation": _pick_index(["citation"], data_indexes[0] if len(data_indexes) >= 1 else (non_read_indexes[0] if len(non_read_indexes) >= 1 else 0)),
+            "title": _pick_index(["title", "party"], data_indexes[1] if len(data_indexes) >= 2 else (non_read_indexes[1] if len(non_read_indexes) >= 2 else 1)),
+            "court": _pick_index(["court"], data_indexes[2] if len(data_indexes) >= 3 else (non_read_indexes[2] if len(non_read_indexes) >= 3 else 2)),
+        }
+
+    @classmethod
+    def _citation_grid_map_v1(cls, page_html: str) -> Dict[str, Any]:
+        columns = cls._citation_grid_columns_from_html(page_html)
         return {
             "fields": {"_all": []},
             "result_layout": {
                 "row_selector": "table#archivedpatientGrid tbody tr",
-                "columns": {"citation": 0, "title": 1, "court": 2},
+                "columns": columns,
                 "detail_link_selector": "a[href]",
             },
             "page_size": None,
@@ -246,7 +287,7 @@ class PakistanLawSitePipeline:
         }
 
     async def _activate_citation_grid_map_v1(self, page_html: str) -> Dict[str, Any]:
-        forced = self._citation_grid_map_v1()
+        forced = self._citation_grid_map_v1(page_html)
         current = await active_map(self.db, SOURCE_NAME)
         if current is not None:
             as_dict = map_as_dict(current)

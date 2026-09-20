@@ -116,8 +116,12 @@ class _FakePage:
         if "capStart" in script and "bodyRows" in script:
             if not self.archived_grid_snapshot:
                 return []
-            start = int(args[0]) if args else 0
-            end = int(args[1]) if len(args) > 1 else len(self.archived_grid_snapshot.get("rows") or [])
+            if args and isinstance(args[0], dict):
+                start = int(args[0].get("start") or 0)
+                end = int(args[0].get("end") or len(self.archived_grid_snapshot.get("rows") or []))
+            else:
+                start = int(args[0]) if args else 0
+                end = int(args[1]) if len(args) > 1 else len(self.archived_grid_snapshot.get("rows") or [])
             rows = list(self.archived_grid_snapshot.get("rows") or [])
             return rows[start:end]
         if "archivedpatientGrid" in script:
@@ -355,7 +359,9 @@ async def test_playwright_goto_compact_grid_headers_are_stable_when_hash_column_
 async def test_playwright_goto_compact_snapshot_timeout_returns_partial_rows(monkeypatch):
     class _SlowBatchPage(_FakePage):
         async def evaluate(self, script, *args):
-            if "capStart" in script and "bodyRows" in script and int(args[0]) >= 1:
+            payload = args[0] if args else {}
+            start = int(payload.get("start") or 0) if isinstance(payload, dict) else int(args[0])
+            if "capStart" in script and "bodyRows" in script and start >= 1:
                 raise asyncio.TimeoutError("simulated batch timeout")
             return await super().evaluate(script, *args)
 
@@ -814,7 +820,7 @@ async def test_pipeline_forces_citation_grid_map_v1_on_archived_grid_surface(db,
     assert active is not None
     assert active.mapped_by == "forced_citation_grid_v1"
     assert active.result_layout["row_selector"] == "table#archivedpatientGrid tbody tr"
-    assert active.result_layout["columns"] == {"citation": 0, "title": 1, "court": 2}
+    assert active.result_layout["columns"] == {"citation": 1, "title": 2, "court": 3}
 
 
 async def test_pipeline_citation_grid_respects_detail_fetch_cap(db, login_source, monkeypatch):

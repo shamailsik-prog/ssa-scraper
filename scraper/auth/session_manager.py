@@ -428,9 +428,21 @@ class PlaywrightBrowser:
         title_idx: int,
         court_idx: int,
     ) -> List[Dict[str, Any]]:
+        payload = {
+            "start": int(start),
+            "end": int(end),
+            "citation_idx": int(citation_idx),
+            "title_idx": int(title_idx),
+            "court_idx": int(court_idx),
+        }
         return await self._wrap(
             self._page.evaluate(
-                """(start, end, citationIdx, titleIdx, courtIdx) => {
+                """(payload) => {
+                    const start = Number(payload?.start ?? 0);
+                    const end = Number(payload?.end ?? 0);
+                    const citationIdx = Number(payload?.citation_idx ?? 0);
+                    const titleIdx = Number(payload?.title_idx ?? 1);
+                    const courtIdx = Number(payload?.court_idx ?? 2);
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return [];
                     const bodyRows = (table.tBodies && table.tBodies[0] ? table.tBodies[0].rows : []);
@@ -478,11 +490,7 @@ class PlaywrightBrowser:
                     }
                     return out;
                 }""",
-                int(start),
-                int(end),
-                int(citation_idx),
-                int(title_idx),
-                int(court_idx),
+                payload,
             )
         )
 
