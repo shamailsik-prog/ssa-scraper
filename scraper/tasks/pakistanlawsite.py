@@ -317,19 +317,18 @@ class PakistanLawSitePipeline:
         except Exception:
             snapshot_start_row = 0
         snapshot_start_row = max(0, snapshot_start_row)
-        if not (snapshot_start_row <= row_offset < snapshot_start_row + row_count):
+        window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
+        if not window_contains_offset:
             logger.warning(
                 "PakistanLawSite citation-grid snapshot window missing absolute offset row_offset=%s snapshot_start=%s rows=%s; using in-window fallback",
                 row_offset,
                 snapshot_start_row,
                 row_count,
             )
-        start_offset = row_offset
-        start_in_window = row_offset - snapshot_start_row
-        if start_in_window < 0 or start_in_window >= row_count:
-            start_in_window = 0
+        start_offset = row_offset if window_contains_offset else snapshot_start_row
+        start_in_window = row_offset - snapshot_start_row if window_contains_offset else 0
         remaining_rows_in_window = max(0, row_count - start_in_window)
-        remaining_rows_total = max(0, total_rows - row_offset)
+        remaining_rows_total = max(0, total_rows - start_offset)
         take_cap = row_count if max_detail <= 0 else min(max_detail, row_count)
         take_count = min(take_cap, remaining_rows_in_window, remaining_rows_total)
         raw_flush_every = cfg.get("citation_grid_flush_every", getattr(settings, "PLS_CITATION_GRID_FLUSH_EVERY", 1))

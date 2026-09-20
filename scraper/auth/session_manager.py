@@ -393,7 +393,7 @@ class PlaywrightBrowser:
             snapshot = await asyncio.wait_for(
                 self._wrap(
                     self._page.evaluate(
-                        """async (maxRows, startRow) => {
+                        """async ({ maxRows, startRow }) => {
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
                     const toInt = (value, fallback = 0) => {
@@ -560,8 +560,7 @@ class PlaywrightBrowser:
                         page_length: Number.isFinite(pageLength) && pageLength > 0 ? Math.floor(pageLength) : null,
                     };
                 }""",
-                        max_rows,
-                        safe_start_row,
+                        {"maxRows": max_rows, "startRow": safe_start_row},
                     )
                 ),
                 timeout=max(15.0, float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0),
