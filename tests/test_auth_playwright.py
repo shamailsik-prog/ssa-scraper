@@ -782,6 +782,49 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
 
 
+async def test_pipeline_citation_grid_prefers_real_detail_link_over_login_check_anchor(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    detail_url = "https://www.pakistanlawsite.com/case/248"
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        f"""
+        <html><body><a href="/logout">Logout</a>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>1</td>
+              <td>PLD 2024 SC 248</td>
+              <td>Beta versus State</td>
+              <td>Supreme Court</td>
+              <td>
+                <a href="/login/check?ReturnUrl=%2FLogin%2FCitationSearch">Read</a>
+                <a href="{detail_url}">Judgment</a>
+              </td>
+            </tr>
+          </tbody>
+        </table></body></html>
+        """,
+    )
+    sc.page(("goto", detail_url), judgment_html("PLD 2024 SC 248", title="Beta versus State"))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["surface_mode"] == "citation_grid"
+    assert stats["staged"] == 1
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto"]
+    assert detail_url in detail_calls
+    assert all("/login/check" not in call.lower() for call in detail_calls)
+    staged = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.id.desc()))).scalars().first()
+    assert staged is not None and staged.source_url == detail_url
+
+
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)

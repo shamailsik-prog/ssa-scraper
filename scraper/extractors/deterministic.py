@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import parse_qsl, quote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -46,6 +46,48 @@ INSTRUMENT_TYPE = re.compile(r"(?i)\b(ordinance|amendment act|act|notification|s
 INSTRUMENT_NUMBER = re.compile(r"(?i)\b(?:act|ordinance|bill|s\.?r\.?o\.?)\s*(?:no\.?\s*)?([IVXLC]+|\d+)(?:\s*\(?[IVXLC]*\)?)?\s*(?:of\s+(\d{4}))?")
 GAZETTE_REF = re.compile(r"(?i)gazette of pakistan[^\n]{0,120}")
 _MONTH_IDX = {m: i % 12 + 1 for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split())}
+_DETAIL_SKIP_TOKENS = ("/login/check", "/login/mainpage", "logout", "logoff")
+_DETAIL_QUERY_HINTS = {"casename", "caseid", "casetypeid", "judgmentid", "judgementid", "citationid", "docid"}
+
+
+def _is_pdf_href(href: str) -> bool:
+    return bool(re.search(r"\.pdf(?:$|[?#])", href or "", flags=re.IGNORECASE))
+
+
+def _should_skip_detail_href(raw_href: str, resolved_href: str) -> bool:
+    raw = (raw_href or "").strip()
+    if not raw or raw == "#":
+        return True
+    lowered = raw.lower()
+    if lowered.startswith("javascript:"):
+        return True
+    lowered_resolved = (resolved_href or raw).lower()
+    return any(token in lowered_resolved for token in _DETAIL_SKIP_TOKENS)
+
+
+def _detail_href_score(href: str, base_url: str) -> int:
+    parsed = urlsplit(href or "")
+    base_host = urlsplit(base_url or "").netloc.lower()
+    path_and_query = f"{parsed.path or ''}?{parsed.query or ''}".lower()
+    score = 0
+    if (parsed.scheme or "").lower() == "https":
+        score += 3
+    if base_host and parsed.netloc.lower() == base_host:
+        score += 5
+    if "referencecaselaw" in path_and_query:
+        score += 20
+    if "caselaw" in path_and_query:
+        score += 12
+    if "judgment" in path_and_query or "judgement" in path_and_query:
+        score += 10
+    if "citation" in path_and_query:
+        score += 8
+    query_keys = {key.lower() for key, _ in parse_qsl(parsed.query or "", keep_blank_values=True)}
+    if query_keys & _DETAIL_QUERY_HINTS:
+        score += 9
+    if "/login/" not in path_and_query:
+        score += 2
+    return score
 
 
 def _to_date(parts, order: str) -> Optional[date]:
@@ -393,12 +435,22 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
             if len(texts) > 2 and not row["court"]:
                 row["court"] = texts[2]
         anchors = tr.select(link_sel) if link_sel else tr.find_all("a", href=True)
-        for a in anchors:
-            href = urljoin(base_url, a.get("href", ""))
-            if href.lower().endswith(".pdf"):
+        detail_candidates: List[tuple[int, int, str]] = []
+        for idx, a in enumerate(anchors):
+            raw_href = (a.get("href") or "").strip()
+            if not raw_href:
+                continue
+            href = urljoin(base_url, raw_href).strip()
+            if not href:
+                continue
+            if _is_pdf_href(href):
                 row["pdf_url"] = row["pdf_url"] or href
-            else:
-                row["detail_url"] = row["detail_url"] or href
+                continue
+            if _should_skip_detail_href(raw_href, href):
+                continue
+            detail_candidates.append((_detail_href_score(href, base_url), -idx, href))
+        if detail_candidates:
+            row["detail_url"] = max(detail_candidates)[2]
         if not row["detail_url"]:
             read_control = tr.select_one("input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]")
             case_type_id = (read_control.get("casetypeid") or "").strip() if read_control else ""

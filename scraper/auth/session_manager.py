@@ -496,6 +496,40 @@ class PlaywrightBrowser:
                     const titleIdx = pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1);
                     const courtIdx = pickIndex(['court'], nonReadIndexes[2] ?? 2);
                     const cellAt = (cells, idx) => (idx >= 0 && idx < cells.length ? (cells[idx] || '') : '');
+                    const skipDetailHref = (href) => {
+                        const raw = (href || '').trim();
+                        if (!raw || raw === '#') return true;
+                        const lower = raw.toLowerCase();
+                        if (lower.startsWith('javascript:')) return true;
+                        if (lower.includes('/login/check')) return true;
+                        if (lower.includes('/login/mainpage')) return true;
+                        if (lower.includes('logout') || lower.includes('logoff')) return true;
+                        return false;
+                    };
+                    const detailHrefScore = (href) => {
+                        let parsed = null;
+                        try {
+                            parsed = new URL(href, window.location.href);
+                        } catch (_parseError) {
+                            return -1;
+                        }
+                        const host = window.location && window.location.host
+                            ? String(window.location.host).toLowerCase()
+                            : '';
+                        const pathAndQuery = `${parsed.pathname || ''}${parsed.search || ''}`.toLowerCase();
+                        let score = 0;
+                        if (parsed.protocol === 'https:') score += 3;
+                        if (host && parsed.host && String(parsed.host).toLowerCase() === host) score += 5;
+                        if (pathAndQuery.includes('referencecaselaw')) score += 20;
+                        if (pathAndQuery.includes('caselaw')) score += 12;
+                        if (pathAndQuery.includes('judgment') || pathAndQuery.includes('judgement')) score += 10;
+                        if (pathAndQuery.includes('citation')) score += 8;
+                        if (/[?&](casename|caseid|casetypeid|judgmentid|judgementid|citationid|docid)=/i.test(parsed.search || '')) {
+                            score += 9;
+                        }
+                        if (!pathAndQuery.includes('/login/')) score += 2;
+                        return score;
+                    };
                     const rows = [];
                     const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                     const trCollection = tbody && tbody.rows ? tbody.rows : [];
@@ -511,14 +545,24 @@ class PlaywrightBrowser:
                         const anchors = tr.querySelectorAll('a[href]');
                         let detailUrl = null;
                         let pdfUrl = null;
+                        const detailCandidates = [];
                         for (let a = 0; a < anchors.length; a += 1) {
-                            const href = anchors[a].href || '';
+                            const rawHref = (anchors[a].getAttribute('href') || '').trim();
+                            const href = (anchors[a].href || rawHref || '').trim();
                             if (!href) continue;
-                            if (!pdfUrl && href.toLowerCase().endsWith('.pdf')) {
+                            if (!pdfUrl && /\\.pdf(?:$|[?#])/i.test(href.toLowerCase())) {
                                 pdfUrl = href;
-                            } else if (!detailUrl) {
-                                detailUrl = href;
+                                continue;
                             }
+                            if (skipDetailHref(rawHref || href)) continue;
+                            detailCandidates.push({ href, score: detailHrefScore(href), index: a });
+                        }
+                        if (detailCandidates.length) {
+                            detailCandidates.sort((left, right) => {
+                                if (right.score !== left.score) return right.score - left.score;
+                                return left.index - right.index;
+                            });
+                            detailUrl = detailCandidates[0].href;
                         }
                         if (!detailUrl) {
                             const readControl = tr.querySelector(
