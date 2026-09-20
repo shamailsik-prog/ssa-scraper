@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import socket
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from celery import shared_task
 from sqlalchemy import select
@@ -29,6 +29,62 @@ from scraper.models import ScraperJob, ScraperSource
 from scraper.notify import notify
 
 logger = logging.getLogger(__name__)
+RUNNING_JOB_STALE_AFTER = timedelta(hours=3)
+
+
+def _running_started_at(job: ScraperJob) -> Optional[datetime]:
+    return job.started_at or job.created_at
+
+
+async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
+    """Return the live running job while retiring stale/zombie running rows."""
+    running_jobs = (
+        await db.execute(
+            select(ScraperJob).where(
+                ScraperJob.source_name == source_name,
+                ScraperJob.status == "running",
+            )
+        )
+    ).scalars().all()
+    if not running_jobs:
+        return None, False
+    stale_cutoff = now - RUNNING_JOB_STALE_AFTER
+    running_jobs.sort(
+        key=lambda job: _running_started_at(job) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    active_job: Optional[ScraperJob] = None
+    mutated = False
+    for job in running_jobs:
+        started_at = _running_started_at(job)
+        stale = started_at is None or started_at <= stale_cutoff
+        if active_job is not None:
+            stale = True
+        if not stale:
+            active_job = job
+            continue
+        if job.status != "failed":
+            job.status = "failed"
+            mutated = True
+        if job.finished_at is None:
+            job.finished_at = now
+            mutated = True
+        if not job.error_message:
+            if started_at is None:
+                reason = "dispatcher marked stale running job as failed (missing started_at)."
+            else:
+                age_seconds = int(max(0, (now - started_at).total_seconds()))
+                reason = f"dispatcher marked stale running job as failed (age_seconds={age_seconds})."
+            job.error_message = reason
+            mutated = True
+        logger.warning(
+            "Recovered stale running job source=%s job_id=%s started_at=%s active_job=%s",
+            source_name,
+            job.id,
+            started_at,
+            active_job.id if active_job is not None else None,
+        )
+    return active_job, mutated
 
 
 async def _connector_for(source: ScraperSource):
@@ -76,15 +132,10 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 return {"skipped": "PAUSED", "reason": source.state_reason}
         elif source.state == "PAUSED":
             return {"skipped": "PAUSED", "reason": source.state_reason}
-        existing = (
-            await db.execute(
-                select(ScraperJob).where(
-                    ScraperJob.source_name == source_name,
-                    ScraperJob.status == "running",
-                )
-            )
-        ).scalars().first()
+        existing, recovered_stale = await _active_running_job(db, source_name, now=datetime.now(timezone.utc))
         if existing is not None:
+            if recovered_stale:
+                await db.commit()
             logger.info(
                 "%s already has running job %s; skipping duplicate kick",
                 source_name,
@@ -170,19 +221,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
                 continue
-            running = (
-                await db.execute(
-                    select(ScraperJob.id).where(
-                        ScraperJob.source_name == s.source_name,
-                        ScraperJob.status == "running",
-                    )
-                )
-            ).scalars().first()
+            running, _ = await _active_running_job(db, s.source_name, now=now)
             if running is not None:
                 logger.info(
                     "%s due but job %s still running; not re-queued",
                     s.source_name,
-                    running,
+                    running.id,
                 )
                 continue
             if s.access_method == "login_session":

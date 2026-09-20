@@ -903,6 +903,43 @@ async def test_pipeline_citation_grid_cursor_falls_back_to_snapshot_window_offse
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 2
 
 
+async def test_pipeline_citation_grid_cursor_normalizes_non_datatable_start_row(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    await _activate(db, login_source)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 200},
+    }
+    await db.commit()
+    rows = [
+        ("PLD 2024 SC 1311", "Case 1311", "Supreme Court", "https://www.pakistanlawsite.com/case/1311"),
+        ("PLD 2024 SC 1312", "Case 1312", "Supreme Court", "https://www.pakistanlawsite.com/case/1312"),
+        ("PLD 2024 SC 1313", "Case 1313", "Supreme Court", "https://www.pakistanlawsite.com/case/1313"),
+    ]
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda _browser: PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=_archived_grid_html(rows),
+        status=200,
+        metadata={"total_rows": 20567, "start_row": 200, "requested_start_row": 200, "seek_mode": "dom"},
+    )
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/1311", "https://www.pakistanlawsite.com/case/1312"]
+    assert stats["citation_grid_offset"] == 0
+    assert stats["citation_grid_next_offset"] == 2
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 2
+
+
 async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_end(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
