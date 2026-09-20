@@ -1,1 +1,1 @@
-@file:///tmp/fixtures_body.txt
+placeholder2
