@@ -277,9 +277,53 @@ async def test_playwright_goto_uses_domcontentloaded_without_networkidle_wait():
     result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
 
     assert result.status == 200
+    assert result.metadata["requested_url"] == "https://www.pakistanlawsite.com/Login/CitationSearch"
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/Login/CitationSearch"
     goto_call = next(c for c in page.calls if c[0] == "goto")
     assert goto_call[2]["wait_until"] == "domcontentloaded"
     assert goto_call[2]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
+
+
+async def test_playwright_goto_rewrites_login_check_to_requested_reference_case_url():
+    page = _FakePage()
+
+    async def _goto_with_redirect(url, **kwargs):
+        page.calls.append(("goto", url, kwargs))
+        page.url = "https://www.pakistanlawsite.com/login/check"
+        return SimpleNamespace(status=200, headers={"content-type": "text/html"})
+
+    page.goto = _goto_with_redirect
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    requested_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
+    result = await browser.goto(requested_url)
+
+    assert result.url == requested_url
+    assert result.metadata["requested_url"] == requested_url
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/login/check"
+    assert result.metadata["url_rewritten_from_login_check"] is True
+
+
+async def test_playwright_goto_rewrites_login_check_when_case_html_contains_citation_name():
+    page = _FakePage(html="<html><body><h2>Citation Name: PLD 2024 SC 101</h2></body></html>")
+
+    async def _goto_with_redirect(url, **kwargs):
+        page.calls.append(("goto", url, kwargs))
+        page.url = "https://www.pakistanlawsite.com/login/check"
+        return SimpleNamespace(status=200, headers={"content-type": "text/html"})
+
+    page.goto = _goto_with_redirect
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    requested_url = "https://www.pakistanlawsite.com/case/247"
+    result = await browser.goto(requested_url)
+
+    assert result.url == requested_url
+    assert result.metadata["requested_url"] == requested_url
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/login/check"
+    assert result.metadata["url_rewritten_from_login_check"] is True
 
 
 async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_grid():

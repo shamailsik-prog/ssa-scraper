@@ -40,50 +40,70 @@ def _det():
     return extract_judgment_deterministic(html=JUDGMENT_HTML, text=clean_html(JUDGMENT_HTML))
 
 
+CASE_TEXT_WITH_CITATION = "Citation Name: PLD 2024 SC 101\nMuhammad Akram versus The State"
+CASE_HTML_WITH_CITATION = "<html><body><h2>Citation Name: PLD 2024 SC 101</h2><p>Muhammad Akram versus The State</p></body></html>"
+
+
 @pytest.mark.parametrize(
-    ("source_url", "raw_text", "raw_html", "judge_names", "reason_code", "signal"),
+    ("source_url", "raw_text", "raw_html", "judge_names", "expect_stub", "reason_code", "signal"),
     (
         (
             "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch",
-            JUDGMENT_TEXT,
-            JUDGMENT_HTML,
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
             ["Qazi Faez Isa"],
+            False,
+            None,
+            None,
+        ),
+        (
+            "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch",
+            "Update Subscriber plan before continuing.",
+            "<html><body>Obtaining subscription</body></html>",
+            ["Qazi Faez Isa"],
+            True,
             "login_stub",
             "source_url_login_check",
         ),
         (
-            "https://www.pakistanlawsite.com/Login/CitationSearch",
-            "Update Subscriber plan before continuing.",
-            "<html><body>Judgment text</body></html>",
+            "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined",
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
             ["Qazi Faez Isa"],
-            "subscription_chrome",
-            "raw_text_update_subscriber",
+            False,
+            None,
+            None,
         ),
         (
             "https://www.pakistanlawsite.com/Login/CitationSearch",
-            JUDGMENT_TEXT,
-            "<html><body>Obtaining Subscription...</body></html>",
-            ["Qazi Faez Isa"],
-            "subscription_chrome",
-            "raw_html_obtaining_subscription",
-        ),
-        (
-            "https://www.pakistanlawsite.com/Login/CitationSearch",
-            JUDGMENT_TEXT,
-            JUDGMENT_HTML,
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
             ["Obtaining Subscription"],
+            True,
             "subscription_chrome",
             "judge_name_obtaining_subscription",
         ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
+            ["Qazi Faez Isa"],
+            False,
+            None,
+            None,
+        ),
     ),
 )
-def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_names, reason_code, signal):
+def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_names, expect_stub, reason_code, signal):
     hit = detect_judgment_stub(
         source_url=source_url,
         raw_text=raw_text,
         raw_html=raw_html,
         judge_names=judge_names,
     )
+    if not expect_stub:
+        assert hit is None
+        return
     assert hit is not None
     assert hit.reason_code == reason_code
     assert hit.signal == signal
@@ -109,7 +129,7 @@ def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_name
         (
             "https://www.pakistanlawsite.com/Login/CitationSearch",
             JUDGMENT_TEXT,
-            JUDGMENT_HTML,
+            "<html><body>Obtaining Subscription...</body></html>",
             ["Obtaining Subscription"],
             "subscription_chrome:",
         ),
@@ -135,6 +155,22 @@ def test_reconcile_judgment_quarantines_login_subscription_stubs(
     )
     assert out.quarantine is True
     assert (out.quarantine_reason or "").startswith(expected_reason_prefix)
+
+
+def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_content_exists():
+    det = _det()
+    det["judge_names"] = ["Obtaining Subscription", "Qazi Faez Isa"]
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=CASE_TEXT_WITH_CITATION,
+        raw_html=CASE_HTML_WITH_CITATION,
+        source_url="https://www.pakistanlawsite.com/login/check?x=1",
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is False
+    assert out.data["judge_names"] == ["Qazi Faez Isa"]
 
 
 @pytest.mark.parametrize(
