@@ -85,7 +85,7 @@ def detect_judgment_stub(
     # Site chrome always includes Update Subscriber modal + FAQ "obtaining subscription".
     # Only treat those markers as stubs when the page has no case body.
     if not has_case:
-    for field_name, value in (("raw_text", raw_text or ""), ("raw_html", raw_html or "")):
+        for field_name, value in (("raw_text", raw_text or ""), ("raw_html", raw_html or "")):
             marker = _match_subscription_chrome(value)
             if marker:
                 return JudgmentGuardSignal(
