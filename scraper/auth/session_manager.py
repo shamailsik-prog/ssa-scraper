@@ -75,7 +75,7 @@ class Browser(Protocol):
 
     slot_number: int
 
-    async def goto(self, url: str) -> PageResult: ...
+    async def goto(self, url: str, **kwargs: Any) -> PageResult: ...
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult: ...
 
@@ -371,7 +371,7 @@ class PlaywrightBrowser:
             )
         )
 
-    async def _capture_archived_grid_snapshot(self) -> Optional[Dict[str, Any]]:
+    async def _capture_archived_grid_snapshot(self, *, start_row: int = 0) -> Optional[Dict[str, Any]]:
         """Compact row extract for #archivedpatientGrid without page.content().
 
         Critical performance rules:
@@ -380,10 +380,12 @@ class PlaywrightBrowser:
         - synthesize detail URLs from casetypeid when anchors are absent
         """
         max_rows = int(settings.PLS_ARCHIVED_GRID_MAX_ROWS)
+        safe_start_row = max(0, int(start_row or 0))
         logger.info(
-            "archivedpatientGrid compact snapshot starting slot=%s max_rows=%s url=%s",
+            "archivedpatientGrid compact snapshot starting slot=%s max_rows=%s start_row=%s url=%s",
             self.slot_number,
             max_rows,
+            safe_start_row,
             self._page.url if self._page else None,
         )
         started = datetime.now(timezone.utc)
@@ -391,9 +393,90 @@ class PlaywrightBrowser:
             snapshot = await asyncio.wait_for(
                 self._wrap(
                     self._page.evaluate(
-                        """(maxRows) => {
+                        """async ({ maxRows, startRow }) => {
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
+                    const toInt = (value, fallback = 0) => {
+                        const n = Number(value);
+                        if (!Number.isFinite(n)) return fallback;
+                        return Math.max(0, Math.floor(n));
+                    };
+                    const requestedStartRow = toInt(startRow, 0);
+                    let appliedStartRow = requestedStartRow;
+                    let totalRows = null;
+                    let pageLength = null;
+                    let seekMode = 'none';
+                    try {
+                        const jq = window.jQuery || window.$;
+                        if (jq && jq.fn && jq.fn.dataTable) {
+                            let dt = null;
+                            try {
+                                dt = jq(table).DataTable();
+                            } catch (_dtError) {
+                                dt = null;
+                            }
+                            if (dt && typeof dt.page === 'function' && typeof dt.page.info === 'function') {
+                                const infoBefore = dt.page.info() || {};
+                                const recordsBefore = Number(infoBefore.recordsDisplay ?? infoBefore.recordsTotal);
+                                if (Number.isFinite(recordsBefore) && recordsBefore >= 0) {
+                                    totalRows = Math.floor(recordsBefore);
+                                }
+                                pageLength = Number(infoBefore.length ?? dt.page.len());
+                                if (!Number.isFinite(pageLength) || pageLength <= 0) {
+                                    pageLength = Math.max(1, maxRows || 1);
+                                }
+                                const boundedStart = totalRows && totalRows > 0
+                                    ? Math.min(requestedStartRow, Math.max(totalRows - 1, 0))
+                                    : requestedStartRow;
+                                const targetPage = Math.floor(boundedStart / pageLength);
+                                await new Promise((resolve) => {
+                                    let done = false;
+                                    const finish = () => {
+                                        if (!done) {
+                                            done = true;
+                                            resolve();
+                                        }
+                                    };
+                                    try {
+                                        jq(table).one('draw.dt', finish);
+                                        dt.page(targetPage).draw(false);
+                                        setTimeout(finish, 1200);
+                                    } catch (_drawError) {
+                                        finish();
+                                    }
+                                });
+                                const infoAfter = dt.page.info() || {};
+                                const recordsAfter = Number(infoAfter.recordsDisplay ?? infoAfter.recordsTotal);
+                                if (Number.isFinite(recordsAfter) && recordsAfter >= 0) {
+                                    totalRows = Math.floor(recordsAfter);
+                                }
+                                pageLength = Number(infoAfter.length ?? pageLength);
+                                if (Number.isFinite(infoAfter.start) && Number(infoAfter.start) >= 0) {
+                                    appliedStartRow = Math.floor(Number(infoAfter.start));
+                                } else {
+                                    appliedStartRow = targetPage * pageLength;
+                                }
+                                seekMode = 'datatable';
+                            }
+                        }
+                    } catch (_seekError) {
+                        // Keep compact snapshot resilient even if DataTables API is unavailable.
+                    }
+                    if (seekMode !== 'datatable') {
+                        const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
+                        const trCollection = tbody && tbody.rows ? tbody.rows : [];
+                        const target = trCollection.length ? trCollection[Math.min(requestedStartRow, trCollection.length - 1)] : null;
+                        if (target && target.scrollIntoView) {
+                            try {
+                                target.scrollIntoView({ block: 'nearest' });
+                                seekMode = 'scroll';
+                            } catch (_scrollError) {
+                                seekMode = 'dom';
+                            }
+                        } else {
+                            seekMode = 'dom';
+                        }
+                    }
                     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
                     const normalizedHeaders = headers.map((h) => h.toLowerCase().replace(/\\s+/g, ' ').trim());
                     const pickIndex = (hints, fallbackIndex) => {
@@ -460,16 +543,24 @@ class PlaywrightBrowser:
                     const nextDisabled = nextLink
                         ? (nextLink.classList.contains('disabled') || (nextLink.parentElement && nextLink.parentElement.classList.contains('disabled')))
                         : true;
+                    const domTotalRows = trCollection.length || 0;
+                    const resolvedTotalRows = Number.isFinite(totalRows) && totalRows >= 0
+                        ? totalRows
+                        : domTotalRows;
                     return {
                         headers,
                         rows,
                         next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
                         body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                        total_rows: trCollection.length || 0,
+                        total_rows: resolvedTotalRows,
+                        requested_start_row: requestedStartRow,
+                        start_row: appliedStartRow,
+                        seek_mode: seekMode,
+                        page_length: Number.isFinite(pageLength) && pageLength > 0 ? Math.floor(pageLength) : null,
                     };
                 }""",
-                        max_rows,
+                        {"maxRows": max_rows, "startRow": safe_start_row},
                     )
                 ),
                 timeout=max(15.0, float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0),
@@ -489,10 +580,12 @@ class PlaywrightBrowser:
         row_count = len((snapshot or {}).get("rows") or []) if snapshot else 0
         total_rows = (snapshot or {}).get("total_rows") if snapshot else None
         logger.info(
-            "archivedpatientGrid compact snapshot done slot=%s rows=%s total_rows=%s elapsed=%.1fs",
+            "archivedpatientGrid compact snapshot done slot=%s rows=%s total_rows=%s start_row=%s seek_mode=%s elapsed=%.1fs",
             self.slot_number,
             row_count,
             total_rows,
+            (snapshot or {}).get("start_row") if snapshot else None,
+            (snapshot or {}).get("seek_mode") if snapshot else None,
             elapsed,
         )
         return snapshot
@@ -547,7 +640,7 @@ class PlaywrightBrowser:
             "</body></html>"
         )
 
-    async def _capture_html(self, *, resp=None) -> tuple[str, Dict[str, Any]]:
+    async def _capture_html(self, *, resp=None, archived_grid_start_row: int = 0) -> tuple[str, Dict[str, Any]]:
         dom = await self._dom_shape()
         content_length = self._header_int(resp, "content-length")
         has_grid = bool(dom.get("has_archivedpatient_grid"))
@@ -560,7 +653,7 @@ class PlaywrightBrowser:
         # input threshold while the live DOM is still ~10-16MB. Always compact when the
         # archived grid is present — never call page.content() on that surface.
         if has_grid:
-            snapshot = await self._capture_archived_grid_snapshot()
+            snapshot = await self._capture_archived_grid_snapshot(start_row=archived_grid_start_row)
             if snapshot:
                 html_compact = self._render_compact_archived_grid_html(snapshot)
                 return html_compact, {
@@ -571,6 +664,10 @@ class PlaywrightBrowser:
                     "rows": len(snapshot.get("rows") or []),
                     "row_cap": int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
                     "total_rows": snapshot.get("total_rows"),
+                    "start_row": snapshot.get("start_row"),
+                    "requested_start_row": snapshot.get("requested_start_row"),
+                    "seek_mode": snapshot.get("seek_mode"),
+                    "page_length": snapshot.get("page_length"),
                     "oversized_hint": oversized,
                 }
             logger.warning(
@@ -603,7 +700,8 @@ class PlaywrightBrowser:
             }
         return await self._wrap(self._page.content()), {}
 
-    async def goto(self, url: str) -> PageResult:
+    async def goto(self, url: str, **kwargs: Any) -> PageResult:
+        archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         resp = await self._wrap(
             self._page.goto(
                 url,
@@ -611,7 +709,7 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
-        html_text, metadata = await self._capture_html(resp=resp)
+        html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)

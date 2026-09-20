@@ -32,6 +32,7 @@ def test_health_and_dashboard(client):
 def test_admin_routes_require_key(client, admin_headers):
     for path in (
         "/admin/sources",
+        "/admin/sources/PakistanLawSite/status",
         "/admin/coverage",
         "/admin/review",
         "/admin/archive",
@@ -69,6 +70,38 @@ def test_sources_view_has_no_credential_card_and_shows_slots(client, admin_heade
         "AJKAssembly",
         "GBAssembly",
     } <= {r["source_name"] for r in rows}
+
+
+def test_pls_status_shows_citation_grid_cursor_progress(client, admin_headers):
+    from scraper.database import SessionLocal
+    from scraper.models import ScraperSource
+
+    async def seed_cursor():
+        async with SessionLocal() as db:
+            source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+            cfg = dict(source.config_json or {})
+            cfg["citation_grid_cursor"] = {
+                "row_offset": "17",
+                "last_start_offset": "14",
+                "last_take_count": "3",
+                "last_rows_seen": "90",
+                "last_total_rows": "120",
+                "updated_at": "2026-09-20T21:00:00+00:00",
+            }
+            source.config_json = cfg
+            await db.commit()
+
+    run_async(seed_cursor())
+    status = client.get("/admin/sources/PakistanLawSite/status", headers=admin_headers).json()
+    progress = status["citation_grid_progress"]
+    assert progress["source_name"] == "PakistanLawSite"
+    assert progress["job_key"] == "PakistanLawSite:archivedpatientGrid"
+    assert progress["citation_grid_cursor"]["row_offset"] == 17
+    assert progress["last_flush"] == {"offset_before": 14, "offset_after": 17, "processed_rows": 3}
+
+    rows = client.get("/admin/sources", headers=admin_headers).json()
+    pls = next(r for r in rows if r["source_name"] == "PakistanLawSite")
+    assert pls["citation_grid_progress"]["citation_grid_cursor"]["row_offset"] == 17
 
 
 def test_extraction_settings_and_guards(client, admin_headers):

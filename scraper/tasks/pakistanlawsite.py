@@ -266,9 +266,17 @@ class PakistanLawSitePipeline:
     async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
         """Fallback when CitationSearch is an authenticated citation table, not a form."""
         await self._charge_page()
+        cfg = dict(self.source.config_json or {})
+        cursor = dict(cfg.get("citation_grid_cursor") or {})
+        raw_offset = cursor.get("row_offset", 0)
+        try:
+            row_offset = int(raw_offset or 0)
+        except Exception:
+            row_offset = 0
+        row_offset = max(0, row_offset)
 
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(settings.PLS_SEARCH_URL)
+            page = await browser.goto(settings.PLS_SEARCH_URL, archived_grid_start_row=row_offset)
             raise_for_verdict(page)
             return page
 
@@ -288,32 +296,52 @@ class PakistanLawSitePipeline:
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
         max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
-        cfg = dict(self.source.config_json or {})
-        cursor = dict(cfg.get("citation_grid_cursor") or {})
-        raw_offset = cursor.get("row_offset", 0)
-        try:
-            row_offset = int(raw_offset or 0)
-        except Exception:
-            row_offset = 0
-        row_offset = max(0, row_offset)
         row_count = len(rows)
         total_rows_meta = (page.metadata or {}).get("total_rows")
         try:
             total_rows = int(total_rows_meta) if total_rows_meta is not None else None
         except Exception:
             total_rows = None
-        start_offset = row_offset % row_count
-        take_count = row_count if max_detail <= 0 else min(max_detail, row_count)
+        if total_rows is None:
+            try:
+                total_rows = int(cursor.get("last_total_rows"))
+            except Exception:
+                total_rows = None
+        if total_rows is None or total_rows <= 0:
+            total_rows = row_count
+        if row_offset >= total_rows:
+            row_offset = row_offset % total_rows
+        start_row_meta = (page.metadata or {}).get("start_row")
+        try:
+            snapshot_start_row = int(start_row_meta) if start_row_meta is not None else 0
+        except Exception:
+            snapshot_start_row = 0
+        snapshot_start_row = max(0, snapshot_start_row)
+        window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
+        if not window_contains_offset:
+            logger.warning(
+                "PakistanLawSite citation-grid snapshot window missing absolute offset row_offset=%s snapshot_start=%s rows=%s; using in-window fallback",
+                row_offset,
+                snapshot_start_row,
+                row_count,
+            )
+        start_offset = row_offset if window_contains_offset else snapshot_start_row
+        start_in_window = row_offset - snapshot_start_row if window_contains_offset else 0
+        remaining_rows_in_window = max(0, row_count - start_in_window)
+        remaining_rows_total = max(0, total_rows - start_offset)
+        take_cap = row_count if max_detail <= 0 else min(max_detail, row_count)
+        take_count = min(take_cap, remaining_rows_in_window, remaining_rows_total)
         raw_flush_every = cfg.get("citation_grid_flush_every", getattr(settings, "PLS_CITATION_GRID_FLUSH_EVERY", 1))
         try:
             flush_every = int(raw_flush_every or 1)
         except Exception:
             flush_every = 1
         flush_every = max(1, flush_every)
-        selected_indexes = [((start_offset + i) % row_count) for i in range(take_count)]
+        selected_indexes = [start_in_window + i for i in range(take_count)]
         logger.info(
-            "PakistanLawSite citation-grid cursor start_offset=%s take_count=%s rows=%s total_rows=%s max_detail=%s flush_every=%s",
+            "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s flush_every=%s",
             start_offset,
+            start_in_window,
             take_count,
             row_count,
             total_rows,
@@ -324,10 +352,19 @@ class PakistanLawSitePipeline:
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
         self.stats["citation_grid_offset"] = start_offset
+        self.stats["citation_grid_snapshot_start"] = snapshot_start_row
         self.stats["citation_grid_rows_seen"] = row_count
         details_since_flush = 0
         staged_since_flush = 0
         last_committed_offset = start_offset
+
+        def next_offset_after(processed_rows: int) -> int:
+            if total_rows <= 0:
+                return start_offset + processed_rows
+            absolute = start_offset + processed_rows
+            if absolute >= total_rows:
+                return absolute % total_rows
+            return absolute
 
         async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
             nonlocal last_committed_offset
@@ -342,6 +379,7 @@ class PakistanLawSitePipeline:
                     "last_take_count": processed_rows,
                     "last_rows_seen": row_count,
                     "last_total_rows": total_rows,
+                    "last_snapshot_start_row": snapshot_start_row,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -374,7 +412,7 @@ class PakistanLawSitePipeline:
                     row.get("title"),
                 )
                 if (idx + 1) == len(selected_indexes):
-                    next_offset = (start_offset + idx + 1) % row_count
+                    next_offset = next_offset_after(idx + 1)
                     await flush_citation_grid_progress(
                         next_offset,
                         staged_this_flush=staged_since_flush,
@@ -395,8 +433,12 @@ class PakistanLawSitePipeline:
             route = {
                 "tier": "citation_grid",
                 "query": {"surface": "archivedpatientGrid"},
-                "cursor": {"row_index": row_idx},
+                "cursor": {
+                    "row_index": row_idx,
+                    "absolute_row_index": snapshot_start_row + row_idx,
+                },
                 "row_index": row_idx,
+                "absolute_row_index": snapshot_start_row + row_idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
             detail = await self.fetch_detail(detail_url)
@@ -405,7 +447,7 @@ class PakistanLawSitePipeline:
             if result == "staged":
                 staged_since_flush += 1
             if details_since_flush >= flush_every or (idx + 1) == len(selected_indexes):
-                next_offset = (start_offset + idx + 1) % row_count
+                next_offset = next_offset_after(idx + 1)
                 await flush_citation_grid_progress(
                     next_offset,
                     staged_this_flush=staged_since_flush,
@@ -431,7 +473,7 @@ class PakistanLawSitePipeline:
             )
             if url_less_skips >= len(selected_indexes):
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
-        next_offset = (start_offset + take_count) % row_count
+        next_offset = next_offset_after(take_count)
         if last_committed_offset != next_offset:
             await flush_citation_grid_progress(
                 next_offset,
@@ -443,7 +485,7 @@ class PakistanLawSitePipeline:
             "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",
             start_offset,
             next_offset,
-            bool(next_offset < start_offset or (start_offset == 0 and take_count == row_count)),
+            bool(total_rows > 0 and next_offset < start_offset),
         )
 
     # ---------------------------------------------------------------- one result page
