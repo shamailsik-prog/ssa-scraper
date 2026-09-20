@@ -80,6 +80,25 @@ ACT_WITH_YEAR_PATTERN = re.compile(
 )
 SECTION_DIGIT_START_RE = re.compile(r'^\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)', re.DOTALL)
 SECTION_KEYWORD_RE = re.compile(r'^\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*(.*)', re.IGNORECASE | re.DOTALL)
+SHORT_TITLE_CLAUSE_RE = re.compile(
+    r'^\s*(?:section\s+\d+[A-Z]?\s*[\.\-\)\:]\s*)?(?:short\s+title[^.:\n]*[:\-\.\)]\s*)?(?:this|the)\s+'
+    r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
+    re.IGNORECASE,
+)
+FOOTNOTE_ANNOTATION_RE = re.compile(
+    r'(?i)\b(?:substituted|inserted|added|omitted|amended|renumbered|repealed)\s+by\b'
+)
+GAZETTE_FOOTNOTE_RE = re.compile(
+    r'(?i)\bgazette\b.*\b(extraordinary|dated|notification|part)\b'
+)
+SECTION_RANGE_FOOTNOTE_RE = re.compile(
+    r'(?i)\b(?:for|in)\s+sections?\s+\d+[A-Z]?(?:\s*,\s*\d+[A-Z]?)*(?:\s+and\s+\d+[A-Z]?)\b'
+)
+TRAILING_AND_SECTION_RE = re.compile(r'(?i)^\s*(?:and|or)\s+\d+[A-Z]?\.?\s*$')
+ACT_SECTION_SANITY_CAPS = {
+    "canal and drainage act 1873": 75,
+    "canal and drainage act": 75,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -171,7 +190,67 @@ def _make_section_dict(number: str, title: str, text: str, statute_name: str) ->
         "section_text": _clean_section_text(text),
     }
 
-def _deduplicate_sections(sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def _normalize_statute_key(name: str) -> str:
+    return re.sub(r'[^a-z0-9]+', ' ', (name or "").lower()).strip()
+
+def _parse_numeric_section_number(raw_section_number: str) -> Optional[int]:
+    match = re.search(r'\d+', raw_section_number or "")
+    return int(match.group(0)) if match else None
+
+def _section_cap_for_statute(statute_name: str) -> Optional[int]:
+    key = _normalize_statute_key(statute_name)
+    if not key:
+        return None
+    for act_key, cap in ACT_SECTION_SANITY_CAPS.items():
+        if act_key in key:
+            return cap
+    return None
+
+def _strip_section_prefix(text: str) -> str:
+    return re.sub(
+        r'^\s*(?:Section|Sec\.|S\.)?\s*\d+[A-Z]?\s*[\.\-\)\:\]]\s*',
+        '',
+        text or "",
+        flags=re.IGNORECASE,
+    ).strip()
+
+def _is_false_section_candidate(section_text: str) -> bool:
+    body = _strip_section_prefix(section_text)
+    if not body:
+        return True
+    if re.fullmatch(r'\d{1,4}', body):
+        return True
+    if TRAILING_AND_SECTION_RE.match(body):
+        return True
+    if GAZETTE_FOOTNOTE_RE.search(body):
+        return True
+    if FOOTNOTE_ANNOTATION_RE.search(body):
+        return True
+    if SECTION_RANGE_FOOTNOTE_RE.search(body) and len(body) < 260:
+        return True
+    return False
+
+def is_short_title_clause(name: str) -> bool:
+    return bool(SHORT_TITLE_CLAUSE_RE.match(_normalize_whitespace(name or "")))
+
+def _is_plausible_act_title(name: str) -> bool:
+    candidate = _normalize_whitespace(name or "")
+    if not candidate or is_short_title_clause(candidate):
+        return False
+    if not (6 <= len(candidate) <= 180):
+        return False
+    return bool(re.search(r'\b(Act|Ordinance|Order|Code|Rules|Regulations|Constitution)\b', candidate, re.IGNORECASE))
+
+def prefer_official_statute_title(detected_name: Optional[str], official_title: Optional[str]) -> str:
+    detected = _normalize_whitespace(detected_name or "") or "Unknown Statute"
+    official = _normalize_whitespace(official_title or "")
+    if official and _is_plausible_act_title(official):
+        if detected == "Unknown Statute" or is_short_title_clause(detected):
+            return official
+    return detected
+
+def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional[str] = None) -> List[Dict[str, str]]:
+    sanity_cap = _section_cap_for_statute(statute_name or "")
     seen = set()
     out = []
     for s in sections:
@@ -182,17 +261,19 @@ def _deduplicate_sections(sections: List[Dict[str, str]]) -> List[Dict[str, str]
         # filter tiny sections that are likely not real
         if len(s.get("section_text", "")) < 20:
             continue
+        if _is_false_section_candidate(s.get("section_text", "")):
+            continue
+        num_int = _parse_numeric_section_number(s.get("section_number", ""))
+        if sanity_cap is not None and num_int is not None and num_int > sanity_cap:
+            continue
         # filter bogus numbers like 99999
-        try:
-            num_int = int(re.sub(r'[^0-9]', '', key) or '0')
-            if num_int > 2000:  # statutes rarely exceed 1000 sections except constitution
-                # still keep constitution but skip crazy
-                if not (num_int < 3000 and "constitution" in s.get("section_title", "").lower()):
-                    # but allow if number is e.g., 511
-                    if num_int > 5000:
-                        continue
-        except ValueError:
-            pass
+        if num_int is not None and num_int > 2000:
+            # statutes rarely exceed 1000 sections except constitution
+            # still keep constitution but skip crazy
+            if not (num_int < 3000 and "constitution" in s.get("section_title", "").lower()):
+                # but allow if number is e.g., 511
+                if num_int > 5000:
+                    continue
         seen.add(key)
         out.append(s)
     return out
@@ -234,7 +315,7 @@ def _strategy_1_p_class_section(soup: BeautifulSoup, statute_name: str) -> List[
                 if inner_m:
                     sections.append(_make_section_dict(inner_m.group(1), _derive_title(txt), txt, statute_name))
         logger.debug(f"Strategy1 p.class=section found {len(sections)}")
-        return _deduplicate_sections(sections)
+        return _deduplicate_sections(sections, statute_name)
     except Exception as e:
         logger.warning(f"Strategy1 failed: {e}")
         return []
@@ -272,7 +353,7 @@ def _strategy_2_div_section_body(soup: BeautifulSoup, statute_name: str) -> List
                     if n:
                         sections.append(_make_section_dict(n, t, b, statute_name))
         logger.debug(f"Strategy2 div.section-body found {len(sections)}")
-        return _deduplicate_sections(sections)
+        return _deduplicate_sections(sections, statute_name)
     except Exception as e:
         logger.warning(f"Strategy2 failed: {e}")
         return []
@@ -307,7 +388,7 @@ def _strategy_3_p_filtered_digit_start(soup: BeautifulSoup, statute_name: str) -
             if num:
                 sections.append(_make_section_dict(num, title, full_text, statute_name))
         logger.debug(f"Strategy3 p digit-start found {len(sections)}")
-        return _deduplicate_sections(sections)
+        return _deduplicate_sections(sections, statute_name)
     except Exception as e:
         logger.warning(f"Strategy3 failed: {e}")
         return []
@@ -340,7 +421,7 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
                 if num:
                     sections.append(_make_section_dict(num, title, chunk, statute_name))
             logger.debug(f"Strategy4 re.split digit found {len(sections)}")
-            return _deduplicate_sections(sections)
+            return _deduplicate_sections(sections, statute_name)
         else:
             # fallback naive split by double newline and filter
             chunks = re.split(r'\n{2,}', plain)
@@ -349,7 +430,7 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
                 if num:
                     sections.append(_make_section_dict(num, title, chunk, statute_name))
             logger.debug(f"Strategy4 fallback chunks found {len(sections)}")
-            return _deduplicate_sections(sections)
+            return _deduplicate_sections(sections, statute_name)
     except Exception as e:
         logger.warning(f"Strategy4 failed: {e}")
         return []
@@ -380,7 +461,7 @@ def _strategy_5_resplit_section_keyword(text: str, statute_name: str) -> List[Di
                 sections.append(_make_section_dict(sec_num, title, chunk, statute_name))
         if sections:
             logger.debug(f"Strategy5 re.split Section found {len(sections)}")
-            return _deduplicate_sections(sections)
+            return _deduplicate_sections(sections, statute_name)
         # If no "Section" keyword, try Article for Constitution
         article_pattern = re.compile(r'(?:\n|^)\s*(?:Article|Art\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*', re.IGNORECASE | re.MULTILINE)
         matches = list(article_pattern.finditer(plain))
@@ -397,7 +478,7 @@ def _strategy_5_resplit_section_keyword(text: str, statute_name: str) -> List[Di
                 # For constitution, keep Article prefix in number
                 sections.append(_make_section_dict(f"Article {sec_num}" if not sec_num.lower().startswith("article") else sec_num, title, chunk, statute_name))
             logger.debug(f"Strategy5 Article fallback found {len(sections)}")
-            return _deduplicate_sections(sections)
+            return _deduplicate_sections(sections, statute_name)
         return []
     except Exception as e:
         logger.warning(f"Strategy5 failed: {e}")
@@ -496,7 +577,7 @@ def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[D
     candidates.extend(_strategy_4_resplit_digit(text, statute_name))
     candidates.extend(_strategy_5_resplit_section_keyword(text, statute_name))
     if candidates:
-        deduped = _deduplicate_sections(candidates)
+        deduped = _deduplicate_sections(candidates, statute_name)
         if deduped:
             # sort by numeric section number if possible
             def sort_key(s):
@@ -737,14 +818,20 @@ def detect_statute_name(text: str, url: Optional[str] = None) -> str:
 # Optional helper for external integration
 # ---------------------------------------------------------------------------
 
-def parse_statute_document(html_or_text: str, url: Optional[str] = None, statute_name: Optional[str] = None) -> Dict[str, object]:
+def parse_statute_document(
+    html_or_text: str,
+    url: Optional[str] = None,
+    statute_name: Optional[str] = None,
+    official_title: Optional[str] = None,
+) -> Dict[str, object]:
     """
     Convenience wrapper that detects name and splits into sections.
     Returns dict with statute_name and sections.
 
     This is useful for pipeline: harvester -> text_cleaner -> this.
     """
-    detected = statute_name or detect_statute_name(html_or_text, url)
+    detected_raw = statute_name or detect_statute_name(html_or_text, url)
+    detected = prefer_official_statute_title(detected_raw, official_title)
     sections = split_into_sections(html_or_text, detected)
     return {
         "statute_name": detected,
