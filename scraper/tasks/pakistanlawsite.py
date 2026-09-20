@@ -21,6 +21,7 @@ import logging
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -241,6 +242,20 @@ class PakistanLawSitePipeline:
         normalized["result_layout"] = layout
         return normalized
 
+    @staticmethod
+    def _extract_case_type_id(row: Dict[str, Any], detail_url: str) -> str:
+        explicit = str(row.get("case_type_id") or "").strip()
+        if explicit:
+            return explicit
+        parsed = urlsplit(str(detail_url or ""))
+        query = {k.lower(): v for k, v in parse_qsl(parsed.query or "", keep_blank_values=True)}
+        for key in ("casename", "casetypeid", "caseid"):
+            value = str(query.get(key) or "").strip()
+            if value:
+                return value
+        case_id = str(row.get("case_id") or "").strip()
+        return case_id
+
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
         async def op(browser: Browser) -> PageResult:
@@ -402,7 +417,7 @@ class PakistanLawSitePipeline:
         for idx, row_idx in enumerate(selected_indexes):
             row = rows[row_idx]
             detail_url = row.get("detail_url") or row.get("pdf_url")
-            case_type_id = str(row.get("case_type_id") or "").strip()
+            case_type_id = self._extract_case_type_id(row, detail_url)
             absolute_row_index = snapshot_start_row + row_idx
             if not detail_url:
                 url_less_skips += 1

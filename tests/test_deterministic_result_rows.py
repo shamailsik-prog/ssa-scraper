@@ -14,7 +14,7 @@ def test_extract_result_rows_skips_login_check_and_uses_real_detail_link():
             <td>Supreme Court</td>
             <td>
               <a href="/login/check?ReturnUrl=%2FLogin%2FCitationSearch">Read</a>
-              <a data-case-type-id="2006K249" href="/Login/ReferenceCaseLawSearch?CaseName=2006K249&court=&Row=0&bookName=undefined">Judgment</a>
+              <a href="/Login/ReferenceCaseLawSearch?CaseName=2006K249&court=&Row=0&bookName=undefined">Judgment</a>
             </td>
           </tr>
         </tbody>
@@ -38,5 +38,4 @@ def test_extract_result_rows_skips_login_check_and_uses_real_detail_link():
         "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
         "?CaseName=2006K249&court=&Row=0&bookName=undefined"
     )
-    assert row["case_type_id"] == "2006K249"
     assert "/login/check" not in (row["detail_url"] or "").lower()

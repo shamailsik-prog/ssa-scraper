@@ -749,6 +749,7 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     await _activate(db, login_source)
     parsed = urlsplit(settings.PLS_SEARCH_URL)
     expected_detail_url = f"{parsed.scheme}://{parsed.netloc}/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
+    expected_requested_detail_url = f"{parsed.scheme}://{parsed.netloc}/Login/ReferenceCaseLawSearch?CaseName=2006K247&court=&Row=0&bookName=undefined"
     sc = BrowserScript()
     sc.page(
         ("goto", settings.PLS_SEARCH_URL),
@@ -788,7 +789,7 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     staged = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.id.desc()))).scalars().first()
     assert staged is not None
     route_json = staged.route_json or {}
-    assert route_json.get("requested_detail_url") == expected_detail_url
+    assert route_json.get("requested_detail_url") == expected_requested_detail_url
     assert route_json.get("requested_case_type_id") == "2006K247"
     assert route_json.get("detail_navigation_mode") == "grid_click"
 

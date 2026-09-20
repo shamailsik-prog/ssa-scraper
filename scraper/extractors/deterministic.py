@@ -426,7 +426,6 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
             "detail_url": None,
             "pdf_url": None,
             "case_id": None,
-            "case_type_id": None,
         }
         if cols:
             for k in ("citation", "title", "court", "date"):
@@ -447,9 +446,6 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
         detail_candidates: List[tuple[int, int, str]] = []
         for idx, a in enumerate(anchors):
             raw_href = (a.get("href") or "").strip()
-            data_case_type_id = (a.get("data-case-type-id") or "").strip()
-            if data_case_type_id and not row["case_type_id"]:
-                row["case_type_id"] = data_case_type_id
             if not raw_href:
                 continue
             href = urljoin(base_url, raw_href).strip()
@@ -466,13 +462,10 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
         if not row["detail_url"]:
             read_control = tr.select_one("input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]")
             case_type_id = (read_control.get("casetypeid") or "").strip() if read_control else ""
-            if case_type_id and not row["case_type_id"]:
-                row["case_type_id"] = case_type_id
             if not case_type_id:
                 m_case = re.search(r"casetypeid\s*=\s*['\"]?([^'\"\s>]+)", str(tr), flags=re.IGNORECASE)
                 if m_case:
                     case_type_id = m_case.group(1).strip()
-                    row["case_type_id"] = row["case_type_id"] or case_type_id
             if case_type_id:
                 parsed = urlsplit(base_url or "")
                 origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
