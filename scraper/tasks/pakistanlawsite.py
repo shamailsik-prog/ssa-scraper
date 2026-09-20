@@ -212,10 +212,15 @@ class PakistanLawSitePipeline:
     @staticmethod
     def _is_citation_grid_surface(page: PageResult) -> bool:
         marker = str((page.metadata or {}).get("content_guard") or "")
-        if marker == "archivedpatientGrid_compact":
+        if marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
             return True
         low = (page.html or "").lower()
         return "id=\"archivedpatientgrid\"" in low or "id='archivedpatientgrid'" in low
+
+    @staticmethod
+    def _uses_compact_citation_grid_columns(page: PageResult) -> bool:
+        marker = str((page.metadata or {}).get("content_guard") or "")
+        return marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed")
 
     @classmethod
     def _is_citation_grid_map(cls, search_map: Dict[str, Any]) -> bool:
@@ -223,6 +228,18 @@ class PakistanLawSitePipeline:
         if "archivedpatientgrid" not in row_sel:
             return False
         return not cls._has_queryable_search_fields(search_map)
+
+    @staticmethod
+    def _with_compact_citation_grid_columns(search_map: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(search_map or {})
+        layout = dict(normalized.get("result_layout") or {})
+        columns = dict(layout.get("columns") or {})
+        columns["citation"] = 0
+        columns["title"] = 1
+        columns["court"] = 2
+        layout["columns"] = columns
+        normalized["result_layout"] = layout
+        return normalized
 
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
@@ -237,6 +254,8 @@ class PakistanLawSitePipeline:
             cached = map_as_dict(m)
             if self._is_citation_grid_surface(page):
                 if self._is_citation_grid_map(cached):
+                    if self._uses_compact_citation_grid_columns(page):
+                        return self._with_compact_citation_grid_columns(cached)
                     return cached
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
@@ -267,6 +286,15 @@ class PakistanLawSitePipeline:
         if not rows:
             self.stats["misses"] += 1
             return
+        # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
+        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
+        if max_detail > 0 and len(rows) > max_detail:
+            logger.info(
+                "PakistanLawSite citation-grid capping detail fetches %s -> %s",
+                len(rows),
+                max_detail,
+            )
+            rows = rows[:max_detail]
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
@@ -282,6 +310,14 @@ class PakistanLawSitePipeline:
                     row.get("title"),
                 )
                 continue
+            if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(rows):
+                logger.info(
+                    "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s",
+                    idx + 1,
+                    len(rows),
+                    self.stats["staged"] - staged_before,
+                    self.stats["duplicates"] - duplicates_before,
+                )
             route = {
                 "tier": "citation_grid",
                 "query": {"surface": "archivedpatientGrid"},

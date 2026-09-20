@@ -621,6 +621,63 @@ async def test_search_map_goes_stale_after_five_parse_failures(db, login_source,
     assert "search_map_stale" in codes
 
 
+async def test_ensure_search_map_normalizes_cached_citation_grid_columns_for_compact_surface(db, login_source):
+    await map_search_form(
+        db,
+        login_source,
+        """
+        <html><body>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody><tr><td>1</td><td>PLD 2024 SC 10</td><td>A v B</td><td>Supreme Court</td><td>Read</td></tr></tbody>
+        </table></body></html>
+        """,
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory())
+
+    async def fake_run(_op):
+        return PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html="<html><body><table id='archivedpatientGrid'></table></body></html>",
+            metadata={"content_guard": "archivedpatientGrid_compact"},
+        )
+
+    pipeline.runner.run = fake_run
+    search_map = await pipeline.ensure_search_map()
+    cols = (search_map.get("result_layout") or {}).get("columns") or {}
+    assert cols.get("citation") == 0
+    assert cols.get("title") == 1
+    assert cols.get("court") == 2
+
+
+async def test_ensure_search_map_keeps_cached_citation_grid_map_when_snapshot_fails(db, login_source):
+    await map_search_form(
+        db,
+        login_source,
+        """
+        <html><body>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody><tr><td>1</td><td>PLD 2024 SC 11</td><td>A v C</td><td>Supreme Court</td><td>Read</td></tr></tbody>
+        </table></body></html>
+        """,
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory())
+
+    async def fake_run(_op):
+        return PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html="<html><body><div id='oversize_guard'>stub</div></body></html>",
+            metadata={"content_guard": "archivedpatientGrid_snapshot_failed", "grid_snapshot_failed": True},
+        )
+
+    pipeline.runner.run = fake_run
+    search_map = await pipeline.ensure_search_map()
+    active = (await db.execute(select(SearchFormMap).where(SearchFormMap.is_active.is_(True)))).scalars().first()
+    assert "archivedpatientgrid" in str((search_map.get("result_layout") or {}).get("row_selector") or "").lower()
+    assert active is not None and active.map_version == 1
+
+
 async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)

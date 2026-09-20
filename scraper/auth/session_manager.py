@@ -347,27 +347,51 @@ class PlaywrightBrowser:
             return None
 
     async def _dom_shape(self) -> Dict[str, Any]:
+        # Keep this evaluate cheap: never walk every DataTables row or serialize
+        # multi-MB innerText/outerHTML here — that is what hung CitationSearch.
         return await self._wrap(
             self._page.evaluate(
                 """() => {
                     const body = document.body;
                     const grid = document.querySelector('#archivedpatientGrid');
+                    let archivedpatient_rows = 0;
+                    if (grid) {
+                        const tbody = grid.tBodies && grid.tBodies[0];
+                        archivedpatient_rows = tbody && tbody.rows ? tbody.rows.length : 0;
+                    }
                     return {
                         forms: document.forms ? document.forms.length : 0,
                         inputs: document.querySelectorAll('input').length,
                         has_archivedpatient_grid: Boolean(grid),
-                        archivedpatient_rows: grid ? grid.querySelectorAll('tbody tr').length : 0,
+                        archivedpatient_rows,
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                        body_preview: (body && body.innerText ? body.innerText : '').slice(0, 2500),
+                        body_preview: (body && body.innerText ? body.innerText : '').slice(0, 400),
                     };
                 }"""
             )
         )
 
     async def _capture_archived_grid_snapshot(self) -> Optional[Dict[str, Any]]:
-        return await self._wrap(
-            self._page.evaluate(
-                """(maxRows) => {
+        """Compact row extract for #archivedpatientGrid without page.content().
+
+        Critical performance rules:
+        - iterate tbody.rows up to maxRows (do NOT Array.from(querySelectorAll(...)))
+        - never read tr.innerHTML (re-serializes huge row markup)
+        - synthesize detail URLs from casetypeid when anchors are absent
+        """
+        max_rows = int(settings.PLS_ARCHIVED_GRID_MAX_ROWS)
+        logger.info(
+            "archivedpatientGrid compact snapshot starting slot=%s max_rows=%s url=%s",
+            self.slot_number,
+            max_rows,
+            self._page.url if self._page else None,
+        )
+        started = datetime.now(timezone.utc)
+        try:
+            snapshot = await asyncio.wait_for(
+                self._wrap(
+                    self._page.evaluate(
+                        """(maxRows) => {
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
                     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
@@ -390,14 +414,22 @@ class PlaywrightBrowser:
                     const courtIdx = pickIndex(['court'], nonReadIndexes[2] ?? 2);
                     const cellAt = (cells, idx) => (idx >= 0 && idx < cells.length ? (cells[idx] || '') : '');
                     const rows = [];
-                    const trNodes = Array.from(table.querySelectorAll('tbody tr')).slice(0, maxRows);
-                    for (const tr of trNodes) {
-                        const cells = Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
-                        const anchors = Array.from(tr.querySelectorAll('a[href]'));
+                    const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
+                    const trCollection = tbody && tbody.rows ? tbody.rows : [];
+                    const limit = Math.min(trCollection.length || 0, maxRows);
+                    for (let i = 0; i < limit; i += 1) {
+                        const tr = trCollection[i];
+                        if (!tr) continue;
+                        const tdNodes = tr.cells || tr.querySelectorAll('td');
+                        const cells = [];
+                        for (let c = 0; c < tdNodes.length; c += 1) {
+                            cells.push((tdNodes[c].textContent || '').trim());
+                        }
+                        const anchors = tr.querySelectorAll('a[href]');
                         let detailUrl = null;
                         let pdfUrl = null;
-                        for (const a of anchors) {
-                            const href = a.href || '';
+                        for (let a = 0; a < anchors.length; a += 1) {
+                            const href = anchors[a].href || '';
                             if (!href) continue;
                             if (!pdfUrl && href.toLowerCase().endsWith('.pdf')) {
                                 pdfUrl = href;
@@ -406,16 +438,14 @@ class PlaywrightBrowser:
                             }
                         }
                         if (!detailUrl) {
-                            const readControl = tr.querySelector('input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]');
-                            let caseTypeId = (readControl && readControl.getAttribute('casetypeid')) ? readControl.getAttribute('casetypeid').trim() : '';
-                            if (!caseTypeId) {
-                                const idMatch = (tr.innerHTML || '').match(/casetypeid\\s*=\\s*['"]?([^'"\\s>]+)/i);
-                                if (idMatch && idMatch[1]) {
-                                    caseTypeId = idMatch[1].trim();
-                                }
-                            }
+                            const readControl = tr.querySelector(
+                                'input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]'
+                            );
+                            const caseTypeId = readControl && readControl.getAttribute('casetypeid')
+                                ? readControl.getAttribute('casetypeid').trim()
+                                : '';
                             if (caseTypeId) {
-                                detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&&court= &&Row=0 &&bookName=undefined`;
+                                detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&court=&Row=0&bookName=undefined`;
                             }
                         }
                         rows.push({
@@ -427,22 +457,51 @@ class PlaywrightBrowser:
                         });
                     }
                     const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
-                    const nextDisabled = nextLink ? (nextLink.classList.contains('disabled') || nextLink.parentElement?.classList.contains('disabled')) : true;
+                    const nextDisabled = nextLink
+                        ? (nextLink.classList.contains('disabled') || (nextLink.parentElement && nextLink.parentElement.classList.contains('disabled')))
+                        : true;
                     return {
                         headers,
                         rows,
                         next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
-                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2500),
+                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
+                        total_rows: trCollection.length || 0,
                     };
                 }""",
-                int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                        max_rows,
+                    )
+                ),
+                timeout=max(15.0, float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0),
             )
+        except asyncio.TimeoutError as exc:
+            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            logger.warning(
+                "archivedpatientGrid compact snapshot timed out after %.1fs slot=%s max_rows=%s",
+                elapsed,
+                self.slot_number,
+                max_rows,
+            )
+            raise BrowserDisconnected(
+                f"archivedpatientGrid compact snapshot timed out after {elapsed:.1f}s"
+            ) from exc
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        row_count = len((snapshot or {}).get("rows") or []) if snapshot else 0
+        total_rows = (snapshot or {}).get("total_rows") if snapshot else None
+        logger.info(
+            "archivedpatientGrid compact snapshot done slot=%s rows=%s total_rows=%s elapsed=%.1fs",
+            self.slot_number,
+            row_count,
+            total_rows,
+            elapsed,
         )
+        return snapshot
 
     @staticmethod
     def _render_compact_archived_grid_html(snapshot: Dict[str, Any]) -> str:
-        headers = snapshot.get("headers") or ["Citation", "Title", "Court", "Read"]
+        # Body cells are always citation/title/court/read — ignore live DataTables headers
+        # (often include a leading "#") so introspect column indexes stay aligned.
+        headers = ["Citation", "Title", "Court", "Read"]
         rows = snapshot.get("rows") or []
         parts: List[str] = ["<html><body>"]
         if snapshot.get("has_logout"):
@@ -491,12 +550,16 @@ class PlaywrightBrowser:
     async def _capture_html(self, *, resp=None) -> tuple[str, Dict[str, Any]]:
         dom = await self._dom_shape()
         content_length = self._header_int(resp, "content-length")
+        has_grid = bool(dom.get("has_archivedpatient_grid"))
         oversized = False
         if content_length is not None and content_length >= settings.PLAYWRIGHT_MAX_HTML_BYTES:
             oversized = True
         if int(dom.get("inputs") or 0) >= settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD:
             oversized = True
-        if oversized and bool(dom.get("has_archivedpatient_grid")):
+        # CitationSearch often omits Content-Length (chunked/gzip) and can sit under the
+        # input threshold while the live DOM is still ~10-16MB. Always compact when the
+        # archived grid is present — never call page.content() on that surface.
+        if has_grid:
             snapshot = await self._capture_archived_grid_snapshot()
             if snapshot:
                 html_compact = self._render_compact_archived_grid_html(snapshot)
@@ -507,7 +570,22 @@ class PlaywrightBrowser:
                     "content_length": content_length,
                     "rows": len(snapshot.get("rows") or []),
                     "row_cap": int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
+                    "total_rows": snapshot.get("total_rows"),
+                    "oversized_hint": oversized,
                 }
+            logger.warning(
+                "archivedpatientGrid present but compact snapshot failed slot=%s url=%s; refusing page.content()",
+                self.slot_number,
+                self._page.url,
+            )
+            stub = self._render_oversize_stub(dom, content_length=content_length)
+            return stub, {
+                "content_guard": "archivedpatientGrid_snapshot_failed",
+                "inputs": int(dom.get("inputs") or 0),
+                "forms": int(dom.get("forms") or 0),
+                "content_length": content_length,
+                "grid_snapshot_failed": True,
+            }
         if oversized:
             logger.warning(
                 "oversized HTML guard tripped for slot=%s url=%s inputs=%s content_length=%s",
