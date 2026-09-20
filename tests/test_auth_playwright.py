@@ -321,7 +321,7 @@ async def test_playwright_goto_compact_snapshot_timeout_returns_partial_rows(mon
     class _SlowBatchPage(_FakePage):
         async def evaluate(self, script, *args):
             if "capStart" in script and "bodyRows" in script and int(args[0]) >= 1:
-                await asyncio.sleep(0.05)
+                raise asyncio.TimeoutError("simulated batch timeout")
             return await super().evaluate(script, *args)
 
     monkeypatch.setattr(settings, "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS", 20)
