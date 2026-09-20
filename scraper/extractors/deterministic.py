@@ -407,7 +407,7 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
             if case_type_id:
                 parsed = urlsplit(base_url or "")
                 origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
-                row["detail_url"] = f"{origin}/Login/ReferenceCaseLawSearch?CaseName={quote(case_type_id)}&&court= &&Row=0 &&bookName=undefined"
+                row["detail_url"] = f"{origin}/Login/ReferenceCaseLawSearch?CaseName={quote(case_type_id)}&court=&Row=0&bookName=undefined"
         m = re.search(r"\b(\d{4}[A-Z]{1,3}\d{2,})\b", tr.decode())
         if m:
             row["case_id"] = m.group(1)

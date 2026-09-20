@@ -267,6 +267,15 @@ class PakistanLawSitePipeline:
         if not rows:
             self.stats["misses"] += 1
             return
+        # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
+        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
+        if max_detail > 0 and len(rows) > max_detail:
+            logger.info(
+                "PakistanLawSite citation-grid capping detail fetches %s -> %s",
+                len(rows),
+                max_detail,
+            )
+            rows = rows[:max_detail]
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
@@ -282,6 +291,14 @@ class PakistanLawSitePipeline:
                     row.get("title"),
                 )
                 continue
+            if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(rows):
+                logger.info(
+                    "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s",
+                    idx + 1,
+                    len(rows),
+                    self.stats["staged"] - staged_before,
+                    self.stats["duplicates"] - duplicates_before,
+                )
             route = {
                 "tier": "citation_grid",
                 "query": {"surface": "archivedpatientGrid"},
