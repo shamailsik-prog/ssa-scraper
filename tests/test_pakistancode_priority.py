@@ -34,9 +34,6 @@ async def test_pakistancode_seed_bumps_existing_lower_crawl_max_pages(db):
     await db.commit()
 
     await seed_data()
+    await db.refresh(source)
 
-    refreshed = (
-        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
-    ).scalars().first()
-    assert refreshed is not None
-    assert refreshed.crawl_max_pages == PC_CRAWL_MAX_PAGES
+    assert source.crawl_max_pages == PC_CRAWL_MAX_PAGES
