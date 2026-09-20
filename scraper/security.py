@@ -59,7 +59,7 @@ METADATA_HOSTS = {
     "metadata",
     "169.254.169.254",
     "fd00:ec2::254",
-    "100.100.200",
+    "100.100.100.200",
     "metadata.azure.com",
 }
 
