@@ -1,1 +1,1 @@
-PLACEHOLDER
+@file:///tmp/fixtures_body.txt
