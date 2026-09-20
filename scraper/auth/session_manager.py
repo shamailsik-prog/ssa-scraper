@@ -376,6 +376,14 @@ class PlaywrightBrowser:
                     if (!table) return null;
                     const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
                     const normalizedHeaders = headers.map((h) => h.toLowerCase().replace(/\\s+/g, ' ').trim());
+                    const nonDataHeader = (header) => {
+                        if (!header) return true;
+                        if (header === '#') return true;
+                        if (/^\\d+$/.test(header)) return true;
+                        if (header.includes('sr') && header.includes('no')) return true;
+                        if (header.includes('serial') || header.includes('s no')) return true;
+                        return false;
+                    };
                     const pickIndex = (hints, fallbackIndex) => {
                         for (let i = 0; i < normalizedHeaders.length; i += 1) {
                             const header = normalizedHeaders[i];
@@ -389,15 +397,20 @@ class PlaywrightBrowser:
                         .map((h, idx) => ({ h, idx }))
                         .filter((entry) => !entry.h.includes('read'))
                         .map((entry) => entry.idx);
+                    const dataIndexes = normalizedHeaders
+                        .map((h, idx) => ({ h, idx }))
+                        .filter((entry) => !entry.h.includes('read') && !nonDataHeader(entry.h))
+                        .map((entry) => entry.idx);
                     const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
                     const nextDisabled = nextLink ? (nextLink.classList.contains('disabled') || nextLink.parentElement?.classList.contains('disabled')) : true;
                     const bodyRows = (table.tBodies && table.tBodies[0] ? table.tBodies[0].rows : []);
                     return {
                         headers,
                         row_count: bodyRows.length,
-                        citation_idx: pickIndex(['citation'], nonReadIndexes[0] ?? 0),
-                        title_idx: pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1),
-                        court_idx: pickIndex(['court'], nonReadIndexes[2] ?? 2),
+                        citation_idx: pickIndex(['citation'], dataIndexes[0] ?? nonReadIndexes[0] ?? 0),
+                        title_idx: pickIndex(['title', 'party'], dataIndexes[1] ?? nonReadIndexes[1] ?? 1),
+                        court_idx: pickIndex(['court'], dataIndexes[2] ?? nonReadIndexes[2] ?? 2),
+                        effective_headers: ['Citation', 'Title', 'Court', 'Read'],
                         next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
                         body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2500),
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
@@ -532,6 +545,7 @@ class PlaywrightBrowser:
             )
         return {
             "headers": meta.get("headers") or [],
+            "effective_headers": meta.get("effective_headers") or ["Citation", "Title", "Court", "Read"],
             "rows": rows,
             "row_count": row_count,
             "row_cap": row_cap,
@@ -543,7 +557,9 @@ class PlaywrightBrowser:
 
     @staticmethod
     def _render_compact_archived_grid_html(snapshot: Dict[str, Any]) -> str:
-        headers = snapshot.get("headers") or ["Citation", "Title", "Court", "Read"]
+        # Always emit a stable data header set so downstream column mapping does not drift when
+        # DataTables adds a leading "#" serial column.
+        headers = snapshot.get("effective_headers") or ["Citation", "Title", "Court", "Read"]
         rows = snapshot.get("rows") or []
         parts: List[str] = ["<html><body>"]
         if snapshot.get("has_logout"):

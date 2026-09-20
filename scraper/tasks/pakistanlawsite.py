@@ -17,6 +17,7 @@ deterministic + LOCAL engine only — never managed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 from datetime import datetime, timedelta, timezone
@@ -43,7 +44,7 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
-from scraper.models import CrawlCoverage, CrawlFrontier, ScraperSource, StatuteSection, Statute
+from scraper.models import CrawlCoverage, CrawlFrontier, ScraperSource, SearchFormMap, StatuteSection, Statute
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
@@ -54,6 +55,7 @@ logger = logging.getLogger(__name__)
 SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
+CITATION_GRID_MAP_PROFILE = "citation_grid_v1"
 
 
 class PacingBudgetExceeded(RuntimeError):
@@ -224,6 +226,62 @@ class PakistanLawSitePipeline:
             return False
         return not cls._has_queryable_search_fields(search_map)
 
+    @staticmethod
+    def _citation_grid_map_v1() -> Dict[str, Any]:
+        return {
+            "fields": {"_all": []},
+            "result_layout": {
+                "row_selector": "table#archivedpatientGrid tbody tr",
+                "columns": {"citation": 0, "title": 1, "court": 2},
+                "detail_link_selector": "a[href]",
+            },
+            "page_size": None,
+            "pagination": {"next_selector": "#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel='next']"},
+            "detail_layout": {"detail_link_selector": "a[href]", "pdf_link_selector": "a[href$='.pdf']"},
+            "limits": {
+                "profile": CITATION_GRID_MAP_PROFILE,
+                "max_detail_fetches": int(settings.PLS_CITATION_GRID_MAX_DETAIL),
+            },
+            "map_version": 1,
+        }
+
+    async def _activate_citation_grid_map_v1(self, page_html: str) -> Dict[str, Any]:
+        forced = self._citation_grid_map_v1()
+        current = await active_map(self.db, SOURCE_NAME)
+        if current is not None:
+            as_dict = map_as_dict(current)
+            if self._is_citation_grid_map(as_dict) and (as_dict.get("limits") or {}).get("profile") == CITATION_GRID_MAP_PROFILE:
+                return as_dict
+            current.is_active = False
+        next_version = (current.map_version + 1) if current else 1
+        rec = SearchFormMap(
+            source_name=SOURCE_NAME,
+            map_version=next_version,
+            fields=forced["fields"],
+            result_layout=forced["result_layout"],
+            page_size=forced["page_size"],
+            pagination=forced["pagination"],
+            detail_layout=forced["detail_layout"],
+            limits=forced["limits"],
+            dom_hash=hashlib.sha256((page_html or "").encode()).hexdigest(),
+            mapped_by="forced_citation_grid_v1",
+            verified_against_dom=True,
+            is_active=True,
+            stale=False,
+            consecutive_parse_failures=0,
+        )
+        self.db.add(rec)
+        await self.db.flush()
+        await notify(
+            self.db,
+            level="info",
+            code="SEARCH_MAP_UPDATED",
+            message=f"search surface forced to {CITATION_GRID_MAP_PROFILE} (version {next_version})",
+            source_name=SOURCE_NAME,
+        )
+        forced["map_version"] = rec.map_version
+        return forced
+
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
         async def op(browser: Browser) -> PageResult:
@@ -232,14 +290,12 @@ class PakistanLawSitePipeline:
             return page
 
         page = await self.runner.run(op)
+        if self._is_citation_grid_surface(page):
+            return await self._activate_citation_grid_map_v1(page.html)
         m = await active_map(self.db, SOURCE_NAME)
         if m is not None and not m.stale:
             cached = map_as_dict(m)
-            if self._is_citation_grid_surface(page):
-                if self._is_citation_grid_map(cached):
-                    return cached
-                logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
-            elif self._has_queryable_search_fields(cached):
+            if self._has_queryable_search_fields(cached):
                 return cached
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
         return map_as_dict(m)
@@ -281,11 +337,15 @@ class PakistanLawSitePipeline:
             return
         detail_candidates = sum(1 for row in rows if row.get("detail_url") or row.get("pdf_url"))
         self.stats["detail_candidates"] = detail_candidates
+        detail_cap = max(1, int(settings.PLS_CITATION_GRID_MAX_DETAIL))
+        self.stats["detail_cap"] = detail_cap
+        self.stats["detail_cap_skipped"] = 0
         self.stats.setdefault("details_started", 0)
         logger.info(
-            "PakistanLawSite citation-grid starting detail fetches rows=%s detail_candidates=%s",
+            "PakistanLawSite citation-grid starting detail fetches rows=%s detail_candidates=%s detail_cap=%s",
             len(rows),
             detail_candidates,
+            detail_cap,
         )
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
@@ -301,6 +361,9 @@ class PakistanLawSitePipeline:
                     row.get("citation"),
                     row.get("title"),
                 )
+                continue
+            if self.stats["details_started"] >= detail_cap:
+                self.stats["detail_cap_skipped"] += 1
                 continue
             route = {
                 "tier": "citation_grid",

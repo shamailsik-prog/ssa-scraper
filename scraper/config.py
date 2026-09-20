@@ -180,7 +180,11 @@ class Settings(BaseSettings):
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
-    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=1200, description="Maximum rows to materialize from #archivedpatientGrid when oversized-page guard compacts HTML.")
+    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=200, description="Maximum rows to materialize from #archivedpatientGrid when oversized-page guard compacts HTML.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(
+        default=40,
+        description="Maximum citation-grid detail pages fetched per run from compact archivedpatientGrid rows.",
+    )
     PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS: int = Field(
         default=15000,
         description="Hard timeout for compact archived-grid snapshot capture on oversized citation surfaces.",
@@ -318,6 +322,7 @@ class Settings(BaseSettings):
         "PLAYWRIGHT_MAX_HTML_BYTES",
         "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
         "PLS_ARCHIVED_GRID_MAX_ROWS",
+        "PLS_CITATION_GRID_MAX_DETAIL",
         "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS",
         "PLS_ARCHIVED_GRID_BATCH_ROWS",
         mode="before",
@@ -413,6 +418,8 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
+        if self.PLS_CITATION_GRID_MAX_DETAIL <= 0:
+            raise ValueError("PLS_CITATION_GRID_MAX_DETAIL must be positive")
         if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_MS must be positive")
         if self.PLS_ARCHIVED_GRID_BATCH_ROWS <= 0:
