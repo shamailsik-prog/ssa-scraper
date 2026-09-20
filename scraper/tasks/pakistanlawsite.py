@@ -244,7 +244,7 @@ class PakistanLawSitePipeline:
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
         return map_as_dict(m)
 
-    async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
+    async def run_citation_grid_surface(self, search_map: Dict[str, Any], max_detail_fetches: Optional[int] = None) -> None:
         """Fallback when CitationSearch is an authenticated citation table, not a form."""
         await self._charge_page()
 
@@ -267,6 +267,8 @@ class PakistanLawSitePipeline:
         if not rows:
             self.stats["misses"] += 1
             return
+        detail_fetch_cap = None if max_detail_fetches is None else max(0, int(max_detail_fetches))
+        detail_fetches = 0
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
@@ -282,6 +284,14 @@ class PakistanLawSitePipeline:
                     row.get("title"),
                 )
                 continue
+            if detail_fetch_cap is not None and detail_fetches >= detail_fetch_cap:
+                logger.info(
+                    "PakistanLawSite citation-grid detail fetch cap reached; fetched=%s cap=%s rows=%s",
+                    detail_fetches,
+                    detail_fetch_cap,
+                    len(rows),
+                )
+                break
             route = {
                 "tier": "citation_grid",
                 "query": {"surface": "archivedpatientGrid"},
@@ -290,6 +300,7 @@ class PakistanLawSitePipeline:
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
             detail = await self.fetch_detail(detail_url)
+            detail_fetches += 1
             await self.preserve_and_extract(detail, route, row)
             await self.db.flush()
         if url_less_skips:
@@ -524,7 +535,7 @@ class PakistanLawSitePipeline:
             search_map = await self.ensure_search_map()
             if self._is_citation_grid_map(search_map):
                 logger.info("PakistanLawSite using citation-grid surface mode (archivedpatientGrid)")
-                await self.run_citation_grid_surface(search_map)
+                await self.run_citation_grid_surface(search_map, max_detail_fetches=max_queries)
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 self.source.last_success_at = self.source.last_scraped_at
                 await self.db.flush()

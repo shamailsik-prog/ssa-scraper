@@ -97,6 +97,8 @@ class _FakePage:
         self.calls.append(("evaluate", script, args))
         if "has_archivedpatient_grid" in script:
             return dict(self.dom_shape)
+        if "Boolean(document.querySelector('#archivedpatientGrid'))" in script:
+            return bool(self.dom_shape.get("has_archivedpatient_grid"))
         if "archivedpatientGrid" in script:
             return self.archived_grid_snapshot
         return None
@@ -292,6 +294,41 @@ async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_g
 
     assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
     assert "id=\"archivedpatientGrid\"" in result.html
+    assert not any(call[0] == "content" for call in page.calls)
+
+
+async def test_playwright_goto_compacts_archived_grid_even_when_not_oversized():
+    page = _FakePage(html="<html><body>small archived grid</body></html>")
+    page.dom_shape = {
+        "forms": 0,
+        "inputs": 3,
+        "has_archivedpatient_grid": True,
+        "archivedpatient_rows": 1,
+        "has_logout": True,
+        "body_preview": "citation table",
+    }
+    page.archived_grid_snapshot = {
+        "headers": ["Citation", "Title", "Court", "Read"],
+        "rows": [
+            {
+                "citation": "PLD 2024 SC 12",
+                "title": "C v D",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/12",
+                "pdf_url": None,
+            }
+        ],
+        "next_url": None,
+        "body_preview": "citation table",
+        "has_logout": True,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
+
+    assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
+    assert "PLD 2024 SC 12" in result.html
     assert not any(call[0] == "content" for call in page.calls)
 
 
@@ -686,6 +723,44 @@ async def test_pipeline_citation_grid_raises_when_rows_have_no_detail_urls(db, l
     assert pipeline.stats["rows"] == 1
     assert pipeline.stats["staged"] == 0
     assert pipeline.stats["url_less_skips"] == 1
+
+
+async def test_pipeline_citation_grid_caps_detail_fetches_to_run_budget(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    detail_urls = [f"https://www.pakistanlawsite.com/case/{n}" for n in range(1, 4)]
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        f"""
+        <html><body><a href="/logout">Logout</a>
+        <table id="archivedpatientGrid">
+          <thead><tr><th>#</th><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>PLD 2024 SC 1</td><td>Case 1</td><td>Supreme Court</td><td><a href="{detail_urls[0]}">Read</a></td></tr>
+            <tr><td>2</td><td>PLD 2024 SC 2</td><td>Case 2</td><td>Supreme Court</td><td><a href="{detail_urls[1]}">Read</a></td></tr>
+            <tr><td>3</td><td>PLD 2024 SC 3</td><td>Case 3</td><td>Supreme Court</td><td><a href="{detail_urls[2]}">Read</a></td></tr>
+          </tbody>
+        </table></body></html>
+        """,
+    )
+    sc.page(("goto", detail_urls[0]), judgment_html("PLD 2024 SC 1", title="Case 1"))
+    sc.page(("goto", detail_urls[1]), judgment_html("PLD 2024 SC 2", title="Case 2"))
+    sc.page(("goto", detail_urls[2]), judgment_html("PLD 2024 SC 3", title="Case 3"))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=2, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+
+    goto_urls = [key[1] for key, _slot in sc.log if key[0] == "goto"]
+    assert stats["surface_mode"] == "citation_grid"
+    assert stats["rows"] == 3
+    assert stats["staged"] == 2
+    assert goto_urls[:2] == [settings.PLS_SEARCH_URL, settings.PLS_SEARCH_URL]
+    assert goto_urls[2:] == [detail_urls[0], detail_urls[1]]
 
 
 async def test_login_scraping_disabled_outside_chambers(db, login_source, monkeypatch):
