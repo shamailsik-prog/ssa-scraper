@@ -345,8 +345,9 @@ class PakistanLawSitePipeline:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            cfg["citation_grid_cursor"] = cursor
-            self.source.config_json = cfg
+            latest_cfg = dict(self.source.config_json or {})
+            latest_cfg["citation_grid_cursor"] = cursor
+            self.source.config_json = latest_cfg
             self.stats["citation_grid_next_offset"] = next_offset
             await self.db.flush()
             await self.db.commit()
@@ -372,6 +373,16 @@ class PakistanLawSitePipeline:
                     row.get("citation"),
                     row.get("title"),
                 )
+                if (idx + 1) == len(selected_indexes):
+                    next_offset = (start_offset + idx + 1) % row_count
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx + 1,
+                    )
+                    details_since_flush = 0
+                    staged_since_flush = 0
                 continue
             if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(selected_indexes):
                 logger.info(
