@@ -218,15 +218,18 @@ def _is_false_section_candidate(section_text: str) -> bool:
     body = _strip_section_prefix(section_text)
     if not body:
         return True
+    short_body = len(body) < 260
     if re.fullmatch(r'\d{1,4}', body):
         return True
     if TRAILING_AND_SECTION_RE.match(body):
         return True
-    if GAZETTE_FOOTNOTE_RE.search(body):
+    gazette_match = GAZETTE_FOOTNOTE_RE.search(body)
+    if short_body and gazette_match and gazette_match.start() <= 6:
         return True
-    if FOOTNOTE_ANNOTATION_RE.search(body):
+    annotation_match = FOOTNOTE_ANNOTATION_RE.search(body)
+    if short_body and annotation_match and annotation_match.start() <= 6:
         return True
-    if SECTION_RANGE_FOOTNOTE_RE.search(body) and len(body) < 260:
+    if SECTION_RANGE_FOOTNOTE_RE.search(body) and short_body:
         return True
     return False
 

@@ -17,6 +17,20 @@ def test_split_into_sections_rejects_footnote_annotation_phantoms():
     assert "279" not in section_numbers
 
 
+def test_split_into_sections_keeps_sections_with_trailing_amendment_note():
+    text = """
+1. Penalty for breach.- Any person who diverts a notified water channel commits an offence and is liable to fine.
+[Substituted by Gazette of Pakistan Extraordinary, Part I, dated 12 June 1975.]
+2. Cognizance.- No court shall take cognizance except on a written complaint by an authorized officer.
+"""
+
+    sections = split_into_sections(text, "Example Irrigation Act, 2000")
+    section_numbers = [section["section_number"] for section in sections]
+
+    assert "1" in section_numbers
+    assert "2" in section_numbers
+
+
 def test_split_into_sections_applies_canal_drainage_section_cap():
     text = """
 1. Short title and extent.- This Act may be called the Canal and Drainage Act and extends to the relevant area.
