@@ -33,6 +33,7 @@ Expected:
 - `"mode": "dry_run"`
 - `"before"` equals `"after"`
 - all `*_reduced` deltas are `0`
+- equivalent task arguments: `run_reconcile=False`
 - optional compact unresolved triage buckets:
   - `--include-unresolved-breakdown`
   - `--unresolved-breakdown-top-n <small N>` (default `5`) for `by_source_name` and unresolved key buckets
@@ -53,6 +54,8 @@ python -m scraper.tasks.residual_smoke_cli \
   --judgment-batch-size 200 \
   --fail-on-increase
 ```
+
+Equivalent task arguments: `run_reconcile=True`, `fail_on_increase=True`.
 
 Expected:
 
