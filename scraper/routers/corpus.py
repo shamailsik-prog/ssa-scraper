@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_FROM_FILE
+@file:///tmp/corpus_content_only.txt
