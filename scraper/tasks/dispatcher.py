@@ -72,6 +72,21 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 return {"skipped": "PAUSED", "reason": source.state_reason}
         elif source.state == "PAUSED":
             return {"skipped": "PAUSED", "reason": source.state_reason}
+        existing = (
+            await db.execute(
+                select(ScraperJob).where(
+                    ScraperJob.source_name == source_name,
+                    ScraperJob.status == "running",
+                )
+            )
+        ).scalars().first()
+        if existing is not None:
+            logger.info(
+                "%s already has running job %s; skipping duplicate kick",
+                source_name,
+                existing.id,
+            )
+            return {"skipped": "already_running", "job_id": str(existing.id)}
         job = ScraperJob(source_id=source.id, source_name=source_name, job_type="scrape", status="running", worker_hostname=socket.gethostname(), started_at=datetime.now(timezone.utc))
         db.add(job)
         await db.commit()
@@ -150,6 +165,21 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
+                continue
+            running = (
+                await db.execute(
+                    select(ScraperJob.id).where(
+                        ScraperJob.source_name == s.source_name,
+                        ScraperJob.status == "running",
+                    )
+                )
+            ).scalars().first()
+            if running is not None:
+                logger.info(
+                    "%s due but job %s still running; not re-queued",
+                    s.source_name,
+                    running,
+                )
                 continue
             if s.access_method == "login_session":
                 app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
