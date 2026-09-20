@@ -580,7 +580,7 @@ class PlaywrightBrowser:
             )
             stub = self._render_oversize_stub(dom, content_length=content_length)
             return stub, {
-                "content_guard": "oversize_stub",
+                "content_guard": "archivedpatientGrid_snapshot_failed",
                 "inputs": int(dom.get("inputs") or 0),
                 "forms": int(dom.get("forms") or 0),
                 "content_length": content_length,

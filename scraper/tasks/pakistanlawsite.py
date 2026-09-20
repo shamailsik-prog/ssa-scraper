@@ -212,10 +212,15 @@ class PakistanLawSitePipeline:
     @staticmethod
     def _is_citation_grid_surface(page: PageResult) -> bool:
         marker = str((page.metadata or {}).get("content_guard") or "")
-        if marker == "archivedpatientGrid_compact":
+        if marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
             return True
         low = (page.html or "").lower()
         return "id=\"archivedpatientgrid\"" in low or "id='archivedpatientgrid'" in low
+
+    @staticmethod
+    def _uses_compact_citation_grid_columns(page: PageResult) -> bool:
+        marker = str((page.metadata or {}).get("content_guard") or "")
+        return marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed")
 
     @classmethod
     def _is_citation_grid_map(cls, search_map: Dict[str, Any]) -> bool:
@@ -223,6 +228,18 @@ class PakistanLawSitePipeline:
         if "archivedpatientgrid" not in row_sel:
             return False
         return not cls._has_queryable_search_fields(search_map)
+
+    @staticmethod
+    def _with_compact_citation_grid_columns(search_map: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(search_map or {})
+        layout = dict(normalized.get("result_layout") or {})
+        columns = dict(layout.get("columns") or {})
+        columns["citation"] = 0
+        columns["title"] = 1
+        columns["court"] = 2
+        layout["columns"] = columns
+        normalized["result_layout"] = layout
+        return normalized
 
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
@@ -237,6 +254,8 @@ class PakistanLawSitePipeline:
             cached = map_as_dict(m)
             if self._is_citation_grid_surface(page):
                 if self._is_citation_grid_map(cached):
+                    if self._uses_compact_citation_grid_columns(page):
+                        return self._with_compact_citation_grid_columns(cached)
                     return cached
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
