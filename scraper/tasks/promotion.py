@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
+from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
@@ -107,6 +108,26 @@ async def _ensure_judges(db: AsyncSession, names, court: Optional[Court]) -> Non
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
+    stub_signal = detect_judgment_stub(
+        source_url=st.source_url or data.get("source_url"),
+        raw_text=st.raw_text,
+        raw_html=st.raw_html,
+        judge_names=data.get("judge_names"),
+    )
+    if stub_signal is not None:
+        await _quarantine(
+            db,
+            st,
+            guard_reason(stub_signal),
+            "judgment",
+            {
+                "reason_code": stub_signal.reason_code,
+                "signal": stub_signal.signal,
+                "matched_value": stub_signal.matched_value,
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
     if st.status == "quarantined" and not force:
         await _quarantine(db, st, st.quarantine_reason or "below confidence threshold", "judgment")
         return "quarantined"

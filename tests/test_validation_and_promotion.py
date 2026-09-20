@@ -10,6 +10,7 @@ from sqlalchemy import delete, func, select, update
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
+from scraper.extractors.judgment_guards import detect_judgment_stub
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
 from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, Treatment
@@ -37,6 +38,175 @@ COURTS = {"supreme court of pakistan": "Supreme Court of Pakistan", "sc": "Supre
 
 def _det():
     return extract_judgment_deterministic(html=JUDGMENT_HTML, text=clean_html(JUDGMENT_HTML))
+
+
+@pytest.mark.parametrize(
+    ("source_url", "raw_text", "raw_html", "judge_names", "reason_code", "signal"),
+    (
+        (
+            "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch",
+            JUDGMENT_TEXT,
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "login_stub",
+            "source_url_login_check",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            "Update Subscriber plan before continuing.",
+            "<html><body>Judgment text</body></html>",
+            ["Qazi Faez Isa"],
+            "subscription_chrome",
+            "raw_text_update_subscriber",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            JUDGMENT_TEXT,
+            "<html><body>Obtaining Subscription...</body></html>",
+            ["Qazi Faez Isa"],
+            "subscription_chrome",
+            "raw_html_obtaining_subscription",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            JUDGMENT_TEXT,
+            JUDGMENT_HTML,
+            ["Obtaining Subscription"],
+            "subscription_chrome",
+            "judge_name_obtaining_subscription",
+        ),
+    ),
+)
+def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_names, reason_code, signal):
+    hit = detect_judgment_stub(
+        source_url=source_url,
+        raw_text=raw_text,
+        raw_html=raw_html,
+        judge_names=judge_names,
+    )
+    assert hit is not None
+    assert hit.reason_code == reason_code
+    assert hit.signal == signal
+
+
+@pytest.mark.parametrize(
+    ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
+    (
+        (
+            "https://www.pakistanlawsite.com/login/check?x=1",
+            JUDGMENT_TEXT,
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "login_stub:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            "Update Subscriber details to continue.",
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "subscription_chrome:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            JUDGMENT_TEXT,
+            JUDGMENT_HTML,
+            ["Obtaining Subscription"],
+            "subscription_chrome:",
+        ),
+    ),
+)
+def test_reconcile_judgment_quarantines_login_subscription_stubs(
+    source_url,
+    raw_text,
+    raw_html,
+    judge_names,
+    expected_reason_prefix,
+):
+    det = _det()
+    det["judge_names"] = judge_names
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=raw_text,
+        raw_html=raw_html,
+        source_url=source_url,
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is True
+    assert (out.quarantine_reason or "").startswith(expected_reason_prefix)
+
+
+@pytest.mark.parametrize(
+    ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
+    (
+        (
+            "https://www.pakistanlawsite.com/login/check?x=1",
+            clean_html(JUDGMENT_HTML),
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "login_stub:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            "Update Subscriber account to continue.",
+            "<html><body><h1>Update Subscriber</h1></body></html>",
+            ["Qazi Faez Isa"],
+            "subscription_chrome:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            clean_html(JUDGMENT_HTML),
+            JUDGMENT_HTML,
+            ["Obtaining Subscription"],
+            "subscription_chrome:",
+        ),
+    ),
+)
+async def test_promotion_blocks_judgment_stub_markers(
+    db,
+    source,
+    source_url,
+    raw_text,
+    raw_html,
+    judge_names,
+    expected_reason_prefix,
+):
+    prov = await record_provenance(
+        db,
+        source=source,
+        url=source_url,
+        content=(raw_html or JUDGMENT_HTML).encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=raw_html,
+        raw_text=raw_text,
+        url=source_url,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 101"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Stub should never promote",
+        "judge_names": judge_names,
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    result = await promote_judgment_staging(db, st)
+    assert result == "quarantined"
+    assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 0
+    q = (
+        await db.execute(
+            select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id),
+        )
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith(expected_reason_prefix)
 
 
 # --------------------------------------------------------------------------- 8

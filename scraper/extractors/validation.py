@@ -14,6 +14,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from scraper.extractors.deterministic import date_in_text
+from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
@@ -78,6 +79,8 @@ def reconcile_judgment(
     deterministic: Dict[str, Any],
     ai: Optional[Dict[str, Any]],
     raw_text: str,
+    source_url: Optional[str] = None,
+    raw_html: Optional[str] = None,
     court_directory: Dict[str, str],
     min_confidence: float,
 ) -> ValidationOutcome:
@@ -188,6 +191,14 @@ def reconcile_judgment(
     out["bench_size"] = bench_size
     if deterministic.get("_bench_conflict"):
         errors.append(deterministic["_bench_conflict"])
+    stub_signal = detect_judgment_stub(
+        source_url=source_url,
+        raw_text=raw_text,
+        raw_html=raw_html,
+        judge_names=out.get("judge_names"),
+    )
+    if stub_signal is not None:
+        errors.append(guard_reason(stub_signal))
 
     # case title must be supported by heading / result row
     title = out.get("case_title")
@@ -251,10 +262,18 @@ def reconcile_judgment(
         conf = min(conf, 0.4)
     conf = max(0.0, min(1.0, round(conf, 3)))
     out["extractor_confidence"] = conf
-    quarantine = conf < min_confidence or not out["citations"] or not out.get("court") or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
+    quarantine = (
+        stub_signal is not None
+        or conf < min_confidence
+        or not out["citations"]
+        or not out.get("court")
+        or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
+    )
     reason = None
     if quarantine:
-        if not out["citations"]:
+        if stub_signal is not None:
+            reason = guard_reason(stub_signal)
+        elif not out["citations"]:
             reason = "no citation supported by source"
         elif not out.get("court"):
             reason = "court unknown"
