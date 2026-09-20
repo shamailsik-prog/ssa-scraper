@@ -272,6 +272,8 @@ SOURCE_SEED = [
     ("GazetteOfPakistan", "Gazette of Pakistan (Printing Corporation)", "http://pcp.gov.pk/Download", "public", ["www.pcp.gov.pk", "pcp.gov.pk"], False, False, True, 48, "hybrid"),
 ]
 
+PAKISTANCODE_CRAWL_MAX_PAGES = 200
+
 
 async def seed_data() -> None:
     from sqlalchemy import select
@@ -287,6 +289,9 @@ async def seed_data() -> None:
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:
                 continue
+            create_kwargs = {}
+            if name == "PakistanCode":
+                create_kwargs["crawl_max_pages"] = PAKISTANCODE_CRAWL_MAX_PAGES
             db.add(
                 ScraperSource(
                     source_name=name,
@@ -304,6 +309,7 @@ async def seed_data() -> None:
                     scrapegraph_schema_version=settings.SGAI_SCHEMA_VERSION,
                     state="PAUSED" if method == "login_session" else "ACTIVE",
                     state_reason="Awaiting human login" if method == "login_session" else None,
+                    **create_kwargs,
                 )
             )
         # Keep LHC source aligned with the connector defaults on existing databases.
@@ -348,6 +354,8 @@ async def seed_data() -> None:
         if pakistan_code is not None:
             if (pakistan_code.source_url or "").rstrip("/") == "https://pakistancode.gov.pk":
                 pakistan_code.source_url = "https://pakistancode.gov.pk/english/index.php"
+            if int(pakistan_code.crawl_max_pages or 0) < PAKISTANCODE_CRAWL_MAX_PAGES:
+                pakistan_code.crawl_max_pages = PAKISTANCODE_CRAWL_MAX_PAGES
             old_listings = [
                 "https://pakistancode.gov.pk/english/LGu3ZBxW1-apaUY2Fqa-apaUY2Fqa-sg-jjjjjjjjjjjjj",
                 "https://pakistancode.gov.pk/federal",

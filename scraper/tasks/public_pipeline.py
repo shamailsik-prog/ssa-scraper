@@ -127,6 +127,7 @@ class PublicPipeline:
         q = (
             select(CrawlFrontier)
             .where(CrawlFrontier.source_name == self.source.source_name, CrawlFrontier.tier == 0, CrawlFrontier.status.in_(["pending", "in_progress"]))
+            # Lower numeric priority is drained first because ordering is ASC.
             .order_by(CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
             .limit(limit)
         )

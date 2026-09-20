@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 PAKISTANCODE_HOST = "pakistancode.gov.pk"
 PAKISTANCODE_HOST_ALIASES = (PAKISTANCODE_HOST, "www.pakistancode.gov.pk")
+PC_DOCUMENT_PRIORITY = 10
+PC_LISTING_PRIORITY = 80
+PC_CRAWL_MAX_PAGES = 200
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 ACT_NO_RE = re.compile(r"\b([IVXLCDM]{1,15}\s+of\s+\d{4})\b", re.IGNORECASE)
 PROMULGATION_RE = re.compile(r"Promulgation\s+Date:\s*([A-Za-z]+\s+\d{1,2}\s+\d{4})", re.IGNORECASE)
@@ -213,7 +216,7 @@ class PakistanCodePipeline(PublicPipeline):
                             "meta": nmeta,
                         },
                         cursor_json={},
-                        priority=40,
+                        priority=PC_LISTING_PRIORITY,
                     )
                 )
                 self.stats["discovered"] += 1
@@ -565,7 +568,7 @@ class PakistanCodePipeline(PublicPipeline):
                         "expect_pdf": bool(meta.get("expect_pdf")),
                     },
                     cursor_json={},
-                    priority=50,
+                    priority=PC_DOCUMENT_PRIORITY,
                 )
             )
             added += 1
