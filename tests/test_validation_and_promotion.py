@@ -1415,6 +1415,7 @@ async def test_reconcile_residual_smoke_dry_run_is_read_only(db):
     assert report["before"]["judgment_citation_unresolved"] >= 1
     assert report["before"] == report["after"]
     assert report["delta"]["total_unresolved_reduced"] == 0
+    assert "unresolved_breakdown" not in report
     assert unresolved_after == unresolved_before
 
 
@@ -1513,6 +1514,88 @@ async def test_reconcile_residual_smoke_apply_reports_before_after_reduction(db)
     assert report["delta"]["instrument_section_unresolved_reduced"] >= 1
     assert "reconcile_instrument_relations" in report["runs"]
     assert "reconcile_judgment_citation_relations" in report["runs"]
+    assert "unresolved_breakdown" not in report
+
+
+async def test_reconcile_residual_smoke_breakdown_reports_top_buckets(db):
+    statute = Statute(name="Qanun-e-Shahadat Order, 1984", jurisdiction="Federal", statute_type="act")
+    db.add(statute)
+    await db.flush()
+
+    judgments = [
+        Judgment(canonical_citation="PLD 2026 SC 801", source_name="SourceA", full_text="The bench relied on PLD 2030 SC 777."),
+        Judgment(canonical_citation="PLD 2026 SC 802", source_name="SourceA", full_text="Counsel cited PLD 2030 SC 777 in support."),
+        Judgment(canonical_citation="PLD 2026 SC 803", source_name="SourceB", full_text="A reference was made to PLD 2040 SC 1."),
+    ]
+    db.add_all(judgments)
+    await db.flush()
+    for judgment in judgments:
+        await sync_judgment_citation_relations(db, judgment)
+
+    instrument_text = "In the Qanun-e-Shahadat Order, 1984, Article 10A and Article 11 shall be omitted."
+    for idx, (number, source_name) in enumerate((("Article 10A", "SourceInstA"), ("Article 10A", "SourceInstA"), ("Article 11", "SourceInstB")), start=1):
+        start = instrument_text.index(number)
+        inst = Instrument(
+            type="act",
+            number=f"Act {source_name}-{idx}",
+            full_text=instrument_text,
+            full_text_hash=canonical_text_hash(f"{instrument_text}:{number}:{source_name}:{idx}"),
+            affected_statute_id=statute.id,
+            affected_statute_name=statute.name,
+            citation_mentions=[],
+            statute_mentions=[
+                {
+                    "raw": number,
+                    "normalized": statute.name,
+                    "canonical_statute_name": statute.name,
+                    "linked_statute_id": str(statute.id),
+                    "section_number": number,
+                    "span": [start, start + len(number)],
+                }
+            ],
+            source_name=source_name,
+            source_url=f"http://127.0.0.1/{source_name}.txt",
+        )
+        db.add(inst)
+        await db.flush()
+        await promotion_task_module._sync_instrument_relation_edges(db, inst)
+    await db.commit()
+
+    report = await reconcile_citation_statute_residual_smoke(
+        run_reconcile=False,
+        include_unresolved_breakdown=True,
+        unresolved_breakdown_top_n=2,
+    )
+
+    breakdown = report["unresolved_breakdown"]
+    assert breakdown["top_n"] == 2
+    assert "judgment_citation_unresolved" in breakdown
+    assert "instrument_section_unresolved" in breakdown
+    judgment_source = breakdown["judgment_citation_unresolved"]["by_source_name"]
+    judgment_keys = breakdown["judgment_citation_unresolved"]["by_target_citation_key"]
+    instrument_source = breakdown["instrument_section_unresolved"]["by_source_name"]
+    instrument_keys = breakdown["instrument_section_unresolved"]["by_target_section_key"]
+    assert len(judgment_source) <= 2 and len(judgment_keys) <= 2
+    assert len(instrument_source) <= 2 and len(instrument_keys) <= 2
+    assert any(row["source_name"] == "SourceA" and row["count"] >= 2 for row in judgment_source)
+    assert any(row["source_name"] == "SourceInstA" and row["count"] >= 2 for row in instrument_source)
+    assert all(row["count"] >= 1 for row in judgment_keys + instrument_keys)
+
+
+async def test_reconcile_residual_smoke_breakdown_empty_when_no_unresolved_rows(db):
+    report = await reconcile_citation_statute_residual_smoke(
+        run_reconcile=False,
+        include_unresolved_breakdown=True,
+        unresolved_breakdown_top_n=3,
+    )
+
+    assert report["before"]["total_unresolved"] == 0
+    breakdown = report["unresolved_breakdown"]
+    assert breakdown["top_n"] == 3
+    assert breakdown["judgment_citation_unresolved"]["by_source_name"] == []
+    assert breakdown["judgment_citation_unresolved"]["by_target_citation_key"] == []
+    assert breakdown["instrument_section_unresolved"]["by_source_name"] == []
+    assert breakdown["instrument_section_unresolved"]["by_target_section_key"] == []
 
 
 # --------------------------------------------------------------------------- treatment (B-7)

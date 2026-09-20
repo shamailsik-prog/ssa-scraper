@@ -33,6 +33,9 @@ Expected:
 - `"mode": "dry_run"`
 - `"before"` equals `"after"`
 - all `*_reduced` deltas are `0`
+- optional compact unresolved triage buckets:
+  - `include_unresolved_breakdown=True`
+  - `unresolved_breakdown_top_n=<small N>` (default `5`) for `by_source_name` and unresolved key buckets
 
 ## 4) Apply reconcile + before→after residual reduction
 

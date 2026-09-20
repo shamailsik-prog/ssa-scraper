@@ -1069,6 +1069,78 @@ async def _unresolved_relation_residual_counts(db: AsyncSession) -> Dict[str, in
     }
 
 
+def _residual_bucket_label(value: Optional[str]) -> str:
+    normalized = str(value or "").strip()
+    return normalized or "(unknown)"
+
+
+async def _unresolved_relation_residual_breakdown(db: AsyncSession, *, top_n: int) -> Dict[str, Any]:
+    judgment_by_source_rows = (
+        await db.execute(
+            select(Judgment.source_name, func.count())
+            .select_from(JudgmentCitationRelation)
+            .join(Judgment, Judgment.id == JudgmentCitationRelation.source_judgment_id)
+            .where(JudgmentCitationRelation.resolution_status == "unresolved")
+            .group_by(Judgment.source_name)
+            .order_by(func.count().desc(), Judgment.source_name.asc().nulls_last())
+            .limit(top_n)
+        )
+    ).all()
+    judgment_by_key_rows = (
+        await db.execute(
+            select(JudgmentCitationRelation.target_citation_key, func.count())
+            .select_from(JudgmentCitationRelation)
+            .where(JudgmentCitationRelation.resolution_status == "unresolved")
+            .group_by(JudgmentCitationRelation.target_citation_key)
+            .order_by(func.count().desc(), JudgmentCitationRelation.target_citation_key.asc().nulls_last())
+            .limit(top_n)
+        )
+    ).all()
+    instrument_by_source_rows = (
+        await db.execute(
+            select(Instrument.source_name, func.count())
+            .select_from(InstrumentSectionRelation)
+            .join(Instrument, Instrument.id == InstrumentSectionRelation.source_instrument_id)
+            .where(InstrumentSectionRelation.target_statute_section_id.is_(None))
+            .group_by(Instrument.source_name)
+            .order_by(func.count().desc(), Instrument.source_name.asc().nulls_last())
+            .limit(top_n)
+        )
+    ).all()
+    instrument_by_key_rows = (
+        await db.execute(
+            select(InstrumentSectionRelation.target_section_key, func.count())
+            .select_from(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.target_statute_section_id.is_(None))
+            .group_by(InstrumentSectionRelation.target_section_key)
+            .order_by(func.count().desc(), InstrumentSectionRelation.target_section_key.asc().nulls_last())
+            .limit(top_n)
+        )
+    ).all()
+    return {
+        "judgment_citation_unresolved": {
+            "by_source_name": [
+                {"source_name": _residual_bucket_label(source_name), "count": int(count)}
+                for source_name, count in judgment_by_source_rows
+            ],
+            "by_target_citation_key": [
+                {"target_citation_key": _residual_bucket_label(citation_key), "count": int(count)}
+                for citation_key, count in judgment_by_key_rows
+            ],
+        },
+        "instrument_section_unresolved": {
+            "by_source_name": [
+                {"source_name": _residual_bucket_label(source_name), "count": int(count)}
+                for source_name, count in instrument_by_source_rows
+            ],
+            "by_target_section_key": [
+                {"target_section_key": _residual_bucket_label(section_key), "count": int(count)}
+                for section_key, count in instrument_by_key_rows
+            ],
+        },
+    }
+
+
 async def reconcile_citation_statute_residual_smoke(
     *,
     lookback_hours: Optional[int] = None,
@@ -1076,6 +1148,8 @@ async def reconcile_citation_statute_residual_smoke(
     judgment_batch_size: Optional[int] = None,
     run_reconcile: bool = False,
     fail_on_increase: bool = True,
+    include_unresolved_breakdown: bool = False,
+    unresolved_breakdown_top_n: Optional[int] = None,
 ) -> Dict[str, Any]:
     instrument_batch = _positive_int(
         instrument_limit,
@@ -1093,8 +1167,12 @@ async def reconcile_citation_statute_residual_smoke(
         lookback_hours,
         fallback=settings.JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS,
     )
+    breakdown_top_n = _positive_int(unresolved_breakdown_top_n, fallback=5)
+    breakdown: Optional[Dict[str, Any]] = None
     async with SessionLocal() as db:
         before = await _unresolved_relation_residual_counts(db)
+        if include_unresolved_breakdown:
+            breakdown = await _unresolved_relation_residual_breakdown(db, top_n=breakdown_top_n)
 
     result: Dict[str, Any] = {
         "mode": "apply" if run_reconcile else "dry_run",
@@ -1136,6 +1214,9 @@ async def reconcile_citation_statute_residual_smoke(
             "instrument_section_unresolved_reduced": int(before["instrument_section_unresolved"]) - int(after["instrument_section_unresolved"]),
             "total_unresolved_reduced": int(before["total_unresolved"]) - int(after["total_unresolved"]),
         }
+        if include_unresolved_breakdown:
+            async with SessionLocal() as db:
+                breakdown = await _unresolved_relation_residual_breakdown(db, top_n=breakdown_top_n)
         regressions = {
             key: {"before": int(before[key]), "after": int(after[key])}
             for key in ("judgment_citation_unresolved", "instrument_section_unresolved", "total_unresolved")
@@ -1143,6 +1224,8 @@ async def reconcile_citation_statute_residual_smoke(
         }
         if fail_on_increase and regressions:
             raise RuntimeError(f"residual smoke failed: unresolved counts increased {regressions}")
+    if include_unresolved_breakdown:
+        result["unresolved_breakdown"] = {"top_n": breakdown_top_n, **(breakdown or {})}
     return result
 
 
