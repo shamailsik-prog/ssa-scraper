@@ -448,8 +448,10 @@ async def run_public_source(
         exists = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == source.source_name, CrawlFrontier.tier == 0, CrawlFrontier.query_key == key))).scalars().first()
         if exists is None:
             db.add(CrawlFrontier(source_name=source.source_name, tier=0, query_key=key, query_json={"kind": "listing", "url": url, "target_kind": item.get("target_kind", "judgment"), "depth": 0}, cursor_json={}, priority=30))
-        elif exists.status == "done" and item.get("refresh", True):
+        elif exists.status in ("done", "retired") and item.get("refresh", True):
             exists.status = "pending"
+            exists.last_error = None
+            exists.attempts = 0
     await db.flush()
     own_fetcher = fetcher is None
     if own_fetcher:
