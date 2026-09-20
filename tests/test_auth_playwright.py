@@ -23,7 +23,8 @@ from scraper.auth.session_manager import (
     raise_for_verdict,
 )
 from scraper.config import settings
-from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperStaging, SearchFormMap
+from scraper.database import SessionLocal
+from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperSource, ScraperStaging, SearchFormMap
 from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
 from scraper.tasks.promotion import promote_staging_records
@@ -774,6 +775,107 @@ async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_sou
     assert stats2["citation_grid_offset"] == 2
     assert stats2["citation_grid_next_offset"] == 4
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 4
+
+
+async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_end(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 3)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 701", "Case 701", "Supreme Court", "https://www.pakistanlawsite.com/case/701"),
+        ("PLD 2024 SC 702", "Case 702", "Supreme Court", "https://www.pakistanlawsite.com/case/702"),
+        ("PLD 2024 SC 703", "Case 703", "Supreme Court", "https://www.pakistanlawsite.com/case/703"),
+        ("PLD 2024 SC 704", "Case 704", "Supreme Court", "https://www.pakistanlawsite.com/case/704"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+
+    pipeline1 = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    original_fetch_detail = pipeline1.fetch_detail
+    detail_calls = {"count": 0}
+
+    async def crash_on_second_detail(url):
+        detail_calls["count"] += 1
+        if detail_calls["count"] == 2:
+            raise RuntimeError("simulated worker recreate")
+        return await original_fetch_detail(url)
+
+    pipeline1.fetch_detail = crash_on_second_detail
+    with pytest.raises(RuntimeError, match="simulated worker recreate"):
+        await pipeline1.run(max_queries=5, max_probes_per_volume=5)
+
+    async with SessionLocal() as verify_db:
+        staged_after_crash = (await verify_db.execute(select(func.count()).select_from(ScraperStaging))).scalar()
+        persisted_source = (await verify_db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().one()
+        assert staged_after_crash == 1
+        assert ((persisted_source.config_json or {}).get("citation_grid_cursor") or {}).get("row_offset") == 1
+
+    sc.log.clear()
+    async with SessionLocal() as resumed_db:
+        resumed_source = (await resumed_db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().one()
+        pipeline2 = PakistanLawSitePipeline(resumed_db, resumed_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+        stats2 = await pipeline2.run(max_queries=5, max_probes_per_volume=5)
+        await resumed_db.commit()
+    await r.aclose()
+
+    resumed_detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert resumed_detail_calls == [
+        "https://www.pakistanlawsite.com/case/702",
+        "https://www.pakistanlawsite.com/case/703",
+        "https://www.pakistanlawsite.com/case/704",
+    ]
+    assert stats2["citation_grid_offset"] == 1
+    assert stats2["citation_grid_next_offset"] == 0
+    async with SessionLocal() as final_verify_db:
+        staged_total = (await final_verify_db.execute(select(func.count()).select_from(ScraperStaging))).scalar()
+        assert staged_total == 4
+
+
+async def test_pipeline_citation_grid_batch_flush_persists_offset_and_rows(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 5)
+    await _activate(db, login_source)
+    login_source.config_json = {**(login_source.config_json or {}), "citation_grid_flush_every": 2}
+    await db.commit()
+    rows = [
+        ("PLD 2024 SC 801", "Case 801", "Supreme Court", "https://www.pakistanlawsite.com/case/801"),
+        ("PLD 2024 SC 802", "Case 802", "Supreme Court", "https://www.pakistanlawsite.com/case/802"),
+        ("PLD 2024 SC 803", "Case 803", "Supreme Court", "https://www.pakistanlawsite.com/case/803"),
+        ("PLD 2024 SC 804", "Case 804", "Supreme Court", "https://www.pakistanlawsite.com/case/804"),
+        ("PLD 2024 SC 805", "Case 805", "Supreme Court", "https://www.pakistanlawsite.com/case/805"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    original_fetch_detail = pipeline.fetch_detail
+    detail_calls = {"count": 0}
+
+    async def crash_on_third_detail(url):
+        detail_calls["count"] += 1
+        if detail_calls["count"] == 3:
+            raise RuntimeError("simulated worker recreate")
+        return await original_fetch_detail(url)
+
+    pipeline.fetch_detail = crash_on_third_detail
+    with pytest.raises(RuntimeError, match="simulated worker recreate"):
+        await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await r.aclose()
+
+    async with SessionLocal() as verify_db:
+        staged_after_crash = (await verify_db.execute(select(func.count()).select_from(ScraperStaging))).scalar()
+        persisted_source = (await verify_db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().one()
+        assert staged_after_crash == 2
+        assert ((persisted_source.config_json or {}).get("citation_grid_cursor") or {}).get("row_offset") == 2
 
 
 async def test_pipeline_citation_grid_cursor_wraps_at_end(db, login_source, monkeypatch):
