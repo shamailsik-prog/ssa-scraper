@@ -378,8 +378,9 @@ class PakistanLawSitePipeline:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        cfg["citation_grid_cursor"] = cursor
-        self.source.config_json = cfg
+        cfg_live = dict(self.source.config_json or {})
+        cfg_live["citation_grid_cursor"] = cursor
+        self.source.config_json = cfg_live
         logger.info(
             "PakistanLawSite citation-grid cursor advanced start_offset=%s next_offset=%s wrap=%s",
             start_offset,
