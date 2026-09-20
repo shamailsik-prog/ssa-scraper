@@ -288,41 +288,60 @@ class PakistanLawSitePipeline:
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
         max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
-        if max_detail > 0 and len(rows) > max_detail:
-            logger.info(
-                "PakistanLawSite citation-grid capping detail fetches %s -> %s",
-                len(rows),
-                max_detail,
-            )
-            rows = rows[:max_detail]
+        cfg = dict(self.source.config_json or {})
+        cursor = dict(cfg.get("citation_grid_cursor") or {})
+        raw_offset = cursor.get("row_offset", 0)
+        try:
+            row_offset = int(raw_offset or 0)
+        except Exception:
+            row_offset = 0
+        row_offset = max(0, row_offset)
+        row_count = len(rows)
+        total_rows_meta = (page.metadata or {}).get("total_rows")
+        try:
+            total_rows = int(total_rows_meta) if total_rows_meta is not None else None
+        except Exception:
+            total_rows = None
+        start_offset = row_offset % row_count
+        take_count = row_count if max_detail <= 0 else min(max_detail, row_count)
+        selected_indexes = [((start_offset + i) % row_count) for i in range(take_count)]
+        logger.info(
+            "PakistanLawSite citation-grid cursor start_offset=%s take_count=%s rows=%s total_rows=%s max_detail=%s",
+            start_offset,
+            take_count,
+            row_count,
+            total_rows,
+            max_detail,
+        )
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
-        for idx, row in enumerate(rows):
+        for idx, row_idx in enumerate(selected_indexes):
+            row = rows[row_idx]
             detail_url = row.get("detail_url") or row.get("pdf_url")
             if not detail_url:
                 url_less_skips += 1
                 self.stats["url_less_skips"] += 1
                 logger.warning(
                     "PakistanLawSite citation-grid row missing detail URL; skipping row_index=%s citation=%r title=%r",
-                    idx,
+                    row_idx,
                     row.get("citation"),
                     row.get("title"),
                 )
                 continue
-            if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(rows):
+            if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(selected_indexes):
                 logger.info(
                     "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s",
                     idx + 1,
-                    len(rows),
+                    len(selected_indexes),
                     self.stats["staged"] - staged_before,
                     self.stats["duplicates"] - duplicates_before,
                 )
             route = {
                 "tier": "citation_grid",
                 "query": {"surface": "archivedpatientGrid"},
-                "cursor": {"row_index": idx},
-                "row_index": idx,
+                "cursor": {"row_index": row_idx},
+                "row_index": row_idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
             detail = await self.fetch_detail(detail_url)
@@ -332,19 +351,41 @@ class PakistanLawSitePipeline:
             logger.warning(
                 "PakistanLawSite citation-grid skipped %s/%s rows with no detail URL",
                 url_less_skips,
-                len(rows),
+                len(selected_indexes),
             )
         staged_delta = self.stats["staged"] - staged_before
-        if rows and staged_delta == 0:
+        if selected_indexes and staged_delta == 0:
             duplicate_delta = self.stats["duplicates"] - duplicates_before
             logger.warning(
                 "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s)",
-                len(rows),
+                len(selected_indexes),
                 duplicate_delta,
                 url_less_skips,
             )
-            if url_less_skips >= len(rows):
+            if url_less_skips >= len(selected_indexes):
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
+        next_offset = (start_offset + take_count) % row_count
+        self.stats["citation_grid_offset"] = start_offset
+        self.stats["citation_grid_next_offset"] = next_offset
+        self.stats["citation_grid_rows_seen"] = row_count
+        cursor.update(
+            {
+                "row_offset": next_offset,
+                "last_start_offset": start_offset,
+                "last_take_count": take_count,
+                "last_rows_seen": row_count,
+                "last_total_rows": total_rows,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        cfg["citation_grid_cursor"] = cursor
+        self.source.config_json = cfg
+        logger.info(
+            "PakistanLawSite citation-grid cursor advanced start_offset=%s next_offset=%s wrap=%s",
+            start_offset,
+            next_offset,
+            bool(next_offset < start_offset or (start_offset == 0 and take_count == row_count)),
+        )
 
     # ---------------------------------------------------------------- one result page
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
