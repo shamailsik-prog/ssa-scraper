@@ -220,6 +220,14 @@ def reconcile_judgment(
         raw_text=raw_text,
         raw_html=raw_html,
         judge_names=out.get("judge_names"),
+        judge_fields={
+            "judge": out.get("judge"),
+            "judges": out.get("judges"),
+            "deterministic_judge": deterministic.get("judge"),
+            "deterministic_judges": deterministic.get("judges"),
+            "ai_judge": (ai or {}).get("judge"),
+            "ai_judges": (ai or {}).get("judges"),
+        },
     )
     if stub_signal is not None:
         errors.append(guard_reason(stub_signal))
