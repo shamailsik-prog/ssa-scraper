@@ -430,20 +430,20 @@ class PlaywrightBrowser:
                                     ? Math.min(requestedStartRow, Math.max(totalRows - 1, 0))
                                     : requestedStartRow;
                                 const targetPage = Math.floor(boundedStart / pageLength);
-                                await new Promise((resolve) => {
+                                const drawWaitResult = await new Promise((resolve) => {
                                     let done = false;
-                                    const finish = () => {
+                                    const finish = (mode) => {
                                         if (!done) {
                                             done = true;
-                                            resolve();
+                                            resolve(mode);
                                         }
                                     };
                                     try {
-                                        jq(table).one('draw.dt', finish);
+                                        jq(table).one('draw.dt', () => finish('draw'));
                                         dt.page(targetPage).draw(false);
-                                        setTimeout(finish, 1200);
+                                        setTimeout(() => finish('timeout'), 1200);
                                     } catch (_drawError) {
-                                        finish();
+                                        finish('error');
                                     }
                                 });
                                 const infoAfter = dt.page.info() || {};
@@ -451,19 +451,22 @@ class PlaywrightBrowser:
                                 if (Number.isFinite(recordsAfter) && recordsAfter >= 0) {
                                     totalRows = Math.floor(recordsAfter);
                                 }
-                                pageLength = Number(infoAfter.length ?? pageLength);
-                                if (Number.isFinite(infoAfter.start) && Number(infoAfter.start) >= 0) {
-                                    appliedStartRow = Math.floor(Number(infoAfter.start));
-                                } else {
-                                    appliedStartRow = targetPage * pageLength;
+                                if (drawWaitResult === 'draw') {
+                                    pageLength = Number(infoAfter.length ?? pageLength);
+                                    if (Number.isFinite(infoAfter.start) && Number(infoAfter.start) >= 0) {
+                                        appliedStartRow = Math.floor(Number(infoAfter.start));
+                                    } else {
+                                        appliedStartRow = targetPage * pageLength;
+                                    }
+                                    seekMode = 'datatable';
                                 }
-                                seekMode = 'datatable';
                             }
                         }
                     } catch (_seekError) {
                         // Keep compact snapshot resilient even if DataTables API is unavailable.
                     }
                     if (seekMode !== 'datatable') {
+                        appliedStartRow = 0;
                         const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                         const trCollection = tbody && tbody.rows ? tbody.rows : [];
                         const target = trCollection.length ? trCollection[Math.min(requestedStartRow, trCollection.length - 1)] : null;

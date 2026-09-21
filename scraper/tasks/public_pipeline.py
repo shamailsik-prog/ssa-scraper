@@ -27,7 +27,7 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
 from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute
-from scraper.models import CrawlFrontier, ScraperSource
+from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
@@ -86,6 +86,9 @@ class PublicPipeline:
             "blocked_cooldown": False,
             "errors": 0,
         }
+        self._persisted_pages = 0
+        self._persisted_staged = 0
+        self._persisted_quarantined = 0
 
     def _extractor(self, prov_id=None, staging_id=None) -> HybridExtractor:
         kwargs = {"provenance_id": prov_id, "staging_id": staging_id}
@@ -342,7 +345,37 @@ class PublicPipeline:
                     return
                 processed.add(fr.id)
                 if await self._drain_one(fr) == "halted":
+                    await self._persist_frontier_progress()
                     return
+                await self._persist_frontier_progress()
+
+    async def _persist_frontier_progress(self) -> None:
+        """Durably persist one frontier step and mirror live counters onto the running job."""
+        fetched = int(self.stats.get("fetched", 0) or 0)
+        staged = int(self.stats.get("staged", 0) or 0)
+        quarantined = int(self.stats.get("quarantined", 0) or 0)
+
+        pages_delta = max(0, fetched - self._persisted_pages)
+        staged_delta = max(0, staged - self._persisted_staged)
+        quarantined_delta = max(0, quarantined - self._persisted_quarantined)
+        if pages_delta:
+            self.source.total_pages_scraped += pages_delta
+        if staged_delta:
+            self.source.total_records_extracted += staged_delta
+        if pages_delta or staged_delta or quarantined_delta:
+            self._persisted_pages = fetched
+            self._persisted_staged = staged
+            self._persisted_quarantined = quarantined
+
+        if self.job_id is not None:
+            job = (await self.db.execute(select(ScraperJob).where(ScraperJob.id == self.job_id))).scalars().first()
+            if job is not None and job.status == "running":
+                job.pages_scraped = fetched
+                job.records_extracted = staged
+                job.records_quarantined = quarantined
+                job.result_summary = dict(self.stats)
+
+        await self.db.commit()
 
     async def _drain_one(self, fr: CrawlFrontier) -> str:
         """Process one frontier row. Returns 'ok' or 'halted' (explicit block: stop the run)."""
@@ -469,7 +502,7 @@ async def run_public_source(
         cfg = dict(source.config_json or {})
         if cfg.pop("block_retry", None) is not None:
             source.config_json = cfg
-    source.total_pages_scraped += pipeline.stats["fetched"]
-    source.total_records_extracted += pipeline.stats["staged"]
+    source.total_pages_scraped += max(0, int(pipeline.stats["fetched"] or 0) - pipeline._persisted_pages)
+    source.total_records_extracted += max(0, int(pipeline.stats["staged"] or 0) - pipeline._persisted_staged)
     await db.flush()
     return pipeline.stats

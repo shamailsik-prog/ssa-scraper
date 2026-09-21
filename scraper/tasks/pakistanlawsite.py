@@ -343,11 +343,19 @@ class PakistanLawSitePipeline:
         if row_offset >= total_rows:
             row_offset = row_offset % total_rows
         start_row_meta = (page.metadata or {}).get("start_row")
+        seek_mode = str((page.metadata or {}).get("seek_mode") or "").strip().lower()
         try:
             snapshot_start_row = int(start_row_meta) if start_row_meta is not None else 0
         except Exception:
             snapshot_start_row = 0
         snapshot_start_row = max(0, snapshot_start_row)
+        if seek_mode and seek_mode != "datatable" and snapshot_start_row > 0:
+            logger.warning(
+                "PakistanLawSite citation-grid snapshot reported start_row=%s for seek_mode=%s; normalizing to 0",
+                snapshot_start_row,
+                seek_mode,
+            )
+            snapshot_start_row = 0
         window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
         if not window_contains_offset:
             logger.warning(
