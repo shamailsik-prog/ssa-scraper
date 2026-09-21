@@ -174,13 +174,14 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
 
 
 def test_reconcile_judgment_marks_notes_only_as_headnote():
-    det = _det()
     notes_text = "Citation Name: PLD 2024 SC 555\nNotes on Cases\nBookmark this Case\nshort extract."
+    notes_html = f"<html><body><pre>{notes_text}</pre></body></html>"
+    det = extract_judgment_deterministic(html=notes_html, text=notes_text)
     out = reconcile_judgment(
         deterministic=det,
         ai=None,
         raw_text=notes_text,
-        raw_html=f"<html><body><pre>{notes_text}</pre></body></html>",
+        raw_html=notes_html,
         source_url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K555",
         court_directory=COURTS,
         min_confidence=0.85,

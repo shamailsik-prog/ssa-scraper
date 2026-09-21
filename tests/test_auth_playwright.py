@@ -852,22 +852,20 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
 
 
-async def test_pipeline_uses_case_description_modal_to_extract_full_judgment(db, login_source, monkeypatch):
-    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
-    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
-    await _activate(db, login_source)
-    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
-    rows = [("PLD 2024 SC 247", "Akram versus State", "Supreme Court", detail_url)]
+async def test_pipeline_uses_case_description_modal_to_extract_full_judgment(db, login_source):
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247&court=&Row=0&bookName=undefined"
     full_text = _pls_full_judgment_modal_text()
     full_html = (
         "<html><body><h3>Citation Name: PLD 2024 SC 247</h3>"
         "<div id='ExceptionResponseScreen1_extracted' data-source='case_description_modal'>"
         f"<pre>{full_text}</pre></div></body></html>"
     )
-    sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
-    sc.page(("goto", detail_url), _pls_notes_only_html(include_case_description=True))
-    sc.routes[("goto", detail_url, (("expand_case_description", True),))] = lambda _browser: PageResult(
+    notes_page = PageResult(
+        url=detail_url,
+        html=_pls_notes_only_html(include_case_description=True),
+        status=200,
+    )
+    full_page = PageResult(
         url=detail_url,
         html=full_html,
         status=200,
@@ -878,14 +876,25 @@ async def test_pipeline_uses_case_description_modal_to_extract_full_judgment(db,
             "case_description_modal_applied": True,
         },
     )
-    r = aioredis.from_url(settings.REDIS_URL)
-    await r.delete("corpus:login_session_lock:PakistanLawSite")
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
-    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+
+    async def fake_fetch_detail(url: str, **kwargs):
+        assert url == detail_url
+        if kwargs.get("expand_case_description"):
+            return full_page
+        return notes_page
+
+    pipeline.fetch_detail = fake_fetch_detail
+    row = {"citation": "PLD 2024 SC 247", "title": "Akram versus State", "court": "Supreme Court"}
+    result = await pipeline.preserve_and_extract(
+        notes_page,
+        route={"tier": "citation_grid", "query": {"surface": "archivedpatientGrid"}, "cursor": {"row_index": 0}},
+        row=row,
+    )
     await db.commit()
-    await r.aclose()
-    assert stats["headnotes_detected"] == 1
-    assert stats["headnotes_navigation_successes"] == 1
+    assert result == "staged"
+    assert pipeline.stats["headnotes_detected"] == 1
+    assert pipeline.stats["headnotes_navigation_successes"] == 1
     staging = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.desc()))).scalars().first()
     assert staging is not None
     judges = (staging.reconciled_json or {}).get("judge_names") or []
@@ -893,23 +902,30 @@ async def test_pipeline_uses_case_description_modal_to_extract_full_judgment(db,
     assert (staging.reconciled_json or {}).get("document_type") == "full_judgment"
 
 
-async def test_pipeline_quarantines_notes_only_when_case_description_missing(db, login_source, monkeypatch):
-    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
-    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
-    await _activate(db, login_source)
-    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K999&&court= &&Row=0 &&bookName=undefined"
-    rows = [("PLD 2024 SC 999", "Notes only case", "Supreme Court", detail_url)]
-    sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
-    sc.page(("goto", detail_url), _pls_notes_only_html(include_case_description=False))
-    r = aioredis.from_url(settings.REDIS_URL)
-    await r.delete("corpus:login_session_lock:PakistanLawSite")
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
-    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+async def test_pipeline_quarantines_notes_only_when_case_description_missing(db, login_source):
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K999&court=&Row=0&bookName=undefined"
+    notes_page = PageResult(
+        url=detail_url,
+        html=_pls_notes_only_html(include_case_description=False),
+        status=200,
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+
+    async def fake_fetch_detail(url: str, **kwargs):
+        assert url == detail_url
+        return notes_page
+
+    pipeline.fetch_detail = fake_fetch_detail
+    row = {"citation": "PLD 2024 SC 999", "title": "Notes only case", "court": "Supreme Court"}
+    result = await pipeline.preserve_and_extract(
+        notes_page,
+        route={"tier": "citation_grid", "query": {"surface": "archivedpatientGrid"}, "cursor": {"row_index": 0}},
+        row=row,
+    )
     await db.commit()
-    await r.aclose()
-    assert stats["headnotes_detected"] == 1
-    assert stats["headnotes_navigation_failures"] == 1
+    assert result == "staged"
+    assert pipeline.stats["headnotes_detected"] == 1
+    assert pipeline.stats["headnotes_navigation_failures"] == 1
     staging = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.desc()))).scalars().first()
     assert staging is not None
     assert staging.status == "quarantined"
