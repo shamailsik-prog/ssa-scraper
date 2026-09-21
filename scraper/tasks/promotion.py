@@ -150,6 +150,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         raw_text=st.raw_text,
         raw_html=st.raw_html,
         judge_names=data.get("judge_names"),
+        judge_fields={
+            "judge": data.get("judge"),
+            "judges": data.get("judges"),
+        },
     )
     if stub_signal is not None:
         await _quarantine(

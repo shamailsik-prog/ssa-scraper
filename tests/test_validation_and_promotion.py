@@ -54,13 +54,14 @@ LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogi
 
 
 @pytest.mark.parametrize(
-    ("source_url", "raw_text", "raw_html", "judge_names", "expect_stub", "reason_code", "signal"),
+    ("source_url", "raw_text", "raw_html", "judge_names", "judge_fields", "expect_stub", "reason_code", "signal"),
     (
         (
             "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch",
             CASE_TEXT_WITH_CITATION,
             CASE_HTML_WITH_CITATION,
             ["Qazi Faez Isa"],
+            {},
             False,
             None,
             None,
@@ -70,6 +71,7 @@ LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogi
             "Update Subscriber plan before continuing.",
             "<html><body>Obtaining subscription</body></html>",
             ["Qazi Faez Isa"],
+            {},
             True,
             "login_stub",
             "source_url_login_check",
@@ -79,6 +81,7 @@ LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogi
             CASE_TEXT_WITH_CITATION,
             CASE_HTML_WITH_CITATION,
             ["Qazi Faez Isa"],
+            {},
             False,
             None,
             None,
@@ -88,6 +91,7 @@ LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogi
             CASE_TEXT_WITH_CITATION,
             CASE_HTML_WITH_CITATION,
             ["Obtaining Subscription"],
+            {},
             True,
             "subscription_chrome",
             "judge_name_obtaining_subscription",
@@ -97,18 +101,40 @@ LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogi
             CASE_TEXT_WITH_CITATION,
             CASE_HTML_WITH_CITATION,
             ["Qazi Faez Isa"],
+            {},
             False,
             None,
             None,
         ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
+            ["Qazi Faez Isa"],
+            {"judge": "Obtaining Subscription"},
+            True,
+            "subscription_chrome",
+            "judge_obtaining_subscription",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
+            ["Qazi Faez Isa"],
+            {"judges": ["Obtaining Subscription"]},
+            True,
+            "subscription_chrome",
+            "judges_obtaining_subscription",
+        ),
     ),
 )
-def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_names, expect_stub, reason_code, signal):
+def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_names, judge_fields, expect_stub, reason_code, signal):
     hit = detect_judgment_stub(
         source_url=source_url,
         raw_text=raw_text,
         raw_html=raw_html,
         judge_names=judge_names,
+        judge_fields=judge_fields,
     )
     if not expect_stub:
         assert hit is None
@@ -170,6 +196,23 @@ def test_login_check_plus_subscription_chrome_quarantines():
     assert hit.signal == "source_url_login_check"
 
 
+@pytest.mark.parametrize(
+    "reconciled",
+    (
+        {"judge": "Obtaining Subscription"},
+        {"judges": ["Update Subscriber"]},
+    ),
+)
+def test_is_login_surface_stub_reads_judge_aliases(reconciled):
+    assert is_login_surface_stub(
+        source_url="https://www.pakistanlawsite.com/Login/CitationSearch",
+        raw_text=CASE_TEXT_WITH_CITATION,
+        raw_html=CASE_HTML_WITH_CITATION,
+        reconciled=reconciled,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+
+
 def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
     text = "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ\nJUDGMENT"
     names = extract_before_jj_judge_names(text)
@@ -228,13 +271,14 @@ def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
 
 
 @pytest.mark.parametrize(
-    ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
+    ("source_url", "raw_text", "raw_html", "judge_names", "judge_field_value", "expected_reason_prefix"),
     (
         (
             "https://www.pakistanlawsite.com/login/check?x=1",
             JUDGMENT_TEXT,
             JUDGMENT_HTML,
             ["Qazi Faez Isa"],
+            None,
             "login_stub:",
         ),
         (
@@ -242,6 +286,7 @@ def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
             "Update Subscriber details to continue.",
             JUDGMENT_HTML,
             ["Qazi Faez Isa"],
+            None,
             "subscription_chrome:",
         ),
         (
@@ -249,6 +294,23 @@ def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
             JUDGMENT_TEXT,
             "<html><body>Obtaining Subscription...</body></html>",
             ["Obtaining Subscription"],
+            None,
+            "subscription_chrome:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            JUDGMENT_TEXT,
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "Obtaining Subscription",
+            "subscription_chrome:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            CASE_TEXT_WITH_CITATION,
+            CASE_HTML_WITH_CITATION,
+            ["Qazi Faez Isa"],
+            "Obtaining Subscription",
             "subscription_chrome:",
         ),
     ),
@@ -258,10 +320,12 @@ def test_reconcile_judgment_quarantines_login_subscription_stubs(
     raw_text,
     raw_html,
     judge_names,
+    judge_field_value,
     expected_reason_prefix,
 ):
     det = _det()
     det["judge_names"] = judge_names
+    det["judge"] = judge_field_value
     out = reconcile_judgment(
         deterministic=det,
         ai=None,
@@ -292,13 +356,14 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
 
 
 @pytest.mark.parametrize(
-    ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
+    ("source_url", "raw_text", "raw_html", "judge_names", "judge_field_value", "expected_reason_prefix"),
     (
         (
             "https://www.pakistanlawsite.com/login/check?x=1",
             clean_html(JUDGMENT_HTML),
             JUDGMENT_HTML,
             ["Qazi Faez Isa"],
+            None,
             "login_stub:",
         ),
         (
@@ -306,6 +371,7 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
             "Update Subscriber account to continue.",
             "<html><body><h1>Update Subscriber</h1></body></html>",
             ["Qazi Faez Isa"],
+            None,
             "subscription_chrome:",
         ),
         (
@@ -313,6 +379,15 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
             clean_html(JUDGMENT_HTML),
             JUDGMENT_HTML,
             ["Obtaining Subscription"],
+            None,
+            "subscription_chrome:",
+        ),
+        (
+            "https://www.pakistanlawsite.com/Login/CitationSearch",
+            clean_html(JUDGMENT_HTML),
+            JUDGMENT_HTML,
+            ["Qazi Faez Isa"],
+            "Obtaining Subscription",
             "subscription_chrome:",
         ),
     ),
@@ -324,6 +399,7 @@ async def test_promotion_blocks_judgment_stub_markers(
     raw_text,
     raw_html,
     judge_names,
+    judge_field_value,
     expected_reason_prefix,
 ):
     prov = await record_provenance(
@@ -347,6 +423,7 @@ async def test_promotion_blocks_judgment_stub_markers(
         "year": 2024,
         "case_title": "Stub should never promote",
         "judge_names": judge_names,
+        "judge": judge_field_value,
     }
     st.status = "extracted"
     st.confidence_score = 0.99

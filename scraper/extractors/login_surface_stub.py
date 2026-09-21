@@ -27,7 +27,11 @@ def is_login_surface_stub(
     if court_val.lower() == "read":
         return True
     names = judge_names if judge_names is not None else data.get("judge_names")
-    name_blob = str(names or "").lower()
+    name_blob = " ".join(
+        str(part)
+        for part in (names, data.get("judge"), data.get("judges"))
+        if part is not None
+    ).lower()
     if "obtaining subscription" in name_blob or "update subscriber" in name_blob:
         return True
     if not has_case:
@@ -36,6 +40,8 @@ def is_login_surface_stub(
             raw_text or "",
             (raw_html or "")[:12000],
             str(names or ""),
+            str(data.get("judge") or ""),
+            str(data.get("judges") or ""),
             court_val,
             str(data.get("case_title") or ""),
         ]

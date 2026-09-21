@@ -89,6 +89,24 @@ def _judge_name_values(judge_names: Optional[Iterable[Any]]) -> list[str]:
     return out
 
 
+def _flatten_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for v in value.values():
+            out.extend(_flatten_values(v))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_flatten_values(item))
+        return out
+    return [str(value)]
+
+
 def strip_leading_judgment_chrome(raw_text: Optional[str]) -> str:
     """Remove known PakistanLawSite modal chrome prefixes while preserving body text."""
     text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
@@ -193,6 +211,7 @@ def detect_judgment_stub(
     raw_text: Optional[str],
     raw_html: Optional[str],
     judge_names: Optional[Iterable[Any]],
+    judge_fields: Optional[dict[str, Any]] = None,
 ) -> Optional[JudgmentGuardSignal]:
     has_case = _has_case_content(raw_text=raw_text, raw_html=raw_html)
     url = source_url or ""
@@ -217,6 +236,22 @@ def detect_judgment_stub(
                 signal="judge_name_read_button",
                 matched_value=judge_name[:500],
             )
+
+    for field_name, value in (judge_fields or {}).items():
+        for flattened in _flatten_values(value):
+            marker = _match_subscription_chrome(flattened)
+            if marker:
+                return JudgmentGuardSignal(
+                    reason_code="subscription_chrome",
+                    signal=f"{field_name}_{marker}",
+                    matched_value=flattened[:500],
+                )
+            if flattened.strip().lower() == "read":
+                return JudgmentGuardSignal(
+                    reason_code="login_stub",
+                    signal=f"{field_name}_read_button",
+                    matched_value=flattened[:500],
+                )
 
     # Site chrome always includes Update Subscriber modal + FAQ "obtaining subscription".
     # Only treat those markers as stubs when the page has no case body.
