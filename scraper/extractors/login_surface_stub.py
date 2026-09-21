@@ -38,6 +38,8 @@ def is_login_surface_stub(
     # Structured login-surface fields dominate regardless of body length.
     if "obtaining subscription" in name_blob or "update subscriber" in name_blob:
         return True
-    # Body chrome: fail-closed only when markers dominate. Incidental
-    # nav/footer/cookie crumbs on a long real judgment are not a stub.
-    return login_subscription_chrome_dominates(raw_text=raw_text, raw_html=raw_html) is not None
+    # Citation Name with a value is a real case page (#100). Remaining
+    # body chrome is fail-closed only when markers dominate the payload.
+    if not has_case:
+        return login_subscription_chrome_dominates(raw_text=raw_text, raw_html=raw_html) is not None
+    return False
