@@ -9,12 +9,13 @@ import pytest
 from sqlalchemy import func, select
 
 from scraper.config import settings
+from scraper.database import SessionLocal
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.prompts import build_prompt, prompt_fingerprint
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
 from scraper.extractors.schemas import JudgmentExtraction
 from scraper.fetchers import HttpFetcher, record_provenance, stage_judgment
-from scraper.models import ArchiveObject, ArchiveTarget, CrawlFrontier, Judgment, ScraperStaging, SourceProvenance
+from scraper.models import ArchiveObject, ArchiveTarget, CrawlFrontier, Judgment, ScraperJob, ScraperStaging, SourceProvenance
 from scraper.parsers.pdf_writer import RENDERED_COPY_LABEL, is_rendered_copy, render_judgment_pdf_bytes
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy, classify_response, contains_secret, reset_robots_cache, robots_allows, scrub_secrets
@@ -317,6 +318,55 @@ async def test_run_public_source_refresh_reopens_finished_or_retired_seed(db, so
     assert row.status == "pending"
     assert row.last_error is None
     assert row.attempts == 0
+
+
+class _PersistProbePipeline(PublicPipeline):
+    committed_job_counters = []
+
+    async def _persist_frontier_progress(self) -> None:  # type: ignore[override]
+        await super()._persist_frontier_progress()
+        if self.job_id is None:
+            return
+        async with SessionLocal() as verify:
+            job = (await verify.execute(select(ScraperJob).where(ScraperJob.id == self.job_id))).scalars().first()
+            assert job is not None
+            self.__class__.committed_job_counters.append((job.pages_scraped, job.records_extracted))
+
+
+async def test_run_public_source_persists_mid_run_job_counters(db, source, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    listing_url = fixture_server.add("/progress-listing", '<html><body><a href="/progress-a.html">Judgment A</a></body></html>')
+    fixture_server.add("/progress-a.html", judgment_html("PLD 2026 SC 101"))
+
+    job = ScraperJob(
+        source_id=source.id,
+        source_name=source.source_name,
+        job_type="scrape",
+        status="running",
+    )
+    db.add(job)
+    await db.commit()
+
+    _PersistProbePipeline.committed_job_counters = []
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await run_public_source(
+            db,
+            source,
+            seed_listings=[{"url": listing_url, "target_kind": "judgment"}],
+            fetcher=fetcher,
+            limit=20,
+            job_id=job.id,
+            pipeline_cls=_PersistProbePipeline,
+        )
+
+    assert stats["staged"] >= 1
+    assert len(_PersistProbePipeline.committed_job_counters) >= 2
+    assert any(pages > 0 for pages, _ in _PersistProbePipeline.committed_job_counters)
+    assert any(records > 0 for _, records in _PersistProbePipeline.committed_job_counters)
+    latest_job = (await db.execute(select(ScraperJob).where(ScraperJob.id == job.id))).scalars().first()
+    assert latest_job is not None
+    assert latest_job.pages_scraped >= 1
+    assert latest_job.records_extracted >= 1
 
 
 # --------------------------------------------------------------------------- public run end-to-end

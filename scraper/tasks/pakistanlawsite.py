@@ -89,7 +89,8 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
                 db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=1, query_key=key, query_json={"reporter": rep, "year": year}, cursor_json={"page_no": 1}, priority=10 + (current_year - year)))
                 counts["tier1"] += 1
             if (rep, year) not in coverage:
-                db.add(CrawlCoverage(source_name=SOURCE_NAME, reporter=rep, year=year))
+                db.add(CrawlCoverage(source_name=SOURCE_NAME, reporter=rep, year=year)
+)
         key4 = f"t4:{rep}:{current_year}"
         if (4, key4) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key4, query_json={"reporter": rep, "year": current_year, "daily": True}, cursor_json={"page": 1}, priority=1, next_run_at=now))
@@ -329,7 +330,7 @@ class PakistanLawSitePipeline:
             self.stats["misses"] += 1
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
-        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
+        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
         row_count = len(rows)
         total_rows_meta = (page.metadata or {}).get("total_rows")
         try:
@@ -346,11 +347,19 @@ class PakistanLawSitePipeline:
         if row_offset >= total_rows:
             row_offset = row_offset % total_rows
         start_row_meta = (page.metadata or {}).get("start_row")
+        seek_mode = str((page.metadata or {}).get("seek_mode") or "").strip().lower()
         try:
             snapshot_start_row = int(start_row_meta) if start_row_meta is not None else 0
         except Exception:
             snapshot_start_row = 0
         snapshot_start_row = max(0, snapshot_start_row)
+        if seek_mode and seek_mode != "datatable" and snapshot_start_row > 0:
+            logger.warning(
+                "PakistanLawSite citation-grid snapshot reported start_row=%s for seek_mode=%s; normalizing to 0",
+                snapshot_start_row,
+                seek_mode,
+            )
+            snapshot_start_row = 0
         window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
         if not window_contains_offset:
             logger.warning(
@@ -456,6 +465,30 @@ class PakistanLawSitePipeline:
                     details_since_flush = 0
                     staged_since_flush = 0
                 continue
+            # Fast path: citation already promoted — skip Playwright detail (dup band speedup).
+            citation_key = (row.get("citation") or "").strip()
+            if citation_key:
+                from sqlalchemy import select, func
+                from scraper.models import Judgment
+                already = await self.db.scalar(
+                    select(func.count())
+                    .select_from(Judgment)
+                    .where(Judgment.canonical_citation == citation_key)
+                )
+                if already and int(already) > 0:
+                    self.stats["duplicates"] += 1
+                    details_since_flush += 1
+                    if details_since_flush >= flush_every or (idx + 1) == len(selected_indexes):
+                        next_offset = next_offset_after(idx + 1)
+                        await flush_citation_grid_progress(
+                            next_offset,
+                            staged_this_flush=staged_since_flush,
+                            details_this_flush=details_since_flush,
+                            processed_rows=idx + 1,
+                        )
+                        details_since_flush = 0
+                        staged_since_flush = 0
+                    continue
             if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(selected_indexes):
                 logger.info(
                     "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s",
