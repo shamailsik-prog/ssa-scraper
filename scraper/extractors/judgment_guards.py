@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -46,6 +47,24 @@ _SUBSCRIPTION_CHROME_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("update_subscription", re.compile(r"\bupdate\s+subscription\b", re.IGNORECASE)),
     ("subscription_account", re.compile(r"\bsubscriber\s+account\b", re.IGNORECASE)),
 )
+# Cookie / login-form leftovers. These only quarantine when they dominate
+# (thin body or high marker share), never as crumbs on a long judgment.
+_LOGIN_SURFACE_BODY_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("agree_terms", re.compile(r"\bi\s+agree\s+with\s+the\s+terms\b", re.IGNORECASE)),
+)
+_PASSWORD_INPUT_RE = re.compile(r"(?i)<input\b[^>]*\btype\s*=\s*['\"]password['\"]")
+_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg)\b[^>]*>.*?</\1>")
+
+# Dominate-vs-crumbs thresholds for body-level login/subscription chrome.
+# Structured fields (judge_names / court == "read") still fail closed on their own.
+#
+# - Thin visible body + any marker => the page IS the chrome (paywall / login / CTA).
+# - Marker characters are a large share of visible text => chrome dominates.
+# - Medium unstructured copy + markers => subscription/login CTA as main content.
+# - Long structured judgment + a few nav/footer/cookie crumbs => NOT a stub.
+_THIN_VISIBLE_COMPACT_CHARS = 400
+_MARKER_DOMINANCE_RATIO = 0.25
+_MEDIUM_UNSTRUCTURED_COMPACT_CHARS = 1200
 _MODAL_CHROME_LINE_MARKERS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*[\u00d7x]+\s*$", re.IGNORECASE),
     re.compile(r"^\s*case\s+description\s*$", re.IGNORECASE),
@@ -112,6 +131,76 @@ def _match_subscription_chrome(value: str) -> Optional[str]:
     for marker_name, marker_re in _SUBSCRIPTION_CHROME_MARKERS:
         if marker_re.search(value):
             return marker_name
+    return None
+
+
+def _compact_len(value: str) -> int:
+    return len(re.sub(r"\s+", "", value or ""))
+
+
+def _html_to_visible_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    text = _SCRIPT_STYLE_RE.sub(" ", raw_html)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = _HTML_NBSP_RE.sub(" ", text)
+    return html_lib.unescape(text)
+
+
+def _visible_payload(*, raw_text: Optional[str], raw_html: Optional[str]) -> str:
+    """Prefer the longer visible surface so a thin extracted line cannot hide a real body."""
+    text = (raw_text or "").strip()
+    html_visible = _html_to_visible_text(raw_html or "").strip()
+    if text and html_visible:
+        if _compact_len(text) >= _compact_len(html_visible):
+            return text
+        return html_visible
+    return text or html_visible
+
+
+def _marker_hits(visible: str) -> list[tuple[str, int]]:
+    hits: list[tuple[str, int]] = []
+    for marker_name, marker_re in _SUBSCRIPTION_CHROME_MARKERS + _LOGIN_SURFACE_BODY_MARKERS:
+        for match in marker_re.finditer(visible):
+            hits.append((marker_name, match.end() - match.start()))
+    return hits
+
+
+def login_subscription_chrome_dominates(
+    *,
+    raw_text: Optional[str],
+    raw_html: Optional[str],
+) -> Optional[str]:
+    """Return a marker name when login/subscription chrome dominates; None for crumbs/absent.
+
+    Incidental nav/footer/cookie/subscription-widget leftovers on a long real
+    judgment must not quarantine. Markers must be the main content.
+    """
+    visible = _visible_payload(raw_text=raw_text, raw_html=raw_html)
+    hits = _marker_hits(visible)
+    html_blob = raw_html or ""
+    has_password = bool(_PASSWORD_INPUT_RE.search(html_blob))
+    if not hits and not has_password:
+        return None
+
+    compact_total = _compact_len(visible)
+    marker_chars = sum(length for _name, length in hits)
+    first_marker = hits[0][0] if hits else "password_input"
+    marker_share = (marker_chars / compact_total) if compact_total else 1.0
+
+    # Thin / empty visible body: a leftover widget IS the page.
+    if compact_total < _THIN_VISIBLE_COMPACT_CHARS:
+        return first_marker
+    # Chrome phrases are a large share of the visible text.
+    if marker_share >= _MARKER_DOMINANCE_RATIO:
+        return first_marker
+    # Medium paywall/CTA copy with no judgment structure still fail-closes.
+    if (
+        hits
+        and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS
+        and not _JUDGMENT_STRUCTURE_RE.search(visible)
+    ):
+        return first_marker
     return None
 
 
@@ -292,17 +381,40 @@ def detect_judgment_stub(
                     matched_value=flattened[:500],
                 )
 
-    # Site chrome always includes Update Subscriber modal + FAQ "obtaining subscription".
-    # Only treat those markers as stubs when the page has no case body.
+    # Site chrome always includes Update Subscriber modal + FAQ crumbs.
+    # Only quarantine when those markers dominate the visible payload
+    # (thin body, high marker share, or unstructured CTA copy). A long
+    # real judgment with incidental nav/footer leftovers is not a stub.
+    # Citation Name with a value still short-circuits (#100).
     if not has_case:
-        for field_name, value in (("raw_text", raw_text or ""), ("raw_html", raw_html or "")):
-            marker = _match_subscription_chrome(value)
-            if marker:
-                return JudgmentGuardSignal(
-                    reason_code="subscription_chrome",
-                    signal=f"{field_name}_{marker}",
-                    matched_value=value[:500],
-                )
+        dominating = login_subscription_chrome_dominates(raw_text=raw_text, raw_html=raw_html)
+        if dominating:
+            reason_code = "login_stub" if dominating in {"agree_terms", "password_input"} else "subscription_chrome"
+            for field_name, value in (("raw_text", raw_text or ""), ("raw_html", raw_html or "")):
+                if dominating == "password_input" and field_name == "raw_html" and _PASSWORD_INPUT_RE.search(value):
+                    return JudgmentGuardSignal(
+                        reason_code=reason_code,
+                        signal=f"{field_name}_{dominating}",
+                        matched_value=value[:500],
+                    )
+                marker = _match_subscription_chrome(value)
+                if marker:
+                    return JudgmentGuardSignal(
+                        reason_code=reason_code,
+                        signal=f"{field_name}_{marker}",
+                        matched_value=value[:500],
+                    )
+                if dominating == "agree_terms" and re.search(r"(?i)\bi\s+agree\s+with\s+the\s+terms\b", value):
+                    return JudgmentGuardSignal(
+                        reason_code=reason_code,
+                        signal=f"{field_name}_{dominating}",
+                        matched_value=value[:500],
+                    )
+            return JudgmentGuardSignal(
+                reason_code=reason_code,
+                signal=f"payload_{dominating}",
+                matched_value=(raw_text or raw_html or "")[:500],
+            )
     return None
 
 

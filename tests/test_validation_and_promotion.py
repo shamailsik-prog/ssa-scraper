@@ -15,6 +15,7 @@ from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
     extract_before_jj_judge_names,
+    login_subscription_chrome_dominates,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.login_surface_stub import is_login_surface_stub
@@ -82,6 +83,31 @@ The appeal is allowed and the conviction is set aside.
 """
 SHORT_SUBSCRIPTION_STUB_TEXT = "Update Subscriber details to continue."
 SHORT_SUBSCRIPTION_STUB_HTML = "<html><body><h1>Update Subscriber</h1><p>Obtaining Subscription</p></body></html>"
+REFERENCE_CASE_URL = (
+    "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
+    "?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
+)
+# Nav/footer/cookie leftovers that Monitor saw on real long judgments after #100.
+INCIDENTAL_CHROME_CRUMBS = (
+    "\nUpdate Subscriber\nObtaining Subscription\n"
+    "I agree with the terms\nCookie settings | Subscriber account\n"
+)
+LONG_JUDGMENT_WITH_CHROME_CRUMBS = JUDGMENT_TEXT + INCIDENTAL_CHROME_CRUMBS
+LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS = (
+    "<html><body>"
+    + "".join(f"<p>{line}</p>" for line in JUDGMENT_TEXT.split("\n"))
+    + "<nav>Case search</nav><footer>Update Subscriber | Obtaining Subscription | "
+    "I agree with the terms</footer></body></html>"
+)
+SHORT_SUBSCRIPTION_CHROME_TEXT = "Update Subscriber details to continue. Obtaining Subscription now."
+SHORT_SUBSCRIPTION_CHROME_HTML = (
+    "<html><body><h1>Update Subscriber</h1><p>Obtaining Subscription</p></body></html>"
+)
+THIN_LOGIN_FORM_HTML = (
+    "<html><body><h1>Please log in</h1>"
+    "<form><input type='password' name='pwd'><button>Sign in</button></form>"
+    "<p>I agree with the terms to access subscriber content.</p></body></html>"
+)
 
 
 @pytest.mark.parametrize(
@@ -284,6 +310,90 @@ def test_is_login_surface_stub_reads_judge_aliases(reconciled):
     ) is True
 
 
+def test_long_judgment_with_incidental_chrome_crumbs_is_not_stub():
+    assert login_subscription_chrome_dominates(
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+    ) is None
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is False
+    assert detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_login_check_long_body_with_citation_name_and_crumbs_is_not_stub():
+    text = "Citation Name: PLD 2024 SC 101\n" + LONG_JUDGMENT_WITH_CHROME_CRUMBS
+    assert is_login_surface_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=text,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is False
+    assert detect_judgment_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=text,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_short_subscription_chrome_still_dominates():
+    assert login_subscription_chrome_dominates(
+        raw_text=SHORT_SUBSCRIPTION_CHROME_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_CHROME_HTML,
+    ) in {"update_subscriber", "obtaining_subscription"}
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=SHORT_SUBSCRIPTION_CHROME_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_CHROME_HTML,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=SHORT_SUBSCRIPTION_CHROME_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_CHROME_HTML,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
+def test_thin_login_form_still_stubs():
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text="Please log in to continue.",
+        raw_html=THIN_LOGIN_FORM_HTML,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text="Please log in to continue.",
+        raw_html=THIN_LOGIN_FORM_HTML,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "login_stub"
+
+
+def test_empty_citation_name_chrome_without_login_check_still_stubs():
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=EMPTY_CITATION_NAME_CHROME,
+        raw_html="<html><body>Obtaining Subscription<br>Update Subscriber<br>Citation Name:</body></html>",
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
 def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
     text = "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ\nJUDGMENT"
     names = extract_before_jj_judge_names(text)
@@ -355,8 +465,8 @@ def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
         ),
         (
             "https://www.pakistanlawsite.com/Login/CitationSearch",
-            SHORT_SUBSCRIPTION_STUB_TEXT,
-            SHORT_SUBSCRIPTION_STUB_HTML,
+            SHORT_SUBSCRIPTION_CHROME_TEXT,
+            SHORT_SUBSCRIPTION_CHROME_HTML,
             ["Qazi Faez Isa"],
             None,
             "subscription_chrome:",
@@ -409,6 +519,23 @@ def test_reconcile_judgment_quarantines_login_subscription_stubs(
     )
     assert out.quarantine is True
     assert (out.quarantine_reason or "").startswith(expected_reason_prefix)
+
+
+def test_reconcile_judgment_allows_long_body_with_incidental_chrome_crumbs():
+    det = _det()
+    det["judge_names"] = ["Qazi Faez Isa"]
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        source_url=REFERENCE_CASE_URL,
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is False
+    assert not (out.quarantine_reason or "").startswith("subscription_chrome:")
+    assert not (out.quarantine_reason or "").startswith("login_stub:")
 
 
 def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_content_exists():
@@ -529,6 +656,40 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_accepts_long_judgment_with_incidental_chrome_crumbs(db, login_source):
+    url = REFERENCE_CASE_URL
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=url,
+        content=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        url=url,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 101"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Chrome crumbs must not block a real judgment",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+    assert judgment is not None
+    assert "The appellant was convicted" in (judgment.full_text or "")
 
 
 async def test_promotion_quarantines_empty_citation_name_login_check_chrome(db, login_source):
