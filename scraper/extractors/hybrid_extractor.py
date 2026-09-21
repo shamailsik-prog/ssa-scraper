@@ -150,6 +150,8 @@ class HybridExtractor:
         started = time.monotonic()
         det_conf = float(deterministic.get("extractor_confidence") or 0.0)
         engine, mode = self.permitted_engine()
+        if deterministic_only:
+            engine, mode = None, "ai_skipped"
         ai_json: Optional[Dict[str, Any]] = None
         ai_result: Optional[EngineResult] = None
         ai_status = mode if engine is None else "pending"

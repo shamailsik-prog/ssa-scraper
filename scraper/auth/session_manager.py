@@ -23,6 +23,7 @@ import html
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol
@@ -177,15 +178,10 @@ class SessionManager:
         if wanted:
             for s in slots:
                 if s.slot_number == wanted and s.state == "ACTIVE":
-                    if cfg.get("current_slot_reason") and "needs human login" in str(cfg.get("current_slot_reason")).lower():
-                        cfg["current_slot_reason"] = None
-                        self.source.config_json = cfg
                     return s
         for s in slots:
             if s.state == "ACTIVE":
                 cfg["current_slot"] = s.slot_number
-                if cfg.get("current_slot_reason") and "needs human login" in str(cfg.get("current_slot_reason")).lower():
-                    cfg["current_slot_reason"] = None
                 self.source.config_json = cfg
                 return s
         return None
@@ -299,12 +295,6 @@ class SessionManager:
         s = await self.slot(slot_number)
         s.last_used_at = datetime.now(timezone.utc)
         s.last_verified_at = s.last_used_at
-        cfg = dict(self.source.config_json or {})
-        if cfg.get("current_slot") == slot_number and cfg.get("current_slot_reason"):
-            reason = str(cfg.get("current_slot_reason") or "")
-            if "needs human login" in reason.lower():
-                cfg["current_slot_reason"] = None
-                self.source.config_json = cfg
         await self.db.flush()
 
 
@@ -574,7 +564,7 @@ class PlaywrightBrowser:
                         {"maxRows": max_rows, "startRow": safe_start_row},
                     )
                 ),
-                timeout=max(15.0, float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0),
+                timeout=max(8.0, float(getattr(settings, "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS", 20) or 20)),
             )
         except asyncio.TimeoutError as exc:
             elapsed = (datetime.now(timezone.utc) - started).total_seconds()
@@ -711,80 +701,59 @@ class PlaywrightBrowser:
             }
         return await self._wrap(self._page.content()), {}
 
-    async def _capture_case_description_text(self) -> Optional[Dict[str, Any]]:
-        """Extract expanded Case Description body text when detail pages render shell + modal."""
-        try:
-            payload = await self._wrap(
-                self._page.evaluate(
-                    """async () => {
-                        const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
-                        const pickTrigger = () => {
-                            const nodes = Array.from(document.querySelectorAll("a,button,input[type='button'],input[type='submit']"));
-                            return nodes.find((node) => /case\\s*description/i.test(normalize(node.innerText || node.textContent || node.value || "")));
-                        };
-                        const trigger = pickTrigger();
-                        if (trigger) {
-                            try {
-                                trigger.click();
-                                await new Promise((resolve) => setTimeout(resolve, 150));
-                            } catch (_err) {
-                                // Continue best-effort extraction from already-rendered content.
-                            }
-                        }
-                        const candidates = [];
-                        const addCandidate = (label, node) => {
-                            if (!node) return;
-                            const text = normalize(node.innerText || node.textContent || "");
-                            if (text.length >= 300) {
-                                candidates.push({ label, text });
-                            }
-                        };
-                        const selectors = [
-                            "#CaseDescription",
-                            "#caseDescription",
-                            ".case-description",
-                            ".caseDescription",
-                            "[id*='CaseDescription']",
-                            ".modal.show .modal-body",
-                            ".modal-body",
-                            "#case_details",
-                            ".case-details",
-                            ".judgment-body",
-                            ".judgment-text"
-                        ];
-                        for (const selector of selectors) {
-                            const nodes = document.querySelectorAll(selector);
-                            nodes.forEach((node, idx) => addCandidate(`${selector}[${idx}]`, node));
-                        }
-                        const rows = document.querySelectorAll("tr");
-                        rows.forEach((row, idx) => {
-                            const heading = normalize((row.querySelector("th,td") || {}).innerText || "");
-                            if (/case\\s*description/i.test(heading)) {
-                                addCandidate(`table-row:${idx}`, row);
-                            }
-                        });
-                        if (!candidates.length) return null;
-                        candidates.sort((a, b) => b.text.length - a.text.length);
-                        return candidates[0];
-                    }"""
-                )
+    async def _capture_case_description_modal(self) -> Dict[str, Any]:
+        return await self._wrap(
+            self._page.evaluate(
+                """async () => {
+                const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                const trigger = document.querySelector(
+                    'input.caseDescription[value="Case Description"], input.caseDescription'
+                );
+                if (!trigger) {
+                    return {
+                        case_description_selector_found: false,
+                        case_description_modal_found: false,
+                        case_description_modal_text: null,
+                        case_description_modal_text_length: 0,
+                    };
+                }
+                try {
+                    if (trigger.scrollIntoView) {
+                        trigger.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    }
+                } catch (_scrollError) {}
+                try {
+                    trigger.click();
+                } catch (_clickError) {
+                    try {
+                        trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    } catch (_dispatchError) {}
+                }
+                let modal = null;
+                let text = '';
+                for (let i = 0; i < 80; i += 1) {
+                    modal = document.querySelector('#ExceptionResponseScreen1');
+                    text = modal && modal.innerText ? modal.innerText.trim() : '';
+                    const hasBeforeMarker = /Before.+/i.test(text);
+                    const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
+                    if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
+                        break;
+                    }
+                    await sleep(150);
+                }
+                return {
+                    case_description_selector_found: true,
+                    case_description_modal_found: Boolean(modal),
+                    case_description_modal_text: text || null,
+                    case_description_modal_text_length: text.length,
+                };
+            }"""
             )
-        except Exception:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        text = str(payload.get("text") or "").strip()
-        if len(text) < 300:
-            return None
-        child_hash = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
-        return {
-            "text": text,
-            "selector": str(payload.get("label") or ""),
-            "child_hash": child_hash,
-        }
+        )
 
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
+        capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
         resp = await self._wrap(
             self._page.goto(
                 url,
@@ -793,32 +762,34 @@ class PlaywrightBrowser:
             )
         )
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
-        case_payload = None
-        if "ReferenceCaseLawSearch" in (self._page.url or ""):
-            case_payload = await self._capture_case_description_text()
-            if case_payload is not None:
-                snippet = (
-                    '<section id="pls-case-description" data-child-hash="'
-                    + html.escape(case_payload["child_hash"], quote=True)
-                    + '"><h2>Case Description</h2><pre>'
-                    + html.escape(case_payload["text"])
-                    + "</pre></section>"
+        if capture_case_description_modal:
+            try:
+                modal_meta = await self._capture_case_description_modal()
+                metadata.update(modal_meta or {})
+            except Exception as exc:
+                logger.warning(
+                    "caseDescription modal capture failed slot=%s url=%s: %s",
+                    self.slot_number,
+                    self._page.url if self._page else url,
+                    exc,
                 )
-                if "</body>" in html_text:
-                    html_text = html_text.replace("</body>", snippet + "</body>", 1)
-                else:
-                    html_text += snippet
-                metadata.update(
-                    {
-                        "case_description_selector": case_payload.get("selector"),
-                        "case_description_chars": len(case_payload["text"]),
-                        "child_hash": case_payload["child_hash"],
-                        "case_description_text": case_payload["text"],
-                    }
-                )
+                metadata["case_description_modal_error"] = str(exc)[:500]
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
-        return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)
+        requested_url = url
+        final_url = self._page.url
+        metadata["requested_url"] = requested_url
+        metadata["final_url"] = final_url
+        has_case_content = bool(re.search(r"Citation\s*Name\s*:", html_text or "", flags=re.IGNORECASE))
+        requested_reference_path = bool(re.search(r"ReferenceCaseLawSearch", requested_url or "", flags=re.IGNORECASE))
+        rewrite_login_check = (
+            bool(re.search(r"/login/check(?:[/?#]|$)", final_url or "", flags=re.IGNORECASE))
+            and (requested_reference_path or has_case_content)
+        )
+        result_url = requested_url if rewrite_login_check else final_url
+        if rewrite_login_check:
+            metadata["url_rewritten_from_login_check"] = True
+        return PageResult(url=result_url, html=html_text, status=status, content_type=ctype, metadata=metadata)
 
     async def _wait_for_post_submit_navigation(self, trigger) -> None:
         from playwright.async_api import TimeoutError as PWTimeoutError

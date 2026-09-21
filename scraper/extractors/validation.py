@@ -22,6 +22,7 @@ from scraper.parsers.citation_extractor import extract_citations, normalise_cita
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
 MANDATORY_STATUTE_FIELDS = ("statute_name", "sections")
 MANDATORY_INSTRUMENT_FIELDS = ("type", "full_text")
+JUDGE_NAME_CHROME_RE = re.compile(r"(?i)(obtaining\s+subscription|update\s+subscriber|^\s*read\s*$)")
 
 
 @dataclass
@@ -71,6 +72,27 @@ def mandatory_present(data: Dict[str, Any], fields: Tuple[str, ...]) -> bool:
         if v is None or v == "" or v == []:
             return False
     return True
+
+
+def _is_judge_chrome_noise(name: str) -> bool:
+    return bool(JUDGE_NAME_CHROME_RE.search(name or ""))
+
+
+def _clean_judge_names(names: List[Any]) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for value in names or []:
+        normalized = normalise_judge_name(str(value))
+        if not normalized:
+            continue
+        if _is_judge_chrome_noise(normalized):
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    return cleaned
 
 
 # --------------------------------------------------------------------------- judgment
@@ -171,15 +193,17 @@ def reconcile_judgment(
     out["year"] = year
 
     # judges / bench
-    judges = list(out.get("judge_names") or [])
+    judges = _clean_judge_names(list(out.get("judge_names") or []))
     if ai and ai.get("judge_names") and not judges:
         for j in ai["judge_names"]:
             nj = normalise_judge_name(str(j))
+            if _is_judge_chrome_noise(nj):
+                continue
             if nj and _norm_ws(nj.split()[-1]) in _norm_ws(raw_text[:20000]):
                 judges.append(nj)
             else:
                 conflicts.append({"field": "judge_names", "ai": j, "reason": "not in source evidence"})
-    out["judge_names"] = judges
+    out["judge_names"] = _clean_judge_names(judges)
     bench_size = out.get("bench_size")
     if judges and bench_size is not None and bench_size != len(judges):
         explicit = (out.get("field_evidence") or {}).get("bench_size", "")

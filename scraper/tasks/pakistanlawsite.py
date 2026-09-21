@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,10 +41,11 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.extractors.judgment_guards import detect_headnotes_only, extract_before_jj_judge_names
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
-from scraper.models import CrawlCoverage, CrawlFrontier, ScraperSource, StatuteSection, Statute
+from scraper.models import Citation, CrawlCoverage, CrawlFrontier, Judgment, ScraperSource, StatuteSection, Statute
 from scraper.notify import notify
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
@@ -84,7 +86,8 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
                 db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=1, query_key=key, query_json={"reporter": rep, "year": year}, cursor_json={"page_no": 1}, priority=10 + (current_year - year)))
                 counts["tier1"] += 1
             if (rep, year) not in coverage:
-                db.add(CrawlCoverage(source_name=SOURCE_NAME, reporter=rep, year=year))
+                db.add(CrawlCoverage(source_name=SOURCE_NAME, reporter=rep, year=year)
+)
         key4 = f"t4:{rep}:{current_year}"
         if (4, key4) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key4, query_json={"reporter": rep, "year": current_year, "daily": True}, cursor_json={"page": 1}, priority=1, next_run_at=now))
@@ -166,7 +169,7 @@ class PakistanLawSitePipeline:
         self.job_id = job_id
         self.sleep = sleep
         self._session_lock: Optional[SessionLock] = None
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
 
@@ -242,6 +245,34 @@ class PakistanLawSitePipeline:
         normalized["result_layout"] = layout
         return normalized
 
+    @staticmethod
+    def _is_reference_case_surface(page: PageResult) -> bool:
+        candidates = [
+            page.url or "",
+            str((page.metadata or {}).get("requested_url") or ""),
+            str((page.metadata or {}).get("final_url") or ""),
+        ]
+        return any(re.search(r"ReferenceCaseLawSearch", value, flags=re.IGNORECASE) for value in candidates)
+
+    @classmethod
+    def _classify_document_type(
+        cls,
+        *,
+        page: PageResult,
+        selected_text: str,
+        modal_text: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        if cls._is_reference_case_surface(page):
+            selector_found = bool((page.metadata or {}).get("case_description_selector_found"))
+            if not selector_found:
+                return "headnote", "case_description_selector_missing"
+            if not (modal_text or "").strip():
+                return "headnote", "case_description_modal_empty"
+        signal = detect_headnotes_only(raw_text=selected_text, raw_html=page.html)
+        if signal is not None:
+            return "headnote", f"{signal.reason_code}:{signal.signal}"
+        return "full_judgment", None
+
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
         async def op(browser: Browser) -> PageResult:
@@ -296,11 +327,10 @@ class PakistanLawSitePipeline:
             self.stats["misses"] += 1
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
+        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
         if self.harvest_mode == "backfill":
-            max_detail = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
             scan_window = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 600) or 600)
         else:
-            max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
             scan_window = int(getattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 200) or 200)
         max_detail = max(1, max_detail)
         scan_window = max(max_detail, scan_window)
@@ -356,8 +386,6 @@ class PakistanLawSitePipeline:
         citation_candidates = {c for c in citation_candidates if c}
         full_ready_citations = set()
         if citation_candidates:
-            from scraper.models import Citation, Judgment
-
             existing_rows = (
                 await self.db.execute(
                     select(Citation.citation_string, Judgment.full_text, Judgment.judge_names)
@@ -366,9 +394,7 @@ class PakistanLawSitePipeline:
                 )
             ).all()
             for citation_string, full_text, judge_names in existing_rows:
-                body_len = len(full_text or "")
-                has_judges = bool(judge_names)
-                if body_len >= 5000 and has_judges:
+                if len(full_text or "") >= 5000 and bool(judge_names):
                     full_ready_citations.add(str(citation_string))
         logger.info(
             "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s",
@@ -387,13 +413,13 @@ class PakistanLawSitePipeline:
         url_less_skips = 0
         known_citation_skips = 0
         detail_attempts = 0
+        processed_rows_total = 0
         self.stats["citation_grid_offset"] = start_offset
         self.stats["citation_grid_snapshot_start"] = snapshot_start_row
         self.stats["citation_grid_rows_seen"] = row_count
         details_since_flush = 0
         staged_since_flush = 0
         last_committed_offset = start_offset
-        processed_rows_total = 0
 
         def next_offset_after(processed_rows: int) -> int:
             if total_rows <= 0:
@@ -442,8 +468,8 @@ class PakistanLawSitePipeline:
             citation_norm = normalise_citation(str(row.get("citation") or ""))
             if citation_norm and citation_norm in full_ready_citations:
                 known_citation_skips += 1
-                self.stats["known_citation_skips"] = self.stats.get("known_citation_skips", 0) + 1
-                if (idx + 1) == len(selected_indexes):
+                self.stats["known_citation_skips"] = known_citation_skips
+                if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
                     next_offset = next_offset_after(idx + 1)
                     await flush_citation_grid_progress(
                         next_offset,
@@ -464,8 +490,6 @@ class PakistanLawSitePipeline:
                         details_this_flush=details_since_flush,
                         processed_rows=idx,
                     )
-                    details_since_flush = 0
-                    staged_since_flush = 0
                 logger.info(
                     "PakistanLawSite citation-grid detail cap reached attempts=%s max_detail=%s processed_rows=%s known_skips=%s",
                     detail_attempts,
@@ -497,11 +521,12 @@ class PakistanLawSitePipeline:
                 continue
             if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(selected_indexes):
                 logger.info(
-                    "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s",
+                    "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s known_skips=%s",
                     idx + 1,
                     len(selected_indexes),
                     self.stats["staged"] - staged_before,
                     self.stats["duplicates"] - duplicates_before,
+                    known_citation_skips,
                 )
             route = {
                 "tier": "citation_grid",
@@ -546,12 +571,13 @@ class PakistanLawSitePipeline:
         if selected_indexes and staged_delta == 0:
             duplicate_delta = self.stats["duplicates"] - duplicates_before
             logger.warning(
-                "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s)",
+                "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s known_skips=%s)",
                 processed_rows_total or len(selected_indexes),
                 duplicate_delta,
                 url_less_skips,
+                known_citation_skips,
             )
-            if processed_rows_total and url_less_skips >= processed_rows_total:
+            if processed_rows_total and url_less_skips >= processed_rows_total and known_citation_skips == 0:
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
         next_offset = next_offset_after(processed_rows_total)
         if last_committed_offset != next_offset:
@@ -581,7 +607,8 @@ class PakistanLawSitePipeline:
 
     async def fetch_detail(self, url: str) -> PageResult:
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(url)
+            capture_case_description_modal = bool(re.search(r"ReferenceCaseLawSearch", url or "", flags=re.IGNORECASE))
+            page = await browser.goto(url, capture_case_description_modal=capture_case_description_modal)
             raise_for_verdict(page)
             return page
 
@@ -597,11 +624,7 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
         html = page.html
-        route = dict(route or {})
-        detail_identity = str(row.get("case_id") or row.get("citation") or page.url or "").strip()
-        if detail_identity:
-            html = html + f"\n<!-- pls-detail-identity:{detail_identity} -->"
-        prov = await record_provenance(
+        html_prov = await record_provenance(
             self.db,
             source=self.source,
             url=page.url,
@@ -611,36 +634,36 @@ class PakistanLawSitePipeline:
             http_status=page.status,
         )
         text = clean_html(html)
-        modal_text = str((page.metadata or {}).get("case_description_text") or "").strip()
-        child_hash = str((page.metadata or {}).get("child_hash") or "")
-        staging_prov = prov
-        if modal_text and len(modal_text) >= 300 and len(modal_text) > len(text):
-            route_with_child = {
-                **route,
-                "child": "case_description",
-                "child_hash": child_hash or None,
-                "case_description_chars": int((page.metadata or {}).get("case_description_chars") or len(modal_text)),
-            }
-            child_prov = await record_provenance(
+        modal_text = str((page.metadata or {}).get("case_description_modal_text") or "").strip()
+        if modal_text:
+            text = modal_text
+        document_type, document_type_reason = self._classify_document_type(
+            page=page,
+            selected_text=text,
+            modal_text=modal_text,
+        )
+        content_prov = html_prov
+        if modal_text and document_type == "full_judgment":
+            # Use modal body bytes as identity when they are the selected full judgment text.
+            content_prov = await record_provenance(
                 self.db,
                 source=self.source,
                 url=page.url,
                 content=modal_text.encode("utf-8"),
                 content_kind="text",
-                route=route_with_child,
+                route=route,
                 http_status=page.status,
-                parent=prov,
+                document_kind="case_description_modal",
+                parent=html_prov,
             )
-            staging_prov = child_prov
-            text = modal_text
-            route = route_with_child
+        modal_judges = extract_before_jj_judge_names(modal_text) if modal_text else []
         pdf_prov = None
         ocr = False
         if row.get("pdf_url"):
             try:
                 pdf_bytes = await self.download(row["pdf_url"])
                 if pdf_bytes[:4] == b"%PDF":
-                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=prov)
+                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=html_prov)
                     from scraper.fetchers import pdf_text_with_ocr
 
                     pdf_text, ocr = pdf_text_with_ocr(pdf_bytes)
@@ -650,7 +673,7 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
-        staging = await stage_judgment(self.db, source=self.source, prov=staging_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
@@ -660,29 +683,40 @@ class PakistanLawSitePipeline:
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
-        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=staging_prov.id, staging_id=staging.id)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=content_prov.id, staging_id=staging.id)
+        deterministic_only = self._is_reference_case_surface(page)
         outcome = await extractor.extract_judgment(
             html=html,
             text=text,
-            source_meta={
-                "citation": row.get("citation"),
-                "title": row.get("title"),
-                "court": row.get("court"),
-                "url": page.url,
-                "access_method": self.source.access_method,
-            },
-            content_hash=staging_prov.content_hash,
+            source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url},
+            content_hash=content_prov.content_hash,
+            deterministic_only=deterministic_only,
         )
+        reconciled = dict(outcome.data or {})
+        if modal_judges:
+            existing = [str(j) for j in (reconciled.get("judge_names") or []) if j]
+            seen = {name.lower() for name in existing}
+            for judge_name in modal_judges:
+                if judge_name.lower() not in seen:
+                    existing.append(judge_name)
+                    seen.add(judge_name.lower())
+            reconciled["judge_names"] = existing
+        reconciled["document_type"] = document_type
+        if document_type_reason:
+            reconciled["document_type_reason"] = document_type_reason
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
-        staging.reconciled_json = _slim(outcome.data)
+        staging.reconciled_json = _slim(reconciled)
         staging.extraction_engine = outcome.engine
         staging.confidence_score = outcome.confidence
-        staging.validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
-        staging.extracted_citation = (outcome.data.get("citations") or [None])[0]
-        staging.extracted_title = outcome.data.get("case_title")
-        staging.extracted_court = outcome.data.get("court")
-        staging.extracted_year = outcome.data.get("year")
+        validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
+        if document_type == "headnote":
+            validation_errors.append("headnote_only: not eligible for full_judgment promotion")
+        staging.validation_errors = validation_errors
+        staging.extracted_citation = (reconciled.get("citations") or [None])[0]
+        staging.extracted_title = reconciled.get("case_title")
+        staging.extracted_court = reconciled.get("court")
+        staging.extracted_year = reconciled.get("year")
         staging.status = "quarantined" if outcome.quarantine else "extracted"
         staging.quarantine_reason = outcome.quarantine_reason
         await self.db.flush()

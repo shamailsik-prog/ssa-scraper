@@ -25,6 +25,7 @@ from scraper.harvest_mode import (
     source_backfill_priority,
     source_selected_for_mode,
 )
+from scraper.auth.session_manager import SessionLockHeld
 from scraper.models import ScraperJob, ScraperSource
 from scraper.notify import notify
 
@@ -83,6 +84,12 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
             job.pages_scraped = int(stats.get("pages", stats.get("fetched", 0)) or 0)
             job.records_extracted = int(stats.get("staged", 0) or 0)
             job.records_quarantined = int(stats.get("quarantined", 0) or 0)
+        except SessionLockHeld as exc:
+            job.status = "done"
+            job.error_message = None
+            stats = {"skipped": "login_session_lock_held", "pages": 0, "staged": 0}
+            job.result_summary = stats
+            logger.info("%s already has an active login-session worker; skipped duplicate job", source_name)
         except Exception as exc:
             job.status = "failed"
             job.error_message = str(exc)[:4000]
@@ -152,6 +159,18 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             if not due:
                 continue
             if s.access_method == "login_session":
+                running = (
+                    await db.execute(
+                        select(ScraperJob.id).where(
+                            ScraperJob.source_name == s.source_name,
+                            ScraperJob.job_type == "scrape",
+                            ScraperJob.status == "running",
+                        )
+                    )
+                ).first()
+                if running is not None:
+                    logger.info("skip enqueue %s: a login-session scrape job is already running", s.source_name)
+                    continue
                 app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")

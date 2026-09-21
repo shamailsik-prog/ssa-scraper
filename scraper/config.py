@@ -181,7 +181,8 @@ class Settings(BaseSettings):
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
     PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=200, description="Maximum rows to materialize from #archivedpatientGrid when compacting CitationSearch HTML (keep low — full DOM walks hang).")
-    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=40, description="Max detail pages to fetch per citation-grid login_session run.")
+    PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots so CitationSearch cannot hold the login lock for a full Playwright navigation timeout.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Max detail pages to fetch per citation-grid login_session run.")
     PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Rows scanned per citation-grid run (can exceed detail fetch cap; known rows are fast-forwarded).")
     BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Backfill-mode max detail pages per citation-grid run.")
     BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill-mode rows scanned per citation-grid run.")
@@ -321,6 +322,7 @@ class Settings(BaseSettings):
         "PLAYWRIGHT_MAX_HTML_BYTES",
         "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
         "PLS_ARCHIVED_GRID_MAX_ROWS",
+        "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS",
         "PLS_CITATION_GRID_MAX_DETAIL",
         "PLS_CITATION_GRID_SCAN_WINDOW",
         "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL",
@@ -427,6 +429,8 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
+        if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS must be positive")
         if self.PLS_CITATION_GRID_MAX_DETAIL <= 0:
             raise ValueError("PLS_CITATION_GRID_MAX_DETAIL must be positive")
         if self.PLS_CITATION_GRID_SCAN_WINDOW <= 0:

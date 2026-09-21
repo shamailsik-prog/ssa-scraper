@@ -5,6 +5,7 @@ __pycache__/
 live/
 raw/
 state/
+archive-export/
 blackletter_state/
 *.log
 .venv/

@@ -27,6 +27,7 @@ def test_health_and_dashboard(client):
     assert d.status_code == 200
     # Dashboard smoke signals should assert visible operator features, not stale section names.
     assert "SIKANDER AI — Corpus Console" in d.text
+    assert "Overview" in d.text
     assert "Corpus viewer" in d.text and "Browse and search" in d.text
     assert "Record detail — full saved text" in d.text and "Admin key" in d.text
     for secret in ("test-admin-key", settings.ENCRYPTION_KEY, "readerpw", "writerpw"):
