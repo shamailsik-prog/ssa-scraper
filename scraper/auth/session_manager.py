@@ -731,13 +731,15 @@ class PlaywrightBrowser:
                 }
                 let modal = null;
                 let text = '';
-                for (let i = 0; i < 35; i += 1) {
+                for (let i = 0; i < 80; i += 1) {
                     modal = document.querySelector('#ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
-                    if (text.length > 0) {
+                    const hasBeforeMarker = /Before.+/i.test(text);
+                    const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
+                    if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
                         break;
                     }
-                    await sleep(120);
+                    await sleep(150);
                 }
                 return {
                     case_description_selector_found: true,
