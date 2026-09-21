@@ -137,10 +137,21 @@ class HybridExtractor:
         return self._court_directory
 
     # ------------------------------------------------------------------ core
-    async def _run(self, extraction_type: str, inp: ExtractionInput, deterministic: Dict[str, Any], mandatory, reconcile) -> ExtractionOutcome:
+    async def _run(
+        self,
+        extraction_type: str,
+        inp: ExtractionInput,
+        deterministic: Dict[str, Any],
+        mandatory,
+        reconcile,
+        *,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         started = time.monotonic()
         det_conf = float(deterministic.get("extractor_confidence") or 0.0)
         engine, mode = self.permitted_engine()
+        if deterministic_only:
+            engine, mode = None, "ai_skipped"
         ai_json: Optional[Dict[str, Any]] = None
         ai_result: Optional[EngineResult] = None
         ai_status = mode if engine is None else "pending"
@@ -241,7 +252,15 @@ class HybridExtractor:
             source_meta=dict(source_meta or {}),
         )
 
-    async def extract_judgment(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
+    async def extract_judgment(
+        self,
+        *,
+        html=None,
+        text=None,
+        source_meta=None,
+        content_hash=None,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         from scraper.parsers.text_cleaner import clean_html
 
         raw_text = text or (clean_html(html) if html else "")
@@ -253,7 +272,16 @@ class HybridExtractor:
             inp,
             deterministic,
             MANDATORY_JUDGMENT_FIELDS,
-            lambda d, a: reconcile_judgment(deterministic=d, ai=a, raw_text=raw_text, court_directory=directory, min_confidence=self.min_confidence),
+            lambda d, a: reconcile_judgment(
+                deterministic=d,
+                ai=a,
+                raw_text=raw_text,
+                source_url=(source_meta or {}).get("url"),
+                raw_html=html,
+                court_directory=directory,
+                min_confidence=self.min_confidence,
+            ),
+            deterministic_only=deterministic_only,
         )
 
     async def extract_statute(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:

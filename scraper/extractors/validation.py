@@ -14,6 +14,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from scraper.extractors.deterministic import date_in_text
+from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
@@ -21,6 +22,7 @@ from scraper.parsers.citation_extractor import extract_citations, normalise_cita
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
 MANDATORY_STATUTE_FIELDS = ("statute_name", "sections")
 MANDATORY_INSTRUMENT_FIELDS = ("type", "full_text")
+JUDGE_NAME_CHROME_RE = re.compile(r"(?i)(obtaining\s+subscription|update\s+subscriber|^\s*read\s*$)")
 
 
 @dataclass
@@ -72,12 +74,35 @@ def mandatory_present(data: Dict[str, Any], fields: Tuple[str, ...]) -> bool:
     return True
 
 
+def _is_judge_chrome_noise(name: str) -> bool:
+    return bool(JUDGE_NAME_CHROME_RE.search(name or ""))
+
+
+def _clean_judge_names(names: List[Any]) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for value in names or []:
+        normalized = normalise_judge_name(str(value))
+        if not normalized:
+            continue
+        if _is_judge_chrome_noise(normalized):
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    return cleaned
+
+
 # --------------------------------------------------------------------------- judgment
 def reconcile_judgment(
     *,
     deterministic: Dict[str, Any],
     ai: Optional[Dict[str, Any]],
     raw_text: str,
+    source_url: Optional[str] = None,
+    raw_html: Optional[str] = None,
     court_directory: Dict[str, str],
     min_confidence: float,
 ) -> ValidationOutcome:
@@ -166,15 +191,17 @@ def reconcile_judgment(
     out["year"] = year
 
     # judges / bench
-    judges = list(out.get("judge_names") or [])
+    judges = _clean_judge_names(list(out.get("judge_names") or []))
     if ai and ai.get("judge_names") and not judges:
         for j in ai["judge_names"]:
             nj = normalise_judge_name(str(j))
+            if _is_judge_chrome_noise(nj):
+                continue
             if nj and _norm_ws(nj.split()[-1]) in _norm_ws(raw_text[:20000]):
                 judges.append(nj)
             else:
                 conflicts.append({"field": "judge_names", "ai": j, "reason": "not in source evidence"})
-    out["judge_names"] = judges
+    out["judge_names"] = _clean_judge_names(judges)
     bench_size = out.get("bench_size")
     if judges and bench_size is not None and bench_size != len(judges):
         explicit = (out.get("field_evidence") or {}).get("bench_size", "")
@@ -188,6 +215,14 @@ def reconcile_judgment(
     out["bench_size"] = bench_size
     if deterministic.get("_bench_conflict"):
         errors.append(deterministic["_bench_conflict"])
+    stub_signal = detect_judgment_stub(
+        source_url=source_url,
+        raw_text=raw_text,
+        raw_html=raw_html,
+        judge_names=out.get("judge_names"),
+    )
+    if stub_signal is not None:
+        errors.append(guard_reason(stub_signal))
 
     # case title must be supported by heading / result row
     title = out.get("case_title")
@@ -251,10 +286,18 @@ def reconcile_judgment(
         conf = min(conf, 0.4)
     conf = max(0.0, min(1.0, round(conf, 3)))
     out["extractor_confidence"] = conf
-    quarantine = conf < min_confidence or not out["citations"] or not out.get("court") or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
+    quarantine = (
+        stub_signal is not None
+        or conf < min_confidence
+        or not out["citations"]
+        or not out.get("court")
+        or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
+    )
     reason = None
     if quarantine:
-        if not out["citations"]:
+        if stub_signal is not None:
+            reason = guard_reason(stub_signal)
+        elif not out["citations"]:
             reason = "no citation supported by source"
         elif not out.get("court"):
             reason = "court unknown"

@@ -26,7 +26,7 @@ from scraper.parsers.citation_extractor import (
     normalise_citation,
     score_confidence,
 )
-from scraper.parsers.statute_parser import detect_statute_name, split_into_sections
+from scraper.parsers.statute_parser import detect_statute_name, prefer_official_statute_title, split_into_sections
 from scraper.parsers.text_cleaner import clean_html
 
 DETERMINISTIC_VERSION = "det-1.0"
@@ -231,7 +231,9 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     source_meta = source_meta or {}
     body = html or text or ""
     raw_text = text or (clean_html(html) if html else "")
-    name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
+    detected_name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
+    official_title = source_meta.get("act_title") or source_meta.get("detail_title")
+    name = prefer_official_statute_title(detected_name, official_title)
     sections = split_into_sections(body, name)
     evidence: Dict[str, str] = {}
     if name:

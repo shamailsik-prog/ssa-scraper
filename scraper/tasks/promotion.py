@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
+from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
@@ -107,6 +108,56 @@ async def _ensure_judges(db: AsyncSession, names, court: Optional[Court]) -> Non
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
+    document_type = str(data.get("document_type") or "").strip().lower()
+    if document_type == "headnote":
+        await _quarantine(
+            db,
+            st,
+            "headnote_only: document_type=headnote is not eligible for full_judgment promotion",
+            "judgment",
+            {
+                "document_type": data.get("document_type"),
+                "document_type_reason": data.get("document_type_reason"),
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
+    if st.source_name == "PakistanLawSite":
+        headnote_signal = detect_headnotes_only(raw_text=st.raw_text, raw_html=st.raw_html)
+        if headnote_signal is not None and headnote_signal.signal == "notes_on_cases_only":
+            await _quarantine(
+                db,
+                st,
+                guard_reason(headnote_signal),
+                "judgment",
+                {
+                    "reason_code": headnote_signal.reason_code,
+                    "signal": headnote_signal.signal,
+                    "matched_value": headnote_signal.matched_value,
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+    stub_signal = detect_judgment_stub(
+        source_url=st.source_url or data.get("source_url"),
+        raw_text=st.raw_text,
+        raw_html=st.raw_html,
+        judge_names=data.get("judge_names"),
+    )
+    if stub_signal is not None:
+        await _quarantine(
+            db,
+            st,
+            guard_reason(stub_signal),
+            "judgment",
+            {
+                "reason_code": stub_signal.reason_code,
+                "signal": stub_signal.signal,
+                "matched_value": stub_signal.matched_value,
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
     if st.status == "quarantined" and not force:
         await _quarantine(db, st, st.quarantine_reason or "below confidence threshold", "judgment")
         return "quarantined"
@@ -122,6 +173,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         return "quarantined"
     canonical = cits[0]
     prov = (await db.execute(select(SourceProvenance).where(SourceProvenance.id == st.provenance_id))).scalars().first()
+    court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
+    dd = data.get("decision_date")
+    decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
+    parts = _parse_citation_parts(canonical)
     # dedupe by identity and by content
     existing = (await db.execute(select(Judgment).where((Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)))).scalars().first()
     if existing is None:
@@ -132,6 +187,82 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 await _quarantine(db, st, f"citation {alt.citation_string} already belongs to judgment {existing.canonical_citation}", "judgment", {"conflict_with": str(existing.id)})
                 return "quarantined"
     if existing is not None:
+        existing_headnote_signal = detect_headnotes_only(raw_text=existing.full_text or "", raw_html=None)
+        should_upgrade_existing = (
+            st.source_name == "PakistanLawSite"
+            and (existing.source_name or "") == "PakistanLawSite"
+            and existing.canonical_citation == canonical
+            and existing.full_text_hash != text_hash
+            and existing_headnote_signal is not None
+            and existing_headnote_signal.signal == "notes_on_cases_only"
+        )
+        if should_upgrade_existing:
+            existing.case_title = (data.get("case_title") or existing.case_title)
+            existing.court_id = court.id if court else existing.court_id
+            existing.court_name = court.name if court else (data.get("court") or existing.court_name)
+            existing.judge_names = data.get("judge_names") or existing.judge_names
+            existing.bench_size = data.get("bench_size")
+            existing.bench_type = data.get("bench_type")
+            existing.decision_date = decision_date
+            existing.year = data.get("year") or parts["year"] or existing.year
+            existing.reporter = parts["reporter"] or existing.reporter
+            existing.page_number = parts["page"] or existing.page_number
+            existing.full_text = full_text
+            existing.full_text_hash = text_hash
+            existing.headnotes = data.get("headnotes")
+            if data.get("statutes_cited") is not None:
+                existing.statutes_cited = data.get("statutes_cited")
+            if data.get("citations_cited") is not None:
+                existing.citations_cited = data.get("citations_cited")
+            existing.access_method = st.access_method
+            existing.source_name = st.source_name
+            existing.source_url = st.source_url
+            existing.source_provenance_id = st.provenance_id
+            existing.original_document_id = st.pdf_provenance_id
+            existing.has_original_pdf = st.pdf_provenance_id is not None
+            existing.confidence_score = st.confidence_score or existing.confidence_score
+            existing.extraction_engine = st.extraction_engine
+            if prov is not None:
+                prov.promoted_table = "judgment"
+                prov.promoted_id = existing.id
+                routes = list(prov.routes or [])
+                if st.route_json and st.route_json not in routes:
+                    routes.append(st.route_json)
+                    prov.routes = routes
+            known = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == existing.id))).scalars().all()}
+            for c in cits:
+                if c not in known:
+                    taken = (await db.execute(select(Citation).where(Citation.citation_string == c))).scalars().first()
+                    if taken is None:
+                        part = _parse_citation_parts(c)
+                        db.add(Citation(judgment_id=existing.id, citation_string=c, raw_string=c, reporter=part["reporter"], year=part["year"], page=part["page"], is_primary=False, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
+            await _ensure_judges(db, data.get("judge_names"), court)
+            st.status = "promoted"
+            st.promoted_to_id = existing.id
+            queue = (
+                await db.execute(
+                    select(EmbeddingQueue).where(
+                        EmbeddingQueue.table_name == "judgment",
+                        EmbeddingQueue.record_id == existing.id,
+                    )
+                )
+            ).scalars().first()
+            if queue is None:
+                db.add(
+                    EmbeddingQueue(
+                        record_id=existing.id,
+                        table_name="judgment",
+                        access_method=st.access_method,
+                        embedding_model=settings.EMBEDDING_MODEL,
+                        embedding_dimensions=settings.EMBEDDING_DIM,
+                    )
+                )
+            else:
+                queue.status = "pending"
+                queue.attempts = 0
+                queue.error_message = None
+            await db.flush()
+            return "promoted"
         st.status = "duplicate"
         st.promoted_to_id = existing.id
         if prov is not None:
@@ -151,10 +282,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                     db.add(Citation(judgment_id=existing.id, citation_string=c, raw_string=c, reporter=parts["reporter"], year=parts["year"], page=parts["page"], is_primary=False, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
         await db.flush()
         return "duplicate"
-    court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
-    dd = data.get("decision_date")
-    decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
-    parts = _parse_citation_parts(canonical)
     j = Judgment(
         canonical_citation=canonical,
         case_title=(data.get("case_title") or None),

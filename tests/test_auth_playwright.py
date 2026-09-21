@@ -24,10 +24,20 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.database import SessionLocal
-from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperSource, ScraperStaging, SearchFormMap
+from scraper.models import (
+    BrowserSessionSlot,
+    CrawlCoverage,
+    CrawlFrontier,
+    Judgment,
+    Notification,
+    ScraperSource,
+    ScraperStaging,
+    SearchFormMap,
+    SourceProvenance,
+)
 from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
-from scraper.tasks.promotion import promote_staging_records
+from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
 from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
 
@@ -62,6 +72,7 @@ class _FakePage:
             "body_preview": "ok",
         }
         self.archived_grid_snapshot = None
+        self.case_description_modal_payload = None
 
     async def goto(self, url, **kwargs):
         self.calls.append(("goto", url, kwargs))
@@ -100,6 +111,8 @@ class _FakePage:
             return dict(self.dom_shape)
         if "archivedpatientGrid" in script:
             return self.archived_grid_snapshot
+        if "#ExceptionResponseScreen1" in script:
+            return self.case_description_modal_payload
         return None
 
 
@@ -148,6 +161,37 @@ def _archived_grid_html(rows):
         f"<tbody>{''.join(trs)}</tbody>"
         "</table></body></html>"
     )
+
+
+def _notes_only_detail_html(citation: str, title: str) -> str:
+    return (
+        "<html><body><a href='/logout'>Logout</a>"
+        f"<h2>Citation Name: {citation}</h2>"
+        f"<h3>{title}</h3>"
+        "<h4>Notes on Cases</h4>"
+        "<p>Important principles noted by the digest editor.</p>"
+        "</body></html>"
+    )
+
+
+def _modal_full_judgment_text(citation: str, title: str) -> str:
+    intro = [
+        citation,
+        "IN THE SUPREME COURT OF PAKISTAN",
+        "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ",
+        title,
+        "Decided on 12th March 2024",
+        "JUDGMENT",
+    ]
+    body = [
+        (
+            "The appellant challenged the conviction under section 302 of the Pakistan Penal Code, 1860. "
+            "After hearing learned counsel for both sides and examining the record in detail, the bench held "
+            "that the prosecution had failed to establish guilt beyond reasonable doubt."
+        )
+        for _ in range(80)
+    ]
+    return "\n".join(intro + body)
 
 
 # --------------------------------------------------------------------------- 16
@@ -277,9 +321,53 @@ async def test_playwright_goto_uses_domcontentloaded_without_networkidle_wait():
     result = await browser.goto("https://www.pakistanlawsite.com/Login/CitationSearch")
 
     assert result.status == 200
+    assert result.metadata["requested_url"] == "https://www.pakistanlawsite.com/Login/CitationSearch"
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/Login/CitationSearch"
     goto_call = next(c for c in page.calls if c[0] == "goto")
     assert goto_call[2]["wait_until"] == "domcontentloaded"
     assert goto_call[2]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
+
+
+async def test_playwright_goto_rewrites_login_check_to_requested_reference_case_url():
+    page = _FakePage()
+
+    async def _goto_with_redirect(url, **kwargs):
+        page.calls.append(("goto", url, kwargs))
+        page.url = "https://www.pakistanlawsite.com/login/check"
+        return SimpleNamespace(status=200, headers={"content-type": "text/html"})
+
+    page.goto = _goto_with_redirect
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    requested_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
+    result = await browser.goto(requested_url)
+
+    assert result.url == requested_url
+    assert result.metadata["requested_url"] == requested_url
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/login/check"
+    assert result.metadata["url_rewritten_from_login_check"] is True
+
+
+async def test_playwright_goto_rewrites_login_check_when_case_html_contains_citation_name():
+    page = _FakePage(html="<html><body><h2>Citation Name: PLD 2024 SC 101</h2></body></html>")
+
+    async def _goto_with_redirect(url, **kwargs):
+        page.calls.append(("goto", url, kwargs))
+        page.url = "https://www.pakistanlawsite.com/login/check"
+        return SimpleNamespace(status=200, headers={"content-type": "text/html"})
+
+    page.goto = _goto_with_redirect
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    requested_url = "https://www.pakistanlawsite.com/case/247"
+    result = await browser.goto(requested_url)
+
+    assert result.url == requested_url
+    assert result.metadata["requested_url"] == requested_url
+    assert result.metadata["final_url"] == "https://www.pakistanlawsite.com/login/check"
+    assert result.metadata["url_rewritten_from_login_check"] is True
 
 
 async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_grid():
@@ -358,6 +446,55 @@ async def test_playwright_goto_passes_archived_grid_start_row_to_compact_snapsho
     assert result.metadata["start_row"] == 200
     assert result.metadata["requested_start_row"] == 200
     assert result.metadata["total_rows"] == 20567
+
+
+async def test_playwright_goto_captures_case_description_modal_text_when_requested():
+    page = _FakePage(html="<html><body>detail</body></html>")
+    page.case_description_modal_payload = {
+        "case_description_selector_found": True,
+        "case_description_modal_found": True,
+        "case_description_modal_text": "Before Justice A and Justice B, JJ\nFull text here",
+        "case_description_modal_text_length": 52,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    result = await browser.goto(
+        "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K247",
+        capture_case_description_modal=True,
+    )
+
+    assert result.metadata["case_description_selector_found"] is True
+    assert result.metadata["case_description_modal_found"] is True
+    assert result.metadata["case_description_modal_text"].startswith("Before Justice A")
+
+
+async def test_capture_case_description_modal_waits_for_full_text_ready_markers():
+    page = _FakePage(html="<html><body>detail</body></html>")
+    page.case_description_modal_payload = {
+        "case_description_selector_found": True,
+        "case_description_modal_found": True,
+        "case_description_modal_text": "modal shell only",
+        "case_description_modal_text_length": 251,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    meta = await browser._capture_case_description_modal()
+
+    assert set(meta) == {
+        "case_description_selector_found",
+        "case_description_modal_found",
+        "case_description_modal_text",
+        "case_description_modal_text_length",
+    }
+    modal_eval_call = next(call for call in page.calls if call[0] == "evaluate" and "#ExceptionResponseScreen1" in call[1])
+    script = modal_eval_call[1]
+    assert "for (let i = 0; i < 80; i += 1)" in script
+    assert "await sleep(150)" in script
+    assert "text.length >= 2000" in script
+    assert "/Before.+/i.test(text)" in script
+    assert "/CLC|SCMR|PLD/i.test(text)" in script
 
 
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
@@ -780,6 +917,149 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     assert stats["staged"] == 1
     assert stats["url_less_skips"] == 0
     assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
+
+
+async def test_pipeline_uses_case_description_modal_text_and_pins_deterministic_extraction(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    citation = "PLD 2024 SC 777"
+    title = "Modal versus Headnote"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K777&&court= &&Row=0 &&bookName=undefined"
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        _archived_grid_html([(citation, title, "Supreme Court", detail_url)]),
+    )
+    sc.routes[("goto", detail_url)] = lambda _browser: PageResult(
+        url=detail_url,
+        html=_notes_only_detail_html(citation, title),
+        status=200,
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_found": True,
+            "case_description_modal_text": _modal_full_judgment_text(citation, title),
+            "case_description_modal_text_length": 32000,
+        },
+    )
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["staged"] == 1
+    staging = (await db.execute(select(ScraperStaging))).scalars().first()
+    assert staging is not None
+    assert staging.extraction_engine == "deterministic"
+    assert (staging.reconciled_json or {}).get("document_type") == "full_judgment"
+    assert "Qazi Faez Isa" in ((staging.reconciled_json or {}).get("judge_names") or [])
+    assert "Notes on Cases" not in (staging.raw_text or "")[:200]
+
+
+async def test_pipeline_marks_notes_only_reference_case_as_headnote_and_promotion_quarantines(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    citation = "PLD 2024 SC 778"
+    title = "Notes Only Case"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K778&&court= &&Row=0 &&bookName=undefined"
+    sc = BrowserScript()
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        _archived_grid_html([(citation, title, "Supreme Court", detail_url)]),
+    )
+    sc.routes[("goto", detail_url)] = lambda _browser: PageResult(
+        url=detail_url,
+        html=_notes_only_detail_html(citation, title),
+        status=200,
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": False,
+            "case_description_modal_found": False,
+            "case_description_modal_text": None,
+            "case_description_modal_text_length": 0,
+        },
+    )
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["staged"] == 1
+    staging = (await db.execute(select(ScraperStaging))).scalars().first()
+    assert staging is not None
+    assert (staging.reconciled_json or {}).get("document_type") == "headnote"
+    assert await promote_judgment_staging(db, staging) == "quarantined"
+
+
+async def test_preserve_and_extract_uses_modal_text_identity_to_upgrade_headnote_html_duplicate(db, login_source):
+    await _activate(db, login_source)
+    citation = "PLD 2024 SC 901"
+    title = "Upgrade from modal body"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K901&&court= &&Row=0 &&bookName=undefined"
+    page_html = _notes_only_detail_html(citation, title)
+    modal_text = _modal_full_judgment_text(citation, title)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    row = {"citation": citation, "title": title, "court": "Supreme Court", "detail_url": detail_url}
+
+    first = await pipeline.preserve_and_extract(
+        PageResult(
+            url=detail_url,
+            html=page_html,
+            metadata={
+                "requested_url": detail_url,
+                "final_url": detail_url,
+                "case_description_selector_found": False,
+                "case_description_modal_found": False,
+                "case_description_modal_text": None,
+                "case_description_modal_text_length": 0,
+            },
+        ),
+        {"tier": 4, "row_index": 0},
+        row,
+    )
+    second = await pipeline.preserve_and_extract(
+        PageResult(
+            url=detail_url,
+            html=page_html,
+            metadata={
+                "requested_url": detail_url,
+                "final_url": detail_url,
+                "case_description_selector_found": True,
+                "case_description_modal_found": True,
+                "case_description_modal_text": modal_text,
+                "case_description_modal_text_length": len(modal_text),
+            },
+        ),
+        {"tier": 4, "row_index": 1},
+        row,
+    )
+
+    assert first == "staged"
+    assert second == "staged"
+    rows = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.asc()))).scalars().all()
+    assert len(rows) == 2
+    headnote_row = next(r for r in rows if (r.reconciled_json or {}).get("document_type") == "headnote")
+    full_row = next(r for r in rows if (r.reconciled_json or {}).get("document_type") == "full_judgment")
+    assert headnote_row.content_hash != full_row.content_hash
+    assert "Notes on Cases" in (headnote_row.raw_text or "")
+    assert "Notes on Cases" not in (full_row.raw_text or "")[:200]
+    assert "Qazi Faez Isa" in ((full_row.reconciled_json or {}).get("judge_names") or [])
+    headnote_prov = (
+        await db.execute(select(SourceProvenance).where(SourceProvenance.id == headnote_row.provenance_id))
+    ).scalars().first()
+    modal_prov = (
+        await db.execute(select(SourceProvenance).where(SourceProvenance.id == full_row.provenance_id))
+    ).scalars().first()
+    assert headnote_prov is not None and modal_prov is not None
+    assert modal_prov.parent_id == headnote_prov.id
+    assert modal_prov.document_kind == "case_description_modal"
+    assert modal_prov.content_kind == "text"
 
 
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):

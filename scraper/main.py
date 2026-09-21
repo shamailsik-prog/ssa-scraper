@@ -19,7 +19,7 @@ from sqlalchemy import func, select, text
 from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
 from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
-from scraper.routers import archive, coverage, export, jobs, review, scrapegraph, search, sessions, sources
+from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("scraper.main")
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.PROJECT_NAME, version="D-15", lifespan=lifespan, docs_url="/docs" if settings.DEBUG else None, redoc_url=None)
-for r in (sources, coverage, review, export, sessions, archive, scrapegraph, jobs, search):
+for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search):
     app.include_router(r.router)
 
 
@@ -60,6 +60,8 @@ async def health() -> Dict[str, Any]:
         "login_scraping_permitted": settings.login_scraping_effective,
         "startup": STARTUP_STATE,
         "not_configured": settings.not_configured(),
+        # Firm LLM keys in not_configured are optional enrichment; they do not block scrape.
+        "not_configured_note": "SGAI_*/OPENAI_API_KEY NOT CONFIGURED = optional enrichment only; deterministic harvest continues.",
     }
     try:
         async with SessionLocal() as db:
