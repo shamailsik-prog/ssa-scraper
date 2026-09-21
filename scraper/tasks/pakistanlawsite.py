@@ -41,7 +41,11 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.extractors.judgment_guards import detect_headnotes_only, extract_before_jj_judge_names
+from scraper.extractors.judgment_guards import (
+    detect_headnotes_only,
+    extract_before_jj_judge_names,
+    strip_leading_judgment_chrome,
+)
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -558,7 +562,7 @@ class PakistanLawSitePipeline:
             http_status=page.status,
         )
         text = clean_html(html)
-        modal_text = str((page.metadata or {}).get("case_description_modal_text") or "").strip()
+        modal_text = strip_leading_judgment_chrome((page.metadata or {}).get("case_description_modal_text"))
         if modal_text:
             text = modal_text
         document_type, document_type_reason = self._classify_document_type(
@@ -597,6 +601,7 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
+        text = strip_leading_judgment_chrome(text)
         staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
