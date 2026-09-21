@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from scraper.parsers.bench_parser import normalise_judge_name
+
 
 @dataclass(frozen=True)
 class JudgmentGuardSignal:
@@ -18,6 +20,13 @@ class JudgmentGuardSignal:
 # URL alone is NOT a stub when the body carries real case content.
 _URL_LOGIN_STUB_RE = re.compile(r"/login/check(?:[/?#]|$)", re.IGNORECASE)
 _CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:", re.IGNORECASE)
+_NOTES_ON_CASES_RE = re.compile(r"\bnotes?\s+on\s+cases?\b", re.IGNORECASE)
+_JUDGMENT_STRUCTURE_RE = re.compile(
+    r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
+)
+_BEFORE_JJ_LINE_RE = re.compile(r"(?im)^\s*before\s*[:\-]?\s*(.{5,300}?)\s*$")
+_JJ_SUFFIX_RE = re.compile(r"(?i),?\s*(?:j\.?|jj\.?|c\.?j\.?|cj)\s*$")
+_NAME_SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|&)\s*", re.IGNORECASE)
 _SUBSCRIPTION_CHROME_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("obtaining_subscription", re.compile(r"\bobtaining\s+subscription\b", re.IGNORECASE)),
     ("update_subscriber", re.compile(r"\bupdate\s+subscriber\b", re.IGNORECASE)),
@@ -49,6 +58,67 @@ def _judge_name_values(judge_names: Optional[Iterable[Any]]) -> list[str]:
             continue
         out.append(str(item))
     return out
+
+
+def extract_before_jj_judge_names(raw_text: Optional[str]) -> list[str]:
+    text = raw_text or ""
+    if not text:
+        return []
+    names: list[str] = []
+    seen = set()
+    for match in _BEFORE_JJ_LINE_RE.finditer(text[:30000]):
+        clause = match.group(1).strip()
+        if not re.search(r"(?i)\bjj?\b", clause):
+            continue
+        clause = _JJ_SUFFIX_RE.sub("", clause).strip(" ,.;:-")
+        for piece in _NAME_SPLIT_RE.split(clause):
+            normalized = normalise_judge_name(piece)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(normalized)
+    return names
+
+
+def detect_headnotes_only(
+    *,
+    raw_text: Optional[str],
+    raw_html: Optional[str] = None,
+    min_full_text_chars: int = 2500,
+) -> Optional[JudgmentGuardSignal]:
+    blob = (raw_text or "").strip()
+    if not blob:
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="body_missing",
+            matched_value="",
+        )
+    if _NOTES_ON_CASES_RE.search(blob):
+        jj_names = extract_before_jj_judge_names(blob)
+        if not jj_names:
+            return JudgmentGuardSignal(
+                reason_code="headnote_only",
+                signal="notes_on_cases_only",
+                matched_value=blob[:500],
+            )
+    compact_len = len(re.sub(r"\s+", "", blob))
+    if compact_len < max(200, min_full_text_chars // 2) and not _JUDGMENT_STRUCTURE_RE.search(blob):
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="body_short_non_judgment",
+            matched_value=blob[:500],
+        )
+    html_blob = raw_html or ""
+    if compact_len < min_full_text_chars and _NOTES_ON_CASES_RE.search(html_blob) and not _JUDGMENT_STRUCTURE_RE.search(blob):
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="body_short_with_notes",
+            matched_value=blob[:500],
+        )
+    return None
 
 
 def detect_judgment_stub(

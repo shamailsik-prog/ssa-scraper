@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,6 +41,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.extractors.judgment_guards import detect_headnotes_only, extract_before_jj_judge_names
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -240,6 +242,34 @@ class PakistanLawSitePipeline:
         layout["columns"] = columns
         normalized["result_layout"] = layout
         return normalized
+
+    @staticmethod
+    def _is_reference_case_surface(page: PageResult) -> bool:
+        candidates = [
+            page.url or "",
+            str((page.metadata or {}).get("requested_url") or ""),
+            str((page.metadata or {}).get("final_url") or ""),
+        ]
+        return any(re.search(r"ReferenceCaseLawSearch", value, flags=re.IGNORECASE) for value in candidates)
+
+    @classmethod
+    def _classify_document_type(
+        cls,
+        *,
+        page: PageResult,
+        selected_text: str,
+        modal_text: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        if cls._is_reference_case_surface(page):
+            selector_found = bool((page.metadata or {}).get("case_description_selector_found"))
+            if not selector_found:
+                return "headnote", "case_description_selector_missing"
+            if not (modal_text or "").strip():
+                return "headnote", "case_description_modal_empty"
+        signal = detect_headnotes_only(raw_text=selected_text, raw_html=page.html)
+        if signal is not None:
+            return "headnote", f"{signal.reason_code}:{signal.signal}"
+        return "full_judgment", None
 
     # ---------------------------------------------------------------- search map
     async def ensure_search_map(self) -> Dict[str, Any]:
@@ -501,7 +531,8 @@ class PakistanLawSitePipeline:
 
     async def fetch_detail(self, url: str) -> PageResult:
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(url)
+            capture_case_description_modal = bool(re.search(r"ReferenceCaseLawSearch", url or "", flags=re.IGNORECASE))
+            page = await browser.goto(url, capture_case_description_modal=capture_case_description_modal)
             raise_for_verdict(page)
             return page
 
@@ -517,15 +548,46 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
         html = page.html
-        prov = await record_provenance(self.db, source=self.source, url=page.url, content=html.encode("utf-8"), content_kind="html", route=route, http_status=page.status)
+        html_prov = await record_provenance(
+            self.db,
+            source=self.source,
+            url=page.url,
+            content=html.encode("utf-8"),
+            content_kind="html",
+            route=route,
+            http_status=page.status,
+        )
         text = clean_html(html)
+        modal_text = str((page.metadata or {}).get("case_description_modal_text") or "").strip()
+        if modal_text:
+            text = modal_text
+        document_type, document_type_reason = self._classify_document_type(
+            page=page,
+            selected_text=text,
+            modal_text=modal_text,
+        )
+        content_prov = html_prov
+        if modal_text and document_type == "full_judgment":
+            # Use modal body bytes as identity when they are the selected full judgment text.
+            content_prov = await record_provenance(
+                self.db,
+                source=self.source,
+                url=page.url,
+                content=modal_text.encode("utf-8"),
+                content_kind="text",
+                route=route,
+                http_status=page.status,
+                document_kind="case_description_modal",
+                parent=html_prov,
+            )
+        modal_judges = extract_before_jj_judge_names(modal_text) if modal_text else []
         pdf_prov = None
         ocr = False
         if row.get("pdf_url"):
             try:
                 pdf_bytes = await self.download(row["pdf_url"])
                 if pdf_bytes[:4] == b"%PDF":
-                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=prov)
+                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=html_prov)
                     from scraper.fetchers import pdf_text_with_ocr
 
                     pdf_text, ocr = pdf_text_with_ocr(pdf_bytes)
@@ -535,7 +597,7 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
-        staging = await stage_judgment(self.db, source=self.source, prov=prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
@@ -545,18 +607,40 @@ class PakistanLawSitePipeline:
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
-        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=prov.id, staging_id=staging.id)
-        outcome = await extractor.extract_judgment(html=html, text=text, source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url}, content_hash=prov.content_hash)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=content_prov.id, staging_id=staging.id)
+        deterministic_only = self._is_reference_case_surface(page)
+        outcome = await extractor.extract_judgment(
+            html=html,
+            text=text,
+            source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url},
+            content_hash=content_prov.content_hash,
+            deterministic_only=deterministic_only,
+        )
+        reconciled = dict(outcome.data or {})
+        if modal_judges:
+            existing = [str(j) for j in (reconciled.get("judge_names") or []) if j]
+            seen = {name.lower() for name in existing}
+            for judge_name in modal_judges:
+                if judge_name.lower() not in seen:
+                    existing.append(judge_name)
+                    seen.add(judge_name.lower())
+            reconciled["judge_names"] = existing
+        reconciled["document_type"] = document_type
+        if document_type_reason:
+            reconciled["document_type_reason"] = document_type_reason
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
-        staging.reconciled_json = _slim(outcome.data)
+        staging.reconciled_json = _slim(reconciled)
         staging.extraction_engine = outcome.engine
         staging.confidence_score = outcome.confidence
-        staging.validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
-        staging.extracted_citation = (outcome.data.get("citations") or [None])[0]
-        staging.extracted_title = outcome.data.get("case_title")
-        staging.extracted_court = outcome.data.get("court")
-        staging.extracted_year = outcome.data.get("year")
+        validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
+        if document_type == "headnote":
+            validation_errors.append("headnote_only: not eligible for full_judgment promotion")
+        staging.validation_errors = validation_errors
+        staging.extracted_citation = (reconciled.get("citations") or [None])[0]
+        staging.extracted_title = reconciled.get("case_title")
+        staging.extracted_court = reconciled.get("court")
+        staging.extracted_year = reconciled.get("year")
         staging.status = "quarantined" if outcome.quarantine else "extracted"
         staging.quarantine_reason = outcome.quarantine_reason
         await self.db.flush()

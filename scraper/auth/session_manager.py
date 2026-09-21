@@ -701,8 +701,59 @@ class PlaywrightBrowser:
             }
         return await self._wrap(self._page.content()), {}
 
+    async def _capture_case_description_modal(self) -> Dict[str, Any]:
+        return await self._wrap(
+            self._page.evaluate(
+                """async () => {
+                const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                const trigger = document.querySelector(
+                    'input.caseDescription[value="Case Description"], input.caseDescription'
+                );
+                if (!trigger) {
+                    return {
+                        case_description_selector_found: false,
+                        case_description_modal_found: false,
+                        case_description_modal_text: null,
+                        case_description_modal_text_length: 0,
+                    };
+                }
+                try {
+                    if (trigger.scrollIntoView) {
+                        trigger.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    }
+                } catch (_scrollError) {}
+                try {
+                    trigger.click();
+                } catch (_clickError) {
+                    try {
+                        trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    } catch (_dispatchError) {}
+                }
+                let modal = null;
+                let text = '';
+                for (let i = 0; i < 80; i += 1) {
+                    modal = document.querySelector('#ExceptionResponseScreen1');
+                    text = modal && modal.innerText ? modal.innerText.trim() : '';
+                    const hasBeforeMarker = /Before.+/i.test(text);
+                    const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
+                    if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
+                        break;
+                    }
+                    await sleep(150);
+                }
+                return {
+                    case_description_selector_found: true,
+                    case_description_modal_found: Boolean(modal),
+                    case_description_modal_text: text || null,
+                    case_description_modal_text_length: text.length,
+                };
+            }"""
+            )
+        )
+
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
+        capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
         resp = await self._wrap(
             self._page.goto(
                 url,
@@ -711,6 +762,18 @@ class PlaywrightBrowser:
             )
         )
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        if capture_case_description_modal:
+            try:
+                modal_meta = await self._capture_case_description_modal()
+                metadata.update(modal_meta or {})
+            except Exception as exc:
+                logger.warning(
+                    "caseDescription modal capture failed slot=%s url=%s: %s",
+                    self.slot_number,
+                    self._page.url if self._page else url,
+                    exc,
+                )
+                metadata["case_description_modal_error"] = str(exc)[:500]
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         requested_url = url

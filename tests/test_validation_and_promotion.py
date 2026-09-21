@@ -10,7 +10,7 @@ from sqlalchemy import delete, func, select, update
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
-from scraper.extractors.judgment_guards import detect_judgment_stub
+from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, extract_before_jj_judge_names
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
 from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, Treatment
@@ -107,6 +107,22 @@ def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_name
     assert hit is not None
     assert hit.reason_code == reason_code
     assert hit.signal == signal
+
+
+def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
+    text = "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ\nJUDGMENT"
+    names = extract_before_jj_judge_names(text)
+    assert names == ["Qazi Faez Isa", "Syed Mansoor Ali Shah"]
+
+
+def test_detect_headnotes_only_flags_notes_on_cases_surface():
+    signal = detect_headnotes_only(
+        raw_text="Notes on Cases\nDigest note only.",
+        raw_html="<html><body><h4>Notes on Cases</h4></body></html>",
+    )
+    assert signal is not None
+    assert signal.reason_code == "headnote_only"
+    assert signal.signal.startswith("notes_on_cases")
 
 
 @pytest.mark.parametrize(
@@ -243,6 +259,96 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_blocks_headnote_document_type_for_full_judgment(db, source):
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K900",
+        content="<html><body><h4>Notes on Cases</h4></body></html>".encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=source,
+        prov=prov,
+        raw_html="<html><body><h4>Notes on Cases</h4></body></html>",
+        raw_text="Notes on Cases\nDigest only",
+        url=prov.source_url,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 900"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Digest row",
+        "judge_names": [],
+        "document_type": "headnote",
+        "document_type_reason": "case_description_selector_missing",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.9
+    assert await promote_judgment_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(
+            select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id),
+        )
+    ).scalars().first()
+    assert q is not None
+    assert "document_type=headnote" in (q.reason or "")
+
+
+async def test_promotion_upgrades_existing_pakistanlawsite_headnote_judgment_with_full_judgment(db, login_source):
+    citation = "PLD 2024 SC 901"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K901&&court= &&Row=0 &&bookName=undefined"
+    existing = Judgment(
+        canonical_citation=citation,
+        case_title="Digest row",
+        court_name="Supreme Court of Pakistan",
+        full_text="Notes on Cases\nDigest only",
+        full_text_hash=canonical_text_hash("Notes on Cases\nDigest only"),
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url=detail_url,
+        confidence_score=0.6,
+    )
+    db.add(existing)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=existing.id,
+            citation_string=citation,
+            raw_string=citation,
+            reporter="PLD",
+            year=2024,
+            page=901,
+            is_primary=True,
+        )
+    )
+    await db.flush()
+
+    full_html = judgment_html(citation, title="Modal Upgrade Case")
+    full_text = clean_html(full_html)
+    prov = await record_provenance(db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html")
+    st = await stage_judgment(db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url)
+    st.reconciled_json = {
+        "citations": [citation],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Modal Upgrade Case",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    updated = (await db.execute(select(Judgment).where(Judgment.id == existing.id))).scalars().first()
+    assert updated is not None
+    assert updated.full_text_hash == canonical_text_hash(full_text)
+    assert "Notes on Cases" not in (updated.full_text or "")[:200]
+    assert st.promoted_to_id == existing.id
+    assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 1
 
 
 # --------------------------------------------------------------------------- 8
