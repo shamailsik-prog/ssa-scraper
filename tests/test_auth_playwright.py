@@ -24,7 +24,17 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.database import SessionLocal
-from scraper.models import BrowserSessionSlot, CrawlCoverage, CrawlFrontier, Judgment, Notification, ScraperSource, ScraperStaging, SearchFormMap
+from scraper.models import (
+    BrowserSessionSlot,
+    CrawlCoverage,
+    CrawlFrontier,
+    Judgment,
+    Notification,
+    ScraperSource,
+    ScraperStaging,
+    SearchFormMap,
+    SourceProvenance,
+)
 from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
@@ -985,6 +995,71 @@ async def test_pipeline_marks_notes_only_reference_case_as_headnote_and_promotio
     assert staging is not None
     assert (staging.reconciled_json or {}).get("document_type") == "headnote"
     assert await promote_judgment_staging(db, staging) == "quarantined"
+
+
+async def test_preserve_and_extract_uses_modal_text_identity_to_upgrade_headnote_html_duplicate(db, login_source):
+    await _activate(db, login_source)
+    citation = "PLD 2024 SC 901"
+    title = "Upgrade from modal body"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K901&&court= &&Row=0 &&bookName=undefined"
+    page_html = _notes_only_detail_html(citation, title)
+    modal_text = _modal_full_judgment_text(citation, title)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    row = {"citation": citation, "title": title, "court": "Supreme Court", "detail_url": detail_url}
+
+    first = await pipeline.preserve_and_extract(
+        PageResult(
+            url=detail_url,
+            html=page_html,
+            metadata={
+                "requested_url": detail_url,
+                "final_url": detail_url,
+                "case_description_selector_found": False,
+                "case_description_modal_found": False,
+                "case_description_modal_text": None,
+                "case_description_modal_text_length": 0,
+            },
+        ),
+        {"tier": 4, "row_index": 0},
+        row,
+    )
+    second = await pipeline.preserve_and_extract(
+        PageResult(
+            url=detail_url,
+            html=page_html,
+            metadata={
+                "requested_url": detail_url,
+                "final_url": detail_url,
+                "case_description_selector_found": True,
+                "case_description_modal_found": True,
+                "case_description_modal_text": modal_text,
+                "case_description_modal_text_length": len(modal_text),
+            },
+        ),
+        {"tier": 4, "row_index": 1},
+        row,
+    )
+
+    assert first == "staged"
+    assert second == "staged"
+    rows = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.asc()))).scalars().all()
+    assert len(rows) == 2
+    headnote_row = next(r for r in rows if (r.reconciled_json or {}).get("document_type") == "headnote")
+    full_row = next(r for r in rows if (r.reconciled_json or {}).get("document_type") == "full_judgment")
+    assert headnote_row.content_hash != full_row.content_hash
+    assert "Notes on Cases" in (headnote_row.raw_text or "")
+    assert "Notes on Cases" not in (full_row.raw_text or "")[:200]
+    assert "Qazi Faez Isa" in ((full_row.reconciled_json or {}).get("judge_names") or [])
+    headnote_prov = (
+        await db.execute(select(SourceProvenance).where(SourceProvenance.id == headnote_row.provenance_id))
+    ).scalars().first()
+    modal_prov = (
+        await db.execute(select(SourceProvenance).where(SourceProvenance.id == full_row.provenance_id))
+    ).scalars().first()
+    assert headnote_prov is not None and modal_prov is not None
+    assert modal_prov.parent_id == headnote_prov.id
+    assert modal_prov.document_kind == "case_description_modal"
+    assert modal_prov.content_kind == "text"
 
 
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):

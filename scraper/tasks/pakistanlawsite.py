@@ -548,7 +548,15 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
         html = page.html
-        prov = await record_provenance(self.db, source=self.source, url=page.url, content=html.encode("utf-8"), content_kind="html", route=route, http_status=page.status)
+        html_prov = await record_provenance(
+            self.db,
+            source=self.source,
+            url=page.url,
+            content=html.encode("utf-8"),
+            content_kind="html",
+            route=route,
+            http_status=page.status,
+        )
         text = clean_html(html)
         modal_text = str((page.metadata or {}).get("case_description_modal_text") or "").strip()
         if modal_text:
@@ -558,6 +566,20 @@ class PakistanLawSitePipeline:
             selected_text=text,
             modal_text=modal_text,
         )
+        content_prov = html_prov
+        if modal_text and document_type == "full_judgment":
+            # Use modal body bytes as identity when they are the selected full judgment text.
+            content_prov = await record_provenance(
+                self.db,
+                source=self.source,
+                url=page.url,
+                content=modal_text.encode("utf-8"),
+                content_kind="text",
+                route=route,
+                http_status=page.status,
+                document_kind="case_description_modal",
+                parent=html_prov,
+            )
         modal_judges = extract_before_jj_judge_names(modal_text) if modal_text else []
         pdf_prov = None
         ocr = False
@@ -565,7 +587,7 @@ class PakistanLawSitePipeline:
             try:
                 pdf_bytes = await self.download(row["pdf_url"])
                 if pdf_bytes[:4] == b"%PDF":
-                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=prov)
+                    pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=html_prov)
                     from scraper.fetchers import pdf_text_with_ocr
 
                     pdf_text, ocr = pdf_text_with_ocr(pdf_bytes)
@@ -575,7 +597,7 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
-        staging = await stage_judgment(self.db, source=self.source, prov=prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
@@ -585,13 +607,13 @@ class PakistanLawSitePipeline:
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
-        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=prov.id, staging_id=staging.id)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=content_prov.id, staging_id=staging.id)
         deterministic_only = self._is_reference_case_surface(page)
         outcome = await extractor.extract_judgment(
             html=html,
             text=text,
             source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url},
-            content_hash=prov.content_hash,
+            content_hash=content_prov.content_hash,
             deterministic_only=deterministic_only,
         )
         reconciled = dict(outcome.data or {})
