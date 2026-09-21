@@ -443,9 +443,12 @@ async def test_playwright_goto_passes_archived_grid_start_row_to_compact_snapsho
         call for call in page.calls if call[0] == "evaluate" and "requested_start_row" in call[1]
     )
     assert snapshot_eval_call[2][0] == {"maxRows": settings.PLS_ARCHIVED_GRID_MAX_ROWS, "startRow": 200}
+    assert "seekArchivedGridAbsolute" in snapshot_eval_call[1]
+    assert "api().page(Math.floor(start/pageLength)).draw(false)" in snapshot_eval_call[1]
     assert result.metadata["start_row"] == 200
     assert result.metadata["requested_start_row"] == 200
     assert result.metadata["total_rows"] == 20567
+    assert result.metadata["seek_mode"] == "datatable"
 
 
 async def test_playwright_goto_captures_case_description_modal_text_when_requested():
@@ -1135,8 +1138,10 @@ async def test_pipeline_citation_grid_cursor_advances_from_absolute_offset_past_
     assert detail_calls == ["https://www.pakistanlawsite.com/case/1201", "https://www.pakistanlawsite.com/case/1202"]
     assert stats["citation_grid_offset"] == 200
     assert stats["citation_grid_next_offset"] == 202
+    assert stats["citation_grid_seek_mode"] == "datatable"
     assert stats["staged"] > 0
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 202
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("last_seek_mode") == "datatable"
     assert len(FakeBrowser.instances) > start_instances
     search_calls = [
         call
@@ -1180,7 +1185,9 @@ async def test_pipeline_citation_grid_cursor_falls_back_to_snapshot_window_offse
     assert detail_calls == ["https://www.pakistanlawsite.com/case/1301", "https://www.pakistanlawsite.com/case/1302"]
     assert stats["citation_grid_offset"] == 0
     assert stats["citation_grid_next_offset"] == 2
+    assert stats["citation_grid_seek_mode"] == "dom"
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 2
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("last_seek_mode") == "dom"
 
 
 async def test_pipeline_citation_grid_cursor_normalizes_non_datatable_start_row(db, login_source, monkeypatch):
@@ -1217,7 +1224,9 @@ async def test_pipeline_citation_grid_cursor_normalizes_non_datatable_start_row(
     assert detail_calls == ["https://www.pakistanlawsite.com/case/1311", "https://www.pakistanlawsite.com/case/1312"]
     assert stats["citation_grid_offset"] == 0
     assert stats["citation_grid_next_offset"] == 2
+    assert stats["citation_grid_seek_mode"] == "dom"
     assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 2
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("last_seek_mode") == "dom"
 
 
 async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_end(db, login_source, monkeypatch):

@@ -26,6 +26,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
 from sqlalchemy import select
@@ -37,6 +38,8 @@ from scraper.notify import notify
 from scraper.security import ExplicitBlock, VerificationRequired, classify_response
 
 logger = logging.getLogger(__name__)
+
+ARCHIVED_GRID_SEEK_JS = (Path(__file__).resolve().parent / "archived_grid_seek.js").read_text(encoding="utf-8")
 
 LOCK_KEY = "corpus:login_session_lock:{source}"
 LOCK_TTL_SECONDS = 3600
@@ -394,90 +397,52 @@ class PlaywrightBrowser:
             snapshot = await asyncio.wait_for(
                 self._wrap(
                     self._page.evaluate(
-                        """async ({ maxRows, startRow }) => {
+                        "async ({ maxRows, startRow }) => {\n"
+                        + ARCHIVED_GRID_SEEK_JS
+                        + """
                     const table = document.querySelector('#archivedpatientGrid');
                     if (!table) return null;
-                    const toInt = (value, fallback = 0) => {
-                        const n = Number(value);
-                        if (!Number.isFinite(n)) return fallback;
-                        return Math.max(0, Math.floor(n));
-                    };
-                    const requestedStartRow = toInt(startRow, 0);
-                    let appliedStartRow = requestedStartRow;
+                    const requestedStartRow = Number.isFinite(Number(startRow)) ? Math.max(0, Math.floor(Number(startRow))) : 0;
+                    let appliedStartRow = 0;
                     let totalRows = null;
                     let pageLength = null;
                     let seekMode = 'none';
                     try {
-                        const jq = window.jQuery || window.$;
-                        if (jq && jq.fn && jq.fn.dataTable) {
-                            let dt = null;
-                            try {
-                                dt = jq(table).DataTable();
-                            } catch (_dtError) {
-                                dt = null;
-                            }
-                            if (dt && typeof dt.page === 'function' && typeof dt.page.info === 'function') {
-                                const infoBefore = dt.page.info() || {};
-                                const recordsBefore = Number(infoBefore.recordsDisplay ?? infoBefore.recordsTotal);
-                                if (Number.isFinite(recordsBefore) && recordsBefore >= 0) {
-                                    totalRows = Math.floor(recordsBefore);
-                                }
-                                pageLength = Number(infoBefore.length ?? dt.page.len());
-                                if (!Number.isFinite(pageLength) || pageLength <= 0) {
-                                    pageLength = Math.max(1, maxRows || 1);
-                                }
-                                const boundedStart = totalRows && totalRows > 0
-                                    ? Math.min(requestedStartRow, Math.max(totalRows - 1, 0))
-                                    : requestedStartRow;
-                                const targetPage = Math.floor(boundedStart / pageLength);
-                                const drawWaitResult = await new Promise((resolve) => {
-                                    let done = false;
-                                    const finish = (mode) => {
-                                        if (!done) {
-                                            done = true;
-                                            resolve(mode);
-                                        }
-                                    };
-                                    try {
-                                        jq(table).one('draw.dt', () => finish('draw'));
-                                        dt.page(targetPage).draw(false);
-                                        setTimeout(() => finish('timeout'), 1200);
-                                    } catch (_drawError) {
-                                        finish('error');
-                                    }
-                                });
-                                const infoAfter = dt.page.info() || {};
-                                const recordsAfter = Number(infoAfter.recordsDisplay ?? infoAfter.recordsTotal);
-                                if (Number.isFinite(recordsAfter) && recordsAfter >= 0) {
-                                    totalRows = Math.floor(recordsAfter);
-                                }
-                                if (drawWaitResult === 'draw') {
-                                    pageLength = Number(infoAfter.length ?? pageLength);
-                                    if (Number.isFinite(infoAfter.start) && Number(infoAfter.start) >= 0) {
-                                        appliedStartRow = Math.floor(Number(infoAfter.start));
-                                    } else {
-                                        appliedStartRow = targetPage * pageLength;
-                                    }
-                                    seekMode = 'datatable';
-                                }
+                        const seek = await seekArchivedGridAbsolute(table, startRow, maxRows);
+                        if (seek) {
+                            totalRows = seek.total_rows;
+                            pageLength = seek.page_length;
+                            seekMode = seek.seek_mode || 'none';
+                            if (seekMode === 'datatable') {
+                                appliedStartRow = Number.isFinite(Number(seek.start_row)) ? Math.max(0, Math.floor(Number(seek.start_row))) : 0;
+                            } else {
+                                appliedStartRow = 0;
                             }
                         }
                     } catch (_seekError) {
                         // Keep compact snapshot resilient even if DataTables API is unavailable.
+                        appliedStartRow = 0;
+                        seekMode = 'none';
                     }
                     if (seekMode !== 'datatable') {
                         appliedStartRow = 0;
                         const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                         const trCollection = tbody && tbody.rows ? tbody.rows : [];
-                        const target = trCollection.length ? trCollection[Math.min(requestedStartRow, trCollection.length - 1)] : null;
-                        if (target && target.scrollIntoView) {
+                        // Only scroll a row that is actually in this DOM page. Do not map a
+                        // deep start_row onto the last first-page row — that invents an offset.
+                        const inDom = requestedStartRow < trCollection.length ? trCollection[requestedStartRow] : null;
+                        if (inDom && inDom.scrollIntoView) {
                             try {
-                                target.scrollIntoView({ block: 'nearest' });
-                                seekMode = 'scroll';
+                                inDom.scrollIntoView({ block: 'nearest' });
+                                if (seekMode === 'unavailable' || seekMode === 'none') {
+                                    seekMode = 'scroll';
+                                }
                             } catch (_scrollError) {
-                                seekMode = 'dom';
+                                if (seekMode === 'unavailable' || seekMode === 'none') {
+                                    seekMode = 'dom';
+                                }
                             }
-                        } else {
+                        } else if (seekMode === 'unavailable' || seekMode === 'none') {
                             seekMode = 'dom';
                         }
                     }

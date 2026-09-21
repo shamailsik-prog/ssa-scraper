@@ -353,6 +353,7 @@ class PakistanLawSitePipeline:
         except Exception:
             snapshot_start_row = 0
         snapshot_start_row = max(0, snapshot_start_row)
+        self.stats["citation_grid_seek_mode"] = seek_mode or "none"
         if seek_mode and seek_mode != "datatable" and snapshot_start_row > 0:
             logger.warning(
                 "PakistanLawSite citation-grid snapshot reported start_row=%s for seek_mode=%s; normalizing to 0",
@@ -423,6 +424,7 @@ class PakistanLawSitePipeline:
                     "last_rows_seen": row_count,
                     "last_total_rows": total_rows,
                     "last_snapshot_start_row": snapshot_start_row,
+                    "last_seek_mode": seek_mode or "none",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
