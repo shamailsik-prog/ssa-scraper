@@ -459,6 +459,34 @@ async def test_playwright_goto_captures_case_description_modal_text_when_request
     assert result.metadata["case_description_modal_text"].startswith("Before Justice A")
 
 
+async def test_capture_case_description_modal_waits_for_full_text_ready_markers():
+    page = _FakePage(html="<html><body>detail</body></html>")
+    page.case_description_modal_payload = {
+        "case_description_selector_found": True,
+        "case_description_modal_found": True,
+        "case_description_modal_text": "modal shell only",
+        "case_description_modal_text_length": 251,
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    meta = await browser._capture_case_description_modal()
+
+    assert set(meta) == {
+        "case_description_selector_found",
+        "case_description_modal_found",
+        "case_description_modal_text",
+        "case_description_modal_text_length",
+    }
+    modal_eval_call = next(call for call in page.calls if call[0] == "evaluate" and "#ExceptionResponseScreen1" in call[1])
+    script = modal_eval_call[1]
+    assert "for (let i = 0; i < 80; i += 1)" in script
+    assert "await sleep(150)" in script
+    assert "text.length >= 2000" in script
+    assert "/Before.+/i.test(text)" in script
+    assert "/CLC|SCMR|PLD/i.test(text)" in script
+
+
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
     page = _FakePage(html=results_html([("PLD 2024 SC 1", "Party v State", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
     browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
