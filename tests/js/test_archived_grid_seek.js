@@ -147,6 +147,17 @@ async function run() {
     }
 
     {
+        const liveTable = createDomTable(20567);
+        const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
+        const result = await seek(liveTable, 1000, 200);
+        assert.strictEqual(result.seek_mode, "dom_absolute", `ContinuityRunner ≥1000 prove: expected dom_absolute, got ${JSON.stringify(result)}`);
+        assert.strictEqual(result.start_row, 1000, "offset 1000 must land as start_row, not a DataTables page guess");
+        assert.strictEqual(result.requested_start_row, 1000);
+        assert.strictEqual(result.total_rows, 20567);
+        assert.strictEqual(liveTable.tBodies[0].rows[1000].scrolled, true);
+    }
+
+    {
         const shortTable = createDomTable(10);
         const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
         const result = await seek(shortTable, 200, 200);

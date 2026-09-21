@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from celery import shared_task
@@ -1692,10 +1692,56 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
 
 
 # --------------------------------------------------------------------------- batch entry points
-async def promote_staging_records(limit: int = 200) -> Dict[str, int]:
+async def _pending_judgment_staging(
+    db: AsyncSession,
+    *,
+    limit: int,
+    source_name: Optional[str] = None,
+) -> List[ScraperStaging]:
+    """Pick promote work without letting older public rows starve PakistanLawSite.
+
+    Cross-source oldest-first is still used inside each slice. A reserved share
+    of the batch is filled from PROMOTE_PREFERRED_SOURCE first when that source
+    has pending rows. `source_name` pins the batch to one source (the former
+    PLS-scoped workaround, now a product argument).
+    """
+    limit = max(1, int(limit))
+    pending = (
+        select(ScraperStaging)
+        .where(
+            ScraperStaging.status.in_(["extracted", "quarantined"]),
+            ScraperStaging.promoted_to_id.is_(None),
+        )
+        .order_by(ScraperStaging.created_at)
+    )
+    if source_name:
+        return (
+            await db.execute(pending.where(ScraperStaging.source_name == source_name).limit(limit))
+        ).scalars().all()
+
+    preferred = (settings.PROMOTE_PREFERRED_SOURCE or "").strip()
+    share = float(settings.PROMOTE_PREFERRED_SHARE or 0)
+    if not preferred or share <= 0:
+        return (await db.execute(pending.limit(limit))).scalars().all()
+
+    reserved = max(1, min(limit, int(limit * share)))
+    preferred_rows = (
+        await db.execute(pending.where(ScraperStaging.source_name == preferred).limit(reserved))
+    ).scalars().all()
+    remaining = limit - len(preferred_rows)
+    if remaining <= 0:
+        return list(preferred_rows)
+    others_q = pending
+    if preferred_rows:
+        others_q = others_q.where(ScraperStaging.id.notin_([row.id for row in preferred_rows]))
+    others = (await db.execute(others_q.limit(remaining))).scalars().all()
+    return list(preferred_rows) + list(others)
+
+
+async def promote_staging_records(limit: int = 200, *, source_name: Optional[str] = None) -> Dict[str, int]:
     counts = {"promoted": 0, "duplicate": 0, "quarantined": 0, "statutes_promoted": 0, "statutes_duplicate": 0, "statutes_quarantined": 0}
     async with SessionLocal() as db:
-        rows = (await db.execute(select(ScraperStaging).where(ScraperStaging.status.in_(["extracted", "quarantined"]), ScraperStaging.promoted_to_id.is_(None)).order_by(ScraperStaging.created_at).limit(limit))).scalars().all()
+        rows = await _pending_judgment_staging(db, limit=limit, source_name=source_name)
         for st in rows:
             if st.status == "quarantined":
                 exists = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().first()
@@ -1791,8 +1837,8 @@ async def resolve_quarantine(db: AsyncSession, item: QuarantineQueue, *, reviewe
 
 
 @shared_task(name="scraper.tasks.promotion.promote_staging_records")
-def promote_staging_records_task(limit: int = 200):
-    return run_async(promote_staging_records(limit))
+def promote_staging_records_task(limit: int = 200, source_name: Optional[str] = None):
+    return run_async(promote_staging_records(limit, source_name=source_name))
 
 
 @shared_task(name="scraper.tasks.promotion.reconcile_instrument_relations")

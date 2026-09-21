@@ -186,6 +186,14 @@ class Settings(BaseSettings):
     PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Rows scanned per citation-grid run (can exceed detail fetch cap; known rows are fast-forwarded).")
     BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Backfill-mode max detail pages per citation-grid run.")
     BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill-mode rows scanned per citation-grid run.")
+    PROMOTE_PREFERRED_SOURCE: str = Field(
+        default="PakistanLawSite",
+        description="Judgment source that reserve a share of each promote batch so oldest-first public rows cannot starve login harvest.",
+    )
+    PROMOTE_PREFERRED_SHARE: float = Field(
+        default=0.5,
+        description="Fraction of each promote batch reserved for PROMOTE_PREFERRED_SOURCE when that source has pending rows.",
+    )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
@@ -423,6 +431,8 @@ class Settings(BaseSettings):
             raise ValueError("BACKFILL_PLS_CITATION_GRID_MAX_DETAIL must be positive")
         if self.BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW <= 0:
             raise ValueError("BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW must be positive")
+        if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:
+            raise ValueError("PROMOTE_PREFERRED_SHARE must be in (0, 1]")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:
