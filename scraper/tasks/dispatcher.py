@@ -16,10 +16,12 @@ from sqlalchemy import select
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
+from scraper.auth.session_manager import SessionLockHeld
 from scraper.harvest_mode import (
     backfill_progress,
     cadence_for_source,
     get_harvest_mode,
+    login_pacing_profile,
     selected_source_names,
     set_harvest_mode,
     source_backfill_priority,
@@ -36,8 +38,15 @@ def _running_started_at(job: ScraperJob) -> Optional[datetime]:
     return job.started_at or job.created_at
 
 
-async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
-    """Return the live running job while retiring stale/zombie running rows."""
+async def _active_running_jobs(
+    db,
+    source_name: str,
+    *,
+    now: datetime,
+    max_active: int = 1,
+) -> tuple[list[ScraperJob], bool]:
+    """Return live running jobs while retiring stale/zombie running rows."""
+    keep = max(1, int(max_active or 1))
     running_jobs = (
         await db.execute(
             select(ScraperJob).where(
@@ -47,21 +56,21 @@ async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[O
         )
     ).scalars().all()
     if not running_jobs:
-        return None, False
+        return [], False
     stale_cutoff = now - RUNNING_JOB_STALE_AFTER
     running_jobs.sort(
         key=lambda job: _running_started_at(job) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    active_job: Optional[ScraperJob] = None
+    active_jobs: list[ScraperJob] = []
     mutated = False
     for job in running_jobs:
         started_at = _running_started_at(job)
         stale = started_at is None or started_at <= stale_cutoff
-        if active_job is not None:
+        if len(active_jobs) >= keep:
             stale = True
         if not stale:
-            active_job = job
+            active_jobs.append(job)
             continue
         if job.status != "failed":
             job.status = "failed"
@@ -78,13 +87,24 @@ async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[O
             job.error_message = reason
             mutated = True
         logger.warning(
-            "Recovered stale running job source=%s job_id=%s started_at=%s active_job=%s",
+            "Recovered stale running job source=%s job_id=%s started_at=%s active_jobs=%s",
             source_name,
             job.id,
             started_at,
-            active_job.id if active_job is not None else None,
+            [active.id for active in active_jobs],
         )
-    return active_job, mutated
+    return active_jobs, mutated
+
+
+async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
+    """Return the newest live running job while retiring stale/zombie running rows."""
+    active_jobs, mutated = await _active_running_jobs(db, source_name, now=now, max_active=1)
+    return (active_jobs[0] if active_jobs else None), mutated
+
+
+async def _login_session_max_active(db) -> int:
+    mode = await get_harvest_mode(db)
+    return int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
 
 
 async def _connector_for(source: ScraperSource):
@@ -132,16 +152,24 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 return {"skipped": "PAUSED", "reason": source.state_reason}
         elif source.state == "PAUSED":
             return {"skipped": "PAUSED", "reason": source.state_reason}
-        existing, recovered_stale = await _active_running_job(db, source_name, now=datetime.now(timezone.utc))
-        if existing is not None:
+        max_active = 1
+        if source.access_method == "login_session":
+            max_active = await _login_session_max_active(db)
+        existing_jobs, recovered_stale = await _active_running_jobs(
+            db,
+            source_name,
+            now=datetime.now(timezone.utc),
+            max_active=max_active,
+        )
+        if len(existing_jobs) >= max_active:
             if recovered_stale:
                 await db.commit()
             logger.info(
-                "%s already has running job %s; skipping duplicate kick",
+                "%s already has %s running job(s); skipping duplicate kick",
                 source_name,
-                existing.id,
+                len(existing_jobs),
             )
-            return {"skipped": "already_running", "job_id": str(existing.id)}
+            return {"skipped": "already_running", "job_id": str(existing_jobs[0].id)}
         job = ScraperJob(source_id=source.id, source_name=source_name, job_type="scrape", status="running", worker_hostname=socket.gethostname(), started_at=datetime.now(timezone.utc))
         db.add(job)
         await db.commit()
@@ -153,6 +181,12 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
             job.pages_scraped = int(stats.get("pages", stats.get("fetched", 0)) or 0)
             job.records_extracted = int(stats.get("staged", 0) or 0)
             job.records_quarantined = int(stats.get("quarantined", 0) or 0)
+        except SessionLockHeld:
+            job.status = "done"
+            job.error_message = None
+            stats = {"skipped": "login_session_lock_held", "pages": 0, "staged": 0}
+            job.result_summary = stats
+            logger.info("%s already has an active login-session worker; skipped duplicate job", source_name)
         except Exception as exc:
             job.status = "failed"
             job.error_message = str(exc)[:4000]
@@ -170,9 +204,9 @@ def run_source_job(self, source_name: str):
 
 
 @shared_task(name="scraper.tasks.dispatcher.run_login_session_job", bind=True, max_retries=0)
-def run_login_session_job(self, source_name: str = "PakistanLawSite"):
-    """Separate task name so Celery routes it to the single-concurrency login_session queue."""
-    return run_async(run_source(source_name))
+def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_shard=None):
+    """Login-session queue. When concurrency is 2, Beat enqueues one job per reporter shard."""
+    return run_async(run_source(source_name, reporter_shard=reporter_shard))
 
 
 async def dispatch_due_sources() -> Dict[str, Any]:
@@ -221,20 +255,39 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
                 continue
-            running, _ = await _active_running_job(db, s.source_name, now=now)
-            if running is not None:
+            concurrency = 1
+            if s.access_method == "login_session":
+                concurrency = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
+            running_jobs, _ = await _active_running_jobs(db, s.source_name, now=now, max_active=concurrency)
+            if len(running_jobs) >= concurrency:
                 logger.info(
-                    "%s due but job %s still running; not re-queued",
+                    "skip enqueue %s: %s login-session scrape job(s) already running",
                     s.source_name,
-                    running.id,
+                    len(running_jobs),
                 )
                 continue
-            if s.access_method == "login_session":
+            if s.access_method == "login_session" and concurrency >= 2:
+                app.send_task(
+                    "scraper.tasks.dispatcher.run_login_session_job",
+                    args=(s.source_name,),
+                    kwargs={"reporter_shard": 0},
+                    queue="login_session",
+                )
+                app.send_task(
+                    "scraper.tasks.dispatcher.run_login_session_job",
+                    args=(s.source_name,),
+                    kwargs={"reporter_shard": 1},
+                    queue="login_session",
+                )
+                queued.append(f"{s.source_name}:shard0")
+                queued.append(f"{s.source_name}:shard1")
+            elif s.access_method == "login_session":
                 app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
+                queued.append(s.source_name)
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
+                queued.append(s.source_name)
             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
-            queued.append(s.source_name)
         await db.commit()
     return {"mode": mode, "auto_switched": auto_switched, "queued": queued}
 

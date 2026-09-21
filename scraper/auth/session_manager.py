@@ -3,8 +3,7 @@ Login-session management for PakistanLawSite (Amendment §9; Cursor command §2,
 
 * Two continuity slots hold Fernet-encrypted Playwright storage state captured by a HUMAN login.
 * Slot states: EMPTY → ACTIVE ↔ NEEDS_HUMAN_LOGIN / PAUSED / HALTED.
-* Exactly one scraping session against the login source at a time (Redis lock; a second
-  worker is refused).
+* Login-session lock: exclusive by default; two holders only when harvest concurrency is 2.
 * Ordinary disconnect: wait RECONNECT_SECONDS, reconnect the SAME slot, resume the SAME cursor;
   only if that fails may the alternate slot continue the same cursor. Never restart from page one.
 * Verification / login expiry: slot → NEEDS_HUMAN_LOGIN, notify, continue with another valid slot
@@ -101,8 +100,11 @@ def raise_for_verdict(page: PageResult) -> None:
 
 # --------------------------------------------------------------------------- lock
 class SessionLock:
-    def __init__(self, source_name: str, redis_client=None):
-        self.key = LOCK_KEY.format(source=source_name)
+    def __init__(self, source_name: str, redis_client=None, *, max_holders: int = 1):
+        holders = 1 if int(max_holders or 1) <= 1 else 2
+        self.max_holders = holders
+        self.exclusive_key = LOCK_KEY.format(source=source_name)
+        self.key = self.exclusive_key if holders == 1 else f"{self.exclusive_key}:holders"
         self._redis = redis_client
         self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
         self._held = False
@@ -116,7 +118,22 @@ class SessionLock:
 
     async def acquire(self) -> None:
         r = await self._client()
-        ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
+        if await r.get(self.exclusive_key) and self.max_holders > 1:
+            raise SessionLockHeld(f"login-session lock {self.exclusive_key} is held by another worker")
+        if self.max_holders == 1:
+            shared = int(await r.scard(f"{self.exclusive_key}:holders") or 0)
+            if shared > 0:
+                raise SessionLockHeld(f"login-session lock {self.exclusive_key}:holders is held by another worker")
+            ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
+        else:
+            ok = await r.eval(
+                "if redis.call('scard', KEYS[1]) < tonumber(ARGV[2]) then redis.call('sadd', KEYS[1], ARGV[1]); redis.call('expire', KEYS[1], ARGV[3]); return 1 else return 0 end",
+                1,
+                self.key,
+                self._token,
+                str(self.max_holders),
+                str(LOCK_TTL_SECONDS),
+            )
         if not ok:
             raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
         self._held = True
@@ -124,13 +141,22 @@ class SessionLock:
     async def refresh(self) -> None:
         if self._held:
             r = await self._client()
-            ok = await r.eval(
-                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                1,
-                self.key,
-                self._token,
-                str(LOCK_TTL_SECONDS),
-            )
+            if self.max_holders == 1:
+                ok = await r.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                    str(LOCK_TTL_SECONDS),
+                )
+            else:
+                ok = await r.eval(
+                    "if redis.call('sismember', KEYS[1], ARGV[1]) == 1 then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                    str(LOCK_TTL_SECONDS),
+                )
             if int(ok or 0) != 1:
                 self._held = False
                 raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
@@ -139,9 +165,14 @@ class SessionLock:
         if not self._held:
             return
         r = await self._client()
-        val = await r.get(self.key)
-        if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
-            await r.delete(self.key)
+        if self.max_holders == 1:
+            val = await r.get(self.key)
+            if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
+                await r.delete(self.key)
+        else:
+            await r.srem(self.key, self._token)
+            if int(await r.scard(self.key) or 0) == 0:
+                await r.delete(self.key)
         self._held = False
 
     async def __aenter__(self) -> "SessionLock":
@@ -532,7 +563,7 @@ class PlaywrightBrowser:
                         {"maxRows": max_rows, "startRow": safe_start_row},
                     )
                 ),
-                timeout=max(15.0, float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0),
+                timeout=max(8.0, float(getattr(settings, "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS", 20) or 20)),
             )
         except asyncio.TimeoutError as exc:
             elapsed = (datetime.now(timezone.utc) - started).total_seconds()
@@ -843,6 +874,7 @@ class ContinuityRunner:
     sleep: Any = asyncio.sleep
     browser: Optional[Browser] = None
     reconnects: int = 0
+    preferred_slot_number: Optional[int] = None
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
@@ -852,6 +884,10 @@ class ContinuityRunner:
     async def ensure_browser(self) -> Browser:
         if self.browser is not None:
             return self.browser
+        if self.preferred_slot_number:
+            preferred = await self.manager.slot(self.preferred_slot_number)
+            if preferred.state == "ACTIVE":
+                return await self.open(preferred)
         slot = await self.manager.current_slot()
         if slot is None:
             raise NoActiveSlot("no ACTIVE slot")
