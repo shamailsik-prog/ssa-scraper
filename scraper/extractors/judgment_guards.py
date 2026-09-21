@@ -33,6 +33,35 @@ _SUBSCRIPTION_CHROME_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("update_subscription", re.compile(r"\bupdate\s+subscription\b", re.IGNORECASE)),
     ("subscription_account", re.compile(r"\bsubscriber\s+account\b", re.IGNORECASE)),
 )
+_MODAL_CHROME_LINE_MARKERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*[\u00d7x]+\s*$", re.IGNORECASE),
+    re.compile(r"^\s*case\s+description\s*$", re.IGNORECASE),
+    re.compile(r"^\s*bookmark\s+this\s+case\s*$", re.IGNORECASE),
+    re.compile(r"^\s*update\s+subscriber\b.*$", re.IGNORECASE),
+    re.compile(r"^\s*obtaining\s+subscription\b.*$", re.IGNORECASE),
+)
+_MODAL_CHROME_INLINE_PREFIX_RE = re.compile(
+    r"(?is)^\s*(?:\u00d7+\s*)?(?:case\s+description\s*)?(?:bookmark\s+this\s+case\s*)?"
+)
+_JUDGMENT_CONTENT_ANCHORS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?im)^citation\s*name\s*:"),
+    re.compile(r"(?im)^\s*(?:before|coram)\b"),
+    re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,120}\bcourt\b"),
+    re.compile(r"(?im)^[^\n]{0,220}\b(?:versus|vs\.?|v\.)\b"),
+)
+
+
+def _looks_like_modal_chrome_prefix(prefix: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (prefix or "").strip().lower())
+    if not normalized:
+        return False
+    return (
+        "case description" in normalized
+        or "bookmark this case" in normalized
+        or         "update subscriber" in normalized
+        or "obtaining subscription" in normalized
+        or normalized.startswith("\u00d7")
+    )
 
 
 def _has_case_content(*, raw_text: Optional[str], raw_html: Optional[str]) -> bool:
@@ -58,6 +87,43 @@ def _judge_name_values(judge_names: Optional[Iterable[Any]]) -> list[str]:
             continue
         out.append(str(item))
     return out
+
+
+def strip_leading_judgment_chrome(raw_text: Optional[str]) -> str:
+    """Remove known PakistanLawSite modal chrome prefixes while preserving body text."""
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    if not text.strip():
+        return ""
+    lines = text.split("\n")
+    idx = 0
+    while idx < len(lines):
+        candidate = lines[idx].strip()
+        if not candidate:
+            idx += 1
+            continue
+        if any(marker.match(candidate) for marker in _MODAL_CHROME_LINE_MARKERS):
+            idx += 1
+            continue
+        break
+    stripped = "\n".join(lines[idx:]).strip()
+    if not stripped:
+        return ""
+    previous = None
+    while previous != stripped:
+        previous = stripped
+        stripped = _MODAL_CHROME_INLINE_PREFIX_RE.sub("", stripped).lstrip(" :-|\n\t")
+    first_anchor = None
+    for anchor in _JUDGMENT_CONTENT_ANCHORS:
+        match = anchor.search(stripped)
+        if match is None:
+            continue
+        if first_anchor is None or match.start() < first_anchor.start():
+            first_anchor = match
+    if first_anchor is not None and first_anchor.start() > 0:
+        prefix = stripped[: first_anchor.start()]
+        if len(prefix) <= 800 and _looks_like_modal_chrome_prefix(prefix):
+            stripped = stripped[first_anchor.start() :].lstrip()
+    return stripped
 
 
 def extract_before_jj_judge_names(raw_text: Optional[str]) -> list[str]:
