@@ -210,7 +210,14 @@ class Settings(BaseSettings):
     GOOGLE_APPLICATION_CREDENTIALS_JSON: Optional[SecretStr] = Field(default=None)
     DRIVE_UPLOAD_CONCURRENCY: int = Field(default=2)
     DRIVE_CHUNK_SIZE_MB: int = Field(default=8)
+    GOOGLE_DRIVE_API_RETRIES: int = Field(default=5)
     ARCHIVE_ENABLED: bool = Field(default=True)
+    ARCHIVE_MIRROR_INTERVAL_SECONDS: int = Field(default=300)
+    ARCHIVE_RECONCILE_INTERVAL_SECONDS: int = Field(default=86400)
+    ARCHIVE_MIRROR_JUDGMENTS_PER_RUN: int = Field(default=500)
+    ARCHIVE_MIRROR_STATUTES_PER_RUN: int = Field(default=1000)
+    ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN: int = Field(default=1000)
+    ARCHIVE_MIRROR_SCAN_PAGE_SIZE: int = Field(default=200)
     ARCHIVE_LOCAL_PATH: str = Field(default="", description="local_path target root. Blank = not configured.")
     ARCHIVE_S3_ENDPOINT: str = Field(default="")
     ARCHIVE_S3_BUCKET: str = Field(default="")
@@ -312,6 +319,15 @@ class Settings(BaseSettings):
         "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
         "PLS_ARCHIVED_GRID_MAX_ROWS",
         "PLS_CITATION_GRID_MAX_DETAIL",
+        "DRIVE_UPLOAD_CONCURRENCY",
+        "DRIVE_CHUNK_SIZE_MB",
+        "GOOGLE_DRIVE_API_RETRIES",
+        "ARCHIVE_MIRROR_INTERVAL_SECONDS",
+        "ARCHIVE_RECONCILE_INTERVAL_SECONDS",
+        "ARCHIVE_MIRROR_JUDGMENTS_PER_RUN",
+        "ARCHIVE_MIRROR_STATUTES_PER_RUN",
+        "ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN",
+        "ARCHIVE_MIRROR_SCAN_PAGE_SIZE",
         mode="before",
     )
     @classmethod
@@ -419,6 +435,18 @@ class Settings(BaseSettings):
             or self.BLOCK_RETRY_MAX_ATTEMPTS <= 0
         ):
             raise ValueError("dispatch, cadence, and block-retry settings must be positive")
+        if (
+            self.DRIVE_UPLOAD_CONCURRENCY <= 0
+            or self.DRIVE_CHUNK_SIZE_MB <= 0
+            or self.GOOGLE_DRIVE_API_RETRIES < 0
+            or self.ARCHIVE_MIRROR_INTERVAL_SECONDS <= 0
+            or self.ARCHIVE_RECONCILE_INTERVAL_SECONDS <= 0
+            or self.ARCHIVE_MIRROR_JUDGMENTS_PER_RUN <= 0
+            or self.ARCHIVE_MIRROR_STATUTES_PER_RUN <= 0
+            or self.ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN <= 0
+            or self.ARCHIVE_MIRROR_SCAN_PAGE_SIZE <= 0
+        ):
+            raise ValueError("archive and Google Drive throughput settings must be positive (retries >= 0)")
         if self.BACKFILL_TARGET_JUDGMENTS < 0 or self.BACKFILL_TARGET_STATUTES < 0:
             raise ValueError("BACKFILL_TARGET_JUDGMENTS/STATUTES must be >= 0")
         if self.EMBEDDING_DIM <= 0:

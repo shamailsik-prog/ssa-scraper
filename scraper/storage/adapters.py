@@ -368,7 +368,12 @@ class GoogleDriveAdapter(ArchiveAdapter):
         self.root_folder_id = config.get("folder_id") or config.get("root_folder_id")
         if not self.root_folder_id:
             raise ArchiveError("google_drive target requires folder_id")
+        self.chunk_size_bytes = max(1, int(config.get("chunk_size_mb", 8))) * 1024 * 1024
+        self.api_retries = max(0, int(config.get("api_retries", 5)))
         self._folder_cache: Dict[str, str] = {"": self.root_folder_id}
+
+    def _execute(self, request):
+        return request.execute(num_retries=self.api_retries)
 
     def _folder_for(self, path: str, create: bool) -> Optional[str]:
         path = path.strip("/")
@@ -379,12 +384,17 @@ class GoogleDriveAdapter(ArchiveAdapter):
         if parent is None:
             return None
         q = f"name = '{name.replace(chr(39), chr(92) + chr(39))}' and '{parent}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        res = self.service.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        res = self._execute(self.service.files().list(q=q, fields="files(id)", pageSize=1))
         files = res.get("files", [])
         if files:
             fid = files[0]["id"]
         elif create:
-            fid = self.service.files().create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}, fields="id").execute()["id"]
+            fid = self._execute(
+                self.service.files().create(
+                    body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]},
+                    fields="id",
+                )
+            )["id"]
         else:
             return None
         self._folder_cache[path] = fid
@@ -397,7 +407,7 @@ class GoogleDriveAdapter(ArchiveAdapter):
         if parent is None:
             return None
         q = f"name = '{name.replace(chr(39), chr(92) + chr(39))}' and '{parent}' in parents and trashed = false"
-        files = self.service.files().list(q=q, fields="files(id,size)", pageSize=1).execute().get("files", [])
+        files = self._execute(self.service.files().list(q=q, fields="files(id,size)", pageSize=1)).get("files", [])
         return files[0]["id"] if files else None
 
     def ensure_tree(self, key: str) -> None:
@@ -412,8 +422,8 @@ class GoogleDriveAdapter(ArchiveAdapter):
         k = self._key(key)
         folder, _, name = k.rpartition("/")
         parent = self._folder_for(folder, create=True)
-        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=len(data) > 5 * 1024 * 1024)
-        self.service.files().create(body={"name": name, "parents": [parent]}, media_body=media, fields="id").execute()
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=True, chunksize=self.chunk_size_bytes)
+        self._execute(self.service.files().create(body={"name": name, "parents": [parent]}, media_body=media, fields="id"))
 
     def exists(self, key: str) -> bool:
         return self._file_id(key) is not None
@@ -422,14 +432,14 @@ class GoogleDriveAdapter(ArchiveAdapter):
         fid = self._file_id(key)
         if fid is None:
             return None
-        meta = self.service.files().get(fileId=fid, fields="size").execute()
+        meta = self._execute(self.service.files().get(fileId=fid, fields="size"))
         return int(meta.get("size", 0))
 
     def get(self, key: str) -> bytes:
         fid = self._file_id(key)
         if fid is None:
             raise ArchiveError(f"missing {key}")
-        return self.service.files().get_media(fileId=fid).execute()
+        return self._execute(self.service.files().get_media(fileId=fid))
 
     def list(self, prefix: str) -> List[str]:
         out: List[str] = []
@@ -440,7 +450,14 @@ class GoogleDriveAdapter(ArchiveAdapter):
         def walk(folder_id: str, rel: str) -> None:
             page = None
             while True:
-                res = self.service.files().list(q=f"'{folder_id}' in parents and trashed = false", fields="nextPageToken, files(id,name,mimeType)", pageToken=page, pageSize=200).execute()
+                res = self._execute(
+                    self.service.files().list(
+                        q=f"'{folder_id}' in parents and trashed = false",
+                        fields="nextPageToken, files(id,name,mimeType)",
+                        pageToken=page,
+                        pageSize=200,
+                    )
+                )
                 for f in res.get("files", []):
                     r = f"{rel}/{f['name']}" if rel else f["name"]
                     if f["mimeType"] == "application/vnd.google-apps.folder":

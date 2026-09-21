@@ -240,6 +240,25 @@ async def test_mirror_write_once_tree_and_index(db, source, tmp_path):
     assert rec2["local"]["missing"] == 1
 
 
+async def test_mirror_pending_drains_backlog_across_runs(db, source, tmp_path):
+    judgments = [
+        await _promote_one(db, source, "PLD 2024 SC 510"),
+        await _promote_one(db, source, "PLD 2024 SC 511"),
+        await _promote_one(db, source, "PLD 2024 SC 512"),
+    ]
+    root = tmp_path / "drain"
+    db.add(ArchiveTarget(name="drain", target_type="local_path", root_path=str(root)))
+    await db.commit()
+
+    # A low per-run limit must still advance through backlog entries over successive runs.
+    for _ in range(3):
+        await ArchiveMirror(db).mirror_pending(limit=1)
+        await db.commit()
+
+    for judgment in judgments:
+        assert (root / judgment_prefix(judgment) / "judgment.txt").exists()
+
+
 async def test_one_target_failing_others_succeed(db, source, tmp_path):
     await _promote_one(db, source, "PLD 2024 SC 501")
     good = tmp_path / "good"

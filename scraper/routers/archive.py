@@ -71,9 +71,9 @@ async def target_action(name: str, action: str, db: AsyncSession = Depends(get_d
 @router.post("/mirror")
 async def mirror_now(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     mirror = ArchiveMirror(db)
-    result = await mirror.mirror_pending()
-    result["statutes"] = await mirror.mirror_statutes()
-    result["instruments"] = await mirror.mirror_instruments()
+    result = await mirror.mirror_pending(limit=settings.ARCHIVE_MIRROR_JUDGMENTS_PER_RUN)
+    result["statutes"] = await mirror.mirror_statutes(limit=settings.ARCHIVE_MIRROR_STATUTES_PER_RUN)
+    result["instruments"] = await mirror.mirror_instruments(limit=settings.ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN)
     await db.commit()
     return result
 

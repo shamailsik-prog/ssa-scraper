@@ -59,8 +59,19 @@ app.conf.update(
         },
         "classify-treatment-nightly": {"task": "scraper.tasks.treatment.classify_treatment", "schedule": 86400},
         "process-embeddings": {"task": "scraper.tasks.embeddings.process_embedding_queue", "schedule": 300},
-        "archive-mirror": {"task": "scraper.tasks.archive_mirror.mirror_pending", "schedule": 1800},
-        "reconcile-storage": {"task": "scraper.tasks.archive_mirror.reconcile_storage", "schedule": 86400},
+        "archive-mirror": {
+            "task": "scraper.tasks.archive_mirror.mirror_pending",
+            "schedule": settings.ARCHIVE_MIRROR_INTERVAL_SECONDS,
+            "kwargs": {
+                "limit": settings.ARCHIVE_MIRROR_JUDGMENTS_PER_RUN,
+                "statute_limit": settings.ARCHIVE_MIRROR_STATUTES_PER_RUN,
+                "instrument_limit": settings.ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN,
+            },
+        },
+        "reconcile-storage": {
+            "task": "scraper.tasks.archive_mirror.reconcile_storage",
+            "schedule": settings.ARCHIVE_RECONCILE_INTERVAL_SECONDS,
+        },
     },
 )
 if settings.TREATMENT_RECONCILE_ENABLED:

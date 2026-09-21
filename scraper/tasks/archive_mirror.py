@@ -6,16 +6,21 @@ from typing import Any, Dict
 
 from celery import shared_task
 
+from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.storage.archive import ArchiveMirror
 
 
-async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
+async def mirror_pending(
+    limit: int = settings.ARCHIVE_MIRROR_JUDGMENTS_PER_RUN,
+    statute_limit: int = settings.ARCHIVE_MIRROR_STATUTES_PER_RUN,
+    instrument_limit: int = settings.ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN,
+) -> Dict[str, Any]:
     async with SessionLocal() as db:
         mirror = ArchiveMirror(db)
         result = await mirror.mirror_pending(limit)
-        statutes = await mirror.mirror_statutes()
-        instruments = await mirror.mirror_instruments()
+        statutes = await mirror.mirror_statutes(limit=statute_limit)
+        instruments = await mirror.mirror_instruments(limit=instrument_limit)
         await db.commit()
         result["statutes"] = statutes
         result["instruments"] = instruments
@@ -30,8 +35,12 @@ async def reconcile_storage() -> Dict[str, Any]:
 
 
 @shared_task(name="scraper.tasks.archive_mirror.mirror_pending")
-def mirror_pending_task(limit: int = 200):
-    return run_async(mirror_pending(limit))
+def mirror_pending_task(
+    limit: int = settings.ARCHIVE_MIRROR_JUDGMENTS_PER_RUN,
+    statute_limit: int = settings.ARCHIVE_MIRROR_STATUTES_PER_RUN,
+    instrument_limit: int = settings.ARCHIVE_MIRROR_INSTRUMENTS_PER_RUN,
+):
+    return run_async(mirror_pending(limit=limit, statute_limit=statute_limit, instrument_limit=instrument_limit))
 
 
 @shared_task(name="scraper.tasks.archive_mirror.reconcile_storage")

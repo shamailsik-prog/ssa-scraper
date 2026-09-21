@@ -28,12 +28,12 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.fetchers import read_raw
-from scraper.models import ArchiveObject, ArchiveTarget, Judgment, SourceProvenance, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import ArchiveObject, ArchiveTarget, CorpusMetadata, Judgment, SourceProvenance, Statute, StatuteSection, StatuteSectionVersion
 from scraper.notify import notify
 from scraper.parsers.pdf_writer import RENDERED_COPY_LABEL, render_judgment_pdf_bytes
 from scraper.security import is_login_session
@@ -67,7 +67,12 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
         "smb": {"server": settings.ARCHIVE_SMB_SERVER, "share": settings.ARCHIVE_SMB_SHARE, "user": settings.ARCHIVE_SMB_USER, "password": settings.ARCHIVE_SMB_PASSWORD.get_secret_value(), "root": settings.ARCHIVE_SMB_ROOT},
         "dropbox": {"token": settings.ARCHIVE_DROPBOX_TOKEN.get_secret_value(), "root": settings.ARCHIVE_DROPBOX_ROOT},
         "onedrive": {"token": settings.ARCHIVE_ONEDRIVE_TOKEN.get_secret_value(), "root": settings.ARCHIVE_ONEDRIVE_ROOT},
-        "google_drive": {"service_account_json": settings.GOOGLE_APPLICATION_CREDENTIALS_JSON.get_secret_value() if settings.GOOGLE_APPLICATION_CREDENTIALS_JSON else "", "folder_id": settings.DRIVE_FOLDER_ROOT},
+        "google_drive": {
+            "service_account_json": settings.GOOGLE_APPLICATION_CREDENTIALS_JSON.get_secret_value() if settings.GOOGLE_APPLICATION_CREDENTIALS_JSON else "",
+            "folder_id": settings.DRIVE_FOLDER_ROOT,
+            "chunk_size_mb": settings.DRIVE_CHUNK_SIZE_MB,
+            "api_retries": settings.GOOGLE_DRIVE_API_RETRIES,
+        },
     }.get(t.target_type, {})
     for k, v in env.items():
         if v and not cfg.get(k):
@@ -87,6 +92,64 @@ class ArchiveMirror:
 
     async def targets(self) -> List[ArchiveTarget]:
         return list((await self.db.execute(select(ArchiveTarget).where(ArchiveTarget.enabled.is_(True)))).scalars().all())
+
+    async def _get_meta_int(self, key: str, default: int = 0) -> int:
+        row = (await self.db.execute(select(CorpusMetadata).where(CorpusMetadata.key == key))).scalars().first()
+        if row is None:
+            return default
+        try:
+            return int(row.value)
+        except Exception:
+            return default
+
+    async def _set_meta_int(self, key: str, value: int) -> None:
+        row = (await self.db.execute(select(CorpusMetadata).where(CorpusMetadata.key == key))).scalars().first()
+        if row is None:
+            self.db.add(CorpusMetadata(key=key, value=str(max(0, int(value)))))
+        else:
+            row.value = str(max(0, int(value)))
+        await self.db.flush()
+
+    async def _pending_judgments(self, target: ArchiveTarget, *, limit: int, include_login_session: bool) -> List[Judgment]:
+        """Return judgments that still need mirror objects for this target."""
+        written_count = func.count(ArchiveObject.id)
+        q = (
+            select(Judgment)
+            .outerjoin(
+                ArchiveObject,
+                and_(
+                    ArchiveObject.target_id == target.id,
+                    ArchiveObject.judgment_id == Judgment.id,
+                    ArchiveObject.status == "written",
+                ),
+            )
+            .group_by(Judgment.id)
+            .having(written_count < 3)
+            .order_by(Judgment.promoted_at.asc(), Judgment.id.asc())
+            .limit(max(1, int(limit)))
+        )
+        if not include_login_session:
+            q = q.where(Judgment.access_method != "login_session")
+        return list((await self.db.execute(q)).scalars().all())
+
+    async def _count_pending_login_session_judgments(self, target: ArchiveTarget) -> int:
+        written_count = func.count(ArchiveObject.id)
+        q = (
+            select(func.count())
+            .select_from(Judgment)
+            .outerjoin(
+                ArchiveObject,
+                and_(
+                    ArchiveObject.target_id == target.id,
+                    ArchiveObject.judgment_id == Judgment.id,
+                    ArchiveObject.status == "written",
+                ),
+            )
+            .where(Judgment.access_method == "login_session")
+            .group_by(Judgment.id)
+            .having(written_count < 3)
+        )
+        return len((await self.db.execute(q)).all())
 
     # ------------------------------------------------------------------ objects for a judgment
     async def judgment_objects(self, j: Judgment) -> List[Dict[str, Any]]:
@@ -183,10 +246,13 @@ class ArchiveMirror:
         targets = await self.targets()
         if not targets:
             return {"targets": 0, "note": "no archive targets configured"}
-        judgments = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
-        index_rows: List[List[str]] = []
         for t in targets:
+            include_login_session = bool(settings.MIRROR_LOGIN_SESSION_ROWS and t.mirror_login_session_rows)
             summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0})
+            if not include_login_session:
+                summary["skipped_policy"] += await self._count_pending_login_session_judgments(t)
+            judgments = await self._pending_judgments(t, limit=limit, include_login_session=include_login_session)
+            index_rows: List[List[str]] = []
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
@@ -198,7 +264,7 @@ class ArchiveMirror:
                 continue
             failures = 0
             for j in judgments:
-                if not self._policy_allows(t, j.access_method):
+                if not include_login_session and is_login_session(j.access_method):
                     summary["skipped_policy"] += 1
                     continue
                 already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
@@ -240,13 +306,12 @@ class ArchiveMirror:
                 t.last_error = None
                 t.last_ok_at = datetime.now(timezone.utc)
             await self.db.flush()
-            index_rows = []
         return {"targets": len(targets), "summary": self.summary}
 
     async def mirror_statutes(self, limit: int = 500) -> Dict[str, Any]:
         targets = await self.targets()
-        rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()).limit(limit))).all()
         out: Dict[str, int] = {}
+        page_size = max(1, int(settings.ARCHIVE_MIRROR_SCAN_PAGE_SIZE))
         for t in targets:
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
@@ -254,13 +319,42 @@ class ArchiveMirror:
                 t.last_error = f"adapter init: {exc}"[:2000]
                 continue
             n = 0
-            for ver, sec, st in rows:
-                key = f"Statutes/{slug(st.jurisdiction or 'Federal', 30)}/{slug(st.name)}/{slug(sec.section_number, 40)}/v{ver.version_no}.txt"
-                try:
-                    status = await self._write(t, adapter, {"key": key, "data": ver.section_text.encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=ver.source_provenance_id)
-                    n += status == "written"
-                except Exception as exc:
-                    logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+            cursor_key = f"archive_cursor:{t.id}:statute_versions_offset"
+            offset = await self._get_meta_int(cursor_key, default=0)
+            reset_once = False
+            while n < limit:
+                rows = (
+                    await self.db.execute(
+                        select(StatuteSectionVersion, StatuteSection, Statute)
+                        .join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id)
+                        .join(Statute, Statute.id == StatuteSection.statute_id)
+                        .order_by(StatuteSectionVersion.created_at.asc(), StatuteSectionVersion.id.asc())
+                        .offset(offset)
+                        .limit(page_size)
+                    )
+                ).all()
+                if not rows:
+                    if offset > 0 and not reset_once:
+                        offset = 0
+                        reset_once = True
+                        continue
+                    break
+                offset += len(rows)
+                for ver, sec, st in rows:
+                    key = f"Statutes/{slug(st.jurisdiction or 'Federal', 30)}/{slug(st.name)}/{slug(sec.section_number, 40)}/v{ver.version_no}.txt"
+                    try:
+                        status = await self._write(
+                            t,
+                            adapter,
+                            {"key": key, "data": ver.section_text.encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"},
+                            prov_id=ver.source_provenance_id,
+                        )
+                        n += status == "written"
+                    except Exception as exc:
+                        logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+                    if n >= limit:
+                        break
+            await self._set_meta_int(cursor_key, offset)
             out[t.name] = n
         return out
 
@@ -268,8 +362,8 @@ class ArchiveMirror:
         from scraper.models import Instrument
 
         targets = await self.targets()
-        rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()).limit(limit))).scalars().all()
         out: Dict[str, int] = {}
+        page_size = max(1, int(settings.ARCHIVE_MIRROR_SCAN_PAGE_SIZE))
         for t in targets:
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
@@ -277,14 +371,41 @@ class ArchiveMirror:
                 t.last_error = f"adapter init: {exc}"[:2000]
                 continue
             n = 0
-            for inst in rows:
-                year = inst.date.year if inst.date else "undated"
-                key = f"Instruments/{year}/{slug(inst.title or inst.number or str(inst.id), 100)}_{inst.full_text_hash[:10] if inst.full_text_hash else str(inst.id)[:8]}.txt"
-                try:
-                    status = await self._write(t, adapter, {"key": key, "data": (inst.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=inst.source_provenance_id)
-                    n += status == "written"
-                except Exception as exc:
-                    logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+            cursor_key = f"archive_cursor:{t.id}:instruments_offset"
+            offset = await self._get_meta_int(cursor_key, default=0)
+            reset_once = False
+            while n < limit:
+                rows = (
+                    await self.db.execute(
+                        select(Instrument)
+                        .order_by(Instrument.created_at.asc(), Instrument.id.asc())
+                        .offset(offset)
+                        .limit(page_size)
+                    )
+                ).scalars().all()
+                if not rows:
+                    if offset > 0 and not reset_once:
+                        offset = 0
+                        reset_once = True
+                        continue
+                    break
+                offset += len(rows)
+                for inst in rows:
+                    year = inst.date.year if inst.date else "undated"
+                    key = f"Instruments/{year}/{slug(inst.title or inst.number or str(inst.id), 100)}_{inst.full_text_hash[:10] if inst.full_text_hash else str(inst.id)[:8]}.txt"
+                    try:
+                        status = await self._write(
+                            t,
+                            adapter,
+                            {"key": key, "data": (inst.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"},
+                            prov_id=inst.source_provenance_id,
+                        )
+                        n += status == "written"
+                    except Exception as exc:
+                        logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+                    if n >= limit:
+                        break
+            await self._set_meta_int(cursor_key, offset)
             out[t.name] = n
         return out
 
