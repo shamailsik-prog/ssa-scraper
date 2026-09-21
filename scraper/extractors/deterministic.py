@@ -48,6 +48,30 @@ GAZETTE_REF = re.compile(r"(?i)gazette of pakistan[^\n]{0,120}")
 _MONTH_IDX = {m: i % 12 + 1 for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split())}
 
 
+def classify_judgment_document_type(
+    *,
+    raw_text: str,
+    judge_names: List[str],
+    has_case_title: bool,
+) -> str:
+    """Classify judgment content quality for fail-closed promotion decisions."""
+    norm = (raw_text or "").lower()
+    has_notes_banner = any(marker in norm for marker in ("notes on cases", "notes-on-cases", "notes on case"))
+    has_case_description = "case description" in norm
+    has_judgment_heading = bool(re.search(r"(?i)\bjudg?ment\b", raw_text or ""))
+    has_before_or_coram = bool(re.search(r"(?i)\b(before|coram)\b", raw_text or ""))
+    long_body = len(raw_text or "") >= 800
+    medium_body = len(raw_text or "") >= 400
+    has_judges = bool(judge_names)
+    if has_notes_banner and not (long_body and has_judges and (has_before_or_coram or has_judgment_heading or has_case_description)):
+        return "headnote_only"
+    if long_body and (has_judges or has_before_or_coram) and (has_judgment_heading or has_case_description):
+        return "full_judgment"
+    if medium_body and (has_case_title or has_judges or has_before_or_coram):
+        return "partial_judgment"
+    return "summary_only"
+
+
 def _to_date(parts, order: str) -> Optional[date]:
     try:
         if order == "dmy_name":
@@ -204,7 +228,13 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
                 doc_links.append(href)
     fields = {"citation": own[0] if own else None, "court": court, "year": year, "title": title, "judges": bench.judge_names, "content": raw_text}
     conf = score_confidence(fields)
+    document_type = classify_judgment_document_type(
+        raw_text=raw_text,
+        judge_names=bench.judge_names,
+        has_case_title=bool(title),
+    )
     data = JudgmentExtraction(
+        document_type=document_type,  # full_judgment|partial_judgment|headnote_only|summary_only
         citations=own,
         case_title=title,
         court=court,

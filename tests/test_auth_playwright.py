@@ -782,6 +782,59 @@ async def test_pipeline_extracts_archivedpatient_grid_rows_without_search_form(d
     assert (await db.execute(select(func.count()).select_from(ScraperStaging))).scalar() == 1
 
 
+async def test_pipeline_uses_case_description_child_hash_to_avoid_shell_duplicates(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 901", "Case 901", "Supreme Court", "https://www.pakistanlawsite.com/case/901"),
+        ("PLD 2024 SC 902", "Case 902", "Supreme Court", "https://www.pakistanlawsite.com/case/902"),
+    ]
+    shell_html = "<html><body><a href='/logout'>Logout</a><h3>Citation Name:</h3><p>Notes on Cases</p></body></html>"
+    modal_a = (
+        "PLD 2024 SC 901\nBEFORE: Justice A, Justice B\nJUDGMENT\n"
+        "The appellant sought relief under section 302 of the Pakistan Penal Code, 1860.\n"
+        "The full reasoning continues for several paragraphs with procedural and factual detail.\n"
+    ) * 8
+    modal_b = (
+        "PLD 2024 SC 902\nBEFORE: Justice C, Justice D\nJUDGMENT\n"
+        "The respondent challenged jurisdiction and relied upon PLD 2019 SC 1.\n"
+        "The full reasoning continues for several paragraphs with statutory interpretation detail.\n"
+    ) * 8
+
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.routes[("goto", "https://www.pakistanlawsite.com/case/901")] = lambda _browser: PageResult(
+        url="https://www.pakistanlawsite.com/case/901",
+        html=shell_html,
+        status=200,
+        metadata={"case_description_text": modal_a, "child_hash": "child-a", "case_description_chars": len(modal_a)},
+    )
+    sc.routes[("goto", "https://www.pakistanlawsite.com/case/902")] = lambda _browser: PageResult(
+        url="https://www.pakistanlawsite.com/case/902",
+        html=shell_html,
+        status=200,
+        metadata={"case_description_text": modal_b, "child_hash": "child-b", "case_description_chars": len(modal_b)},
+    )
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+
+    staged = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.asc()))).scalars().all()
+    assert stats["rows"] == 2
+    assert stats["staged"] == 2
+    assert stats["duplicates"] == 0
+    assert len(staged) == 2
+    assert staged[0].content_hash != staged[1].content_hash
+    assert "PLD 2024 SC 901" in (staged[0].raw_text + staged[1].raw_text)
+    assert "PLD 2024 SC 902" in (staged[0].raw_text + staged[1].raw_text)
+
+
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
@@ -1097,6 +1150,18 @@ async def test_pipeline_citation_grid_raises_when_rows_have_no_detail_urls(db, l
     assert pipeline.stats["rows"] == 1
     assert pipeline.stats["staged"] == 0
     assert pipeline.stats["url_less_skips"] == 1
+
+
+async def test_touch_clears_stale_current_slot_needs_human_reason(db, login_source):
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "current_slot": 2,
+        "current_slot_reason": "slot 2 needs human login",
+    }
+    await db.commit()
+    await mgr.touch(2)
+    assert (login_source.config_json or {}).get("current_slot_reason") in (None, "")
 
 
 async def test_login_scraping_disabled_outside_chambers(db, login_source, monkeypatch):

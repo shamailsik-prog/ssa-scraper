@@ -108,6 +108,19 @@ async def _ensure_judges(db: AsyncSession, names, court: Optional[Court]) -> Non
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
+    document_type = str(data.get("document_type") or "")
+    if st.access_method == "login_session" and document_type and document_type != "full_judgment":
+        await _quarantine(
+            db,
+            st,
+            f"document_type:{document_type}",
+            "judgment",
+            {
+                "document_type": document_type,
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
     stub_signal = detect_judgment_stub(
         source_url=st.source_url or data.get("source_url"),
         raw_text=st.raw_text,
@@ -235,6 +248,39 @@ def _norm_section(n: Optional[str]) -> str:
     if stable_key:
         return stable_key
     return raw
+
+
+_STATUTE_TITLE_KEYWORDS = re.compile(r"(?i)\b(act|code|ordinance|rules|regulations|constitution|order)\b")
+_CLAUSE_STYLE_NAME = re.compile(r"(?i)\b(provided that|whereas|shall|hereby|thereof|substituted|inserted|omitted|punishment)\b")
+_LEGAL_SECTION_MARKERS = re.compile(r"(?i)\b(section|article|rule|schedule|shall|offence|penalty|court|act|code|ordinance)\b")
+_EDU_CONTAMINATION_MARKERS = re.compile(r"(?i)\b(university|semester|syllabus|curriculum|admission|student|faculty|credit\s*hour|campus|department|exam(?:ination)?s?)\b")
+
+
+def _statute_contamination_reason(name: str, sections: list[dict], raw_text: str) -> Optional[str]:
+    title = (name or "").strip()
+    if not title:
+        return "statute name missing"
+    title_words = len(title.split())
+    if _CLAUSE_STYLE_NAME.search(title) and not _STATUTE_TITLE_KEYWORDS.search(title):
+        return "statute_name looks like clause text, not an enactment title"
+    if title_words > 24:
+        return "statute_name is implausibly long and likely parser contamination"
+    section_texts = [str((s or {}).get("section_text") or "").strip() for s in sections]
+    section_texts = [txt for txt in section_texts if txt]
+    if not section_texts:
+        return "statute sections missing"
+    legal_hits = sum(1 for txt in section_texts if _LEGAL_SECTION_MARKERS.search(txt))
+    if legal_hits == 0:
+        return "statute sections lack legal-section markers"
+    edu_hits = sum(1 for txt in section_texts if _EDU_CONTAMINATION_MARKERS.search(txt))
+    if edu_hits and edu_hits >= max(1, int(len(section_texts) * 0.5)):
+        return "statute sections resemble non-legal/academic content"
+    sample = " ".join(section_texts[:5])[:6000]
+    if _EDU_CONTAMINATION_MARKERS.search(sample) and not _LEGAL_SECTION_MARKERS.search(sample):
+        return "statute body appears contaminated (non-legal text dominates sample)"
+    if title and _STATUTE_TITLE_KEYWORDS.search(title) and not _STATUTE_TITLE_KEYWORDS.search(raw_text[:20000]):
+        return "statute title not evidenced in raw source text"
+    return None
 
 
 def _validated_mentions_payload(
@@ -1375,6 +1421,16 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     sections = data.get("sections") or []
     if not name or not sections:
         await _quarantine(db, st, "statute name or sections missing", "statute")
+        return "quarantined"
+    contamination_reason = _statute_contamination_reason(name, sections, st.raw_text or "")
+    if contamination_reason:
+        await _quarantine(
+            db,
+            st,
+            contamination_reason,
+            "statute",
+            {"statute_name": name, "section_count": len(sections)},
+        )
         return "quarantined"
     statute = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
     if statute is None:

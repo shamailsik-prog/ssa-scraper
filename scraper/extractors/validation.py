@@ -92,6 +92,8 @@ def reconcile_judgment(
 
     # G. full_text always from preserved source
     out["full_text_candidate"] = raw_text
+    document_type = str(out.get("document_type") or "summary_only")
+    out["document_type"] = document_type
 
     # E. deterministic citations are authoritative; AI citations only if present in raw
     det_cits = [normalise_citation(c) for c in deterministic.get("citations") or [] if c]
@@ -264,6 +266,7 @@ def reconcile_judgment(
     out["extractor_confidence"] = conf
     quarantine = (
         stub_signal is not None
+        or document_type in ("headnote_only", "summary_only")
         or conf < min_confidence
         or not out["citations"]
         or not out.get("court")
@@ -279,6 +282,8 @@ def reconcile_judgment(
             reason = "court unknown"
         elif any(c["field"] == "primary_citation" for c in conflicts):
             reason = "citation conflict between deterministic parser and AI"
+        elif document_type in ("headnote_only", "summary_only"):
+            reason = f"document_type:{document_type}"
         else:
             reason = f"confidence {conf} below threshold {min_confidence}"
     return ValidationOutcome(out, conf, conflicts, errors, quarantine, reason)

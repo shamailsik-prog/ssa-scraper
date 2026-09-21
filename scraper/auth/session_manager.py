@@ -177,10 +177,15 @@ class SessionManager:
         if wanted:
             for s in slots:
                 if s.slot_number == wanted and s.state == "ACTIVE":
+                    if cfg.get("current_slot_reason") and "needs human login" in str(cfg.get("current_slot_reason")).lower():
+                        cfg["current_slot_reason"] = None
+                        self.source.config_json = cfg
                     return s
         for s in slots:
             if s.state == "ACTIVE":
                 cfg["current_slot"] = s.slot_number
+                if cfg.get("current_slot_reason") and "needs human login" in str(cfg.get("current_slot_reason")).lower():
+                    cfg["current_slot_reason"] = None
                 self.source.config_json = cfg
                 return s
         return None
@@ -294,6 +299,12 @@ class SessionManager:
         s = await self.slot(slot_number)
         s.last_used_at = datetime.now(timezone.utc)
         s.last_verified_at = s.last_used_at
+        cfg = dict(self.source.config_json or {})
+        if cfg.get("current_slot") == slot_number and cfg.get("current_slot_reason"):
+            reason = str(cfg.get("current_slot_reason") or "")
+            if "needs human login" in reason.lower():
+                cfg["current_slot_reason"] = None
+                self.source.config_json = cfg
         await self.db.flush()
 
 
@@ -700,6 +711,78 @@ class PlaywrightBrowser:
             }
         return await self._wrap(self._page.content()), {}
 
+    async def _capture_case_description_text(self) -> Optional[Dict[str, Any]]:
+        """Extract expanded Case Description body text when detail pages render shell + modal."""
+        try:
+            payload = await self._wrap(
+                self._page.evaluate(
+                    """async () => {
+                        const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                        const pickTrigger = () => {
+                            const nodes = Array.from(document.querySelectorAll("a,button,input[type='button'],input[type='submit']"));
+                            return nodes.find((node) => /case\\s*description/i.test(normalize(node.innerText || node.textContent || node.value || "")));
+                        };
+                        const trigger = pickTrigger();
+                        if (trigger) {
+                            try {
+                                trigger.click();
+                                await new Promise((resolve) => setTimeout(resolve, 150));
+                            } catch (_err) {
+                                // Continue best-effort extraction from already-rendered content.
+                            }
+                        }
+                        const candidates = [];
+                        const addCandidate = (label, node) => {
+                            if (!node) return;
+                            const text = normalize(node.innerText || node.textContent || "");
+                            if (text.length >= 300) {
+                                candidates.push({ label, text });
+                            }
+                        };
+                        const selectors = [
+                            "#CaseDescription",
+                            "#caseDescription",
+                            ".case-description",
+                            ".caseDescription",
+                            "[id*='CaseDescription']",
+                            ".modal.show .modal-body",
+                            ".modal-body",
+                            "#case_details",
+                            ".case-details",
+                            ".judgment-body",
+                            ".judgment-text"
+                        ];
+                        for (const selector of selectors) {
+                            const nodes = document.querySelectorAll(selector);
+                            nodes.forEach((node, idx) => addCandidate(`${selector}[${idx}]`, node));
+                        }
+                        const rows = document.querySelectorAll("tr");
+                        rows.forEach((row, idx) => {
+                            const heading = normalize((row.querySelector("th,td") || {}).innerText || "");
+                            if (/case\\s*description/i.test(heading)) {
+                                addCandidate(`table-row:${idx}`, row);
+                            }
+                        });
+                        if (!candidates.length) return null;
+                        candidates.sort((a, b) => b.text.length - a.text.length);
+                        return candidates[0];
+                    }"""
+                )
+            )
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        text = str(payload.get("text") or "").strip()
+        if len(text) < 300:
+            return None
+        child_hash = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
+        return {
+            "text": text,
+            "selector": str(payload.get("label") or ""),
+            "child_hash": child_hash,
+        }
+
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         resp = await self._wrap(
@@ -710,6 +793,29 @@ class PlaywrightBrowser:
             )
         )
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        case_payload = None
+        if "ReferenceCaseLawSearch" in (self._page.url or ""):
+            case_payload = await self._capture_case_description_text()
+            if case_payload is not None:
+                snippet = (
+                    '<section id="pls-case-description" data-child-hash="'
+                    + html.escape(case_payload["child_hash"], quote=True)
+                    + '"><h2>Case Description</h2><pre>'
+                    + html.escape(case_payload["text"])
+                    + "</pre></section>"
+                )
+                if "</body>" in html_text:
+                    html_text = html_text.replace("</body>", snippet + "</body>", 1)
+                else:
+                    html_text += snippet
+                metadata.update(
+                    {
+                        "case_description_selector": case_payload.get("selector"),
+                        "case_description_chars": len(case_payload["text"]),
+                        "child_hash": case_payload["child_hash"],
+                        "case_description_text": case_payload["text"],
+                    }
+                )
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)

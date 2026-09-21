@@ -137,13 +137,25 @@ class HybridExtractor:
         return self._court_directory
 
     # ------------------------------------------------------------------ core
-    async def _run(self, extraction_type: str, inp: ExtractionInput, deterministic: Dict[str, Any], mandatory, reconcile) -> ExtractionOutcome:
+    async def _run(
+        self,
+        extraction_type: str,
+        inp: ExtractionInput,
+        deterministic: Dict[str, Any],
+        mandatory,
+        reconcile,
+        *,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         started = time.monotonic()
         det_conf = float(deterministic.get("extractor_confidence") or 0.0)
         engine, mode = self.permitted_engine()
         ai_json: Optional[Dict[str, Any]] = None
         ai_result: Optional[EngineResult] = None
         ai_status = mode if engine is None else "pending"
+        if deterministic_only:
+            engine = None
+            ai_status = "ai_skipped"
         # B. accept deterministic output without spending AI when confident and complete
         if engine is not None and not self.force_ai and det_conf >= self.min_confidence and mandatory_present(deterministic, mandatory):
             ai_status = "ai_skipped"
@@ -241,7 +253,15 @@ class HybridExtractor:
             source_meta=dict(source_meta or {}),
         )
 
-    async def extract_judgment(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
+    async def extract_judgment(
+        self,
+        *,
+        html=None,
+        text=None,
+        source_meta=None,
+        content_hash=None,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         from scraper.parsers.text_cleaner import clean_html
 
         raw_text = text or (clean_html(html) if html else "")
@@ -262,28 +282,74 @@ class HybridExtractor:
                 court_directory=directory,
                 min_confidence=self.min_confidence,
             ),
+            deterministic_only=deterministic_only,
         )
 
-    async def extract_statute(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
+    async def extract_statute(
+        self,
+        *,
+        html=None,
+        text=None,
+        source_meta=None,
+        content_hash=None,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         from scraper.parsers.text_cleaner import clean_html
 
         raw_text = text or (clean_html(html) if html else "")
         deterministic = det.extract_statute_deterministic(html=html, text=raw_text, source_meta=source_meta)
         inp = self._input(html=html, text=raw_text, source_meta=source_meta, content_hash=content_hash)
-        return await self._run("statute", inp, deterministic, MANDATORY_STATUTE_FIELDS, lambda d, a: reconcile_statute(deterministic=d, ai=a, raw_text=raw_text, min_confidence=self.min_confidence))
+        return await self._run(
+            "statute",
+            inp,
+            deterministic,
+            MANDATORY_STATUTE_FIELDS,
+            lambda d, a: reconcile_statute(deterministic=d, ai=a, raw_text=raw_text, min_confidence=self.min_confidence),
+            deterministic_only=deterministic_only,
+        )
 
-    async def extract_instrument(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
+    async def extract_instrument(
+        self,
+        *,
+        html=None,
+        text=None,
+        source_meta=None,
+        content_hash=None,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         from scraper.parsers.text_cleaner import clean_html
 
         raw_text = text or (clean_html(html) if html else "")
         deterministic = det.extract_instrument_deterministic(html=html, text=raw_text, source_meta=source_meta)
         inp = self._input(html=html, text=raw_text, source_meta=source_meta, content_hash=content_hash)
-        return await self._run("instrument", inp, deterministic, MANDATORY_INSTRUMENT_FIELDS, lambda d, a: reconcile_instrument(deterministic=d, ai=a, raw_text=raw_text, min_confidence=self.min_confidence))
+        return await self._run(
+            "instrument",
+            inp,
+            deterministic,
+            MANDATORY_INSTRUMENT_FIELDS,
+            lambda d, a: reconcile_instrument(deterministic=d, ai=a, raw_text=raw_text, min_confidence=self.min_confidence),
+            deterministic_only=deterministic_only,
+        )
 
-    async def extract_result_rows(self, *, html, search_map=None, base_url: str = "", content_hash=None) -> ExtractionOutcome:
+    async def extract_result_rows(
+        self,
+        *,
+        html,
+        search_map=None,
+        base_url: str = "",
+        content_hash=None,
+        deterministic_only: bool = False,
+    ) -> ExtractionOutcome:
         deterministic = det.extract_result_rows_deterministic(html=html, search_map=search_map, base_url=base_url)
         inp = self._input(html=html, text=None, source_meta={"url": base_url}, content_hash=content_hash)
-        return await self._run("result_rows", inp, deterministic, ("result_rows",), lambda d, a: reconcile_result_rows(deterministic=d, ai=a, html=html))
+        return await self._run(
+            "result_rows",
+            inp,
+            deterministic,
+            ("result_rows",),
+            lambda d, a: reconcile_result_rows(deterministic=d, ai=a, html=html),
+            deterministic_only=deterministic_only,
+        )
 
 
 def _trim(d: Optional[Dict[str, Any]], limit: int = 20000) -> Optional[Dict[str, Any]]:

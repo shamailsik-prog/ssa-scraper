@@ -517,8 +517,43 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
         html = page.html
-        prov = await record_provenance(self.db, source=self.source, url=page.url, content=html.encode("utf-8"), content_kind="html", route=route, http_status=page.status)
+        route = dict(route or {})
+        detail_identity = str(row.get("case_id") or row.get("citation") or page.url or "").strip()
+        if detail_identity:
+            html = html + f"\n<!-- pls-detail-identity:{detail_identity} -->"
+        prov = await record_provenance(
+            self.db,
+            source=self.source,
+            url=page.url,
+            content=html.encode("utf-8"),
+            content_kind="html",
+            route=route,
+            http_status=page.status,
+        )
         text = clean_html(html)
+        modal_text = str((page.metadata or {}).get("case_description_text") or "").strip()
+        child_hash = str((page.metadata or {}).get("child_hash") or "")
+        staging_prov = prov
+        if modal_text and len(modal_text) >= 300 and len(modal_text) > len(text):
+            route_with_child = {
+                **route,
+                "child": "case_description",
+                "child_hash": child_hash or None,
+                "case_description_chars": int((page.metadata or {}).get("case_description_chars") or len(modal_text)),
+            }
+            child_prov = await record_provenance(
+                self.db,
+                source=self.source,
+                url=page.url,
+                content=modal_text.encode("utf-8"),
+                content_kind="text",
+                route=route_with_child,
+                http_status=page.status,
+                parent=prov,
+            )
+            staging_prov = child_prov
+            text = modal_text
+            route = route_with_child
         pdf_prov = None
         ocr = False
         if row.get("pdf_url"):
@@ -535,7 +570,7 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
-        staging = await stage_judgment(self.db, source=self.source, prov=prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(self.db, source=self.source, prov=staging_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
@@ -545,8 +580,19 @@ class PakistanLawSitePipeline:
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
-        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=prov.id, staging_id=staging.id)
-        outcome = await extractor.extract_judgment(html=html, text=text, source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url}, content_hash=prov.content_hash)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=staging_prov.id, staging_id=staging.id)
+        outcome = await extractor.extract_judgment(
+            html=html,
+            text=text,
+            source_meta={
+                "citation": row.get("citation"),
+                "title": row.get("title"),
+                "court": row.get("court"),
+                "url": page.url,
+                "access_method": self.source.access_method,
+            },
+            content_hash=staging_prov.content_hash,
+        )
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
         staging.reconciled_json = _slim(outcome.data)

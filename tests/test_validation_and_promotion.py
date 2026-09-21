@@ -137,6 +137,31 @@ def test_reconcile_judgment_quarantines_login_subscription_stubs(
     assert (out.quarantine_reason or "").startswith(expected_reason_prefix)
 
 
+def test_reconcile_judgment_quarantines_headnote_only_document_type():
+    raw = """
+    Citation Name: PLD 1979 SC 88
+    Notes on Cases
+    This digest paragraph summarizes counsel submissions but is not the full judgment body.
+    """
+    det = extract_judgment_deterministic(
+        html=None,
+        text=raw,
+        source_meta={"citation": "PLD 1979 SC 88", "court": "Supreme Court of Pakistan"},
+    )
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=raw,
+        source_url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=x",
+        raw_html=f"<html><body>{raw}</body></html>",
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.data["document_type"] == "headnote_only"
+    assert out.quarantine is True
+    assert out.quarantine_reason == "document_type:headnote_only"
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
     (
@@ -207,6 +232,40 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_blocks_login_session_non_full_judgment_document_type(db, login_source):
+    raw = "Citation Name: PLD 1979 SC 89\nNotes on Cases\nShort digest only."
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=abc",
+        content=raw.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=f"<html><body>{raw}</body></html>",
+        raw_text=raw,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=abc",
+    )
+    st.reconciled_json = {
+        "document_type": "headnote_only",
+        "citations": ["PLD 1979 SC 89"],
+        "court": "Supreme Court of Pakistan",
+        "year": 1979,
+        "case_title": "Digest only record",
+        "judge_names": [],
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.95
+    result = await promote_judgment_staging(db, st)
+    assert result == "quarantined"
+    q = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().first()
+    assert q is not None
+    assert q.reason == "document_type:headnote_only"
 
 
 # --------------------------------------------------------------------------- 8
@@ -304,6 +363,18 @@ async def test_same_judgment_from_three_routes_is_one_row(db, source):
     j = (await db.execute(select(Judgment))).scalars().first()
     assert s3.promoted_to_id == j.id
     assert (await db.execute(select(func.count()).select_from(Citation).where(Citation.judgment_id == j.id))).scalar() >= 1
+
+
+async def test_hybrid_extractor_supports_deterministic_only_flag(db, source):
+    raw = clean_html(JUDGMENT_HTML)
+    out = await HybridExtractor(db, source).extract_judgment(
+        html=JUDGMENT_HTML,
+        text=raw,
+        content_hash="d" * 64,
+        deterministic_only=True,
+    )
+    assert out.ai_status == "ai_skipped"
+    assert out.engine == "deterministic"
 
 
 async def test_citation_belonging_to_another_judgment_quarantines(db, source):
@@ -558,6 +629,64 @@ async def test_instrument_relation_graph_fails_closed_for_unresolved_targets(db)
         )
     ).scalars().all()
     assert edges == []
+
+
+@pytest.mark.parametrize(
+    ("statute_name", "section_text", "expected_reason_fragment"),
+    (
+        (
+            "Provided that where any clause is substituted in subsection 2",
+            "Section 1. Transitional clause text for this proviso.",
+            "statute_name looks like clause text",
+        ),
+        (
+            "Code of Criminal Procedure, 1898",
+            "Semester system and admission policy for university departments and faculty credits.",
+            "non-legal/academic content",
+        ),
+    ),
+)
+async def test_statute_promotion_quarantines_clause_names_and_contaminated_bodies(
+    db,
+    source,
+    statute_name,
+    section_text,
+    expected_reason_fragment,
+):
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/suspect-statute.txt",
+        content=section_text.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=section_text,
+        url="http://127.0.0.1/suspect-statute.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": statute_name,
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_text": section_text,
+                "section_title": "sample",
+            }
+        ],
+    }
+    result = await promote_statute_staging(db, st)
+    assert result == "quarantined"
+    q = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))).scalars().first()
+    assert q is not None
+    assert expected_reason_fragment in (q.reason or "")
 
 
 async def test_instrument_section_relation_graph_extracts_amendment_operations(db):

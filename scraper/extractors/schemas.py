@@ -30,6 +30,7 @@ class StatuteCitedRef(_Strict):
 
 
 class JudgmentExtraction(_Strict):
+    document_type: Optional[Literal["full_judgment", "partial_judgment", "headnote_only", "summary_only"]] = None
     citations: List[str] = Field(default_factory=list)
     case_title: Optional[str] = None
     court: Optional[str] = None
