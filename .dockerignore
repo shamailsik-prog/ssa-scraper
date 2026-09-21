@@ -3,6 +3,7 @@
 live
 raw
 state
+archive-export
 blackletter_state
 __pycache__
 .pytest_cache

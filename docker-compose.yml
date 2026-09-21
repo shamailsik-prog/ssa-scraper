@@ -6,6 +6,7 @@ x-app: &app
     - ./live:/app/live
     - ./raw:/app/raw
     - ./state:/app/state
+    - ./archive-export:/app/archive-export
   depends_on:
     postgres:
       condition: service_healthy
