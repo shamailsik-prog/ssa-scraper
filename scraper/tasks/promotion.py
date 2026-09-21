@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
+from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
@@ -108,6 +108,36 @@ async def _ensure_judges(db: AsyncSession, names, court: Optional[Court]) -> Non
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
+    document_type = str(data.get("document_type") or "").strip().lower()
+    if document_type == "headnote":
+        await _quarantine(
+            db,
+            st,
+            "headnote_only: document_type=headnote is not eligible for full_judgment promotion",
+            "judgment",
+            {
+                "document_type": data.get("document_type"),
+                "document_type_reason": data.get("document_type_reason"),
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
+    if st.source_name == "PakistanLawSite":
+        headnote_signal = detect_headnotes_only(raw_text=st.raw_text, raw_html=st.raw_html)
+        if headnote_signal is not None and headnote_signal.signal == "notes_on_cases_only":
+            await _quarantine(
+                db,
+                st,
+                guard_reason(headnote_signal),
+                "judgment",
+                {
+                    "reason_code": headnote_signal.reason_code,
+                    "signal": headnote_signal.signal,
+                    "matched_value": headnote_signal.matched_value,
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
     stub_signal = detect_judgment_stub(
         source_url=st.source_url or data.get("source_url"),
         raw_text=st.raw_text,
