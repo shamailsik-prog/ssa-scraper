@@ -62,6 +62,10 @@ SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
 DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD")
+# Confirmed absolute-seek modes: only these may keep a non-zero snapshot start_row.
+# datatable = DataTables page.info().start landed (#101).
+# dom_absolute = live non-DT grid; offset-th <tr> confirmed in DOM (New Bot hotpatch).
+CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -404,7 +408,7 @@ class PakistanLawSitePipeline:
             snapshot_start_row = 0
         snapshot_start_row = max(0, snapshot_start_row)
         self.stats["citation_grid_seek_mode"] = seek_mode or "none"
-        if seek_mode and seek_mode != "datatable" and snapshot_start_row > 0:
+        if seek_mode not in CONFIRMED_CITATION_GRID_SEEK_MODES and snapshot_start_row > 0:
             logger.warning(
                 "PakistanLawSite citation-grid snapshot reported start_row=%s for seek_mode=%s; normalizing to 0",
                 snapshot_start_row,
