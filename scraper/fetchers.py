@@ -334,6 +334,18 @@ async def stage_judgment(
     return row
 
 
+def statute_staging_identity_url(pdf_url: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Stable identity for a statute row so shared PDF bytes do not collapse distinct acts."""
+    meta = meta or {}
+    detail = str(meta.get("detail_url") or "").strip()
+    if detail:
+        return detail
+    extra = str(meta.get("act_no") or meta.get("act_title") or "").strip()
+    if extra and pdf_url:
+        return f"{pdf_url}|{extra}"
+    return None
+
+
 async def stage_statute(
     db: AsyncSession,
     *,
@@ -344,17 +356,23 @@ async def stage_statute(
     url: Optional[str],
     kind: str = "statute",
     job_id=None,
+    identity_key: Optional[str] = None,
 ) -> StatutesStaging:
-    existing = (
-        await db.execute(select(StatutesStaging).where(StatutesStaging.source_name == source.source_name, StatutesStaging.content_hash == prov.content_hash))
-    ).scalars().first()
+    stored_url = identity_key or url
+    existing_q = select(StatutesStaging).where(
+        StatutesStaging.source_name == source.source_name,
+        StatutesStaging.content_hash == prov.content_hash,
+    )
+    if identity_key:
+        existing_q = existing_q.where(StatutesStaging.source_url == identity_key)
+    existing = (await db.execute(existing_q)).scalars().first()
     if existing is not None:
         return existing
     row = StatutesStaging(
         source_id=source.id,
         source_name=source.source_name,
         access_method=source.access_method,
-        source_url=url,
+        source_url=stored_url,
         provenance_id=prov.id,
         job_id=job_id,
         content_hash=prov.content_hash,

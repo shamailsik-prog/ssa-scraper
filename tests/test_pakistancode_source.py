@@ -4,7 +4,12 @@ from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
-from scraper.tasks.pakistancode import _effective_crawl_limit, normalize_pakistancode_public_url, scrape_pakistancode
+from scraper.tasks.pakistancode import (
+    _effective_crawl_limit,
+    document_query_key,
+    normalize_pakistancode_public_url,
+    scrape_pakistancode,
+)
 from tests.fixtures import text_pdf_bytes
 
 
@@ -134,7 +139,11 @@ async def test_pakistancode_listing_and_detail_route_provenance_for_statutes_and
         await db.execute(
             select(CrawlFrontier).where(
                 CrawlFrontier.source_name == "PakistanCode",
-                CrawlFrontier.query_key == f"statute:{statute_pdf_url}",
+                CrawlFrontier.query_key == document_query_key(
+                    "statute",
+                    statute_pdf_url,
+                    {"detail_url": statute_detail_url},
+                ),
             )
         )
     ).scalars().first()
@@ -146,11 +155,16 @@ async def test_pakistancode_listing_and_detail_route_provenance_for_statutes_and
     assert statute_doc_row.query_json["route"]["detail_url"].endswith("tqaw%3D%3D-sg-jjjjjjjjjjjjj")
 
     ord_pdf_url = f"http://127.0.0.1:{fixture_server.port}/pdffiles/administrator-ord-2026.pdf"
+    ord_detail_url = f"http://127.0.0.1:{fixture_server.port}/english/UY2FqaJw1-apaUY2Fqa-apaUY2Npa5tpbw%3D%3D-sg-jjjjjjjjjjjjj"
     ord_doc_row = (
         await db.execute(
             select(CrawlFrontier).where(
                 CrawlFrontier.source_name == "PakistanCode",
-                CrawlFrontier.query_key == f"instrument:{ord_pdf_url}",
+                CrawlFrontier.query_key == document_query_key(
+                    "instrument",
+                    ord_pdf_url,
+                    {"detail_url": ord_detail_url},
+                ),
             )
         )
     ).scalars().first()
@@ -223,11 +237,16 @@ async def test_pakistancode_pdf_signature_gate_retires_non_pdf_candidate(db, fix
     assert staged == 0
 
     document_url = f"http://127.0.0.1:{fixture_server.port}/pdffiles/fake-ord-2026.pdf"
+    document_detail_url = f"http://127.0.0.1:{fixture_server.port}/english/UY2FqaJw1-apaUY2Fqa-apaUY2Npa5tpbw%3D%3D-sg-jjjjjjjjjjjjj"
     row = (
         await db.execute(
             select(CrawlFrontier).where(
                 CrawlFrontier.source_name == "PakistanCode",
-                CrawlFrontier.query_key == f"instrument:{document_url}",
+                CrawlFrontier.query_key == document_query_key(
+                    "instrument",
+                    document_url,
+                    {"detail_url": document_detail_url},
+                ),
             )
         )
     ).scalars().first()
@@ -247,3 +266,107 @@ async def test_pakistancode_effective_limit_enforces_floor_and_respects_explicit
     source.config_json = {**(source.config_json or {}), "crawl_max_pages": 310}
     assert _effective_crawl_limit(source, None) == 310
     assert _effective_crawl_limit(source, 75) == 75
+
+
+def test_document_query_key_keeps_shared_pdfs_distinct():
+    pdf = "https://pakistancode.gov.pk/pdffiles/shared.pdf"
+    alpha = document_query_key("statute", pdf, {"detail_url": "https://pakistancode.gov.pk/english/alpha"})
+    beta = document_query_key("statute", pdf, {"detail_url": "https://pakistancode.gov.pk/english/beta"})
+    assert alpha != beta
+    assert alpha.startswith("statute:https://pakistancode.gov.pk/pdffiles/shared.pdf|")
+    assert document_query_key("statute", pdf, {}) == f"statute:{pdf}"
+
+
+async def test_pakistancode_shared_pdf_keeps_distinct_act_frontier_and_staging(db, fixture_server):
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add(
+        "/english/LGu0xBD.php",
+        """
+        <html><body>
+          <div class="tab-pane fade show active" id="primary-legislation">
+            <div class="accordion">
+              <div class="accordion-section">
+                <div class='accordion-section-title'><a href="UY2FqaJw1-alpha-detail"><strong>1.</strong> Alpha Fisheries Act, 2026</a></div>
+                <div class='accordion-section-content'>General Laws | <font size="3">I of 2026</font></div>
+              </div>
+              <div class="accordion-section">
+                <div class='accordion-section-title'><a href="UY2FqaJw1-beta-detail"><strong>2.</strong> Beta Forestry Act, 2026</a></div>
+                <div class='accordion-section-content'>General Laws | <font size="3">II of 2026</font></div>
+              </div>
+            </div>
+          </div>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/english/UY2FqaJw1-alpha-detail",
+        """
+        <html><body>
+          <h2>Alpha Fisheries Act, 2026</h2>
+          <a href="/pdffiles/shared-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/english/UY2FqaJw1-beta-detail",
+        """
+        <html><body>
+          <h2>Beta Forestry Act, 2026</h2>
+          <a href="/pdffiles/shared-2026.pdf">Download PDF</a>
+        </body></html>
+        """,
+    )
+    fixture_server.add(
+        "/pdffiles/shared-2026.pdf",
+        text_pdf_bytes(
+            "Alpha Fisheries Act, 2026\n"
+            "Beta Forestry Act, 2026\n"
+            "1. Short title.- This Act shall be called the Shared Compilation Act and extends throughout Pakistan.\n"
+            "2. Definitions.- In this Act, unless the context otherwise requires, terms have assigned meanings.\n"
+        ),
+        content_type="application/pdf",
+    )
+
+    source = await _pakistancode_source(db, fixture_server, ["/english/LGu0xBD.php"])
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_pakistancode(source, db, fetcher=fetcher, limit=80)
+    await db.commit()
+
+    assert stats["halted"] is False
+    pdf_url = f"http://127.0.0.1:{fixture_server.port}/pdffiles/shared-2026.pdf"
+    alpha_detail = f"http://127.0.0.1:{fixture_server.port}/english/UY2FqaJw1-alpha-detail"
+    beta_detail = f"http://127.0.0.1:{fixture_server.port}/english/UY2FqaJw1-beta-detail"
+
+    alpha_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PakistanCode",
+                CrawlFrontier.query_key == document_query_key("statute", pdf_url, {"detail_url": alpha_detail}),
+            )
+        )
+    ).scalars().first()
+    beta_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PakistanCode",
+                CrawlFrontier.query_key == document_query_key("statute", pdf_url, {"detail_url": beta_detail}),
+            )
+        )
+    ).scalars().first()
+    assert alpha_row is not None
+    assert beta_row is not None
+    assert alpha_row.query_key != beta_row.query_key
+
+    staged = (
+        await db.execute(
+            select(StatutesStaging).where(StatutesStaging.source_name == "PakistanCode")
+        )
+    ).scalars().all()
+    names = {
+        (row.reconciled_json or {}).get("statute_name")
+        for row in staged
+        if row.reconciled_json
+    }
+    assert len(staged) == 2
+    assert "Alpha Fisheries Act, 2026" in names
+    assert "Beta Forestry Act, 2026" in names

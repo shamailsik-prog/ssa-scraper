@@ -237,16 +237,54 @@ def _is_plausible_act_title(name: str) -> bool:
     candidate = _normalize_whitespace(name or "")
     if not candidate or is_short_title_clause(candidate):
         return False
+    if looks_like_fragment_name(candidate):
+        return False
     if not (6 <= len(candidate) <= 180):
         return False
     return bool(re.search(r'\b(Act|Ordinance|Order|Code|Rules|Regulations|Constitution)\b', candidate, re.IGNORECASE))
+
+
+def looks_like_fragment_name(name: str) -> bool:
+    """True for URL slugs, ViewerJS fragments, encoded PakistanCode ids, or filename leftovers."""
+    candidate = _normalize_whitespace(name or "")
+    if not candidate:
+        return False
+    lowered = candidate.lower()
+    if any(token in lowered for token in ("pdffiles", "viewerjs", "uy2f", "lgu0x", "%3d", "%2f")):
+        return True
+    if re.search(r"\badministrator[\s-]+act\b", lowered):
+        return True
+    if re.search(r"\.(pdf|html?|php|aspx)\b", lowered):
+        return True
+    compact = re.sub(r"\s+", "", candidate)
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]{20,}", compact):
+        return True
+    if re.search(r"[%][0-9A-Fa-f]{2}", candidate):
+        return True
+    if candidate.count("=") >= 2 and " " not in candidate:
+        return True
+    return False
+
+
+def listed_title_supported_by_text(title: str, text: str) -> bool:
+    """Require the listing title to appear in the document so a shared junk PDF cannot rename an act."""
+    official = _normalize_whitespace(title or "")
+    body = text or ""
+    if not official or not body:
+        return False
+    if official.lower() in body.lower():
+        return True
+    tokens = [t for t in re.findall(r"[A-Za-z]{5,}", official) if t.lower() not in {"pakistan", "federal", "islamic", "republic", "ordinance"}]
+    if not tokens:
+        return False
+    hits = sum(1 for token in tokens if re.search(rf"\b{re.escape(token)}\b", body, re.IGNORECASE))
+    return hits >= max(1, (len(tokens) + 1) // 2)
 
 def prefer_official_statute_title(detected_name: Optional[str], official_title: Optional[str]) -> str:
     detected = _normalize_whitespace(detected_name or "") or "Unknown Statute"
     official = _normalize_whitespace(official_title or "")
     if official and _is_plausible_act_title(official):
-        if detected == "Unknown Statute" or is_short_title_clause(detected):
-            return official
+        return official
     return detected
 
 def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional[str] = None) -> List[Dict[str, str]]:
@@ -605,7 +643,7 @@ def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[D
         ]
     return []
 
-def detect_statute_name(text: str, url: Optional[str] = None) -> str:
+def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) -> str:
     """
     Detect canonical statute name from text and URL.
 
@@ -773,8 +811,8 @@ def detect_statute_name(text: str, url: Optional[str] = None) -> str:
                     if len(ln_clean) >= 10:
                         return ln_clean[:150]
 
-        # 6) Fallback: humanize URL slug
-        if url:
+        # 6) Fallback: humanize URL slug — never for pdffiles / ViewerJS / encoded ids.
+        if url and not looks_like_fragment_name(url) and "/pdffiles/" not in url.lower() and "viewerjs" not in url.lower():
             try:
                 parsed = urlparse(url)
                 slug = parsed.path.strip("/").split("/")[-1] if parsed.path else ""
@@ -813,6 +851,15 @@ def detect_statute_name(text: str, url: Optional[str] = None) -> str:
     except Exception as e:
         logger.error(f"detect_statute_name failed for url={url}: {e}", exc_info=True)
         return "Unknown Statute"
+
+
+def detect_statute_name(text: str, url: Optional[str] = None) -> str:
+    """Detect a canonical statute name and reject URL-fragment leftovers."""
+    detected = _detect_statute_name_from_text_or_url(text, url)
+    if looks_like_fragment_name(detected):
+        logger.info("detect_statute_name: rejecting fragment name %r for url=%s", detected, url)
+        return "Unknown Statute"
+    return detected
 
 # ---------------------------------------------------------------------------
 # Optional helper for external integration

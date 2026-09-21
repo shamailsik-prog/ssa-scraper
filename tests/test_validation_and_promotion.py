@@ -306,7 +306,8 @@ def test_strip_leading_judgment_chrome_removes_modal_prefix_noise():
         "Citation Name: PLD 2024 SC 101\nMuhammad Akram versus The State\nBefore Qazi Faez Isa, CJ"
     )
     cleaned = strip_leading_judgment_chrome(noisy)
-    assert cleaned.startswith("Citation Name: PLD 2024 SC 101")
+    assert cleaned.startswith("Muhammad Akram versus The State")
+    assert "Citation Name:" not in cleaned
     assert "Case Description" not in cleaned[:80]
     assert "Bookmark this Case" not in cleaned[:80]
     assert "Update Subscriber" not in cleaned[:120]
@@ -604,7 +605,8 @@ async def test_promotion_accepts_login_check_when_citation_name_has_value(db, lo
     assert await promote_judgment_staging(db, st) == "promoted"
     judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
     assert judgment is not None
-    assert "Citation Name: PLD 2024 SC 916" in (judgment.full_text or "")
+    assert "Muhammad Akram versus The State" in (judgment.full_text or "")
+    assert "Citation Name:" not in (judgment.full_text or "")
 
 
 async def test_promotion_accepts_clc_body_without_citation_name_label(db, login_source):
@@ -770,7 +772,8 @@ async def test_promotion_strips_modal_chrome_before_persisting_full_text(db, log
     assert await promote_judgment_staging(db, st) == "promoted"
     judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
     assert judgment is not None
-    assert judgment.full_text.startswith("Citation Name: PLD 2024 SC 915")
+    assert judgment.full_text.startswith("Muhammad Akram versus The State")
+    assert "Citation Name:" not in (judgment.full_text or "")
     assert "Case Description" not in (judgment.full_text or "")[:120]
     assert "Bookmark this Case" not in (judgment.full_text or "")[:120]
     assert judgment.full_text_hash == canonical_text_hash(judgment.full_text or "")
@@ -911,6 +914,142 @@ async def test_pakistancode_statute_promotion_accepts_real_name_and_operative_te
         await db.execute(select(func.count()).select_from(StatuteSectionVersion))
     ).scalar()
     assert versions == 1
+
+
+async def test_pakistancode_statute_promotion_quarantines_fragment_name(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-fragment-name.txt",
+        content=b"fragment name row",
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text="Section 1. Short title",
+        url="http://127.0.0.1/pakistancode-fragment-name.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "Administrator Act 2026",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Short title",
+                "section_text": "1. This Act shall be called the Administrator Act, 2026 and shall extend to all of Pakistan.",
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("pakistancode_fragment_name:")
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
+
+
+async def test_pakistancode_statute_promotion_quarantines_listed_title_absent(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-listed-title-absent.txt",
+        content=b"shared junk pdf",
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text="Scanned placeholder page.",
+        url="http://127.0.0.1/pakistancode-listed-title-absent.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "Defense Forces of Pakistan Act, 2026",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "field_evidence": {"listed_title_absent": "Defense Forces of Pakistan Act, 2026"},
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Placeholder",
+                "section_text": "1. This placeholder page has enough characters to pass the thin-section check without being the listed act.",
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("pakistancode_listed_title_absent:")
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
+
+
+async def test_pakistancode_statute_promotion_quarantines_empty_section_bodies(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-empty-sections.txt",
+        content=b"empty sections row",
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text="No operative text",
+        url="http://127.0.0.1/pakistancode-empty-sections.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "Sample Empty Sections Act, 2026",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "",
+                "section_title": "Missing number",
+                "section_text": (
+                    "This Act shall be called the Sample Empty Sections Act, 2026 and shall "
+                    "extend to the whole of Pakistan with operative words."
+                ),
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("empty_statute_sections:")
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
 
 
 # --------------------------------------------------------------------------- 8
