@@ -57,10 +57,13 @@ _MODAL_CHROME_INLINE_PREFIX_RE = re.compile(
     r"(?is)^\s*(?:\u00d7+\s*)?(?:case\s+description\s*)?(?:bookmark\s+this\s+case\s*)?"
 )
 _JUDGMENT_CONTENT_ANCHORS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?im)^citation\s*name\s*:"),
+    # Value-required only — empty \"Citation Name:\" chrome must not count as an anchor
+    # (Auditor fail-closed; filled Citation Name is also handled by _CASE_CONTENT_RE).
+    re.compile(r"(?im)^citation\s*name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]"),
     re.compile(r"(?im)^\s*(?:before|coram)\b"),
     re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,120}\bcourt\b"),
     re.compile(r"(?im)^[^\n]{0,220}\b(?:versus|vs\.?|v\.)\b"),
+    re.compile(r"(?im)^\s*(?:judgment|judgement)\b"),
 )
 
 
@@ -94,7 +97,8 @@ def _has_case_content(*, raw_text: Optional[str], raw_html: Optional[str]) -> bo
     A filled `Citation Name:` value still short-circuits (#100). Structured case
     text (parties, court heading, Before/Coram, JUDGMENT, Held) also counts so
     CLC and similar reporter bodies without that chrome label are not treated
-    as empty.
+    as empty. Never treat length alone or empty Citation Name chrome as case
+    content (Auditor fail-closed).
     """
     raw_blob = f"{raw_text or ''}\n{raw_html or ''}"
     if _CASE_CONTENT_RE.search(raw_blob):
