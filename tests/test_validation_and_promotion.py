@@ -10,10 +10,15 @@ from sqlalchemy import delete, func, select, update
 from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
-from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, extract_before_jj_judge_names
+from scraper.extractors.judgment_guards import (
+    detect_headnotes_only,
+    detect_judgment_stub,
+    extract_before_jj_judge_names,
+    strip_leading_judgment_chrome,
+)
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
-from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, Treatment
+from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, StatuteSectionVersion, Treatment
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import extract_instrument_mentions, extract_statute_mentions
 from scraper.parsers.text_cleaner import clean_html
@@ -123,6 +128,47 @@ def test_detect_headnotes_only_flags_notes_on_cases_surface():
     assert signal is not None
     assert signal.reason_code == "headnote_only"
     assert signal.signal.startswith("notes_on_cases")
+
+
+def test_strip_leading_judgment_chrome_removes_modal_prefix_noise():
+    noisy = (
+        "×\nCase Description\nBookmark this Case\nUpdate Subscriber details\n"
+        "Citation Name: PLD 2024 SC 101\nMuhammad Akram versus The State\nBefore Qazi Faez Isa, CJ"
+    )
+    cleaned = strip_leading_judgment_chrome(noisy)
+    assert cleaned.startswith("Citation Name: PLD 2024 SC 101")
+    assert "Case Description" not in cleaned[:80]
+    assert "Bookmark this Case" not in cleaned[:80]
+    assert "Update Subscriber" not in cleaned[:120]
+
+
+def test_strip_leading_judgment_chrome_preserves_party_names_starting_with_x():
+    text = "X versus The State\nBefore Qazi Faez Isa, CJ\nJUDGMENT"
+    assert strip_leading_judgment_chrome(text) == text
+
+
+def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
+    short = promotion_task_module._collect_pakistancode_thin_sections(
+        [{"section_number": "1", "section_text": "1. Citation."}]
+    )
+    footnote_only = promotion_task_module._collect_pakistancode_thin_sections(
+        [{"section_number": "279", "section_text": "279. Substituted by Gazette of Pakistan Extraordinary, Part I."}]
+    )
+    fat_with_footnote = promotion_task_module._collect_pakistancode_thin_sections(
+        [
+            {
+                "section_number": "302",
+                "section_text": (
+                    "302. Punishment of qatl-i-amd.- Whoever commits qatl-e-amd shall, subject to the "
+                    "provisions of this Chapter, be punished with death as qisas. Substituted by "
+                    "Criminal Law (Amendment) Act, 1997."
+                ),
+            }
+        ]
+    )
+    assert short and short[0]["section_number"] == "1"
+    assert footnote_only and footnote_only[0]["section_number"] == "279"
+    assert fat_with_footnote == []
 
 
 @pytest.mark.parametrize(
@@ -349,6 +395,186 @@ async def test_promotion_upgrades_existing_pakistanlawsite_headnote_judgment_wit
     assert "Notes on Cases" not in (updated.full_text or "")[:200]
     assert st.promoted_to_id == existing.id
     assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 1
+
+
+async def test_promotion_strips_modal_chrome_before_persisting_full_text(db, login_source):
+    citation = "PLD 2024 SC 915"
+    noisy = (
+        "×\nCase Description\nBookmark this Case\nUpdate Subscriber account details\n"
+        "Citation Name: PLD 2024 SC 915\nMuhammad Akram versus The State\nBefore Qazi Faez Isa, CJ\nJUDGMENT\n"
+        "The appellant was convicted under section 302(b) of the Pakistan Penal Code, 1860."
+    )
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K915"
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=detail_url,
+        content=noisy.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=None,
+        raw_text=noisy,
+        url=detail_url,
+    )
+    st.reconciled_json = {
+        "citations": [citation],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Modal chrome strip case",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+    assert judgment is not None
+    assert judgment.full_text.startswith("Citation Name: PLD 2024 SC 915")
+    assert "Case Description" not in (judgment.full_text or "")[:120]
+    assert "Bookmark this Case" not in (judgment.full_text or "")[:120]
+    assert judgment.full_text_hash == canonical_text_hash(judgment.full_text or "")
+
+
+async def test_pakistancode_statute_promotion_quarantines_clause_as_name(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-bad-name.txt",
+        content=b"short title row",
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text="Section 1. Short title",
+        url="http://127.0.0.1/pakistancode-bad-name.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "This Act shall be called the Sample Act, 2026",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Short title",
+                "section_text": "1. This Act shall be called the Sample Act, 2026 and shall extend to all of Pakistan.",
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("pakistancode_bad_name:")
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
+
+
+async def test_pakistancode_statute_promotion_quarantines_thin_section_bodies(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-thin-section.txt",
+        content=b"thin section row",
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text="Section 1. Citation.",
+        url="http://127.0.0.1/pakistancode-thin-section.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "Sample Compliance Act, 2026",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Citation",
+                "section_text": "1. Citation.",
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "quarantined"
+    q = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("pakistancode_thin_section_body:")
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
+
+
+async def test_pakistancode_statute_promotion_accepts_real_name_and_operative_text(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    section_text = (
+        "1. Title and extent of operation of the Code.- This Act shall be called the Pakistan "
+        "Penal Code, and shall take effect throughout Pakistan. Substituted by Act II of 1997."
+    )
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="http://127.0.0.1/pakistancode-good-section.txt",
+        content=section_text.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=section_text,
+        url="http://127.0.0.1/pakistancode-good-section.txt",
+        kind="statute",
+    )
+    st.status = "extracted"
+    st.reconciled_json = {
+        "statute_name": "Pakistan Penal Code, 1860",
+        "jurisdiction": "Federal",
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Title and extent",
+                "section_text": section_text,
+            }
+        ],
+    }
+
+    assert await promote_statute_staging(db, st) == "promoted"
+    statute = (await db.execute(select(Statute).where(Statute.id == st.promoted_to_id))).scalars().first()
+    assert statute is not None
+    assert statute.name == "Pakistan Penal Code, 1860"
+    versions = (
+        await db.execute(select(func.count()).select_from(StatuteSectionVersion))
+    ).scalar()
+    assert versions == 1
 
 
 # --------------------------------------------------------------------------- 8

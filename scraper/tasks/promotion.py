@@ -25,7 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, guard_reason
+from scraper.extractors.judgment_guards import (
+    detect_headnotes_only,
+    detect_judgment_stub,
+    guard_reason,
+    strip_leading_judgment_chrome,
+)
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
@@ -48,6 +53,7 @@ from scraper.models import (
 )
 from scraper.parsers.bench_parser import normalise_judge_name
 from scraper.parsers.citation_extractor import canonicalise_statute_name, extract_citations, normalise_citation
+from scraper.parsers.statute_parser import is_short_title_clause
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +172,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     if not cits:
         await _quarantine(db, st, "no citation supported by source", "judgment")
         return "quarantined"
-    full_text = st.raw_text or ""
+    full_text = strip_leading_judgment_chrome(st.raw_text or "")
+    if full_text != (st.raw_text or ""):
+        st.raw_text = full_text
+        st.raw_text_hash = canonical_text_hash(full_text)
     text_hash = canonical_text_hash(full_text)
     if st.raw_text_hash and text_hash != st.raw_text_hash:
         await _quarantine(db, st, "full_text hash changed between staging and promotion", "judgment")
@@ -341,6 +350,50 @@ def _norm_section(n: Optional[str]) -> str:
     if stable_key:
         return stable_key
     return raw
+
+
+_PAKISTANCODE_MIN_SECTION_BODY_CHARS = 80
+_PAKISTANCODE_THIN_BODY_RE = re.compile(
+    r"(?i)\b(?:substituted|inserted|added|omitted|amended|renumbered|repealed)\s+by\b"
+)
+
+
+def _normalize_section_body_for_quality(section_text: Any) -> str:
+    text = str(section_text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?i)^\s*(?:section|sec\.?|s\.?|article|art\.?|rule|r\.?)\s+\d+[A-Z]?\s*[\.\-:)\]]*\s*", "", text)
+    text = re.sub(r"^\s*\d+[A-Z]?\s*[\.\-:)\]]\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_pakistancode_thin_section_body(normalized_body: str) -> bool:
+    footnote = _PAKISTANCODE_THIN_BODY_RE.search(normalized_body)
+    operative = normalized_body[: footnote.start()] if footnote else normalized_body
+    operative = operative.strip(" .,:;-")
+    return len(operative) < _PAKISTANCODE_MIN_SECTION_BODY_CHARS
+
+
+def _collect_pakistancode_thin_sections(sections: Any) -> list[Dict[str, Any]]:
+    if not isinstance(sections, list):
+        return []
+    thin: list[Dict[str, Any]] = []
+    for idx, section in enumerate(sections):
+        if not isinstance(section, dict):
+            thin.append({"index": idx, "section_number": None, "reason": "section_not_object"})
+            continue
+        section_number = str(section.get("section_number") or "").strip()
+        section_text = str(section.get("section_text") or "")
+        normalized_body = _normalize_section_body_for_quality(section_text)
+        if _is_pakistancode_thin_section_body(normalized_body):
+            thin.append(
+                {
+                    "index": idx,
+                    "section_number": section_number or None,
+                    "body_chars": len(normalized_body),
+                    "snippet": normalized_body[:160],
+                }
+            )
+    return thin
 
 
 def _validated_mentions_payload(
@@ -1479,6 +1532,35 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     # statute
     name = (data.get("statute_name") or "").strip()
     sections = data.get("sections") or []
+    if st.source_name == "PakistanCode":
+        if name and is_short_title_clause(name):
+            await _quarantine(
+                db,
+                st,
+                "pakistancode_bad_name: statute_name matched short-title clause",
+                "statute",
+                {
+                    "reason_code": "pakistancode_bad_name",
+                    "statute_name": name[:280],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+        thin_sections = _collect_pakistancode_thin_sections(sections)
+        if thin_sections:
+            await _quarantine(
+                db,
+                st,
+                "pakistancode_thin_section_body: one or more sections were too thin",
+                "statute",
+                {
+                    "reason_code": "pakistancode_thin_section_body",
+                    "min_chars": _PAKISTANCODE_MIN_SECTION_BODY_CHARS,
+                    "thin_sections": thin_sections[:25],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
     if not name or not sections:
         await _quarantine(db, st, "statute name or sections missing", "statute")
         return "quarantined"
