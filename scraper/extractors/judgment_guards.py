@@ -19,7 +19,7 @@ class JudgmentGuardSignal:
 # PLS parks authenticated case HTML on /login/check after ReferenceCaseLawSearch.
 # URL alone is NOT a stub when the body carries real case content.
 _URL_LOGIN_STUB_RE = re.compile(r"/login/check(?:[/?#]|$)", re.IGNORECASE)
-_CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:", re.IGNORECASE)
+_CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]", re.IGNORECASE)
 _NOTES_ON_CASES_RE = re.compile(r"\bnotes?\s+on\s+cases?\b", re.IGNORECASE)
 _JUDGMENT_STRUCTURE_RE = re.compile(
     r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
