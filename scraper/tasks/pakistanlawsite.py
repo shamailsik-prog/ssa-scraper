@@ -376,7 +376,6 @@ class PakistanLawSitePipeline:
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
         max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
         if self.harvest_mode == "backfill":
-            max_detail = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", max_detail) or max_detail)
             scan_window = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 600) or 600)
         else:
             scan_window = int(getattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 200) or 200)

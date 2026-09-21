@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 
+from scraper.config import settings
 from scraper.models import ScraperJob, ScraperSource
 from scraper.tasks import dispatcher
 from scraper.tasks.dispatcher import dispatch_due_sources, run_source
@@ -140,6 +141,7 @@ async def test_dispatch_due_sources_enqueues_two_reporter_shards_when_concurrenc
     target.next_scrape_at = now - timedelta(minutes=1)
     target.state = "ACTIVE"
     target.is_active = True
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
     await set_harvest_mode(db, "backfill", changed_by="qa", reason="shard enqueue")
     await db.commit()
 
