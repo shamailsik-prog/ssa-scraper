@@ -31,6 +31,7 @@ from scraper.extractors.judgment_guards import (
     guard_reason,
     strip_leading_judgment_chrome,
 )
+from scraper.extractors.login_surface_stub import is_login_surface_stub
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
     Citation,
@@ -160,6 +161,27 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 "reason_code": stub_signal.reason_code,
                 "signal": stub_signal.signal,
                 "matched_value": stub_signal.matched_value,
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
+    if is_login_surface_stub(
+        source_url=st.source_url or data.get("source_url"),
+        raw_text=st.raw_text,
+        raw_html=st.raw_html,
+        reconciled=data,
+        court=data.get("court"),
+        judge_names=data.get("judge_names"),
+    ):
+        await _quarantine(
+            db,
+            st,
+            "login_stub: is_login_surface_stub",
+            "judgment",
+            {
+                "reason_code": "login_stub",
+                "signal": "is_login_surface_stub",
+                "matched_value": (st.source_url or data.get("source_url") or "")[:500],
                 "validation_errors": st.validation_errors,
             },
         )

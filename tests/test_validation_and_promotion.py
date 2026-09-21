@@ -11,11 +11,13 @@ from scraper.config import settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.judgment_guards import (
+    _has_case_content,
     detect_headnotes_only,
     detect_judgment_stub,
     extract_before_jj_judge_names,
     strip_leading_judgment_chrome,
 )
+from scraper.extractors.login_surface_stub import is_login_surface_stub
 from scraper.extractors.validation import reconcile_instrument, reconcile_judgment
 from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment, stage_statute
 from scraper.models import Citation, Instrument, InstrumentRelation, InstrumentSectionRelation, Judgment, JudgmentCitationRelation, QuarantineQueue, ScraperSource, ScraperStaging, Statute, StatuteSection, StatuteSectionVersion, Treatment
@@ -47,6 +49,8 @@ def _det():
 
 CASE_TEXT_WITH_CITATION = "Citation Name: PLD 2024 SC 101\nMuhammad Akram versus The State"
 CASE_HTML_WITH_CITATION = "<html><body><h2>Citation Name: PLD 2024 SC 101</h2><p>Muhammad Akram versus The State</p></body></html>"
+EMPTY_CITATION_NAME_CHROME = "Obtaining Subscription\nUpdate Subscriber\nCitation Name:\n"
+LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch"
 
 
 @pytest.mark.parametrize(
@@ -112,6 +116,58 @@ def test_detect_judgment_stub_signals(source_url, raw_text, raw_html, judge_name
     assert hit is not None
     assert hit.reason_code == reason_code
     assert hit.signal == signal
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    (
+        "Citation Name:\n",
+        "Citation Name: \n",
+        "Citation Name: &nbsp;\n",
+        EMPTY_CITATION_NAME_CHROME,
+    ),
+)
+def test_empty_citation_name_is_not_case_content(raw_text):
+    assert _has_case_content(raw_text=raw_text, raw_html=None) is False
+    assert is_login_surface_stub(source_url=LOGIN_CHECK_URL, raw_text=raw_text, raw_html="") is True
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    (
+        CASE_TEXT_WITH_CITATION,
+        "Citation Name: [2024] SCMR 1\n",
+        "Citation Name: (2024) PLD 1\n",
+        "Citation Name:&nbsp;PLD 2024 SC 101\n",
+    ),
+)
+def test_real_citation_name_value_is_case_content(raw_text):
+    assert _has_case_content(raw_text=raw_text, raw_html=None) is True
+    assert is_login_surface_stub(source_url=LOGIN_CHECK_URL, raw_text=raw_text, raw_html="") is False
+    assert detect_judgment_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=raw_text,
+        raw_html=None,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_login_check_plus_subscription_chrome_quarantines():
+    html = "<html><body>Obtaining Subscription<br>Update Subscriber<br>Citation Name:</body></html>"
+    assert is_login_surface_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=EMPTY_CITATION_NAME_CHROME,
+        raw_html=html,
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=EMPTY_CITATION_NAME_CHROME,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "login_stub"
+    assert hit.signal == "source_url_login_check"
 
 
 def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
@@ -305,6 +361,83 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_quarantines_empty_citation_name_login_check_chrome(db, login_source):
+    html = "<html><body>Obtaining Subscription<br>Update Subscriber<br>Citation Name:</body></html>"
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=LOGIN_CHECK_URL,
+        content=html.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=html,
+        raw_text=EMPTY_CITATION_NAME_CHROME,
+        url=LOGIN_CHECK_URL,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 101"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Empty citation chrome must quarantine",
+        "judge_names": ["Qazi Faez Isa"],
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    result = await promote_judgment_staging(db, st)
+    assert result == "quarantined"
+    assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 0
+    q = (
+        await db.execute(
+            select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id),
+        )
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("login_stub:")
+
+
+async def test_promotion_accepts_login_check_when_citation_name_has_value(db, login_source):
+    full_text = (
+        "Citation Name: PLD 2024 SC 916\nMuhammad Akram versus The State\n"
+        "Before Qazi Faez Isa, CJ\nJUDGMENT\n"
+        "The appellant was convicted under section 302(b) of the Pakistan Penal Code, 1860."
+    )
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=LOGIN_CHECK_URL,
+        content=full_text.encode("utf-8"),
+        content_kind="text",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=None,
+        raw_text=full_text,
+        url=LOGIN_CHECK_URL,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 916"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Real citation value must promote",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+    assert judgment is not None
+    assert "Citation Name: PLD 2024 SC 916" in (judgment.full_text or "")
 
 
 async def test_promotion_blocks_headnote_document_type_for_full_judgment(db, source):

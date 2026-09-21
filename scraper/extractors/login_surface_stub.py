@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional
 
-_CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:", re.IGNORECASE)
+_CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]", re.IGNORECASE)
 
 
 def is_login_surface_stub(
