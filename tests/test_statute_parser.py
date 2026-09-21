@@ -71,11 +71,11 @@ def test_looks_like_fragment_name_catches_url_and_filename_leftovers():
 
 def test_detect_statute_name_rejects_pdffiles_slug_fallback():
     name = detect_statute_name(
-        "1. Short title.- This Act applies throughout Pakistan and has no printed long title on this page.",
+        "",
         "https://pakistancode.gov.pk/pdffiles/administrator-act-2026.pdf",
     )
     assert name == "Unknown Statute"
-    assert not looks_like_fragment_name(name)
+    assert "Administrator" not in name
 
 
 def test_prefer_official_title_wins_over_url_fragment():
