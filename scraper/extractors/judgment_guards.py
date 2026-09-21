@@ -53,7 +53,10 @@ _LOGIN_SURFACE_BODY_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("agree_terms", re.compile(r"\bi\s+agree\s+with\s+the\s+terms\b", re.IGNORECASE)),
 )
 _PASSWORD_INPUT_RE = re.compile(r"(?i)<input\b[^>]*\btype\s*=\s*['\"]password['\"]")
-_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg)\b[^>]*>.*?</\1>")
+# Same chrome tags clean_html decomposes, plus script/style/svg noise.
+_SCRIPT_STYLE_RE = re.compile(
+    r"(?is)<(script|style|noscript|svg|header|footer|nav|iframe)\b[^>]*>.*?</\1>"
+)
 
 # Dominate-vs-crumbs thresholds for body-level login/subscription chrome.
 # Structured fields (judge_names / court == "read") still fail closed on their own.
@@ -142,20 +145,10 @@ def _html_to_visible_text(raw_html: str) -> str:
     if not raw_html:
         return ""
     text = _SCRIPT_STYLE_RE.sub(" ", raw_html)
+    text = _HTML_BREAK_RE.sub("\n", text)
     text = _HTML_TAG_RE.sub(" ", text)
     text = _HTML_NBSP_RE.sub(" ", text)
     return html_lib.unescape(text)
-
-
-def _visible_payload(*, raw_text: Optional[str], raw_html: Optional[str]) -> str:
-    """Prefer the longer visible surface so a thin extracted line cannot hide a real body."""
-    text = (raw_text or "").strip()
-    html_visible = _html_to_visible_text(raw_html or "").strip()
-    if text and html_visible:
-        if _compact_len(text) >= _compact_len(html_visible):
-            return text
-        return html_visible
-    return text or html_visible
 
 
 def _marker_hits(visible: str) -> list[tuple[str, int]]:
@@ -164,6 +157,39 @@ def _marker_hits(visible: str) -> list[tuple[str, int]]:
         for match in marker_re.finditer(visible):
             hits.append((marker_name, match.end() - match.start()))
     return hits
+
+
+def _has_line_anchored_judgment_structure(visible: str) -> bool:
+    """True for line-anchored case structure, not mid-sentence CTA words."""
+    return any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
+
+
+def _chrome_dominates_surface(visible: str) -> Optional[str]:
+    """Score one visible surface. Empty/crumb-only text returns None."""
+    hits = _marker_hits(visible)
+    if not hits:
+        return None
+
+    compact_total = _compact_len(visible)
+    marker_chars = sum(length for _name, length in hits)
+    first_marker = hits[0][0]
+    marker_share = (marker_chars / compact_total) if compact_total else 1.0
+
+    # Thin / empty visible body: a leftover widget IS the page.
+    if compact_total < _THIN_VISIBLE_COMPACT_CHARS:
+        return first_marker
+    # Chrome phrases are a large share of the visible text.
+    if marker_share >= _MARKER_DOMINANCE_RATIO:
+        return first_marker
+    # Medium paywall/CTA copy with no line-anchored judgment structure.
+    # Mid-sentence "before" / "judgment" (plan before continuing to read this
+    # judgment) is not structure — those words are typical #87 paywall copy.
+    if (
+        compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS
+        and not _has_line_anchored_judgment_structure(visible)
+    ):
+        return first_marker
+    return None
 
 
 def login_subscription_chrome_dominates(
@@ -175,32 +201,27 @@ def login_subscription_chrome_dominates(
 
     Incidental nav/footer/cookie/subscription-widget leftovers on a long real
     judgment must not quarantine. Markers must be the main content.
+
+    Score cleaned text and chrome-stripped HTML independently. Staging
+    raw_text comes from clean_html (header/footer/nav dropped); the HTML
+    helper used to keep that shell, so preferring the longer surface hid
+    thin stub bodies inside a 400+/1200+ character PLS wrapper.
     """
-    visible = _visible_payload(raw_text=raw_text, raw_html=raw_html)
-    hits = _marker_hits(visible)
+    text = (raw_text or "").strip()
+    html_visible = _html_to_visible_text(raw_html or "").strip()
     html_blob = raw_html or ""
     has_password = bool(_PASSWORD_INPUT_RE.search(html_blob))
-    if not hits and not has_password:
-        return None
 
-    compact_total = _compact_len(visible)
-    marker_chars = sum(length for _name, length in hits)
-    first_marker = hits[0][0] if hits else "password_input"
-    marker_share = (marker_chars / compact_total) if compact_total else 1.0
+    for visible in (text, html_visible):
+        dominating = _chrome_dominates_surface(visible)
+        if dominating:
+            return dominating
 
-    # Thin / empty visible body: a leftover widget IS the page.
-    if compact_total < _THIN_VISIBLE_COMPACT_CHARS:
-        return first_marker
-    # Chrome phrases are a large share of the visible text.
-    if marker_share >= _MARKER_DOMINANCE_RATIO:
-        return first_marker
-    # Medium paywall/CTA copy with no judgment structure still fail-closes.
-    if (
-        hits
-        and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS
-        and not _JUDGMENT_STRUCTURE_RE.search(visible)
-    ):
-        return first_marker
+    # Password input with no phrase markers only quarantines on a thin surface.
+    if has_password:
+        compact_total = _compact_len(html_visible or text)
+        if compact_total < _THIN_VISIBLE_COMPACT_CHARS:
+            return "password_input"
     return None
 
 
