@@ -171,7 +171,7 @@ COURT_SEED = [
 
 SOURCE_SEED = [
     # name, display, url, access_method, allow_list, case_law, statutes, instruments, frequency_h, extraction_mode
-    ("PakistanLawSite", "Pakistan Law Site (subscription)", "https://www.pakistanlawsite.com", "login_session", ["www.pakistanlawsite.com", "pakistanlawsite.com"], True, True, False, 24, "hybrid"),
+    ("PakistanLawSite", "Pakistan Law Site (subscription)", "https://www.pakistanlawsite.com", "login_session", ["www.pakistanlawsite.com", "pakistanlawsite.com"], True, True, False, 24, "deterministic"),
     ("NasirLawSite", "Nasir Law Site", "https://www.nasirlawsite.com", "public", ["www.nasirlawsite.com", "nasirlawsite.com"], True, True, False, 24, "hybrid"),
     ("PakistanCode", "Pakistan Code (Ministry of Law)", "https://pakistancode.gov.pk/english/index.php", "public", ["pakistancode.gov.pk", "www.pakistancode.gov.pk"], False, True, True, 48, "hybrid"),
     ("SupremeCourt", "Supreme Court of Pakistan", "https://www.supremecourt.gov.pk/judgements/", "public", ["www.supremecourt.gov.pk", "supremecourt.gov.pk"], True, False, False, 12, "hybrid"),
@@ -363,6 +363,10 @@ async def seed_data() -> None:
         for n in (1, 2):
             if ("PakistanLawSite", n) not in slots:
                 db.add(BrowserSessionSlot(source_name="PakistanLawSite", slot_number=n, role="primary" if n == 1 else "alternate", state="EMPTY"))
+        pls_source = existing_source_rows.get("PakistanLawSite")
+        if pls_source is not None and (pls_source.extraction_mode or "").lower() != "deterministic":
+            # Keep login-session extraction pinned to deterministic unless an operator explicitly changes it later.
+            pls_source.extraction_mode = "deterministic"
         targets = {t.name for t in (await db.execute(select(ArchiveTarget))).scalars().all()}
         if settings.ARCHIVE_LOCAL_PATH and "local" not in targets:
             db.add(ArchiveTarget(name="local", target_type="local_path", root_path=settings.ARCHIVE_LOCAL_PATH, mirror_login_session_rows=settings.MIRROR_LOGIN_SESSION_ROWS))

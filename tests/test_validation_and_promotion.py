@@ -173,6 +173,23 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
     assert out.data["judge_names"] == ["Qazi Faez Isa"]
 
 
+def test_reconcile_judgment_marks_notes_only_as_headnote():
+    det = _det()
+    notes_text = "Citation Name: PLD 2024 SC 555\nNotes on Cases\nBookmark this Case\nshort extract."
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=notes_text,
+        raw_html=f"<html><body><pre>{notes_text}</pre></body></html>",
+        source_url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K555",
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is True
+    assert out.data["document_type"] == "headnote"
+    assert (out.quarantine_reason or "").startswith("headnotes_only:")
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_text", "raw_html", "judge_names", "expected_reason_prefix"),
     (
@@ -243,6 +260,45 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_quarantines_headnote_document_type(db, source):
+    notes_html = "<html><body><h3>Citation Name: PLD 2024 SC 556</h3><div>Notes on Cases</div><div>Bookmark this Case</div></body></html>"
+    notes_text = clean_html(notes_html)
+    prov = await record_provenance(
+        db,
+        source=source,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K556",
+        content=notes_html.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=notes_html,
+        raw_text=notes_text,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K556",
+    )
+    st.reconciled_json = {
+        "document_type": "headnote",
+        "citations": ["PLD 2024 SC 556"],
+        "court": "Supreme Court of Pakistan",
+        "case_title": "Notes-only sample",
+        "judge_names": [],
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+    result = await promote_judgment_staging(db, st)
+    assert result == "quarantined"
+    assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 0
+    q = (
+        await db.execute(
+            select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id),
+        )
+    ).scalars().first()
+    assert q is not None
+    assert (q.reason or "").startswith("headnotes_only:")
 
 
 # --------------------------------------------------------------------------- 8

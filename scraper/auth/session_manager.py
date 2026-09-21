@@ -701,8 +701,75 @@ class PlaywrightBrowser:
             }
         return await self._wrap(self._page.content()), {}
 
+    async def _extract_case_description_modal_text(self) -> tuple[Optional[str], Dict[str, Any]]:
+        """PakistanLawSite deterministic full-text path from ReferenceCaseLawSearch:
+        click input.caseDescription[value='Case Description'] and read #ExceptionResponseScreen1 innerText.
+        """
+        metadata: Dict[str, Any] = {
+            "case_description_selector_present": False,
+            "case_description_selector_clicked": False,
+            "case_description_modal_chars": 0,
+        }
+        selector = "input.caseDescription[value='Case Description']"
+        modal_selector = "#ExceptionResponseScreen1"
+        try:
+            control = self._page.locator(selector).first
+            count = await self._wrap(control.count())
+        except Exception:
+            return None, metadata
+        if int(count or 0) <= 0:
+            return None, metadata
+        metadata["case_description_selector_present"] = True
+        try:
+            await self._wrap(control.click())
+            metadata["case_description_selector_clicked"] = True
+        except Exception:
+            return None, metadata
+        try:
+            from playwright.async_api import TimeoutError as PWTimeoutError
+
+            try:
+                await self._wrap(
+                    self._page.wait_for_function(
+                        """() => {
+                            const el = document.querySelector('#ExceptionResponseScreen1');
+                            if (!el) return false;
+                            return ((el.innerText || '').trim().length) > 80;
+                        }""",
+                        timeout=min(9000, settings.PLAYWRIGHT_TIMEOUT_MS),
+                    )
+                )
+            except PWTimeoutError:
+                pass
+        except Exception:
+            pass
+        try:
+            modal = self._page.locator(modal_selector).first
+            text = await self._wrap(modal.inner_text())
+        except Exception:
+            return None, metadata
+        text = (text or "").strip()
+        metadata["case_description_modal_chars"] = len(text)
+        if not text:
+            return None, metadata
+        return text, metadata
+
+    @staticmethod
+    def _inject_case_description_modal_text(html_text: str, modal_text: str) -> str:
+        if not modal_text:
+            return html_text
+        block = (
+            "<div id=\"ExceptionResponseScreen1_extracted\" data-source=\"case_description_modal\">"
+            f"<pre>{html.escape(modal_text)}</pre>"
+            "</div>"
+        )
+        if "</body>" in (html_text or ""):
+            return (html_text or "").replace("</body>", block + "</body>", 1)
+        return (html_text or "") + block
+
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
+        expand_case_description = bool(kwargs.get("expand_case_description"))
         resp = await self._wrap(
             self._page.goto(
                 url,
@@ -710,7 +777,18 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
+        case_description_text: Optional[str] = None
+        case_description_meta: Dict[str, Any] = {}
+        if expand_case_description:
+            case_description_text, case_description_meta = await self._extract_case_description_modal_text()
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        if case_description_meta:
+            metadata.update(case_description_meta)
+        if case_description_text:
+            html_text = self._inject_case_description_modal_text(html_text, case_description_text)
+            metadata["case_description_modal_applied"] = True
+        elif expand_case_description:
+            metadata["case_description_modal_applied"] = False
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
         requested_url = url

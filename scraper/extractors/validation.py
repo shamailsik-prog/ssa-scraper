@@ -14,7 +14,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from scraper.extractors.deterministic import date_in_text
-from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
+from scraper.extractors.judgment_guards import detect_headnotes_only, detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
@@ -223,6 +223,16 @@ def reconcile_judgment(
     )
     if stub_signal is not None:
         errors.append(guard_reason(stub_signal))
+    headnote_signal = detect_headnotes_only(
+        raw_text=raw_text,
+        raw_html=raw_html,
+        judge_names=out.get("judge_names"),
+    )
+    if headnote_signal is not None:
+        errors.append(guard_reason(headnote_signal))
+        out["document_type"] = "headnote"
+    else:
+        out["document_type"] = "full_judgment"
 
     # case title must be supported by heading / result row
     title = out.get("case_title")
@@ -288,6 +298,7 @@ def reconcile_judgment(
     out["extractor_confidence"] = conf
     quarantine = (
         stub_signal is not None
+        or headnote_signal is not None
         or conf < min_confidence
         or not out["citations"]
         or not out.get("court")
@@ -297,6 +308,8 @@ def reconcile_judgment(
     if quarantine:
         if stub_signal is not None:
             reason = guard_reason(stub_signal)
+        elif headnote_signal is not None:
+            reason = guard_reason(headnote_signal)
         elif not out["citations"]:
             reason = "no citation supported by source"
         elif not out.get("court"):

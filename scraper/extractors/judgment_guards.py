@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from scraper.parsers.text_cleaner import clean_html
+
 
 @dataclass(frozen=True)
 class JudgmentGuardSignal:
@@ -18,6 +20,11 @@ class JudgmentGuardSignal:
 # URL alone is NOT a stub when the body carries real case content.
 _URL_LOGIN_STUB_RE = re.compile(r"/login/check(?:[/?#]|$)", re.IGNORECASE)
 _CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:", re.IGNORECASE)
+_NOTES_ON_CASES_RE = re.compile(r"\bnotes?\s+on\s+cases?\b", re.IGNORECASE)
+_BOOKMARK_CASE_RE = re.compile(r"\bbookmark\s+this\s+case\b", re.IGNORECASE)
+_BENCH_HINT_RE = re.compile(r"\b(coram|present\s*:|before\s+mr\.?\s+justice|before\s+justice|justice\s+[a-z])\b", re.IGNORECASE)
+_JUDGMENT_BODY_HINT_RE = re.compile(r"\b(judgment|order|versus|vs\.?|v\.)\b", re.IGNORECASE)
+_SHORT_BODY_CHAR_THRESHOLD = 2500
 _SUBSCRIPTION_CHROME_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("obtaining_subscription", re.compile(r"\bobtaining\s+subscription\b", re.IGNORECASE)),
     ("update_subscriber", re.compile(r"\bupdate\s+subscriber\b", re.IGNORECASE)),
@@ -29,6 +36,15 @@ _SUBSCRIPTION_CHROME_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 def _has_case_content(*, raw_text: Optional[str], raw_html: Optional[str]) -> bool:
     blob = f"{raw_text or ''}\n{raw_html or ''}"
     return bool(_CASE_CONTENT_RE.search(blob))
+
+
+def _normalized_body_text(*, raw_text: Optional[str], raw_html: Optional[str]) -> str:
+    text = (raw_text or "").strip()
+    if text:
+        return text
+    if raw_html:
+        return clean_html(raw_html)
+    return ""
 
 
 def _match_subscription_chrome(value: str) -> Optional[str]:
@@ -93,6 +109,46 @@ def detect_judgment_stub(
                     signal=f"{field_name}_{marker}",
                     matched_value=value[:500],
                 )
+    return None
+
+
+def detect_headnotes_only(
+    *,
+    raw_text: Optional[str],
+    raw_html: Optional[str],
+    judge_names: Optional[Iterable[Any]],
+) -> Optional[JudgmentGuardSignal]:
+    """Detect citation/headnote pages that should not promote as full judgments."""
+    body_text = _normalized_body_text(raw_text=raw_text, raw_html=raw_html)
+    body_low = body_text.lower()
+    html_low = (raw_html or "").lower()
+    has_notes_marker = bool(_NOTES_ON_CASES_RE.search(body_low) or _NOTES_ON_CASES_RE.search(html_low))
+    has_bookmark_marker = bool(_BOOKMARK_CASE_RE.search(body_low) or _BOOKMARK_CASE_RE.search(html_low))
+    short_body = len(body_text) < _SHORT_BODY_CHAR_THRESHOLD
+    bench_or_judges = bool(_BENCH_HINT_RE.search(body_text))
+    cleaned_judges = [j for j in _judge_name_values(judge_names) if j.strip()]
+    if cleaned_judges:
+        bench_or_judges = True
+    has_judgment_body_signal = bool(_JUDGMENT_BODY_HINT_RE.search(body_text))
+
+    if has_notes_marker and has_bookmark_marker and short_body and not bench_or_judges:
+        return JudgmentGuardSignal(
+            reason_code="headnotes_only",
+            signal="notes_and_bookmark_short_without_bench",
+            matched_value=body_text[:500],
+        )
+    if has_notes_marker and short_body and not bench_or_judges:
+        return JudgmentGuardSignal(
+            reason_code="headnotes_only",
+            signal="notes_short_without_bench",
+            matched_value=body_text[:500],
+        )
+    if (has_notes_marker or has_bookmark_marker) and not has_judgment_body_signal and not bench_or_judges:
+        return JudgmentGuardSignal(
+            reason_code="headnotes_only",
+            signal="notes_surface_missing_judgment_signals",
+            matched_value=body_text[:500],
+        )
     return None
 
 

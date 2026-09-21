@@ -40,6 +40,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.extractors.judgment_guards import detect_headnotes_only
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -165,7 +166,24 @@ class PakistanLawSitePipeline:
         self.job_id = job_id
         self.sleep = sleep
         self._session_lock: Optional[SessionLock] = None
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self.stats = {
+            "queries": 0,
+            "pages": 0,
+            "rows": 0,
+            "staged": 0,
+            "duplicates": 0,
+            "misses": 0,
+            "url_less_skips": 0,
+            "volumes_closed": 0,
+            "halted": False,
+            "paused": False,
+            "pacing_paused": False,
+            "pages_charged": 0,
+            "headnotes_detected": 0,
+            "headnotes_navigation_attempts": 0,
+            "headnotes_navigation_successes": 0,
+            "headnotes_navigation_failures": 0,
+        }
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
 
@@ -499,14 +517,61 @@ class PakistanLawSitePipeline:
         await self._charge_page()
         return await self.runner.run(op)
 
-    async def fetch_detail(self, url: str) -> PageResult:
+    async def fetch_detail(self, url: str, **goto_kwargs: Any) -> PageResult:
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(url)
+            page = await browser.goto(url, **goto_kwargs)
             raise_for_verdict(page)
             return page
 
         await self._charge_page()
         return await self.runner.run(op)
+
+    @staticmethod
+    def _is_headnotes_only_page(page: PageResult) -> bool:
+        text = clean_html(page.html or "")
+        return (
+            detect_headnotes_only(
+                raw_text=text,
+                raw_html=page.html,
+                judge_names=None,
+            )
+            is not None
+        )
+
+    async def _resolve_full_judgment_page(self, page: PageResult) -> tuple[PageResult, Dict[str, Any]]:
+        if not self._is_headnotes_only_page(page):
+            return page, {"headnotes_detected": False}
+        self.stats["headnotes_detected"] += 1
+        if "referencecaselawsearch" not in (page.url or "").lower():
+            self.stats["headnotes_navigation_failures"] += 1
+            return page, {"headnotes_detected": True, "resolved": False, "reason": "not_reference_case_page"}
+        self.stats["headnotes_navigation_attempts"] += 1
+        try:
+            # Confirmed live flow (droplet): click Case Description and harvest modal full text.
+            expanded = await self.fetch_detail(page.url, expand_case_description=True)
+        except (ExplicitBlock, VerificationRequired, LoginRequired, BrowserDisconnected):
+            raise
+        except Exception as exc:
+            logger.warning("PakistanLawSite full-judgment modal fetch failed url=%s err=%s", page.url, exc)
+            self.stats["headnotes_navigation_failures"] += 1
+            return page, {"headnotes_detected": True, "resolved": False, "reason": "modal_fetch_failed"}
+        modal_chars = int((expanded.metadata or {}).get("case_description_modal_chars") or 0)
+        if modal_chars >= 2000 and not self._is_headnotes_only_page(expanded):
+            self.stats["headnotes_navigation_successes"] += 1
+            return expanded, {
+                "headnotes_detected": True,
+                "resolved": True,
+                "resolved_url": expanded.url,
+                "case_description_modal_chars": modal_chars,
+            }
+        self.stats["headnotes_navigation_failures"] += 1
+        return page, {
+            "headnotes_detected": True,
+            "resolved": False,
+            "case_description_modal_chars": modal_chars,
+            "case_description_selector_present": bool((expanded.metadata or {}).get("case_description_selector_present")),
+            "case_description_selector_clicked": bool((expanded.metadata or {}).get("case_description_selector_clicked")),
+        }
 
     async def download(self, url: str) -> bytes:
         async def op(browser: Browser) -> bytes:
@@ -516,8 +581,20 @@ class PakistanLawSitePipeline:
 
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
-        html = page.html
-        prov = await record_provenance(self.db, source=self.source, url=page.url, content=html.encode("utf-8"), content_kind="html", route=route, http_status=page.status)
+        resolved_page, resolution = await self._resolve_full_judgment_page(page)
+        route_for_storage = dict(route or {})
+        if resolution.get("headnotes_detected"):
+            route_for_storage["headnotes_resolution"] = resolution
+        html = resolved_page.html
+        prov = await record_provenance(
+            self.db,
+            source=self.source,
+            url=resolved_page.url,
+            content=html.encode("utf-8"),
+            content_kind="html",
+            route=route_for_storage,
+            http_status=resolved_page.status,
+        )
         text = clean_html(html)
         pdf_prov = None
         ocr = False
@@ -535,18 +612,39 @@ class PakistanLawSitePipeline:
                 raise
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
-        staging = await stage_judgment(self.db, source=self.source, prov=prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(
+            self.db,
+            source=self.source,
+            prov=prov,
+            raw_html=html,
+            raw_text=text,
+            url=resolved_page.url,
+            route=route_for_storage,
+            job_id=self.job_id,
+            pdf_prov=pdf_prov,
+            ocr_applied=ocr,
+        )
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
-            if route not in routes:
-                routes.append(route)
+            if route_for_storage not in routes:
+                routes.append(route_for_storage)
                 staging.route_json = {**(staging.route_json or {}), "routes": routes}
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
         extractor = HybridExtractor(self.db, self.source, local=self.local_engine, provenance_id=prov.id, staging_id=staging.id)
-        outcome = await extractor.extract_judgment(html=html, text=text, source_meta={"citation": row.get("citation"), "title": row.get("title"), "court": row.get("court"), "url": page.url}, content_hash=prov.content_hash)
+        outcome = await extractor.extract_judgment(
+            html=html,
+            text=text,
+            source_meta={
+                "citation": row.get("citation"),
+                "title": row.get("title"),
+                "court": row.get("court"),
+                "url": resolved_page.url,
+            },
+            content_hash=prov.content_hash,
+        )
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
         staging.reconciled_json = _slim(outcome.data)

@@ -219,6 +219,7 @@ async def test_managed_text_input_uses_payload_not_refetch_url(db, source):
 
 
 async def test_local_engine_ok_for_login_session_on_prem_only(db, login_source):
+    login_source.extraction_mode = "hybrid"
     extractor = HybridExtractor(db, login_source, force_ai=True, local=local_with(AI_RESULT))
     o = await extractor.extract_judgment(html=JUDGMENT_HTML, content_hash="e" * 64)
     assert o.ai_status == "ok" and o.engine == "hybrid:local"
