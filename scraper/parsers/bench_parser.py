@@ -20,6 +20,7 @@ CORAM_LINE = re.compile(r"(?im)^[ \t]*(?:coram|bench|before|present)[ \t]*[:\-â€
 CORAM_BLOCK = re.compile(r"(?is)\b(?:coram|bench|before)\s*[:\-â€”]?\s*(.{5,400}?)(?:\n\s*\n|\bpetitioner|\bappellant|\bapplicant|\bversus|\bvs\.?|\bv\.\s)")
 JUDGE_SUFFIX = re.compile(r"(?i),?\s*(?:j\.?|jj\.?|c\.?j\.?|cj|hcj|acj|actg\.?\s*c\.?j\.?)\s*(?=$|,|;|\band\b|&)")
 SPLIT = re.compile(r"\s*(?:,|;|\band\b|&|\n)\s*", re.I)
+JUDGE_CHROME_NOISE = re.compile(r"(?i)(obtaining\s+subscription|update\s+subscriber|^\s*read\s*$)")
 
 BENCH_PHRASES = [
     (re.compile(r"(?i)\b(larger|full)\s+bench\b"), None),
@@ -54,6 +55,8 @@ def _split_names(blob: str) -> List[str]:
     names: List[str] = []
     for piece in SPLIT.split(blob):
         n = normalise_judge_name(piece)
+        if JUDGE_CHROME_NOISE.search(n):
+            continue
         if len(n) >= 4 and len(n.split()) <= 6 and not re.search(r"\d", n):
             if n.lower() not in {x.lower() for x in names}:
                 names.append(n)
