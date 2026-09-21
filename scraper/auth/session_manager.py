@@ -709,15 +709,32 @@ class PlaywrightBrowser:
             "case_description_selector_present": False,
             "case_description_selector_clicked": False,
             "case_description_modal_chars": 0,
+            "case_description_selector_used": None,
         }
-        selector = "input.caseDescription[value='Case Description']"
+        selectors = [
+            "input.caseDescription[value='Case Description']",
+            "input.caseDescription[value*='Case Description' i]",
+            "input.caseDescription",
+            "button.caseDescription",
+            "a.caseDescription",
+            "input[value='Case Description']",
+            "button:has-text('Case Description')",
+            "a:has-text('Case Description')",
+        ]
         modal_selector = "#ExceptionResponseScreen1"
-        try:
-            control = self._page.locator(selector).first
-            count = await self._wrap(control.count())
-        except Exception:
-            return None, metadata
-        if int(count or 0) <= 0:
+        control = None
+        for selector in selectors:
+            try:
+                locator = self._page.locator(selector).first
+                count = await self._wrap(locator.count())
+                if int(count or 0) <= 0:
+                    continue
+                control = locator
+                metadata["case_description_selector_used"] = selector
+                break
+            except Exception:
+                continue
+        if control is None:
             return None, metadata
         metadata["case_description_selector_present"] = True
         try:

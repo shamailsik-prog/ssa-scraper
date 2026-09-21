@@ -897,6 +897,9 @@ async def test_pipeline_uses_case_description_modal_to_extract_full_judgment(db,
     assert pipeline.stats["headnotes_navigation_successes"] == 1
     staging = (await db.execute(select(ScraperStaging).order_by(ScraperStaging.created_at.desc()))).scalars().first()
     assert staging is not None
+    assert staging.raw_text.startswith("Citation Name: PLD 2024 SC 247")
+    assert "Before Qazi Faez Isa, CJ, Syed Mansoor Ali Shah and Ayesha A. Malik, JJ" in staging.raw_text
+    assert len(staging.raw_text) > 30000
     judges = (staging.reconciled_json or {}).get("judge_names") or []
     assert "Qazi Faez Isa" in judges
     assert (staging.reconciled_json or {}).get("document_type") == "full_judgment"

@@ -22,6 +22,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -538,6 +539,16 @@ class PakistanLawSitePipeline:
             is not None
         )
 
+    @staticmethod
+    def _case_description_modal_text(page: PageResult) -> Optional[str]:
+        """Return extracted Case Description modal text when injected by Playwright wrapper."""
+        soup = BeautifulSoup(page.html or "", "html.parser")
+        node = soup.select_one("#ExceptionResponseScreen1_extracted")
+        if node is None:
+            return None
+        text = node.get_text("\n", strip=True)
+        return text if len(text) >= 2000 else None
+
     async def _resolve_full_judgment_page(self, page: PageResult) -> tuple[PageResult, Dict[str, Any]]:
         if not self._is_headnotes_only_page(page):
             return page, {"headnotes_detected": False}
@@ -582,6 +593,10 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
         resolved_page, resolution = await self._resolve_full_judgment_page(page)
+        modal_full_text = self._case_description_modal_text(resolved_page)
+        if modal_full_text:
+            resolution["modal_full_text_used"] = True
+            resolution["modal_full_text_chars"] = len(modal_full_text)
         route_for_storage = dict(route or {})
         if resolution.get("headnotes_detected"):
             route_for_storage["headnotes_resolution"] = resolution
@@ -595,7 +610,7 @@ class PakistanLawSitePipeline:
             route=route_for_storage,
             http_status=resolved_page.status,
         )
-        text = clean_html(html)
+        text = modal_full_text or clean_html(html)
         pdf_prov = None
         ocr = False
         if row.get("pdf_url"):
