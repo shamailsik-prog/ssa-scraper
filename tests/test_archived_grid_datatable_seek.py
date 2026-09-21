@@ -1,4 +1,8 @@
-"""Unit tests for PakistanLawSite #archivedpatientGrid DataTables absolute seek."""
+"""Unit tests for PakistanLawSite #archivedpatientGrid absolute seek.
+
+Primary live path is DOM tr-slice (seek_mode=dom_absolute). DataTables is an
+optional fallback when the offset-th row is not already in the DOM.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from scraper.auth.session_manager import ARCHIVED_GRID_SEEK_JS, PlaywrightBrowser
+from scraper.tasks.pakistanlawsite import CONFIRMED_CITATION_GRID_SEEK_MODES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +24,11 @@ def test_archived_grid_seek_js_uses_datatable_page_and_ajax_start():
     assert "api().page(Math.floor(start/pageLength)).draw(false)" in source
     assert "api.page(Math.floor(boundedStart / pageLength)).draw(false)" in source
     assert "oAjaxData.start = start" in source
+    assert 'seek_mode = "dom_absolute"' in source
+    assert "applyDomAbsolute" in source
+    assert "Primary live path" in source
+    assert "optional fallback" in source
+    assert source.index("if (applyDomAbsolute())") < source.index("const api = resolveApi()")
 
 
 def test_archived_grid_seek_js_nonzero_start_row_and_seek_mode():
@@ -39,3 +49,9 @@ def test_playwright_snapshot_script_embeds_datatable_seek_helper():
     assert "seekArchivedGridAbsolute" in joined
     assert "seek_mode" in joined
     assert "requested_start_row" in joined
+    assert "dom_absolute" in joined
+    assert "harvestStart" in joined
+
+
+def test_confirmed_citation_grid_seek_modes_include_datatable_and_dom_absolute():
+    assert CONFIRMED_CITATION_GRID_SEEK_MODES == frozenset({"datatable", "dom_absolute"})

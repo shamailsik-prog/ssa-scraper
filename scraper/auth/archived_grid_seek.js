@@ -15,6 +15,46 @@ async function seekArchivedGridAbsolute(table, startRow, maxRows) {
     const root = typeof globalThis !== "undefined" ? globalThis : {};
     const jq = (root.jQuery || root.$ || (root.window && (root.window.jQuery || root.window.$))) || null;
 
+    const readDomRows = () => {
+        if (!table) return [];
+        try {
+            const tbody = (table.tBodies && table.tBodies[0])
+                || (typeof table.querySelector === "function" ? table.querySelector("tbody") : null);
+            if (!tbody) return [];
+            if (tbody.rows) return tbody.rows;
+            if (typeof tbody.length === "number") return tbody;
+        } catch (_domError) {
+            return [];
+        }
+        return [];
+    };
+
+    // Primary live path (New Bot / droplet prove): no jQuery / no DataTables; the
+    // full ~20k <tr> list is already in the DOM. Slice at row_offset and expose
+    // seek_mode=dom_absolute ONLY when the offset-th row is confirmed present.
+    // DataTables is an optional fallback when that row is not in the DOM.
+    const applyDomAbsolute = () => {
+        const rows = readDomRows();
+        const length = rows && typeof rows.length === "number" ? rows.length : 0;
+        if (!(requestedStartRow < length && rows[requestedStartRow])) {
+            return false;
+        }
+        const windowLen = Math.max(1, toInt(maxRows, 1) || 1);
+        result.total_rows = length;
+        result.page_length = windowLen;
+        const target = rows[requestedStartRow];
+        if (target && typeof target.scrollIntoView === "function") {
+            try {
+                target.scrollIntoView({ block: "nearest" });
+            } catch (_scrollError) {
+                // Slice/index is the source of truth; scroll is best-effort.
+            }
+        }
+        result.start_row = requestedStartRow;
+        result.seek_mode = "dom_absolute";
+        return true;
+    };
+
     const resolveApi = () => {
         if (!jq || !jq.fn || !jq.fn.dataTable) return null;
         const attempts = [
@@ -36,7 +76,31 @@ async function seekArchivedGridAbsolute(table, startRow, maxRows) {
         return null;
     };
 
+    const isDataTableControlling = () => {
+        try {
+            return Boolean(
+                jq
+                && jq.fn
+                && jq.fn.dataTable
+                && typeof jq.fn.dataTable.isDataTable === "function"
+                && jq.fn.dataTable.isDataTable(table)
+            );
+        } catch (_dtCheckError) {
+            return false;
+        }
+    };
+
+    if (applyDomAbsolute()) {
+        return result;
+    }
+
     const api = resolveApi();
+    const dtControlling = Boolean(api) || isDataTableControlling();
+    if (!dtControlling) {
+        result.start_row = 0;
+        result.seek_mode = "unavailable";
+        return result;
+    }
     if (!api) {
         result.seek_mode = "unavailable";
         return result;

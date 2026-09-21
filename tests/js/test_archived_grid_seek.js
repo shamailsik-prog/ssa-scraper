@@ -98,14 +98,70 @@ function createDataTableEnv({ start = 0, pageLength = 10, total = 20567, fireDra
     return { api, state, jq };
 }
 
+function createDomTable(rowCount) {
+    const rows = [];
+    for (let i = 0; i < rowCount; i += 1) {
+        rows.push({
+            index: i,
+            scrolled: false,
+            scrollIntoView() {
+                this.scrolled = true;
+            },
+        });
+    }
+    return {
+        id: "archivedpatientGrid",
+        tBodies: [{ rows }],
+        querySelector(sel) {
+            return sel === "tbody" ? this.tBodies[0] : null;
+        },
+    };
+}
+
 async function run() {
     const table = { id: "archivedpatientGrid" };
 
+    // Primary live path: no jQuery / no DataTables; full ~20k <tr> list in DOM.
+    {
+        const liveTable = createDomTable(20567);
+        const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
+        const result = await seek(liveTable, 141, 200);
+        assert.strictEqual(result.seek_mode, "dom_absolute", `expected live DOM-slice seek, got ${JSON.stringify(result)}`);
+        assert.strictEqual(result.start_row, 141, "droplet-proved offset must land as start_row");
+        assert.strictEqual(result.requested_start_row, 141);
+        assert.strictEqual(result.total_rows, 20567);
+        assert.strictEqual(result.page_length, 200);
+        assert.strictEqual(liveTable.tBodies[0].rows[141].scrolled, true);
+    }
+
+    {
+        const liveTable = createDomTable(20567);
+        const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
+        const result = await seek(liveTable, 200, 200);
+        assert.strictEqual(result.seek_mode, "dom_absolute", `expected dom_absolute on live non-DT grid, got ${JSON.stringify(result)}`);
+        assert.strictEqual(result.start_row, 200);
+        assert.strictEqual(result.requested_start_row, 200);
+        assert.strictEqual(result.total_rows, 20567);
+        assert.strictEqual(result.page_length, 200);
+        assert.strictEqual(liveTable.tBodies[0].rows[200].scrolled, true);
+    }
+
+    {
+        const shortTable = createDomTable(10);
+        const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
+        const result = await seek(shortTable, 200, 200);
+        assert.notStrictEqual(result.seek_mode, "dom_absolute");
+        assert.notStrictEqual(result.seek_mode, "datatable");
+        assert.strictEqual(result.start_row, 0, "must not invent start_row from first-page DOM when the offset-th row is missing");
+        assert.strictEqual(result.requested_start_row, 200);
+    }
+
+    // Optional DataTables fallback: only when the offset-th <tr> is not already in the DOM.
     {
         const env = createDataTableEnv({ start: 0, pageLength: 10, total: 20567 });
         const seek = loadSeek({ jQuery: env.jq, $: env.jq, ARCHIVED_GRID_SEEK_TIMEOUT_MS: 50 });
         const result = await seek(table, 200, 200);
-        assert.strictEqual(result.seek_mode, "datatable", `expected datatable seek, got ${JSON.stringify(result)}`);
+        assert.strictEqual(result.seek_mode, "datatable", `expected datatable fallback, got ${JSON.stringify(result)}`);
         assert.strictEqual(result.start_row, 200);
         assert.strictEqual(result.requested_start_row, 200);
         assert.strictEqual(result.page_length, 10);
@@ -135,7 +191,7 @@ async function run() {
         const seek = loadSeek({ ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
         const result = await seek(table, 200, 200);
         assert.strictEqual(result.seek_mode, "unavailable");
-        assert.strictEqual(result.start_row, 0, "must not invent start_row from a DOM index when DataTables is missing");
+        assert.strictEqual(result.start_row, 0, "must not invent start_row from a DOM index when DataTables is missing and the offset-th row is absent");
         assert.strictEqual(result.requested_start_row, 200);
     }
 
@@ -155,8 +211,19 @@ async function run() {
         };
         const seek = loadSeek({ jQuery: env.jq, $: env.jq, ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
         const result = await seek(table, 200, 200);
-        assert.strictEqual(result.start_row, 0, "failed API seek must keep start_row at 0");
+        assert.strictEqual(result.start_row, 0, "failed API seek must keep start_row at 0 when the offset-th row is not in the DOM");
         assert.notStrictEqual(result.seek_mode, "datatable");
+        assert.notStrictEqual(result.seek_mode, "dom_absolute");
+    }
+
+    {
+        const env = createDataTableEnv({ start: 0, pageLength: 10, total: 20567 });
+        const livePlusDt = createDomTable(20567);
+        const seek = loadSeek({ jQuery: env.jq, $: env.jq, ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20 });
+        const result = await seek(livePlusDt, 141, 200);
+        assert.strictEqual(result.seek_mode, "dom_absolute", "live DOM slice is primary even if DataTables is also present");
+        assert.strictEqual(result.start_row, 141);
+        assert.strictEqual(env.state.oAjaxData.start, 0, "must not touch DataTables ajax start= when the offset-th <tr> is already in the DOM");
     }
 
     console.log("archived_grid_seek.js: all assertions passed");

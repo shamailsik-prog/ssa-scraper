@@ -444,18 +444,18 @@ class PlaywrightBrowser:
                             totalRows = seek.total_rows;
                             pageLength = seek.page_length;
                             seekMode = seek.seek_mode || 'none';
-                            if (seekMode === 'datatable') {
+                            if (seekMode === 'datatable' || seekMode === 'dom_absolute') {
                                 appliedStartRow = Number.isFinite(Number(seek.start_row)) ? Math.max(0, Math.floor(Number(seek.start_row))) : 0;
                             } else {
                                 appliedStartRow = 0;
                             }
                         }
                     } catch (_seekError) {
-                        // Keep compact snapshot resilient even if DataTables API is unavailable.
+                        // Keep compact snapshot resilient; live path is DOM slice, DT is optional.
                         appliedStartRow = 0;
                         seekMode = 'none';
                     }
-                    if (seekMode !== 'datatable') {
+                    if (seekMode !== 'datatable' && seekMode !== 'dom_absolute') {
                         appliedStartRow = 0;
                         const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                         const trCollection = tbody && tbody.rows ? tbody.rows : [];
@@ -499,8 +499,11 @@ class PlaywrightBrowser:
                     const rows = [];
                     const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                     const trCollection = tbody && tbody.rows ? tbody.rows : [];
-                    const limit = Math.min(trCollection.length || 0, maxRows);
-                    for (let i = 0; i < limit; i += 1) {
+                    // Live default: full <tr> list — slice [offset : offset+page_size].
+                    // DataTables fallback already materialized the window; harvest from 0.
+                    const harvestStart = (seekMode === 'dom_absolute') ? appliedStartRow : 0;
+                    const limit = Math.min(trCollection.length || 0, harvestStart + maxRows);
+                    for (let i = harvestStart; i < limit; i += 1) {
                         const tr = trCollection[i];
                         if (!tr) continue;
                         const tdNodes = tr.cells || tr.querySelectorAll('td');
