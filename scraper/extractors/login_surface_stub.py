@@ -1,10 +1,9 @@
 """Detect PakistanLawSite login-surface stub pages that must never promote."""
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, Optional
 
-_CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]", re.IGNORECASE)
+from scraper.extractors.judgment_guards import _has_case_content
 
 
 def is_login_surface_stub(
@@ -17,10 +16,11 @@ def is_login_surface_stub(
     judge_names: Any = None,
 ) -> bool:
     data = reconciled or {}
-    blob_text = f"{raw_text or ''}\n{raw_html or ''}"
-    has_case = bool(_CASE_CONTENT_RE.search(blob_text))
+    has_case = _has_case_content(raw_text=raw_text, raw_html=raw_html)
     url = (source_url or "").lower()
     # /login/check is the post-redirect host for real PLS case pages when session is good.
+    # Empty Citation Name chrome is not case content (#100). Structured CLC-like
+    # bodies without that label still count as case content.
     if "/login/check" in url and not has_case:
         return True
     court_val = str(court or data.get("court") or data.get("court_canonical") or "").strip()

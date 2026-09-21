@@ -50,7 +50,38 @@ def _det():
 CASE_TEXT_WITH_CITATION = "Citation Name: PLD 2024 SC 101\nMuhammad Akram versus The State"
 CASE_HTML_WITH_CITATION = "<html><body><h2>Citation Name: PLD 2024 SC 101</h2><p>Muhammad Akram versus The State</p></body></html>"
 EMPTY_CITATION_NAME_CHROME = "Obtaining Subscription\nUpdate Subscriber\nCitation Name:\n"
+EMPTY_CITATION_NAME_HTML = "<html><body>Obtaining Subscription<br>Update Subscriber<br>Citation Name:</body></html>"
 LOGIN_CHECK_URL = "https://www.pakistanlawsite.com/login/check?ReturnUrl=%2FLogin%2FCitationSearch"
+# Reporter bodies (CLC and similar) often have parties/holdings but no PLS chrome label.
+CLC_BODY_WITHOUT_CITATION_NAME = """2024 CLC 392
+IN THE LAHORE HIGH COURT, LAHORE
+(Judicial Department)
+
+Muhammad Yaqoob versus Commissioner Lahore Division
+
+Writ Petition No. 123 of 2023
+Decided on 15th January 2024
+
+JUDGMENT
+
+The petitioner challenged the impugned assessment order. Held: the petition
+is allowed and the impugned order is set aside.
+"""
+CLC_HTML_WITHOUT_CITATION_NAME = (
+    "<html><body>"
+    + "".join(f"<p>{line}</p>" for line in CLC_BODY_WITHOUT_CITATION_NAME.split("\n"))
+    + "</body></html>"
+)
+YLR_BODY_WITHOUT_CITATION_NAME = """2024 YLR 88
+IN THE PESHAWAR HIGH COURT
+Farid Khan vs. The State
+Criminal Appeal No. 44 of 2023
+Before Ikramullah Khan, J
+JUDGMENT
+The appeal is allowed and the conviction is set aside.
+"""
+SHORT_SUBSCRIPTION_STUB_TEXT = "Update Subscriber details to continue."
+SHORT_SUBSCRIPTION_STUB_HTML = "<html><body><h1>Update Subscriber</h1><p>Obtaining Subscription</p></body></html>"
 
 
 @pytest.mark.parametrize(
@@ -178,8 +209,48 @@ def test_real_citation_name_value_is_case_content(raw_text):
     ) is None
 
 
+@pytest.mark.parametrize(
+    "raw_text",
+    (
+        CLC_BODY_WITHOUT_CITATION_NAME,
+        YLR_BODY_WITHOUT_CITATION_NAME,
+        JUDGMENT_TEXT,
+    ),
+)
+def test_structured_reporter_body_without_citation_name_label_is_case_content(raw_text):
+    assert "Citation Name:" not in raw_text
+    assert _has_case_content(raw_text=raw_text, raw_html=None) is True
+    assert is_login_surface_stub(source_url=LOGIN_CHECK_URL, raw_text=raw_text, raw_html="") is False
+    assert detect_judgment_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=raw_text,
+        raw_html=None,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_clc_html_without_citation_name_label_is_case_content():
+    assert "Citation Name:" not in CLC_HTML_WITHOUT_CITATION_NAME
+    assert _has_case_content(raw_text="", raw_html=CLC_HTML_WITHOUT_CITATION_NAME) is True
+    assert is_login_surface_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text="",
+        raw_html=CLC_HTML_WITHOUT_CITATION_NAME,
+    ) is False
+
+
+def test_mid_sentence_before_in_subscription_cta_is_not_case_content():
+    text = "Update Subscriber plan before continuing."
+    assert _has_case_content(raw_text=text, raw_html=None) is False
+    assert is_login_surface_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=text,
+        raw_html="<html><body>Update Subscriber plan before continuing.</body></html>",
+    ) is True
+
+
 def test_login_check_plus_subscription_chrome_quarantines():
-    html = "<html><body>Obtaining Subscription<br>Update Subscriber<br>Citation Name:</body></html>"
+    html = EMPTY_CITATION_NAME_HTML
     assert is_login_surface_stub(
         source_url=LOGIN_CHECK_URL,
         raw_text=EMPTY_CITATION_NAME_CHROME,
@@ -275,24 +346,24 @@ def test_pakistancode_thin_section_helper_flags_short_or_footnote_only_bodies():
     (
         (
             "https://www.pakistanlawsite.com/login/check?x=1",
-            JUDGMENT_TEXT,
-            JUDGMENT_HTML,
+            EMPTY_CITATION_NAME_CHROME,
+            EMPTY_CITATION_NAME_HTML,
             ["Qazi Faez Isa"],
             None,
             "login_stub:",
         ),
         (
             "https://www.pakistanlawsite.com/Login/CitationSearch",
-            "Update Subscriber details to continue.",
-            JUDGMENT_HTML,
+            SHORT_SUBSCRIPTION_STUB_TEXT,
+            SHORT_SUBSCRIPTION_STUB_HTML,
             ["Qazi Faez Isa"],
             None,
             "subscription_chrome:",
         ),
         (
             "https://www.pakistanlawsite.com/Login/CitationSearch",
-            JUDGMENT_TEXT,
-            "<html><body>Obtaining Subscription...</body></html>",
+            SHORT_SUBSCRIPTION_STUB_TEXT,
+            SHORT_SUBSCRIPTION_STUB_HTML,
             ["Obtaining Subscription"],
             None,
             "subscription_chrome:",
@@ -355,13 +426,32 @@ def test_reconcile_judgment_scrubs_subscription_modal_judge_names_when_case_cont
     assert out.data["judge_names"] == ["Qazi Faez Isa"]
 
 
+def test_reconcile_judgment_does_not_quarantine_clc_body_without_citation_name_label():
+    det = _det()
+    det["citations"] = ["2024 CLC 392"]
+    det["court"] = "Lahore High Court"
+    det["year"] = 2024
+    det["case_title"] = "Muhammad Yaqoob versus Commissioner Lahore Division"
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=CLC_BODY_WITHOUT_CITATION_NAME,
+        raw_html=CLC_HTML_WITHOUT_CITATION_NAME,
+        source_url=LOGIN_CHECK_URL,
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is False
+    assert out.quarantine_reason is None
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_text", "raw_html", "judge_names", "judge_field_value", "expected_reason_prefix"),
     (
         (
             "https://www.pakistanlawsite.com/login/check?x=1",
-            clean_html(JUDGMENT_HTML),
-            JUDGMENT_HTML,
+            EMPTY_CITATION_NAME_CHROME,
+            EMPTY_CITATION_NAME_HTML,
             ["Qazi Faez Isa"],
             None,
             "login_stub:",
@@ -515,6 +605,42 @@ async def test_promotion_accepts_login_check_when_citation_name_has_value(db, lo
     judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
     assert judgment is not None
     assert "Citation Name: PLD 2024 SC 916" in (judgment.full_text or "")
+
+
+async def test_promotion_accepts_clc_body_without_citation_name_label(db, login_source):
+    assert "Citation Name:" not in CLC_BODY_WITHOUT_CITATION_NAME
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=LOGIN_CHECK_URL,
+        content=CLC_HTML_WITHOUT_CITATION_NAME.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=CLC_HTML_WITHOUT_CITATION_NAME,
+        raw_text=CLC_BODY_WITHOUT_CITATION_NAME,
+        url=LOGIN_CHECK_URL,
+    )
+    st.reconciled_json = {
+        "citations": ["2024 CLC 392"],
+        "court": "Lahore High Court",
+        "year": 2024,
+        "case_title": "Muhammad Yaqoob versus Commissioner Lahore Division",
+        "judge_names": ["Muhammad Ameer Bhatti"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+    assert judgment is not None
+    assert "Citation Name:" not in (judgment.full_text or "")
+    assert "Muhammad Yaqoob versus Commissioner Lahore Division" in (judgment.full_text or "")
+    assert "2024 CLC 392" in (judgment.full_text or "")
 
 
 async def test_promotion_blocks_headnote_document_type_for_full_judgment(db, source):
