@@ -19,7 +19,20 @@ class JudgmentGuardSignal:
 # PLS parks authenticated case HTML on /login/check after ReferenceCaseLawSearch.
 # URL alone is NOT a stub when the body carries real case content.
 _URL_LOGIN_STUB_RE = re.compile(r"/login/check(?:[/?#]|$)", re.IGNORECASE)
+# #100 short-circuit: a filled Citation Name value is always case content.
 _CASE_CONTENT_RE = re.compile(r"Citation\s*Name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]", re.IGNORECASE)
+# CLC / SCMR / YLR (and similar) reporter bodies often omit the PLS chrome
+# label. Line-anchored so mid-sentence words ("plan before continuing") do not count.
+_CASE_BODY_CONTENT_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?im)^\s*(?:before|coram)\b"),
+    re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,160}\bcourt\b"),
+    re.compile(r"(?im)^[^\n]{0,220}\b(?:versus|vs\.?|v\.)\b"),
+    re.compile(r"(?im)^\s*(?:judgment|judgement)\b"),
+    re.compile(r"(?im)^\s*held\s*[:\-.]"),
+)
+_HTML_BREAK_RE = re.compile(r"(?i)<br\s*/?>|</(?:p|div|tr|h[1-6]|li|td|th)>")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_NBSP_RE = re.compile(r"&nbsp;|&#160;", re.IGNORECASE)
 _NOTES_ON_CASES_RE = re.compile(r"\bnotes?\s+on\s+cases?\b", re.IGNORECASE)
 _JUDGMENT_STRUCTURE_RE = re.compile(
     r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
@@ -64,9 +77,30 @@ def _looks_like_modal_chrome_prefix(prefix: str) -> bool:
     )
 
 
+def _visible_case_blob(*, raw_text: Optional[str], raw_html: Optional[str]) -> str:
+    """Flatten HTML enough for line-anchored judgment-body detectors."""
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    html = raw_html or ""
+    if html:
+        html = _HTML_BREAK_RE.sub("\n", html)
+        html = _HTML_TAG_RE.sub(" ", html)
+        html = _HTML_NBSP_RE.sub(" ", html)
+    return f"{text}\n{html}"
+
+
 def _has_case_content(*, raw_text: Optional[str], raw_html: Optional[str]) -> bool:
-    blob = f"{raw_text or ''}\n{raw_html or ''}"
-    return bool(_CASE_CONTENT_RE.search(blob))
+    """True when the payload is a real judgment body, not empty Citation Name chrome.
+
+    A filled `Citation Name:` value still short-circuits (#100). Structured case
+    text (parties, court heading, Before/Coram, JUDGMENT, Held) also counts so
+    CLC and similar reporter bodies without that chrome label are not treated
+    as empty.
+    """
+    raw_blob = f"{raw_text or ''}\n{raw_html or ''}"
+    if _CASE_CONTENT_RE.search(raw_blob):
+        return True
+    visible = _visible_case_blob(raw_text=raw_text, raw_html=raw_html)
+    return any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
 
 
 def _match_subscription_chrome(value: str) -> Optional[str]:
