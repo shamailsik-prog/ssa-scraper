@@ -23,6 +23,7 @@ import html
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol
@@ -712,7 +713,20 @@ class PlaywrightBrowser:
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
         status = resp.status if resp else 200
         ctype = (resp.headers.get("content-type", "") if resp else "")
-        return PageResult(url=self._page.url, html=html_text, status=status, content_type=ctype, metadata=metadata)
+        requested_url = url
+        final_url = self._page.url
+        metadata["requested_url"] = requested_url
+        metadata["final_url"] = final_url
+        has_case_content = bool(re.search(r"Citation\s*Name\s*:", html_text or "", flags=re.IGNORECASE))
+        requested_reference_path = bool(re.search(r"ReferenceCaseLawSearch", requested_url or "", flags=re.IGNORECASE))
+        rewrite_login_check = (
+            bool(re.search(r"/login/check(?:[/?#]|$)", final_url or "", flags=re.IGNORECASE))
+            and (requested_reference_path or has_case_content)
+        )
+        result_url = requested_url if rewrite_login_check else final_url
+        if rewrite_login_check:
+            metadata["url_rewritten_from_login_check"] = True
+        return PageResult(url=result_url, html=html_text, status=status, content_type=ctype, metadata=metadata)
 
     async def _wait_for_post_submit_navigation(self, trigger) -> None:
         from playwright.async_api import TimeoutError as PWTimeoutError
