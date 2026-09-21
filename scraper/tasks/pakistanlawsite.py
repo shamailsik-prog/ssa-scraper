@@ -45,6 +45,7 @@ from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import CrawlCoverage, CrawlFrontier, ScraperSource, StatuteSection, Statute
 from scraper.notify import notify
+from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.search_map import active_map, map_as_dict, map_search_form, record_parse_result
@@ -295,7 +296,14 @@ class PakistanLawSitePipeline:
             self.stats["misses"] += 1
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
-        max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
+        if self.harvest_mode == "backfill":
+            max_detail = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
+            scan_window = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 600) or 600)
+        else:
+            max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 40) or 40)
+            scan_window = int(getattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 200) or 200)
+        max_detail = max(1, max_detail)
+        scan_window = max(max_detail, scan_window)
         row_count = len(rows)
         total_rows_meta = (page.metadata or {}).get("total_rows")
         try:
@@ -329,7 +337,7 @@ class PakistanLawSitePipeline:
         start_in_window = row_offset - snapshot_start_row if window_contains_offset else 0
         remaining_rows_in_window = max(0, row_count - start_in_window)
         remaining_rows_total = max(0, total_rows - start_offset)
-        take_cap = row_count if max_detail <= 0 else min(max_detail, row_count)
+        take_cap = min(scan_window, row_count)
         take_count = min(take_cap, remaining_rows_in_window, remaining_rows_total)
         raw_flush_every = cfg.get("citation_grid_flush_every", getattr(settings, "PLS_CITATION_GRID_FLUSH_EVERY", 1))
         try:
@@ -338,25 +346,54 @@ class PakistanLawSitePipeline:
             flush_every = 1
         flush_every = max(1, flush_every)
         selected_indexes = [start_in_window + i for i in range(take_count)]
+        self.stats["citation_grid_scan_window"] = scan_window
+        self.stats["citation_grid_detail_cap"] = max_detail
+        citation_candidates = {
+            normalise_citation(str(rows[idx].get("citation") or ""))
+            for idx in selected_indexes
+            if rows[idx].get("citation")
+        }
+        citation_candidates = {c for c in citation_candidates if c}
+        full_ready_citations = set()
+        if citation_candidates:
+            from scraper.models import Citation, Judgment
+
+            existing_rows = (
+                await self.db.execute(
+                    select(Citation.citation_string, Judgment.full_text, Judgment.judge_names)
+                    .join(Judgment, Judgment.id == Citation.judgment_id)
+                    .where(Citation.citation_string.in_(list(citation_candidates)))
+                )
+            ).all()
+            for citation_string, full_text, judge_names in existing_rows:
+                body_len = len(full_text or "")
+                has_judges = bool(judge_names)
+                if body_len >= 5000 and has_judges:
+                    full_ready_citations.add(str(citation_string))
         logger.info(
-            "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s flush_every=%s",
+            "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s",
             start_offset,
             start_in_window,
             take_count,
             row_count,
             total_rows,
             max_detail,
+            scan_window,
             flush_every,
+            len(full_ready_citations),
         )
         staged_before = self.stats["staged"]
         duplicates_before = self.stats["duplicates"]
         url_less_skips = 0
+        known_citation_skips = 0
+        detail_attempts = 0
         self.stats["citation_grid_offset"] = start_offset
         self.stats["citation_grid_snapshot_start"] = snapshot_start_row
         self.stats["citation_grid_rows_seen"] = row_count
         details_since_flush = 0
         staged_since_flush = 0
         last_committed_offset = start_offset
+        processed_rows_total = 0
 
         def next_offset_after(processed_rows: int) -> int:
             if total_rows <= 0:
@@ -401,6 +438,42 @@ class PakistanLawSitePipeline:
 
         for idx, row_idx in enumerate(selected_indexes):
             row = rows[row_idx]
+            processed_rows_total = idx + 1
+            citation_norm = normalise_citation(str(row.get("citation") or ""))
+            if citation_norm and citation_norm in full_ready_citations:
+                known_citation_skips += 1
+                self.stats["known_citation_skips"] = self.stats.get("known_citation_skips", 0) + 1
+                if (idx + 1) == len(selected_indexes):
+                    next_offset = next_offset_after(idx + 1)
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx + 1,
+                    )
+                    details_since_flush = 0
+                    staged_since_flush = 0
+                continue
+            if detail_attempts >= max_detail:
+                processed_rows_total = idx
+                next_offset = next_offset_after(idx)
+                if idx > 0:
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx,
+                    )
+                    details_since_flush = 0
+                    staged_since_flush = 0
+                logger.info(
+                    "PakistanLawSite citation-grid detail cap reached attempts=%s max_detail=%s processed_rows=%s known_skips=%s",
+                    detail_attempts,
+                    max_detail,
+                    idx,
+                    known_citation_skips,
+                )
+                break
             detail_url = row.get("detail_url") or row.get("pdf_url")
             if not detail_url:
                 url_less_skips += 1
@@ -442,6 +515,7 @@ class PakistanLawSitePipeline:
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
             detail = await self.fetch_detail(detail_url)
+            detail_attempts += 1
             result = await self.preserve_and_extract(detail, route, row)
             details_since_flush += 1
             if result == "staged":
@@ -462,24 +536,30 @@ class PakistanLawSitePipeline:
                 url_less_skips,
                 len(selected_indexes),
             )
+        if known_citation_skips:
+            logger.info(
+                "PakistanLawSite citation-grid fast-forwarded %s/%s known full citations",
+                known_citation_skips,
+                len(selected_indexes),
+            )
         staged_delta = self.stats["staged"] - staged_before
         if selected_indexes and staged_delta == 0:
             duplicate_delta = self.stats["duplicates"] - duplicates_before
             logger.warning(
                 "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s)",
-                len(selected_indexes),
+                processed_rows_total or len(selected_indexes),
                 duplicate_delta,
                 url_less_skips,
             )
-            if url_less_skips >= len(selected_indexes):
+            if processed_rows_total and url_less_skips >= processed_rows_total:
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
-        next_offset = next_offset_after(take_count)
+        next_offset = next_offset_after(processed_rows_total)
         if last_committed_offset != next_offset:
             await flush_citation_grid_progress(
                 next_offset,
                 staged_this_flush=0,
                 details_this_flush=0,
-                processed_rows=take_count,
+                processed_rows=processed_rows_total,
             )
         logger.info(
             "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",

@@ -642,7 +642,7 @@ async def test_instrument_relation_graph_fails_closed_for_unresolved_targets(db)
         (
             "Code of Criminal Procedure, 1898",
             "Semester system and admission policy for university departments and faculty credits.",
-            "non-legal/academic content",
+            "statute sections",
         ),
     ),
 )

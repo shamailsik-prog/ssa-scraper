@@ -835,6 +835,55 @@ async def test_pipeline_uses_case_description_child_hash_to_avoid_shell_duplicat
     assert "PLD 2024 SC 902" in (staged[0].raw_text + staged[1].raw_text)
 
 
+async def test_pipeline_citation_grid_fast_forwards_known_full_citations(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 1)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 3)
+    await _activate(db, login_source)
+
+    from scraper.fetchers import canonical_text_hash
+    from scraper.models import Citation
+
+    for citation in ("PLD 2024 SC 911", "PLD 2024 SC 912"):
+        row = Judgment(
+            canonical_citation=citation,
+            full_text=("FULL JUDGMENT BODY " + citation + "\n") * 260,
+            full_text_hash=canonical_text_hash(("FULL JUDGMENT BODY " + citation + "\n") * 260),
+            judge_names=["Justice A", "Justice B"],
+            source_name="PakistanLawSite",
+            access_method="login_session",
+        )
+        db.add(row)
+        await db.flush()
+        db.add(Citation(judgment_id=row.id, citation_string=citation, raw_string=citation, is_primary=True))
+    await db.commit()
+
+    rows = [
+        ("PLD 2024 SC 911", "Known 911", "Supreme Court", "https://www.pakistanlawsite.com/case/911"),
+        ("PLD 2024 SC 912", "Known 912", "Supreme Court", "https://www.pakistanlawsite.com/case/912"),
+        ("PLD 2024 SC 913", "New 913", "Supreme Court", "https://www.pakistanlawsite.com/case/913"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/911"), judgment_html("PLD 2024 SC 911", title="Known 911"))
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/912"), judgment_html("PLD 2024 SC 912", title="Known 912"))
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/913"), judgment_html("PLD 2024 SC 913", title="New 913"))
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/913"]
+    assert stats["known_citation_skips"] == 2
+    assert stats["staged"] == 1
+    assert stats["citation_grid_next_offset"] == 0
+
+
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
