@@ -2,6 +2,9 @@
 PakistanLawSite — SEARCH-DRIVEN, four-tier coverage inside a human-login Playwright session
 (Amendment §9, §10; Cursor command §2).
 
+The spec frontier is the base path. Live-site adapters (citation-grid, known-citation skip,
+reporter shards, backfill pacing) are pull-off layers in scraper.harvest_layers.
+
 TIER 1 citation enumeration (backbone): for each subscribed reporter × year, probe citation
         page numbers 1, 2, 3 … ; VOLUME_END_GAP consecutive misses close the volume.
 TIER 2 statute/section enumeration: one query per promoted statute section.
@@ -44,6 +47,14 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.judgment_guards import detect_headnotes_only, extract_before_jj_judge_names
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
+from scraper.harvest_layers import (
+    describe_layers,
+    frontier_drain_after_grid_enabled,
+    should_use_citation_grid,
+    skip_known_full_enabled,
+    surface_adapter,
+    volume_from_citation,
+)
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Citation, CrawlCoverage, CrawlFrontier, Judgment, ScraperSource, StatuteSection, Statute
 from scraper.notify import notify
@@ -250,6 +261,50 @@ class PakistanLawSitePipeline:
         if self.reporter_shard is not None:
             self.runner.preferred_slot_number = self.reporter_shard + 1
 
+    async def credit_volume_from_citation(self, citation: str, *, via: str, result: str) -> None:
+        """Write a live-site hit onto spec crawl_coverage / existing Tier-1 frontier rows."""
+        volume = volume_from_citation(citation)
+        if volume is None:
+            return
+        rep, year, page_no = volume["reporter"], volume["year"], volume["page"]
+        cov = (
+            await self.db.execute(
+                select(CrawlCoverage).where(
+                    CrawlCoverage.source_name == SOURCE_NAME,
+                    CrawlCoverage.reporter == rep,
+                    CrawlCoverage.year == year,
+                )
+            )
+        ).scalars().first()
+        if cov is None:
+            cov = CrawlCoverage(source_name=SOURCE_NAME, reporter=rep, year=year)
+            self.db.add(cov)
+            await self.db.flush()
+        if page_no:
+            cov.highest_page_seen = max(int(cov.highest_page_seen or 0), int(page_no))
+        cov.judgments_found = int(cov.judgments_found or 0) + 1
+        cov.consecutive_misses = 0
+        routes = dict(cov.routes_json or {})
+        routes[via] = int(routes.get(via, 0) or 0) + 1
+        cov.routes_json = routes
+        key = f"t1:{rep}:{year}"
+        frontier = (
+            await self.db.execute(
+                select(CrawlFrontier).where(
+                    CrawlFrontier.source_name == SOURCE_NAME,
+                    CrawlFrontier.tier == 1,
+                    CrawlFrontier.query_key == key,
+                )
+            )
+        ).scalars().first()
+        if frontier is not None:
+            frontier.yield_count = int(frontier.yield_count or 0) + 1
+            if result == "staged":
+                frontier.new_count = int(frontier.new_count or 0) + 1
+            frontier.last_run_at = datetime.now(timezone.utc)
+        self.stats["frontier_credits"] = int(self.stats.get("frontier_credits", 0) or 0) + 1
+        await self.db.flush()
+
     @staticmethod
     def _has_queryable_search_fields(search_map: Dict[str, Any]) -> bool:
         fields = search_map.get("fields") or {}
@@ -428,7 +483,7 @@ class PakistanLawSitePipeline:
         }
         citation_candidates = {c for c in citation_candidates if c}
         full_ready_citations = set()
-        if citation_candidates:
+        if citation_candidates and skip_known_full_enabled():
             existing_rows = (
                 await self.db.execute(
                     select(Citation.citation_string, Judgment.full_text, Judgment.judge_names)
@@ -529,6 +584,7 @@ class PakistanLawSitePipeline:
             if citation_norm and citation_norm in full_ready_citations:
                 known_citation_skips += 1
                 self.stats["known_citation_skips"] = known_citation_skips
+                await self.credit_volume_from_citation(citation_norm, via="citation_grid", result="known")
                 if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
                     next_offset = next_offset_after(idx + 1)
                     await flush_citation_grid_progress(
@@ -588,10 +644,17 @@ class PakistanLawSitePipeline:
                     self.stats["duplicates"] - duplicates_before,
                     known_citation_skips,
                 )
+            volume = volume_from_citation(citation_norm) if citation_norm else None
             route = {
-                "tier": "citation_grid",
-                "query": {"surface": "archivedpatientGrid"},
+                "tier": 1 if volume else "citation_grid",
+                "layer": "citation_grid",
+                "query": (
+                    {"reporter": volume["reporter"], "year": volume["year"], "surface": "archivedpatientGrid"}
+                    if volume
+                    else {"surface": "archivedpatientGrid"}
+                ),
                 "cursor": {
+                    "page_no": volume["page"] if volume else None,
                     "row_index": row_idx,
                     "absolute_row_index": snapshot_start_row + row_idx,
                 },
@@ -602,6 +665,8 @@ class PakistanLawSitePipeline:
             detail = await self.fetch_detail(detail_url)
             detail_attempts += 1
             result = await self.preserve_and_extract(detail, route, row)
+            if citation_norm:
+                await self.credit_volume_from_citation(citation_norm, via="citation_grid", result=result)
             details_since_flush += 1
             if result == "staged":
                 staged_since_flush += 1
@@ -894,6 +959,62 @@ class PakistanLawSitePipeline:
             page = await self.fetch_detail(nxt)
             self.stats["pages"] += 0
 
+    async def _drain_frontier(self, search_map: Dict[str, Any], slot, lock, *, max_queries: int, max_probes_per_volume: int) -> None:
+        """Spec Tiers 1–4. crawl_frontier is the truth of progress."""
+        now = datetime.now(timezone.utc)
+        q = (
+            select(CrawlFrontier)
+            .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status.in_(["pending", "in_progress"]))
+            .where((CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now))
+            .order_by(CrawlFrontier.tier.asc(), CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
+            .limit(max_queries)
+        )
+        frontier_rows = (await self.db.execute(q)).scalars().all()
+        if self.reporter_shard_reporters:
+            frontier_rows = [
+                fr
+                for fr in frontier_rows
+                if not fr.query_json.get("reporter") or fr.query_json.get("reporter") in self.reporter_shard_reporters
+            ]
+        self.stats["frontier_rows"] = len(frontier_rows)
+        for fr in frontier_rows:
+            fr.status = "in_progress"
+            fr.slot_number = self.runner.browser.slot_number if self.runner.browser else slot.slot_number
+            await self.db.flush()
+            try:
+                if fr.tier == 1:
+                    await self.run_tier1(fr, search_map, max_probes_per_volume)
+                else:
+                    await self.run_paged_query(fr, search_map, max_pages=10)
+                fr.last_error = None
+            except ExplicitBlock as exc:
+                fr.status = "pending"
+                fr.last_error = f"halted: {exc}"
+                self.stats["halted"] = True
+                await self.db.flush()
+                return
+            except (LoginRequired, VerificationRequired, NoActiveSlot) as exc:
+                fr.status = "pending"
+                fr.last_error = f"paused: {exc}"
+                self.stats["paused"] = True
+                await self.db.flush()
+                return
+            except BrowserDisconnected as exc:
+                fr.status = "pending"
+                fr.last_error = f"disconnected: {exc}"
+                self.stats["paused"] = True
+                await self.db.flush()
+                return
+            except PacingBudgetExceeded as exc:
+                fr.status = "pending"
+                fr.last_error = f"pacing: {exc}"
+                self.stats["pacing_paused"] = True
+                logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
+                await self.db.flush()
+                return
+            await lock.refresh()
+            await self.db.flush()
+
     # ---------------------------------------------------------------- main loop
     async def run(self, *, max_queries: int = 20, max_probes_per_volume: int = 60) -> Dict[str, Any]:
         self._assert_permitted()
@@ -939,72 +1060,32 @@ class PakistanLawSitePipeline:
                     slot.slot_number,
                 )
             search_map = await self.ensure_search_map()
-            if self._is_citation_grid_map(search_map):
+            seeded = await seed_frontier(self.db, self.source)
+            self.stats["frontier_seeded"] = seeded
+            self.stats["layers"] = describe_layers(self.harvest_mode, self.reporter_shard)
+            self.stats["surface_adapter"] = surface_adapter()
+            use_grid = should_use_citation_grid(is_grid_map=self._is_citation_grid_map(search_map))
+            if use_grid:
                 logger.info(
-                    "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
+                    "PakistanLawSite layer=citation_grid adapter=%s shard=%s titles=%s",
+                    surface_adapter(),
                     self.reporter_shard,
                     self.reporter_shard_reporters or "all",
                 )
                 await self.run_citation_grid_surface(search_map)
-                self.source.last_scraped_at = datetime.now(timezone.utc)
-                self.source.last_success_at = self.source.last_scraped_at
-                await self.db.flush()
-                return self.stats
-            await seed_frontier(self.db, self.source)
-            now = datetime.now(timezone.utc)
-            q = (
-                select(CrawlFrontier)
-                .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status.in_(["pending", "in_progress"]))
-                .where((CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now))
-                .order_by(CrawlFrontier.tier.asc(), CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
-                .limit(max_queries)
-            )
-            frontier_rows = (await self.db.execute(q)).scalars().all()
-            if self.reporter_shard_reporters:
-                frontier_rows = [
-                    fr
-                    for fr in frontier_rows
-                    if not fr.query_json.get("reporter") or fr.query_json.get("reporter") in self.reporter_shard_reporters
-                ]
-            for fr in frontier_rows:
-                fr.status = "in_progress"
-                fr.slot_number = self.runner.browser.slot_number if self.runner.browser else slot.slot_number
-                await self.db.flush()
-                try:
-                    if fr.tier == 1:
-                        await self.run_tier1(fr, search_map, max_probes_per_volume)
-                    else:
-                        await self.run_paged_query(fr, search_map, max_pages=10)
-                    fr.last_error = None
-                except ExplicitBlock as exc:
-                    fr.status = "pending"
-                    fr.last_error = f"halted: {exc}"
-                    self.stats["halted"] = True
-                    await self.db.flush()
-                    return self.stats
-                except (LoginRequired, VerificationRequired, NoActiveSlot) as exc:
-                    fr.status = "pending"
-                    fr.last_error = f"paused: {exc}"
-                    self.stats["paused"] = True
-                    await self.db.flush()
-                    return self.stats
-                except BrowserDisconnected as exc:
-                    fr.status = "pending"
-                    fr.last_error = f"disconnected: {exc}"
-                    self.stats["paused"] = True
-                    await self.db.flush()
-                    return self.stats
-                except PacingBudgetExceeded as exc:
-                    fr.status = "pending"
-                    fr.last_error = f"pacing: {exc}"
-                    self.stats["pacing_paused"] = True
-                    logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
-                    await self.db.flush()
-                    return self.stats
-                await lock.refresh()
-                await self.db.flush()
+                if frontier_drain_after_grid_enabled() and self._has_queryable_search_fields(search_map):
+                    logger.info("PakistanLawSite layer=frontier_drain_after_grid starting spec tiers")
+                    await self._drain_frontier(
+                        search_map, slot, lock, max_queries=max_queries, max_probes_per_volume=max_probes_per_volume
+                    )
+            else:
+                logger.info("PakistanLawSite layer=spec_frontier adapter=%s", surface_adapter())
+                await self._drain_frontier(
+                    search_map, slot, lock, max_queries=max_queries, max_probes_per_volume=max_probes_per_volume
+                )
             self.source.last_scraped_at = datetime.now(timezone.utc)
-            self.source.last_success_at = self.source.last_scraped_at
+            if not self.stats.get("halted"):
+                self.source.last_success_at = self.source.last_scraped_at
             await self.db.flush()
             return self.stats
         finally:

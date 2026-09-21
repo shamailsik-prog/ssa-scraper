@@ -34,6 +34,7 @@ ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", 
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
 HARVEST_MODES = ("backfill", "updates")
+PLS_SURFACE_ADAPTERS = ("auto", "form", "citation_grid")
 
 SECRET_FIELD_NAMES = (
     "ENCRYPTION_KEY",
@@ -184,6 +185,18 @@ class Settings(BaseSettings):
     PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots so CitationSearch cannot hold the login lock for a full Playwright navigation timeout.")
     PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Max detail pages to fetch per citation-grid login_session run.")
     PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Rows scanned per citation-grid run (can exceed detail fetch cap; known rows are fast-forwarded).")
+    PLS_SURFACE_ADAPTER: str = Field(
+        default="auto",
+        description="Pull-off layer: auto=detect live surface, form=spec §3.4 only, citation_grid=force CaseNames walk.",
+    )
+    PLS_SKIP_KNOWN_FULL_CITATIONS: bool = Field(
+        default=True,
+        description="Pull-off layer: skip citation-grid rows already stored as full judgments.",
+    )
+    PLS_ALSO_DRAIN_FRONTIER: bool = Field(
+        default=False,
+        description="Pull-off layer: after a citation-grid window, also drain spec Tiers 1–4 when the form map has fields.",
+    )
     BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Backfill-mode max detail pages per citation-grid run.")
     BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill-mode rows scanned per citation-grid run.")
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
@@ -393,6 +406,14 @@ class Settings(BaseSettings):
         v = v.strip().lower()
         if v not in HARVEST_MODES:
             raise ValueError(f"HARVEST_MODE must be one of {HARVEST_MODES}")
+        return v
+
+    @field_validator("PLS_SURFACE_ADAPTER")
+    @classmethod
+    def _validate_surface_adapter(cls, v: str) -> str:
+        v = (v or "auto").strip().lower()
+        if v not in PLS_SURFACE_ADAPTERS:
+            raise ValueError(f"PLS_SURFACE_ADAPTER must be one of {PLS_SURFACE_ADAPTERS}")
         return v
 
     @field_validator("PLS_SUBSCRIBED_REPORTERS", "PLS_JOURNALS", "PLS_JOURNALS_B")

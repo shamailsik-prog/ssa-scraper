@@ -18,6 +18,7 @@ from sqlalchemy import func, select, text
 
 from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
+from scraper.harvest_layers import describe_layers
 from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
 from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources
 
@@ -78,6 +79,7 @@ async def health() -> Dict[str, Any]:
             out["embedding_identity_ok"] = await embedding_identity_matches()
             harvest_mode = await get_harvest_mode(db)
             out["harvest_mode"] = harvest_mode
+            out["harvest_layers"] = describe_layers(harvest_mode)
             out["backfill_progress"] = await backfill_progress(
                 db, source_names=(await selected_source_names(db, "backfill"))
             )

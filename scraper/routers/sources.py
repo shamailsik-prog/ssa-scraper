@@ -259,8 +259,11 @@ async def harvest_mode_status(db: AsyncSession = Depends(get_db)) -> Dict[str, A
             }
         )
 
+    from scraper.harvest_layers import describe_layers
+
     return {
         "mode": mode,
+        "layers": describe_layers(mode),
         "auto_switch": settings.HARVEST_AUTO_SWITCH,
         "selected_sources": selected,
         "dispatch_loop_seconds": settings.DISPATCH_LOOP_SECONDS,

@@ -54,6 +54,12 @@ def test_harvest_mode_settings_validate():
         Settings(**BASE, BACKFILL_LOGIN_SESSION_CONCURRENCY=3)
 
 
+def test_surface_adapter_must_be_known_layer():
+    assert Settings(**BASE, PLS_SURFACE_ADAPTER="auto").PLS_SURFACE_ADAPTER == "auto"
+    with pytest.raises(ValidationError):
+        Settings(**BASE, PLS_SURFACE_ADAPTER="invented")
+
+
 def test_every_required_sgai_setting_exists():
     for name in ["SGAI_ENABLED", "SGAI_MODE", "SGAI_API_KEY", "SGAI_MANAGED_PUBLIC_ONLY", "SGAI_LOCAL_ENABLED", "SGAI_LOCAL_LLM_PROVIDER", "SGAI_LOCAL_LLM_MODEL", "SGAI_LOCAL_LLM_BASE_URL", "SGAI_TIMEOUT_SECONDS", "SGAI_MAX_RETRIES", "SGAI_DAILY_CREDIT_CAP", "SGAI_CACHE_ENABLED", "SGAI_SCHEMA_VERSION", "SGAI_STEALTH_ALLOWED", "SGAI_FAIL_OPEN_TO_DETERMINISTIC"]:
         assert hasattr(settings, name), name
