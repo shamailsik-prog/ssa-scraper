@@ -181,7 +181,7 @@ class Settings(BaseSettings):
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
     PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=200, description="Maximum rows to materialize from #archivedpatientGrid when compacting CitationSearch HTML (keep low — full DOM walks hang).")
-    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=40, description="Max detail pages to fetch per citation-grid login_session run.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Max detail pages to fetch per citation-grid login_session run.")
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
