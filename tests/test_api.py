@@ -24,7 +24,11 @@ def test_health_and_dashboard(client):
     assert h["read_only_role"]["status"] == "CONFIGURED" and h["read_only_role"]["exists"]
     assert "PLS_SUBSCRIBED_REPORTERS" in h["not_configured"]
     d = client.get("/dashboard")
-    assert d.status_code == 200 and "Human login" in d.text and "Check viewer" in d.text and "Review queue" in d.text and "Archive storage" in d.text
+    assert d.status_code == 200
+    # Dashboard smoke signals should assert visible operator features, not stale section names.
+    assert "SIKANDER AI — Corpus Console" in d.text
+    assert "Corpus viewer" in d.text and "Browse and search" in d.text
+    assert "Record detail — full saved text" in d.text and "Admin key" in d.text
     for secret in ("test-admin-key", settings.ENCRYPTION_KEY, "readerpw", "writerpw"):
         assert secret not in json.dumps(h) and secret not in d.text
 
