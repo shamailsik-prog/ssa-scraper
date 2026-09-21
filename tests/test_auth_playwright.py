@@ -1434,6 +1434,45 @@ async def test_pipeline_citation_grid_cursor_advances_from_dom_absolute_offset(d
     assert any(call[3].get("archived_grid_start_row") == 200 for call in search_calls)
 
 
+async def test_pipeline_citation_grid_cursor_advances_from_droplet_proved_dom_absolute_offset(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    await _activate(db, login_source)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 141},
+    }
+    await db.commit()
+    rows = [
+        ("PLD 2024 SC 1411", "Case 1411", "Supreme Court", "https://www.pakistanlawsite.com/case/1411"),
+        ("PLD 2024 SC 1412", "Case 1412", "Supreme Court", "https://www.pakistanlawsite.com/case/1412"),
+        ("PLD 2024 SC 1413", "Case 1413", "Supreme Court", "https://www.pakistanlawsite.com/case/1413"),
+    ]
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda _browser: PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=_archived_grid_html(rows),
+        status=200,
+        metadata={"total_rows": 20567, "start_row": 141, "requested_start_row": 141, "seek_mode": "dom_absolute"},
+    )
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/1411", "https://www.pakistanlawsite.com/case/1412"]
+    assert stats["citation_grid_offset"] == 141
+    assert stats["citation_grid_next_offset"] == 143
+    assert stats["citation_grid_seek_mode"] == "dom_absolute"
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 143
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("last_seek_mode") == "dom_absolute"
+
+
 async def test_pipeline_citation_grid_skip_known_still_advances_dom_absolute_cursor(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)

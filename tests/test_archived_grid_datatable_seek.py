@@ -1,4 +1,8 @@
-"""Unit tests for PakistanLawSite #archivedpatientGrid DataTables absolute seek."""
+"""Unit tests for PakistanLawSite #archivedpatientGrid absolute seek.
+
+Primary live path is DOM tr-slice (seek_mode=dom_absolute). DataTables is an
+optional fallback when the offset-th row is not already in the DOM.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,9 @@ def test_archived_grid_seek_js_uses_datatable_page_and_ajax_start():
     assert "oAjaxData.start = start" in source
     assert 'seek_mode = "dom_absolute"' in source
     assert "applyDomAbsolute" in source
+    assert "Primary live path" in source
+    assert "optional fallback" in source
+    assert source.index("if (applyDomAbsolute())") < source.index("const api = resolveApi()")
 
 
 def test_archived_grid_seek_js_nonzero_start_row_and_seek_mode():

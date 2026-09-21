@@ -63,8 +63,8 @@ TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
 DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD")
 # Confirmed absolute-seek modes: only these may keep a non-zero snapshot start_row.
-# datatable = DataTables page.info().start landed (#101).
-# dom_absolute = live non-DT grid; offset-th <tr> confirmed in DOM (New Bot hotpatch).
+# dom_absolute = primary live path; offset-th <tr> confirmed in DOM (New Bot / droplet).
+# datatable = optional fallback when DataTables is present and page.info().start lands (#101).
 CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
 
 

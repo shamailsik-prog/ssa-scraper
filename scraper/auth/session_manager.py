@@ -451,7 +451,7 @@ class PlaywrightBrowser:
                             }
                         }
                     } catch (_seekError) {
-                        // Keep compact snapshot resilient even if DataTables API is unavailable.
+                        // Keep compact snapshot resilient; live path is DOM slice, DT is optional.
                         appliedStartRow = 0;
                         seekMode = 'none';
                     }
@@ -499,8 +499,8 @@ class PlaywrightBrowser:
                     const rows = [];
                     const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
                     const trCollection = tbody && tbody.rows ? tbody.rows : [];
-                    // DataTables already materialized the absolute window in-DOM; harvest from 0.
-                    // Live non-DT grid has the full <tr> list — slice [offset : offset+page_size].
+                    // Live default: full <tr> list — slice [offset : offset+page_size].
+                    // DataTables fallback already materialized the window; harvest from 0.
                     const harvestStart = (seekMode === 'dom_absolute') ? appliedStartRow : 0;
                     const limit = Math.min(trCollection.length || 0, harvestStart + maxRows);
                     for (let i = harvestStart; i < limit; i += 1) {
