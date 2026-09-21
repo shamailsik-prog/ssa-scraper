@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
@@ -20,6 +20,7 @@ from scraper.harvest_mode import (
     backfill_progress,
     cadence_for_source,
     get_harvest_mode,
+    login_pacing_profile,
     selected_source_names,
     set_harvest_mode,
     source_backfill_priority,
@@ -107,9 +108,9 @@ def run_source_job(self, source_name: str):
 
 
 @shared_task(name="scraper.tasks.dispatcher.run_login_session_job", bind=True, max_retries=0)
-def run_login_session_job(self, source_name: str = "PakistanLawSite"):
-    """Separate task name so Celery routes it to the single-concurrency login_session queue."""
-    return run_async(run_source(source_name))
+def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_shard=None):
+    """Login-session queue. When concurrency is 2, Beat enqueues one job per reporter shard."""
+    return run_async(run_source(source_name, reporter_shard=reporter_shard))
 
 
 async def dispatch_due_sources() -> Dict[str, Any]:
@@ -159,19 +160,44 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             if not due:
                 continue
             if s.access_method == "login_session":
-                running = (
-                    await db.execute(
-                        select(ScraperJob.id).where(
-                            ScraperJob.source_name == s.source_name,
-                            ScraperJob.job_type == "scrape",
-                            ScraperJob.status == "running",
+                running_count = int(
+                    (
+                        await db.execute(
+                            select(func.count())
+                            .select_from(ScraperJob)
+                            .where(
+                                ScraperJob.source_name == s.source_name,
+                                ScraperJob.job_type == "scrape",
+                                ScraperJob.status == "running",
+                            )
                         )
-                    )
-                ).first()
-                if running is not None:
-                    logger.info("skip enqueue %s: a login-session scrape job is already running", s.source_name)
+                    ).scalar()
+                    or 0
+                )
+                concurrency = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
+                if running_count >= concurrency:
+                    logger.info("skip enqueue %s: %s login-session scrape job(s) already running", s.source_name, running_count)
                     continue
-                app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
+                if concurrency >= 2:
+                    app.send_task(
+                        "scraper.tasks.dispatcher.run_login_session_job",
+                        args=(s.source_name,),
+                        kwargs={"reporter_shard": 0},
+                        queue="login_session",
+                    )
+                    app.send_task(
+                        "scraper.tasks.dispatcher.run_login_session_job",
+                        args=(s.source_name,),
+                        kwargs={"reporter_shard": 1},
+                        queue="login_session",
+                    )
+                    queued.append(f"{s.source_name}:shard0")
+                    queued.append(f"{s.source_name}:shard1")
+                else:
+                    app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
+                    queued.append(s.source_name)
+                s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                continue
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))

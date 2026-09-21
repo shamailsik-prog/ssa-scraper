@@ -38,7 +38,13 @@ from scraper.models import (
     SourceProvenance,
 )
 from scraper.security import ExplicitBlock, VerificationRequired
-from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
+from scraper.tasks.pakistanlawsite import (
+    PakistanLawSitePipeline,
+    build_values,
+    reporter_from_citation,
+    seed_frontier,
+    split_reporter_shards,
+)
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
 from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
@@ -667,6 +673,14 @@ async def test_explicit_block_halts_without_slot_switch(db, login_source, html, 
     assert "SOURCE_HALTED" in codes
 
 
+def test_split_reporter_shards_puts_nine_titles_into_two_rounds():
+    left, right = split_reporter_shards(["PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD"])
+    assert left == ["PLD", "SCMR", "CLC", "PCrLJ", "PTD"]
+    assert right == ["PLC", "CLD", "YLR", "MLD"]
+    assert reporter_from_citation("PLD 2024 SC 88") == "PLD"
+    assert reporter_from_citation("PCrLJ 2019 Cr 12") == "PCrLJ"
+
+
 # --------------------------------------------------------------------------- 21
 async def test_second_concurrent_login_session_worker_refused():
     r = aioredis.from_url(settings.REDIS_URL)
@@ -682,6 +696,24 @@ async def test_second_concurrent_login_session_worker_refused():
     await lock2.acquire()
     await lock2.release()
     await r.aclose()
+
+
+async def test_session_lock_allows_two_holders_when_configured():
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite:holders")
+    lock1 = SessionLock("PakistanLawSite", r, max_holders=2)
+    lock2 = SessionLock("PakistanLawSite", r, max_holders=2)
+    lock3 = SessionLock("PakistanLawSite", r, max_holders=2)
+    await lock1.acquire()
+    await lock2.acquire()
+    try:
+        with pytest.raises(SessionLockHeld):
+            await lock3.acquire()
+    finally:
+        await lock1.release()
+        await lock2.release()
+        await r.delete("corpus:login_session_lock:PakistanLawSite:holders")
+        await r.aclose()
 
 
 async def test_lock_refresh_requires_same_owner_token():
@@ -1108,6 +1140,41 @@ async def test_pipeline_citation_grid_fast_forwards_known_full_citations(db, log
     assert stats["known_citation_skips"] == 2
     assert stats["staged"] == 1
     assert stats["citation_grid_next_offset"] == 0
+
+
+async def test_pipeline_citation_grid_shard_fetches_only_its_reporters(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 3)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 601", "PLD one", "Supreme Court", "https://www.pakistanlawsite.com/case/601"),
+        ("CLC 2024 Lah 602", "CLC one", "Lahore High Court", "https://www.pakistanlawsite.com/case/602"),
+        ("PLD 2024 SC 603", "PLD two", "Supreme Court", "https://www.pakistanlawsite.com/case/603"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(
+        db,
+        login_source,
+        browser_factory=sc.factory(),
+        redis_client=r,
+        sleep=_nosleep,
+        reporter_shard=0,
+    )
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/601", "https://www.pakistanlawsite.com/case/603"]
+    assert stats["reporter_shard"] == 0
+    assert stats["reporter_shard_titles"] == ["PLD"]
+    assert stats["reporter_skips"] == 1
+    assert stats["staged"] == 2
 
 
 async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_source, monkeypatch):

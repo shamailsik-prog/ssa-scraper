@@ -39,7 +39,7 @@ from scraper.auth.session_manager import (
     playwright_browser_factory,
     raise_for_verdict,
 )
-from scraper.config import settings
+from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.judgment_guards import detect_headnotes_only, extract_before_jj_judge_names
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
@@ -57,6 +57,32 @@ logger = logging.getLogger(__name__)
 SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
+DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD")
+
+
+def reporter_from_citation(citation: str) -> str:
+    token = (citation or "").strip().upper()
+    if not token:
+        return ""
+    for reporter in sorted(KNOWN_REPORTERS, key=len, reverse=True):
+        name = reporter.upper()
+        if token == name or token.startswith(name + " ") or token.startswith(name + "-"):
+            return reporter
+    return token.split()[0]
+
+
+def split_reporter_shards(reporters: Optional[List[str]] = None) -> tuple[List[str], List[str]]:
+    names = [str(item).strip() for item in (reporters or []) if str(item).strip()]
+    if not names:
+        names = list(DEFAULT_REPORTER_SHARD_TITLES)
+    midpoint = (len(names) + 1) // 2
+    return names[:midpoint], names[midpoint:]
+
+
+def citation_grid_cursor_key(reporter_shard: Optional[int]) -> str:
+    if reporter_shard in (0, 1):
+        return f"citation_grid_cursor_shard_{reporter_shard}"
+    return "citation_grid_cursor"
 
 
 class PacingBudgetExceeded(RuntimeError):
@@ -159,6 +185,7 @@ class PakistanLawSitePipeline:
         sleep=asyncio.sleep,
         redis_client=None,
         job_id=None,
+        reporter_shard: Optional[int] = None,
     ):
         self.db = db
         self.source = source
@@ -168,8 +195,10 @@ class PakistanLawSitePipeline:
         self.redis_client = redis_client
         self.job_id = job_id
         self.sleep = sleep
+        self.reporter_shard = reporter_shard if reporter_shard in (0, 1) else None
+        self.reporter_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
 
@@ -207,6 +236,19 @@ class PakistanLawSitePipeline:
             raise PermissionError("ALLOW_LOGIN_SCRAPING is false or ENVIRONMENT != chambers; login-session scraping is not permitted here")
         if self.source.state in ("HALTED", "DISABLED"):
             raise PermissionError(f"source is {self.source.state}: {self.source.state_reason}")
+
+    def _bind_reporter_shard(self) -> None:
+        left, right = split_reporter_shards(settings.subscribed_reporters)
+        if self.reporter_shard == 0:
+            self.reporter_shard_reporters = left
+        elif self.reporter_shard == 1:
+            self.reporter_shard_reporters = right
+        else:
+            self.reporter_shard_reporters = []
+        self.stats["reporter_shard"] = self.reporter_shard
+        self.stats["reporter_shard_titles"] = list(self.reporter_shard_reporters)
+        if self.reporter_shard is not None:
+            self.runner.preferred_slot_number = self.reporter_shard + 1
 
     @staticmethod
     def _has_queryable_search_fields(search_map: Dict[str, Any]) -> bool:
@@ -299,7 +341,8 @@ class PakistanLawSitePipeline:
         """Fallback when CitationSearch is an authenticated citation table, not a form."""
         await self._charge_page()
         cfg = dict(self.source.config_json or {})
-        cursor = dict(cfg.get("citation_grid_cursor") or {})
+        cursor_key = citation_grid_cursor_key(self.reporter_shard)
+        cursor = dict(cfg.get(cursor_key) or cfg.get("citation_grid_cursor") or {})
         raw_offset = cursor.get("row_offset", 0)
         try:
             row_offset = int(raw_offset or 0)
@@ -447,7 +490,9 @@ class PakistanLawSitePipeline:
                 }
             )
             latest_cfg = dict(self.source.config_json or {})
-            latest_cfg["citation_grid_cursor"] = cursor
+            latest_cfg[cursor_key] = cursor
+            if cursor_key == "citation_grid_cursor" or self.reporter_shard is None:
+                latest_cfg["citation_grid_cursor"] = cursor
             self.source.config_json = latest_cfg
             self.stats["citation_grid_next_offset"] = next_offset
             await self.db.flush()
@@ -466,6 +511,21 @@ class PakistanLawSitePipeline:
             row = rows[row_idx]
             processed_rows_total = idx + 1
             citation_norm = normalise_citation(str(row.get("citation") or ""))
+            if self.reporter_shard_reporters:
+                row_reporter = reporter_from_citation(str(row.get("citation") or ""))
+                if row_reporter not in self.reporter_shard_reporters:
+                    self.stats["reporter_skips"] = self.stats.get("reporter_skips", 0) + 1
+                    if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
+                        next_offset = next_offset_after(idx + 1)
+                        await flush_citation_grid_progress(
+                            next_offset,
+                            staged_this_flush=staged_since_flush,
+                            details_this_flush=details_since_flush,
+                            processed_rows=idx + 1,
+                        )
+                        details_since_flush = 0
+                        staged_since_flush = 0
+                    continue
             if citation_norm and citation_norm in full_ready_citations:
                 known_citation_skips += 1
                 self.stats["known_citation_skips"] = known_citation_skips
@@ -846,7 +906,11 @@ class PakistanLawSitePipeline:
             "login_delay_min": self.pacing_profile["login_delay_min"],
             "login_delay_max": self.pacing_profile["login_delay_max"],
         }
-        lock = SessionLock(SOURCE_NAME, self.redis_client)
+        lock = SessionLock(
+            SOURCE_NAME,
+            self.redis_client,
+            max_holders=int(self.pacing_profile.get("login_session_concurrency") or 1),
+        )
         try:
             await lock.acquire()
         except SessionLockHeld:
@@ -854,14 +918,33 @@ class PakistanLawSitePipeline:
             raise
         try:
             self._session_lock = lock
-            slot = await self.manager.current_slot()
+            self._bind_reporter_shard()
+            preferred = self.runner.preferred_slot_number
+            slot = None
+            if preferred:
+                candidate = await self.manager.slot(preferred)
+                if candidate.state == "ACTIVE":
+                    slot = candidate
+            if slot is None:
+                slot = await self.manager.current_slot()
             if slot is None:
                 await self.manager.pause_source("no ACTIVE slot: human login required")
                 self.stats["paused"] = True
                 return self.stats
+            if preferred and slot.slot_number != preferred:
+                logger.info(
+                    "PakistanLawSite shard %s preferred slot %s is not ACTIVE; using slot %s",
+                    self.reporter_shard,
+                    preferred,
+                    slot.slot_number,
+                )
             search_map = await self.ensure_search_map()
             if self._is_citation_grid_map(search_map):
-                logger.info("PakistanLawSite using citation-grid surface mode (archivedpatientGrid)")
+                logger.info(
+                    "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
+                    self.reporter_shard,
+                    self.reporter_shard_reporters or "all",
+                )
                 await self.run_citation_grid_surface(search_map)
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 self.source.last_success_at = self.source.last_scraped_at
@@ -877,6 +960,12 @@ class PakistanLawSitePipeline:
                 .limit(max_queries)
             )
             frontier_rows = (await self.db.execute(q)).scalars().all()
+            if self.reporter_shard_reporters:
+                frontier_rows = [
+                    fr
+                    for fr in frontier_rows
+                    if not fr.query_json.get("reporter") or fr.query_json.get("reporter") in self.reporter_shard_reporters
+                ]
             for fr in frontier_rows:
                 fr.status = "in_progress"
                 fr.slot_number = self.runner.browser.slot_number if self.runner.browser else slot.slot_number
@@ -935,5 +1024,6 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 async def scrape_pakistanlawsite(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
-    pipeline = PakistanLawSitePipeline(db, source, **kwargs)
+    reporter_shard = kwargs.pop("reporter_shard", None)
+    pipeline = PakistanLawSitePipeline(db, source, reporter_shard=reporter_shard, **kwargs)
     return await pipeline.run()
