@@ -1,7 +1,7 @@
 """
 Celery application. Queues:
   * scraper        — public sources (worker-scraper)
-  * login_session  — PakistanLawSite, concurrency 1, one worker (worker-scraper runs it with -c 1)
+  * login_session  — PakistanLawSite, concurrency from LOGIN_SESSION_CONCURRENCY (1–2; reporter shards)
   * embeddings     — worker-embed
   * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch
 Beat owns scheduling; ScrapeGraph 'monitor' jobs are supplemental only and never replace it.

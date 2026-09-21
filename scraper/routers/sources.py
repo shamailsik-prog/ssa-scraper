@@ -96,6 +96,14 @@ def _citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[
         "job_key": "PakistanLawSite:archivedpatientGrid",
         "citation_grid_cursor": cursor_view,
     }
+    for shard in (0, 1):
+        shard_key = f"citation_grid_cursor_shard_{shard}"
+        shard_raw = cfg.get(shard_key)
+        if isinstance(shard_raw, dict):
+            shard_view = dict(shard_raw)
+            shard_offset = _to_int_or_none(shard_raw.get("row_offset"))
+            shard_view["row_offset"] = shard_offset if shard_offset is not None else 0
+            status[shard_key] = shard_view
     last_flush: Dict[str, Any] = {}
     last_start_offset = _to_int_or_none(cursor.get("last_start_offset"))
     if last_start_offset is not None:
