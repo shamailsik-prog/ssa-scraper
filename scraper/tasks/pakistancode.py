@@ -136,6 +136,24 @@ def _classify_discovered_url(url: str) -> Optional[str]:
     return None
 
 
+def document_identity_suffix(meta: Optional[Dict[str, Any]] = None) -> str:
+    """Detail page / act number / listing title that distinguishes shared PDF bytes."""
+    meta = meta or {}
+    for key in ("detail_url", "act_no", "act_title"):
+        value = str(meta.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def document_query_key(kind: str, url: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    """Frontier key for a PakistanCode document. Shared PDFs stay distinct per act."""
+    suffix = document_identity_suffix(meta)
+    if suffix:
+        return f"{kind}:{url}|{suffix}"
+    return f"{kind}:{url}"
+
+
 def _infer_target_kind(*, title: str, source_section: str) -> str:
     lowered = (title or "").lower()
     if source_section in ("ordinances", "subordinate_legislation", "amendments"):
@@ -537,7 +555,7 @@ class PakistanCodePipeline(PublicPipeline):
         added = 0
         for url, meta in docs.items():
             kind = meta.get("target_kind") or default_target_kind
-            key = f"{kind}:{url}"
+            key = document_query_key(kind, url, meta)
             exists = (
                 await self.db.execute(
                     select(CrawlFrontier).where(

@@ -54,7 +54,7 @@ from scraper.models import (
 )
 from scraper.parsers.bench_parser import normalise_judge_name
 from scraper.parsers.citation_extractor import canonicalise_statute_name, extract_citations, normalise_citation
-from scraper.parsers.statute_parser import is_short_title_clause
+from scraper.parsers.statute_parser import is_short_title_clause, looks_like_fragment_name
 
 logger = logging.getLogger(__name__)
 
@@ -1558,6 +1558,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     # statute
     name = (data.get("statute_name") or "").strip()
     sections = data.get("sections") or []
+    evidence = data.get("field_evidence") or {}
     if st.source_name == "PakistanCode":
         if name and is_short_title_clause(name):
             await _quarantine(
@@ -1568,6 +1569,33 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 {
                     "reason_code": "pakistancode_bad_name",
                     "statute_name": name[:280],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+        if name and looks_like_fragment_name(name):
+            await _quarantine(
+                db,
+                st,
+                "pakistancode_fragment_name: statute_name looks like a URL or filename fragment",
+                "statute",
+                {
+                    "reason_code": "pakistancode_fragment_name",
+                    "statute_name": name[:280],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+        if evidence.get("listed_title_absent"):
+            await _quarantine(
+                db,
+                st,
+                "pakistancode_listed_title_absent: listing title is not supported by document text",
+                "statute",
+                {
+                    "reason_code": "pakistancode_listed_title_absent",
+                    "statute_name": name[:280],
+                    "listed_title": str(evidence.get("listed_title_absent"))[:280],
                     "validation_errors": st.validation_errors,
                 },
             )
@@ -1587,11 +1615,12 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
-    if not name or not sections:
+    if not name or name == "Unknown Statute" or not sections:
         await _quarantine(db, st, "statute name or sections missing", "statute")
         return "quarantined"
     statute = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
-    if statute is None:
+    created_new_statute = statute is None
+    if created_new_statute:
         statute = Statute(name=name, short_name=data.get("short_name"), jurisdiction=data.get("jurisdiction") or "Federal", statute_type=data.get("statute_type"), year_enacted=data.get("year_enacted"), source_name=st.source_name, source_url=st.source_url)
         db.add(statute)
         await db.flush()
@@ -1634,9 +1663,29 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 if prev is not None and prev.effective_to is None and ver.effective_from is not None:
                     prev.effective_to = ver.effective_from
         sec.current_version_id = ver.id
+    if order == 0:
+        if created_new_statute:
+            await db.delete(statute)
+            await db.flush()
+            await _quarantine(
+                db,
+                st,
+                "empty_statute_sections: no parseable section bodies",
+                "statute",
+                {
+                    "reason_code": "empty_statute_sections",
+                    "statute_name": name[:280],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+        st.status = "duplicate"
+        st.promoted_to_id = statute.id
+        await db.flush()
+        return "duplicate"
     if prov is not None:
         prov.promoted_table, prov.promoted_id = "statute", statute.id
-    st.status = "promoted" if new_versions or order else "duplicate"
+    st.status = "promoted" if new_versions else "duplicate"
     st.promoted_to_id = statute.id
     await db.flush()
     return st.status

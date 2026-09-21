@@ -26,7 +26,7 @@ from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
-from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute
+from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute, statute_staging_identity_url
 from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -300,6 +300,9 @@ class PublicPipeline:
 
     async def ingest_statute(self, res: FetchResult, *, route: Dict[str, Any], kind: str = "statute", meta: Optional[Dict[str, Any]] = None) -> str:
         meta = dict(meta or {})
+        for key in ("act_title", "detail_title", "act_no", "act_year", "detail_url", "source_section", "jurisdiction"):
+            if not meta.get(key) and route.get(key):
+                meta[key] = route[key]
         if res.is_pdf:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind="pdf", route=route, http_status=res.status_code, is_original_document=True, document_kind="original_pdf")
             text, _ = pdf_text_with_ocr(res.content)
@@ -308,7 +311,17 @@ class PublicPipeline:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
             html = res.text
             text = clean_html(html)
-        staging = await stage_statute(self.db, source=self.source, prov=prov, raw_html=html, raw_text=text, url=res.final_url, kind=kind, job_id=self.job_id)
+        staging = await stage_statute(
+            self.db,
+            source=self.source,
+            prov=prov,
+            raw_html=html,
+            raw_text=text,
+            url=res.final_url,
+            kind=kind,
+            job_id=self.job_id,
+            identity_key=statute_staging_identity_url(res.final_url, meta),
+        )
         if staging.reconciled_json is not None:
             self.stats["duplicates"] += 1
             return "duplicate"

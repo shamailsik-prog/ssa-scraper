@@ -26,7 +26,12 @@ from scraper.parsers.citation_extractor import (
     normalise_citation,
     score_confidence,
 )
-from scraper.parsers.statute_parser import detect_statute_name, prefer_official_statute_title, split_into_sections
+from scraper.parsers.statute_parser import (
+    detect_statute_name,
+    listed_title_supported_by_text,
+    prefer_official_statute_title,
+    split_into_sections,
+)
 from scraper.parsers.text_cleaner import clean_html
 
 DETERMINISTIC_VERSION = "det-1.0"
@@ -238,6 +243,10 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     evidence: Dict[str, str] = {}
     if name:
         evidence["statute_name"] = raw_text[:160]
+    official = re.sub(r"\s+", " ", (official_title or "")).strip()
+    name_norm = re.sub(r"\s+", " ", name or "").strip()
+    if official and name_norm == official and not listed_title_supported_by_text(official, raw_text):
+        evidence["listed_title_absent"] = official[:160]
     year = None
     m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", name or "")
     if m:

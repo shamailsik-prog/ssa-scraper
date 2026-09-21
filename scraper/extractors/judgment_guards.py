@@ -52,14 +52,13 @@ _MODAL_CHROME_LINE_MARKERS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*bookmark\s+this\s+case\s*$", re.IGNORECASE),
     re.compile(r"^\s*update\s+subscriber\b.*$", re.IGNORECASE),
     re.compile(r"^\s*obtaining\s+subscription\b.*$", re.IGNORECASE),
+    re.compile(r"^\s*citation\s*name\s*:.*$", re.IGNORECASE),
+    re.compile(r"^\s*notes?\s+on\s+cases?\s*$", re.IGNORECASE),
 )
 _MODAL_CHROME_INLINE_PREFIX_RE = re.compile(
-    r"(?is)^\s*(?:\u00d7+\s*)?(?:case\s+description\s*)?(?:bookmark\s+this\s+case\s*)?"
+    r"(?is)^\s*(?:\u00d7+\s*)?(?:case\s+description\s*)?(?:bookmark\s+this\s+case\s*)?(?:citation\s*name\s*:[^\n]*\n*)?(?:notes?\s+on\s+cases?\s*)?"
 )
 _JUDGMENT_CONTENT_ANCHORS: tuple[re.Pattern[str], ...] = (
-    # Value-required only — empty \"Citation Name:\" chrome must not count as an anchor
-    # (Auditor fail-closed; filled Citation Name is also handled by _CASE_CONTENT_RE).
-    re.compile(r"(?im)^citation\s*name\s*:\s*(?:&nbsp;|\s)*[A-Za-z0-9\[\(]"),
     re.compile(r"(?im)^\s*(?:before|coram)\b"),
     re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,120}\bcourt\b"),
     re.compile(r"(?im)^[^\n]{0,220}\b(?:versus|vs\.?|v\.)\b"),
@@ -74,8 +73,10 @@ def _looks_like_modal_chrome_prefix(prefix: str) -> bool:
     return (
         "case description" in normalized
         or "bookmark this case" in normalized
-        or         "update subscriber" in normalized
+        or "update subscriber" in normalized
         or "obtaining subscription" in normalized
+        or "citation name:" in normalized
+        or "notes on cases" in normalized
         or normalized.startswith("\u00d7")
     )
 
