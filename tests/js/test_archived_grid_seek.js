@@ -7,6 +7,48 @@ const vm = require("vm");
 
 const seekPath = path.resolve(__dirname, "../../scraper/auth/archived_grid_seek.js");
 const seekSource = fs.readFileSync(seekPath, "utf8");
+const sessionManagerPath = path.resolve(__dirname, "../../scraper/auth/session_manager.py");
+const sessionManagerSource = fs.readFileSync(sessionManagerPath, "utf8");
+
+function stripJsStringsAndComments(source) {
+    return source
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .replace(/\/\/.*$/gm, " ")
+        .replace(/'(?:\\.|[^'\\])*'/g, "''")
+        .replace(/"(?:\\.|[^"\\])*"/g, "\"\"")
+        .replace(/`(?:\\.|[^`\\])*`/g, "``");
+}
+
+function barePrivateFieldIds(source) {
+    const stripped = stripJsStringsAndComments(source);
+    const ids = [];
+    const re = /#([A-Za-z_][A-Za-z0-9_]*)/g;
+    let match;
+    while ((match = re.exec(stripped)) !== null) {
+        ids.push(match[1]);
+    }
+    return ids;
+}
+
+function extractEvaluateJsBlobs(pySource) {
+    const blobs = [];
+    const re = /(?:self\._page\.evaluate\(\s*)((?:"""[\s\S]*?""")|(?:"(?:\\.|[^"\\])*"))/g;
+    let match;
+    while ((match = re.exec(pySource)) !== null) {
+        let raw = match[1];
+        if (raw.startsWith('"""') && raw.endsWith('"""')) {
+            blobs.push(raw.slice(3, -3));
+        } else if (raw.startsWith('"') && raw.endsWith('"')) {
+            blobs.push(JSON.parse(raw));
+        }
+    }
+    const concatRe = /"async \(\{ maxRows, startRow \}\) => \{\\n"\s*\+\s*ARCHIVED_GRID_SEEK_JS\s*\+\s*"""([\s\S]*?)"""/;
+    const concatMatch = concatRe.exec(pySource);
+    if (concatMatch) {
+        blobs.push(`async ({ maxRows, startRow }) => {\n${seekSource}${concatMatch[1]}`);
+    }
+    return blobs;
+}
 
 function loadSeek(sandboxExtras) {
     const sandbox = {
@@ -235,6 +277,45 @@ async function run() {
         assert.strictEqual(result.seek_mode, "dom_absolute", "live DOM slice is primary even if DataTables is also present");
         assert.strictEqual(result.start_row, 141);
         assert.strictEqual(env.state.oAjaxData.start, 0, "must not touch DataTables ajax start= when the offset-th <tr> is already in the DOM");
+    }
+
+    {
+        const liveTable = createDomTable(20567);
+        const seek = loadSeek({
+            ARCHIVED_GRID_SEEK_TIMEOUT_MS: 20,
+            document: { getElementById: (id) => (id === "archivedpatientGrid" ? liveTable : null) },
+        });
+        const result = await seek(null, 1000, 200);
+        assert.strictEqual(result.seek_mode, "dom_absolute", "getElementById must resolve the live grid when table is omitted");
+        assert.strictEqual(result.start_row, 1000);
+        assert.strictEqual(liveTable.tBodies[0].rows[1000].scrolled, true);
+    }
+
+    {
+        const bare = "document.querySelector(#archivedpatientGrid)";
+        assert.deepStrictEqual(barePrivateFieldIds(bare), ["archivedpatientGrid"]);
+        assert.throws(
+            () => new Function(bare),
+            (err) => err instanceof SyntaxError && /Private field|Unexpected/.test(String(err)),
+            "unquoted CSS id must be a private-field SyntaxError"
+        );
+        assert.deepStrictEqual(barePrivateFieldIds(seekSource), [], `seek helper has bare private-field tokens: ${barePrivateFieldIds(seekSource)}`);
+        assert.doesNotThrow(() => new Function(`${seekSource}\nreturn seekArchivedGridAbsolute;`));
+        const blobs = extractEvaluateJsBlobs(sessionManagerSource);
+        assert.ok(blobs.some((blob) => blob.includes("seekArchivedGridAbsolute")), "expected concatenated snapshot evaluate JS");
+        assert.ok(blobs.some((blob) => blob.includes("getElementById")), "expected getElementById evaluate JS");
+        for (const blob of blobs) {
+            if (!blob.includes("getElementById") && !blob.includes("seekArchivedGridAbsolute")) continue;
+            const ids = barePrivateFieldIds(blob);
+            assert.deepStrictEqual(ids, [], `evaluate JS has bare private-field tokens ${JSON.stringify(ids)} in: ${blob.slice(0, 180)}`);
+            assert.doesNotThrow(() => new Function(blob));
+            assert.doesNotThrow(() => new Function(`return (${blob});`));
+        }
+        assert.ok(
+            !/querySelector\(\s*#archivedpatientGrid\b/.test(sessionManagerSource),
+            "snapshot evaluate must not pass an unquoted CSS id to querySelector"
+        );
+        assert.match(sessionManagerSource, /getElementById\(\s*['"]archivedpatientGrid['"]\s*\)/);
     }
 
     console.log("archived_grid_seek.js: all assertions passed");
