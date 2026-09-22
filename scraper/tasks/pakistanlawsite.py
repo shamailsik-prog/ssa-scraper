@@ -44,6 +44,7 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
+    judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
@@ -378,6 +379,7 @@ class PakistanLawSitePipeline:
             self.stats["misses"] += 1
             return
         # Compact grid can materialize 1000+ rows; uncapped detail fetches hang for hours.
+        # One operator knob: PLS_CITATION_GRID_MAX_DETAIL. Backfill only widens the scan window.
         max_detail = int(getattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 120) or 120)
         if self.harvest_mode == "backfill":
             scan_window = int(getattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 600) or 600)
@@ -416,15 +418,23 @@ class PakistanLawSitePipeline:
             )
             snapshot_start_row = 0
         window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
-        if not window_contains_offset:
-            logger.warning(
-                "PakistanLawSite citation-grid snapshot window missing absolute offset row_offset=%s snapshot_start=%s rows=%s; using in-window fallback",
+        seek_confirmed = seek_mode in CONFIRMED_CITATION_GRID_SEEK_MODES
+        if row_offset > 0 and (not seek_confirmed or not window_contains_offset):
+            logger.error(
+                "PakistanLawSite citation-grid seek failed; refusing to harvest from row 0 or move cursor "
+                "row_offset=%s snapshot_start=%s rows=%s seek_mode=%s",
                 row_offset,
                 snapshot_start_row,
                 row_count,
+                seek_mode or "none",
             )
-        start_offset = row_offset if window_contains_offset else snapshot_start_row
-        start_in_window = row_offset - snapshot_start_row if window_contains_offset else 0
+            self.stats["citation_grid_seek_failed"] = True
+            self.stats["citation_grid_offset"] = row_offset
+            self.stats["citation_grid_snapshot_start"] = snapshot_start_row
+            self.stats["citation_grid_rows_seen"] = row_count
+            return
+        start_offset = row_offset
+        start_in_window = row_offset - snapshot_start_row
         remaining_rows_in_window = max(0, row_count - start_in_window)
         remaining_rows_total = max(0, total_rows - start_offset)
         take_cap = min(scan_window, row_count)
@@ -460,7 +470,7 @@ class PakistanLawSitePipeline:
             for canonical, full_text, judge_names in existing_judgments:
                 key = str(canonical)
                 known_citations.add(key)
-                if len(full_text or "") >= 5000 and bool(judge_names):
+                if judgment_is_full_ready(full_text, judge_names):
                     full_ready_citations.add(key)
             existing_citations = (
                 await self.db.execute(
@@ -472,7 +482,7 @@ class PakistanLawSitePipeline:
             for citation_string, full_text, judge_names in existing_citations:
                 key = str(citation_string)
                 known_citations.add(key)
-                if len(full_text or "") >= 5000 and bool(judge_names):
+                if judgment_is_full_ready(full_text, judge_names):
                     full_ready_citations.add(key)
         logger.info(
             "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s seek_mode=%s",
@@ -570,12 +580,9 @@ class PakistanLawSitePipeline:
             is_known = (citation_norm and citation_norm in known_citations) or (
                 citation_key and citation_key in known_citations
             )
-            if is_full_ready or is_known:
-                if is_full_ready:
-                    known_citation_skips += 1
-                    self.stats["known_citation_skips"] = known_citation_skips
-                else:
-                    self.stats["duplicates"] += 1
+            if is_full_ready:
+                known_citation_skips += 1
+                self.stats["known_citation_skips"] = known_citation_skips
                 if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
                     next_offset = next_offset_after(idx + 1)
                     await flush_citation_grid_progress(
@@ -587,6 +594,8 @@ class PakistanLawSitePipeline:
                     details_since_flush = 0
                     staged_since_flush = 0
                 continue
+            if is_known:
+                self.stats["incomplete_citation_refetch"] = self.stats.get("incomplete_citation_refetch", 0) + 1
             if detail_attempts >= max_detail:
                 processed_rows_total = idx
                 next_offset = next_offset_after(idx)

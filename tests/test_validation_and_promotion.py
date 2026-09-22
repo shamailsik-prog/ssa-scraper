@@ -15,6 +15,7 @@ from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
     extract_before_jj_judge_names,
+    judgment_is_full_ready,
     login_subscription_chrome_dominates,
     strip_leading_judgment_chrome,
 )
@@ -304,6 +305,13 @@ def test_is_login_surface_stub_reads_judge_aliases(reconciled):
         reconciled=reconciled,
         judge_names=["Qazi Faez Isa"],
     ) is True
+
+
+def test_judgment_is_full_ready_requires_long_text_and_judges():
+    assert judgment_is_full_ready("x" * 5000, ["Justice A"]) is True
+    assert judgment_is_full_ready("x" * 4999, ["Justice A"]) is False
+    assert judgment_is_full_ready("x" * 5000, []) is False
+    assert judgment_is_full_ready(None, ["Justice A"]) is False
 
 
 def test_long_judgment_with_incidental_chrome_crumbs_is_not_stub():
@@ -955,6 +963,60 @@ async def test_promotion_upgrades_existing_pakistanlawsite_headnote_judgment_wit
     assert updated is not None
     assert updated.full_text_hash == canonical_text_hash(full_text)
     assert "Notes on Cases" not in (updated.full_text or "")[:200]
+    assert st.promoted_to_id == existing.id
+    assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 1
+
+
+async def test_promotion_upgrades_incomplete_pakistanlawsite_judgment_with_fuller_text(db, login_source):
+    citation = "PLD 2024 SC 902"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K902"
+    existing = Judgment(
+        canonical_citation=citation,
+        case_title="Thin first pass",
+        court_name="Supreme Court of Pakistan",
+        full_text="Short body without bench.",
+        full_text_hash=canonical_text_hash("Short body without bench."),
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url=detail_url,
+        confidence_score=0.6,
+    )
+    db.add(existing)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=existing.id,
+            citation_string=citation,
+            raw_string=citation,
+            reporter="PLD",
+            year=2024,
+            page=902,
+            is_primary=True,
+        )
+    )
+    await db.flush()
+
+    full_html = judgment_html(citation, title="Completed Modal Case")
+    full_text = clean_html(full_html)
+    prov = await record_provenance(db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html")
+    st = await stage_judgment(db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url)
+    st.reconciled_json = {
+        "citations": [citation],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Completed Modal Case",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    updated = (await db.execute(select(Judgment).where(Judgment.id == existing.id))).scalars().first()
+    assert updated is not None
+    assert updated.full_text_hash == canonical_text_hash(full_text)
+    assert "Short body without bench." not in (updated.full_text or "")
+    assert "Qazi Faez Isa" in (updated.judge_names or [])
     assert st.promoted_to_id == existing.id
     assert (await db.execute(select(func.count()).select_from(Judgment))).scalar() == 1
 
