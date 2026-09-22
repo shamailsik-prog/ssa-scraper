@@ -380,6 +380,62 @@ def test_thin_login_form_still_stubs():
     assert hit.reason_code == "login_stub"
 
 
+def test_fat_page_chrome_does_not_hide_thin_subscription_stub():
+    thin_text = "Update Subscriber"
+    fat_html = (
+        "<html><head><title>Pakistan Law Site</title></head><body>"
+        "<header>Pakistan Law Site Home About Contact Help FAQ Case Law Search</header>"
+        "<nav>Citation Search | Statute Search | Case Law | Reference Search | My Account | Logout</nav>"
+        "<main><h1>Update Subscriber</h1>"
+        "<p>Please update your subscriber plan to continue reading this case.</p></main>"
+        "<footer>"
+        + (" Pakistan Law Site footer navigation link item " * 80)
+        + " Update Subscriber | Obtaining Subscription | Subscriber Account</footer>"
+        "</body></html>"
+    )
+    assert _has_case_content(raw_text=thin_text, raw_html=fat_html) is False
+    assert login_subscription_chrome_dominates(
+        raw_text=thin_text,
+        raw_html=fat_html,
+    ) in {"update_subscriber", "obtaining_subscription"}
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=thin_text,
+        raw_html=fat_html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=thin_text,
+        raw_html=fat_html,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
+def test_medium_unstructured_cta_with_mid_sentence_before_is_stub():
+    padding = "Please review your account details and confirm the selected options. " * 12
+    text = "Update Subscriber plan before continuing. " + padding
+    html = f"<html><body><p>{text}</p></body></html>"
+    assert _has_case_content(raw_text=text, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=text, raw_html=html) == "update_subscriber"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=text,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=text,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
 def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
     text = "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ\nJUDGMENT"
     names = extract_before_jj_judge_names(text)

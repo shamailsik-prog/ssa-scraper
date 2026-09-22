@@ -53,7 +53,9 @@ _LOGIN_SURFACE_BODY_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("agree_terms", re.compile(r"\bi\s+agree\s+with\s+the\s+terms\b", re.IGNORECASE)),
 )
 _PASSWORD_INPUT_RE = re.compile(r"(?i)<input\b[^>]*\btype\s*=\s*['\"]password['\"]")
-_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg)\b[^>]*>.*?</\1>")
+_SCRIPT_STYLE_RE = re.compile(
+    r"(?is)<(script|style|noscript|svg|header|footer|nav|iframe)\b[^>]*>.*?</\1>"
+)
 # Dominate-vs-crumbs thresholds for body-level login/subscription chrome.
 # Structured fields (judge_names / court == "read") still fail closed on their own.
 _THIN_VISIBLE_COMPACT_CHARS = 400
@@ -142,14 +144,17 @@ def _html_to_visible_text(raw_html: str) -> str:
 
 
 def _visible_payload(*, raw_text: Optional[str], raw_html: Optional[str]) -> str:
-    """Prefer the longer visible surface so a thin extracted line cannot hide a real body."""
+    """Use extracted text when present; chrome-stripped HTML is fallback only.
+
+    Dominate runs only after `_has_case_content` is already false, so a longer
+    tag-stripped document cannot reveal a real judgment. Preferring it only
+    counts nav/footer/header that `clean_html` already drops and hides thin
+    login/subscription extracts behind ordinary site chrome.
+    """
     text = (raw_text or "").strip()
-    html_visible = _html_to_visible_text(raw_html or "").strip()
-    if text and html_visible:
-        if _compact_len(text) >= _compact_len(html_visible):
-            return text
-        return html_visible
-    return text or html_visible
+    if text:
+        return text
+    return _html_to_visible_text(raw_html or "").strip()
 
 
 def _marker_hits(visible: str) -> list[tuple[str, int]]:
@@ -189,7 +194,7 @@ def login_subscription_chrome_dominates(
     if (
         hits
         and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS
-        and not _JUDGMENT_STRUCTURE_RE.search(visible)
+        and not any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
     ):
         return first_marker
     return None
