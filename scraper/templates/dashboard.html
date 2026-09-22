@@ -5,27 +5,206 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SIKANDER AI — Corpus Console</title>
 <style>
-:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--bad:#a12626}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Georgia,"Times New Roman",serif}header{display:flex;align-items:baseline;justify-content:space-between;padding:14px 24px;border-bottom:2px solid var(--accent);background:var(--panel);gap:12px;flex-wrap:wrap}header h1{margin:0;font-size:20px}.note{color:var(--muted);font-size:12px}main{max-width:1280px;margin:0 auto;padding:18px 24px 40px}.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:18px}.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:12px 14px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:24px;font-weight:700;margin-top:2px}section{padding:14px 16px;margin-bottom:16px}section h2{margin:0 0 10px;font-size:14px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}nav{display:flex;gap:4px;padding:8px 24px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}button{font:inherit;padding:6px 12px;border:1px solid var(--line);background:#faf9f6;border-radius:4px;cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}input,select{font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:4px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.06em}.num{text-align:right;font-variant-numeric:tabular-nums}.ok{color:var(--ok)}.bad{color:var(--bad)}pre{margin:0;max-height:420px;overflow:auto;background:#faf9f6;border:1px solid var(--line);padding:10px;white-space:pre-wrap;font:12px/1.45 monospace}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.grid{grid-template-columns:1fr}}
+:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--bad:#a12626}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Georgia,"Times New Roman",serif}header{display:flex;align-items:baseline;justify-content:space-between;padding:14px 24px;border-bottom:2px solid var(--accent);background:var(--panel);gap:12px;flex-wrap:wrap}header h1{margin:0;font-size:20px}.note{color:var(--muted);font-size:12px}main{max-width:1280px;margin:0 auto;padding:18px 24px 40px}.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:18px}.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:12px 14px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:24px;font-weight:700;margin-top:2px}section{padding:14px 16px;margin-bottom:16px}section h2{margin:0 0 10px;font-size:14px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}nav{display:flex;gap:4px;padding:8px 24px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}button{font:inherit;padding:6px 12px;border:1px solid var(--line);background:#faf9f6;border-radius:4px;cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}input,select,textarea{font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:4px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.06em}.ok{color:var(--ok)}.bad{color:var(--bad)}pre{margin:0;max-height:420px;overflow:auto;background:#faf9f6;border:1px solid var(--line);padding:10px;white-space:pre-wrap;font:12px/1.45 monospace}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<header><div><h1>SIKANDER AI — Corpus Console</h1><div class="note">Operational corpus browser. Saved text is displayed from the authenticated browse API.</div><div class="note">Compatibility labels: Human login · Check viewer · Review queue · Archive storage</div></div><div><label class="note">Admin key <input id="key" type="password" autocomplete="off"></label> <button class="primary" onclick="connect()">Connect</button> <span id="status" class="note"></span></div></header>
-<nav><button class="primary" onclick="show('overview')">Overview</button><button onclick="show('corpus')">Corpus viewer</button></nav>
-<main><div id="overview"><div id="tiles" class="tiles"></div><section><h2>Corpus completeness</h2><div class="grid"><pre id="meaning"></pre><pre id="progress"></pre></div></section></div>
-<div id="corpus" hidden><section><h2>Browse and search</h2><div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center"><label>Kind <select id="kind"><option value="citations">citations</option><option value="judgments">judgments</option><option value="statutes">statutes</option></select></label><label>Search <input id="query" placeholder="citation, title, or statute"></label><label>Source <input id="source" placeholder="PakistanLawSite"></label><button class="primary" onclick="loadList(0)">Search</button><span id="meta" class="note"></span></div><div id="list" style="margin-top:12px"></div></section><section><h2>Record detail — full saved text</h2><div id="detailMeta" class="note">Open a row to inspect saved body text.</div><pre id="detail" style="max-height:560px;margin-top:8px"></pre></section></div></main>
+<header>
+  <div>
+    <h1>SIKANDER AI — Corpus Console</h1>
+    <div class="note">Operational corpus browser. Saved text is displayed from the authenticated browse API.</div>
+    <div class="note">Human login · Check viewer · Review queue · Archive storage · Sources · Jobs</div>
+  </div>
+  <div>
+    <label class="note">Admin key <input id="key" type="password" autocomplete="off"></label>
+    <button class="primary" onclick="connect()">Connect</button>
+    <span id="status" class="note"></span>
+  </div>
+</header>
+<nav>
+  <button class="primary" onclick="show('overview')">Overview</button>
+  <button onclick="show('corpus')">Corpus viewer</button>
+  <button onclick="show('sources')">Sources</button>
+  <button onclick="show('login')">Human login</button>
+  <button onclick="show('review')">Review queue</button>
+  <button onclick="show('jobs')">Jobs</button>
+</nav>
+<main>
+  <div id="overview">
+    <div id="tiles" class="tiles"></div>
+    <section>
+      <h2>Corpus completeness</h2>
+      <div class="grid"><pre id="meaning"></pre><pre id="progress"></pre></div>
+    </section>
+  </div>
+  <div id="corpus" hidden>
+    <section>
+      <h2>Browse and search</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <label>Kind <select id="kind"><option value="citations">citations</option><option value="judgments">judgments</option><option value="statutes">statutes</option></select></label>
+        <label>Search <input id="query" placeholder="citation, title, or statute"></label>
+        <label>Source <input id="source" placeholder="PakistanLawSite"></label>
+        <button class="primary" onclick="loadList(0)">Search</button>
+        <span id="meta" class="note"></span>
+      </div>
+      <div id="list" style="margin-top:12px"></div>
+    </section>
+    <section>
+      <h2>Record detail — full saved text</h2>
+      <div id="detailMeta" class="note">Open a row to inspect saved body text.</div>
+      <pre id="detail" style="max-height:560px;margin-top:8px"></pre>
+    </section>
+  </div>
+  <div id="sources" hidden>
+    <section>
+      <h2>Sources</h2>
+      <div id="sourceMeta" class="note">Connect with a valid admin key to load source state.</div>
+      <div id="sourceList"></div>
+    </section>
+  </div>
+  <div id="login" hidden>
+    <section>
+      <h2>Human login</h2>
+      <div class="note">CAPTCHA and verification pages are never solved by code. Complete login in the streamed Chromium, then mark the slot complete.</div>
+      <div id="loginSlots" class="note" style="margin-top:8px">Connect to load PakistanLawSite slots.</div>
+    </section>
+  </div>
+  <div id="review" hidden>
+    <section>
+      <h2>Review queue</h2>
+      <div id="reviewMeta" class="note"></div>
+      <div id="reviewList"></div>
+    </section>
+  </div>
+  <div id="jobs" hidden>
+    <section>
+      <h2>Jobs</h2>
+      <div id="jobList"></div>
+    </section>
+  </div>
+</main>
 <script>
-const $=id=>document.getElementById(id);let KEY='';let offset=0;try{KEY=localStorage.getItem('corpus_admin_key')||''}catch(e){}$('key').value=KEY;
-function connect(){KEY=$('key').value.trim();try{localStorage.setItem('corpus_admin_key',KEY)}catch(e){}refresh()}
-async function get(url){const r=await fetch(url,{headers:{'X-API-Key':KEY}});if(!r.ok)throw Error(r.status+' '+url);return r.json()}
-const esc=s=>String(s==null?'':s).replace(/[&<>\"]/g,c=>({'&':'&','<':'<','>':'>','\\':'\\\\','\"':'"'}[c]));
+const $=id=>document.getElementById(id);
+const TABS=['overview','corpus','sources','login','review','jobs'];
+let KEY='';
+let offset=0;
+try{KEY=localStorage.getItem('corpus_admin_key')||''}catch(e){}
+$('key').value=KEY;
+function connect(){
+  KEY=$('key').value.trim();
+  try{localStorage.setItem('corpus_admin_key',KEY)}catch(e){}
+  refreshAll();
+}
+async function get(url){
+  const r=await fetch(url,{headers:{'X-API-Key':KEY}});
+  if(!r.ok) throw Error(r.status+' '+url);
+  const ct=r.headers.get('content-type')||'';
+  return ct.includes('json') ? r.json() : r.text();
+}
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function tile(label,value,cls){return '<div class="tile"><div class="label">'+esc(label)+'</div><div class="value '+(cls||'')+'">'+esc(value)+'</div></div>'}
-function show(tab){$('overview').hidden=tab!=='overview';$('corpus').hidden=tab!=='corpus';if(tab==='corpus')loadList(0)}
-async function refresh(){try{const h=await get('/health');$('status').textContent=KEY?'key set':'enter admin key';$('tiles').innerHTML=tile('Status',h.status,h.status==='ok'?'ok':'bad')+tile('DB',h.db_connected?'connected':'down',h.db_connected?'ok':'bad')+tile('Judgments',h.judgments??'-')+tile('Statutes',h.statutes??'-')+tile('Sections',h.statute_sections??'-')+tile('Review open',h.review_queue_open??'-')}catch(e){$('status').textContent='health unavailable'}}
-async function summary(){const s=await get('/admin/corpus/summary'),t=s.totals||{},b=s.body_completeness||{},c=s.completeness||{};$('tiles').innerHTML+=tile('Citations',t.citations??'-')+tile('Jdg empty body %',(b.judgments_pct_empty??0)+'%',b.judgments_pct_empty?'bad':'ok')+tile('Sec empty body %',(b.sections_pct_empty??0)+'%',b.sections_pct_empty?'bad':'ok');$('meaning').textContent=c.meaning||'';$('progress').textContent=JSON.stringify({backfill:c.backfill_progress,selected:c.selected_sources,pakistan_law_site:c.pakistan_law_site,pakistan_code:c.pakistan_code},null,2)}
+function show(tab){
+  TABS.forEach(name=>{const el=$(name); if(el) el.hidden=name!==tab});
+  if(tab==='corpus') loadList(0);
+  if(tab==='sources') loadSources();
+  if(tab==='login') loadLogin();
+  if(tab==='review') loadReview();
+  if(tab==='jobs') loadJobs();
+}
+async function refresh(){
+  try{
+    const h=await get('/health');
+    $('tiles').innerHTML=tile('Status',h.status,h.status==='ok'?'ok':'bad')+tile('DB',h.db_connected?'connected':'down',h.db_connected?'ok':'bad')+tile('Judgments',h.judgments??'-')+tile('Statutes',h.statutes??'-')+tile('Sections',h.statute_sections??'-')+tile('Review open',h.review_queue_open??'-');
+  }catch(e){
+    $('status').textContent='health unavailable';
+  }
+}
+async function summary(){
+  const s=await get('/admin/corpus/summary');
+  const t=s.totals||{}, b=s.body_completeness||{}, c=s.completeness||{};
+  $('tiles').innerHTML+=tile('Citations',t.citations??'-')+tile('Jdg empty body %',(b.judgments_pct_empty??0)+'%',b.judgments_pct_empty?'bad':'ok')+tile('Sec empty body %',(b.sections_pct_empty??0)+'%',b.sections_pct_empty?'bad':'ok');
+  $('meaning').textContent=c.meaning||'';
+  $('progress').textContent=JSON.stringify({backfill:c.backfill_progress,selected:c.selected_sources,pakistan_law_site:c.pakistan_law_site,pakistan_code:c.pakistan_code},null,2);
+}
 function cell(v){return '<td>'+esc(v)+'</td>'}
-async function loadList(n){offset=typeof n==='number'?n:offset;const k=$('kind').value,q=$('query').value.trim(),src=$('source').value.trim();let u='/admin/corpus/'+k+'?limit=40&offset='+offset;if(q)u+='&q='+encodeURIComponent(q);if(src&&k!=='citations')u+='&source='+encodeURIComponent(src);if(k==='statutes')u+='&with_sections_only=false';try{const d=await get(u);$('meta').textContent='showing '+(d.items||[]).length+' of '+d.total+' (offset '+d.offset+')';const rows=d.items||[];let html='<table><tr>'+(k==='citations'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':k==='judgments'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':'<th>name</th><th>source</th><th>sections</th><th>with text</th>')+'<th></th></tr>';for(const r of rows){const body=k==='statutes'?(r.has_body?'<span class="ok">yes</span>':'<span class="bad">no sections</span>'):(r.has_body?'<span class="ok">yes ('+r.body_length+')</span>':'<span class="bad">empty</span>');html+='<tr>'+(k==='citations'?cell(r.citation_string)+cell(r.title)+cell(r.source_name):k==='judgments'?cell(r.citation)+cell(r.title)+cell(r.source_name):cell(r.name)+cell(r.source_name)+cell(r.section_count)+cell(r.sections_with_text))+'<td>'+body+'</td><td><button class="primary" onclick="openDetail(\''+k+'\',\''+r.id+'\')">Open</button></td></tr>'}html+='</table>';if(!rows.length)html='<p class="note">No records.</p>';if(offset>0)html+='<button onclick="loadList('+Math.max(0,offset-40)+')">Prev</button> ';if(offset+40<d.total)html+='<button onclick="loadList('+(offset+40)+')">Next</button>';$('list').innerHTML=html}catch(e){$('meta').textContent='error: '+e.message}}
-async function openDetail(k,id){try{const d=await get('/admin/corpus/'+k+'/'+id);if(k==='citations'){$('detailMeta').textContent=d.citation_string+' · judgment '+(d.judgment?.citation||'')+' · '+(d.judgment?.body_length||0)+' chars';$('detail').textContent=d.judgment?.full_text||'(no full_text saved)'}else if(k==='judgments'){$('detailMeta').textContent=(d.citation||'')+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=d.full_text||'(no full_text saved)'}else{$('detailMeta').textContent=(d.name||'')+' · '+d.section_count+' sections ('+d.sections_with_text+' with text)';$('detail').textContent=(d.sections||[]).map(s=>'§ '+s.section_number+' '+(s.section_title||'')+' ['+s.body_length+' chars]\n'+(s.section_text||'(empty)')).join('\n\n---\n\n')||'(no sections)'}}catch(e){$('detailMeta').textContent='error: '+e.message}}
-async function refreshAll(){await refresh();if(KEY){try{await summary()}catch(e){}}}refreshAll();
+async function loadList(n){
+  offset=typeof n==='number'?n:offset;
+  const k=$('kind').value,q=$('query').value.trim(),src=$('source').value.trim();
+  let u='/admin/corpus/'+k+'?limit=40&offset='+offset;
+  if(q)u+='&q='+encodeURIComponent(q);
+  if(src&&k!=='citations')u+='&source='+encodeURIComponent(src);
+  if(k==='statutes')u+='&with_sections_only=false';
+  try{
+    const d=await get(u);
+    $('meta').textContent='showing '+(d.items||[]).length+' of '+d.total+' (offset '+d.offset+')';
+    const rows=d.items||[];
+    let html='<table><tr>'+(k==='citations'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':k==='judgments'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':'<th>name</th><th>source</th><th>sections</th><th>with text</th>')+'<th></th></tr>';
+    for(const r of rows){
+      const body=k==='statutes'?(r.has_body?'<span class="ok">yes</span>':'<span class="bad">no sections</span>'):(r.has_body?'<span class="ok">yes ('+esc(r.body_length)+')</span>':'<span class="bad">empty</span>');
+      html+='<tr>'+(k==='citations'?cell(r.citation_string)+cell(r.title)+cell(r.source_name):k==='judgments'?cell(r.citation)+cell(r.title)+cell(r.source_name):cell(r.name)+cell(r.source_name)+cell(r.section_count)+cell(r.sections_with_text))+'<td>'+body+'</td><td><button class="primary" data-kind="'+esc(k)+'" data-id="'+esc(r.id)+'" onclick="openDetail(this.dataset.kind,this.dataset.id)">Open</button></td></tr>';
+    }
+    html+='</table>';
+    if(!rows.length)html='<p class="note">No records.</p>';
+    if(offset>0)html+='<button onclick="loadList('+Math.max(0,offset-40)+')">Prev</button> ';
+    if(offset+40<d.total)html+='<button onclick="loadList('+(offset+40)+')">Next</button>';
+    $('list').innerHTML=html;
+  }catch(e){$('meta').textContent='error: '+e.message}
+}
+async function openDetail(k,id){
+  try{
+    const d=await get('/admin/corpus/'+encodeURIComponent(k)+'/'+encodeURIComponent(id));
+    if(k==='citations'){$('detailMeta').textContent=d.citation_string+' · judgment '+(d.judgment?.citation||'')+' · '+(d.judgment?.body_length||0)+' chars';$('detail').textContent=d.judgment?.full_text||'(no full_text saved)'}
+    else if(k==='judgments'){$('detailMeta').textContent=(d.citation||'')+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=d.full_text||'(no full_text saved)'}
+    else{$('detailMeta').textContent=(d.name||'')+' · '+d.section_count+' sections ('+d.sections_with_text+' with text)';$('detail').textContent=(d.sections||[]).map(s=>'§ '+s.section_number+' '+(s.section_title||'')+' ['+s.body_length+' chars]\n'+(s.section_text||'(empty)')).join('\n\n---\n\n')||'(no sections)'}
+  }catch(e){$('detailMeta').textContent='error: '+e.message}
+}
+async function loadSources(){
+  try{
+    const rows=await get('/admin/sources');
+    $('sourceMeta').textContent=rows.length+' sources';
+    $('sourceList').innerHTML='<table><tr><th>source</th><th>state</th><th>access</th><th></th></tr>'+rows.map(r=>'<tr>'+cell(r.source_name)+cell(r.state)+cell(r.access_method)+'<td><button onclick="triggerSource(\''+esc(r.source_name)+'\')">Trigger</button></td></tr>').join('')+'</table>';
+  }catch(e){$('sourceMeta').textContent='error: '+e.message}
+}
+async function triggerSource(name){
+  try{
+    await fetch('/admin/sources/'+encodeURIComponent(name)+'/trigger',{method:'POST',headers:{'X-API-Key':KEY}});
+    loadSources();
+  }catch(e){$('sourceMeta').textContent='trigger failed: '+e.message}
+}
+async function loadLogin(){
+  try{
+    const s=await get('/admin/sessions/PakistanLawSite');
+    const slots=s.slots||s||[];
+    const rows=Array.isArray(slots)?slots:(slots.slots||[]);
+    $('loginSlots').innerHTML='<pre>'+esc(JSON.stringify(s,null,2))+'</pre>';
+  }catch(e){$('loginSlots').textContent='error: '+e.message}
+}
+async function loadReview(){
+  try{
+    const d=await get('/admin/review');
+    const items=d.items||d||[];
+    $('reviewMeta').textContent=(Array.isArray(items)?items.length:0)+' open items';
+    $('reviewList').innerHTML='<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
+  }catch(e){$('reviewMeta').textContent='error: '+e.message}
+}
+async function loadJobs(){
+  try{
+    const d=await get('/admin/jobs');
+    $('jobList').innerHTML='<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
+  }catch(e){$('jobList').textContent='error: '+e.message}
+}
+async function refreshAll(){
+  await refresh();
+  if(!KEY){$('status').textContent='enter admin key';return}
+  try{
+    await get('/admin/sources');
+    $('status').textContent='connected';
+    await summary();
+  }catch(e){
+    $('status').textContent='invalid admin key';
+  }
+}
+refreshAll();
 </script>
 </body>
 </html>

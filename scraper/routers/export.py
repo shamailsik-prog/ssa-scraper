@@ -21,10 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scraper.config import settings
 from scraper.database import get_db
 from scraper.models import Judgment, Statute, StatuteSection, StatuteSectionVersion
-from scraper.routers.auth import _ok
+from scraper.routers.auth import _ok, require_admin
 from scraper.security import is_login_session
 
-router = APIRouter(prefix="/export", tags=["export"])
+router = APIRouter(prefix="/export", tags=["export"], dependencies=[Depends(require_admin)])
 CONFIRM_PHRASE = "export-login-session-full-text"
 
 

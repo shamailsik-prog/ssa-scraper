@@ -336,6 +336,17 @@ async def test_playwright_goto_uses_domcontentloaded_without_networkidle_wait():
     assert goto_call[2]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
 
 
+async def test_playwright_goto_refuses_metadata_and_off_allow_list_urls():
+    page = _FakePage()
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+    with pytest.raises(ExplicitBlock, match="url_policy"):
+        await browser.goto("http://169.254.169.254/latest/meta-data/")
+    with pytest.raises(ExplicitBlock, match="url_policy"):
+        await browser.goto("https://example.com/")
+    assert not any(call[0] == "goto" for call in page.calls)
+
+
 async def test_playwright_goto_rewrites_login_check_to_requested_reference_case_url():
     page = _FakePage()
 

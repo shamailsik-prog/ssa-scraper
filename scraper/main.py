@@ -12,7 +12,7 @@ import pathlib
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select, text
 
@@ -20,6 +20,7 @@ from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
 from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
 from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources
+from scraper.routers.auth import _ok
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("scraper.main")
@@ -51,41 +52,47 @@ for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegr
 
 
 @app.get("/health")
-async def health() -> Dict[str, Any]:
+async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "status": "ok",
         "service": settings.PROJECT_NAME,
-        "environment": settings.ENVIRONMENT,
-        "deploy_region": settings.DEPLOY_REGION or "NOT CONFIGURED",
-        "login_scraping_permitted": settings.login_scraping_effective,
-        "startup": STARTUP_STATE,
-        "not_configured": settings.not_configured(),
-        # Firm LLM keys in not_configured are optional enrichment; they do not block scrape.
-        "not_configured_note": "SGAI_*/OPENAI_API_KEY NOT CONFIGURED = optional enrichment only; deterministic harvest continues.",
     }
+    privileged = _ok(x_api_key)
+    if privileged:
+        out.update(
+            {
+                "environment": settings.ENVIRONMENT,
+                "deploy_region": settings.DEPLOY_REGION or "NOT CONFIGURED",
+                "login_scraping_permitted": settings.login_scraping_effective,
+                "startup": STARTUP_STATE,
+                "not_configured": settings.not_configured(),
+                "not_configured_note": "SGAI_*/OPENAI_API_KEY NOT CONFIGURED = optional enrichment only; deterministic harvest continues.",
+            }
+        )
     try:
         async with SessionLocal() as db:
             await db.execute(text("SELECT 1"))
-            from scraper.models import Judgment, QuarantineQueue, ScraperJob, ScraperSource, Statute, StatuteSection
-
             out["db_connected"] = True
-            out["judgments"] = (await db.execute(select(func.count()).select_from(Judgment))).scalar()
-            out["statutes"] = (await db.execute(select(func.count()).select_from(Statute))).scalar()
-            out["statute_sections"] = (await db.execute(select(func.count()).select_from(StatuteSection))).scalar()
-            out["review_queue_open"] = (await db.execute(select(func.count()).select_from(QuarantineQueue).where(QuarantineQueue.reviewed.is_(False)))).scalar()
-            out["sources"] = {s.source_name: s.state for s in (await db.execute(select(ScraperSource))).scalars().all()}
-            out["running_jobs"] = (await db.execute(select(func.count()).select_from(ScraperJob).where(ScraperJob.status == "running"))).scalar()
-            out["embedding_identity_ok"] = await embedding_identity_matches()
-            harvest_mode = await get_harvest_mode(db)
-            out["harvest_mode"] = harvest_mode
-            out["backfill_progress"] = await backfill_progress(
-                db, source_names=(await selected_source_names(db, "backfill"))
-            )
-            out["read_only_role"] = {
-                "name": settings.SIKANDER_READER_ROLE,
-                "status": "CONFIGURED" if settings.reader_role_configured else "NOT CONFIGURED",
-                "exists": bool((await db.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.SIKANDER_READER_ROLE})).scalar()),
-            }
+            if privileged:
+                from scraper.models import Judgment, QuarantineQueue, ScraperJob, ScraperSource, Statute, StatuteSection
+
+                out["judgments"] = (await db.execute(select(func.count()).select_from(Judgment))).scalar()
+                out["statutes"] = (await db.execute(select(func.count()).select_from(Statute))).scalar()
+                out["statute_sections"] = (await db.execute(select(func.count()).select_from(StatuteSection))).scalar()
+                out["review_queue_open"] = (await db.execute(select(func.count()).select_from(QuarantineQueue).where(QuarantineQueue.reviewed.is_(False)))).scalar()
+                out["sources"] = {s.source_name: s.state for s in (await db.execute(select(ScraperSource))).scalars().all()}
+                out["running_jobs"] = (await db.execute(select(func.count()).select_from(ScraperJob).where(ScraperJob.status == "running"))).scalar()
+                out["embedding_identity_ok"] = await embedding_identity_matches()
+                harvest_mode = await get_harvest_mode(db)
+                out["harvest_mode"] = harvest_mode
+                out["backfill_progress"] = await backfill_progress(
+                    db, source_names=(await selected_source_names(db, "backfill"))
+                )
+                out["read_only_role"] = {
+                    "name": settings.SIKANDER_READER_ROLE,
+                    "status": "CONFIGURED" if settings.reader_role_configured else "NOT CONFIGURED",
+                    "exists": bool((await db.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.SIKANDER_READER_ROLE})).scalar()),
+                }
     except Exception as exc:
         out["status"] = "degraded"
         out["db_connected"] = False
