@@ -1147,11 +1147,11 @@ class PakistanLawSitePipeline:
             "login_delay_min": self.pacing_profile["login_delay_min"],
             "login_delay_max": self.pacing_profile["login_delay_max"],
         }
-        lock = SessionLock(
-            SOURCE_NAME,
-            self.redis_client,
-            max_holders=int(self.pacing_profile.get("login_session_concurrency") or 1),
-        )
+        # One browser per human login: the lock admits at most as many workers as there are ACTIVE
+        # slots, whatever the pacing profile targets (two browsers on one login end each other).
+        active_slot_count = len([s for s in await self.manager.slots() if s.state == "ACTIVE"])
+        max_holders = max(1, min(int(self.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
+        lock = SessionLock(SOURCE_NAME, self.redis_client, max_holders=max_holders)
         try:
             await lock.acquire()
         except SessionLockHeld:

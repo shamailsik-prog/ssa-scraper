@@ -193,6 +193,7 @@ async def test_run_source_allows_second_login_job_when_concurrency_is_2(db, monk
     assert source is not None
     source.state = "ACTIVE"
     source.is_active = True
+    await _activate_pls_slots(db, (1, 2))  # a second job needs a second human login
     await set_harvest_mode(db, "backfill", changed_by="qa", reason="dual lock holders")
     running = ScraperJob(
         source_id=source.id,
@@ -293,3 +294,55 @@ async def test_run_source_keeps_running_job_with_recent_heartbeat(db):
     # updated_at defaults to now: the job is old but still heartbeating.
     result = await run_source(source.source_name)
     assert result == {"skipped": "already_running", "job_id": str(live.id)}
+
+
+async def test_login_session_max_active_is_capped_by_active_slots(db, monkeypatch):
+    """Backfill targets two login-session workers, but every concurrent browser needs its own human
+    login: with one ACTIVE slot only one job may run (two browsers on one login end each other)."""
+    from scraper.harvest_mode import set_harvest_mode
+
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="cap by slots")
+    await _activate_pls_slots(db, (1,))
+    await db.commit()
+    assert await dispatcher._login_session_max_active(db, "PakistanLawSite") == 1
+
+    await _activate_pls_slots(db, (2,))
+    await db.commit()
+    assert await dispatcher._login_session_max_active(db, "PakistanLawSite") == 2
+
+
+async def test_dispatch_due_sources_does_not_queue_second_job_on_single_slot(db, monkeypatch):
+    """With one ACTIVE slot and a live running job, the dispatcher must not queue another
+    PakistanLawSite job even though the backfill profile targets two."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    sources = (await db.execute(select(ScraperSource))).scalars().all()
+    for source in sources:
+        source.next_scrape_at = now + timedelta(hours=1)
+    target = next((s for s in sources if s.source_name == "PakistanLawSite"), None)
+    target.next_scrape_at = now - timedelta(minutes=1)
+    target.state = "ACTIVE"
+    target.is_active = True
+    await _activate_pls_slots(db, (1,))
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="single slot, job running")
+    db.add(
+        ScraperJob(
+            source_id=target.id,
+            source_name=target.source_name,
+            job_type="scrape",
+            status="running",
+            started_at=now - timedelta(minutes=5),
+        )
+    )
+    await db.commit()
+
+    queued = []
+    monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append(name))
+    result = await dispatch_due_sources()
+    assert result["queued"] == []
+    assert queued == []
