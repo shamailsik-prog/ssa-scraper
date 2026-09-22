@@ -388,7 +388,7 @@ class PlaywrightBrowser:
             self._page.evaluate(
                 """() => {
                     const body = document.body;
-                    const grid = document.querySelector('#archivedpatientGrid');
+                    const grid = document.getElementById('archivedpatientGrid');
                     let archivedpatient_rows = 0;
                     if (grid) {
                         const tbody = grid.tBodies && grid.tBodies[0];
@@ -407,7 +407,7 @@ class PlaywrightBrowser:
         )
 
     async def _capture_archived_grid_snapshot(self, *, start_row: int = 0) -> Optional[Dict[str, Any]]:
-        """Compact row extract for #archivedpatientGrid without page.content().
+        """Compact row extract for archivedpatientGrid without page.content().
 
         Critical performance rules:
         - iterate tbody.rows up to maxRows (do NOT Array.from(querySelectorAll(...)))
@@ -431,7 +431,7 @@ class PlaywrightBrowser:
                         "async ({ maxRows, startRow }) => {\n"
                         + ARCHIVED_GRID_SEEK_JS
                         + """
-                    const table = document.querySelector('#archivedpatientGrid');
+                    const table = document.getElementById('archivedpatientGrid');
                     if (!table) return null;
                     const requestedStartRow = Number.isFinite(Number(startRow)) ? Math.max(0, Math.floor(Number(startRow))) : 0;
                     let appliedStartRow = 0;
@@ -542,7 +542,9 @@ class PlaywrightBrowser:
                             pdf_url: pdfUrl,
                         });
                     }
-                    const nextLink = document.querySelector('#archivedpatientGrid_next a, .dataTables_paginate a.next, a[rel="next"]');
+                    const nextRoot = document.getElementById('archivedpatientGrid_next');
+                    const nextLink = (nextRoot && nextRoot.querySelector('a'))
+                        || document.querySelector('.dataTables_paginate a.next, a[rel="next"]');
                     const nextDisabled = nextLink
                         ? (nextLink.classList.contains('disabled') || (nextLink.parentElement && nextLink.parentElement.classList.contains('disabled')))
                         : true;
@@ -734,7 +736,7 @@ class PlaywrightBrowser:
                 let modal = null;
                 let text = '';
                 for (let i = 0; i < 80; i += 1) {
-                    modal = document.querySelector('#ExceptionResponseScreen1');
+                    modal = document.getElementById('ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
                     const hasBeforeMarker = /Before.+/i.test(text);
                     const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);

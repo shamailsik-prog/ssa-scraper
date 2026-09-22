@@ -15,6 +15,14 @@ async function seekArchivedGridAbsolute(table, startRow, maxRows) {
     const root = typeof globalThis !== "undefined" ? globalThis : {};
     const jq = (root.jQuery || root.$ || (root.window && (root.window.jQuery || root.window.$))) || null;
 
+    // Resolve the live grid by getElementById so a CSS id is never a private-field token.
+    if (!table) {
+        const doc = root.document || (root.window && root.window.document) || null;
+        if (doc && typeof doc.getElementById === "function") {
+            table = doc.getElementById("archivedpatientGrid");
+        }
+    }
+
     const readDomRows = () => {
         if (!table) return [];
         try {

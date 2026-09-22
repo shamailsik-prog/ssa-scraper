@@ -6,6 +6,7 @@ optional fallback when the offset-th row is not already in the DOM.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -55,3 +56,56 @@ def test_playwright_snapshot_script_embeds_datatable_seek_helper():
 
 def test_confirmed_citation_grid_seek_modes_include_datatable_and_dom_absolute():
     assert CONFIRMED_CITATION_GRID_SEEK_MODES == frozenset({"datatable", "dom_absolute"})
+
+
+_JS_STRING_OR_COMMENT = re.compile(
+    r"""
+    /\*[\s\S]*?\*/          |
+    //.*?$                  |
+    '(?:\\.|[^'\\])*'       |
+    "(?:\\.|[^"\\])*"       |
+    `(?:\\.|[^`\\])*`
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+_BARE_PRIVATE_FIELD = re.compile(r"#([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _bare_private_field_ids(js: str) -> list[str]:
+    stripped = _JS_STRING_OR_COMMENT.sub(" ", js)
+    return _BARE_PRIVATE_FIELD.findall(stripped)
+
+
+def test_seek_js_rejects_bare_css_id_private_field_tokens():
+    """Bare `#archivedpatientGrid` is a private-field SyntaxError; shipped seek JS must not contain it."""
+    session_src = (REPO_ROOT / "scraper" / "auth" / "session_manager.py").read_text(encoding="utf-8")
+    assert _bare_private_field_ids("document.querySelector(#archivedpatientGrid)") == ["archivedpatientGrid"]
+    assert "getElementById('archivedpatientGrid')" in session_src or 'getElementById("archivedpatientGrid")' in session_src
+    assert "querySelector(#archivedpatientGrid" not in session_src
+    assert "querySelector('#archivedpatientGrid')" not in session_src
+    assert 'querySelector("#archivedpatientGrid")' not in session_src
+
+    snapshot_js = (
+        "async ({ maxRows, startRow }) => {\n"
+        + ARCHIVED_GRID_SEEK_JS
+        + "\nconst table = document.getElementById('archivedpatientGrid');\nreturn table;\n}"
+    )
+    assert _bare_private_field_ids(ARCHIVED_GRID_SEEK_JS) == []
+    assert _bare_private_field_ids(snapshot_js) == []
+
+    joined = "\n".join(
+        part
+        for part in PlaywrightBrowser.__dict__["_capture_archived_grid_snapshot"].__code__.co_consts
+        if isinstance(part, str) and "getElementById" in part
+    )
+    assert "getElementById" in joined
+    assert _bare_private_field_ids(joined) == []
+
+    bare = subprocess.run(
+        ["node", "-e", "new Function('document.querySelector(#archivedpatientGrid)')"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert bare.returncode != 0
+    assert "Private field" in (bare.stderr + bare.stdout)
