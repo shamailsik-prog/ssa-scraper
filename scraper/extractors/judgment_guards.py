@@ -9,6 +9,15 @@ from typing import Any, Iterable, Optional
 
 from scraper.parsers.bench_parser import normalise_judge_name
 
+# Grid skip + promote upgrade: a citation is "full ready" only when the stored
+# body is long enough to be a judgment and the bench is populated. Headnotes and
+# thin first-pass rows stay eligible for modal refetch.
+FULL_READY_JUDGMENT_CHARS = 5000
+
+
+def judgment_is_full_ready(full_text: Optional[str], judge_names: Any) -> bool:
+    return len(full_text or "") >= FULL_READY_JUDGMENT_CHARS and bool(judge_names)
+
 
 @dataclass(frozen=True)
 class JudgmentGuardSignal:
