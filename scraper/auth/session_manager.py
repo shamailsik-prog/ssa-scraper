@@ -736,7 +736,7 @@ class PlaywrightBrowser:
                 let modal = null;
                 let text = '';
                 for (let i = 0; i < 80; i += 1) {
-                    modal = document.getElementById('ExceptionResponseScreen1');
+                    modal = document.querySelector('#ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
                     const hasBeforeMarker = /Before.+/i.test(text);
                     const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
