@@ -270,28 +270,53 @@ class PageVerdict:
     detail: str = ""
 
 
+# A page this long, or one carrying a "Citation Name:" label, is a document body (a judgment or a
+# statute), not a site notice. A block, CAPTCHA or "already logged in" notice replaces the content
+# of the page; it is never delivered alongside a full judgment. Phrases such as "access denied",
+# "suspicious activity" or "verification code" inside a judgment's own text (ordinary words in
+# criminal and banking cases) must never HALT the source or expire the slot, so document bodies are
+# classified by HTTP status and URL only.
+DOCUMENT_BODY_MIN_CHARS = 60_000
+DOCUMENT_CHROME_HEAD_CHARS = 8_000
+DOCUMENT_CHROME_TAIL_CHARS = 4_000
+_CASE_CONTENT_MARKER = re.compile(r"citation\s*name\s*:", re.IGNORECASE)
+
+
+def _is_document_body(low: str) -> bool:
+    return len(low) >= DOCUMENT_BODY_MIN_CHARS or bool(_CASE_CONTENT_MARKER.search(low[:20_000]))
+
+
 def classify_response(status_code: Optional[int], body: str, final_url: str = "") -> PageVerdict:
-    low = (body or "")[:200_000].lower()
+    low = (body or "")[:400_000].lower()
     url_low = (final_url or "").lower()
     if status_code in (401,):
         return PageVerdict("login", "HTTP 401")
     if status_code in (403, 429, 451):
         return PageVerdict("block", f"HTTP {status_code}")
-    for marker in BLOCK_MARKERS:
-        if marker in low:
-            return PageVerdict("block", marker)
-    for marker in CAPTCHA_MARKERS:
-        if marker in low:
-            return PageVerdict("verification", marker)
-    for marker in MULTILOGIN_MARKERS:
-        if marker in low:
-            return PageVerdict("multilogin", marker)
+    document_body = _is_document_body(low)
+    authenticated_hint = "logout" in low or "log off" in low or "sign out" in low
+    if not document_body:
+        for marker in BLOCK_MARKERS:
+            if marker in low:
+                return PageVerdict("block", marker)
+        for marker in CAPTCHA_MARKERS:
+            if marker in low:
+                return PageVerdict("verification", marker)
+        for marker in MULTILOGIN_MARKERS:
+            if marker in low:
+                return PageVerdict("multilogin", marker)
     if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
         return PageVerdict("login", "login surface URL")
-    if "login" in url_low and any(m in low for m in LOGIN_MARKERS):
+    if authenticated_hint:
+        # A page that offers to log the user out is an authenticated page; the "Update Subscriber"
+        # modal on PakistanLawSite case pages carries password fields but is not a login bounce.
+        return PageVerdict("ok")
+    # Only the page chrome of a document body can carry a login form.
+    zone = (low[:DOCUMENT_CHROME_HEAD_CHARS] + "\n" + low[-DOCUMENT_CHROME_TAIL_CHARS:]) if document_body else low
+    if "login" in url_low and any(m in zone for m in LOGIN_MARKERS):
         return PageVerdict("login", "redirected to login")
     for marker in LOGIN_MARKERS:
-        if marker in low and "logout" not in low and "log off" not in low:
+        if marker in zone:
             return PageVerdict("login", marker)
     return PageVerdict("ok")
 

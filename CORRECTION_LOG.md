@@ -125,3 +125,12 @@ one-file change. The `cookies`, `headers` and `stealth` parameters are **never**
 
 Infrastructure files required alongside them: `docker-compose.yml`, `Dockerfile`,
 `requirements.txt`, `.env.example`, `init.sql`, `pytest.ini`, `tests/*`.
+
+
+## 7. Throughput audit, 22 September 2026
+
+`docs/AUDIT_2026-09-22.md` records the line-by-line audit made after the corpus stalled at ~450
+citations. Fourteen findings (F1–F14) are listed there with the amendment that introduced or left each
+one, the fix applied and the regression test that pins it. The contract rules (raw-first, human login
+only, no bypass, HALT on explicit block, login-session material never sent to a managed engine) are
+unchanged; the findings concern scheduling, pacing, batch selection and page classification.

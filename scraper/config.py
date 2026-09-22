@@ -180,12 +180,16 @@ class Settings(BaseSettings):
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
-    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=200, description="Maximum rows to materialize from #archivedpatientGrid when compacting CitationSearch HTML (keep low — full DOM walks hang).")
+    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=400, description="Maximum rows materialized per compact #archivedpatientGrid snapshot (one window). The snapshot reads cell text only; on a snapshot timeout the window is halved and retried before the page is treated as disconnected.")
     PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots so CitationSearch cannot hold the login lock for a full Playwright navigation timeout.")
-    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Max detail pages to fetch per citation-grid login_session run.")
-    PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Rows scanned per citation-grid run (can exceed detail fetch cap; known rows are fast-forwarded).")
-    BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Backfill-mode max detail pages per citation-grid run.")
-    BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill-mode rows scanned per citation-grid run.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Updates mode: max detail pages fetched per citation-grid window.")
+    PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Updates mode: rows scanned per citation-grid window (can exceed detail fetch cap; known rows are fast-forwarded).")
+    BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=300, description="Backfill mode: max detail pages fetched per citation-grid window.")
+    BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill mode: rows scanned per citation-grid window.")
+    PLS_RUN_MAX_MINUTES: int = Field(default=0, description="Updates mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes (0 = one window per job).")
+    BACKFILL_PLS_RUN_MAX_MINUTES: int = Field(default=50, description="Backfill mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes, so the session is not idle between Beat kicks (0 = one window per job). Keep it under the login-session lock TTL (60 min) and the job stale cut-off.")
+    PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip citation-grid rows whose citation already has a staging row (extracted, promoted, duplicate or quarantined) so a wrap of the grid does not re-download pages that were already preserved.")
+    PLS_CASE_DESCRIPTION_WAIT_SECONDS: float = Field(default=6.0, description="How long to wait for the 'Case Description' control to render on a ReferenceCaseLawSearch page before the page is classified as headnote-only.")
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
@@ -320,6 +324,9 @@ class Settings(BaseSettings):
         "PLS_CITATION_GRID_SCAN_WINDOW",
         "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL",
         "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW",
+        "PLS_RUN_MAX_MINUTES",
+        "BACKFILL_PLS_RUN_MAX_MINUTES",
+        "PLS_CASE_DESCRIPTION_WAIT_SECONDS",
         mode="before",
     )
     @classmethod
@@ -423,6 +430,10 @@ class Settings(BaseSettings):
             raise ValueError("BACKFILL_PLS_CITATION_GRID_MAX_DETAIL must be positive")
         if self.BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW <= 0:
             raise ValueError("BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW must be positive")
+        if self.PLS_RUN_MAX_MINUTES < 0 or self.BACKFILL_PLS_RUN_MAX_MINUTES < 0:
+            raise ValueError("PLS_RUN_MAX_MINUTES and BACKFILL_PLS_RUN_MAX_MINUTES must be >= 0")
+        if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
+            raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:

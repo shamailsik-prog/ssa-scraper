@@ -1,9 +1,11 @@
 """
 Celery application. Queues:
-  * scraper        — public sources (worker-scraper)
+  * scraper        — public sources (worker-public)
   * login_session  — PakistanLawSite, concurrency from LOGIN_SESSION_CONCURRENCY (1–2; reporter shards)
   * embeddings     — worker-embed
-  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch
+  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-maintenance:
+                     never share this queue with long scrape runs, or dispatch and promotion stall
+                     behind them)
 Beat owns scheduling; ScrapeGraph 'monitor' jobs are supplemental only and never replace it.
 """
 
@@ -52,7 +54,9 @@ app.conf.update(
     },
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
-        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900},
+        # Promotion must keep up with a continuous login-session harvest (hundreds of staged rows per
+        # hour): 500 rows every 5 minutes, on its own worker (see worker-maintenance in docker-compose.yml).
+        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 300, "kwargs": {"limit": 500}},
         "reconcile-instrument-relations": {
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,

@@ -27,15 +27,25 @@ from scraper.harvest_mode import (
     source_backfill_priority,
     source_selected_for_mode,
 )
-from scraper.models import ScraperJob, ScraperSource
+from scraper.models import BrowserSessionSlot, ScraperJob, ScraperSource
 from scraper.notify import notify
 
 logger = logging.getLogger(__name__)
 RUNNING_JOB_STALE_AFTER = timedelta(hours=3)
+# A live connector heartbeats its scraper_jobs row (updated_at) on every page it charges and on
+# every committed progress step. A running row that has not been touched for this long belongs to
+# a worker that was recreated (deploy, OOM, restart) and would otherwise block its source for
+# RUNNING_JOB_STALE_AFTER.
+RUNNING_JOB_HEARTBEAT_STALE_AFTER = timedelta(minutes=30)
 
 
 def _running_started_at(job: ScraperJob) -> Optional[datetime]:
     return job.started_at or job.created_at
+
+
+def _running_heartbeat_at(job: ScraperJob) -> Optional[datetime]:
+    candidates = [t for t in (job.updated_at, job.started_at, job.created_at) if t is not None]
+    return max(candidates) if candidates else None
 
 
 async def _active_running_jobs(
@@ -58,6 +68,7 @@ async def _active_running_jobs(
     if not running_jobs:
         return [], False
     stale_cutoff = now - RUNNING_JOB_STALE_AFTER
+    heartbeat_cutoff = now - RUNNING_JOB_HEARTBEAT_STALE_AFTER
     running_jobs.sort(
         key=lambda job: _running_started_at(job) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
@@ -66,7 +77,10 @@ async def _active_running_jobs(
     mutated = False
     for job in running_jobs:
         started_at = _running_started_at(job)
+        heartbeat_at = _running_heartbeat_at(job)
         stale = started_at is None or started_at <= stale_cutoff
+        if not stale and heartbeat_at is not None and heartbeat_at <= heartbeat_cutoff:
+            stale = True
         if len(active_jobs) >= keep:
             stale = True
         if not stale:
@@ -81,6 +95,9 @@ async def _active_running_jobs(
         if not job.error_message:
             if started_at is None:
                 reason = "dispatcher marked stale running job as failed (missing started_at)."
+            elif heartbeat_at is not None and heartbeat_at <= heartbeat_cutoff and started_at > stale_cutoff:
+                silent_seconds = int(max(0, (now - heartbeat_at).total_seconds()))
+                reason = f"dispatcher marked running job as failed: no heartbeat for {silent_seconds}s (worker restarted?)."
             else:
                 age_seconds = int(max(0, (now - started_at).total_seconds()))
                 reason = f"dispatcher marked stale running job as failed (age_seconds={age_seconds})."
@@ -178,7 +195,7 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
             stats = await connector(source, db, job_id=job.id, **connector_kwargs)
             job.status = "done"
             job.result_summary = stats
-            job.pages_scraped = int(stats.get("pages", stats.get("fetched", 0)) or 0)
+            job.pages_scraped = int(stats.get("pages_charged") or stats.get("pages") or stats.get("fetched") or 0)
             job.records_extracted = int(stats.get("staged", 0) or 0)
             job.records_quarantined = int(stats.get("quarantined", 0) or 0)
         except SessionLockHeld:
@@ -207,6 +224,18 @@ def run_source_job(self, source_name: str):
 def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_shard=None):
     """Login-session queue. When concurrency is 2, Beat enqueues one job per reporter shard."""
     return run_async(run_source(source_name, reporter_shard=reporter_shard))
+
+
+async def _active_slot_numbers(db, source_name: str) -> list[int]:
+    rows = (
+        await db.execute(
+            select(BrowserSessionSlot.slot_number).where(
+                BrowserSessionSlot.source_name == source_name,
+                BrowserSessionSlot.state == "ACTIVE",
+            )
+        )
+    ).scalars().all()
+    return sorted(int(n) for n in rows)
 
 
 async def dispatch_due_sources() -> Dict[str, Any]:
@@ -266,7 +295,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     len(running_jobs),
                 )
                 continue
-            if s.access_method == "login_session" and concurrency >= 2:
+            if s.access_method == "login_session" and concurrency >= 2 and len(await _active_slot_numbers(db, s.source_name)) >= 2:
+                # Two shards only when both slots hold a human login: each shard runs on its own slot.
                 app.send_task(
                     "scraper.tasks.dispatcher.run_login_session_job",
                     args=(s.source_name,),
@@ -282,6 +312,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 queued.append(f"{s.source_name}:shard0")
                 queued.append(f"{s.source_name}:shard1")
             elif s.access_method == "login_session":
+                if concurrency >= 2:
+                    logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
                 app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
                 queued.append(s.source_name)
             else:

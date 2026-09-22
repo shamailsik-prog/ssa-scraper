@@ -71,7 +71,16 @@ validators and tests.
    access" / CAPTCHA → source **HALTED**, notify, no slot switch, no proxy, no stealth, admin review.
 5. Login-session worker concurrency is environment-controlled (`LOGIN_SESSION_CONCURRENCY`, 1–2).
    Backfill profile defaults can target dual slots (`BACKFILL_LOGIN_SESSION_CONCURRENCY=2`), while
-   continuity safeguards still require explicit human login in each slot.
+   continuity safeguards still require explicit human login in each slot. Two reporter shards are
+   dispatched only when **both** slots are ACTIVE; each shard runs on its own slot and never borrows
+   the other (the site allows one login per account). With one slot, one unsharded job runs.
+6. **Citation grid (the live CitationSearch surface).** The authenticated page is a table of every
+   citation, not a form. The connector walks it in windows of `PLS_ARCHIVED_GRID_MAX_ROWS` rows from a
+   durable row cursor, skips rows already in the corpus or already staged, fetches up to
+   `BACKFILL_PLS_CITATION_GRID_MAX_DETAIL` detail pages per window, commits progress per row, and in
+   backfill mode keeps taking consecutive windows for `BACKFILL_PLS_RUN_MAX_MINUTES` inside one job
+   so the session is never idle between Beat kicks. See `docs/AUDIT_2026-09-22.md` for the
+   throughput model and the defects this replaced.
 
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
@@ -84,7 +93,8 @@ slow CitationSearch responses on the live host.
 |---|---|
 | `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
 | `worker-scraper` | Celery, queue `login_session`, concurrency from `LOGIN_SESSION_CONCURRENCY` (1–2) |
-| `worker-public` | Celery, queues `scraper`, `maintenance` (public sources, promotion, treatment, archive, dispatch) |
+| `worker-public` | Celery, queue `scraper` (public sources) |
+| `worker-maintenance` | Celery, queue `maintenance` (dispatch, promotion, treatment, archive mirror, reconcile) — on its own worker so a slow public scrape can never delay the scheduler or promotion |
 | `worker-embed` | Celery, queue `embeddings` |
 | `celery-beat` | schedules (see `scraper/tasks/celery_app.py`) |
 | `celery-flower` | Celery monitoring on the compose network |
@@ -140,8 +150,10 @@ locally), enter the `ADMIN_API_KEY`, and:
 2. **Harvest mode** — in *Overview*, keep mode on **backfill** for initial download. This enables the
    high-throughput pacing profile (`BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`,
    `BACKFILL_LOGIN_DELAY_MIN/MAX`) and continuous source dispatch. Use **Backfill complete → switch
-   to updates** (or let auto-switch run when frontier is drained and targets are met) to move to
-   6-hour updates cadence.
+   to updates** to move to the 6-hour updates cadence. Auto-switch fires only when
+   `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached with the frontier
+   drained; with both at 0 the mode never changes on its own (an empty frontier at first boot used
+   to flip a fresh install into updates mode within a minute).
 3. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2, then
    use **Login with saved credentials** or manual login in the stream; press *Complete* once
    authenticated. Fill slot 2 as well for dual-slot continuity during backfill.

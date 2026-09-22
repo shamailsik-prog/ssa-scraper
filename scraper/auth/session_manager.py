@@ -106,6 +106,7 @@ class SessionLock:
         self.exclusive_key = LOCK_KEY.format(source=source_name)
         self.key = self.exclusive_key if holders == 1 else f"{self.exclusive_key}:holders"
         self._redis = redis_client
+        self._own_client = redis_client is None
         self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
         self._held = False
 
@@ -162,18 +163,26 @@ class SessionLock:
                 raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
 
     async def release(self) -> None:
-        if not self._held:
-            return
-        r = await self._client()
-        if self.max_holders == 1:
-            val = await r.get(self.key)
-            if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
-                await r.delete(self.key)
-        else:
-            await r.srem(self.key, self._token)
-            if int(await r.scard(self.key) or 0) == 0:
-                await r.delete(self.key)
-        self._held = False
+        try:
+            if not self._held:
+                return
+            r = await self._client()
+            if self.max_holders == 1:
+                val = await r.get(self.key)
+                if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
+                    await r.delete(self.key)
+            else:
+                await r.srem(self.key, self._token)
+                if int(await r.scard(self.key) or 0) == 0:
+                    await r.delete(self.key)
+            self._held = False
+        finally:
+            if self._own_client and self._redis is not None:
+                try:
+                    await self._redis.aclose()
+                except Exception:
+                    pass
+                self._redis = None
 
     async def __aenter__(self) -> "SessionLock":
         await self.acquire()
@@ -394,19 +403,36 @@ class PlaywrightBrowser:
                         const tbody = grid.tBodies && grid.tBodies[0];
                         archivedpatient_rows = tbody && tbody.rows ? tbody.rows.length : 0;
                     }
+                    // innerText forces style + layout of the whole document: on the 20k-row
+                    // CitationSearch grid that alone takes seconds. Build the preview from the
+                    // chrome around the grid instead (textContent needs no layout).
+                    let body_preview = '';
+                    if (grid && archivedpatient_rows > 500) {
+                        const parts = [];
+                        const children = body ? body.children : [];
+                        for (let i = 0; i < children.length && parts.join(' ').length < 400; i += 1) {
+                            const el = children[i];
+                            if (!el || el === grid || el.contains(grid) || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+                            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (t) parts.push(t);
+                        }
+                        body_preview = parts.join(' ').slice(0, 400);
+                    } else {
+                        body_preview = (body && body.innerText ? body.innerText : '').slice(0, 400);
+                    }
                     return {
                         forms: document.forms ? document.forms.length : 0,
                         inputs: document.querySelectorAll('input').length,
                         has_archivedpatient_grid: Boolean(grid),
                         archivedpatient_rows,
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                        body_preview: (body && body.innerText ? body.innerText : '').slice(0, 400),
+                        body_preview,
                     };
                 }"""
             )
         )
 
-    async def _capture_archived_grid_snapshot(self, *, start_row: int = 0) -> Optional[Dict[str, Any]]:
+    async def _capture_archived_grid_snapshot(self, *, start_row: int = 0, max_rows_override: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Compact row extract for #archivedpatientGrid without page.content().
 
         Critical performance rules:
@@ -414,7 +440,7 @@ class PlaywrightBrowser:
         - never read tr.innerHTML (re-serializes huge row markup)
         - synthesize detail URLs from casetypeid when anchors are absent
         """
-        max_rows = int(settings.PLS_ARCHIVED_GRID_MAX_ROWS)
+        max_rows = int(max_rows_override or settings.PLS_ARCHIVED_GRID_MAX_ROWS)
         safe_start_row = max(0, int(start_row or 0))
         logger.info(
             "archivedpatientGrid compact snapshot starting slot=%s max_rows=%s start_row=%s url=%s",
@@ -576,6 +602,12 @@ class PlaywrightBrowser:
                 self.slot_number,
                 max_rows,
             )
+            if max_rows > 50:
+                # The page is still open: try a smaller window before treating the browser as gone
+                # (a reconnect re-renders the whole 10-16 MB grid and would time out the same way).
+                smaller = max(50, max_rows // 2)
+                logger.warning("archivedpatientGrid retrying compact snapshot with max_rows=%s", smaller)
+                return await self._capture_archived_grid_snapshot(start_row=start_row, max_rows_override=smaller)
             raise BrowserDisconnected(
                 f"archivedpatientGrid compact snapshot timed out after {elapsed:.1f}s"
             ) from exc
@@ -704,13 +736,22 @@ class PlaywrightBrowser:
         return await self._wrap(self._page.content()), {}
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
+        wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)
         return await self._wrap(
             self._page.evaluate(
-                """async () => {
+                """async ({ waitMs }) => {
                 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-                const trigger = document.querySelector(
+                const findTrigger = () => document.querySelector(
                     'input.caseDescription[value="Case Description"], input.caseDescription'
                 );
+                let trigger = findTrigger();
+                // The control is rendered by the page's own scripts after domcontentloaded; a page
+                // classified before it appears would be recorded as headnote-only by mistake.
+                const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
+                while (!trigger && Date.now() < deadline) {
+                    await sleep(150);
+                    trigger = findTrigger();
+                }
                 if (!trigger) {
                     return {
                         case_description_selector_found: false,
@@ -749,7 +790,8 @@ class PlaywrightBrowser:
                     case_description_modal_text: text || null,
                     case_description_modal_text_length: text.length,
                 };
-            }"""
+            }""",
+                {"waitMs": wait_ms},
             )
         )
 
@@ -878,6 +920,9 @@ class ContinuityRunner:
     browser: Optional[Browser] = None
     reconnects: int = 0
     preferred_slot_number: Optional[int] = None
+    # True for a reporter shard: it may never continue on the other shard's slot, because that slot
+    # is in use by the other shard at the same time (one login per account on the site).
+    exclusive_slot: bool = False
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
@@ -929,6 +974,8 @@ class ContinuityRunner:
             except BrowserDisconnected as exc2:
                 logger.warning("same-slot reconnect failed for slot %s: %s", slot_no, exc2)
                 await self.close()
+                if self.exclusive_slot:
+                    raise
                 alt = await self.manager.alternate_active_slot(slot_no)
                 if alt is None:
                     await self.manager.pause_source(f"slot {slot_no} unreachable after reconnect and no alternate slot")
@@ -942,6 +989,8 @@ class ContinuityRunner:
         except (LoginRequired, VerificationRequired) as exc:
             await self.close()
             await self.manager.mark_needs_human_login(slot_no, f"{type(exc).__name__}: {exc}")
+            if self.exclusive_slot:
+                raise
             alt = await self.manager.alternate_active_slot(slot_no)
             if alt is None:
                 raise

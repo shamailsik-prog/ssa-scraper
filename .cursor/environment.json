@@ -10,8 +10,13 @@
     },
     {
       "name": "worker-public",
-      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO",
-      "description": "Celery worker for public sources and maintenance (promotion, treatment, archive, dispatch)."
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q scraper --concurrency=2 -n scraper-public@%h --loglevel=INFO",
+      "description": "Celery worker for public sources."
+    },
+    {
+      "name": "worker-maintenance",
+      "command": "bash .cursor/svc.sh celery -A scraper.tasks.celery_app worker -Q maintenance --concurrency=2 -n maintenance@%h --loglevel=INFO",
+      "description": "Celery worker for maintenance (dispatch, promotion, treatment, archive, reconcile) on its own queue."
     },
     {
       "name": "worker-scraper",

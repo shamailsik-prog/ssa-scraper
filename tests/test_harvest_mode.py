@@ -92,3 +92,46 @@ async def test_public_pipeline_block_retry_cooldown(db, source, fixture_server):
     assert source.state == "ACTIVE"
     assert source.next_scrape_at is not None
     assert (source.config_json or {}).get("block_retry", {}).get("count") == 1
+
+
+async def test_backfill_progress_never_completes_without_configured_targets(db, monkeypatch):
+    """At first boot the frontier is empty before any source has run, and the PakistanLawSite
+    citation grid never uses the frontier: an empty frontier alone must not flip the mode."""
+    from scraper.config import settings
+    from scraper.harvest_mode import backfill_progress
+
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_JUDGMENTS", 0)
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_STATUTES", 0)
+    progress = await backfill_progress(db, source_names=["PakistanLawSite", "PakistanCode"])
+    assert progress["frontier_remaining"] == 0
+    assert progress["complete"] is False
+    assert progress["targets_configured"] is False
+    assert "BACKFILL_TARGET" in (progress["auto_switch_blocked_reason"] or "")
+
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_JUDGMENTS", 1)
+    progress = await backfill_progress(db, source_names=["PakistanLawSite"])
+    assert progress["complete"] is False
+    assert progress["targets_met"]["judgments"] is False
+
+
+async def test_dispatch_does_not_auto_switch_to_updates_on_empty_frontier(db, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from scraper.config import settings
+    from scraper.harvest_mode import get_harvest_mode, set_harvest_mode
+    from scraper.tasks.celery_app import app
+    from scraper.tasks.dispatcher import dispatch_due_sources
+
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", True)
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_JUDGMENTS", 0)
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_STATUTES", 0)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="fresh install")
+    now = datetime.now(timezone.utc)
+    for source in (await db.execute(select(ScraperSource))).scalars().all():
+        source.next_scrape_at = now + timedelta(hours=1)
+    await db.commit()
+    monkeypatch.setattr(app, "send_task", lambda *a, **k: None)
+    result = await dispatch_due_sources()
+    assert result["auto_switched"] is False
+    assert result["mode"] == "backfill"
+    assert await get_harvest_mode(db) == "backfill"
