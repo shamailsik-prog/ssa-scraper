@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import delete, func, select, update
 
 from scraper.config import settings
+from scraper.database import SessionLocal
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.extractors.hybrid_extractor import HybridExtractor, load_court_directory
 from scraper.extractors.judgment_guards import (
@@ -607,6 +608,57 @@ async def test_promotion_accepts_login_check_when_citation_name_has_value(db, lo
     assert judgment is not None
     assert "Muhammad Akram versus The State" in (judgment.full_text or "")
     assert "Citation Name:" not in (judgment.full_text or "")
+
+
+async def test_promote_staging_records_is_not_starved_by_old_quarantined_rows(db, login_source):
+    """Quarantined rows keep status=quarantined and promoted_to_id=NULL forever. Selecting both
+    statuses in one created_at-ordered batch let a few hundred old quarantines fill every batch, so
+    newer extracted rows were never promoted while harvesting continued."""
+    from scraper.tasks.promotion import promote_staging_records
+
+    base = datetime.now(timezone.utc) - timedelta(days=2)
+    for n in range(6):
+        text = f"Citation Name: PLD 2020 SC {5000 + n}\nNotes on Cases\nHeadnote only {n}"
+        prov = await record_provenance(db, source=login_source, url=f"https://www.pakistanlawsite.com/q/{n}", content=text.encode(), content_kind="text")
+        st = await stage_judgment(db, source=login_source, prov=prov, raw_html=None, raw_text=text, url=f"https://www.pakistanlawsite.com/q/{n}")
+        st.status = "quarantined"
+        st.quarantine_reason = "headnote_only: notes_on_cases_only"
+        st.reconciled_json = {"citations": [f"PLD 2020 SC {5000 + n}"], "document_type": "headnote"}
+        await db.flush()
+        await db.execute(update(ScraperStaging).where(ScraperStaging.id == st.id).values(created_at=base + timedelta(minutes=n)))
+    full_text = (
+        "Citation Name: PLD 2024 SC 5100\nMuhammad Akram versus The State\n"
+        "Before Qazi Faez Isa, CJ\nJUDGMENT\n"
+        "The appellant was convicted under section 302(b) of the Pakistan Penal Code, 1860."
+    )
+    prov = await record_provenance(db, source=login_source, url="https://www.pakistanlawsite.com/q/new", content=full_text.encode(), content_kind="text")
+    fresh = await stage_judgment(db, source=login_source, prov=prov, raw_html=None, raw_text=full_text, url="https://www.pakistanlawsite.com/q/new")
+    fresh.reconciled_json = {
+        "citations": ["PLD 2024 SC 5100"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Fresh extracted row",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    fresh.status = "extracted"
+    fresh.confidence_score = 0.99
+    await db.commit()
+
+    counts = await promote_staging_records(limit=3)
+    assert counts["promoted"] == 1
+    assert counts["quarantined"] == 3  # review-queue entries for the first batch of quarantines
+    async with SessionLocal() as verify:
+        promoted = (await verify.execute(select(Judgment).where(Judgment.canonical_citation == "PLD 2024 SC 5100"))).scalars().first()
+        assert promoted is not None
+    counts2 = await promote_staging_records(limit=3)
+    assert counts2["promoted"] == 0
+    assert counts2["quarantined"] == 3
+    counts3 = await promote_staging_records(limit=3)
+    assert counts3 == {"promoted": 0, "duplicate": 0, "quarantined": 0, "statutes_promoted": 0, "statutes_duplicate": 0, "statutes_quarantined": 0}
+    async with SessionLocal() as verify:
+        queued = (await verify.execute(select(func.count()).select_from(QuarantineQueue))).scalar()
+        assert queued == 6
 
 
 async def test_promotion_accepts_clc_body_without_citation_name_label(db, login_source):

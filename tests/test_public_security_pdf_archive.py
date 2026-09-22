@@ -384,3 +384,27 @@ async def test_public_source_listing_to_promotion(db, source, fixture_server, mo
     assert (await db.execute(select(func.count()).select_from(CrawlFrontier).where(CrawlFrontier.tier == 0))).scalar() >= 4
     counts = await promote_staging_records()
     assert counts["promoted"] >= 2
+
+
+def test_classify_response_ignores_block_and_login_phrases_inside_a_judgment_body():
+    """Criminal and banking judgments say "access denied", "suspicious activity", "verification code"
+    in their own text. Those words inside a document must never HALT the source or expire the slot."""
+    body = "<html><body><a href='/logout'>Logout</a><div>Citation Name: 2024 CLC 1234</div><div>Before Ali, J.</div>"
+    body += "<p>" + ("The accused was found guilty of unusual activity and access denied to the premises. " * 1500) + "</p>"
+    body += "<p>The verification code was sent as a one-time password to the complainant. There was suspicious activity. Please log in was the message.</p>"
+    body += "<div class='modal'><input type='password' name='UpdateSubscriber.Password'></div></body></html>"
+    assert len(body) > 60_000
+    verdict = classify_response(200, body, "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=x")
+    assert verdict.kind == "ok", verdict
+
+    # A short notice page still classifies as before.
+    assert classify_response(200, "<html><body><h1>Access denied</h1></body></html>").kind == "block"
+    assert classify_response(200, "<html><body>Verify you are human</body></html>").kind == "verification"
+    assert classify_response(200, "<html><body><form id='mainLoginForm'><input type='password'></form></body></html>").kind == "login"
+    assert classify_response(403, "").kind == "block"
+
+
+def test_classify_response_authenticated_case_page_with_password_modal_is_ok():
+    body = "<html><body><a href='/logout'>Logout</a><h2>Citation Name: PLD 2024 SC 1</h2><p>JUDGMENT</p>"
+    body += "<div id='UpdateSubscriber'><input type='password' name='Password'></div></body></html>"
+    assert classify_response(200, body, "https://www.pakistanlawsite.com/Login/Check").kind == "ok"

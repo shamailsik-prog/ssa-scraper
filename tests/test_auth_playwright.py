@@ -1588,6 +1588,193 @@ async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_e
         assert staged_total == 4
 
 
+async def test_reporter_from_citation_handles_year_first_reporters():
+    """Every reporter except PLD is cited year-first; the shard filter must still see the reporter."""
+    assert reporter_from_citation("2024 SCMR 1") == "SCMR"
+    assert reporter_from_citation("2024 CLC 1234") == "CLC"
+    assert reporter_from_citation("2023 YLR 5") == "YLR"
+    assert reporter_from_citation("2022 MLD 77") == "MLD"
+    assert reporter_from_citation("2021 P Cr. L J 12") == "PCrLJ"
+    assert reporter_from_citation("2021 PCRLJ 12") == "PCrLJ"
+    assert reporter_from_citation("PLD 2024 SC 1") == "PLD"
+    assert reporter_from_citation("") == ""
+    assert reporter_from_citation("no reporter here 2024") == ""
+
+
+async def test_pipeline_citation_grid_shard0_is_catch_all_and_shard1_takes_its_reporters(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 5)
+    await _activate(db, login_source, slots=(1, 2))
+    rows = [
+        ("PLD 2024 SC 611", "PLD", "Supreme Court", "https://www.pakistanlawsite.com/case/611"),
+        ("2024 CLC 612", "CLC year first", "Lahore High Court", "https://www.pakistanlawsite.com/case/612"),
+        ("2024 SCMR 613", "Unsubscribed reporter", "Supreme Court", "https://www.pakistanlawsite.com/case/613"),
+        ("Odd 614", "No reporter at all", "Supreme Court", "https://www.pakistanlawsite.com/case/614"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    await r.delete("corpus:login_session_lock:PakistanLawSite:holders")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep, reporter_shard=1)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == ["https://www.pakistanlawsite.com/case/612"]
+    assert stats["reporter_skips"] == 3
+    sc.log.clear()
+    login_source.config_json = {k: v for k, v in (login_source.config_json or {}).items() if not k.startswith("citation_grid_cursor")}
+    await db.commit()
+    pipeline0 = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep, reporter_shard=0)
+    stats0 = await pipeline0.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls0 = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls0 == [
+        "https://www.pakistanlawsite.com/case/611",
+        "https://www.pakistanlawsite.com/case/613",
+        "https://www.pakistanlawsite.com/case/614",
+    ]
+    assert stats0["reporter_skips"] == 1
+    assert stats0["reporter_shard_catch_all"] is True
+
+
+async def test_pipeline_shard_never_borrows_the_other_shards_slot(db, login_source):
+    """Only slot 1 is ACTIVE: shard 1 must not run on it (two browsers on one login end the session)."""
+    await _activate(db, login_source, slots=(1,))
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html([("PLD 2024 SC 1", "One", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    await r.delete("corpus:login_session_lock:PakistanLawSite:holders")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep, reporter_shard=1)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["skipped"] == "shard_slot_not_active"
+    assert stats["paused"] is False
+    assert login_source.state == "ACTIVE"
+    assert sc.log == []
+
+
+async def test_pipeline_citation_grid_backfill_run_takes_consecutive_windows(db, login_source, monkeypatch):
+    """Backfill: one job keeps walking the grid window after window until the run budget is spent
+    or the cursor wraps, instead of one window per Beat kick."""
+    from scraper.harvest_mode import set_harvest_mode
+
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 30)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 1)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="continuous")
+    await _activate(db, login_source)
+    all_rows = [
+        (f"PLD 2024 SC {n}", f"Case {n}", "Supreme Court", f"https://www.pakistanlawsite.com/case/{n}") for n in range(2001, 2007)
+    ]
+    sc = BrowserScript()
+    grid_loads = []
+
+    def grid(browser):
+        start = int(browser.calls[-1][3].get("archived_grid_start_row", 0) or 0)
+        grid_loads.append(start)
+        window = all_rows[start : start + 2]
+        return PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html=_archived_grid_html(window),
+            status=200,
+            metadata={"total_rows": len(all_rows), "start_row": start, "requested_start_row": start, "seek_mode": "dom_absolute"},
+        )
+
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = grid
+    for citation, title, _court, detail_url in all_rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    await r.delete("corpus:login_session_lock:PakistanLawSite:holders")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == [row[3] for row in all_rows]
+    assert stats["staged"] == 6
+    assert stats["citation_grid_windows"] == 3
+    # The surface page rendered for the search map is reused for the first window: 3 grid loads, not 4.
+    assert grid_loads == [0, 2, 4]
+    assert stats["citation_grid_offset"] == 0
+    assert stats["citation_grid_next_offset"] == 0  # wrapped after the last window
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("wraps") == 1
+    assert stats["pacing_paused"] is False
+
+
+async def test_pipeline_citation_grid_pacing_budget_ends_run_cleanly(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PAGES_PER_HOUR", 2)
+    monkeypatch.setattr(settings, "PAGES_PER_DAY", 2)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 3001", "Case 3001", "Supreme Court", "https://www.pakistanlawsite.com/case/3001"),
+        ("PLD 2024 SC 3002", "Case 3002", "Supreme Court", "https://www.pakistanlawsite.com/case/3002"),
+        ("PLD 2024 SC 3003", "Case 3003", "Supreme Court", "https://www.pakistanlawsite.com/case/3003"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    # grid page (1) + first detail (2) charged; the second detail exceeds the budget.
+    assert stats["pacing_paused"] is True
+    assert stats["staged"] == 1
+    assert "pacing" in stats["stop_reason"]
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 1
+    assert login_source.state == "ACTIVE"
+
+
+async def test_pipeline_citation_grid_skips_rows_already_staged(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 4001", "Case 4001", "Supreme Court", "https://www.pakistanlawsite.com/case/4001"),
+        ("PLD 2024 SC 4002", "Case 4002", "Supreme Court", "https://www.pakistanlawsite.com/case/4002"),
+    ]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    assert stats["staged"] == 2
+    # Nothing promoted yet (promotion runs on its own schedule); a second pass over the same rows must
+    # not download them again.
+    login_source.config_json = {k: v for k, v in (login_source.config_json or {}).items() if not k.startswith("citation_grid_cursor")}
+    await db.commit()
+    sc.log.clear()
+    pipeline2 = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats2 = await pipeline2.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+    assert detail_calls == []
+    assert stats2["staged_citation_skips"] == 2
+    assert stats2["staged"] == 0
+    assert stats2["citation_grid_next_offset"] == 0
+
+
 async def test_pipeline_citation_grid_batch_flush_persists_offset_and_rows(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)

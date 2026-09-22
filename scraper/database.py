@@ -381,6 +381,29 @@ async def seed_data() -> None:
             "service_started_at": datetime.now(timezone.utc).isoformat(),
         }
         existing_meta = {m.key: m for m in (await db.execute(select(CorpusMetadata))).scalars().all()}
+        # Repair: an earlier release auto-switched backfill -> updates the moment the frontier was empty,
+        # with no target configured. That switch was a defect, so undo it once at boot: restore the
+        # configured mode when the stored mode was written by that auto-switch and no target exists.
+        stored_mode = existing_meta.get("harvest_mode")
+        stored_by = existing_meta.get("harvest_mode_changed_by")
+        stored_reason = existing_meta.get("harvest_mode_reason")
+        if (
+            stored_mode is not None
+            and stored_mode.value == "updates"
+            and settings.HARVEST_MODE == "backfill"
+            and stored_by is not None
+            and stored_by.value == "system"
+            and (stored_reason.value if stored_reason is not None else "").startswith("auto-switch")
+            and not (settings.BACKFILL_TARGET_JUDGMENTS or settings.BACKFILL_TARGET_STATUTES)
+        ):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            stored_mode.value = "backfill"
+            stored_by.value = "system"
+            stored_reason.value = "repair: undid a targetless auto-switch to updates (see docs/AUDIT_2026-09-22.md F1)"
+            changed_at = existing_meta.get("harvest_mode_changed_at")
+            if changed_at is not None:
+                changed_at.value = now_iso
+            logger.warning("harvest_mode restored to backfill: the stored 'updates' came from a targetless auto-switch")
         for k, v in meta.items():
             if k in existing_meta:
                 if k in ("embedding_model", "embedding_dim") and existing_meta[k].value != v:

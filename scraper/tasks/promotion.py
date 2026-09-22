@@ -1693,16 +1693,33 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
 
 # --------------------------------------------------------------------------- batch entry points
 async def promote_staging_records(limit: int = 200) -> Dict[str, int]:
+    """Promote every `extracted` staging row (bounded per pass) and make sure every `quarantined` row
+    has a review-queue entry.
+
+    The two populations are selected separately. A quarantined row keeps status=quarantined and
+    promoted_to_id=NULL forever, so one query over both statuses ordered by created_at fills the
+    batch with old quarantined rows once enough of them accumulate and newer extracted rows are
+    never reached: promotion silently stops while harvesting continues."""
     counts = {"promoted": 0, "duplicate": 0, "quarantined": 0, "statutes_promoted": 0, "statutes_duplicate": 0, "statutes_quarantined": 0}
     async with SessionLocal() as db:
-        rows = (await db.execute(select(ScraperStaging).where(ScraperStaging.status.in_(["extracted", "quarantined"]), ScraperStaging.promoted_to_id.is_(None)).order_by(ScraperStaging.created_at).limit(limit))).scalars().all()
+        unqueued = (
+            await db.execute(
+                select(ScraperStaging)
+                .where(
+                    ScraperStaging.status == "quarantined",
+                    ScraperStaging.promoted_to_id.is_(None),
+                    ~exists(select(QuarantineQueue.id).where(QuarantineQueue.staging_id == ScraperStaging.id)),
+                )
+                .order_by(ScraperStaging.created_at)
+                .limit(limit)
+            )
+        ).scalars().all()
+        for st in unqueued:
+            await _quarantine(db, st, st.quarantine_reason or "below threshold", "judgment")
+            counts["quarantined"] += 1
+        await db.commit()
+        rows = (await db.execute(select(ScraperStaging).where(ScraperStaging.status == "extracted", ScraperStaging.promoted_to_id.is_(None)).order_by(ScraperStaging.created_at).limit(limit))).scalars().all()
         for st in rows:
-            if st.status == "quarantined":
-                exists = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().first()
-                if exists is None:
-                    await _quarantine(db, st, st.quarantine_reason or "below threshold", "judgment")
-                    counts["quarantined"] += 1
-                continue
             try:
                 counts[await promote_judgment_staging(db, st)] += 1
                 await db.commit()
@@ -1714,14 +1731,24 @@ async def promote_staging_records(limit: int = 200) -> Dict[str, int]:
                     await _quarantine(db, st2, f"promotion error: {exc}"[:1000], "judgment")
                     await db.commit()
                     counts["quarantined"] += 1
-        srows = (await db.execute(select(StatutesStaging).where(StatutesStaging.status.in_(["extracted", "quarantined"]), StatutesStaging.promoted_to_id.is_(None)).order_by(StatutesStaging.created_at).limit(limit))).scalars().all()
+        s_unqueued = (
+            await db.execute(
+                select(StatutesStaging)
+                .where(
+                    StatutesStaging.status == "quarantined",
+                    StatutesStaging.promoted_to_id.is_(None),
+                    ~exists(select(QuarantineQueue.id).where(QuarantineQueue.statutes_staging_id == StatutesStaging.id)),
+                )
+                .order_by(StatutesStaging.created_at)
+                .limit(limit)
+            )
+        ).scalars().all()
+        for st in s_unqueued:
+            await _quarantine(db, st, st.quarantine_reason or "below threshold", st.kind)
+            counts["statutes_quarantined"] += 1
+        await db.commit()
+        srows = (await db.execute(select(StatutesStaging).where(StatutesStaging.status == "extracted", StatutesStaging.promoted_to_id.is_(None)).order_by(StatutesStaging.created_at).limit(limit))).scalars().all()
         for st in srows:
-            if st.status == "quarantined":
-                exists = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))).scalars().first()
-                if exists is None:
-                    await _quarantine(db, st, st.quarantine_reason or "below threshold", st.kind)
-                    counts["statutes_quarantined"] += 1
-                continue
             try:
                 r = await promote_statute_staging(db, st)
                 counts[f"statutes_{r}"] += 1

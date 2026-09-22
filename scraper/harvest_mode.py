@@ -118,15 +118,30 @@ async def backfill_progress(db: AsyncSession, *, source_names: Sequence[str] | N
     statutes = int((await db.execute(select(func.count()).select_from(Statute))).scalar() or 0)
     target_j = int(settings.BACKFILL_TARGET_JUDGMENTS)
     target_s = int(settings.BACKFILL_TARGET_STATUTES)
-    complete = frontier_remaining == 0 and (judgments >= target_j if target_j else True) and (statutes >= target_s if target_s else True)
+    targets_configured = bool(target_j or target_s)
+    targets_met = {"judgments": judgments >= target_j if target_j else True, "statutes": statutes >= target_s if target_s else True}
+    # Backfill is "complete" only when the firm has stated what complete means (a judgment and/or
+    # statute target) and that target is reached with nothing left in the frontier. Without a target
+    # an empty frontier proves nothing: at first boot the frontier is empty before any source has run,
+    # and the PakistanLawSite citation grid never uses the frontier at all.
+    complete = targets_configured and frontier_remaining == 0 and all(targets_met.values())
+    blocked_reason = None
+    if not targets_configured:
+        blocked_reason = "no BACKFILL_TARGET_JUDGMENTS / BACKFILL_TARGET_STATUTES configured; auto-switch stays off"
+    elif frontier_remaining:
+        blocked_reason = f"{frontier_remaining} frontier rows still pending"
+    elif not all(targets_met.values()):
+        blocked_reason = "backfill targets not yet met"
     return {
         "frontier_remaining": frontier_remaining,
         "judgments_total": judgments,
         "statutes_total": statutes,
         "judgments_target": target_j or None,
         "statutes_target": target_s or None,
-        "targets_met": {"judgments": judgments >= target_j if target_j else True, "statutes": statutes >= target_s if target_s else True},
+        "targets_configured": targets_configured,
+        "targets_met": targets_met,
         "complete": complete,
+        "auto_switch_blocked_reason": blocked_reason,
     }
 
 
