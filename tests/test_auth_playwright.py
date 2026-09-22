@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 import redis.asyncio as aioredis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from scraper.auth.session_manager import (
     BrowserDisconnected,
@@ -1807,13 +1807,47 @@ async def test_refresh_storage_state_ignores_inactive_or_empty_states(db, login_
     mgr = await _activate(db, login_source)
     slot = await mgr.slot(1)
     before = slot.storage_state_hash
-    assert await mgr.refresh_storage_state(1, {"cookies": [], "origins": []}) is False
-    assert await mgr.refresh_storage_state(1, STATE) is False  # identical state: nothing to write
+    assert await mgr.refresh_storage_state(1, {"cookies": [], "origins": []}, expected_hash=before) is None
+    assert await mgr.refresh_storage_state(1, STATE, expected_hash=before) is None  # identical state: nothing to write
     assert (await mgr.slot(1)).storage_state_hash == before
     slot.state = "NEEDS_HUMAN_LOGIN"
     await db.flush()
-    assert await mgr.refresh_storage_state(1, {"cookies": [{"name": "x", "value": "y", "domain": "d", "path": "/"}], "origins": []}) is False
+    renewed = {"cookies": [{"name": "x", "value": "y", "domain": "d", "path": "/"}], "origins": []}
+    assert await mgr.refresh_storage_state(1, renewed, expected_hash=before) is None
     assert (await mgr.slot(1)).storage_state_hash == before
+
+
+async def test_refresh_storage_state_never_overwrites_a_newer_human_login_or_an_admin_clear(db, login_source):
+    """A job that opened its browser with state A must not write its renewed cookies over state B that a
+    human login stored meanwhile, nor over a slot an admin cleared (Codex review on #111)."""
+    mgr = await _activate(db, login_source)
+    opened_with = (await mgr.slot(1)).storage_state_hash
+    await db.commit()
+    # Meanwhile: a fresh human login in another session stores state B.
+    newer = {"cookies": [{"name": "sid", "value": "fresh-login", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+    async with SessionLocal() as other:
+        other_source = (await other.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().one()
+        await SessionManager(other, other_source).save_storage_state(1, newer, by="human")
+        await other.commit()
+    stale_renewal = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}, {"name": "renewed", "value": "r1", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=opened_with) is None
+    await db.commit()
+    async with SessionLocal() as verify:
+        row = (await verify.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1))).scalars().one()
+        assert json.loads(settings.decrypt_value(row.storage_state_encrypted)) == newer
+        current = row.storage_state_hash
+    # With the current hash the refresh is accepted.
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=current) is not None
+    await db.commit()
+    # Meanwhile: an admin clears the slot.
+    async with SessionLocal() as other:
+        await other.execute(update(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1).values(storage_state_encrypted=None, storage_state_hash=None, state="EMPTY", state_reason="cleared by admin"))
+        await other.commit()
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=(await mgr.slot(1)).storage_state_hash) is None
+    await db.commit()
+    async with SessionLocal() as verify:
+        row = (await verify.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1))).scalars().one()
+        assert row.state == "EMPTY" and row.storage_state_encrypted is None
 
 
 async def test_pipeline_citation_grid_batch_flush_persists_offset_and_rows(db, login_source, monkeypatch):

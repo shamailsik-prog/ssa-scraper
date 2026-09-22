@@ -293,12 +293,15 @@ class PakistanLawSitePipeline:
         except Exception as exc:
             logger.warning("PakistanLawSite: live session export failed for slot %s: %s", getattr(browser, "slot_number", "?"), exc)
             return
-        changed = await self.manager.refresh_storage_state(browser.slot_number, state)
-        if changed:
+        new_hash = await self.manager.refresh_storage_state(
+            browser.slot_number, state, expected_hash=self.runner.opened_state_hash
+        )
+        # Commit at once: the slot row must not stay locked by an open transaction after a run
+        # ends (a following job in another session updates the same row and would block).
+        await self.db.commit()
+        if new_hash:
+            self.runner.opened_state_hash = new_hash
             self.stats["session_state_refreshes"] = int(self.stats.get("session_state_refreshes", 0) or 0) + 1
-            # Commit at once: the slot row must not stay locked by an open transaction after a run
-            # ends (a following job in another session updates the same row and would block).
-            await self.db.commit()
 
     # ---------------------------------------------------------------- guards
     def _assert_permitted(self) -> None:
