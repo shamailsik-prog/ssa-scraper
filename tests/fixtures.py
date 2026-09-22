@@ -226,6 +226,15 @@ class FakeBrowser:
         res = self.script.respond(("download", url), self)
         return res.pdf_bytes or b""
 
+    async def export_storage_state(self) -> Dict[str, Any]:
+        """The site renews the session cookie during a run: return the stored state plus a renewed cookie."""
+        state = json.loads(json.dumps(self.storage_state))
+        cookies = list(state.get("cookies") or [])
+        cookies.append({"name": "renewed", "value": f"r{len(self.calls)}", "domain": "www.pakistanlawsite.com", "path": "/", "expires": 4102444800})
+        state["cookies"] = cookies
+        self.calls.append(("export_storage_state", self.slot_number))
+        return state
+
     async def close(self) -> None:
         self.closed = True
 

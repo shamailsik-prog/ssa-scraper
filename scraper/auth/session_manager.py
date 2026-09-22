@@ -27,14 +27,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
+from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
-from scraper.security import ExplicitBlock, VerificationRequired, classify_response
+from scraper.security import ExplicitBlock, VerificationRequired, classify_response, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +93,41 @@ def raise_for_verdict(page: PageResult) -> None:
     v = page.classify()
     if v.kind == "block":
         raise ExplicitBlock(v.kind, v.detail)
+    where = f" (landed on {safe_url_for_record(page.url)})" if page.url else ""
     if v.kind == "verification":
-        raise VerificationRequired(v.detail)
+        raise VerificationRequired(f"{v.detail}{where}")
     if v.kind in ("login", "multilogin"):
-        raise LoginRequired(v.detail)
+        raise LoginRequired(f"{v.detail}{where}")
+
+
+def safe_url_for_record(url: Optional[str]) -> str:
+    """Scheme, host and path of a URL only: the query string and fragment (where return-URL tokens,
+    session ids or credential-shaped parameters would sit) are never persisted or logged."""
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(str(url))
+    except Exception:
+        return "[unparseable url]"
+    if not parts.scheme or not parts.netloc:
+        return scrub_secrets(str(url).split("?", 1)[0])[:300]
+    return scrub_secrets(f"{parts.scheme}://{parts.netloc}{parts.path or '/'}")[:300]
+
+
+def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:
+    """Names, domains and expiry times of the cookies in a storage state: never their values.
+    Logged when a slot is opened or refreshed so a lost login can be traced to an expired cookie."""
+    out: List[str] = []
+    for c in (storage_state or {}).get("cookies") or []:
+        if not isinstance(c, dict):
+            continue
+        exp = c.get("expires")
+        try:
+            exp_txt = "session" if exp in (None, -1, "-1") else datetime.fromtimestamp(float(exp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        except Exception:
+            exp_txt = str(exp)
+        out.append(f"{c.get('name')}@{c.get('domain')} exp={exp_txt}")
+    return out
 
 
 # --------------------------------------------------------------------------- lock
@@ -265,6 +297,56 @@ class SessionManager:
         if not slot.storage_state_encrypted:
             raise NoActiveSlot(f"slot {slot.slot_number} has no storage state")
         return json.loads(settings.decrypt_value(slot.storage_state_encrypted))
+
+    async def refresh_storage_state(
+        self,
+        slot_number: int,
+        storage_state: Dict[str, Any],
+        *,
+        expected_hash: Optional[str] = None,
+    ) -> Optional[str]:
+        """Keep an ACTIVE slot's stored session current with the cookies the site has renewed during
+        a run. The login itself is still the human's; only its live continuation is stored, so the next
+        job opens with the renewed cookies instead of the ones captured at login time.
+
+        Compare-and-update: the row is written only while it is still ACTIVE and still holds the state
+        this browser was opened with (`expected_hash`). A human login completed meanwhile, or an admin
+        clear, changes that hash or state and therefore wins; the stale browser's cookies never
+        overwrite it. Returns the new hash when the stored state changed, else None."""
+        if not isinstance(storage_state, dict) or not storage_state.get("cookies"):
+            return None
+        raw = json.dumps(storage_state, separators=(",", ":"))
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        now = datetime.now(timezone.utc)
+        guard = [
+            BrowserSessionSlot.source_name == self.source.source_name,
+            BrowserSessionSlot.slot_number == slot_number,
+            BrowserSessionSlot.state == "ACTIVE",
+            BrowserSessionSlot.storage_state_encrypted.isnot(None),
+        ]
+        if expected_hash is not None:
+            guard.append(BrowserSessionSlot.storage_state_hash == expected_hash)
+        if expected_hash is not None and digest == expected_hash:
+            await self.db.execute(update(BrowserSessionSlot).where(*guard).values(last_verified_at=now))
+            return None
+        result = await self.db.execute(
+            update(BrowserSessionSlot)
+            .where(*guard, BrowserSessionSlot.storage_state_hash != digest)
+            .values(storage_state_encrypted=settings.encrypt_value(raw), storage_state_hash=digest, last_verified_at=now)
+        )
+        changed = int(result.rowcount or 0) > 0
+        # Refresh the in-memory row so later reads in this session see what the database holds.
+        for row in await self.slots():
+            if row.slot_number == slot_number:
+                await self.db.refresh(row)
+        if not changed:
+            logger.info(
+                "slot %s storage state not refreshed: the row changed meanwhile (new human login, admin clear or paused slot); the newer state is kept",
+                slot_number,
+            )
+            return None
+        logger.info("slot %s storage state refreshed from the live browser: %s", slot_number, ", ".join(cookie_summary(storage_state)) or "no cookies")
+        return digest
 
     async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
         s = await self.slot(slot_number)
@@ -885,6 +967,10 @@ class PlaywrightBrowser:
     async def storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state()
 
+    async def export_storage_state(self) -> Dict[str, Any]:
+        """The live session (cookies + localStorage) as the site has renewed it during this run."""
+        return await self._wrap(self._context.storage_state())
+
     async def close(self) -> None:
         for closer in (self._context, self._browser):
             try:
@@ -920,13 +1006,24 @@ class ContinuityRunner:
     browser: Optional[Browser] = None
     reconnects: int = 0
     preferred_slot_number: Optional[int] = None
+    # Hash of the storage state the current browser was opened with; a live-state refresh is
+    # written only while the slot still holds it (compare-and-update).
+    opened_state_hash: Optional[str] = None
     # True for a reporter shard: it may never continue on the other shard's slot, because that slot
     # is in use by the other shard at the same time (one login per account on the site).
     exclusive_slot: bool = False
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
+        logger.info(
+            "opening slot %s (logged in %s by %s): cookies %s",
+            slot.slot_number,
+            slot.logged_in_at.isoformat() if slot.logged_in_at else "unknown",
+            slot.logged_in_by or "unknown",
+            ", ".join(cookie_summary(state)) or "none",
+        )
         self.browser = await self.factory(state, slot.slot_number)
+        self.opened_state_hash = slot.storage_state_hash
         return self.browser
 
     async def ensure_browser(self) -> Browser:

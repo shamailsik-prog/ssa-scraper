@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 import redis.asyncio as aioredis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from scraper.auth.session_manager import (
     BrowserDisconnected,
@@ -1773,6 +1773,98 @@ async def test_pipeline_citation_grid_skips_rows_already_staged(db, login_source
     assert stats2["staged_citation_skips"] == 2
     assert stats2["staged"] == 0
     assert stats2["citation_grid_next_offset"] == 0
+
+
+async def test_pipeline_persists_renewed_session_cookies_back_to_the_slot(db, login_source, monkeypatch):
+    """Each job opens a fresh browser from the slot's stored state. If that state stays frozen at
+    login time while the site renews its cookies, the next job opens with stale cookies and the login
+    is lost about once an hour. The live state must be written back after every window."""
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    mgr = await _activate(db, login_source)
+    before = (await mgr.slot(1)).storage_state_hash
+    rows = [("PLD 2024 SC 6001", "Case 6001", "Supreme Court", "https://www.pakistanlawsite.com/case/6001")]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.page(("goto", rows[0][3]), judgment_html(rows[0][0], title=rows[0][1]))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["staged"] == 1
+    assert stats["session_state_refreshes"] >= 1
+    slot = await mgr.slot(1)
+    assert slot.storage_state_hash != before
+    assert slot.state == "ACTIVE"
+    refreshed = mgr.load_storage_state(slot)
+    assert any(c.get("name") == "renewed" for c in refreshed["cookies"])
+    assert any(c.get("name") == "sid" for c in refreshed["cookies"])  # the human login's cookie is kept
+
+
+def test_raise_for_verdict_records_only_the_landed_path_never_query_or_tokens():
+    from scraper.auth.session_manager import LoginRequired, safe_url_for_record
+
+    page = PageResult(
+        url="https://www.pakistanlawsite.com/Login/MainPage?ReturnUrl=%2FLogin%2FCheck&token=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ12345&sid=verysecretsessionid#frag",
+        html=LOGIN_PAGE,
+    )
+    with pytest.raises(LoginRequired) as exc:
+        raise_for_verdict(page)
+    text = str(exc.value)
+    assert "landed on https://www.pakistanlawsite.com/Login/MainPage" in text
+    for leaked in ("token=", "sid=", "verysecretsessionid", "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ12345", "ReturnUrl", "#frag"):
+        assert leaked not in text
+    assert safe_url_for_record("") == ""
+    assert safe_url_for_record("not a url?x=1") == "not a url"
+
+
+async def test_refresh_storage_state_ignores_inactive_or_empty_states(db, login_source):
+    mgr = await _activate(db, login_source)
+    slot = await mgr.slot(1)
+    before = slot.storage_state_hash
+    assert await mgr.refresh_storage_state(1, {"cookies": [], "origins": []}, expected_hash=before) is None
+    assert await mgr.refresh_storage_state(1, STATE, expected_hash=before) is None  # identical state: nothing to write
+    assert (await mgr.slot(1)).storage_state_hash == before
+    slot.state = "NEEDS_HUMAN_LOGIN"
+    await db.flush()
+    renewed = {"cookies": [{"name": "x", "value": "y", "domain": "d", "path": "/"}], "origins": []}
+    assert await mgr.refresh_storage_state(1, renewed, expected_hash=before) is None
+    assert (await mgr.slot(1)).storage_state_hash == before
+
+
+async def test_refresh_storage_state_never_overwrites_a_newer_human_login_or_an_admin_clear(db, login_source):
+    """A job that opened its browser with state A must not write its renewed cookies over state B that a
+    human login stored meanwhile, nor over a slot an admin cleared (Codex review on #111)."""
+    mgr = await _activate(db, login_source)
+    opened_with = (await mgr.slot(1)).storage_state_hash
+    await db.commit()
+    # Meanwhile: a fresh human login in another session stores state B.
+    newer = {"cookies": [{"name": "sid", "value": "fresh-login", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+    async with SessionLocal() as other:
+        other_source = (await other.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().one()
+        await SessionManager(other, other_source).save_storage_state(1, newer, by="human")
+        await other.commit()
+    stale_renewal = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}, {"name": "renewed", "value": "r1", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=opened_with) is None
+    await db.commit()
+    async with SessionLocal() as verify:
+        row = (await verify.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1))).scalars().one()
+        assert json.loads(settings.decrypt_value(row.storage_state_encrypted)) == newer
+        current = row.storage_state_hash
+    # With the current hash the refresh is accepted.
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=current) is not None
+    await db.commit()
+    # Meanwhile: an admin clears the slot.
+    async with SessionLocal() as other:
+        await other.execute(update(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1).values(storage_state_encrypted=None, storage_state_hash=None, state="EMPTY", state_reason="cleared by admin"))
+        await other.commit()
+    assert await mgr.refresh_storage_state(1, stale_renewal, expected_hash=(await mgr.slot(1)).storage_state_hash) is None
+    await db.commit()
+    async with SessionLocal() as verify:
+        row = (await verify.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite", BrowserSessionSlot.slot_number == 1))).scalars().one()
+        assert row.state == "EMPTY" and row.storage_state_encrypted is None
 
 
 async def test_pipeline_citation_grid_batch_flush_persists_offset_and_rows(db, login_source, monkeypatch):
