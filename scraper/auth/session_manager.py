@@ -92,10 +92,27 @@ def raise_for_verdict(page: PageResult) -> None:
     v = page.classify()
     if v.kind == "block":
         raise ExplicitBlock(v.kind, v.detail)
+    where = f" (landed on {page.url})" if page.url else ""
     if v.kind == "verification":
-        raise VerificationRequired(v.detail)
+        raise VerificationRequired(f"{v.detail}{where}")
     if v.kind in ("login", "multilogin"):
-        raise LoginRequired(v.detail)
+        raise LoginRequired(f"{v.detail}{where}")
+
+
+def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:
+    """Names, domains and expiry times of the cookies in a storage state: never their values.
+    Logged when a slot is opened or refreshed so a lost login can be traced to an expired cookie."""
+    out: List[str] = []
+    for c in (storage_state or {}).get("cookies") or []:
+        if not isinstance(c, dict):
+            continue
+        exp = c.get("expires")
+        try:
+            exp_txt = "session" if exp in (None, -1, "-1") else datetime.fromtimestamp(float(exp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        except Exception:
+            exp_txt = str(exp)
+        out.append(f"{c.get('name')}@{c.get('domain')} exp={exp_txt}")
+    return out
 
 
 # --------------------------------------------------------------------------- lock
@@ -265,6 +282,28 @@ class SessionManager:
         if not slot.storage_state_encrypted:
             raise NoActiveSlot(f"slot {slot.slot_number} has no storage state")
         return json.loads(settings.decrypt_value(slot.storage_state_encrypted))
+
+    async def refresh_storage_state(self, slot_number: int, storage_state: Dict[str, Any]) -> bool:
+        """Keep an ACTIVE slot's stored session current with the cookies the site has renewed during
+        a run. The login itself is still the human's; only its live continuation is stored, so the next
+        job opens with the renewed cookies instead of the ones captured at login time. Returns True when
+        the stored state changed."""
+        s = await self.slot(slot_number)
+        if s.state != "ACTIVE" or not s.storage_state_encrypted:
+            return False
+        if not isinstance(storage_state, dict) or not storage_state.get("cookies"):
+            return False
+        raw = json.dumps(storage_state, separators=(",", ":"))
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        s.last_verified_at = datetime.now(timezone.utc)
+        if digest == s.storage_state_hash:
+            await self.db.flush()
+            return False
+        s.storage_state_encrypted = settings.encrypt_value(raw)
+        s.storage_state_hash = digest
+        await self.db.flush()
+        logger.info("slot %s storage state refreshed from the live browser: %s", slot_number, ", ".join(cookie_summary(storage_state)) or "no cookies")
+        return True
 
     async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
         s = await self.slot(slot_number)
@@ -885,6 +924,10 @@ class PlaywrightBrowser:
     async def storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state()
 
+    async def export_storage_state(self) -> Dict[str, Any]:
+        """The live session (cookies + localStorage) as the site has renewed it during this run."""
+        return await self._wrap(self._context.storage_state())
+
     async def close(self) -> None:
         for closer in (self._context, self._browser):
             try:
@@ -926,6 +969,13 @@ class ContinuityRunner:
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
+        logger.info(
+            "opening slot %s (logged in %s by %s): cookies %s",
+            slot.slot_number,
+            slot.logged_in_at.isoformat() if slot.logged_in_at else "unknown",
+            slot.logged_in_by or "unknown",
+            ", ".join(cookie_summary(state)) or "none",
+        )
         self.browser = await self.factory(state, slot.slot_number)
         return self.browser
 

@@ -1775,6 +1775,47 @@ async def test_pipeline_citation_grid_skips_rows_already_staged(db, login_source
     assert stats2["citation_grid_next_offset"] == 0
 
 
+async def test_pipeline_persists_renewed_session_cookies_back_to_the_slot(db, login_source, monkeypatch):
+    """Each job opens a fresh browser from the slot's stored state. If that state stays frozen at
+    login time while the site renews its cookies, the next job opens with stale cookies and the login
+    is lost about once an hour. The live state must be written back after every window."""
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    mgr = await _activate(db, login_source)
+    before = (await mgr.slot(1)).storage_state_hash
+    rows = [("PLD 2024 SC 6001", "Case 6001", "Supreme Court", "https://www.pakistanlawsite.com/case/6001")]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.page(("goto", rows[0][3]), judgment_html(rows[0][0], title=rows[0][1]))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert stats["staged"] == 1
+    assert stats["session_state_refreshes"] >= 1
+    slot = await mgr.slot(1)
+    assert slot.storage_state_hash != before
+    assert slot.state == "ACTIVE"
+    refreshed = mgr.load_storage_state(slot)
+    assert any(c.get("name") == "renewed" for c in refreshed["cookies"])
+    assert any(c.get("name") == "sid" for c in refreshed["cookies"])  # the human login's cookie is kept
+
+
+async def test_refresh_storage_state_ignores_inactive_or_empty_states(db, login_source):
+    mgr = await _activate(db, login_source)
+    slot = await mgr.slot(1)
+    before = slot.storage_state_hash
+    assert await mgr.refresh_storage_state(1, {"cookies": [], "origins": []}) is False
+    assert await mgr.refresh_storage_state(1, STATE) is False  # identical state: nothing to write
+    assert (await mgr.slot(1)).storage_state_hash == before
+    slot.state = "NEEDS_HUMAN_LOGIN"
+    await db.flush()
+    assert await mgr.refresh_storage_state(1, {"cookies": [{"name": "x", "value": "y", "domain": "d", "path": "/"}], "origins": []}) is False
+    assert (await mgr.slot(1)).storage_state_hash == before
+
+
 async def test_pipeline_citation_grid_batch_flush_persists_offset_and_rows(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)

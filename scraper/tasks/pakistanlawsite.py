@@ -281,6 +281,25 @@ class PakistanLawSitePipeline:
             )
         )
 
+    async def _persist_live_session(self) -> None:
+        """Store the browser's current cookies back into its slot (same human login, renewed by the
+        site during the run) so the next job does not start from the cookies captured at login time."""
+        browser = self.runner.browser
+        exporter = getattr(browser, "export_storage_state", None)
+        if browser is None or not callable(exporter):
+            return
+        try:
+            state = await exporter()
+        except Exception as exc:
+            logger.warning("PakistanLawSite: live session export failed for slot %s: %s", getattr(browser, "slot_number", "?"), exc)
+            return
+        changed = await self.manager.refresh_storage_state(browser.slot_number, state)
+        if changed:
+            self.stats["session_state_refreshes"] = int(self.stats.get("session_state_refreshes", 0) or 0) + 1
+            # Commit at once: the slot row must not stay locked by an open transaction after a run
+            # ends (a following job in another session updates the same row and would block).
+            await self.db.commit()
+
     # ---------------------------------------------------------------- guards
     def _assert_permitted(self) -> None:
         if not settings.login_scraping_effective:
@@ -448,6 +467,7 @@ class PakistanLawSitePipeline:
             outcome = await self._run_citation_grid_window(search_map, limits)
             windows += 1
             self.stats["citation_grid_windows"] = windows
+            await self._persist_live_session()
             if deadline is None:
                 break
             if outcome["rows"] == 0:
@@ -1257,6 +1277,10 @@ class PakistanLawSitePipeline:
             return self.stats
         finally:
             self._session_lock = None
+            try:
+                await self._persist_live_session()
+            except Exception as exc:
+                logger.warning("PakistanLawSite: could not persist the live session at run end: %s", exc)
             await self.runner.close()
             await lock.release()
 
