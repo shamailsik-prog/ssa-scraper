@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
+from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scraper.config import settings
 from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
-from scraper.security import ExplicitBlock, VerificationRequired, classify_response
+from scraper.security import ExplicitBlock, VerificationRequired, classify_response, scrub_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +93,25 @@ def raise_for_verdict(page: PageResult) -> None:
     v = page.classify()
     if v.kind == "block":
         raise ExplicitBlock(v.kind, v.detail)
-    where = f" (landed on {page.url})" if page.url else ""
+    where = f" (landed on {safe_url_for_record(page.url)})" if page.url else ""
     if v.kind == "verification":
         raise VerificationRequired(f"{v.detail}{where}")
     if v.kind in ("login", "multilogin"):
         raise LoginRequired(f"{v.detail}{where}")
+
+
+def safe_url_for_record(url: Optional[str]) -> str:
+    """Scheme, host and path of a URL only: the query string and fragment (where return-URL tokens,
+    session ids or credential-shaped parameters would sit) are never persisted or logged."""
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(str(url))
+    except Exception:
+        return "[unparseable url]"
+    if not parts.scheme or not parts.netloc:
+        return scrub_secrets(str(url).split("?", 1)[0])[:300]
+    return scrub_secrets(f"{parts.scheme}://{parts.netloc}{parts.path or '/'}")[:300]
 
 
 def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:

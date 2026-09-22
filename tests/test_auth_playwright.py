@@ -1803,6 +1803,23 @@ async def test_pipeline_persists_renewed_session_cookies_back_to_the_slot(db, lo
     assert any(c.get("name") == "sid" for c in refreshed["cookies"])  # the human login's cookie is kept
 
 
+def test_raise_for_verdict_records_only_the_landed_path_never_query_or_tokens():
+    from scraper.auth.session_manager import LoginRequired, safe_url_for_record
+
+    page = PageResult(
+        url="https://www.pakistanlawsite.com/Login/MainPage?ReturnUrl=%2FLogin%2FCheck&token=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ12345&sid=verysecretsessionid#frag",
+        html=LOGIN_PAGE,
+    )
+    with pytest.raises(LoginRequired) as exc:
+        raise_for_verdict(page)
+    text = str(exc.value)
+    assert "landed on https://www.pakistanlawsite.com/Login/MainPage" in text
+    for leaked in ("token=", "sid=", "verysecretsessionid", "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ12345", "ReturnUrl", "#frag"):
+        assert leaked not in text
+    assert safe_url_for_record("") == ""
+    assert safe_url_for_record("not a url?x=1") == "not a url"
+
+
 async def test_refresh_storage_state_ignores_inactive_or_empty_states(db, login_source):
     mgr = await _activate(db, login_source)
     slot = await mgr.slot(1)
