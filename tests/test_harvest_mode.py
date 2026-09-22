@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
+from scraper.database import SessionLocal
 from scraper.fetchers import HttpFetcher
 from scraper.models import ScraperSource
 from scraper.tasks.public_pipeline import run_public_source
@@ -135,3 +136,26 @@ async def test_dispatch_does_not_auto_switch_to_updates_on_empty_frontier(db, mo
     assert result["auto_switched"] is False
     assert result["mode"] == "backfill"
     assert await get_harvest_mode(db) == "backfill"
+
+
+async def test_seed_data_undoes_targetless_auto_switch_to_updates(db, monkeypatch):
+    """The stored mode 'updates' written by the old auto-switch (no target configured) is a defect
+    outcome; the API boot restores the configured backfill mode once."""
+    from scraper.config import settings
+    from scraper.database import seed_data
+    from scraper.harvest_mode import get_harvest_mode, set_harvest_mode
+
+    monkeypatch.setattr(settings, "HARVEST_MODE", "backfill")
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_JUDGMENTS", 0)
+    monkeypatch.setattr(settings, "BACKFILL_TARGET_STATUTES", 0)
+    await set_harvest_mode(db, "updates", changed_by="system", reason="auto-switch: frontier drained, judgments=3, statutes=0")
+    await db.commit()
+    await seed_data()
+    async with SessionLocal() as verify:
+        assert await get_harvest_mode(verify) == "backfill"
+    # A deliberate operator switch is respected.
+    await set_harvest_mode(db, "updates", changed_by="dashboard", reason="operator choice")
+    await db.commit()
+    await seed_data()
+    async with SessionLocal() as verify:
+        assert await get_harvest_mode(verify) == "updates"

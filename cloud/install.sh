@@ -169,7 +169,33 @@ PY
     unset SGAI_KEY
   fi
 else
-  log "Keeping existing .env"
+  log "Keeping existing .env (adding keys new in .env.example; retiring known stale values)"
+  python3 - <<'RECONCILE'
+import re
+example = open(".env.example").read()
+s = open(".env").read()
+present = {m.group(1) for m in re.finditer(r"^([A-Z][A-Z0-9_]*)=", s, flags=re.M)}
+added = []
+for line in example.splitlines():
+    m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+    if not m or m.group(1) in present:
+        continue
+    s += ("" if s.endswith("\n") else "\n") + line + "\n"
+    added.append(m.group(1))
+# Values an earlier release wrote that are known to throttle the harvest. Only the exact old defaults
+# are replaced; a value the operator changed on purpose is left alone.
+stale = {"PLS_CITATION_GRID_MAX_DETAIL": ("40", "120"), "PLS_ARCHIVED_GRID_MAX_ROWS": ("200", "400")}
+migrated = []
+for key, (old_value, new_value) in stale.items():
+    s, n = re.subn(rf"^{key}={old_value}\s*$", f"{key}={new_value}", s, flags=re.M)
+    if n:
+        migrated.append(f"{key} {old_value}->{new_value}")
+open(".env", "w").write(s)
+if added:
+    print("  added to .env:", ", ".join(added))
+if migrated:
+    print("  migrated in .env:", ", ".join(migrated))
+RECONCILE
 fi
 
 # Reuse a previously configured domain on updates unless --domain overrides it.
