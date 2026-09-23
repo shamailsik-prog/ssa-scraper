@@ -9,16 +9,23 @@ login or only throttled the account is not known at that moment. This Beat task 
 1. LOGIN_RECOVERY_COOLDOWN_MINUTES after the loss it opens a headless browser with the slot's stored
    session (the human's login, nothing else) and loads the authenticated search page.
 2. If the page renders, the slot is ACTIVE again and a paused source resumes at once.
-3. If the site still bounces to its login page, the attempt is recorded and the next one waits
-   longer (15, 30, 60 minutes, then hourly). No credentials are ever submitted by this task: a dead
-   login is re-established by the human, through the dashboard, as the contract prescribes.
+3. If the site still bounces to its login page, and the operator saved username/password for the
+   slot (dashboard → Human login, encrypted at rest), the same server-side browser used for the
+   streamed human login opens the sign-in page, fills and submits the form, and the resulting
+   session is stored in the slot. The operator authorised this unattended sign-in expressly
+   (23 September 2026) so the harvest runs around the clock on the firm's two logins.
+4. A verification page (CAPTCHA, OTP, "verify you are human") is never solved: the slot waits for a
+   human and the next automatic attempt is two hours away. Without saved credentials the attempt
+   backs off (15, 30, 60 minutes, then hourly) and a human login from the dashboard restores it.
 
 An explicit block (HTTP 403/429/451 or a block page) halts the source as it always has. Attempts
-are recorded in the source's config_json under `slot_recovery_<n>` (never cookie values).
+are recorded in the source's config_json under `slot_recovery_<n>` (never credentials or cookie
+values); credentials are never logged or returned by any API.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
@@ -26,6 +33,7 @@ from typing import Any, Callable, Dict, Optional
 from celery import shared_task
 from sqlalchemy import select
 
+from scraper.auth.browser_login import LoginSessionRegistry
 from scraper.auth.session_manager import (
     SessionLock,
     SessionLockHeld,
@@ -42,6 +50,7 @@ from scraper.notify import notify
 logger = logging.getLogger(__name__)
 
 BACKOFF_MINUTES = (15, 30, 60)
+VERIFICATION_BACKOFF_MINUTES = 120
 
 
 def recovery_key(slot_number: int) -> str:
@@ -99,6 +108,50 @@ async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlo
     return {"alive": False, "verdict": verdict.kind, "detail": verdict.detail, "landed": landed}
 
 
+async def sign_in_with_saved_credentials(
+    manager: SessionManager,
+    slot: BrowserSessionSlot,
+    credentials: Dict[str, str],
+    registry_factory: Callable[[], LoginSessionRegistry] = LoginSessionRegistry,
+) -> Dict[str, Any]:
+    """Sign in with the operator's saved credentials in the server-side browser and store the
+    resulting session in the slot (the same path the dashboard's *Human login* uses, completed by
+    the service instead of a person). Returns {"stored": bool, "verdict": kind, "detail": str}.
+    A verification page is reported as verdict "verification", never solved. Credentials are never
+    logged or included in the result."""
+    source_name = manager.source.source_name
+    registry = registry_factory()
+    try:
+        sess = await registry.start(
+            source_name,
+            slot.slot_number,
+            settings.PLS_LOGIN_URL if source_name == "PakistanLawSite" else manager.source.source_url,
+            started_by="auto-recovery",
+            saved_credentials=credentials,
+            auto_complete=True,
+        )
+        autofill = dict(sess.last_autofill or {})
+        if not autofill.get("submitted"):
+            state = await sess.is_authenticated()
+            return {
+                "stored": False,
+                "verdict": state.get("verdict", "unknown"),
+                "detail": "sign-in form not recognised; nothing submitted",
+                "landed": safe_url_for_record(state.get("url") or ""),
+            }
+        await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
+        check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
+        landed = safe_url_for_record(check.get("url") or "")
+        if check.get("verdict") == "verification":
+            return {"stored": False, "verdict": "verification", "detail": check.get("detail"), "landed": landed}
+        if not check.get("authenticated"):
+            return {"stored": False, "verdict": check.get("verdict", "login"), "detail": check.get("detail"), "landed": landed}
+        result = await registry.complete(source_name, manager)
+        return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
+    finally:
+        await registry.cancel(source_name)
+
+
 async def recover_slot(
     db,
     manager: SessionManager,
@@ -106,6 +159,7 @@ async def recover_slot(
     *,
     now: Optional[datetime] = None,
     browser_factory: Callable = playwright_browser_factory,
+    registry_factory: Callable[[], LoginSessionRegistry] = LoginSessionRegistry,
     redis_client=None,
 ) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
@@ -116,13 +170,17 @@ async def recover_slot(
         if record:
             await merge_source_config(db, source, {key: {}})
         return {"skipped": "ACTIVE"}
-    if slot.state != "NEEDS_HUMAN_LOGIN" or not slot.storage_state_encrypted:
-        return {"skipped": slot.state if slot.state != "NEEDS_HUMAN_LOGIN" else "no stored session"}
+    if slot.state not in ("NEEDS_HUMAN_LOGIN", "EMPTY"):
+        return {"skipped": slot.state}
     if not settings.LOGIN_AUTO_RECOVER:
         return {"skipped": "LOGIN_AUTO_RECOVER off"}
+    credentials = manager.load_login_credentials(slot)
+    can_verify = slot.state == "NEEDS_HUMAN_LOGIN" and bool(slot.storage_state_encrypted)
+    if not can_verify and not credentials:
+        return {"skipped": "EMPTY without saved credentials" if slot.state == "EMPTY" else "no stored session and no saved credentials"}
 
     if not record:
-        cooldown = timedelta(minutes=int(settings.LOGIN_RECOVERY_COOLDOWN_MINUTES))
+        cooldown = timedelta(minutes=int(settings.LOGIN_RECOVERY_COOLDOWN_MINUTES)) if slot.state == "NEEDS_HUMAN_LOGIN" else timedelta(0)
         record = {"attempts": 0, "lost_at": _iso(now), "next_attempt_at": _iso(now + cooldown), "last_outcome": "scheduled"}
         await merge_source_config(db, source, {key: record})
         return {"scheduled": record["next_attempt_at"]}
@@ -137,17 +195,56 @@ async def recover_slot(
         return {"skipped": "slot_in_use"}
     try:
         attempts = int(record.get("attempts", 0) or 0) + 1
-        check = await verify_stored_session(manager, slot, browser_factory)
-        outcome: Dict[str, Any] = {"attempt": attempts, "verify": check}
-        if check["verdict"] == "block":
-            await manager.halt_source(f"explicit block while re-verifying slot {slot.slot_number}: {check.get('detail')}", slot_number=slot.slot_number)
-            await merge_source_config(db, source, {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "last_outcome": "halted"}})
-            return {**outcome, "halted": True}
-        if check["alive"]:
-            await manager.reactivate_slot(slot.slot_number, f"stored session verified after cool-down (attempt {attempts})", by="recovery")
-            await merge_source_config(db, source, {key: {}})
-            return {**outcome, "recovered": "verified"}
-        reason = f"stored session still bounced by the site ({check.get('verdict')}; landed on {check.get('landed')})"
+        outcome: Dict[str, Any] = {"attempt": attempts}
+        reason = ""
+
+        # 1. The stored session may still be alive once the account has cooled down.
+        if can_verify:
+            check = await verify_stored_session(manager, slot, browser_factory)
+            outcome["verify"] = check
+            if check["verdict"] == "block":
+                await manager.halt_source(f"explicit block while re-verifying slot {slot.slot_number}: {check.get('detail')}", slot_number=slot.slot_number)
+                await merge_source_config(db, source, {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "last_outcome": "halted"}})
+                return {**outcome, "halted": True}
+            if check["alive"]:
+                await manager.reactivate_slot(slot.slot_number, f"stored session verified after cool-down (attempt {attempts})", by="recovery")
+                await merge_source_config(db, source, {key: {}})
+                return {**outcome, "recovered": "verified"}
+            reason = f"stored session still bounced by the site ({check.get('verdict')}; landed on {check.get('landed')})"
+
+        # 2. Sign in again with the credentials the operator saved for this slot.
+        if credentials:
+            relogin = await sign_in_with_saved_credentials(manager, slot, credentials, registry_factory)
+            outcome["sign_in"] = relogin
+            if relogin.get("stored"):
+                await merge_source_config(db, source, {key: {}})
+                await notify(
+                    db,
+                    level="info",
+                    code="SLOT_RECOVERED",
+                    message=f"slot {slot.slot_number}: signed in again with the saved credentials (attempt {attempts})",
+                    source_name=source.source_name,
+                )
+                return {**outcome, "recovered": "signed_in"}
+            if relogin.get("verdict") == "verification":
+                next_attempt = now + timedelta(minutes=VERIFICATION_BACKOFF_MINUTES)
+                await merge_source_config(
+                    db,
+                    source,
+                    {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "next_attempt_at": _iso(next_attempt), "last_outcome": "verification page at sign-in"}},
+                )
+                await notify(
+                    db,
+                    level="warning",
+                    code="NEEDS_HUMAN_LOGIN",
+                    message=f"slot {slot.slot_number}: the site shows a verification page at sign-in; it is never solved by code. Log in from the dashboard (next automatic attempt {next_attempt:%H:%M} UTC).",
+                    source_name=source.source_name,
+                )
+                return {**outcome, "verification": True, "next_attempt_at": _iso(next_attempt)}
+            reason = f"sign-in with the saved credentials did not authenticate ({relogin.get('verdict')}: {relogin.get('detail')}; landed on {relogin.get('landed')})"
+        else:
+            reason = f"{reason}; no saved credentials for this slot" if reason else "no saved credentials for this slot"
+
         next_attempt = now + timedelta(minutes=BACKOFF_MINUTES[min(attempts, len(BACKOFF_MINUTES)) - 1])
         await merge_source_config(
             db,
@@ -159,7 +256,7 @@ async def recover_slot(
                 db,
                 level="warning",
                 code="SLOT_RECOVERY_FAILED",
-                message=f"slot {slot.slot_number}: {reason}; a human login from the dashboard restores it now, the next automatic check is at {next_attempt:%H:%M} UTC (attempt {attempts})",
+                message=f"slot {slot.slot_number}: {reason}; a human login from the dashboard restores it now, the next automatic attempt is at {next_attempt:%H:%M} UTC (attempt {attempts})",
                 source_name=source.source_name,
             )
         return {**outcome, "failed": reason, "next_attempt_at": _iso(next_attempt)}
@@ -171,6 +268,7 @@ async def recover_login_slots_async(
     *,
     now: Optional[datetime] = None,
     browser_factory: Callable = playwright_browser_factory,
+    registry_factory: Callable[[], LoginSessionRegistry] = LoginSessionRegistry,
     redis_client=None,
 ) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
@@ -190,7 +288,9 @@ async def recover_login_slots_async(
             manager = SessionManager(db, source)
             for slot in await manager.slots():
                 try:
-                    outcome = await recover_slot(db, manager, slot, now=now, browser_factory=browser_factory, redis_client=redis_client)
+                    outcome = await recover_slot(
+                        db, manager, slot, now=now, browser_factory=browser_factory, registry_factory=registry_factory, redis_client=redis_client
+                    )
                 except Exception as exc:  # one slot's failure must not stop the other's check
                     logger.warning("login recovery for %s slot %s failed: %s", source.source_name, slot.slot_number, exc)
                     outcome = {"error": str(exc)[:300]}

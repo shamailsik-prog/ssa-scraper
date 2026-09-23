@@ -26,7 +26,10 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null --no-check-certificate https://127.0.0.1/health || wget -q -O /dev/null http://127.0.0.1/health"]
+      # Ask Caddy's own admin endpoint (loopback only) whether it is serving; the public listener
+      # redirects plain HTTP to HTTPS and serves a certificate for the server's IP, not 127.0.0.1,
+      # so a probe through it always failed and the container showed "unhealthy" while working.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5

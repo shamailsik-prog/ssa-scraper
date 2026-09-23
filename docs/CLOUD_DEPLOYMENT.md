@@ -121,9 +121,11 @@ Re-running the same command later (with the token lines again while private) upd
    `BACKFILL_PLS_CITATION_GRID_MAX_DETAIL` and `BACKFILL_PLS_RUN_MAX_MINUTES`.
    Log in on **both** slots (slot 1 and slot 2) and keep `LOGIN_SESSION_CONCURRENCY=2`: the two
    reporter shards then run in parallel, one browser per login, each under its own 450-page hourly
-   budget. A slot the site bounces is re-verified after 15 minutes by the `recover-login-slots` task
-   and returns on its own when its session is alive; otherwise the dashboard shows
-   `SLOT_RECOVERY_FAILED` and a human login on that slot restores it.
+   budget. Save the username/password of both logins on the *Human login* tab: a slot the site
+   bounces is re-verified after 15 minutes by the `recover-login-slots` task, and if its session is
+   dead the task signs in again with the saved credentials, so the harvest runs without anyone at
+   the dashboard. Only a verification page or a slot without saved credentials needs a person
+   (`NEEDS_HUMAN_LOGIN` / `SLOT_RECOVERY_FAILED` notifications).
    Switch to `updates` mode from the dashboard when the corpus is where you want it. Auto-switch
    happens only when `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached.
    After updating an existing server, check `.env` against `.env.example` for the PakistanLawSite

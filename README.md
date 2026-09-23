@@ -100,16 +100,19 @@ The harvest is meant to run around the clock on the two logins the firm holds (s
   in an hour (measured 22-23 September 2026). Page counters are kept per slot
   (`pacing_slot_<n>` in the source config), and backfill paces each login at 6-9 s between fetches
   under a 450-page hourly budget, so a run pauses itself before the site does.
-* **A bounced slot comes back on its own when its session is alive.** When the site redirects a slot
-  to its login page the slot is marked `NEEDS_HUMAN_LOGIN`, the other slot carries on, and the
-  `recover-login-slots` Beat task re-opens the stored session after `LOGIN_RECOVERY_COOLDOWN_MINUTES`
-  (15). If the search page renders, the slot is ACTIVE again and a paused source resumes at once;
-  if not, the next check waits 30, then 60 minutes, and a `SLOT_RECOVERY_FAILED` notification says
-  so. No credentials are submitted by code: a login the site really ended is re-established from the
-  dashboard (*Human login*, with the saved credentials pre-filled). Verification pages are never
-  solved.
-* **What still needs a person.** A dead login on both slots; a verification/CAPTCHA page; an explicit
-  block (HTTP 403/429/451), which halts the source for admin review as before.
+* **A bounced slot comes back on its own.** When the site redirects a slot to its login page the
+  slot is marked `NEEDS_HUMAN_LOGIN`, the other slot carries on, and the `recover-login-slots` Beat
+  task re-opens the stored session after `LOGIN_RECOVERY_COOLDOWN_MINUTES` (15). If the search page
+  renders, the slot is ACTIVE again and a paused source resumes at once. If the site really ended
+  the login, the task signs in again with the username/password the operator saved for that slot
+  (*Human login* → save credentials; encrypted at rest, never logged) in the same server-side
+  browser the streamed human login uses, and stores the new session. A slot that was never logged
+  in but has saved credentials is brought up the same way, so both logins run. Failed attempts
+  back off (15, 30, 60 minutes) and post one `SLOT_RECOVERY_FAILED` notification.
+* **What still needs a person.** A verification/CAPTCHA page at sign-in (never solved by code; the
+  slot waits two hours between attempts and a `NEEDS_HUMAN_LOGIN` notification says so); a slot
+  without saved credentials; an explicit block (HTTP 403/429/451), which halts the source for
+  admin review as before.
 
 ## Services (docker-compose)
 
