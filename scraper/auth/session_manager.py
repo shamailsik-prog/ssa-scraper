@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from scraper.config import settings
 from scraper.models import BrowserSessionSlot, ScraperSource
@@ -224,6 +225,27 @@ class SessionLock:
         await self.release()
 
 
+# --------------------------------------------------------------------------- source config
+async def merge_source_config(db: AsyncSession, source: ScraperSource, patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge top-level keys into scraper_sources.config_json atomically (JSONB `||`).
+
+    Two reporter shards run at the same time in two worker processes, each holding its own copy of
+    the source row; writing the whole JSON back from either copy would overwrite the other shard's
+    cursor and pacing counters. Each writer therefore sends only its own keys, and the in-memory
+    row is set to the merged value the database returns."""
+    if not patch:
+        return dict(source.config_json or {})
+    stmt = (
+        update(ScraperSource)
+        .where(ScraperSource.id == source.id)
+        .values(config_json=ScraperSource.config_json.op("||")(patch))
+        .returning(ScraperSource.config_json)
+    )
+    merged = (await db.execute(stmt)).scalar_one()
+    set_committed_value(source, "config_json", dict(merged or {}))
+    return dict(merged or {})
+
+
 # --------------------------------------------------------------------------- slot manager
 class SessionManager:
     def __init__(self, db: AsyncSession, source: ScraperSource):
@@ -256,8 +278,7 @@ class SessionManager:
                     return s
         for s in slots:
             if s.state == "ACTIVE":
-                cfg["current_slot"] = s.slot_number
-                self.source.config_json = cfg
+                await merge_source_config(self.db, self.source, {"current_slot": s.slot_number})
                 return s
         return None
 
@@ -268,10 +289,7 @@ class SessionManager:
         return None
 
     async def switch_current(self, slot_number: int, reason: str) -> None:
-        cfg = dict(self.source.config_json or {})
-        cfg["current_slot"] = slot_number
-        cfg["current_slot_reason"] = reason
-        self.source.config_json = cfg
+        await merge_source_config(self.db, self.source, {"current_slot": slot_number, "current_slot_reason": reason})
         await self.db.flush()
 
     # ---------------------------------------------------------------- storage state
@@ -285,12 +303,28 @@ class SessionManager:
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
+        await self._resume_source_if_paused()
+        await self.db.flush()
+        await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active (login by {by})", source_name=self.source.source_name)
+        return s
+
+    async def _resume_source_if_paused(self) -> None:
         if self.source.state == "PAUSED":
             self.source.state = "ACTIVE"
             self.source.state_reason = None
             self.source.state_changed_at = datetime.now(timezone.utc)
+            self.source.next_scrape_at = datetime.now(timezone.utc)
+
+    async def reactivate_slot(self, slot_number: int, reason: str, *, by: str = "recovery") -> BrowserSessionSlot:
+        """A slot the site had bounced turns out to hold a live session after a cool-down (the site
+        throttled the account rather than ending the login): put it back into rotation."""
+        s = await self.slot(slot_number)
+        s.state = "ACTIVE"
+        s.state_reason = reason[:1000]
+        s.last_verified_at = datetime.now(timezone.utc)
+        await self._resume_source_if_paused()
         await self.db.flush()
-        await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active after human login", source_name=self.source.source_name)
+        await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active again: {reason} ({by})", source_name=self.source.source_name)
         return s
 
     def load_storage_state(self, slot: BrowserSessionSlot) -> Dict[str, Any]:

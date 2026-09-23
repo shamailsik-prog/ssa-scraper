@@ -346,3 +346,61 @@ async def test_dispatch_due_sources_does_not_queue_second_job_on_single_slot(db,
     result = await dispatch_due_sources()
     assert result["queued"] == []
     assert queued == []
+
+
+async def _prepare_pls_due(db, slots):
+    now = datetime.now(timezone.utc)
+    sources = (await db.execute(select(ScraperSource))).scalars().all()
+    for source in sources:
+        source.next_scrape_at = now + timedelta(hours=1)
+    target = next((s for s in sources if s.source_name == "PakistanLawSite"), None)
+    target.next_scrape_at = now - timedelta(minutes=1)
+    target.state = "ACTIVE"
+    target.is_active = True
+    await _activate_pls_slots(db, slots)
+    return target
+
+
+async def test_dispatch_starts_only_the_missing_shard_when_one_shard_is_running(db, monkeypatch):
+    """Slot 2 recovered while shard 0 still runs on slot 1: only shard 1 is started, never a second
+    browser for shard 0."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.tasks.celery_app import app
+
+    target = await _prepare_pls_due(db, (1, 2))
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="one shard running")
+    db.add(
+        ScraperJob(
+            source_id=target.id,
+            source_name=target.source_name,
+            job_type="scrape",
+            status="running",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            result_summary={"reporter_shard": 0, "pages_charged": 12},
+        )
+    )
+    await db.commit()
+    queued = []
+    monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append((kwargs or {}).get("reporter_shard")))
+    result = await dispatch_due_sources()
+    assert result["queued"] == ["PakistanLawSite:shard1"] and queued == [1]
+
+
+async def test_dispatch_starts_nothing_beside_a_running_unsharded_job(db, monkeypatch):
+    """An unsharded job may fail over to any ACTIVE slot, so no shard is started while it runs,
+    even after the second slot comes back."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.tasks.celery_app import app
+
+    target = await _prepare_pls_due(db, (1, 2))
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="unsharded running")
+    db.add(ScraperJob(source_id=target.id, source_name=target.source_name, job_type="scrape", status="running", started_at=datetime.now(timezone.utc) - timedelta(minutes=5), result_summary={"reporter_shard": None}))
+    await db.commit()
+    queued = []
+    monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append(name))
+    result = await dispatch_due_sources()
+    assert result["queued"] == [] and queued == []

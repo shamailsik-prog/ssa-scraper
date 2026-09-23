@@ -112,11 +112,18 @@ Re-running the same command later (with the token lines again while private) upd
 5. **Sources**: public courts, PakistanCode, the legislatures and the Gazette run on their own
    schedule. The Supreme Court website's robots.txt disallows its judgment path; that source halts
    for your review as the contract requires.
-6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for full-speed initial harvest.
+6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for the initial harvest (paced at
+   6-9 s between PakistanLawSite fetches and 450 pages per hour: the site ends a login after roughly
+   500-600 page views in an hour, and a self-imposed pause costs nothing while a lost login needs a human).
    Backfill defaults are controlled by environment values such as:
    `BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`, `BACKFILL_LOGIN_DELAY_MIN/MAX`,
    `BACKFILL_SOURCE_FREQUENCY_MINUTES`, `BACKFILL_LOGIN_SESSION_CONCURRENCY`,
    `BACKFILL_PLS_CITATION_GRID_MAX_DETAIL` and `BACKFILL_PLS_RUN_MAX_MINUTES`.
+   Log in on **both** slots (slot 1 and slot 2) and keep `LOGIN_SESSION_CONCURRENCY=2`: the two
+   reporter shards then run in parallel, one browser per login, each under its own 450-page hourly
+   budget. A slot the site bounces is re-verified after 15 minutes by the `recover-login-slots` task
+   and returns on its own when its session is alive; otherwise the dashboard shows
+   `SLOT_RECOVERY_FAILED` and a human login on that slot restores it.
    Switch to `updates` mode from the dashboard when the corpus is where you want it. Auto-switch
    happens only when `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached.
    After updating an existing server, check `.env` against `.env.example` for the PakistanLawSite

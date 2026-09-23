@@ -36,6 +36,7 @@ from scraper.auth.session_manager import (
     PageResult,
     SessionLock,
     SessionLockHeld,
+    merge_source_config,
     SessionManager,
     playwright_browser_factory,
     raise_for_verdict,
@@ -110,6 +111,12 @@ def citation_grid_cursor_key(reporter_shard: Optional[int]) -> str:
     if reporter_shard in (0, 1):
         return f"citation_grid_cursor_shard_{reporter_shard}"
     return "citation_grid_cursor"
+
+
+def pacing_key(slot_number: int) -> str:
+    """config_json key of one slot's page counters. The site's quota is per account (per login), so
+    the budgets are kept per slot, not per source."""
+    return f"pacing_slot_{int(slot_number or 0)}"
 
 
 class PacingBudgetExceeded(RuntimeError):
@@ -231,6 +238,7 @@ class PakistanLawSitePipeline:
         self.reporter_shard_reporters: List[str] = []
         self._other_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
+        self._slot_lock: Optional[SessionLock] = None
         self._surface_page: Optional[PageResult] = None
         self._surface_page_start_row: Optional[int] = None
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "citation_grid_windows": 0}
@@ -238,13 +246,27 @@ class PakistanLawSitePipeline:
         self.pacing_profile = login_pacing_profile("updates")
 
     # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
+    async def _pacing_slot_number(self) -> int:
+        browser = self.runner.browser
+        if browser is not None:
+            return int(getattr(browser, "slot_number", 0) or 0)
+        if self.runner.preferred_slot_number:
+            return int(self.runner.preferred_slot_number)
+        current = await self.manager.current_slot()
+        return int(current.slot_number) if current is not None else 0
+
     async def _charge_page(self) -> None:
-        """Count one login-session page against the hourly and daily budgets, then pace."""
+        """Count one login-session page against the hourly and daily budgets of the slot in use,
+        then pace. Counters are per slot (the site's quota is per account) and are merged into the
+        source row atomically, so a shard on the other slot never overwrites them."""
         if self._session_lock is not None:
             await self._session_lock.refresh()
+        if self._slot_lock is not None:
+            await self._slot_lock.refresh()
         now = datetime.now(timezone.utc)
+        key = pacing_key(await self._pacing_slot_number())
         cfg = dict(self.source.config_json or {})
-        pacing = dict(cfg.get("pacing") or {})
+        pacing = dict(cfg.get(key) or {})
         hour_key = now.strftime("%Y-%m-%dT%H")
         day_key = now.strftime("%Y-%m-%d")
         if pacing.get("hour") != hour_key:
@@ -253,17 +275,16 @@ class PakistanLawSitePipeline:
             pacing["day"], pacing["day_pages"] = day_key, 0
         pacing["hour_pages"] = int(pacing.get("hour_pages", 0)) + 1
         pacing["day_pages"] = int(pacing.get("day_pages", 0)) + 1
-        cfg["pacing"] = pacing
-        self.source.config_json = cfg
+        await merge_source_config(self.db, self.source, {key: pacing})
         self.stats["pages_charged"] += 1
         await self._heartbeat_job()
         await self.db.flush()
         pages_per_day = int(self.pacing_profile["pages_per_day"])
         pages_per_hour = int(self.pacing_profile["pages_per_hour"])
         if pacing["day_pages"] > pages_per_day:
-            raise PacingBudgetExceeded(f"PAGES_PER_DAY={pages_per_day} spent for {day_key}")
+            raise PacingBudgetExceeded(f"PAGES_PER_DAY={pages_per_day} spent for {day_key} on {key}")
         if pacing["hour_pages"] > pages_per_hour:
-            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={pages_per_hour} spent for {hour_key}")
+            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={pages_per_hour} spent for {hour_key} on {key}")
         await self.sleep(random.uniform(float(self.pacing_profile["login_delay_min"]), float(self.pacing_profile["login_delay_max"])))
 
     async def _heartbeat_job(self) -> None:
@@ -705,11 +726,11 @@ class PakistanLawSitePipeline:
             if total_rows > 0 and next_offset < start_offset:
                 cursor["wrapped_at"] = cursor["updated_at"]
                 cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
-            latest_cfg = dict(self.source.config_json or {})
-            latest_cfg[cursor_key] = cursor
+            patch = {cursor_key: cursor}
             if cursor_key == "citation_grid_cursor" or self.reporter_shard is None:
-                latest_cfg["citation_grid_cursor"] = cursor
-            self.source.config_json = latest_cfg
+                patch["citation_grid_cursor"] = cursor
+            # Atomic top-level merge: the other shard's cursor and counters are never overwritten.
+            await merge_source_config(self.db, self.source, patch)
             self.stats["citation_grid_next_offset"] = next_offset
             self.stats["known_citation_skips"] = known_citation_skips
             self.stats["staged_citation_skips"] = staged_citation_skips
@@ -1189,6 +1210,20 @@ class PakistanLawSitePipeline:
                 await self.manager.pause_source("no ACTIVE slot: human login required")
                 self.stats["paused"] = True
                 return self.stats
+            # One browser per login, enforced where it matters: an exclusive lock on the slot itself.
+            slot_lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", self.redis_client, max_holders=1)
+            try:
+                await slot_lock.acquire()
+            except SessionLockHeld:
+                self.stats["skipped"] = "slot_in_use"
+                self.stats["slot"] = slot.slot_number
+                logger.info(
+                    "PakistanLawSite: slot %s is in use by another login-session worker; not opening a second browser on it",
+                    slot.slot_number,
+                )
+                return self.stats
+            self._slot_lock = slot_lock
+            self.stats["slot"] = slot.slot_number
             grid_start_row = self._citation_grid_cursor()[2]
             search_map = await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             if self._is_citation_grid_map(search_map):
@@ -1285,6 +1320,11 @@ class PakistanLawSitePipeline:
             except Exception as exc:
                 logger.warning("PakistanLawSite: could not persist the live session at run end: %s", exc)
             await self.runner.close()
+            if self._slot_lock is not None:
+                try:
+                    await self._slot_lock.release()
+                finally:
+                    self._slot_lock = None
             await lock.release()
 
 

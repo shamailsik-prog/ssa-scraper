@@ -182,9 +182,17 @@ for line in example.splitlines():
         continue
     s += ("" if s.endswith("\n") else "\n") + line + "\n"
     added.append(m.group(1))
-# Values an earlier release wrote that are known to throttle the harvest. Only the exact old defaults
-# are replaced; a value the operator changed on purpose is left alone.
-stale = {"PLS_CITATION_GRID_MAX_DETAIL": ("40", "120"), "PLS_ARCHIVED_GRID_MAX_ROWS": ("200", "400")}
+# Values an earlier release wrote that are known to throttle the harvest or to cost the human login
+# (0.4-1.0s backfill pacing made PakistanLawSite end the session after ~500 pages). Only the exact
+# old defaults are replaced; a value the operator changed on purpose is left alone.
+stale = {
+    "PLS_CITATION_GRID_MAX_DETAIL": ("40", "120"),
+    "PLS_ARCHIVED_GRID_MAX_ROWS": ("200", "400"),
+    "BACKFILL_LOGIN_DELAY_MIN": ("0.4", "6"),
+    "BACKFILL_LOGIN_DELAY_MAX": ("1.0", "9"),
+    "BACKFILL_PAGES_PER_HOUR": ("10000", "450"),
+    "LOGIN_SESSION_CONCURRENCY": ("1", "2"),
+}
 migrated = []
 for key, (old_value, new_value) in stale.items():
     s, n = re.subn(rf"^{key}={old_value}\s*$", f"{key}={new_value}", s, flags=re.M)
