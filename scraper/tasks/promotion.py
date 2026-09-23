@@ -1178,7 +1178,22 @@ async def reconcile_instrument_relations(
                 InstrumentSectionRelation.target_statute_section_id.is_(None),
             )
         )
-        filters = (or_(base_recent_filter, unresolved_section_backfill_filter),)
+        # PakistanCode amendment and ordinance documents can arrive before the
+        # instrument that they reference.  There is no persisted row for a
+        # relation that failed closed at promotion time, so a time-window-only
+        # scan would never revisit that older source. Keep this active public
+        # statute track eligible for the bounded round-robin reconcile pass.
+        pakistancode_late_target_filter = and_(
+            Instrument.source_name == "PakistanCode",
+            or_(Instrument.citation_mentions.isnot(None), Instrument.statute_mentions.isnot(None)),
+        )
+        filters = (
+            or_(
+                base_recent_filter,
+                unresolved_section_backfill_filter,
+                pakistancode_late_target_filter,
+            ),
+        )
         total = (
             await db.execute(
                 select(func.count()).select_from(Instrument).where(*filters)

@@ -2118,6 +2118,103 @@ async def test_instrument_relation_reconcile_backfills_late_resolved_targets(db)
     assert amended[0].target_instrument_id == target_instrument.id
 
 
+async def test_pakistancode_relation_reconcile_backfills_old_source_after_late_target(db):
+    source = (
+        await db.execute(
+            select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"),
+        )
+    ).scalars().first()
+    assert source is not None
+
+    async def _promote(
+        text: str,
+        url: str,
+        *,
+        instrument_type: str,
+        number: str,
+        citation_mentions: list[dict],
+    ) -> Instrument:
+        prov = await record_provenance(
+            db,
+            source=source,
+            url=url,
+            content=text.encode("utf-8"),
+            content_kind="text",
+        )
+        staging = await stage_statute(
+            db,
+            source=source,
+            prov=prov,
+            raw_html=None,
+            raw_text=text,
+            url=url,
+            kind="instrument",
+        )
+        staging.status = "extracted"
+        staging.reconciled_json = {
+            "type": instrument_type,
+            "number": number,
+            "full_text": text,
+            "citation_mentions": citation_mentions,
+            "statute_mentions": [],
+        }
+        assert await promote_statute_staging(db, staging) == "promoted"
+        return (
+            await db.execute(select(Instrument).where(Instrument.id == staging.promoted_to_id))
+        ).scalars().first()
+
+    target_reference = "Ordinance No. XII of 2025"
+    source_text = f"This Act stands superseded by {target_reference}."
+    source_instrument = await _promote(
+        source_text,
+        "http://127.0.0.1/pakistancode-old-source.pdf",
+        instrument_type="act",
+        number="Act No. XI of 2025",
+        citation_mentions=[
+            {
+                "raw": target_reference,
+                "normalized": target_reference,
+                "mention_type": "ordinance_no",
+                "number": "XII",
+                "year": 2025,
+                "span": [
+                    source_text.index(target_reference),
+                    source_text.index(target_reference) + len(target_reference),
+                ],
+            }
+        ],
+    )
+    assert source_instrument is not None
+    await db.execute(
+        update(Instrument)
+        .where(Instrument.id == source_instrument.id)
+        .values(created_at=datetime.now(timezone.utc) - timedelta(days=30))
+    )
+
+    target_instrument = await _promote(
+        target_reference,
+        "http://127.0.0.1/pakistancode-late-target.pdf",
+        instrument_type="ordinance",
+        number=target_reference,
+        citation_mentions=[],
+    )
+    assert target_instrument is not None
+    await db.commit()
+
+    counts = await reconcile_instrument_relations(limit=50, lookback_hours=1)
+    assert counts["processed"] >= 2
+    edges = (
+        await db.execute(
+            select(InstrumentRelation).where(
+                InstrumentRelation.source_instrument_id == source_instrument.id,
+            ),
+        )
+    ).scalars().all()
+    assert len(edges) == 1
+    assert edges[0].relation_type == "superseded_by"
+    assert edges[0].target_instrument_id == target_instrument.id
+
+
 async def test_instrument_section_relation_reconcile_backfills_late_article_and_rule_targets(db):
     source = (
         await db.execute(
