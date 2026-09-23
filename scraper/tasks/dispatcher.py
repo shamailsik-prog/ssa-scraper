@@ -119,9 +119,16 @@ async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[O
     return (active_jobs[0] if active_jobs else None), mutated
 
 
-async def _login_session_max_active(db) -> int:
+async def _login_session_max_active(db, source_name: Optional[str] = None) -> int:
+    """How many login-session jobs may run at once for a source: the pacing profile's target,
+    capped by the number of ACTIVE slots. Each concurrent browser needs its own human login; two
+    browsers on one login share one server-side session and the site ends one of them."""
     mode = await get_harvest_mode(db)
-    return int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
+    target = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
+    if source_name is None or target <= 1:
+        return max(1, target)
+    active_slots = len(await _active_slot_numbers(db, source_name))
+    return max(1, min(target, active_slots))
 
 
 async def _connector_for(source: ScraperSource):
@@ -171,7 +178,7 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
             return {"skipped": "PAUSED", "reason": source.state_reason}
         max_active = 1
         if source.access_method == "login_session":
-            max_active = await _login_session_max_active(db)
+            max_active = await _login_session_max_active(db, source_name)
         existing_jobs, recovered_stale = await _active_running_jobs(
             db,
             source_name,
@@ -286,7 +293,7 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             concurrency = 1
             if s.access_method == "login_session":
-                concurrency = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
+                concurrency = await _login_session_max_active(db, s.source_name)
             running_jobs, _ = await _active_running_jobs(db, s.source_name, now=now, max_active=concurrency)
             if len(running_jobs) >= concurrency:
                 logger.info(
