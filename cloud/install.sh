@@ -109,6 +109,14 @@ if [ -d "$DIR/.git" ]; then
   # .env, state/, raw/ and live/ are untracked and untouched.
   git -C "$DIR" remote set-url origin "$REPO"
   "${GIT[@]}" -C "$DIR" fetch -q origin "$BRANCH"
+  # A file edited by hand on the server would make the checkout abort and leave the old code
+  # running. Set such edits aside in a stash (never deleted, recoverable with `git stash list`)
+  # and say so: the deployed code must be the fetched commit.
+  if [ -n "$(git -C "$DIR" status --porcelain --untracked-files=no)" ]; then
+    log "Local edits found in $DIR (set aside in a git stash, not deployed):"
+    git -C "$DIR" status --porcelain --untracked-files=no | sed 's/^/    /'
+    git -C "$DIR" stash push -q -m "install.sh $(date -u +%Y-%m-%dT%H:%M:%SZ): local edits set aside before deploying $BRANCH"
+  fi
   git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD
 else
   log "Cloning $REPO ($BRANCH) into $DIR"
