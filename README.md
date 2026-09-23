@@ -148,8 +148,10 @@ locally), enter the `ADMIN_API_KEY`, and:
    (PakistanLawSite AI assist), `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` (embeddings) in `.env`
    as the firm decides. Blank values stay conservative.
 2. **Harvest mode** — in *Overview*, keep mode on **backfill** for initial download. This enables the
-   high-throughput pacing profile (`BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`,
-   `BACKFILL_LOGIN_DELAY_MIN/MAX`) and continuous source dispatch. Use **Backfill complete → switch
+   backfill pacing profile (`BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`,
+   `BACKFILL_LOGIN_DELAY_MIN/MAX`; 6-9 s between fetches and 450 pages per hour, because
+   PakistanLawSite ends a login after roughly 500-600 page views in an hour) and continuous
+   source dispatch. Use **Backfill complete → switch
    to updates** to move to the 6-hour updates cadence. Auto-switch fires only when
    `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached with the frontier
    drained; with both at 0 the mode never changes on its own (an empty frontier at first boot used

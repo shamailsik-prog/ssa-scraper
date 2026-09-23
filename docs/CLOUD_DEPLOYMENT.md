@@ -112,7 +112,9 @@ Re-running the same command later (with the token lines again while private) upd
 5. **Sources**: public courts, PakistanCode, the legislatures and the Gazette run on their own
    schedule. The Supreme Court website's robots.txt disallows its judgment path; that source halts
    for your review as the contract requires.
-6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for full-speed initial harvest.
+6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for the initial harvest (paced at
+   6-9 s between PakistanLawSite fetches and 450 pages per hour: the site ends a login after roughly
+   500-600 page views in an hour, and a self-imposed pause costs nothing while a lost login needs a human).
    Backfill defaults are controlled by environment values such as:
    `BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`, `BACKFILL_LOGIN_DELAY_MIN/MAX`,
    `BACKFILL_SOURCE_FREQUENCY_MINUTES`, `BACKFILL_LOGIN_SESSION_CONCURRENCY`,

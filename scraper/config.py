@@ -162,9 +162,18 @@ class Settings(BaseSettings):
         default=0,
         description="Optional backfill completion target; 0 means no statute-count threshold is required.",
     )
-    BACKFILL_LOGIN_DELAY_MIN: float = Field(default=0.4, description="Backfill mode minimum delay between login-session page fetches.")
-    BACKFILL_LOGIN_DELAY_MAX: float = Field(default=1.0, description="Backfill mode maximum delay between login-session page fetches.")
-    BACKFILL_PAGES_PER_HOUR: int = Field(default=10000, description="Backfill mode login-session page budget per hour.")
+    BACKFILL_LOGIN_DELAY_MIN: float = Field(
+        default=6.0,
+        description="Backfill mode minimum delay between login-session page fetches. PakistanLawSite ends a "
+        "login after roughly 500-600 page views in an hour (observed 22-23 Sep 2026: 532 and 373 pages, "
+        "26 and 15 minutes after login, at 0.4-1.0s pacing); 6-9s keeps the account near 380 pages/hour.",
+    )
+    BACKFILL_LOGIN_DELAY_MAX: float = Field(default=9.0, description="Backfill mode maximum delay between login-session page fetches.")
+    BACKFILL_PAGES_PER_HOUR: int = Field(
+        default=450,
+        description="Backfill mode login-session page budget per clock hour: a backstop under the site's observed "
+        "session quota, so the run pauses itself (PacingBudgetExceeded) instead of losing the human login.",
+    )
     BACKFILL_PAGES_PER_DAY: int = Field(default=200000, description="Backfill mode login-session page budget per day.")
     BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(default=2, description="Backfill-mode login-session worker concurrency target.")
     BLOCK_RETRY_COOLDOWN_MINUTES: int = Field(
