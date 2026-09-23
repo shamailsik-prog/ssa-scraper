@@ -299,7 +299,7 @@ class SessionManager:
         s.storage_state_encrypted = settings.encrypt_value(raw)
         s.storage_state_hash = hashlib.sha256(raw.encode()).hexdigest()
         s.state = "ACTIVE"
-        s.state_reason = "human login completed"
+        s.state_reason = "human login completed" if by not in ("auto-recovery", "recovery") else f"login completed by {by} with the saved credentials"
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at

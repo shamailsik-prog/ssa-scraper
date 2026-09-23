@@ -113,6 +113,58 @@ async def _active_running_jobs(
     return active_jobs, mutated
 
 
+async def retire_orphaned_login_jobs(*, reason: str = "login-session worker started", redis_client=None) -> int:
+    """Called when the login-session worker boots. Every login-session job still recorded as
+    running belonged to the previous worker process (a deploy or crash ended it mid-run), because
+    only this worker runs that queue; retire the rows now instead of leaving the source blocked for
+    RUNNING_JOB_HEARTBEAT_STALE_AFTER, and drop the Redis session locks those jobs held (they
+    expire only after LOCK_TTL_SECONDS, an hour, during which every new job skips as
+    "lock held"). The grid cursor is committed per row, so the next job resumes where the dead one
+    stopped."""
+    from scraper.auth.session_manager import LOCK_KEY
+
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(ScraperJob)
+                .join(ScraperSource, ScraperSource.id == ScraperJob.source_id)
+                .where(ScraperSource.access_method == "login_session", ScraperJob.status == "running")
+            )
+        ).scalars().all()
+        for job in rows:
+            job.status = "failed"
+            job.finished_at = now
+            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); retired at worker start."
+            logger.warning("Retired orphaned login-session job source=%s job_id=%s", job.source_name, job.id)
+        await db.commit()
+        source_names = (
+            await db.execute(select(ScraperSource.source_name).where(ScraperSource.access_method == "login_session"))
+        ).scalars().all()
+    # The locks of the dead processes: only this worker takes them, so none can be live now.
+    keys: list[str] = []
+    for name in source_names:
+        base = LOCK_KEY.format(source=name)
+        keys += [base, f"{base}:holders", f"{base}:slot1", f"{base}:slot2"]
+    if keys:
+        own_client = redis_client is None
+        if own_client:
+            import redis.asyncio as aioredis
+
+            redis_client = aioredis.from_url(settings.REDIS_URL)
+        try:
+            dropped = int(await redis_client.delete(*keys) or 0)
+            if dropped:
+                logger.warning("Dropped %s stale login-session lock key(s) at worker start", dropped)
+        finally:
+            if own_client:
+                try:
+                    await redis_client.aclose()
+                except Exception:
+                    pass
+    return len(rows)
+
+
 async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
     """Return the newest live running job while retiring stale/zombie running rows."""
     active_jobs, mutated = await _active_running_jobs(db, source_name, now=now, max_active=1)

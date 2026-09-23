@@ -404,3 +404,34 @@ async def test_dispatch_starts_nothing_beside_a_running_unsharded_job(db, monkey
     monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append(name))
     result = await dispatch_due_sources()
     assert result["queued"] == [] and queued == []
+
+
+async def test_worker_start_retires_orphaned_login_session_jobs(db):
+    """A deploy recreates the login-session worker while a job runs; the row must not block the
+    source for the heartbeat cut-off. Public-source jobs (other workers) are left alone."""
+    now = datetime.now(timezone.utc)
+    pls = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    pub = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))).scalars().first()
+    dead = ScraperJob(source_id=pls.id, source_name=pls.source_name, job_type="scrape", status="running", started_at=now - timedelta(minutes=3))
+    alive_public = ScraperJob(source_id=pub.id, source_name=pub.source_name, job_type="scrape", status="running", started_at=now - timedelta(minutes=3))
+    db.add_all([dead, alive_public])
+    await db.commit()
+    import redis.asyncio as aioredis
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    base = "corpus:login_session_lock:PakistanLawSite"
+    await r.set(base, "dead-token", ex=3600)
+    await r.sadd(f"{base}:holders", "dead-token")
+    await r.set(f"{base}:slot1", "dead-token", ex=3600)
+    await r.set("corpus:login_session_lock:Other", "keep", ex=60)
+    try:
+        assert await dispatcher.retire_orphaned_login_jobs(redis_client=r) == 1
+        assert await r.exists(base, f"{base}:holders", f"{base}:slot1") == 0  # the dead jobs' locks are gone
+        assert await r.exists("corpus:login_session_lock:Other") == 1  # unrelated keys untouched
+    finally:
+        await r.delete("corpus:login_session_lock:Other")
+        await r.aclose()
+    async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as fresh:
+        rows = {j.source_name: j for j in (await fresh.execute(select(ScraperJob))).scalars().all()}
+        assert rows["PakistanLawSite"].status == "failed" and "worker started" in rows["PakistanLawSite"].error_message
+        assert rows["PakistanCode"].status == "running"

@@ -149,9 +149,10 @@ class Settings(BaseSettings):
     LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker processes (1-2). With two ACTIVE slots (two logins) and 2, the reporter shards run in parallel, one per login.")
     LOGIN_AUTO_RECOVER: bool = Field(
         default=True,
-        description="Re-verify a bounced login slot without a human: LOGIN_RECOVERY_COOLDOWN_MINUTES after the site "
-        "redirected a slot to its login page, open the stored session again and, if the search page renders, put the slot "
-        "back into rotation. No credentials are submitted by code; a dead login is re-established from the dashboard.",
+        description="Recover a lost login slot without a human: LOGIN_RECOVERY_COOLDOWN_MINUTES after the site bounced a "
+        "slot, re-open the stored session and put the slot back if the search page renders; if it is dead, sign in again "
+        "with the credentials the operator saved for the slot and store the new session. Verification/CAPTCHA pages are "
+        "never solved: the slot then waits for a human.",
     )
     LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
     LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
