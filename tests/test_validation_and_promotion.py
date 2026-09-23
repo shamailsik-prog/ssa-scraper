@@ -29,6 +29,7 @@ from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import (
     _pending_judgment_staging,
+    _pending_statute_staging_query,
     promote_judgment_staging,
     promote_statute_staging,
     reconcile_citation_statute_residual_smoke,
@@ -3002,3 +3003,68 @@ async def test_embedding_identity_mismatch_refuses(db, monkeypatch):
     monkeypatch.setattr(settings, "OPENAI_API_KEY", None)
     counts = await process_embedding_queue()
     assert counts["refused"] == 1
+
+
+def test_long_password_form_without_subscription_marker_dominates():
+    prose = "Enter your registered e-mail address and account password to sign in to the service. " * 20
+    html = (
+        "<html><body><form action='/login/check' method='post'>"
+        f"<p>{prose}</p>"
+        "<input type='text' name='email'><input type='password' name='pwd'>"
+        "</form></body></html>"
+    )
+    assert _has_case_content(raw_text=prose, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=prose, raw_html=html) == "password_input"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=prose,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+
+
+def test_password_input_on_structured_judgment_is_not_dominant():
+    body = (
+        "IN THE SUPREME COURT OF PAKISTAN\n"
+        "Before Qazi Faez Isa, CJ\n"
+        "Muhammad Aslam versus The State\n"
+        "JUDGMENT\n"
+        + ("The appellant was convicted under section 302 PPC and the appeal is heard on merits. " * 20)
+    )
+    html = (
+        "<html><body><header><form><input type='password' name='pwd'></form></header>"
+        f"<main><pre>{body}</pre></main></body></html>"
+    )
+    assert login_subscription_chrome_dominates(raw_text=body, raw_html=html) is None
+
+
+def test_marker_share_uses_compact_marker_length():
+    spaced = "Update      Subscriber"
+    padding = "x" * 70
+    # 16 compact marker chars / 86 compact total is below the 25% dominance ratio;
+    # counting the raw whitespace would push it over.
+    text = f"{spaced} {padding}"
+    from scraper.extractors.judgment_guards import _MARKER_DOMINANCE_RATIO, _compact_len, _marker_hits
+
+    hits = _marker_hits(text)
+    assert hits == [("update_subscriber", _compact_len(spaced))]
+    assert hits[0][1] / _compact_len(text) < _MARKER_DOMINANCE_RATIO
+
+
+async def test_statute_promote_query_honours_source_pin(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    url = "http://127.0.0.1/pakistancode-pin.txt"
+    prov = await record_provenance(db, source=source, url=url, content=b"pin", content_kind="text")
+    st = await stage_statute(db, source=source, prov=prov, raw_html=None, raw_text="Section 1. Pin", url=url, kind="statute")
+    st.status = "extracted"
+    await db.flush()
+
+    pinned = (await db.execute(_pending_statute_staging_query(limit=50, source_name="PakistanLawSite"))).scalars().all()
+    assert st.id not in {row.id for row in pinned}
+    own = (await db.execute(_pending_statute_staging_query(limit=50, source_name="PakistanCode"))).scalars().all()
+    assert st.id in {row.id for row in own}
+    unpinned = (await db.execute(_pending_statute_staging_query(limit=50))).scalars().all()
+    assert st.id in {row.id for row in unpinned}

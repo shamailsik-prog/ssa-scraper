@@ -161,7 +161,8 @@ def _marker_hits(visible: str) -> list[tuple[str, int]]:
     hits: list[tuple[str, int]] = []
     for marker_name, marker_re in _SUBSCRIPTION_CHROME_MARKERS + _LOGIN_SURFACE_BODY_MARKERS:
         for match in marker_re.finditer(visible):
-            hits.append((marker_name, match.end() - match.start()))
+            # Compact length, same unit as the whitespace-stripped total.
+            hits.append((marker_name, _compact_len(match.group(0))))
     return hits
 
 
@@ -191,11 +192,11 @@ def login_subscription_chrome_dominates(
         return first_marker
     if marker_share >= _MARKER_DOMINANCE_RATIO:
         return first_marker
-    if (
-        hits
-        and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS
-        and not any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
-    ):
+    structured = any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
+    if hits and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS and not structured:
+        return first_marker
+    # A password form with no judgment structure is a login page at any length.
+    if has_password and not structured:
         return first_marker
     return None
 
