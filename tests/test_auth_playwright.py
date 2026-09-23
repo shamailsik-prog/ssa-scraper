@@ -1238,6 +1238,7 @@ async def test_pipeline_citation_grid_shard_fetches_only_its_reporters(db, login
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 3)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     rows = [
         ("PLD 2024 SC 601", "PLD one", "Supreme Court", "https://www.pakistanlawsite.com/case/601"),
@@ -1575,6 +1576,7 @@ async def test_pipeline_citation_grid_skip_known_still_advances_dom_absolute_cur
     # advances 200 → 202 without fetching the known row.
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 2)
     monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     login_source.config_json = {
         **(login_source.config_json or {}),
@@ -1631,6 +1633,7 @@ async def test_pipeline_citation_grid_refetches_incomplete_known_citation(db, lo
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 2)
     monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     login_source.config_json = {
         **(login_source.config_json or {}),
@@ -1754,6 +1757,7 @@ async def test_pipeline_citation_grid_shard0_is_catch_all_and_shard1_takes_its_r
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 5)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source, slots=(1, 2))
     rows = [
         ("PLD 2024 SC 611", "PLD", "Supreme Court", "https://www.pakistanlawsite.com/case/611"),
@@ -1866,6 +1870,9 @@ async def test_pipeline_citation_grid_pacing_budget_ends_run_cleanly(db, login_s
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PAGES_PER_HOUR", 2)
     monkeypatch.setattr(settings, "PAGES_PER_DAY", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
+    monkeypatch.setattr(settings, "BACKFILL_PAGES_PER_HOUR", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PAGES_PER_DAY", 2)
     await _activate(db, login_source)
     rows = [
         ("PLD 2024 SC 3001", "Case 3001", "Supreme Court", "https://www.pakistanlawsite.com/case/3001"),
