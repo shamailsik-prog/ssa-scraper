@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
+from celery.signals import worker_ready
 
 from scraper.config import settings
 
@@ -89,3 +90,22 @@ if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
         },
     }
 logger.info("Celery configured: queues scraper/login_session/embeddings/maintenance; beat %s", list(app.conf.beat_schedule))
+
+
+@worker_ready.connect
+def _retire_orphaned_login_jobs_at_start(sender=None, **_kwargs) -> None:
+    """The login-session worker is the only process that runs login-session jobs: any job still
+    recorded as running when it boots died with the previous container (deploy, crash). Retire
+    those rows at once so the dispatcher can start the next job instead of waiting for the
+    heartbeat cut-off."""
+    hostname = str(getattr(sender, "hostname", "") or "")
+    if not hostname.startswith("scraper-login@"):
+        return
+    from scraper.database import run_async
+    from scraper.tasks.dispatcher import retire_orphaned_login_jobs
+
+    try:
+        retired = run_async(retire_orphaned_login_jobs())
+        logger.info("login-session worker start: retired %s orphaned running job(s)", retired)
+    except Exception as exc:  # never keep the worker from starting
+        logger.warning("could not retire orphaned login-session jobs at start: %s", exc)

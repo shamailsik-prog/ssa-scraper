@@ -113,6 +113,30 @@ async def _active_running_jobs(
     return active_jobs, mutated
 
 
+async def retire_orphaned_login_jobs(*, reason: str = "login-session worker started") -> int:
+    """Called when the login-session worker boots. Every login-session job still recorded as
+    running belonged to the previous worker process (a deploy or crash ended it mid-run), because
+    only this worker runs that queue; retire the rows now instead of leaving the source blocked for
+    RUNNING_JOB_HEARTBEAT_STALE_AFTER. The grid cursor is committed per row, so the next job resumes
+    where the dead one stopped."""
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(ScraperJob)
+                .join(ScraperSource, ScraperSource.id == ScraperJob.source_id)
+                .where(ScraperSource.access_method == "login_session", ScraperJob.status == "running")
+            )
+        ).scalars().all()
+        for job in rows:
+            job.status = "failed"
+            job.finished_at = now
+            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); retired at worker start."
+            logger.warning("Retired orphaned login-session job source=%s job_id=%s", job.source_name, job.id)
+        await db.commit()
+        return len(rows)
+
+
 async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
     """Return the newest live running job while retiring stale/zombie running rows."""
     active_jobs, mutated = await _active_running_jobs(db, source_name, now=now, max_active=1)
