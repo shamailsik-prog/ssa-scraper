@@ -270,6 +270,29 @@ EOF
   ACCESS_URL="https://${PUBLIC_IP}/dashboard   (self-signed certificate: accept the browser warning once)"
 fi
 
+# ---------------------------------------------------------------- server-side automation outside the repository
+# The service re-verifies and re-establishes its own logins (recover-login-slots) and Beat
+# dispatches its own jobs. Cron entries found on the server that log in to PakistanLawSite or
+# dispatch jobs from outside the compose stack fight the service: every extra login ends the
+# session the worker is using (the site allows one live session per account), which is what made
+# the harvest lose its login every 30 minutes on 23 September 2026. They are not part of this
+# repository. The root crontab is backed up to state/ before the lines are removed, and any
+# running dispatch loop is stopped.
+log "Checking for server-side automation outside the repository"
+CRON_NOW="$(crontab -l 2>/dev/null || true)"
+if printf '%s\n' "$CRON_NOW" | grep -Eq 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory'; then
+  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '%s\n' "$CRON_NOW" > "state/crontab.backup.$STAMP"
+  chmod 600 "state/crontab.backup.$STAMP"
+  log "Removing cron entries that log in or dispatch outside the service (backup: state/crontab.backup.$STAMP):"
+  printf '%s\n' "$CRON_NOW" | grep -E 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory' | sed 's/^/    /'
+  printf '%s\n' "$CRON_NOW" | grep -Ev 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory' | crontab - || crontab -r || true
+fi
+if pgrep -f 'backfill_dispatch_loop|pls_keepalive' >/dev/null 2>&1; then
+  log "Stopping dispatch/keepalive loop processes running outside the service"
+  pkill -f 'backfill_dispatch_loop|pls_keepalive' || true
+fi
+
 # ---------------------------------------------------------------- firewall
 if [ "$SKIP_FIREWALL" = 0 ] && command -v ufw >/dev/null 2>&1; then
   log "Firewall: allow SSH, 80, 443 only"
