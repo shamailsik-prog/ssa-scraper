@@ -171,6 +171,33 @@ def _archived_grid_html(rows):
     )
 
 
+def _archived_grid_seek_result(rows, browser, *, seek_mode="dom_absolute") -> PageResult:
+    """Confirmed live seek: slice the compact window at archived_grid_start_row.
+
+    Fail-closed harvest refuses a non-zero cursor when seek_mode is unconfirmed
+    or the snapshot starts at 0. Tests that resume a cursor must look like the
+    live #archivedpatientGrid path (dom_absolute + matching start_row).
+    """
+    start = 0
+    if browser.calls:
+        last = browser.calls[-1]
+        if last and last[0] == "goto" and len(last) > 3 and isinstance(last[3], dict):
+            start = max(0, int(last[3].get("archived_grid_start_row", 0) or 0))
+    window = rows[start:]
+    return PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=_archived_grid_html(window),
+        status=200,
+        metadata={
+            "total_rows": len(rows),
+            "start_row": start,
+            "requested_start_row": start,
+            "seek_mode": seek_mode,
+            "content_guard": "archivedpatientGrid_compact",
+        },
+    )
+
+
 def _notes_only_detail_html(citation: str, title: str) -> str:
     return (
         "<html><body><a href='/logout'>Logout</a>"
@@ -1283,7 +1310,7 @@ async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_sou
         ("PLD 2024 SC 405", "Case 405", "Supreme Court", "https://www.pakistanlawsite.com/case/405"),
     ]
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda browser: _archived_grid_seek_result(rows, browser)
     for citation, title, _court, detail_url in rows:
         sc.page(("goto", detail_url), judgment_html(citation, title=title))
     r = aioredis.from_url(settings.REDIS_URL)
@@ -1632,6 +1659,7 @@ async def test_pipeline_citation_grid_refetches_incomplete_known_citation(db, lo
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 2)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_SCAN_WINDOW", 2)
     monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 2)
     monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
@@ -1694,7 +1722,7 @@ async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_e
         ("PLD 2024 SC 704", "Case 704", "Supreme Court", "https://www.pakistanlawsite.com/case/704"),
     ]
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda browser: _archived_grid_seek_result(rows, browser)
     for citation, title, _court, detail_url in rows:
         sc.page(("goto", detail_url), judgment_html(citation, title=title))
     r = aioredis.from_url(settings.REDIS_URL)
@@ -2077,7 +2105,7 @@ async def test_pipeline_citation_grid_cursor_wraps_at_end(db, login_source, monk
         ("PLD 2024 SC 503", "Case 503", "Supreme Court", "https://www.pakistanlawsite.com/case/503"),
     ]
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda browser: _archived_grid_seek_result(rows, browser)
     for citation, title, _court, detail_url in rows:
         sc.page(("goto", detail_url), judgment_html(citation, title=title))
     r = aioredis.from_url(settings.REDIS_URL)
