@@ -133,6 +133,8 @@ async def sign_in_with_saved_credentials(
         autofill = dict(sess.last_autofill or {})
         if not autofill.get("submitted"):
             state = await sess.is_authenticated()
+            if state.get("verdict") == "block":
+                return {"stored": False, "verdict": "block", "detail": state.get("detail"), "landed": safe_url_for_record(state.get("url") or "")}
             return {
                 "stored": False,
                 "verdict": state.get("verdict", "unknown"),
@@ -142,14 +144,33 @@ async def sign_in_with_saved_credentials(
         await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
         check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
         landed = safe_url_for_record(check.get("url") or "")
-        if check.get("verdict") == "verification":
-            return {"stored": False, "verdict": "verification", "detail": check.get("detail"), "landed": landed}
+        if check.get("verdict") in ("verification", "block"):
+            return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}
         if not check.get("authenticated"):
             return {"stored": False, "verdict": check.get("verdict", "login"), "detail": check.get("detail"), "landed": landed}
         result = await registry.complete(source_name, manager)
         return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
     finally:
         await registry.cancel(source_name)
+
+
+async def _wait_for_human(db, source, slot, key, record, attempts, now, what: str, outcome: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A verification page is never solved by code: record the attempt, wait two hours before the
+    next automatic one, and ask for a human login."""
+    next_attempt = now + timedelta(minutes=VERIFICATION_BACKOFF_MINUTES)
+    await merge_source_config(
+        db,
+        source,
+        {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "next_attempt_at": _iso(next_attempt), "last_outcome": what}},
+    )
+    await notify(
+        db,
+        level="warning",
+        code="NEEDS_HUMAN_LOGIN",
+        message=f"slot {slot.slot_number}: {what}; it is never solved by code. Log in from the dashboard (next automatic attempt {next_attempt:%H:%M} UTC).",
+        source_name=source.source_name,
+    )
+    return {**(outcome or {"attempt": attempts}), "verification": True, "next_attempt_at": _iso(next_attempt)}
 
 
 async def recover_slot(
@@ -210,12 +231,24 @@ async def recover_slot(
                 await manager.reactivate_slot(slot.slot_number, f"stored session verified after cool-down (attempt {attempts})", by="recovery")
                 await merge_source_config(db, source, {key: {}})
                 return {**outcome, "recovered": "verified"}
+            if check["verdict"] == "verification":
+                # The site wants a human on this session: no credentials are submitted behind it.
+                return await _wait_for_human(db, source, slot, key, record, attempts, now, "verification page when re-opening the stored session")
             reason = f"stored session still bounced by the site ({check.get('verdict')}; landed on {check.get('landed')})"
 
         # 2. Sign in again with the credentials the operator saved for this slot.
         if credentials:
-            relogin = await sign_in_with_saved_credentials(manager, slot, credentials, registry_factory)
+            try:
+                relogin = await sign_in_with_saved_credentials(manager, slot, credentials, registry_factory)
+            except Exception as exc:  # browser launch / navigation failure: count the attempt, back off, never loop every 5 minutes
+                relogin = {"stored": False, "verdict": "error", "detail": str(exc)[:300], "landed": None}
+                logger.warning("sign-in with saved credentials failed for %s slot %s: %s", source.source_name, slot.slot_number, exc)
             outcome["sign_in"] = relogin
+            if relogin.get("verdict") == "block":
+                # An explicit block on the sign-in surface is the one answer that must never be retried.
+                await manager.halt_source(f"explicit block while signing in on slot {slot.slot_number}: {relogin.get('detail')}", slot_number=slot.slot_number)
+                await merge_source_config(db, source, {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "last_outcome": "halted at sign-in"}})
+                return {**outcome, "halted": True}
             if relogin.get("stored"):
                 await merge_source_config(db, source, {key: {}})
                 await notify(
@@ -227,20 +260,7 @@ async def recover_slot(
                 )
                 return {**outcome, "recovered": "signed_in"}
             if relogin.get("verdict") == "verification":
-                next_attempt = now + timedelta(minutes=VERIFICATION_BACKOFF_MINUTES)
-                await merge_source_config(
-                    db,
-                    source,
-                    {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "next_attempt_at": _iso(next_attempt), "last_outcome": "verification page at sign-in"}},
-                )
-                await notify(
-                    db,
-                    level="warning",
-                    code="NEEDS_HUMAN_LOGIN",
-                    message=f"slot {slot.slot_number}: the site shows a verification page at sign-in; it is never solved by code. Log in from the dashboard (next automatic attempt {next_attempt:%H:%M} UTC).",
-                    source_name=source.source_name,
-                )
-                return {**outcome, "verification": True, "next_attempt_at": _iso(next_attempt)}
+                return await _wait_for_human(db, source, slot, key, record, attempts, now, "verification page at sign-in", outcome)
             reason = f"sign-in with the saved credentials did not authenticate ({relogin.get('verdict')}: {relogin.get('detail')}; landed on {relogin.get('landed')})"
         else:
             reason = f"{reason}; no saved credentials for this slot" if reason else "no saved credentials for this slot"

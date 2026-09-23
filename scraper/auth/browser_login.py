@@ -435,9 +435,15 @@ class LoginSessionRegistry:
             sess = LoginSession(source_name=source_name, slot_number=slot_number, login_url=login_url, started_by=started_by)
             if wanted:
                 sess.viewport = wanted
-            await sess.start()
-            if saved_credentials:
-                await sess.apply_saved_credentials(saved_credentials.get("username", ""), saved_credentials.get("password", ""), auto_complete=auto_complete)
+            try:
+                await sess.start()
+                if saved_credentials:
+                    await sess.apply_saved_credentials(saved_credentials.get("username", ""), saved_credentials.get("password", ""), auto_complete=auto_complete)
+            except BaseException:
+                # A browser launched but the login page never came (navigation timeout, lost page):
+                # the session is not registered yet, so close its Playwright objects here or they leak.
+                await sess.close()
+                raise
             self._sessions[source_name] = sess
             return sess
 

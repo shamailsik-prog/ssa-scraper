@@ -230,6 +230,7 @@ class FakeRegistry:
 
 AUTHENTICATED = {"authenticated": True, "verdict": "ok", "detail": "", "url": "https://www.pakistanlawsite.com/Login/CitationSearch"}
 VERIFICATION = {"authenticated": False, "verdict": "verification", "detail": "verify you are human", "url": "https://www.pakistanlawsite.com/Login/Login?x=1"}
+BLOCKED = {"authenticated": False, "verdict": "block", "detail": "HTTP 403", "url": "https://www.pakistanlawsite.com/Login/Login"}
 
 
 async def _save_credentials(db, n, username="firm-user", password="firm-secret"):
@@ -309,8 +310,8 @@ async def test_unattended_sign_in_end_to_end_with_real_browser(db, login_source,
     monkeypatch.setattr(settings, "LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS", 0.5)
     fixture_server.add(
         "/",
-        "<html><body><form id='mainLoginForm' action='/Login/Login'><input name='Login.UserName'>"
-        "<input type='password' name='Login.Password'><button type='submit'>Log in</button></form></body></html>",
+        "<html><body><form id='mainLoginForm' action='/Login/Login' onsubmit=\"document.cookie='submitted='+encodeURIComponent(this['Login.UserName'].value+'/'+this['Login.Password'].value)+'; path=/'\">"
+        "<input name='Login.UserName'><input type='password' name='Login.Password'><button type='submit'>Log in</button></form></body></html>",
     )
     fixture_server.add("/Login/Login", "<html><body>signed in</body></html>")
     # The authenticated page sets the session cookie the slot must end up holding.
@@ -330,4 +331,82 @@ async def test_unattended_sign_in_end_to_end_with_real_browser(db, login_source,
     assert slot.state == "ACTIVE" and slot.logged_in_by == "auto-recovery"
     state = __import__("json").loads(settings.decrypt_value(slot.storage_state_encrypted))
     assert any(c["name"] == "ASP.NET_SessionId" and c["value"] == "e2e" for c in state["cookies"])
+    assert any(c["name"] == "submitted" and c["value"] == "e2e-user%2Fe2e-pass" for c in state["cookies"])  # the saved values were what the form sent
+    assert "login completed by auto-recovery" in slot.state_reason
     assert login_source.state == "ACTIVE"
+
+
+async def test_block_at_sign_in_halts_source_and_slot(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    reg = FakeRegistry(BLOCKED)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert result.get("halted") is True and ("complete", 1) not in reg.log
+    assert login_source.state == "HALTED" and (await _slot(db, 1)).state == "HALTED"
+
+
+async def test_verification_when_reopening_stored_session_waits_for_a_human(db, login_source, monkeypatch):
+    """A CAPTCHA on the stored session means no credentials are submitted behind it."""
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), "<html><body>Please verify you are human</body></html>")
+    reg = FakeRegistry(AUTHENTICATED)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert result.get("verification") is True and reg.log == []
+    assert (await _slot(db, 1)).state == "NEEDS_HUMAN_LOGIN"
+
+
+async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_source, monkeypatch):
+    """A browser that cannot even open the login page must not make the task retry every five
+    minutes: the attempt is recorded and the next one waits."""
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+
+    class ExplodingRegistry(FakeRegistry):
+        async def start(self, *a, **k):
+            raise RuntimeError("navigation timeout")
+
+    reg = ExplodingRegistry(AUTHENTICATED)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert "failed" in result and result["sign_in"]["verdict"] == "error"
+    record = (login_source.config_json or {})[recovery_key(1)]
+    assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
+
+
+async def test_registry_start_closes_browser_when_login_page_fails(monkeypatch):
+    """A half-started login session (Chromium up, login page never loaded) is closed, not leaked."""
+    from scraper.auth import browser_login
+
+    closed = []
+
+    class BrokenSession(browser_login.LoginSession):
+        async def start(self):
+            raise RuntimeError("navigation timeout")
+
+        async def close(self):
+            closed.append(self.slot_number)
+
+    monkeypatch.setattr(browser_login, "LoginSession", BrokenSession)
+    reg = browser_login.LoginSessionRegistry()
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError):
+        await reg.start("PakistanLawSite", 1, "http://127.0.0.1:1/login")
+    assert closed == [1] and reg.get("PakistanLawSite") is None
