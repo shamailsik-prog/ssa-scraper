@@ -210,7 +210,7 @@ class Settings(BaseSettings):
     PLS_CASE_DESCRIPTION_WAIT_SECONDS: float = Field(default=6.0, description="How long to wait for the 'Case Description' control to render on a ReferenceCaseLawSearch page before the page is classified as headnote-only.")
     PROMOTE_PREFERRED_SOURCE: str = Field(
         default="PakistanLawSite",
-        description="Judgment source that reserve a share of each promote batch so oldest-first public rows cannot starve login harvest.",
+        description="Judgment source that reserves a share of each promote batch so oldest-first public rows cannot starve login harvest.",
     )
     PROMOTE_PREFERRED_SHARE: float = Field(
         default=0.5,

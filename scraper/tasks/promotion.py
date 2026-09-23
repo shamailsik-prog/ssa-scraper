@@ -1738,6 +1738,21 @@ async def _pending_judgment_staging(
     return list(preferred_rows) + list(others)
 
 
+def _pending_statute_staging_query(*, limit: int, source_name: Optional[str] = None):
+    """Extracted statute promote work, honouring the same source pin as judgments."""
+    query = (
+        select(StatutesStaging)
+        .where(
+            StatutesStaging.status == "extracted",
+            StatutesStaging.promoted_to_id.is_(None),
+        )
+        .order_by(StatutesStaging.created_at)
+    )
+    if source_name:
+        query = query.where(StatutesStaging.source_name == source_name)
+    return query.limit(max(1, int(limit)))
+
+
 async def promote_staging_records(limit: int = 200, *, source_name: Optional[str] = None) -> Dict[str, int]:
     """Promote every `extracted` staging row (bounded per pass) and make sure every `quarantined` row
     has a review-queue entry.
@@ -1795,7 +1810,7 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
             await _quarantine(db, st, st.quarantine_reason or "below threshold", st.kind)
             counts["statutes_quarantined"] += 1
         await db.commit()
-        srows = (await db.execute(select(StatutesStaging).where(StatutesStaging.status == "extracted", StatutesStaging.promoted_to_id.is_(None)).order_by(StatutesStaging.created_at).limit(limit))).scalars().all()
+        srows = (await db.execute(_pending_statute_staging_query(limit=limit, source_name=source_name))).scalars().all()
         for st in srows:
             try:
                 r = await promote_statute_staging(db, st)
