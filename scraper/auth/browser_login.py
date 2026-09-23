@@ -94,9 +94,11 @@ class LoginSession:
         """Capture the current page as one frame. The screencast only emits when the page repaints,
         so a static page shows nothing to an operator who (re)connects or resizes; this fills that gap."""
         try:
-            shot = await self._cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 60})
+            # A screenshot asked for while the page is navigating (a submitted login form) can wait
+            # on the debug channel indefinitely; bound it, the next real frame follows anyway.
+            shot = await asyncio.wait_for(self._cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 60}), timeout=5.0)
             self._on_frame({"data": shot.get("data"), "metadata": {"deviceWidth": self.viewport["width"], "deviceHeight": self.viewport["height"]}})
-        except Exception as exc:  # page navigating; the next real frame will follow
+        except Exception as exc:  # page navigating or slow; the next real frame will follow
             logger.debug("snapshot skipped: %s", exc)
 
     async def _ack(self, session_id) -> None:
@@ -381,6 +383,14 @@ class LoginSession:
         await self.snapshot()
         return result
 
+    async def settle(self, timeout_ms: Optional[int] = None) -> None:
+        """Let a navigation the page just started (a submitted form) reach DOMContentLoaded, so the
+        next check reads the page the site answered with rather than the one being left."""
+        try:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms or settings.PLAYWRIGHT_TIMEOUT_MS)
+        except Exception as exc:
+            logger.debug("settle: %s", exc)
+
     async def close(self) -> None:
         self.status = "closed"
         for step in (
@@ -392,7 +402,7 @@ class LoginSession:
             try:
                 r = step()
                 if r is not None:
-                    await r
+                    await asyncio.wait_for(r, timeout=15.0)
             except Exception:
                 pass
 

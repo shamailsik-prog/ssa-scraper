@@ -108,6 +108,11 @@ async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlo
     return {"alive": False, "verdict": verdict.kind, "detail": verdict.detail, "landed": landed}
 
 
+def _sign_in_deadline_seconds() -> float:
+    # Three page loads at the Playwright timeout plus the submit wait, then the attempt is abandoned.
+    return 3 * float(settings.PLAYWRIGHT_TIMEOUT_MS) / 1000.0 + float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS) + 30.0
+
+
 async def sign_in_with_saved_credentials(
     manager: SessionManager,
     slot: BrowserSessionSlot,
@@ -118,40 +123,49 @@ async def sign_in_with_saved_credentials(
     resulting session in the slot (the same path the dashboard's *Human login* uses, completed by
     the service instead of a person). Returns {"stored": bool, "verdict": kind, "detail": str}.
     A verification page is reported as verdict "verification", never solved. Credentials are never
-    logged or included in the result."""
+    logged or included in the result. The whole attempt is bounded: a browser that stops answering
+    can never hold the recovery task."""
     source_name = manager.source.source_name
     registry = registry_factory()
     try:
-        sess = await registry.start(
-            source_name,
-            slot.slot_number,
-            settings.PLS_LOGIN_URL if source_name == "PakistanLawSite" else manager.source.source_url,
-            started_by="auto-recovery",
-            saved_credentials=credentials,
-            auto_complete=True,
-        )
-        autofill = dict(sess.last_autofill or {})
-        if not autofill.get("submitted"):
-            state = await sess.is_authenticated()
-            if state.get("verdict") == "block":
-                return {"stored": False, "verdict": "block", "detail": state.get("detail"), "landed": safe_url_for_record(state.get("url") or "")}
-            return {
-                "stored": False,
-                "verdict": state.get("verdict", "unknown"),
-                "detail": "sign-in form not recognised; nothing submitted",
-                "landed": safe_url_for_record(state.get("url") or ""),
-            }
-        await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
-        check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
-        landed = safe_url_for_record(check.get("url") or "")
-        if check.get("verdict") in ("verification", "block"):
-            return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}
-        if not check.get("authenticated"):
-            return {"stored": False, "verdict": check.get("verdict", "login"), "detail": check.get("detail"), "landed": landed}
-        result = await registry.complete(source_name, manager)
-        return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
+        return await asyncio.wait_for(_sign_in(registry, manager, slot, credentials), timeout=_sign_in_deadline_seconds())
     finally:
         await registry.cancel(source_name)
+
+
+async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, credentials: Dict[str, str]) -> Dict[str, Any]:
+    source_name = manager.source.source_name
+    sess = await registry.start(
+        source_name,
+        slot.slot_number,
+        settings.PLS_LOGIN_URL if source_name == "PakistanLawSite" else manager.source.source_url,
+        started_by="auto-recovery",
+        saved_credentials=credentials,
+        auto_complete=True,
+    )
+    autofill = dict(sess.last_autofill or {})
+    if not autofill.get("submitted"):
+        state = await sess.is_authenticated()
+        if state.get("verdict") == "block":
+            return {"stored": False, "verdict": "block", "detail": state.get("detail"), "landed": safe_url_for_record(state.get("url") or "")}
+        return {
+            "stored": False,
+            "verdict": state.get("verdict", "unknown"),
+            "detail": "sign-in form not recognised; nothing submitted",
+            "landed": safe_url_for_record(state.get("url") or ""),
+        }
+    settle = getattr(sess, "settle", None)
+    if callable(settle):
+        await settle()  # the submitted form's navigation reaches the page the site answered with
+    await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
+    check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
+    landed = safe_url_for_record(check.get("url") or "")
+    if check.get("verdict") in ("verification", "block"):
+        return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}
+    if not check.get("authenticated"):
+        return {"stored": False, "verdict": check.get("verdict", "login"), "detail": check.get("detail"), "landed": landed}
+    result = await registry.complete(source_name, manager)
+    return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
 
 
 async def _wait_for_human(db, source, slot, key, record, attempts, now, what: str, outcome: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -159,16 +173,16 @@ async def _wait_for_human(db, source, slot, key, record, attempts, now, what: st
     next automatic one, and ask for a human login."""
     next_attempt = now + timedelta(minutes=VERIFICATION_BACKOFF_MINUTES)
     await merge_source_config(
-        db,
-        source,
-        {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "next_attempt_at": _iso(next_attempt), "last_outcome": what}},
+    db,
+    source,
+    {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "next_attempt_at": _iso(next_attempt), "last_outcome": what}},
     )
     await notify(
-        db,
-        level="warning",
-        code="NEEDS_HUMAN_LOGIN",
-        message=f"slot {slot.slot_number}: {what}; it is never solved by code. Log in from the dashboard (next automatic attempt {next_attempt:%H:%M} UTC).",
-        source_name=source.source_name,
+    db,
+    level="warning",
+    code="NEEDS_HUMAN_LOGIN",
+    message=f"slot {slot.slot_number}: {what}; it is never solved by code. Log in from the dashboard (next automatic attempt {next_attempt:%H:%M} UTC).",
+    source_name=source.source_name,
     )
     return {**(outcome or {"attempt": attempts}), "verification": True, "next_attempt_at": _iso(next_attempt)}
 
