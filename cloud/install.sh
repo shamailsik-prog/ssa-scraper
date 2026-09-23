@@ -115,7 +115,12 @@ if [ -d "$DIR/.git" ]; then
   if [ -n "$(git -C "$DIR" status --porcelain --untracked-files=no)" ]; then
     log "Local edits found in $DIR (set aside in a git stash, not deployed):"
     git -C "$DIR" status --porcelain --untracked-files=no | sed 's/^/    /'
-    git -C "$DIR" stash push -q -m "install.sh $(date -u +%Y-%m-%dT%H:%M:%SZ): local edits set aside before deploying $BRANCH"
+    STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    git -C "$DIR" stash push -q -m "install.sh $STAMP: local edits set aside before deploying $BRANCH"
+    # A stash entry lives only in the reflog and can be garbage-collected after 30 days; a plain
+    # ref keeps the saved state for good: `git -C /opt/ssa-scraper log refs/server-edits/<stamp>`.
+    git -C "$DIR" update-ref "refs/server-edits/$STAMP" refs/stash
+    log "  saved as refs/server-edits/$STAMP (git stash list also shows it)"
   fi
   git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD
 else
