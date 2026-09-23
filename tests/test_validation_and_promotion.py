@@ -16,6 +16,7 @@ from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
     extract_before_jj_judge_names,
+    login_subscription_chrome_dominates,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.login_surface_stub import is_login_surface_stub
@@ -27,6 +28,8 @@ from scraper.parsers.citation_extractor import extract_instrument_mentions, extr
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks import promotion as promotion_task_module
 from scraper.tasks.promotion import (
+    _pending_judgment_staging,
+    _pending_statute_staging_query,
     promote_judgment_staging,
     promote_statute_staging,
     reconcile_citation_statute_residual_smoke,
@@ -83,6 +86,26 @@ The appeal is allowed and the conviction is set aside.
 """
 SHORT_SUBSCRIPTION_STUB_TEXT = "Update Subscriber details to continue."
 SHORT_SUBSCRIPTION_STUB_HTML = "<html><body><h1>Update Subscriber</h1><p>Obtaining Subscription</p></body></html>"
+REFERENCE_CASE_URL = (
+    "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
+    "?CaseName=2006K247&&court= &&Row=0 &&bookName=undefined"
+)
+INCIDENTAL_CHROME_CRUMBS = (
+    "\nUpdate Subscriber\nObtaining Subscription\n"
+    "I agree with the terms\nCookie settings | Subscriber account\n"
+)
+LONG_JUDGMENT_WITH_CHROME_CRUMBS = JUDGMENT_TEXT + INCIDENTAL_CHROME_CRUMBS
+LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS = (
+    "<html><body>"
+    + "".join(f"<p>{line}</p>" for line in JUDGMENT_TEXT.split("\n"))
+    + "<nav>Case search</nav><footer>Update Subscriber | Obtaining Subscription | "
+    "I agree with the terms</footer></body></html>"
+)
+THIN_LOGIN_FORM_HTML = (
+    "<html><body><h1>Please log in</h1>"
+    "<form><input type='password' name='pwd'><button>Sign in</button></form>"
+    "<p>I agree with the terms to access subscriber content.</p></body></html>"
+)
 
 
 @pytest.mark.parametrize(
@@ -285,6 +308,135 @@ def test_is_login_surface_stub_reads_judge_aliases(reconciled):
     ) is True
 
 
+def test_long_judgment_with_incidental_chrome_crumbs_is_not_stub():
+    assert login_subscription_chrome_dominates(
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+    ) is None
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is False
+    assert detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_login_check_long_body_with_citation_name_and_crumbs_is_not_stub():
+    text = "Citation Name: PLD 2024 SC 101\n" + LONG_JUDGMENT_WITH_CHROME_CRUMBS
+    assert is_login_surface_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=text,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is False
+    assert detect_judgment_stub(
+        source_url=LOGIN_CHECK_URL,
+        raw_text=text,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        judge_names=["Qazi Faez Isa"],
+    ) is None
+
+
+def test_short_subscription_chrome_still_dominates():
+    assert login_subscription_chrome_dominates(
+        raw_text=SHORT_SUBSCRIPTION_STUB_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_STUB_HTML,
+    ) in {"update_subscriber", "obtaining_subscription"}
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=SHORT_SUBSCRIPTION_STUB_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_STUB_HTML,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=SHORT_SUBSCRIPTION_STUB_TEXT,
+        raw_html=SHORT_SUBSCRIPTION_STUB_HTML,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
+def test_thin_login_form_still_stubs():
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text="Please log in to continue.",
+        raw_html=THIN_LOGIN_FORM_HTML,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text="Please log in to continue.",
+        raw_html=THIN_LOGIN_FORM_HTML,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "login_stub"
+
+
+def test_fat_page_chrome_does_not_hide_thin_subscription_stub():
+    thin_text = "Update Subscriber"
+    fat_html = (
+        "<html><head><title>Pakistan Law Site</title></head><body>"
+        "<header>Pakistan Law Site Home About Contact Help FAQ Case Law Search</header>"
+        "<nav>Citation Search | Statute Search | Case Law | Reference Search | My Account | Logout</nav>"
+        "<main><h1>Update Subscriber</h1>"
+        "<p>Please update your subscriber plan to continue reading this case.</p></main>"
+        "<footer>"
+        + (" Pakistan Law Site footer navigation link item " * 80)
+        + " Update Subscriber | Obtaining Subscription | Subscriber Account</footer>"
+        "</body></html>"
+    )
+    assert _has_case_content(raw_text=thin_text, raw_html=fat_html) is False
+    assert login_subscription_chrome_dominates(
+        raw_text=thin_text,
+        raw_html=fat_html,
+    ) in {"update_subscriber", "obtaining_subscription"}
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=thin_text,
+        raw_html=fat_html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=thin_text,
+        raw_html=fat_html,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
+def test_medium_unstructured_cta_with_mid_sentence_before_is_stub():
+    padding = "Please review your account details and confirm the selected options. " * 12
+    text = "Update Subscriber plan before continuing. " + padding
+    html = f"<html><body><p>{text}</p></body></html>"
+    assert _has_case_content(raw_text=text, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=text, raw_html=html) == "update_subscriber"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=text,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    hit = detect_judgment_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=text,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    )
+    assert hit is not None
+    assert hit.reason_code == "subscription_chrome"
+
+
 def test_extract_before_jj_judge_names_parses_reference_case_modal_line():
     text = "Before Qazi Faez Isa, CJ and Syed Mansoor Ali Shah, JJ\nJUDGMENT"
     names = extract_before_jj_judge_names(text)
@@ -447,6 +599,23 @@ def test_reconcile_judgment_does_not_quarantine_clc_body_without_citation_name_l
     assert out.quarantine_reason is None
 
 
+def test_reconcile_judgment_allows_long_body_with_incidental_chrome_crumbs():
+    det = _det()
+    det["judge_names"] = ["Qazi Faez Isa"]
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        source_url=REFERENCE_CASE_URL,
+        court_directory=COURTS,
+        min_confidence=0.85,
+    )
+    assert out.quarantine is False
+    assert not (out.quarantine_reason or "").startswith("subscription_chrome:")
+    assert not (out.quarantine_reason or "").startswith("login_stub:")
+
+
 @pytest.mark.parametrize(
     ("source_url", "raw_text", "raw_html", "judge_names", "judge_field_value", "expected_reason_prefix"),
     (
@@ -530,6 +699,62 @@ async def test_promotion_blocks_judgment_stub_markers(
     ).scalars().first()
     assert q is not None
     assert (q.reason or "").startswith(expected_reason_prefix)
+
+
+async def test_promotion_accepts_long_judgment_with_incidental_chrome_crumbs(db, login_source):
+    url = REFERENCE_CASE_URL
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url=url,
+        content=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html=LONG_JUDGMENT_HTML_WITH_CHROME_CRUMBS,
+        raw_text=LONG_JUDGMENT_WITH_CHROME_CRUMBS,
+        url=url,
+    )
+    st.reconciled_json = {
+        "citations": ["PLD 2024 SC 101"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2024,
+        "case_title": "Chrome crumbs must not block a real judgment",
+        "judge_names": ["Qazi Faez Isa"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().first()
+    assert judgment is not None
+    assert "The appellant was convicted" in (judgment.full_text or "")
+
+
+async def test_promote_queue_reserves_pakistanlawsite_instead_of_oldest_first_starve(db, source, login_source):
+    older_public = []
+    for i in range(3):
+        url = f"http://127.0.0.1/public-{i}"
+        prov = await record_provenance(db, source=source, url=url, content=f"pub{i}".encode(), content_kind="text")
+        st = await stage_judgment(db, source=source, prov=prov, raw_html=None, raw_text=f"public {i}", url=url)
+        st.status = "extracted"
+        st.reconciled_json = {"citations": [f"PLD 2020 SC {i + 1}"]}
+        older_public.append(st)
+    url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=newer"
+    prov = await record_provenance(db, source=login_source, url=url, content=b"pls", content_kind="text")
+    pls = await stage_judgment(db, source=login_source, prov=prov, raw_html=None, raw_text="pls newer", url=url)
+    pls.status = "extracted"
+    pls.reconciled_json = {"citations": ["PLD 2024 SC 999"]}
+    await db.flush()
+
+    selected = await _pending_judgment_staging(db, limit=2)
+    assert [row.source_name for row in selected] == ["PakistanLawSite", "SupremeCourt"]
+    pinned = await _pending_judgment_staging(db, limit=10, source_name="PakistanLawSite")
+    assert [row.id for row in pinned] == [pls.id]
 
 
 async def test_promotion_quarantines_empty_citation_name_login_check_chrome(db, login_source):
@@ -2778,3 +3003,88 @@ async def test_embedding_identity_mismatch_refuses(db, monkeypatch):
     monkeypatch.setattr(settings, "OPENAI_API_KEY", None)
     counts = await process_embedding_queue()
     assert counts["refused"] == 1
+
+
+def test_long_password_form_without_subscription_marker_dominates():
+    prose = "Enter your registered e-mail address and account password to sign in to the service. " * 20
+    html = (
+        "<html><body><form action='/login/check' method='post'>"
+        f"<p>{prose}</p>"
+        "<input type='text' name='email'><input type='password' name='pwd'>"
+        "</form></body></html>"
+    )
+    assert _has_case_content(raw_text=prose, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=prose, raw_html=html) == "password_input"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=prose,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+
+
+def test_password_input_on_structured_judgment_is_not_dominant():
+    body = (
+        "IN THE SUPREME COURT OF PAKISTAN\n"
+        "Before Qazi Faez Isa, CJ\n"
+        "Muhammad Aslam versus The State\n"
+        "JUDGMENT\n"
+        + ("The appellant was convicted under section 302 PPC and the appeal is heard on merits. " * 20)
+    )
+    html = (
+        "<html><body><header><form><input type='password' name='pwd'></form></header>"
+        f"<main><pre>{body}</pre></main></body></html>"
+    )
+    assert login_subscription_chrome_dominates(raw_text=body, raw_html=html) is None
+
+
+def test_marker_share_uses_compact_marker_length():
+    spaced = "Update      Subscriber"
+    padding = "x" * 70
+    # 16 compact marker chars / 86 compact total is below the 25% dominance ratio;
+    # counting the raw whitespace would push it over.
+    text = f"{spaced} {padding}"
+    from scraper.extractors.judgment_guards import _MARKER_DOMINANCE_RATIO, _compact_len, _marker_hits
+
+    hits = _marker_hits(text)
+    assert hits == [("update_subscriber", _compact_len(spaced))]
+    assert hits[0][1] / _compact_len(text) < _MARKER_DOMINANCE_RATIO
+
+
+async def test_statute_promote_query_honours_source_pin(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))
+    ).scalars().first()
+    assert source is not None
+    url = "http://127.0.0.1/pakistancode-pin.txt"
+    prov = await record_provenance(db, source=source, url=url, content=b"pin", content_kind="text")
+    st = await stage_statute(db, source=source, prov=prov, raw_html=None, raw_text="Section 1. Pin", url=url, kind="statute")
+    st.status = "extracted"
+    await db.flush()
+
+    pinned = (await db.execute(_pending_statute_staging_query(limit=50, source_name="PakistanLawSite"))).scalars().all()
+    assert st.id not in {row.id for row in pinned}
+    own = (await db.execute(_pending_statute_staging_query(limit=50, source_name="PakistanCode"))).scalars().all()
+    assert st.id in {row.id for row in own}
+    unpinned = (await db.execute(_pending_statute_staging_query(limit=50))).scalars().all()
+    assert st.id in {row.id for row in unpinned}
+
+
+def test_generic_before_prompt_does_not_shield_password_form():
+    prose = "Before continuing, enter your password to open this case.\n" + (
+        "Your subscriber session has ended and must be renewed from the account page. " * 12
+    )
+    html = (
+        "<html><body><form action='/Login/ReferenceCaseLawSearch' method='post'>"
+        f"<p>{prose}</p><input type='password' name='pwd'></form></body></html>"
+    )
+    assert _has_case_content(raw_text=prose, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=prose, raw_html=html) == "password_input"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=prose,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    # Without a password form, the same leading Before line still counts as structure.
+    assert _has_case_content(raw_text=prose, raw_html=f"<p>{prose}</p>") is True

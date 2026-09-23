@@ -208,6 +208,14 @@ class Settings(BaseSettings):
     BACKFILL_PLS_RUN_MAX_MINUTES: int = Field(default=50, description="Backfill mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes, so the session is not idle between Beat kicks (0 = one window per job). Keep it under the login-session lock TTL (60 min) and the job stale cut-off.")
     PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip citation-grid rows whose citation already has a staging row (extracted, promoted, duplicate or quarantined) so a wrap of the grid does not re-download pages that were already preserved.")
     PLS_CASE_DESCRIPTION_WAIT_SECONDS: float = Field(default=6.0, description="How long to wait for the 'Case Description' control to render on a ReferenceCaseLawSearch page before the page is classified as headnote-only.")
+    PROMOTE_PREFERRED_SOURCE: str = Field(
+        default="PakistanLawSite",
+        description="Judgment source that reserves a share of each promote batch so oldest-first public rows cannot starve login harvest.",
+    )
+    PROMOTE_PREFERRED_SHARE: float = Field(
+        default=0.5,
+        description="Fraction of each promote batch reserved for PROMOTE_PREFERRED_SOURCE when that source has pending rows.",
+    )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
@@ -454,6 +462,8 @@ class Settings(BaseSettings):
             raise ValueError("PLS_RUN_MAX_MINUTES and BACKFILL_PLS_RUN_MAX_MINUTES must be >= 0")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
+        if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:
+            raise ValueError("PROMOTE_PREFERRED_SHARE must be in (0, 1]")
         if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
             raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:

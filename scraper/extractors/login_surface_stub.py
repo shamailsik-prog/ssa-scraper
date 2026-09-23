@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from scraper.extractors.judgment_guards import _has_case_content
+from scraper.extractors.judgment_guards import (
+    _has_case_content,
+    login_subscription_chrome_dominates,
+)
 
 
 def is_login_surface_stub(
@@ -32,24 +35,11 @@ def is_login_surface_stub(
         for part in (names, data.get("judge"), data.get("judges"))
         if part is not None
     ).lower()
+    # Structured login-surface fields dominate regardless of body length.
     if "obtaining subscription" in name_blob or "update subscriber" in name_blob:
         return True
+    # Citation Name / structured case text is a real page (#100 / #105).
+    # Remaining body chrome is fail-closed only when markers dominate.
     if not has_case:
-        blob_parts = [
-            source_url or "",
-            raw_text or "",
-            (raw_html or "")[:12000],
-            str(names or ""),
-            str(data.get("judge") or ""),
-            str(data.get("judges") or ""),
-            court_val,
-            str(data.get("case_title") or ""),
-        ]
-        blob = " ".join(blob_parts).lower()
-        if "obtaining subscription" in blob:
-            return True
-        if "update subscriber" in blob:
-            return True
-        if "i agree with the terms" in blob and ("subscriber" in blob or "login" in blob):
-            return True
+        return login_subscription_chrome_dominates(raw_text=raw_text, raw_html=raw_html) is not None
     return False
