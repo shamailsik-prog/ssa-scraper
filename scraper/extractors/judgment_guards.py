@@ -31,6 +31,14 @@ _CASE_BODY_CONTENT_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?im)^\s*(?:judgment|judgement)\b"),
     re.compile(r"(?im)^\s*held\s*[:\-.]"),
 )
+# A page carrying a password input needs stronger evidence than a bare leading
+# "Before"/"Judgment" line: login copy such as "Before continuing, enter your
+# password" matches those. Court heading, parties, or a Before line naming judges.
+_STRONG_CASE_BODY_CONTENT_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,160}\bcourt\b"),
+    re.compile(r"(?im)^[^\n]{0,220}\b(?:versus|vs\.?|v\.)\s"),
+    re.compile(r"(?im)^\s*(?:before|coram)\s*[:\-]?\s*[^\n]{3,300}?,?\s*(?:j|jj|c\.?\s*j)\.?\s*$"),
+)
 _HTML_BREAK_RE = re.compile(r"(?i)<br\s*/?>|</(?:p|div|tr|h[1-6]|li|td|th)>")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _HTML_NBSP_RE = re.compile(r"&nbsp;|&#160;", re.IGNORECASE)
@@ -120,7 +128,13 @@ def _has_case_content(*, raw_text: Optional[str], raw_html: Optional[str]) -> bo
     if _CASE_CONTENT_RE.search(raw_blob):
         return True
     visible = _visible_case_blob(raw_text=raw_text, raw_html=raw_html)
-    return any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
+    return any(pattern.search(visible) for pattern in _case_body_patterns(raw_html))
+
+
+def _case_body_patterns(raw_html: Optional[str]) -> tuple[re.Pattern[str], ...]:
+    if _PASSWORD_INPUT_RE.search(raw_html or ""):
+        return _STRONG_CASE_BODY_CONTENT_RES
+    return _CASE_BODY_CONTENT_RES
 
 
 def _match_subscription_chrome(value: str) -> Optional[str]:
@@ -192,7 +206,7 @@ def login_subscription_chrome_dominates(
         return first_marker
     if marker_share >= _MARKER_DOMINANCE_RATIO:
         return first_marker
-    structured = any(pattern.search(visible) for pattern in _CASE_BODY_CONTENT_RES)
+    structured = any(pattern.search(visible) for pattern in _case_body_patterns(html_blob))
     if hits and compact_total < _MEDIUM_UNSTRUCTURED_COMPACT_CHARS and not structured:
         return first_marker
     # A password form with no judgment structure is a login page at any length.

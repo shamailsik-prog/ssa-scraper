@@ -3068,3 +3068,23 @@ async def test_statute_promote_query_honours_source_pin(db):
     assert st.id in {row.id for row in own}
     unpinned = (await db.execute(_pending_statute_staging_query(limit=50))).scalars().all()
     assert st.id in {row.id for row in unpinned}
+
+
+def test_generic_before_prompt_does_not_shield_password_form():
+    prose = "Before continuing, enter your password to open this case.\n" + (
+        "Your subscriber session has ended and must be renewed from the account page. " * 12
+    )
+    html = (
+        "<html><body><form action='/Login/ReferenceCaseLawSearch' method='post'>"
+        f"<p>{prose}</p><input type='password' name='pwd'></form></body></html>"
+    )
+    assert _has_case_content(raw_text=prose, raw_html=html) is False
+    assert login_subscription_chrome_dominates(raw_text=prose, raw_html=html) == "password_input"
+    assert is_login_surface_stub(
+        source_url=REFERENCE_CASE_URL,
+        raw_text=prose,
+        raw_html=html,
+        judge_names=["Qazi Faez Isa"],
+    ) is True
+    # Without a password form, the same leading Before line still counts as structure.
+    assert _has_case_content(raw_text=prose, raw_html=f"<p>{prose}</p>") is True
