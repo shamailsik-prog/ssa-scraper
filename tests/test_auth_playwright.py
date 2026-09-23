@@ -1301,6 +1301,8 @@ async def test_pipeline_citation_grid_cursor_advances_between_runs(db, login_sou
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     rows = [
         ("PLD 2024 SC 401", "Case 401", "Supreme Court", "https://www.pakistanlawsite.com/case/401"),
@@ -1714,6 +1716,8 @@ async def test_pipeline_citation_grid_flush_commits_rows_and_cursor_before_run_e
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 3)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 3)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     rows = [
         ("PLD 2024 SC 701", "Case 701", "Supreme Court", "https://www.pakistanlawsite.com/case/701"),
@@ -2098,6 +2102,8 @@ async def test_pipeline_citation_grid_cursor_wraps_at_end(db, login_source, monk
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
     await _activate(db, login_source)
     rows = [
         ("PLD 2024 SC 501", "Case 501", "Supreme Court", "https://www.pakistanlawsite.com/case/501"),
