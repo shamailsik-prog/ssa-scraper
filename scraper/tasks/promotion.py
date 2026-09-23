@@ -29,6 +29,7 @@ from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
     guard_reason,
+    judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.login_surface_stub import is_login_surface_stub
@@ -223,13 +224,22 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 return "quarantined"
     if existing is not None:
         existing_headnote_signal = detect_headnotes_only(raw_text=existing.full_text or "", raw_html=None)
+        existing_is_headnote = (
+            existing_headnote_signal is not None and existing_headnote_signal.signal == "notes_on_cases_only"
+        )
+        existing_is_incomplete = existing_is_headnote or not judgment_is_full_ready(
+            existing.full_text, existing.judge_names
+        )
+        incoming_is_fuller = len(full_text or "") > len(existing.full_text or "") or (
+            not existing.judge_names and bool(data.get("judge_names"))
+        )
         should_upgrade_existing = (
             st.source_name == "PakistanLawSite"
             and (existing.source_name or "") == "PakistanLawSite"
             and existing.canonical_citation == canonical
             and existing.full_text_hash != text_hash
-            and existing_headnote_signal is not None
-            and existing_headnote_signal.signal == "notes_on_cases_only"
+            and existing_is_incomplete
+            and incoming_is_fuller
         )
         if should_upgrade_existing:
             existing.case_title = (data.get("case_title") or existing.case_title)

@@ -46,6 +46,7 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
+    judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
@@ -575,33 +576,23 @@ class PakistanLawSitePipeline:
             )
             snapshot_start_row = 0
         window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
-        if not window_contains_offset:
-            result["cursor_unconfirmed"] = True
-            self.stats["citation_grid_cursor_unconfirmed"] = self.stats.get("citation_grid_cursor_unconfirmed", 0) + 1
-            logger.warning(
-                "PakistanLawSite citation-grid snapshot window missing absolute offset row_offset=%s snapshot_start=%s rows=%s seek_mode=%s; using in-window fallback",
+        seek_confirmed = seek_mode in CONFIRMED_CITATION_GRID_SEEK_MODES
+        if row_offset > 0 and (not seek_confirmed or not window_contains_offset):
+            logger.error(
+                "PakistanLawSite citation-grid seek failed; refusing to harvest from row 0 or move cursor "
+                "row_offset=%s snapshot_start=%s rows=%s seek_mode=%s",
                 row_offset,
                 snapshot_start_row,
                 row_count,
                 seek_mode or "none",
             )
-            if not cursor.get("seek_unconfirmed_notified"):
-                await notify(
-                    self.db,
-                    level="warning",
-                    code="PLS_GRID_SEEK_UNCONFIRMED",
-                    message=(
-                        f"CitationSearch could not be positioned at row {row_offset} (seek_mode={seek_mode or 'none'}, "
-                        f"snapshot rows={row_count}); the run is re-reading the first window. The grid layout may "
-                        "have changed; check PLS_ARCHIVED_GRID_MAX_ROWS and the seek script."
-                    ),
-                    source_name=SOURCE_NAME,
-                )
-                cursor["seek_unconfirmed_notified"] = datetime.now(timezone.utc).isoformat()
-        elif cursor.get("seek_unconfirmed_notified"):
-            cursor.pop("seek_unconfirmed_notified", None)
-        start_offset = row_offset if window_contains_offset else snapshot_start_row
-        start_in_window = row_offset - snapshot_start_row if window_contains_offset else 0
+            self.stats["citation_grid_seek_failed"] = True
+            self.stats["citation_grid_offset"] = row_offset
+            self.stats["citation_grid_snapshot_start"] = snapshot_start_row
+            self.stats["citation_grid_rows_seen"] = row_count
+            return result
+        start_offset = row_offset
+        start_in_window = row_offset - snapshot_start_row
         remaining_rows_in_window = max(0, row_count - start_in_window)
         remaining_rows_total = max(0, total_rows - start_offset)
         take_cap = min(scan_window, row_count)
@@ -639,7 +630,7 @@ class PakistanLawSitePipeline:
             for canonical, full_text, judge_names in existing_judgments:
                 key = str(canonical)
                 known_citations.add(key)
-                if len(full_text or "") >= 5000 and bool(judge_names):
+                if judgment_is_full_ready(full_text, judge_names):
                     full_ready_citations.add(key)
             existing_citations = (
                 await self.db.execute(
@@ -651,7 +642,7 @@ class PakistanLawSitePipeline:
             for citation_string, full_text, judge_names in existing_citations:
                 key = str(citation_string)
                 known_citations.add(key)
-                if len(full_text or "") >= 5000 and bool(judge_names):
+                if judgment_is_full_ready(full_text, judge_names):
                     full_ready_citations.add(key)
             if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
                 # Pages already preserved and staged (waiting for promotion, promoted, duplicate or
@@ -776,12 +767,10 @@ class PakistanLawSitePipeline:
             is_staged = (citation_norm and citation_norm in staged_citations) or (
                 citation_key and citation_key in staged_citations
             )
-            if is_full_ready or is_known or is_staged:
+            if is_full_ready or is_staged:
                 if is_full_ready:
                     known_citation_skips += 1
                     self.stats["known_citation_skips"] = known_citation_skips
-                elif is_known:
-                    self.stats["duplicates"] += 1
                 else:
                     staged_citation_skips += 1
                     self.stats["staged_citation_skips"] = staged_citation_skips
@@ -797,6 +786,8 @@ class PakistanLawSitePipeline:
                     details_since_flush = 0
                     staged_since_flush = 0
                 continue
+            if is_known:
+                self.stats["incomplete_citation_refetch"] = self.stats.get("incomplete_citation_refetch", 0) + 1
             if detail_attempts >= max_detail:
                 processed_rows_total = idx
                 next_offset = next_offset_after(idx)

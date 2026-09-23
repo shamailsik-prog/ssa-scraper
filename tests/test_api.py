@@ -18,15 +18,20 @@ from scraper.tasks.promotion import promote_judgment_staging, promote_staging_re
 from tests.fixtures import judgment_html
 
 
-def test_health_and_dashboard(client):
-    h = client.get("/health").json()
-    assert h["status"] == "ok" and h["db_connected"] and h["redis_connected"]
+def test_health_and_dashboard(client, admin_headers):
+    public = client.get("/health").json()
+    assert public["status"] == "ok" and public["db_connected"] and public["redis_connected"]
+    assert "not_configured" not in public
+    assert "sources" not in public
+    assert "read_only_role" not in public
+    h = client.get("/health", headers=admin_headers).json()
     assert h["read_only_role"]["status"] == "CONFIGURED" and h["read_only_role"]["exists"]
     assert "PLS_SUBSCRIBED_REPORTERS" in h["not_configured"]
     d = client.get("/dashboard")
     assert d.status_code == 200 and "Overview" in d.text and "Corpus viewer" in d.text and "Browse and search" in d.text and "Record detail" in d.text
+    assert "Human login" in d.text and "Review queue" in d.text and "Sources" in d.text
     for secret in ("test-admin-key", settings.ENCRYPTION_KEY, "readerpw", "writerpw"):
-        assert secret not in json.dumps(h) and secret not in d.text
+        assert secret not in json.dumps(public) and secret not in json.dumps(h) and secret not in d.text
 
 
 def test_admin_routes_require_key(client, admin_headers):
@@ -43,6 +48,9 @@ def test_admin_routes_require_key(client, admin_headers):
         "/admin/jobs",
         "/admin/notifications",
         "/admin/errors",
+        "/admin/corpus/summary",
+        "/export/judgments",
+        "/export/statutes",
     ):
         assert client.get(path).status_code == 401, path
         assert client.get(path, headers=admin_headers).status_code == 200, path
@@ -276,7 +284,8 @@ def test_export_excludes_login_session_full_text_without_confirmation(client, ad
 
     run_async(_seed_judgments("public"))
     run_async(_seed_judgments("login_session"))
-    rows = [json.loads(l) for l in client.get("/export/judgments?format=jsonl&include_full_text=true").text.splitlines()]
+    assert client.get("/export/judgments?format=jsonl&include_full_text=true").status_code == 401
+    rows = [json.loads(l) for l in client.get("/export/judgments?format=jsonl&include_full_text=true", headers=admin_headers).text.splitlines()]
     by = {r["canonical_citation"]: r for r in rows}
     assert "The appellant" in by["PLD 2024 SC 701"]["full_text"]
     assert by["PLD 2024 SC 702"]["full_text"].startswith("[EXCLUDED")
@@ -286,7 +295,7 @@ def test_export_excludes_login_session_full_text_without_confirmation(client, ad
     monkeypatch.setattr(settings, "EXPORT_LOGIN_SESSION_FULL_TEXT", True)
     rows = [json.loads(l) for l in client.get("/export/judgments?format=jsonl&include_full_text=true", headers={**admin_headers, "X-Admin-Confirm": "export-login-session-full-text"}).text.splitlines()]
     assert "The appellant" in {r["canonical_citation"]: r for r in rows}["PLD 2024 SC 702"]["full_text"]
-    csv_text = client.get("/export/judgments?format=csv").text
+    csv_text = client.get("/export/judgments?format=csv", headers=admin_headers).text
     assert "PLD 2024 SC 701" in csv_text and "The appellant" not in csv_text
 
 

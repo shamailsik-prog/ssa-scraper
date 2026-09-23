@@ -36,7 +36,14 @@ from sqlalchemy.orm.attributes import set_committed_value
 from scraper.config import settings
 from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
-from scraper.security import ExplicitBlock, VerificationRequired, classify_response, scrub_secrets
+from scraper.security import (
+    ExplicitBlock,
+    URLPolicyError,
+    VerificationRequired,
+    check_url_policy,
+    classify_response,
+    scrub_secrets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -462,15 +469,41 @@ class PlaywrightBrowser:
     """Headless Chromium bound to one slot's storage state. Ordinary search-page fields are
     automated normally; verification pages are never solved."""
 
-    def __init__(self, storage_state: Dict[str, Any], slot_number: int, *, base_url: str, headless: Optional[bool] = None):
+    def __init__(
+        self,
+        storage_state: Dict[str, Any],
+        slot_number: int,
+        *,
+        base_url: str,
+        headless: Optional[bool] = None,
+        allow_list: Optional[List[str]] = None,
+        document_cdn_hosts: Optional[List[str]] = None,
+    ):
         self.slot_number = slot_number
         self._storage_state = storage_state
         self.base_url = base_url
         self._headless = settings.PLAYWRIGHT_HEADLESS if headless is None else headless
+        host = ""
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(base_url).hostname or "").lower()
+        except Exception:
+            host = ""
+        self._allow_list = list(allow_list or ([host] if host else ["www.pakistanlawsite.com"]))
+        self._document_cdn_hosts = list(document_cdn_hosts or [])
         self._pw = None
         self._browser = None
         self._context = None
         self._page = None
+
+    def _assert_url_policy(self, url: str) -> str:
+        return check_url_policy(
+            url,
+            self._allow_list,
+            document_cdn_hosts=self._document_cdn_hosts,
+            allow_private_for_tests=bool(settings.DEBUG),
+        )
 
     async def start(self) -> "PlaywrightBrowser":
         from playwright.async_api import async_playwright
@@ -916,6 +949,10 @@ class PlaywrightBrowser:
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
+        try:
+            url = self._assert_url_policy(url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(
             self._page.goto(
                 url,
@@ -995,6 +1032,10 @@ class PlaywrightBrowser:
         return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
 
     async def download(self, url: str) -> bytes:
+        try:
+            url = self._assert_url_policy(url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(self._context.request.get(url))
         if resp.status >= 400:
             raise BrowserDisconnected(f"download HTTP {resp.status}") if resp.status >= 500 else ExplicitBlock("block", f"HTTP {resp.status} on download")
