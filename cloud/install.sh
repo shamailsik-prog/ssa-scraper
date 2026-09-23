@@ -191,6 +191,7 @@ stale = {
     "BACKFILL_LOGIN_DELAY_MIN": ("0.4", "6"),
     "BACKFILL_LOGIN_DELAY_MAX": ("1.0", "9"),
     "BACKFILL_PAGES_PER_HOUR": ("10000", "450"),
+    "LOGIN_SESSION_CONCURRENCY": ("1", "2"),
 }
 migrated = []
 for key, (old_value, new_value) in stale.items():

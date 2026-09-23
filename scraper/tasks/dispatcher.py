@@ -233,6 +233,17 @@ def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_s
     return run_async(run_source(source_name, reporter_shard=reporter_shard))
 
 
+def _running_reporter_shards(running_jobs) -> list[Optional[int]]:
+    """The reporter shard each live job runs (from its heartbeat), None for an unsharded job or
+    one that has not heartbeated yet (treated as unsharded: it may hold any slot)."""
+    shards: list[Optional[int]] = []
+    for job in running_jobs:
+        summary = job.result_summary if isinstance(job.result_summary, dict) else {}
+        shard = summary.get("reporter_shard")
+        shards.append(shard if shard in (0, 1) else None)
+    return shards
+
+
 async def _active_slot_numbers(db, source_name: str) -> list[int]:
     rows = (
         await db.execute(
@@ -302,27 +313,39 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     len(running_jobs),
                 )
                 continue
-            if s.access_method == "login_session" and concurrency >= 2 and len(await _active_slot_numbers(db, s.source_name)) >= 2:
-                # Two shards only when both slots hold a human login: each shard runs on its own slot.
-                app.send_task(
-                    "scraper.tasks.dispatcher.run_login_session_job",
-                    args=(s.source_name,),
-                    kwargs={"reporter_shard": 0},
-                    queue="login_session",
-                )
-                app.send_task(
-                    "scraper.tasks.dispatcher.run_login_session_job",
-                    args=(s.source_name,),
-                    kwargs={"reporter_shard": 1},
-                    queue="login_session",
-                )
-                queued.append(f"{s.source_name}:shard0")
-                queued.append(f"{s.source_name}:shard1")
-            elif s.access_method == "login_session":
-                if concurrency >= 2:
-                    logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
-                app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
-                queued.append(s.source_name)
+            if s.access_method == "login_session":
+                active_slots = await _active_slot_numbers(db, s.source_name)
+                running_shards = _running_reporter_shards(running_jobs)
+                if running_jobs and any(shard not in (0, 1) for shard in running_shards):
+                    # An unsharded job may fail over to any ACTIVE slot: nothing else may start.
+                    logger.info("%s: an unsharded login-session job is running; not enqueuing a shard beside it", s.source_name)
+                    continue
+                if concurrency >= 2 and len(active_slots) >= 2:
+                    # Two shards only when both slots hold a login: each shard runs on its own slot
+                    # (shard n on slot n+1), and a shard whose slot is already served by a running
+                    # job is not started twice.
+                    sent = False
+                    for shard in (0, 1):
+                        if shard in running_shards or (shard + 1) not in active_slots:
+                            continue
+                        app.send_task(
+                            "scraper.tasks.dispatcher.run_login_session_job",
+                            args=(s.source_name,),
+                            kwargs={"reporter_shard": shard},
+                            queue="login_session",
+                        )
+                        queued.append(f"{s.source_name}:shard{shard}")
+                        sent = True
+                    if not sent:
+                        continue
+                elif running_jobs:
+                    # One slot left and a shard already runs on it.
+                    continue
+                else:
+                    if concurrency >= 2:
+                        logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
+                    app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
+                    queued.append(s.source_name)
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
                 queued.append(s.source_name)

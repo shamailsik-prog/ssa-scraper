@@ -146,7 +146,16 @@ class Settings(BaseSettings):
     LOGIN_DELAY_MAX: float = Field(default=9.0, description="Seconds between login-session page fetches (maximum).")
     PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
     PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
-    LOGIN_SESSION_CONCURRENCY: int = Field(default=1)
+    LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker processes (1-2). With two ACTIVE slots (two logins) and 2, the reporter shards run in parallel, one per login.")
+    LOGIN_AUTO_RECOVER: bool = Field(
+        default=True,
+        description="Re-verify a bounced login slot without a human: LOGIN_RECOVERY_COOLDOWN_MINUTES after the site "
+        "redirected a slot to its login page, open the stored session again and, if the search page renders, put the slot "
+        "back into rotation. No credentials are submitted by code; a dead login is re-established from the dashboard.",
+    )
+    LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
+    LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
+    LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
     HARVEST_MODE: str = Field(default="updates", description="Global scheduler mode: backfill (continuous) or updates (steady state).")
     HARVEST_AUTO_SWITCH: bool = Field(
         default=True,
@@ -427,6 +436,8 @@ class Settings(BaseSettings):
             raise ValueError("PLAYWRIGHT_MAX_HTML_BYTES and PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD must be positive")
         if self.LOGIN_SESSION_CONCURRENCY not in (1, 2):
             raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
+        if self.LOGIN_RECOVERY_COOLDOWN_MINUTES < 0 or self.LOGIN_RECOVERY_SCHEDULE_SECONDS <= 0 or self.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS < 0:
+            raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
         if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:

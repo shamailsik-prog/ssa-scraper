@@ -29,6 +29,7 @@ app = Celery(
         "scraper.tasks.treatment",
         "scraper.tasks.embeddings",
         "scraper.tasks.archive_mirror",
+        "scraper.tasks.login_recovery",
     ],
 )
 app.conf.update(
@@ -51,12 +52,14 @@ app.conf.update(
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
+        "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
     },
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
         # Promotion must keep up with a continuous login-session harvest (hundreds of staged rows per
         # hour): 500 rows every 5 minutes, on its own worker (see worker-maintenance in docker-compose.yml).
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 300, "kwargs": {"limit": 500}},
+        "recover-login-slots": {"task": "scraper.tasks.login_recovery.recover_login_slots", "schedule": settings.LOGIN_RECOVERY_SCHEDULE_SECONDS},
         "reconcile-instrument-relations": {
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,
