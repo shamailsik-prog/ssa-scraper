@@ -1571,6 +1571,7 @@ async def test_pipeline_citation_grid_skip_known_still_advances_dom_absolute_cur
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
     monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 2)
     # #95 take_count follows scan_window (updates or backfill), not max_detail.
     # Pin both so skip-known still proves the confirmed dom_absolute cursor
     # advances 200 → 202 without fetching the known row.
