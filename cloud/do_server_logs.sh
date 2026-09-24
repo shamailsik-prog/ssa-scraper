@@ -32,6 +32,13 @@ IP="$(echo "$DROPLET" | jq -r '.networks.v4[] | select(.type=="public") | .ip_ad
 [ -n "$IP" ] && [ "$IP" != "null" ] || die "droplet has no public IPv4 address"
 
 SSH_OPTS=(-i "$KEYDIR/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR)
+if [ "$SERVICES" = "status" ]; then
+  # The corpus numbers as the key-free /status page shows them (the API listens on 127.0.0.1:8000
+  # behind Caddy), plus the promotion and archive lines of the last hour.
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo "== /status.json" && curl -sS http://127.0.0.1:8000/status.json | python3 -m json.tool && echo && echo "== promotion and archive (last hour)" && docker compose logs --no-color --since 1h worker-public 2>/dev/null | grep -E "promote_staging_records|mirror_pending|reconcile_storage" | tail -20' 2>&1 \
+    | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
+  exit 0
+fi
 if [ "$SERVICES" = "inspect" ]; then
   # Read-only inventory of what else runs on the server: anything outside the compose stack that
   # touches the database or the site (a cron job, a timer, a second checkout, a hand edit set aside

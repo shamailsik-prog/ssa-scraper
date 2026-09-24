@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Corpus status</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#7a1f1f">
+<style>
+:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--bad:#a12626;--warn:#8a5a00}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Georgia,"Times New Roman",serif}
+header{padding:14px 16px;border-bottom:2px solid var(--accent);background:var(--panel)}header h1{margin:0;font-size:20px}
+.note{color:var(--muted);font-size:12px}main{max-width:1100px;margin:0 auto;padding:16px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
+.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:10px 12px}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:26px;font-weight:700}
+section{padding:12px 14px;margin-bottom:14px}section h2{margin:0 0 8px;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.wrap{overflow:auto}a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>SIKANDER AI corpus — status</h1>
+  <div class="note" id="stamp">loading…</div>
+  <div class="note">Numbers only, refreshed every 60 s. Actions and records: <a href="/dashboard">dashboard</a> (admin key). On a phone use "Add to Home Screen" to keep this page as an app.</div>
+</header>
+<main>
+  <div class="tiles" id="tiles"></div>
+  <section><h2>Movement</h2><div id="movement"></div></section>
+  <section><h2>Google Drive and archive targets</h2><div class="wrap" id="archive"></div></section>
+  <section><h2>Sources</h2><div class="wrap" id="sources"></div></section>
+  <section><h2>PakistanLawSite login slots and pacing today</h2><div class="wrap" id="pls"></div></section>
+  <section><h2>Judgments by reporter and year</h2><div class="wrap" id="volumes"></div></section>
+  <section><h2>Open notifications</h2><div class="wrap" id="notes"></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const when=v=>v?new Date(v).toLocaleString():'-';
+const tile=(l,v,c)=>'<div class="tile"><div class="label">'+esc(l)+'</div><div class="value '+(c||'')+'">'+esc(v)+'</div></div>';
+const cell=v=>'<td>'+esc(v==null?'-':v)+'</td>';
+function stateClass(s){return s==='ACTIVE'?'ok':(s==='HALTED'||s==='DISABLED'?'bad':'warn')}
+async function load(){
+  let d;
+  try{const r=await fetch('/status.json',{cache:'no-store'});d=await r.json();}catch(e){$('stamp').textContent='status unavailable: '+e;return;}
+  $('stamp').textContent='as of '+when(d.generated_at);
+  const t=d.totals||{},m=d.movement||{};
+  $('tiles').innerHTML=tile('Judgments',t.judgments)+tile('Citations',t.citations)+tile('Statutes',t.statutes)+tile('Sections',t.statute_sections)+tile('Instruments',t.instruments)+tile('Promoted today',m.judgments_promoted_today,m.judgments_promoted_today?'ok':'')+tile('Last 7 days',m.judgments_promoted_last_7_days)+tile('Review queue',t.review_queue_open,t.review_queue_open?'warn':'');
+  $('movement').innerHTML='<table><tr><th>last promotion</th><th>staged, waiting for promotion</th><th>staging by status</th></tr><tr>'+cell(when(m.last_promotion_at))+cell(m.staged_waiting_for_promotion)+cell(JSON.stringify(m.staging_by_status||{}))+'</tr></table>';
+  const g=(d.archive||{}).google_drive||{};
+  let a='<p class="'+(g.configured?'ok':'bad')+'"><strong>Google Drive: '+(g.configured?'configured':'NOT CONFIGURED')+'</strong>'+(g.note?' — '+esc(g.note):'')+'</p>';
+  const ts=(d.archive||{}).targets||[];
+  a+='<table><tr><th>target</th><th>type</th><th>enabled</th><th>takes PakistanLawSite rows</th><th>judgments mirrored</th><th>objects</th><th>last written</th><th>last ok</th><th>failures</th><th>last error</th></tr>'+ts.map(x=>'<tr>'+cell(x.name)+cell(x.type)+cell(x.enabled?'yes':'no')+cell(x.mirrors_pakistanlawsite?'yes':'no')+cell(x.judgments_mirrored)+cell(JSON.stringify(x.objects||{}))+cell(when(x.last_written_at))+cell(when(x.last_ok_at))+cell(x.consecutive_failures)+cell(x.last_error)+'</tr>').join('')+'</table>';
+  if(!ts.length)a+='<p class="note">No archive target yet.</p>';
+  $('archive').innerHTML=a;
+  $('sources').innerHTML='<table><tr><th>source</th><th>state</th><th>reason</th><th>judgments</th><th>last success</th><th>next run</th><th>last job</th></tr>'+(d.sources||[]).map(s=>{const j=s.last_job||{};return '<tr>'+cell(s.source)+'<td class="'+stateClass(s.state)+'">'+esc(s.state)+'</td>'+cell(s.reason)+cell(s.judgments)+cell(when(s.last_success_at))+cell(when(s.next_scrape_at))+cell(j.status?j.status+' '+when(j.started_at)+' pages '+j.pages+' staged '+j.staged+(j.outcome?' — '+j.outcome:''):'-')+'</tr>'}).join('')+'</table>';
+  const pls=(d.sources||[]).filter(s=>s.access==='login_session');
+  $('pls').innerHTML=pls.map(s=>{const p=s.pacing_today||{};return '<p><strong>'+esc(s.source)+'</strong>: current slot '+esc(s.current_slot)+'; pages today '+esc(p.pages_today)+' of '+esc(p.limit_per_day)+', this hour '+esc(p.pages_this_hour)+' of '+esc(p.limit_per_hour)+'</p><table><tr><th>slot</th><th>state</th><th>reason</th><th>logged in</th><th>last used</th></tr>'+(s.slots||[]).map(x=>'<tr>'+cell(x.slot)+'<td class="'+stateClass(x.state)+'">'+esc(x.state)+'</td>'+cell(x.reason)+cell(when(x.logged_in_at))+cell(when(x.last_used_at))+'</tr>').join('')+'</table>'}).join('')||'<p class="note">no login-session source</p>';
+  const v=d.judgments_by_reporter_year||[];
+  $('volumes').innerHTML=v.length?'<table><tr><th>reporter</th><th>year</th><th>judgments</th></tr>'+v.map(x=>'<tr>'+cell(x.reporter)+cell(x.year)+cell(x.judgments)+'</tr>').join('')+'</table>':'<p class="note">none yet</p>';
+  const n=d.open_notifications||[];
+  $('notes').innerHTML=n.length?'<table><tr><th>when</th><th>level</th><th>code</th><th>source</th><th>message</th></tr>'+n.map(x=>'<tr>'+cell(when(x.at))+'<td class="'+(x.level==='critical'||x.level==='error'?'bad':'warn')+'">'+esc(x.level)+'</td>'+cell(x.code)+cell(x.source)+cell(x.message)+'</tr>').join('')+'</table>':'<p class="note">none</p>';
+}
+load();setInterval(load,60000);
+</script>
+</body>
+</html>

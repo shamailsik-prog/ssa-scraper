@@ -179,9 +179,14 @@ class SessionLock:
             if not self._held:
                 return
             r = await self._client()
-            val = await r.get(self.key)
-            if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
-                await r.delete(self.key)
+            # Compare-and-delete in one step: a lock that expired and was taken by another worker
+            # between a GET and a DEL would otherwise be deleted from under that worker.
+            await r.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                self.key,
+                self._token,
+            )
             self._held = False
         finally:
             if self._own_client and self._redis is not None:
@@ -448,7 +453,33 @@ class PlaywrightBrowser:
             raise
 
     async def _capture_html(self) -> str:
-        return await self._wrap(self._page.content())
+        """The page's HTML. The authenticated CitationSearch page is a 10-16 MB DOM on which a full
+        serialization can outlast the Playwright timeout; when it does, the search-form map only
+        needs the forms, so those (and the logout link the verdict looks for) are captured on their
+        own instead of treating the page as lost."""
+        timeout = max(5.0, settings.PLAYWRIGHT_TIMEOUT_MS / 1000.0)
+        try:
+            return await asyncio.wait_for(self._wrap(self._page.content()), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "page.content() exceeded %.0fs on slot %s (%s); capturing the forms only",
+                timeout,
+                self.slot_number,
+                self._page.url if self._page else "?",
+            )
+        return await self._wrap(
+            self._page.evaluate(
+                """() => {
+                    const parts = [];
+                    const title = document.title ? '<title>' + document.title.replace(/</g, '&lt;') + '</title>' : '';
+                    for (const a of document.querySelectorAll('a[href*="logout" i], a[href*="logoff" i], a[href*="signout" i]')) {
+                        parts.push(a.outerHTML);
+                    }
+                    for (const f of document.forms) parts.push(f.outerHTML);
+                    return '<html><head>' + title + '</head><body>' + parts.join('\n') + '</body></html>';
+                }"""
+            )
+        )
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
         wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)

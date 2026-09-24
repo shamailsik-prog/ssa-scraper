@@ -929,3 +929,78 @@ async def test_login_scraping_disabled_outside_chambers(db, login_source, monkey
 
 async def _nosleep(_s):
     return None
+
+
+async def test_lock_release_never_deletes_another_workers_lock():
+    """Release is a compare-and-delete: a lock that expired and was taken by another worker in the
+    meantime must survive the first worker's release."""
+    r = aioredis.from_url(settings.REDIS_URL)
+    key = "corpus:login_session_lock:PakistanLawSite"
+    await r.delete(key)
+    lock1 = SessionLock("PakistanLawSite", r)
+    await lock1.acquire()
+    await r.set(key, "another-workers-token", ex=60)  # the TTL ran out and a second worker took it
+    await lock1.release()
+    assert (await r.get(key)) == b"another-workers-token"
+    await r.delete(key)
+    await r.aclose()
+
+
+async def test_page_capture_falls_back_to_forms_when_content_outlasts_the_timeout(monkeypatch):
+    """The live CitationSearch DOM is 10-16 MB; when page.content() outlasts the Playwright timeout
+    the forms (and the logout link) are captured on their own instead of the page being lost."""
+    monkeypatch.setattr(settings, "PLAYWRIGHT_TIMEOUT_MS", 100)  # floor is 5 s
+    page = _FakePage()
+
+    async def slow_content():
+        page.calls.append(("content",))
+        await asyncio.sleep(30)
+        return page.html
+
+    async def evaluate(script, *args):
+        page.calls.append(("evaluate", script, args))
+        assert "document.forms" in script
+        return '<html><head><title>Citation Search</title></head><body><a href="/Login/Logout">Logout</a><form id="f"><select name="book"></select></form></body></html>'
+
+    page.content = slow_content
+    page.evaluate = evaluate
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+    result = await browser.goto(settings.PLS_SEARCH_URL)
+    assert "<form" in result.html and "Logout" in result.html
+    assert result.classify().kind == "ok"
+
+
+async def test_paged_query_resumes_from_saved_next_url_not_page_one(db, login_source, monkeypatch):
+    """Specification 3.5: a Tier 3 row that stopped after 10 pages continues from its saved
+    next_url on the next run; it never resubmits the query and reprocesses page 1."""
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_TIER3_VOCABULARY", "")
+    await _activate(db, login_source)
+    next_url = "https://www.pakistanlawsite.com/r?page=11"
+    db.add(CrawlFrontier(source_name="PakistanLawSite", tier=3, query_key="t3:limitation", query_json={"keyword": "limitation"}, cursor_json={"page": 11, "row_index": 0, "next_url": next_url}, priority=80))
+    await db.commit()
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), search_form_html())
+    submitted = []
+
+    def search(values, browser):
+        submitted.append(values)
+        return PageResult(url="https://www.pakistanlawsite.com/r", html=results_html([("PLD 2024 SC 1", "Page one", "Supreme Court", "https://www.pakistanlawsite.com/case/1")]))
+
+    sc.default_search = search
+    sc.page(("goto", next_url), results_html([("PLD 2024 SC 11", "Page eleven", "Supreme Court", "https://www.pakistanlawsite.com/case/11")]))
+    sc.page(("goto", "https://www.pakistanlawsite.com/case/11"), judgment_html("PLD 2024 SC 11", title="Page eleven"))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert submitted == []  # the query was not resubmitted
+    assert stats["staged"] == 1
+    staged = (await db.execute(select(ScraperStaging))).scalars().first()
+    assert staged.extracted_citation == "PLD 2024 SC 11"
+    fr = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.tier == 3))).scalars().first()
+    assert fr.status == "done" and fr.yield_count == 1
