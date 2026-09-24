@@ -280,7 +280,7 @@ class SessionManager:
         s.storage_state_encrypted = settings.encrypt_value(raw)
         s.storage_state_hash = hashlib.sha256(raw.encode()).hexdigest()
         s.state = "ACTIVE"
-        s.state_reason = "human login completed"
+        s.state_reason = "human login completed" if by not in ("auto-recovery", "recovery") else f"login completed by {by} with the saved credentials"
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
@@ -295,6 +295,18 @@ class SessionManager:
             self.source.state_reason = None
             self.source.state_changed_at = datetime.now(timezone.utc)
             self.source.next_scrape_at = datetime.now(timezone.utc)
+
+    async def reactivate_slot(self, slot_number: int, reason: str, *, by: str = "recovery") -> BrowserSessionSlot:
+        """A slot the site had bounced turns out to hold a live session after a cool-down (the site
+        throttled the account rather than ending the login): put it back into rotation."""
+        s = await self.slot(slot_number)
+        s.state = "ACTIVE"
+        s.state_reason = reason[:1000]
+        s.last_verified_at = datetime.now(timezone.utc)
+        await self._resume_source_if_paused()
+        await self.db.flush()
+        await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active again: {reason} ({by})", source_name=self.source.source_name)
+        return s
 
     def load_storage_state(self, slot: BrowserSessionSlot) -> Dict[str, Any]:
         if not slot.storage_state_encrypted:
@@ -350,6 +362,38 @@ class SessionManager:
             return None
         logger.info("slot %s storage state refreshed from the live browser: %s", slot_number, ", ".join(cookie_summary(storage_state)) or "no cookies")
         return digest
+
+    # ---------------------------------------------------------------- saved sign-in (operator decision, 24 September 2026)
+    async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
+        s = await self.slot(slot_number)
+        s.login_username_encrypted = settings.encrypt_value(username.strip())
+        s.login_password_encrypted = settings.encrypt_value(password)
+        s.login_credentials_updated_at = datetime.now(timezone.utc)
+        s.login_credentials_updated_by = by
+        await self.db.flush()
+        return s
+
+    def load_login_credentials(self, slot: BrowserSessionSlot) -> Optional[Dict[str, str]]:
+        if not slot.login_username_encrypted or not slot.login_password_encrypted:
+            return None
+        try:
+            username = settings.decrypt_value(slot.login_username_encrypted).strip()
+            password = settings.decrypt_value(slot.login_password_encrypted)
+        except Exception as exc:
+            logger.warning("Ignoring malformed saved credentials for %s slot %s: %s", self.source.source_name, slot.slot_number, exc)
+            return None
+        if not username or not password:
+            return None
+        return {"username": username, "password": password}
+
+    async def clear_login_credentials(self, slot_number: int) -> BrowserSessionSlot:
+        s = await self.slot(slot_number)
+        s.login_username_encrypted = None
+        s.login_password_encrypted = None
+        s.login_credentials_updated_at = None
+        s.login_credentials_updated_by = None
+        await self.db.flush()
+        return s
 
     # ---------------------------------------------------------------- state transitions
     async def mark_needs_human_login(self, slot_number: int, reason: str) -> None:

@@ -94,8 +94,10 @@ Re-running the same command later (with the token lines again while private) upd
    type in the box under the picture (on a phone the keyboard opens there; on a computer you can
    also type straight into the picture), tap the password field, type, tick **I Agree with the
    Terms and Conditions**, tap **Sign in**, then **Complete**. Repeat on slot 2 so the alternate
-   slot can continue the same cursor if the primary is lost. Nothing but the encrypted storage
-   state is stored; a slot the site bounces waits for you (`NEEDS_HUMAN_LOGIN` notification).
+   slot can continue the same cursor if the primary is lost. Under **Saved sign-in** on the same
+   tab, save the username and password of each login once: the service then signs in again by
+   itself when the site ends a session (it ticks the box below the password for you). A
+   verification page is left for you (`NEEDS_HUMAN_LOGIN`).
 
    PakistanLawSite allows one login per account at a time. If the page shows **Logout From All
    Devices**, the account is still logged in elsewhere (your own browser or phone): enter the

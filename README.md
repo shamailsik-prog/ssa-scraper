@@ -79,15 +79,18 @@ validators and tests.
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
 
-### The human login is the only way a session is created
+### Human login, and the saved sign-in the operator asked for
 
 The dashboard's *Human login* tab streams a server-side Chromium to the operator, who types the
 username and password into it, ticks **I Agree with the Terms and Conditions** and signs in; on
-**Complete** the service stores only the Fernet-encrypted browser storage state in the chosen slot.
-No username or password is ever stored, logged or echoed by the service, nothing signs in
-unattended, and a slot the site bounces waits for a person (`NEEDS_HUMAN_LOGIN` notification).
-The site allows one live login per account: logging in to it yourself with the same account ends
-the scraper's session.
+**Complete** the service stores the Fernet-encrypted browser storage state in the chosen slot.
+On the operator's instruction of 24 September 2026 the tab also offers **Saved sign-in**: the
+username and password of each login are stored encrypted (never shown or logged again), and when
+the site ends a session the `recover-login-slots` task waits `LOGIN_RECOVERY_COOLDOWN_MINUTES`
+(15), re-opens the stored session, and if it is dead fills the form, ticks the box below the
+password and presses Sign in. A verification page is never solved: the slot then waits for a
+person (`NEEDS_HUMAN_LOGIN`). The site allows one live login per account: logging in to it
+yourself with the same account ends the scraper's session.
 
 ## Services (docker-compose)
 

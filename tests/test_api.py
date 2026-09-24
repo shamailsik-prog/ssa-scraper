@@ -299,3 +299,115 @@ def test_connect_google_drive_flow_stores_encrypted_refresh_token_and_creates_fo
     assert cfg["refresh_token"] == "1//refresh-token-value" and cfg["folder_id"] == "folder-id-123"
     creds = google_drive_credentials(cfg)
     assert creds.refresh_token == "1//refresh-token-value" and creds.client_id == "1234567890-abc.apps.googleusercontent.com"
+
+
+def test_saved_credentials_api_never_echoes_plaintext_password(client, admin_headers):
+    password = "Slot1-Top-Secret-Password!"
+    username = "slot1.user@example.com"
+    save = client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": username, "password": password, "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+    assert save.status_code == 200
+    body = json.dumps(save.json())
+    assert password not in body and username not in body
+    assert save.json()["username"] == "CONFIGURED" and save.json()["password"] == "CONFIGURED"
+
+    slots = client.get("/admin/sessions/PakistanLawSite", headers=admin_headers).json()
+    slots_dump = json.dumps(slots)
+    assert password not in slots_dump and username not in slots_dump
+    assert next(s for s in slots["slots"] if s["slot"] == 1)["credentials"]["password"] == "CONFIGURED"
+
+    creds = client.get("/admin/sessions/PakistanLawSite/credentials", headers=admin_headers).json()
+    creds_dump = json.dumps(creds)
+    assert password not in creds_dump and username not in creds_dump
+    assert next(s for s in creds["slots"] if s["slot"] == 1)["password"] == "CONFIGURED"
+
+
+def test_login_start_uses_saved_credentials_for_empty_slot(client, admin_headers, monkeypatch):
+    client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": "slot1.user@example.com", "password": "TopSecret#1", "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+    seen = {}
+
+    class DummySession:
+        status = "awaiting_human"
+        slot_number = 1
+        viewport = {"width": 1280, "height": 800}
+        last_autofill = {"applied": True, "submitted": True}
+
+    async def fake_start(source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+        seen["source_name"] = source_name
+        seen["slot_number"] = slot_number
+        seen["saved_credentials"] = saved_credentials
+        seen["auto_complete"] = auto_complete
+        return DummySession()
+
+    monkeypatch.setattr("scraper.routers.sessions.registry.start", fake_start)
+    r = client.post(
+        "/admin/sessions/PakistanLawSite/login/start",
+        json={"slot": 1, "use_saved_credentials": True, "auto_complete_if_empty": True},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert seen["source_name"] == "PakistanLawSite"
+    assert seen["saved_credentials"] == {"username": "slot1.user@example.com", "password": "TopSecret#1"}
+    assert seen["auto_complete"] is True
+    assert r.json()["saved_credentials_used"] is True and r.json()["auto_complete_attempted"] is True
+
+
+def test_login_start_ignores_malformed_saved_credentials(client, admin_headers, monkeypatch):
+    from scraper.database import SessionLocal
+    from scraper.models import BrowserSessionSlot
+
+    client.post(
+        "/admin/sessions/PakistanLawSite/credentials/1",
+        json={"username": "slot1.user@example.com", "password": "TopSecret#1", "saved_by": "ops-user"},
+        headers=admin_headers,
+    )
+
+    async def corrupt_saved_credentials():
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(BrowserSessionSlot).where(
+                        BrowserSessionSlot.source_name == "PakistanLawSite",
+                        BrowserSessionSlot.slot_number == 1,
+                    )
+                )
+            ).scalars().first()
+            row.login_username_encrypted = "bad-token"
+            row.login_password_encrypted = "bad-token"
+            await db.commit()
+
+    run_async(corrupt_saved_credentials())
+    seen = {}
+
+    class DummySession:
+        status = "awaiting_human"
+        slot_number = 1
+        viewport = {"width": 1280, "height": 800}
+        last_autofill = None
+
+    async def fake_start(source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+        seen["source_name"] = source_name
+        seen["slot_number"] = slot_number
+        seen["saved_credentials"] = saved_credentials
+        seen["auto_complete"] = auto_complete
+        return DummySession()
+
+    monkeypatch.setattr("scraper.routers.sessions.registry.start", fake_start)
+    r = client.post(
+        "/admin/sessions/PakistanLawSite/login/start",
+        json={"slot": 1, "use_saved_credentials": True, "auto_complete_if_empty": True},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200
+    assert seen["saved_credentials"] is None
+    assert seen["auto_complete"] is False
+    assert r.json()["saved_credentials_used"] is False
+    assert r.json()["auto_complete_attempted"] is False
+

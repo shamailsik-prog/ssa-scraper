@@ -125,7 +125,7 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
                 "limit_per_day": settings.PAGES_PER_DAY,
             }
             entry["slots"] = [
-                {"slot": sl.slot_number, "state": sl.state, "reason": sl.state_reason, "logged_in_at": _iso(sl.logged_in_at), "last_used_at": _iso(sl.last_used_at)}
+                {"slot": sl.slot_number, "state": sl.state, "reason": sl.state_reason, "logged_in_at": _iso(sl.logged_in_at), "last_used_at": _iso(sl.last_used_at), "saved_sign_in": bool(sl.login_username_encrypted and sl.login_password_encrypted)}
                 for sl in (
                     await db.execute(
                         select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == s.source_name).order_by(BrowserSessionSlot.slot_number)

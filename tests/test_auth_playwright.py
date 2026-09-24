@@ -1004,3 +1004,52 @@ async def test_paged_query_resumes_from_saved_next_url_not_page_one(db, login_so
     assert staged.extracted_citation == "PLD 2024 SC 11"
     fr = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.tier == 3))).scalars().first()
     assert fr.status == "done" and fr.yield_count == 1
+
+
+async def test_saved_credentials_encrypt_decrypt_round_trip(db, login_source):
+    mgr = SessionManager(db, login_source)
+    slot = await mgr.save_login_credentials(1, "advocate@example.com", "Sup3rSecret!", by="operator")
+    assert slot.login_username_encrypted and slot.login_username_encrypted.startswith("gAAAA")
+    assert slot.login_password_encrypted and slot.login_password_encrypted.startswith("gAAAA")
+    assert "advocate@example.com" not in slot.login_username_encrypted
+    assert "Sup3rSecret!" not in slot.login_password_encrypted
+    assert mgr.load_login_credentials(slot) == {"username": "advocate@example.com", "password": "Sup3rSecret!"}
+    await mgr.clear_login_credentials(1)
+    assert mgr.load_login_credentials(slot) is None
+
+
+async def test_saved_credentials_malformed_tokens_fail_closed(db, login_source):
+    mgr = SessionManager(db, login_source)
+    slot = await mgr.slot(1)
+    slot.login_username_encrypted = "not-a-fernet-token"
+    slot.login_password_encrypted = "also-not-a-token"
+    await db.flush()
+    assert mgr.load_login_credentials(slot) is None
+
+
+async def test_human_login_autofills_saved_credentials_and_can_submit(fixture_server):
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add(
+        "/login",
+        "<html><body><form onsubmit=\"document.getElementById('out').textContent='ok:'+u.value+'/'+p.value;return false;\">"
+        "<input id=u name='Login.UserName'><input id=p name='Login.Password' type='password'>"
+        "<input id=terms type=checkbox name='chkAgree'><input id=remember type=checkbox name='RememberMe'><button id=signin type=submit>Sign in</button></form><div id=out></div></body></html>",
+    )
+    reg = LoginSessionRegistry()
+    sess = await reg.start(
+        "PakistanLawSite",
+        1,
+        fixture_server.url("/login"),
+        saved_credentials={"username": "stored-user", "password": "stored-pass"},
+        auto_complete=True,
+    )
+    try:
+        await sess._page.wait_for_timeout(300)
+        data = await sess._page.evaluate("() => ({u: u.value, p: p.value, terms: terms.checked, out: document.getElementById('out').textContent})")
+        assert data == {"u": "stored-user", "p": "stored-pass", "terms": True, "out": "ok:stored-user/stored-pass"}
+        assert await sess._page.evaluate("() => remember.checked") is True  # every box in the form is ticked
+        assert sess.last_autofill and sess.last_autofill["applied"] and sess.last_autofill["submitted"]
+    finally:
+        await reg.cancel("PakistanLawSite")
+

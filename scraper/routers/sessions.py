@@ -6,10 +6,13 @@
     POST  /admin/sessions/{source}/login/complete             → verifies auth, stores encrypted state
     POST  /admin/sessions/{source}/login/cancel
     GET   /admin/sessions/{source}                            → slot states
+    GET   /admin/sessions/{source}/credentials                → saved sign-in status per slot (never values)
+    POST  /admin/sessions/{source}/credentials/{n}            → save username/password (Fernet-encrypted)
+    POST  /admin/sessions/{source}/credentials/{n}/clear      → clear saved credentials
     POST  /admin/sessions/{source}/slots/{n}/{pause|resume|clear}
 
-The streamed human login is the only way a session is created (specification 3.2). No
-username or password is ever stored by the service.
+Operator decision of 24 September 2026: a username and password may be saved per slot; the service
+signs in with them when a slot is lost. Values are never echoed by any endpoint.
 """
 
 from __future__ import annotations
@@ -36,10 +39,18 @@ router = APIRouter(prefix="/admin/sessions", tags=["sessions"])
 class StartLogin(BaseModel):
     slot: int = Field(default=1, ge=1, le=2)
     started_by: str = "operator"
+    use_saved_credentials: bool = True
+    auto_complete_if_empty: bool = True
     # Size of the streamed browser. A phone-sized viewport makes the site render its mobile layout,
     # so the stream fits a phone screen and fields are large enough to tap.
     viewport_width: Optional[int] = Field(default=None, ge=320, le=1920)
     viewport_height: Optional[int] = Field(default=None, ge=480, le=1600)
+
+
+class SaveCredentials(BaseModel):
+    username: str = Field(min_length=1, max_length=300)
+    password: str = Field(min_length=1, max_length=300)
+    saved_by: str = "operator"
 
 
 async def _source(db: AsyncSession, name: str) -> ScraperSource:
@@ -59,6 +70,12 @@ def _slot_view(r: BrowserSessionSlot) -> Dict[str, Any]:
         "logged_in_by": r.logged_in_by,
         "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,
         "reconnects": r.reconnect_count,
+        "credentials": {
+            "username": "CONFIGURED" if r.login_username_encrypted else "NOT CONFIGURED",
+            "password": "CONFIGURED" if r.login_password_encrypted else "NOT CONFIGURED",
+            "updated_at": r.login_credentials_updated_at.isoformat() if r.login_credentials_updated_at else None,
+            "updated_by": r.login_credentials_updated_by,
+        },
     }
 
 
@@ -85,6 +102,38 @@ async def slots(source: str, db: AsyncSession = Depends(get_db)) -> Dict[str, An
     }
 
 
+@router.get("/{source}/credentials", dependencies=[Depends(require_admin)])
+async def get_credentials(source: str, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    s = await _source(db, source)
+    rows = await SessionManager(db, s).slots()
+    return {"source": source, "slots": [{"slot": r.slot_number, "role": r.role, **_slot_view(r)["credentials"]} for r in rows]}
+
+
+@router.post("/{source}/credentials/{slot}", dependencies=[Depends(require_admin)])
+async def save_credentials(source: str, slot: int, body: SaveCredentials, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    s = await _source(db, source)
+    if not settings.ENCRYPTION_KEY:
+        raise HTTPException(409, "ENCRYPTION_KEY is NOT CONFIGURED; credentials cannot be encrypted")
+    username = body.username.strip()
+    if not username:
+        raise HTTPException(422, "username is required")
+    manager = SessionManager(db, s)
+    await _slot_or_422(manager, slot)
+    row = await manager.save_login_credentials(slot, username, body.password, by=body.saved_by)
+    await db.commit()
+    return {"source": source, "slot": row.slot_number, "username": "CONFIGURED", "password": "CONFIGURED", "updated_at": row.login_credentials_updated_at.isoformat() if row.login_credentials_updated_at else None, "updated_by": row.login_credentials_updated_by}
+
+
+@router.post("/{source}/credentials/{slot}/clear", dependencies=[Depends(require_admin)])
+async def clear_credentials(source: str, slot: int, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    s = await _source(db, source)
+    manager = SessionManager(db, s)
+    await _slot_or_422(manager, slot)
+    row = await manager.clear_login_credentials(slot)
+    await db.commit()
+    return {"source": source, "slot": row.slot_number, "username": "NOT CONFIGURED", "password": "NOT CONFIGURED"}
+
+
 @router.post("/{source}/login/start", dependencies=[Depends(require_admin)])
 async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     s = await _source(db, source)
@@ -94,6 +143,8 @@ async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(
         raise HTTPException(409, "ENCRYPTION_KEY is NOT CONFIGURED; storage state cannot be encrypted")
     if s.state == "HALTED":
         raise HTTPException(409, f"source is HALTED: {s.state_reason}; re-enable after admin review first")
+    saved = manager.load_login_credentials(row) if body.use_saved_credentials else None
+    auto_complete = bool(saved and body.auto_complete_if_empty and row.state in ("EMPTY", "NEEDS_HUMAN_LOGIN"))
     viewport = {"width": body.viewport_width, "height": body.viewport_height} if body.viewport_width and body.viewport_height else None
     try:
         sess = await registry.start(
@@ -102,15 +153,25 @@ async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(
             settings.PLS_LOGIN_URL if source == "PakistanLawSite" else s.source_url,
             started_by=body.started_by,
             viewport=viewport,
+            saved_credentials=saved,
+            auto_complete=auto_complete,
         )
     except LoginSessionError as exc:
         raise HTTPException(409, str(exc))
+    note = "type your username and password in the streamed browser, tick 'I Agree', sign in, then press Complete"
+    if saved:
+        note = "saved credentials applied and the boxes ticked; confirm the page and press Complete"
+        if auto_complete:
+            note = "saved credentials applied, boxes ticked and Sign in pressed; press Complete once the page shows you signed in"
     return {
         "status": sess.status,
         "slot": sess.slot_number,
         "viewport": sess.viewport,
         "stream": f"/admin/sessions/{source}/login/stream",
-        "note": "type your username and password in the streamed browser, tick 'I Agree', sign in, then press Complete",
+        "saved_credentials_used": bool(saved),
+        "auto_complete_attempted": auto_complete,
+        "autofill": sess.last_autofill,
+        "note": note,
     }
 
 

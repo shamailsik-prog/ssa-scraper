@@ -232,8 +232,7 @@ for key in (
     "BACKFILL_SOURCE_FREQUENCY_MINUTES", "BACKFILL_TARGET_JUDGMENTS", "BACKFILL_TARGET_STATUTES",
     "BACKFILL_LOGIN_DELAY_MIN", "BACKFILL_LOGIN_DELAY_MAX", "BACKFILL_PAGES_PER_HOUR", "BACKFILL_PAGES_PER_DAY",
     "BACKFILL_LOGIN_SESSION_CONCURRENCY", "BLOCK_RETRY_COOLDOWN_MINUTES", "BLOCK_RETRY_MAX_ATTEMPTS",
-    "LOGIN_AUTO_RECOVER", "LOGIN_RECOVERY_COOLDOWN_MINUTES", "LOGIN_RECOVERY_SCHEDULE_SECONDS",
-    "LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS", "PLS_ARCHIVED_GRID_MAX_ROWS", "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS",
+    "PLS_ARCHIVED_GRID_MAX_ROWS", "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS",
     "PLS_CITATION_GRID_MAX_DETAIL", "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", "PLS_CITATION_GRID_SCAN_WINDOW",
     "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", "PLS_RUN_MAX_MINUTES", "BACKFILL_PLS_RUN_MAX_MINUTES",
     "PLS_CITATION_GRID_SKIP_STAGED", "PLAYWRIGHT_MAX_HTML_BYTES", "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
@@ -318,8 +317,8 @@ EOF
 fi
 
 # ---------------------------------------------------------------- server-side automation outside the repository
-# A PakistanLawSite session is created only by the human login on the dashboard, and Beat
-# dispatches the service's own jobs. Cron entries found on the server that log in to PakistanLawSite
+# The service re-verifies and, with saved credentials, re-establishes its own logins
+# (recover-login-slots), and Beat dispatches its own jobs. Cron entries found on the server that log in to PakistanLawSite
 # or dispatch jobs from outside the compose stack fight the service: every extra login ends the
 # session the worker is using (the site allows one live session per account), which is what made
 # the harvest lose its login every 30 minutes on 23 September 2026. They are not part of this

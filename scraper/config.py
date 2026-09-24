@@ -143,6 +143,16 @@ class Settings(BaseSettings):
     PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
     PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
     LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker processes. One login-session worker runs at a time (specification 3.1); any other value is refused.")
+    LOGIN_AUTO_RECOVER: bool = Field(
+        default=True,
+        description="Operator decision of 24 September 2026: LOGIN_RECOVERY_COOLDOWN_MINUTES after the site bounced a slot, "
+        "re-open the stored session and put the slot back if the search page renders; if it is dead, sign in again with the "
+        "credentials the operator saved for the slot (the box below the password ticked) and store the new session. "
+        "Verification/CAPTCHA pages are never solved: the slot then waits for a human.",
+    )
+    LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
+    LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
+    LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
     MIRROR_LOGIN_SESSION_ROWS: bool = Field(default=False, description="Whether login_session judgments may be mirrored to archive targets.")
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
@@ -365,6 +375,8 @@ class Settings(BaseSettings):
             raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
         if self.LOGIN_SESSION_CONCURRENCY != 1:
             raise ValueError("LOGIN_SESSION_CONCURRENCY other than 1 is refused: one login-session worker runs at a time")
+        if self.LOGIN_RECOVERY_COOLDOWN_MINUTES < 0 or self.LOGIN_RECOVERY_SCHEDULE_SECONDS <= 0 or self.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS < 0:
+            raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
         if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:

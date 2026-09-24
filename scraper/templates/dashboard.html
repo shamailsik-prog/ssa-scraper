@@ -72,6 +72,21 @@
       <div class="note">CAPTCHA and verification pages are never solved by code. Complete login in the streamed Chromium, then mark the slot complete.</div>
       <div id="loginSlots" class="note" style="margin-top:8px">Connect to load PakistanLawSite slots.</div>
     </section>
+    <section>
+      <h2>Saved sign-in (the service logs in by itself when a slot is lost)</h2>
+      <p class="note">Save the username and password of each PakistanLawSite login once. They are stored encrypted and never shown again. When the site ends a session, the service waits 15 minutes, re-opens the stored session and, if it is dead, fills the form, ticks the box below the password and presses Sign in. A verification page is left for you.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <label>Slot <select id="credSlot"><option value="1">1</option><option value="2">2</option></select></label>
+        <label>Username <input id="credUser" size="24" autocomplete="off"></label>
+        <label>Password <input id="credPass" type="password" size="20" autocomplete="off"></label>
+        <button class="primary" onclick="saveCredentials()">Save</button>
+        <button onclick="clearCredentials()">Clear</button>
+        <button onclick="loginWithSaved()">Sign in now with saved</button>
+        <button onclick="completeLogin()">Complete</button>
+        <span id="credMeta" class="note"></span>
+      </div>
+      <div id="credList" style="margin-top:8px"></div>
+    </section>
   </div>
   <div id="review" hidden>
     <section>
@@ -208,10 +223,26 @@ async function triggerSource(name){
 async function loadLogin(){
   try{
     const s=await get('/admin/sessions/PakistanLawSite');
-    const slots=s.slots||s||[];
-    const rows=Array.isArray(slots)?slots:(slots.slots||[]);
     $('loginSlots').innerHTML='<pre>'+esc(JSON.stringify(s,null,2))+'</pre>';
+    const rows=(s.slots||[]);
+    $('credList').innerHTML='<table><tr><th>slot</th><th>state</th><th>username</th><th>password</th><th>saved at</th></tr>'+rows.map(r=>'<tr>'+cell(r.slot)+cell(r.state)+cell((r.credentials||{}).username)+cell((r.credentials||{}).password)+cell((r.credentials||{}).updated_at||'-')+'</tr>').join('')+'</table>';
   }catch(e){$('loginSlots').textContent='error: '+e.message}
+}
+async function saveCredentials(){
+  const slot=$('credSlot').value;
+  try{await post('/admin/sessions/PakistanLawSite/credentials/'+slot,{username:$('credUser').value.trim(),password:$('credPass').value,saved_by:'dashboard'});$('credPass').value='';$('credMeta').textContent='saved for slot '+slot;loadLogin();}catch(e){$('credMeta').textContent='save failed: '+e.message}
+}
+async function clearCredentials(){
+  const slot=$('credSlot').value;
+  try{await post('/admin/sessions/PakistanLawSite/credentials/'+slot+'/clear');$('credMeta').textContent='cleared slot '+slot;loadLogin();}catch(e){$('credMeta').textContent='clear failed: '+e.message}
+}
+async function loginWithSaved(){
+  const slot=parseInt($('credSlot').value,10);
+  $('credMeta').textContent='signing in…';
+  try{const d=await post('/admin/sessions/PakistanLawSite/login/start',{slot:slot,use_saved_credentials:true,auto_complete_if_empty:true});$('credMeta').textContent=d.note||JSON.stringify(d);}catch(e){$('credMeta').textContent='start failed: '+e.message}
+}
+async function completeLogin(){
+  try{const d=await post('/admin/sessions/PakistanLawSite/login/complete');$('credMeta').textContent=d.stored?'stored in slot '+d.slot:'not stored: '+(d.detail||d.verdict||JSON.stringify(d));loadLogin();}catch(e){$('credMeta').textContent='complete failed: '+e.message}
 }
 async function loadReview(){
   try{
