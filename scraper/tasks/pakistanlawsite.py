@@ -174,6 +174,9 @@ def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict
 
 def unmapped_query_reason(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
     """Explain why no safely mapped form field can express a frontier query."""
+    surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+    if surface == "grid_surface_no_query_form":
+        return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     values = build_values(search_map, query, cursor)
     fields = search_map.get("fields") or {}
     if "reporter" in query:

@@ -42,7 +42,7 @@ from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
-from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, citation_search_hybrid_html, judgment_html, results_html, search_form_html
+from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, citation_search_grid_only_html, citation_search_hybrid_html, judgment_html, results_html, search_form_html
 
 STATE = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
 
@@ -406,6 +406,23 @@ async def test_playwright_submit_search_rejects_unsafe_mapped_control_before_fil
     assert not any(call[0] == "fill" for call in page.calls)
 
 
+async def test_playwright_submit_search_rejects_grid_only_surface_before_fill():
+    page = _FakePage()
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    with pytest.raises(SearchFormSubmissionError, match="grid_surface_no_query_form"):
+        await browser.submit_search(
+            {
+                "surface": "grid_surface_no_query_form",
+                "fields": {"keyword": {"selector": "#gridSearch", "kind": "text"}},
+            },
+            {"keyword": "test"},
+        )
+
+    assert not any(call[0] == "fill" for call in page.calls)
+
+
 async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_server):
     """Phones have no hardware keyboard: the dashboard sends text and named keys, and learns which
     field has focus after each tap (type and label only, never a value). Reopening the login for the
@@ -643,6 +660,36 @@ async def test_search_form_map_prefers_citation_form_over_grid_filters(db, login
         "year": "2024",
         "citation": "3",
     }
+
+
+async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query_form(db, login_source):
+    m = await map_search_form(db, login_source, citation_search_grid_only_html())
+
+    assert m.fields == {"_all": []}
+    assert m.limits["surface"] == "grid_surface_no_query_form"
+    assert m.result_layout["row_selector"] == "table#citationGrid tr"
+
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    frontier = CrawlFrontier(
+        source_name="PakistanLawSite",
+        tier=3,
+        query_key="t3:constitutional",
+        query_json={"keyword": "constitutional"},
+        cursor_json={"page": 1},
+    )
+    await pipeline.run_paged_query(
+        frontier,
+        {
+            "fields": m.fields,
+            "limits": m.limits,
+            "surface": m.limits["surface"],
+        },
+        max_pages=1,
+    )
+
+    assert frontier.status == "retired"
+    assert frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available"
+    assert pipeline.stats["queries"] == 0
 
 
 async def test_paged_query_retires_with_explicit_unmapped_role_reason(db, login_source):

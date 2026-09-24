@@ -88,6 +88,18 @@ def citation_search_hybrid_html() -> str:
     </body></html>"""
 
 
+def citation_search_grid_only_html() -> str:
+    """CitationSearch result grid with DataTables-style filters but no query form."""
+    return """<html><body>
+    <div id="citationGrid_filter"><label>Filter <input id="gridSearch" name="citation_filter" type="search"></label></div>
+    <table id="citationGrid"><thead><tr><th>Citation</th><th>Case Title</th><th>Court</th></tr></thead>
+      <tbody><tr><td><input name="citation_column_filter"></td><td><input name="title_filter"></td><td><input name="court_filter"></td></tr>
+      <tr><td>PLD 2024 SC 1</td><td><a href="/case/1">Party v State</a></td><td>Supreme Court</td></tr></tbody>
+    </table>
+    <a id="nextResults" rel="next" href="/Login/CitationSearch?page=2">Next</a>
+    </body></html>"""
+
+
 def results_html(rows: List[Tuple[str, str, str, str]], next_page: Optional[str] = None) -> str:
     trs = "".join(f'<tr><td>{c}</td><td><a href="{u}">{t}</a></td><td>{court}</td></tr>' for c, t, court, u in rows)
     nxt = f'<a rel="next" href="{next_page}">Next</a>' if next_page else ""
