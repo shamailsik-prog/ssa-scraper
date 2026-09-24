@@ -192,10 +192,12 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
     now = datetime.now(timezone.utc)
     if body.action == "pause":
         s.state, s.state_reason = "PAUSED", body.reason or "paused by admin"
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": True}
     elif body.action == "resume":
         if s.state == "HALTED":
             raise HTTPException(409, "a HALTED source needs re_enable with reviewed_by")
         s.state, s.state_reason = "ACTIVE", None
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": False}
     elif body.action == "re_enable":
         if not body.reviewed_by:
             raise HTTPException(422, "re_enable requires reviewed_by (admin review of the block)")

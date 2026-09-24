@@ -423,3 +423,65 @@ async def test_paused_source_is_left_alone_when_admin_paused_or_too_recent(db, l
         assert row.state == "PAUSED"
 
 
+
+
+async def test_recovery_never_lifts_a_pause_an_admin_set(db, login_source, monkeypatch):
+    """An admin's pause (flagged from the dashboard) survives a verified slot and a saved-credential
+    sign-in; only a continuity pause is lifted."""
+    from datetime import datetime, timedelta, timezone
+
+    await _bounce_slot(db, login_source, 1)
+    login_source.state = "PAUSED"
+    login_source.state_reason = "stop for the weekend"
+    login_source.config_json = {**(login_source.config_json or {}), "paused_by_admin": True}
+    login_source.state_changed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    await db.commit()
+    mgr = SessionManager(db, login_source)
+    assert mgr.is_admin_paused()
+    await mgr.reactivate_slot(1, "verified", by="recovery")
+    await db.commit()
+    assert login_source.state == "PAUSED"
+    assert await login_recovery.resume_paused_source(db, mgr, now=datetime.now(timezone.utc)) is None
+    assert login_source.state == "PAUSED"
+    # a human's Complete lifts it (specification 3.2)
+    await mgr.save_storage_state(1, {"cookies": [{"name": "sid", "value": "x", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}, by="operator")
+    await db.commit()
+    assert login_source.state == "ACTIVE" and not (login_source.config_json or {}).get("paused_by_admin")
+
+
+async def test_verified_slot_keeps_the_cookies_the_site_renewed(db, login_source, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from scraper.auth.session_manager import PageResult
+
+    await _bounce_slot(db, login_source, 1)
+    slot = await _slot(db, 1)
+    before = slot.storage_state_hash
+    login_source.config_json = {**(login_source.config_json or {}), recovery_key(1): {"attempts": 0, "lost_at": "2026-09-24T00:00:00+00:00", "next_attempt_at": "2026-09-24T00:00:00+00:00", "last_outcome": "scheduled"}}
+    await db.commit()
+
+    class Browser:
+        def __init__(self, state, n):
+            self.state, self.slot_number = state, n
+
+        async def goto(self, url, **kw):
+            return PageResult(url=url, html="<html><body><a href='/logout'>Logout</a><form id='searchForm'></form></body></html>", status=200)
+
+        async def export_storage_state(self):
+            return {"cookies": [{"name": "ASP.NET_SessionId", "value": "renewed-value", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+
+        async def close(self):
+            pass
+
+    async def factory(state, n):
+        return Browser(state, n)
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    outcome = await recover_slot(db, SessionManager(db, login_source), slot, now=datetime.now(timezone.utc) + timedelta(minutes=1), browser_factory=factory, redis_client=r)
+    await db.commit()
+    await r.aclose()
+    assert outcome.get("recovered") == "verified"
+    slot = await _slot(db, 1)
+    assert slot.state == "ACTIVE" and slot.storage_state_hash != before
+    assert any(c["value"] == "renewed-value" for c in __import__("json").loads(settings.decrypt_value(slot.storage_state_encrypted))["cookies"])

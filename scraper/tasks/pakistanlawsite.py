@@ -575,6 +575,7 @@ class PakistanLawSitePipeline:
             await lock.acquire()
         except SessionLockHeld:
             logger.warning("refusing to start: another login-session worker holds the lock")
+            await lock.release()  # closes the client the lock opened for itself
             raise
         try:
             self._session_lock = lock

@@ -284,17 +284,35 @@ class SessionManager:
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
-        await self._resume_source_if_paused()
+        # A human's Complete lifts any pause (specification 3.2); the service's own sign-in never
+        # lifts a pause an admin set.
+        await self._resume_source_if_paused(respect_admin=by in ("auto-recovery", "recovery"))
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active (login by {by})", source_name=self.source.source_name)
         return s
 
-    async def _resume_source_if_paused(self) -> None:
-        if self.source.state == "PAUSED":
-            self.source.state = "ACTIVE"
-            self.source.state_reason = None
-            self.source.state_changed_at = datetime.now(timezone.utc)
-            self.source.next_scrape_at = datetime.now(timezone.utc)
+    def is_admin_paused(self) -> bool:
+        """A pause an admin set from the dashboard (flagged in the source config, or worded so)
+        is never lifted by the service's own recovery; only a human or an admin action lifts it."""
+        if self.source.state != "PAUSED":
+            return False
+        cfg = dict(self.source.config_json or {})
+        if cfg.get("paused_by_admin"):
+            return True
+        return "admin" in (self.source.state_reason or "").lower()
+
+    async def _resume_source_if_paused(self, *, respect_admin: bool = False) -> None:
+        if self.source.state != "PAUSED":
+            return
+        if respect_admin and self.is_admin_paused():
+            return
+        self.source.state = "ACTIVE"
+        self.source.state_reason = None
+        self.source.state_changed_at = datetime.now(timezone.utc)
+        self.source.next_scrape_at = datetime.now(timezone.utc)
+        cfg = dict(self.source.config_json or {})
+        if cfg.get("paused_by_admin"):
+            await merge_source_config(self.db, self.source, {"paused_by_admin": False})
 
     async def reactivate_slot(self, slot_number: int, reason: str, *, by: str = "recovery") -> BrowserSessionSlot:
         """A slot the site had bounced turns out to hold a live session after a cool-down (the site
@@ -303,7 +321,7 @@ class SessionManager:
         s.state = "ACTIVE"
         s.state_reason = reason[:1000]
         s.last_verified_at = datetime.now(timezone.utc)
-        await self._resume_source_if_paused()
+        await self._resume_source_if_paused(respect_admin=True)
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active again: {reason} ({by})", source_name=self.source.source_name)
         return s

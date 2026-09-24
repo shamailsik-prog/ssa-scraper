@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -36,8 +37,9 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.fetchers import HttpFetcher, canonical_text_hash
+from scraper.fetchers import HttpFetcher, canonical_text_hash, pdf_text_with_ocr
 from scraper.models import Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
 
@@ -98,27 +100,42 @@ async def check_judgments(
     try:
         await lock.acquire()
     except SessionLockHeld:
+        await lock.release()  # closes the client the lock opened for itself
         return [{"skipped": "a login-session job holds the lock; checked on the next run"}]
     results: List[Dict[str, Any]] = []
     try:
         pipeline._session_lock = lock
-        if await pipeline.manager.current_slot() is None:
+        slot = await pipeline.manager.current_slot()
+        if slot is None:
             return [{"skipped": "no ACTIVE slot"}]
+        # The page is fetched on the current slot only: a spot check never walks the continuity
+        # ladder (no reconnect on the alternate slot, no switch of the current slot), so a bounce
+        # here costs one slot its state exactly as a harvest would, and nothing more.
+        browser = await pipeline.runner.open(slot)
         for j in rows:
             label = j.canonical_citation
             try:
-                page = await pipeline.fetch_detail(j.source_url)
+                await pipeline._charge_page()
+                page = await browser.goto(j.source_url, capture_case_description_modal=bool(re.search(r"ReferenceCaseLawSearch", j.source_url or "", flags=re.IGNORECASE)))
+                await pipeline.manager.touch(slot.slot_number)
+                raise_for_verdict(page)
             except PacingBudgetExceeded as exc:
                 results.append({"label": label, "result": "skipped", "detail": f"pacing: {exc}"})
                 _record(db, kind="judgment", label=label, url=j.source_url, result="skipped", detail=f"pacing budget spent: {exc}", record_id=j.id)
                 break
-            except (LoginRequired, VerificationRequired, NoActiveSlot, BrowserDisconnected) as exc:
+            except (LoginRequired, VerificationRequired) as exc:
+                await pipeline.manager.mark_needs_human_login(slot.slot_number, f"{type(exc).__name__}: {exc}")
                 results.append({"label": label, "result": "login_required", "detail": str(exc)[:300]})
                 _record(db, kind="judgment", label=label, url=j.source_url, result="login_required", detail=f"{type(exc).__name__}: {exc}", record_id=j.id)
                 break
+            except (NoActiveSlot, BrowserDisconnected) as exc:
+                results.append({"label": label, "result": "unreachable", "detail": str(exc)[:300]})
+                _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=j.id)
+                break
             except ExplicitBlock as exc:
+                await pipeline.manager.halt_source(f"explicit block during a spot check: {exc}", slot_number=slot.slot_number)
                 results.append({"label": label, "result": "unreachable", "detail": f"block: {exc}"})
-                _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"block: {exc}", record_id=j.id)
+                _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"block, source halted: {exc}", record_id=j.id)
                 break
             text = clean_html(page.html)
             modal_text = strip_leading_judgment_chrome((page.metadata or {}).get("case_description_modal_text"))
@@ -128,8 +145,10 @@ async def check_judgments(
             live_hash = canonical_text_hash(text)
             stored_hash = j.full_text_hash or canonical_text_hash(j.full_text or "")
             citation_seen = _norm(j.canonical_citation).lower() in _norm(page.html).lower() or _norm(j.canonical_citation).lower() in _norm(text).lower()
-            if live_hash == stored_hash:
-                result, detail, sim = "match", "stored full text is exactly what the site shows" + ("" if citation_seen else "; citation string not seen on the page"), 1.0
+            if live_hash == stored_hash and citation_seen:
+                result, detail, sim = "match", "stored full text is exactly what the site shows and the citation is on the page", 1.0
+            elif live_hash == stored_hash:
+                result, detail, sim = "differs", "the text matches but the stored citation is not on the page (the URL may now serve another document)", 1.0
             else:
                 sim = _similarity(_norm(text), _norm(j.full_text or ""))
                 result = "differs"
@@ -181,6 +200,21 @@ async def check_statute_sections(db, *, sample: Optional[int] = None, allow_priv
         try:
             async with HttpFetcher(source, allow_private_for_tests=allow_private_for_tests) as fetcher:
                 res = await fetcher.get(prov.source_url)
+        except ExplicitBlock as exc:
+            if exc.kind == "robots_disallow":
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"robots.txt disallows the page now: {str(exc)[:200]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": "robots disallow"})
+                continue
+            # A block halts the source exactly as the public pipeline does (specification 3.7 / 4.5).
+            now = datetime.now(timezone.utc)
+            source.state = "HALTED"
+            source.state_reason = f"explicit block during a spot check: {str(exc)[:900]}"
+            source.state_changed_at = now
+            source.requires_admin_review = True
+            await notify(db, level="critical", code="SOURCE_HALTED", message=f"explicit block — {str(exc)[:500]}; no evasion attempted; admin review required (spot check)", source_name=source.source_name)
+            _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"block, source halted: {str(exc)[:300]}", record_id=section.id)
+            results.append({"label": label, "result": "unreachable", "detail": f"block: {str(exc)[:200]}"})
+            break
         except Exception as exc:
             _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=section.id)
             results.append({"label": label, "result": "unreachable", "detail": str(exc)[:200]})
@@ -189,11 +223,16 @@ async def check_statute_sections(db, *, sample: Optional[int] = None, allow_priv
             _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"HTTP {res.status_code}", record_id=section.id)
             results.append({"label": label, "result": "unreachable", "detail": f"HTTP {res.status_code}"})
             continue
-        page_text = _norm(clean_html(res.text)) if "html" in (res.content_type or "").lower() or res.text.lstrip().startswith("<") else _norm(res.text)
+        if res.is_pdf:
+            page_text, _ocr = pdf_text_with_ocr(res.content)
+            page_text = _norm(page_text)
+        elif "html" in (res.content_type or "").lower() or res.text.lstrip().startswith("<"):
+            page_text = _norm(clean_html(res.text))
+        else:
+            page_text = _norm(res.text)
         stored = _norm(version.section_text)
-        probe = stored[:400]
-        if probe and probe.lower() in page_text.lower():
-            result, detail, sim = "match", "stored section text found on the source page", 1.0
+        if stored and stored.lower() in page_text.lower():
+            result, detail, sim = "match", "the whole stored section text is on the source page", 1.0
         else:
             sim = _similarity(page_text, stored)
             # the section number with a piece of its heading is a weaker sign the section is still there
