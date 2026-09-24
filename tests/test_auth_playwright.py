@@ -17,6 +17,7 @@ from scraper.auth.session_manager import (
     ContinuityRunner,
     PageResult,
     PlaywrightBrowser,
+    SearchFormSubmissionError,
     SessionLock,
     SessionLockHeld,
     SessionManager,
@@ -41,7 +42,7 @@ from scraper.security import ExplicitBlock, VerificationRequired
 from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
-from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
+from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, citation_search_hybrid_html, judgment_html, results_html, search_form_html
 
 STATE = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
 
@@ -391,6 +392,20 @@ async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():
     assert nav_call[1]["timeout"] == settings.PLAYWRIGHT_TIMEOUT_MS
 
 
+async def test_playwright_submit_search_rejects_unsafe_mapped_control_before_fill():
+    page = _FakePage()
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+
+    with pytest.raises(SearchFormSubmissionError, match="unsupported control kind"):
+        await browser.submit_search(
+            {"fields": {"keyword": {"selector": "#gridFilter", "kind": "hidden"}}},
+            {"keyword": "test"},
+        )
+
+    assert not any(call[0] == "fill" for call in page.calls)
+
+
 async def test_human_login_typing_box_text_named_keys_and_focus_info(fixture_server):
     """Phones have no hardware keyboard: the dashboard sends text and named keys, and learns which
     field has focus after each tap (type and label only, never a value). Reopening the login for the
@@ -610,6 +625,40 @@ async def test_search_form_map_deterministic_and_verified(db, login_source):
     assert vals == {"reporter": "PLD", "year": "2024", "page": "3"}
     m2 = await map_search_form(db, login_source, search_form_html())
     assert m2.map_version == 2 and not m.is_active
+
+
+async def test_search_form_map_prefers_citation_form_over_grid_filters(db, login_source):
+    m = await map_search_form(db, login_source, citation_search_hybrid_html())
+
+    assert set(m.fields) >= {"reporter", "year", "citation", "keyword", "submit"}
+    assert m.fields["reporter"]["selector"] == "#reporter"
+    assert m.fields["citation"]["selector"] == "#citationPage"
+    assert m.fields["keyword"]["selector"] == "#queryText"
+    assert "citation_filter" not in {field["name"] for field in m.fields["_all"]}
+    assert "title_filter" not in {field["name"] for field in m.fields["_all"]}
+    assert m.result_layout["row_selector"] == "table#citationGrid tr"
+    assert m.pagination["next_selector"] == "a#nextResults"
+    assert build_values({"fields": m.fields}, {"reporter": "PLD", "year": 2024}, {"page_no": 3}) == {
+        "reporter": "PLD",
+        "year": "2024",
+        "citation": "3",
+    }
+
+
+async def test_paged_query_retires_with_explicit_unmapped_role_reason(db, login_source):
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    frontier = CrawlFrontier(
+        source_name="PakistanLawSite",
+        tier=3,
+        query_key="t3:constitutional",
+        query_json={"keyword": "constitutional"},
+        cursor_json={"page": 1},
+    )
+
+    await pipeline.run_paged_query(frontier, {"fields": {"submit": {"selector": "#go", "kind": "submit"}}}, max_pages=1)
+
+    assert frontier.status == "retired"
+    assert frontier.last_error == "search map cannot express keyword query; missing usable role: keyword"
 
 
 async def test_tier1_volume_closes_after_40_misses_and_frontier_is_truth(db, login_source, monkeypatch):

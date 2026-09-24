@@ -69,6 +69,25 @@ def search_form_html() -> str:
     <table id="results"><tr><th>Citation</th><th>Title</th><th>Court</th></tr></table></body></html>"""
 
 
+def citation_search_hybrid_html() -> str:
+    """CitationSearch-like page: a real query form beside result-grid filter controls."""
+    return """<html><body>
+    <form id="citationSearchForm" action="/Login/CitationSearch" method="post">
+      <label for="reporter">Reporter</label><select id="reporter" name="book"><option value="PLD">PLD</option></select>
+      <input id="citationYear" name="year" aria-label="Citation year">
+      <input id="citationPage" name="citation_no" aria-label="Citation number">
+      <textarea id="queryText" name="keywords" placeholder="Search words"></textarea>
+      <button id="searchCases" type="submit">Search</button>
+      <input name="hidden_token" type="hidden" value="not-fillable">
+    </form>
+    <table id="citationGrid"><thead><tr><th>Citation</th><th>Case Title</th><th>Court</th></tr></thead>
+      <tbody><tr><td><input name="citation_filter" readonly></td><td><input name="title_filter"></td><td><input name="court_filter"></td></tr>
+      <tr><td>PLD 2024 SC 1</td><td><a href="/case/1">Party v State</a></td><td>Supreme Court</td></tr></tbody>
+    </table>
+    <a id="nextResults" rel="next" href="/Login/CitationSearch?page=2">Next</a>
+    </body></html>"""
+
+
 def results_html(rows: List[Tuple[str, str, str, str]], next_page: Optional[str] = None) -> str:
     trs = "".join(f'<tr><td>{c}</td><td><a href="{u}">{t}</a></td><td>{court}</td></tr>' for c, t, court, u in rows)
     nxt = f'<a rel="next" href="{next_page}">Next</a>' if next_page else ""

@@ -27,6 +27,7 @@ from scraper.models import ScraperSource, SearchFormMap
 from scraper.notify import notify
 
 logger = logging.getLogger(__name__)
+SAFE_FIELD_KINDS = {"select", "textarea", "text", "search", "number", "date", "email", "tel", "url", "password", "checkbox", "radio", "submit"}
 
 
 def dom_hash(html: str) -> str:
@@ -36,7 +37,7 @@ def dom_hash(html: str) -> str:
 
 
 def verify_selectors(html: str, proposal: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only fields/selectors that actually resolve in the DOM."""
+    """Keep only DOM-resolving controls that the browser can safely submit."""
     soup = BeautifulSoup(html or "", "html.parser")
     verified_fields = []
     for f in proposal.get("fields") or []:
@@ -45,7 +46,14 @@ def verify_selectors(html: str, proposal: Dict[str, Any]) -> Dict[str, Any]:
             hit = soup.select_one(sel) if sel else None
         except Exception:
             hit = None
-        if hit is not None:
+        kind = f.get("kind")
+        safe = (
+            hit is not None
+            and kind in SAFE_FIELD_KINDS
+            and not hit.has_attr("disabled")
+            and not hit.has_attr("readonly")
+        )
+        if safe:
             verified_fields.append(f)
     out = dict(proposal)
     out["fields"] = verified_fields
@@ -151,3 +159,19 @@ async def record_parse_result(db: AsyncSession, m: SearchFormMap, *, ok: bool, s
         return True
     await db.flush()
     return False
+
+
+async def mark_map_stale(db: AsyncSession, m: SearchFormMap, *, source_name: str, reason: str) -> None:
+    """Invalidate a map when a verified control is no longer usable at submit time."""
+    if m.stale:
+        return
+    m.stale = True
+    m.consecutive_parse_failures = max(m.consecutive_parse_failures, settings.SEARCH_MAP_STALE_FAILURES)
+    await db.flush()
+    await notify(
+        db,
+        level="error",
+        code="search_map_stale",
+        message=f"search form map is stale; remap required: {reason[:300]}",
+        source_name=source_name,
+    )
