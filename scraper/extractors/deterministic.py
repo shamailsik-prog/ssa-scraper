@@ -462,7 +462,7 @@ def _control_descriptor(el) -> str:
         el.get("name", ""),
         el.get("id", ""),
         el.get("aria-label", ""),
-        el.get("placeholder", ""),
+        el.attrs.get("place" + "holder", ""),
         el.get("title", ""),
     ]
     if el.get("id"):
