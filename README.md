@@ -93,7 +93,7 @@ the scraper's session.
 
 | service | role |
 |---|---|
-| `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
+| `api` | FastAPI: `/health`, `/status` (key-free numbers page; "Add to Home Screen" makes it an app), `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
 | `worker-scraper` | Celery, queue `login_session`, concurrency 1 (PakistanLawSite only) |
 | `worker-public` | Celery, queues `scraper` and `maintenance`, concurrency 2 (public sources, promotion, treatment, archive, dispatch) |
 | `worker-embed` | Celery, queue `embeddings` |

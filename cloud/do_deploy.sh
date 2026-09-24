@@ -111,6 +111,7 @@ ARGS=(--repo /root/ssa-src --branch "$BRANCH")
 [ -n "$REPORTERS" ] && ARGS+=(--reporters "$REPORTERS")
 [ -n "$EARLIEST_YEAR" ] && ARGS+=(--earliest-year "$EARLIEST_YEAR")
 [ -n "$DEPLOY_REGION_LABEL" ] && ARGS+=(--region "$DEPLOY_REGION_LABEL")
+case "${MIRROR_LOGIN_SESSION_ROWS:-keep}" in true|false) ARGS+=(--mirror-login-session-rows "$MIRROR_LOGIN_SESSION_ROWS");; esac
 ssh "${SSH_OPTS[@]}" "root@$IP" "bash /root/ssa-src/cloud/install.sh $(printf '%q ' "${ARGS[@]}") < /dev/null" 2>&1 | sed -E 's/Admin key:  [0-9a-f]{64}/Admin key:  (see the job summary)/'
 
 # ---------------------------------------------------------------- optional secrets, sent over stdin, never echoed

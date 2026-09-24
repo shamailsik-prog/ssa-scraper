@@ -64,6 +64,7 @@ of those features; they remain the record of what the site did under each settin
 | `tasks/promotion.py` | A share of each promotion batch is reserved for PakistanLawSite rows; relation reconciliation tasks for instruments, treatments and judgment citations run on Beat; migrations 003-006 (relation graphs) | Promotion and relation internals; the contract tables of section 8 are unchanged. |
 | `cloud/install.sh`, `cloud/do_server_logs.sh` | Local edits on the server are stashed and pinned before checkout; root cron jobs that log in to the site or dispatch outside the stack are removed; an `inspect` mode for the logs workflow | Section 12: the installer "resets the service checkout to the fetched commit"; the cron jobs ended the worker's session (audit section 12). |
 | `pytest.ini`, CI | `pytest-timeout` 600 s per test, 60-minute job timeout | Section 14 needs the suite to finish. |
+| `routers/status.py`, `templates/status.html` | A key-free `/status` page and `/status.json` with numbers only (totals, promotion movement, per-source state, slots and pacing, archive targets and whether Google Drive is configured, open notifications); a web-app manifest so the page installs on a phone | Requested by the operator on 24 September; section 9's key still guards every action and record. |
 
 ## What to expect after this change
 

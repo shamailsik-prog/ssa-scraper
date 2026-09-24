@@ -68,6 +68,23 @@ class PacingBudgetExceeded(RuntimeError):
     """PAGES_PER_HOUR / PAGES_PER_DAY spent; the run ends, the source stays ACTIVE and Beat resumes it later."""
 
 
+def _aggregate_legacy_pacing(cfg: Dict[str, Any], *, hour_key: str, day_key: str) -> Dict[str, Any]:
+    """Sum the `pacing_slot_<n>` counters an earlier release kept per login slot, for the current
+    hour and day only, into one `pacing` object."""
+    hour_pages = 0
+    day_pages = 0
+    for name, value in cfg.items():
+        if not (isinstance(name, str) and name.startswith("pacing_slot_") and isinstance(value, dict)):
+            continue
+        if value.get("hour") == hour_key:
+            hour_pages += int(value.get("hour_pages", 0) or 0)
+        if value.get("day") == day_key:
+            day_pages += int(value.get("day_pages", 0) or 0)
+    if not hour_pages and not day_pages:
+        return {}
+    return {"hour": hour_key, "hour_pages": hour_pages, "day": day_key, "day_pages": day_pages}
+
+
 DEFAULT_VOCABULARY = []  # firm value: seeded from PLS_TIER3_VOCABULARY or the dashboard; never invented here
 
 
@@ -191,6 +208,10 @@ class PakistanLawSitePipeline:
         pacing = dict(cfg.get(key) or {})
         hour_key = now.strftime("%Y-%m-%dT%H")
         day_key = now.strftime("%Y-%m-%d")
+        if not pacing:
+            # First run after the switch from per-slot counters: what the earlier release charged
+            # this hour and today still counts against the budgets.
+            pacing = _aggregate_legacy_pacing(cfg, hour_key=hour_key, day_key=day_key)
         if pacing.get("hour") != hour_key:
             pacing["hour"], pacing["hour_pages"] = hour_key, 0
         if pacing.get("day") != day_key:
@@ -493,7 +514,9 @@ class PakistanLawSitePipeline:
             await self.db.flush()
 
     async def run_paged_query(self, frontier: CrawlFrontier, search_map: Dict[str, Any], max_pages: int) -> None:
-        """Tiers 2–4: a query with ordinary pagination; cursor = (page, row_index)."""
+        """Tiers 2–4: a query with ordinary pagination; cursor = {page, row_index, next_url}.
+        A row that stopped mid-way resumes from its saved next_url (specification 3.5: nothing
+        ever restarts from page one); only a fresh row submits the query."""
         page_idx = int(frontier.cursor_json.get("page") or 1)
         values = build_values(search_map, frontier.query_json, frontier.cursor_json)
         if not values:
@@ -501,7 +524,11 @@ class PakistanLawSitePipeline:
             frontier.last_error = "search map offers no field for this query"
             return
         pages_done = 0
-        page = await self.fetch_results(search_map, values)
+        saved_next = frontier.cursor_json.get("next_url") if page_idx > 1 else None
+        if saved_next:
+            page = await self.fetch_detail(saved_next)
+        else:
+            page = await self.fetch_results(search_map, values)
         self.stats["queries"] += 1
         while True:
             result = await self.process_result_page(page, search_map, frontier, start_index=int(frontier.cursor_json.get("row_index", 0)))
