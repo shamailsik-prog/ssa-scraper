@@ -410,3 +410,96 @@ async def test_registry_start_closes_browser_when_login_page_fails(monkeypatch):
     with _pytest.raises(RuntimeError):
         await reg.start("PakistanLawSite", 1, "http://127.0.0.1:1/login")
     assert closed == [1] and reg.get("PakistanLawSite") is None
+
+
+async def test_paused_source_resumes_once_a_slot_is_active_again(db, login_source, monkeypatch):
+    """A source paused for a continuity reason stayed paused for 13 hours with both slots ACTIVE
+    (23 Sep 2026): only a slot state change ever resumed it. The recovery task now resumes it."""
+    from scraper.tasks.login_recovery import recover_login_slots_async
+
+    monkeypatch.setattr(settings, "ALLOW_LOGIN_SCRAPING", True)
+    monkeypatch.setattr(settings, "ENVIRONMENT", "chambers")
+    await _activate(db, login_source, slots=(1, 2))
+    login_source.state = "PAUSED"
+    login_source.state_reason = "slot 1 unreachable after reconnect and no alternate slot"
+    login_source.state_changed_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+    await db.commit()
+    result = await recover_login_slots_async(now=datetime.now(timezone.utc), browser_factory=BrowserScript().factory())
+    assert result["PakistanLawSite:source"] == "resumed"
+    async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as fresh:
+        row = (await fresh.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+        assert row.state == "ACTIVE" and row.next_scrape_at is not None
+        codes = [n.code for n in (await fresh.execute(select(Notification).where(Notification.source_name == "PakistanLawSite"))).scalars().all()]
+        assert "SOURCE_RESUMED" in codes
+
+
+async def test_paused_source_is_left_alone_when_admin_paused_or_too_recent(db, login_source, monkeypatch):
+    from scraper.tasks.login_recovery import recover_login_slots_async
+
+    monkeypatch.setattr(settings, "ALLOW_LOGIN_SCRAPING", True)
+    monkeypatch.setattr(settings, "ENVIRONMENT", "chambers")
+    await _activate(db, login_source, slots=(1,))
+    login_source.state = "PAUSED"
+    login_source.state_reason = "paused by admin"
+    login_source.state_changed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    await db.commit()
+    result = await recover_login_slots_async(browser_factory=BrowserScript().factory())
+    assert "PakistanLawSite:source" not in result
+    login_source.state_reason = "no valid slot; slot 1: LoginRequired: login surface URL"
+    login_source.state_changed_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    await db.commit()
+    result = await recover_login_slots_async(browser_factory=BrowserScript().factory())
+    assert "PakistanLawSite:source" not in result
+    async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as fresh:
+        row = (await fresh.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+        assert row.state == "PAUSED"
+
+
+async def test_grid_surface_never_yields_a_form_map_and_revives_a_stale_grid_map(db, login_source):
+    """23 Sep 2026, map v28: a failed compact snapshot returned the full CitationSearch DOM, whose
+    filter form (32 inputs) was mapped as the search form; every later job typed into it and
+    timed out. The grid surface must always give the grid map."""
+    from scraper.models import SearchFormMap
+    from scraper.tasks.search_map import active_map
+
+    await _activate(db, login_source, slots=(1,))
+    # A stale grid map from earlier bounced windows.
+    stale = SearchFormMap(
+        source_name="PakistanLawSite",
+        map_version=27,
+        fields={},
+        result_layout={"row_selector": "#archivedpatientGrid tbody tr", "columns": {"citation": 0, "title": 1, "court": 2}},
+        page_size=None,
+        pagination={},
+        detail_layout={},
+        limits={},
+        dom_hash="x",
+        mapped_by="deterministic",
+        verified_against_dom=True,
+        is_active=True,
+        stale=True,
+        consecutive_parse_failures=5,
+    )
+    db.add(stale)
+    await db.commit()
+    full_dom = (
+        "<html><body><form id='searchForm'>"
+        + "".join(f"<input name='f{i}' type='text'>" for i in range(32))
+        + "<button type='submit'>Search</button></form>"
+        "<table id='archivedpatientGrid'><tbody><tr><td>PLD 2024 SC 1</td><td>A v B</td><td>SC</td></tr></tbody></table>"
+        "<a href='/logout'>Logout</a></body></html>"
+    )
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), full_dom)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), sleep=_nosleep)
+    search_map = await pipeline.ensure_search_map()
+    assert PakistanLawSitePipeline._is_citation_grid_map(search_map), search_map
+    m = await active_map(db, "PakistanLawSite")
+    assert m.map_version == 27 and m.stale is False and m.consecutive_parse_failures == 0
+
+    # With no usable map at all, mapping the full DOM must still not produce a form map.
+    m.is_active = False
+    await db.commit()
+    search_map = await pipeline.ensure_search_map()
+    assert PakistanLawSitePipeline._is_citation_grid_map(search_map), search_map
+    assert not PakistanLawSitePipeline._has_queryable_search_fields(search_map)

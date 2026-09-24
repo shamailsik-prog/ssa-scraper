@@ -438,10 +438,17 @@ class PakistanLawSitePipeline:
         self._surface_page = page
         self._surface_page_start_row = start_row
         m = await active_map(self.db, SOURCE_NAME)
-        if m is not None and not m.stale:
+        grid_surface = self._is_citation_grid_surface(page)
+        if m is not None and (not m.stale or grid_surface):
             cached = map_as_dict(m)
-            if self._is_citation_grid_surface(page):
+            if grid_surface:
                 if self._is_citation_grid_map(cached):
+                    if m.stale:
+                        # Empty or bounced windows are not the map's fault: the grid is the surface.
+                        m.stale = False
+                        m.consecutive_parse_failures = 0
+                        await self.db.flush()
+                        logger.info("PakistanLawSite grid map v%s revived: the citation grid is still the surface", m.map_version)
                     if self._uses_compact_citation_grid_columns(page):
                         return self._with_compact_citation_grid_columns(cached)
                     return cached
@@ -449,7 +456,19 @@ class PakistanLawSitePipeline:
             elif self._has_queryable_search_fields(cached):
                 return cached
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
-        return map_as_dict(m)
+        mapped = map_as_dict(m)
+        if grid_surface and self._has_queryable_search_fields(mapped):
+            # The full CitationSearch DOM (a failed compact snapshot returns it) carries the filter
+            # form beside the grid; mapping those inputs would flip the connector into form mode
+            # and every later job would type into fields that mean nothing (23 Sep 2026, map v28).
+            m.fields = {}
+            layout = dict(m.result_layout or {})
+            layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
+            m.result_layout = layout
+            await self.db.flush()
+            logger.info("PakistanLawSite map v%s reduced to the citation grid: the surface is the grid, not a form", m.map_version)
+            mapped = map_as_dict(m)
+        return mapped
 
     def _citation_grid_limits(self) -> Dict[str, int]:
         """Per-window caps and the per-job time budget for the current harvest mode."""
@@ -536,8 +555,10 @@ class PakistanLawSitePipeline:
         outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
         rows = outcome.data.get("result_rows") or []
         m = await active_map(self.db, SOURCE_NAME)
-        if m is not None:
-            await record_parse_result(self.db, m, ok=bool(rows), source_name=SOURCE_NAME)
+        if m is not None and rows:
+            # A window with rows proves the grid map; an empty window (a bounce, the end of the
+            # grid) says nothing about it and must not mark it stale.
+            await record_parse_result(self.db, m, ok=True, source_name=SOURCE_NAME)
         self.stats["queries"] += 1
         self.stats["pages"] += 1
         self.stats["rows"] += len(rows)

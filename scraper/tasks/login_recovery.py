@@ -50,6 +50,38 @@ from scraper.notify import notify
 logger = logging.getLogger(__name__)
 
 BACKOFF_MINUTES = (15, 30, 60)
+SOURCE_RESUME_COOLDOWN_MINUTES = 15
+
+
+async def resume_paused_source(db, manager: SessionManager, *, now: Optional[datetime] = None) -> Optional[str]:
+    """A source paused for a continuity reason ("no valid slot", "unreachable after reconnect") stays
+    paused even after its slots are ACTIVE again, because only a slot state change resumed it. When a
+    slot is ACTIVE and the pause is older than the cool-down, resume the source. A pause set by an
+    admin is left alone."""
+    now = now or datetime.now(timezone.utc)
+    source = manager.source
+    if source.state != "PAUSED":
+        return None
+    reason = (source.state_reason or "").lower()
+    if "admin" in reason:
+        return None
+    if not any(s.state == "ACTIVE" for s in await manager.slots()):
+        return None
+    changed = source.state_changed_at
+    if changed is not None and changed.tzinfo is None:
+        changed = changed.replace(tzinfo=timezone.utc)
+    if changed is not None and now - changed < timedelta(minutes=SOURCE_RESUME_COOLDOWN_MINUTES):
+        return None
+    await manager._resume_source_if_paused()
+    await db.flush()
+    await notify(
+        db,
+        level="info",
+        code="SOURCE_RESUMED",
+        message=f"resumed: a slot is ACTIVE again (was paused: {source.state_reason or 'no reason recorded'})",
+        source_name=source.source_name,
+    )
+    return "resumed"
 VERIFICATION_BACKOFF_MINUTES = 120
 
 
@@ -332,6 +364,14 @@ async def recover_login_slots_async(
                 await db.commit()
                 if source.state == "HALTED":
                     break
+            if source.state == "PAUSED":
+                try:
+                    resumed = await resume_paused_source(db, manager, now=now)
+                    if resumed:
+                        results[f"{source.source_name}:source"] = resumed
+                        await db.commit()
+                except Exception as exc:
+                    logger.warning("resume of paused source %s failed: %s", source.source_name, exc)
     return results
 
 
