@@ -98,10 +98,11 @@
   <div id="archive" hidden>
     <section>
       <h2>Connect Google Drive</h2>
-      <p class="note">Paste the OAuth client id and secret from your Google Cloud project once (the steps are in docs/CLOUD_DEPLOYMENT.md, "Connect Google Drive"), press Connect, sign in on Google's page with your Google username and password, press Allow. The service creates the folder "SIKANDER AI Corpus" in your Drive and copies judgments into it every 30 minutes. Your Google password never reaches this service.</p>
+      <p class="note">Paste the OAuth client id and secret from your Google Cloud project once (the steps are in docs/CLOUD_DEPLOYMENT.md, "Connect Google Drive"), press Connect, sign in on Google's page with your Google username and password, press Allow. The service creates the folder "SIKANDER AI Corpus" in your Drive and copies judgments into it every 30 minutes, or, when you paste the link of a folder that already exists (for example the one an earlier service wrote into), it writes into that folder. Your Google password never reaches this service.</p>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
         <label>Client id <input id="gdClientId" size="40" autocomplete="off"></label>
         <label>Client secret <input id="gdClientSecret" type="password" size="28" autocomplete="off"></label>
+        <label>Existing folder link (optional) <input id="gdFolder" size="44" autocomplete="off" placeholder="https://drive.google.com/drive/folders/…"></label>
         <label><input id="gdMirrorPls" type="checkbox" checked> include PakistanLawSite judgments</label>
         <button class="primary" onclick="connectDrive()">Connect Google Drive</button>
         <span id="gdMeta" class="note"></span>
@@ -282,7 +283,7 @@ async function addTarget(){
 async function connectDrive(){
   $('gdMeta').textContent='opening Google sign-in…';
   try{
-    const d=await post('/admin/archive/google-drive/connect',{client_id:$('gdClientId').value.trim(),client_secret:$('gdClientSecret').value,mirror_login_session_rows:$('gdMirrorPls').checked});
+    const d=await post('/admin/archive/google-drive/connect',{client_id:$('gdClientId').value.trim(),client_secret:$('gdClientSecret').value,mirror_login_session_rows:$('gdMirrorPls').checked,folder:$('gdFolder').value.trim()||null});
     $('gdClientSecret').value='';
     window.location.href=d.authorization_url;
   }catch(e){$('gdMeta').textContent='could not start: '+e.message}

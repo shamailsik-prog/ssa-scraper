@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -39,7 +40,11 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_EXCHANGE_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"  # only files and folders this service creates
+# An existing folder (one an earlier service created) is invisible under drive.file, so writing into
+# it needs the full Drive permission for that account.
+GOOGLE_DRIVE_FULL_SCOPE = "https://www.googleapis.com/auth/drive"
 DRIVE_ROOT_FOLDER_NAME = "SIKANDER AI Corpus"
+_FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 OAUTH_CALLBACK_PATH = "/oauth/google-drive/callback"
 _PENDING_KEY = "corpus:google_drive_oauth:{state}"
 _PENDING_TTL_SECONDS = 900
@@ -50,6 +55,21 @@ class GoogleDriveConnect(BaseModel):
     client_secret: str = Field(min_length=6, max_length=300)
     name: str = Field(default="google_drive", min_length=1, max_length=100)
     mirror_login_session_rows: bool = True
+    # Optional: the link (or id) of a folder that already exists in that Drive, for example the one
+    # an earlier service wrote into. Empty: a new folder "SIKANDER AI Corpus" is created.
+    folder: Optional[str] = Field(default=None, max_length=400)
+
+
+def folder_id_from(text: Optional[str]) -> Optional[str]:
+    """The Drive folder id in a pasted link (`.../folders/<id>`, `?id=<id>`) or a bare id."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = re.search(r"/folders/([A-Za-z0-9_-]+)", text) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", text)
+    candidate = m.group(1) if m else text
+    if not _FOLDER_ID_RE.match(candidate):
+        raise HTTPException(422, "folder must be a Google Drive folder link (https://drive.google.com/drive/folders/...) or a folder id")
+    return candidate
 
 
 async def _redis():
@@ -87,10 +107,28 @@ async def _create_root_folder(access_token: str) -> str:
     return str(resp.json().get("id") or "")
 
 
+async def _verify_folder(access_token: str, folder_id: str) -> str:
+    """The name of an existing folder the granted account can reach (a Shared Drive included);
+    anything else is refused before the target is stored."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{GOOGLE_DRIVE_FILES_URL}/{folder_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "id,name,mimeType,trashed", "supportsAllDrives": "true"},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Google Drive cannot open that folder with this account (HTTP {resp.status_code}): {resp.text[:200]}")
+    meta = resp.json()
+    if meta.get("mimeType") != "application/vnd.google-apps.folder" or meta.get("trashed"):
+        raise HTTPException(502, "the link is not a folder that is still in the Drive")
+    return str(meta.get("name") or folder_id)
+
+
 @router.post("/google-drive/connect")
 async def google_drive_connect(body: GoogleDriveConnect, request: Request) -> Dict[str, Any]:
     if not settings.ENCRYPTION_KEY:
         raise HTTPException(409, "ENCRYPTION_KEY is NOT CONFIGURED; the Drive permission cannot be stored")
+    folder_id = folder_id_from(body.folder)
     state = secrets.token_urlsafe(32)
     redirect_uri = _callback_url(request)
     pending = {
@@ -98,6 +136,8 @@ async def google_drive_connect(body: GoogleDriveConnect, request: Request) -> Di
         "client_secret": body.client_secret.strip(),
         "name": body.name.strip(),
         "mirror_login_session_rows": body.mirror_login_session_rows,
+        "folder_id": folder_id,
+        "scope": GOOGLE_DRIVE_FULL_SCOPE if folder_id else GOOGLE_DRIVE_SCOPE,
         "redirect_uri": redirect_uri,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -110,7 +150,7 @@ async def google_drive_connect(body: GoogleDriveConnect, request: Request) -> Di
         "client_id": pending["client_id"],
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": GOOGLE_DRIVE_SCOPE,
+        "scope": pending["scope"],
         "access_type": "offline",
         "prompt": "consent",
         "include_granted_scopes": "true",
@@ -158,8 +198,13 @@ async def google_drive_callback(request: Request, db: AsyncSession = Depends(get
             "<p>Google returned no lasting permission. On Google's screen remove this app under <em>Security → Third-party access</em>, then press Connect again so Google asks for consent afresh.</p>",
             502,
         )
+    folder_id = pending.get("folder_id") or ""
+    folder_name = DRIVE_ROOT_FOLDER_NAME
     try:
-        folder_id = await _create_root_folder(access_token)
+        if folder_id:
+            folder_name = await _verify_folder(access_token, folder_id)
+        else:
+            folder_id = await _create_root_folder(access_token)
     except HTTPException as exc:
         return _page("Google Drive not connected", f"<p>{html.escape(str(exc.detail))}</p>", 502)
     if not folder_id:
@@ -174,7 +219,7 @@ async def google_drive_callback(request: Request, db: AsyncSession = Depends(get
     t.consecutive_failures = 0
     t.last_error = None
     t.config_encrypted = settings.encrypt_value(
-        json.dumps({"client_id": pending["client_id"], "client_secret": pending["client_secret"], "refresh_token": refresh_token, "folder_id": folder_id, "scope": GOOGLE_DRIVE_SCOPE})
+        json.dumps({"client_id": pending["client_id"], "client_secret": pending["client_secret"], "refresh_token": refresh_token, "folder_id": folder_id, "scope": pending.get("scope") or GOOGLE_DRIVE_SCOPE})
     )
     if existing is None:
         db.add(t)
@@ -188,7 +233,7 @@ async def google_drive_callback(request: Request, db: AsyncSession = Depends(get
         )
     return _page(
         "Google Drive connected",
-        f"<p>The folder <strong>{html.escape(DRIVE_ROOT_FOLDER_NAME)}</strong> now exists in your Google Drive and the service will copy judgments into it on its next archive run (every 30 minutes).</p>{note}",
+        f"<p>The service will copy judgments into the folder <strong>{html.escape(folder_name)}</strong> in your Google Drive on its next archive run (every 30 minutes).</p>{note}",
     )
 
 

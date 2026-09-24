@@ -301,6 +301,61 @@ def test_connect_google_drive_flow_stores_encrypted_refresh_token_and_creates_fo
     assert creds.refresh_token == "1//refresh-token-value" and creds.client_id == "1234567890-abc.apps.googleusercontent.com"
 
 
+def test_connect_google_drive_into_an_existing_folder(client, admin_headers, monkeypatch):
+    """A pasted folder link (the folder an earlier service filled) makes the connect ask for the
+    full Drive permission, and the callback verifies that folder instead of creating a new one;
+    a link that is not a folder id is refused before anything is stored."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from scraper.routers import archive as archive_router
+
+    assert archive_router.folder_id_from("https://drive.google.com/drive/folders/1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v?usp=sharing") == "1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v"
+    assert archive_router.folder_id_from("  1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v ") == "1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v"
+    assert archive_router.folder_id_from("") is None
+    bad = client.post("/admin/archive/google-drive/connect", json={"client_id": "1234567890-abc.apps.googleusercontent.com", "client_secret": "GOCSPX-supersecret", "folder": "not a folder"}, headers=admin_headers)
+    assert bad.status_code == 422
+
+    r = client.post(
+        "/admin/archive/google-drive/connect",
+        json={"client_id": "1234567890-abc.apps.googleusercontent.com", "client_secret": "GOCSPX-supersecret", "name": "google_drive_existing", "folder": "https://drive.google.com/drive/folders/1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    q = parse_qs(urlsplit(r.json()["authorization_url"]).query)
+    assert q["scope"] == ["https://www.googleapis.com/auth/drive"]
+    state = q["state"][0]
+    seen = {}
+
+    async def fake_exchange(*, code, client_id, client_secret, redirect_uri):
+        return {"access_token": "ya29.access", "refresh_token": "1//refresh-existing", "expires_in": 3599}
+
+    async def fake_verify(access_token, folder_id):
+        seen["verified"] = folder_id
+        return "SIKANDER_AI_Corpus_Archive"
+
+    async def never_create(access_token):
+        raise AssertionError("an existing folder must not be replaced by a new one")
+
+    monkeypatch.setattr(archive_router, "_exchange_code", fake_exchange)
+    monkeypatch.setattr(archive_router, "_verify_folder", fake_verify)
+    monkeypatch.setattr(archive_router, "_create_root_folder", never_create)
+    done = client.get(f"/oauth/google-drive/callback?state={state}&code=4/0AbCd")
+    assert done.status_code == 200 and "SIKANDER_AI_Corpus_Archive" in done.text
+    assert seen["verified"] == "1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v"
+    from scraper.models import ArchiveTarget
+    from scraper.storage.archive import target_config
+    from sqlalchemy import select
+    from scraper.database import SessionLocal, run_async
+
+    async def _cfg():
+        async with SessionLocal() as db:
+            t = (await db.execute(select(ArchiveTarget).where(ArchiveTarget.name == "google_drive_existing"))).scalars().first()
+            return target_config(t)
+
+    cfg = run_async(_cfg())
+    assert cfg["folder_id"] == "1ozu4dHxb8lfc9kXA26hj43Nzg7pnGY6v" and cfg["scope"] == "https://www.googleapis.com/auth/drive"
+
+
 def test_saved_credentials_api_never_echoes_plaintext_password(client, admin_headers):
     password = "Slot1-Top-Secret-Password!"
     username = "slot1.user@example.com"

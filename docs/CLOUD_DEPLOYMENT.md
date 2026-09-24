@@ -155,7 +155,11 @@ and takes about ten clicks. After that, connecting is a button and Google's own 
 **Then, on the dashboard (one minute):**
 
 8. Open the **Archive storage** tab, paste the client id and client secret, keep *include
-   PakistanLawSite judgments* ticked, press **Connect Google Drive**.
+   PakistanLawSite judgments* ticked, press **Connect Google Drive**. To keep writing into a
+   folder that already exists in that Drive (the one an earlier service filled, such as
+   *SIKANDER_AI_Corpus_Archive*), paste its link into *Existing folder link* first; the service
+   then asks Google for permission over that Drive rather than only over files it creates, and
+   the callback refuses a link that is not a reachable folder.
 9. Google's sign-in page opens: enter your Google username and password, and if Google says the
    app is not verified press *Advanced* and continue (it is your own app; the only permission it
    asks for is to manage files it creates itself). Press **Allow**.
