@@ -10,8 +10,11 @@ on /status that what was stored is what the site shows.
   must also appear on the page. A login or verification page ends the run without a verdict on
   the records (the slot is handled as during a harvest); a block halts the source as always.
 * Statute sections (public sources, PakistanCode): two current section versions chosen at random,
-  their source page re-fetched with the public fetcher (allow-list, robots, retries), and the
-  section text looked for in the page text.
+  their source page opened in a headless browser (the operator's instruction of 24 September:
+  compare on the browser, not on a download, so nothing the page renders is missed), under the
+  same allow-list, robots policy and per-host pacing as the public fetcher, and the whole stored
+  section text looked for in the text the browser shows. A PDF is fetched through the same
+  browser and read with the same extraction ingestion uses.
 
 Every check is one row in spot_check: kind, what was checked, the result (match, differs,
 unreachable, login_required, skipped) and a short detail. Nothing is changed in the corpus.
@@ -19,11 +22,14 @@ unreachable, login_required, skipped) and a short detail. Nothing is changed in 
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
+import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from celery import shared_task
 from sqlalchemy import func, select
@@ -32,16 +38,17 @@ from scraper.auth.session_manager import (
     BrowserDisconnected,
     LoginRequired,
     NoActiveSlot,
+    PlaywrightBrowser,
     SessionLockHeld,
     playwright_browser_factory,
 )
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.fetchers import HttpFetcher, canonical_text_hash, pdf_text_with_ocr
+from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
 from scraper.models import Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
-from scraper.security import ExplicitBlock, VerificationRequired
+from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +175,56 @@ async def check_judgments(
 
 
 # --------------------------------------------------------------------------- statute sections (public)
-async def check_statute_sections(db, *, sample: Optional[int] = None, allow_private_for_tests: bool = False) -> List[Dict[str, Any]]:
+async def public_browser_factory(source: ScraperSource, *, allow_private_for_tests: bool = False) -> PlaywrightBrowser:
+    """A headless browser with no login state for a public source: the same allow-list and
+    document hosts as the public fetcher, so it can open nothing the fetcher could not."""
+    browser = PlaywrightBrowser(
+        {"cookies": [], "origins": []},
+        0,
+        base_url=source.source_url or "",
+        headless=True,
+        allow_list=list(source.allow_list or []),
+        document_cdn_hosts=list(source.document_cdn_hosts or []),
+        enforce_policy_on_requests=True,  # every request the page makes, redirects included
+        allow_private_for_tests=allow_private_for_tests,
+        user_agent=settings.SCRAPER_USER_AGENT,  # the agent the robots rules were evaluated for
+    )
+    return await browser.start()
+
+
+def _source_delay(source: ScraperSource) -> float:
+    # The same interval the public fetcher uses for this source.
+    lo = (source.request_delay_min_ms or 1200) / 1000.0
+    hi = (source.request_delay_max_ms or 2500) / 1000.0
+    return random.uniform(lo, max(lo, hi))
+
+
+def _looks_like_pdf(url: str, content_type: str = "") -> bool:
+    return "pdf" in (content_type or "").lower() or urlsplit(url or "").path.lower().endswith(".pdf")
+
+
+async def _halt_public_source(db, source: ScraperSource, detail: str) -> None:
+    # A block halts the source exactly as the public pipeline does (specification 3.7 / 4.5).
+    now = datetime.now(timezone.utc)
+    source.state = "HALTED"
+    source.state_reason = f"explicit block during a spot check: {detail[:900]}"
+    source.state_changed_at = now
+    source.requires_admin_review = True
+    await notify(db, level="critical", code="SOURCE_HALTED", message=f"explicit block — {detail[:500]}; no evasion attempted; admin review required (spot check)", source_name=source.source_name)
+
+
+async def check_statute_sections(
+    db,
+    *,
+    sample: Optional[int] = None,
+    allow_private_for_tests: bool = False,
+    browser_factory: Callable = public_browser_factory,
+    sleep: Callable = asyncio.sleep,
+) -> List[Dict[str, Any]]:
+    """Open each sampled section's source page in a headless browser and look for the whole stored
+    section text in what the browser shows. The comparison is against the rendered page (or the PDF
+    the browser fetched), never against a bare download, so a page whose text is rendered by its
+    own scripts is compared on what a reader sees."""
     n = int(sample if sample is not None else settings.SPOT_CHECK_STATUTES)
     if n <= 0:
         return [{"skipped": "SPOT_CHECK_STATUTES=0"}]
@@ -187,63 +243,127 @@ async def check_statute_sections(db, *, sample: Optional[int] = None, allow_priv
         return [{"skipped": "no current statute section with a source URL"}]
     results: List[Dict[str, Any]] = []
     sources: Dict[str, ScraperSource] = {}
-    for version, section, statute, prov in rows:
-        label = f"{statute.short_name or statute.name} s. {section.section_number}"
-        source = sources.get(prov.source_name)
-        if source is None:
-            source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == prov.source_name))).scalars().first()
+    browsers: Dict[str, PlaywrightBrowser] = {}
+    pages_opened = 0
+    try:
+        for version, section, statute, prov in rows:
+            label = f"{statute.short_name or statute.name} s. {section.section_number}"
+            source = sources.get(prov.source_name)
             if source is None:
-                _record(db, kind="statute_section", label=label, url=prov.source_url, result="skipped", detail=f"source {prov.source_name} not found", record_id=section.id)
-                results.append({"label": label, "result": "skipped"})
+                source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == prov.source_name))).scalars().first()
+                if source is None:
+                    _record(db, kind="statute_section", label=label, url=prov.source_url, result="skipped", detail=f"source {prov.source_name} not found", record_id=section.id)
+                    results.append({"label": label, "result": "skipped"})
+                    continue
+                sources[prov.source_name] = source
+            # The same gate the public fetcher applies: allow-list and SSRF guard, then robots.
+            try:
+                safe_url = check_url_policy(prov.source_url, list(source.allow_list or []), document_cdn_hosts=list(source.document_cdn_hosts or []), allow_private_for_tests=allow_private_for_tests)
+            except URLPolicyError as exc:
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"outside the source's allow-list: {str(exc)[:200]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": "url policy"})
                 continue
-            sources[prov.source_name] = source
-        try:
-            async with HttpFetcher(source, allow_private_for_tests=allow_private_for_tests) as fetcher:
-                res = await fetcher.get(prov.source_url)
-        except ExplicitBlock as exc:
-            if exc.kind == "robots_disallow":
-                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"robots.txt disallows the page now: {str(exc)[:200]}", record_id=section.id)
+            try:
+                robots_ok = (not source.respect_robots) or robots_allows(safe_url)
+            except RobotsUnavailable as exc:
+                # RFC 9309: an unreachable robots.txt is a temporary disallow, not a block.
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"robots.txt unavailable, deferred: {str(exc)[:200]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": "robots unavailable"})
+                continue
+            if not robots_ok:
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail="robots.txt disallows the page now", record_id=section.id)
                 results.append({"label": label, "result": "unreachable", "detail": "robots disallow"})
                 continue
-            # A block halts the source exactly as the public pipeline does (specification 3.7 / 4.5).
-            now = datetime.now(timezone.utc)
-            source.state = "HALTED"
-            source.state_reason = f"explicit block during a spot check: {str(exc)[:900]}"
-            source.state_changed_at = now
-            source.requires_admin_review = True
-            await notify(db, level="critical", code="SOURCE_HALTED", message=f"explicit block — {str(exc)[:500]}; no evasion attempted; admin review required (spot check)", source_name=source.source_name)
-            _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"block, source halted: {str(exc)[:300]}", record_id=section.id)
-            results.append({"label": label, "result": "unreachable", "detail": f"block: {str(exc)[:200]}"})
-            break
-        except Exception as exc:
-            _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=section.id)
-            results.append({"label": label, "result": "unreachable", "detail": str(exc)[:200]})
-            continue
-        if res.status_code >= 400:
-            _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"HTTP {res.status_code}", record_id=section.id)
-            results.append({"label": label, "result": "unreachable", "detail": f"HTTP {res.status_code}"})
-            continue
-        if res.is_pdf:
-            page_text, _ocr = pdf_text_with_ocr(res.content)
-            page_text = _norm(page_text)
-        elif "html" in (res.content_type or "").lower() or res.text.lstrip().startswith("<"):
-            page_text = _norm(clean_html(res.text))
-        else:
-            page_text = _norm(res.text)
-        stored = _norm(version.section_text)
-        if stored and stored.lower() in page_text.lower():
-            result, detail, sim = "match", "the whole stored section text is on the source page", 1.0
-        else:
-            sim = _similarity(page_text, stored)
-            # the section number with a piece of its heading is a weaker sign the section is still there
-            heading = _norm(f"{section.section_number} {section.section_title or ''}")[:80].lower()
-            present = bool(heading.strip()) and heading in page_text.lower()
-            result = "differs"
-            detail = ("section heading still on the page but the stored text was not found" if present else "neither the stored text nor the section heading was found on the page") + f" (similarity {sim:.3f})"
-        _record(db, kind="statute_section", label=label, url=prov.source_url, result=result, detail=detail, similarity=sim, record_id=section.id)
-        results.append({"label": label, "result": result, "similarity": sim})
+            if pages_opened:
+                await sleep(_source_delay(source))  # the source's own pacing, as the public fetcher
+            pages_opened += 1
+            try:
+                browser = browsers.get(source.source_name)
+                if browser is None:
+                    browser = browsers[source.source_name] = await browser_factory(source, allow_private_for_tests=allow_private_for_tests)
+                page_text, where = await _page_text_in_browser(browser, safe_url, policy=lambda u: check_url_policy(u, list(source.allow_list or []), document_cdn_hosts=list(source.document_cdn_hosts or []), allow_private_for_tests=allow_private_for_tests))
+            except ExplicitBlock as exc:
+                await _halt_public_source(db, source, str(exc))
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"block, source halted: {str(exc)[:300]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": f"block: {str(exc)[:200]}"})
+                break
+            except Exception as exc:
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": str(exc)[:200]})
+                continue
+            stored = _norm(version.section_text)
+            if stored and stored.lower() in page_text.lower():
+                result, detail, sim = "match", f"the whole stored section text is on the page as the browser shows it ({where})", 1.0
+            else:
+                sim = _similarity(page_text, stored)
+                # the section number with a piece of its heading is a weaker sign the section is still there
+                heading = _norm(f"{section.section_number} {section.section_title or ''}")[:80].lower()
+                present = bool(heading.strip()) and heading in page_text.lower()
+                result = "differs"
+                detail = ("section heading still on the page but the stored text was not found" if present else "neither the stored text nor the section heading was found on the page") + f" ({where}; similarity {sim:.3f})"
+            _record(db, kind="statute_section", label=label, url=prov.source_url, result=result, detail=detail, similarity=sim, record_id=section.id)
+            results.append({"label": label, "result": result, "similarity": sim})
+    finally:
+        for browser in browsers.values():
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("spot check: browser close: %s", exc)
     await db.flush()
     return results
+
+
+_DOWNLOAD_STATUS_RE = re.compile(r"HTTP (\d{3}) on download")
+
+
+async def _pdf_text_via_browser(browser: PlaywrightBrowser, url: str) -> tuple[str, str]:
+    """The PDF fetched through the browser's own context. Only a real block (403, 429, 451) is a
+    block; a stale link (404, 410 and the like) is unreachable and halts nothing."""
+    try:
+        data = await browser.download(url)
+    except ExplicitBlock as exc:
+        m = _DOWNLOAD_STATUS_RE.search(str(exc))
+        status = int(m.group(1)) if m else None
+        if status is not None and status not in (403, 429, 451):
+            raise RuntimeError(f"HTTP {status}") from exc
+        raise
+    text, ocr = pdf_text_with_ocr(data)
+    return _norm(text), "PDF fetched by the browser" + (", OCR" if ocr else "")
+
+
+async def _page_text_in_browser(browser: PlaywrightBrowser, url: str, *, policy: Optional[Callable[[str], str]] = None) -> tuple[str, str]:
+    """(normalised text, where it came from): the rendered page's visible text, or the text of the
+    PDF the browser fetched. A blocked answer raises ExplicitBlock; a server failure raises. The
+    page the browser ends on is checked against the URL policy again, so a redirect cannot
+    substitute a page outside the source's allow-list."""
+    if _looks_like_pdf(url):
+        return await _pdf_text_via_browser(browser, url)
+    try:
+        page = await browser.goto(url)
+    except BrowserDisconnected as exc:
+        # Chromium turns a PDF answer on a plain URL into a download and aborts the navigation.
+        if "ERR_ABORTED" in str(exc) or "Download is starting" in str(exc):
+            return await _pdf_text_via_browser(browser, url)
+        raise
+    if policy is not None:
+        try:
+            policy(page.url)
+        except URLPolicyError as exc:
+            raise RuntimeError(f"the page redirected outside the source's allow-list: {str(exc)[:200]}") from exc
+    if _looks_like_pdf(url, page.content_type):
+        return await _pdf_text_via_browser(browser, url)
+    verdict = classify_response(page.status, page.html, page.url)
+    if verdict.kind == "block":
+        raise ExplicitBlock(verdict.kind, verdict.detail)
+    if page.status >= 500:
+        raise BrowserDisconnected(f"HTTP {page.status}")
+    if page.status >= 400:
+        raise RuntimeError(f"HTTP {page.status}")
+    visible = _norm(await browser.visible_text())
+    # innerText is what a reader sees; the cleaned document text is kept beside it for pages whose
+    # visible text is folded away in collapsed panels.
+    rendered = _norm(clean_html(page.html))
+    return (visible + " \n " + rendered), "rendered page"
 
 
 async def spot_check_judgments_async(**kwargs) -> Dict[str, Any]:
