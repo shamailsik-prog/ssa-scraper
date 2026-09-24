@@ -237,6 +237,58 @@ async def test_statute_spot_check_block_halts_the_source_and_partial_text_differ
     assert "SOURCE_HALTED" in codes
 
 
+async def test_statute_spot_check_stale_links_redirects_and_robots_outages_never_halt(db, fixture_server, monkeypatch):
+    """A removed PDF (404), a page that redirects outside the allow-list, and a robots.txt the site
+    cannot serve are each recorded as unreachable and the run goes on; the source stays ACTIVE."""
+    from scraper import security
+
+    source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))).scalars().first()
+    source.allow_list = list(source.allow_list or []) + ["127.0.0.1"]
+    fixture_server.add("/robots.txt", "User-agent: *\nAllow: /\n")
+    url_gone = fixture_server.add("/ppc/gone.pdf", "not here", status=404, content_type="text/plain")
+    url_redirect = fixture_server.add_redirect("/ppc/redirect", "http://localhost:9/elsewhere")  # off the allow-list
+    st = Statute(name="Test Code", short_name="TC", source_name="PakistanCode")
+    db.add(st)
+    await db.flush()
+
+    async def add_section(num, text, url):
+        prov = SourceProvenance(source_name="PakistanCode", access_method="public", source_url=url, content_hash=hashlib.sha256(url.encode()).hexdigest(), content_kind="html")
+        db.add(prov)
+        await db.flush()
+        sec = StatuteSection(statute_id=st.id, section_number=num, section_title="t")
+        db.add(sec)
+        await db.flush()
+        ver = StatuteSectionVersion(section_id=sec.id, version_no=1, section_text=text, text_hash=canonical_text_hash(text), source_provenance_id=prov.id)
+        db.add(ver)
+        await db.flush()
+        sec.current_version_id = ver.id
+
+    await add_section("600", "Gone section text.", url_gone)
+    await add_section("601", "Redirected section text.", url_redirect)
+    await db.commit()
+
+    async def no_sleep(_seconds):
+        return None
+
+    results = await check_statute_sections(db, sample=5, allow_private_for_tests=True, sleep=no_sleep)
+    await db.commit()
+    by_label = {x["label"]: x for x in results if "label" in x}
+    assert by_label["TC s. 600"]["result"] == "unreachable" and "404" in by_label["TC s. 600"]["detail"]
+    assert by_label["TC s. 601"]["result"] == "unreachable"
+    assert source.state == "ACTIVE"
+    checks = {c.label: c.detail for c in (await db.execute(select(SpotCheck).where(SpotCheck.kind == "statute_section"))).scalars().all()}
+    assert "block" not in checks["TC s. 600"]
+
+    # robots.txt answered with a server error: RFC 9309 treats it as a temporary disallow.
+    security.reset_robots_cache()
+    fixture_server.add("/robots.txt", "boom", status=503)
+    results = await check_statute_sections(db, sample=5, allow_private_for_tests=True, sleep=no_sleep)
+    await db.commit()
+    security.reset_robots_cache()
+    assert results and all(x.get("result") == "unreachable" and x.get("detail") == "robots unavailable" for x in results if "label" in x)
+    assert source.state == "ACTIVE"
+
+
 def test_status_spot_checks_carry_no_urls(client, admin_headers):
     data = client.get("/status.json").json()
     for row in data["spot_checks"]["recent"]:

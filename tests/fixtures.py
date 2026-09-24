@@ -146,6 +146,11 @@ class FixtureServer:
         self.post_routes[path] = (status, content_type, data)
         return self.url(path)
 
+    def add_redirect(self, path: str, to: str, status: int = 302) -> str:
+        """An HTTP redirect: the route's content type carries the Location the handler sends."""
+        self.routes[path] = (status, f"redirect:{to}", b"")
+        return self.url(path)
+
     def url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.port}{path}"
 
@@ -164,6 +169,9 @@ class FixtureServer:
                 else:
                     status, ctype, data = 404, "text/plain", b"not found"
                 self.send_response(status)
+                if ctype.startswith("redirect:"):
+                    self.send_header("Location", ctype[len("redirect:"):])
+                    ctype = "text/plain"
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
