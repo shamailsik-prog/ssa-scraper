@@ -69,10 +69,6 @@ class PacingBudgetExceeded(RuntimeError):
     """PAGES_PER_HOUR / PAGES_PER_DAY spent; the run ends, the source stays ACTIVE and Beat resumes it later."""
 
 
-class SearchMapStale(RuntimeError):
-    """The saved CitationSearch map no longer describes a usable result page."""
-
-
 def _aggregate_legacy_pacing(cfg: Dict[str, Any], *, hour_key: str, day_key: str) -> Dict[str, Any]:
     """Sum the `pacing_slot_<n>` counters an earlier release kept per login slot, for the current
     hour and day only, into one `pacing` object."""
@@ -492,9 +488,10 @@ class PakistanLawSitePipeline:
         if m is not None:
             went_stale = await record_parse_result(self.db, m, ok=parse_ok, source_name=SOURCE_NAME)
             if went_stale:
-                frontier.status = "stale"
-                frontier.last_error = "search map stale after consecutive result parse failures; remap required"
-                raise SearchMapStale(frontier.last_error)
+                # The current request may still be a valid empty citation probe.  Leave
+                # its frontier cursor intact; `ensure_search_map` replaces the stale map
+                # before the next run.
+                logger.warning("PakistanLawSite search map went stale; a fresh map will be built before the next run")
         self.stats["pages"] += 1
         self.stats["rows"] += len(rows)
         for idx, row in enumerate(rows):
@@ -682,9 +679,6 @@ class PakistanLawSitePipeline:
                     fr.last_error = f"pacing: {exc}"
                     self.stats["pacing_paused"] = True
                     logger.info("PakistanLawSite pacing budget reached: %s; the source stays ACTIVE and Beat resumes it later", exc)
-                    await self.db.flush()
-                    return self.stats
-                except SearchMapStale:
                     await self.db.flush()
                     return self.stats
                 await lock.refresh()
