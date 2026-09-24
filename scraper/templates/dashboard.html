@@ -158,7 +158,7 @@ async function summary(){
   const t=s.totals||{}, b=s.body_completeness||{}, c=s.completeness||{};
   $('tiles').innerHTML+=tile('Citations',t.citations??'-')+tile('Jdg empty body %',(b.judgments_pct_empty??0)+'%',b.judgments_pct_empty?'bad':'ok')+tile('Sec empty body %',(b.sections_pct_empty??0)+'%',b.sections_pct_empty?'bad':'ok');
   $('meaning').textContent=c.meaning||'';
-  $('progress').textContent=JSON.stringify({frontier_remaining:c.frontier_remaining,pakistan_law_site:c.pakistan_law_site,pakistan_code:c.pakistan_code},null,2);
+  $('progress').textContent=JSON.stringify({backfill:c.backfill_progress,selected:c.selected_sources,pakistan_law_site:c.pakistan_law_site,pakistan_code:c.pakistan_code},null,2);
 }
 function cell(v){return '<td>'+esc(v)+'</td>'}
 async function loadList(n){

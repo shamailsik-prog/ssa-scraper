@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       services:
-        description: "Services to show (space-separated: api worker-scraper worker-public worker-embed celery-beat caddy postgres redis), the word status for the corpus numbers (/status.json) and the last hour of promotion and archive lines, or the word inspect for a read-only inventory of everything else running on the server"
+        description: "Services to show (space-separated: api worker-scraper worker-public worker-embed celery-beat caddy postgres redis), the word inspect for a read-only inventory of everything else running on the server, the word status for a read-only harvest report (corpus counts, speed, sources, login slots, Google Drive and other archive mirrors), or the word summary for the key-free /status.json numbers and the last hour of promotion and archive lines"
         default: "api worker-scraper"
         required: false
       lines:

@@ -30,13 +30,13 @@ services:
 
   # Workers and Beat depend on the API being healthy: the API applies migrations, roles and seed data at
   # startup, so no task can run against a database whose tables do not exist yet (first-boot race).
-  # Login-session queue: PakistanLawSite only, one worker, concurrency 1 (specification 1, 3.1).
+  # Login-session sources queue. Set LOGIN_SESSION_CONCURRENCY in .env (1-2).
   worker-scraper:
     <<: *app
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
+    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=${LOGIN_SESSION_CONCURRENCY:-1} -n scraper-login@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-login@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
@@ -44,15 +44,30 @@ services:
       retries: 5
       start_period: 40s
 
-  # Public sources, promotion, treatment, archive mirror, reconcile and dispatch (specification 1).
+  # Public sources only. Long public runs must never sit in front of dispatch and promotion.
   worker-public:
     <<: *app
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO
+    command: celery -A scraper.tasks.celery_app worker -Q scraper --concurrency=2 -n scraper-public@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-public@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  # Maintenance (dispatch, promotion, treatment, archive mirror, reconcile) on its own worker so a
+  # slow public scrape can never delay the scheduler or the promotion of staged judgments.
+  worker-maintenance:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+    command: celery -A scraper.tasks.celery_app worker -Q maintenance --concurrency=2 -n maintenance@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d maintenance@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
       timeout: 15s
       retries: 5

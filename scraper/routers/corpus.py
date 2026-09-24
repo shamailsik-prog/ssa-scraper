@@ -16,6 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import get_db
+from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
 from scraper.models import (
     Citation,
     CrawlCoverage,
@@ -156,9 +157,9 @@ async def corpus_summary(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
         for v in sample_cursor
     ]
 
-    frontier_remaining = int(
-        (await db.execute(select(func.count()).select_from(CrawlFrontier).where(CrawlFrontier.status.in_(["pending", "in_progress", "stale"])))).scalar() or 0
-    )
+    mode = await get_harvest_mode(db)
+    selected = await selected_source_names(db, mode)
+    progress = await backfill_progress(db, source_names=selected)
 
     statutes_with_sections = int(
         (await db.execute(select(func.count(func.distinct(StatuteSection.statute_id))))).scalar() or 0
@@ -195,11 +196,14 @@ async def corpus_summary(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
         },
         "completeness": {
             "meaning": (
-                "frontier_remaining > 0 means crawl frontier rows are still pending, in progress or stale. "
+                "complete=false means the crawl frontier for selected backfill sources is not empty "
+                "(frontier_remaining > 0) and/or optional BACKFILL_TARGET_* counts are unmet. "
                 "It does NOT mean harvest is broken. Firm LLM keys (SGAI_*, OPENAI_API_KEY) are "
                 "optional enrichment and do not block deterministic scrape."
             ),
-            "frontier_remaining": frontier_remaining,
+            "backfill_progress": progress,
+            "selected_sources": selected,
+            "harvest_mode": mode,
             "pakistan_law_site": {
                 "frontier_remaining": pls_remaining,
                 "coverage_volumes_total": volume_total,

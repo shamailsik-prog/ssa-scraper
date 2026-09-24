@@ -198,56 +198,27 @@ for line in example.splitlines():
         continue
     s += ("" if s.endswith("\n") else "\n") + line + "\n"
     added.append(m.group(1))
-# Values an earlier release wrote that the specification refuses or no longer reads. The settings
-# validator refuses LOGIN_SESSION_CONCURRENCY other than 1 (one login-session worker at a time), so
-# a 2 left in .env would stop every container from starting; keys of removed features (harvest
-# modes, backfill pacing, citation-grid windows, automatic login recovery, block-retry cooldowns)
-# are dropped so the file matches .env.example.
+# Values an earlier release wrote that are known to throttle the harvest or to cost the human login
+# (0.4-1.0s backfill pacing made PakistanLawSite end the session after ~500 pages). Only the exact
+# old defaults are replaced; a value the operator changed on purpose is left alone.
+stale = {
+    "PLS_CITATION_GRID_MAX_DETAIL": ("40", "120"),
+    "PLS_ARCHIVED_GRID_MAX_ROWS": ("200", "400"),
+    "BACKFILL_LOGIN_DELAY_MIN": ("0.4", "6"),
+    "BACKFILL_LOGIN_DELAY_MAX": ("1.0", "9"),
+    "BACKFILL_PAGES_PER_HOUR": ("10000", "450"),
+    "LOGIN_SESSION_CONCURRENCY": ("1", "2"),
+}
 migrated = []
-s, n = re.subn(r"^LOGIN_SESSION_CONCURRENCY=2\s*$", "LOGIN_SESSION_CONCURRENCY=1", s, flags=re.M)
-if n:
-    migrated.append("LOGIN_SESSION_CONCURRENCY 2->1")
-# Specification 3.6 and 11: the login-session pacing numbers are fixed (4.0-9.0 s, 300 pages an
-# hour, 2,500 a day) and "server size never changes these numbers". An earlier release had left
-# PAGES_PER_HOUR=10000 and PAGES_PER_DAY=200000 on the server (seen 24 September 2026), which is
-# the pace that cost the human login; the installer pins the specified values.
-fixed = {"LOGIN_DELAY_MIN": "4.0", "LOGIN_DELAY_MAX": "9.0", "PAGES_PER_HOUR": "300", "PAGES_PER_DAY": "2500"}
-for key, value in fixed.items():
-    m = re.search(rf"^{key}=(.*)$", s, flags=re.M)
-    current = m.group(1).strip() if m else None
-    try:
-        same = current is not None and float(current) == float(value)
-    except ValueError:
-        same = False
-    if same:
-        continue
-    if m:
-        s = re.sub(rf"^{key}=.*$", f"{key}={value}", s, flags=re.M)
-    else:
-        s += ("" if s.endswith("\n") else "\n") + f"{key}={value}\n"
-    migrated.append(f"{key} {current}->{value}")
-removed = []
-for key in (
-    "DISPATCH_LOOP_SECONDS", "HARVEST_MODE", "HARVEST_AUTO_SWITCH", "UPDATE_CADENCE_HOURS",
-    "BACKFILL_SOURCE_FREQUENCY_MINUTES", "BACKFILL_TARGET_JUDGMENTS", "BACKFILL_TARGET_STATUTES",
-    "BACKFILL_LOGIN_DELAY_MIN", "BACKFILL_LOGIN_DELAY_MAX", "BACKFILL_PAGES_PER_HOUR", "BACKFILL_PAGES_PER_DAY",
-    "BACKFILL_LOGIN_SESSION_CONCURRENCY", "BLOCK_RETRY_COOLDOWN_MINUTES", "BLOCK_RETRY_MAX_ATTEMPTS",
-    "LOGIN_AUTO_RECOVER", "LOGIN_RECOVERY_COOLDOWN_MINUTES", "LOGIN_RECOVERY_SCHEDULE_SECONDS",
-    "LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS", "PLS_ARCHIVED_GRID_MAX_ROWS", "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS",
-    "PLS_CITATION_GRID_MAX_DETAIL", "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", "PLS_CITATION_GRID_SCAN_WINDOW",
-    "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", "PLS_RUN_MAX_MINUTES", "BACKFILL_PLS_RUN_MAX_MINUTES",
-    "PLS_CITATION_GRID_SKIP_STAGED", "PLAYWRIGHT_MAX_HTML_BYTES", "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
-):
-    s, n = re.subn(rf"^{key}=.*\n?", "", s, flags=re.M)
+for key, (old_value, new_value) in stale.items():
+    s, n = re.subn(rf"^{key}={old_value}\s*$", f"{key}={new_value}", s, flags=re.M)
     if n:
-        removed.append(key)
+        migrated.append(f"{key} {old_value}->{new_value}")
 open(".env", "w").write(s)
 if added:
     print("  added to .env:", ", ".join(added))
 if migrated:
     print("  migrated in .env:", ", ".join(migrated))
-if removed:
-    print("  removed from .env (no longer read):", ", ".join(removed))
 RECONCILE
 fi
 
@@ -318,9 +289,9 @@ EOF
 fi
 
 # ---------------------------------------------------------------- server-side automation outside the repository
-# A PakistanLawSite session is created only by the human login on the dashboard, and Beat
-# dispatches the service's own jobs. Cron entries found on the server that log in to PakistanLawSite
-# or dispatch jobs from outside the compose stack fight the service: every extra login ends the
+# The service re-verifies and re-establishes its own logins (recover-login-slots) and Beat
+# dispatches its own jobs. Cron entries found on the server that log in to PakistanLawSite or
+# dispatch jobs from outside the compose stack fight the service: every extra login ends the
 # session the worker is using (the site allows one live session per account), which is what made
 # the harvest lose its login every 30 minutes on 23 September 2026. They are not part of this
 # repository. The root crontab is backed up to state/ before the lines are removed, and any
@@ -356,7 +327,7 @@ fi
 
 # ---------------------------------------------------------------- start
 log "Building the image and starting the stack (first build downloads Chromium; allow 5–10 minutes)"
-docker compose up -d --build --remove-orphans
+docker compose up -d --build
 if docker compose config --services | grep -qx 'caddy'; then
   log "Recreating caddy so state/Caddyfile changes are applied"
   docker compose up -d --no-deps --force-recreate caddy
