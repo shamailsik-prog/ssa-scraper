@@ -446,7 +446,8 @@ def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[st
 ROLE_HINTS = {
     "reporter": ("book", "journal", "reporter", "law_report"),
     "year": ("year",),
-    "page": ("page", "pg", "citation_no", "cite_no"),
+    "citation": ("citation_no", "cite_no", "citationnumber"),
+    "page": ("page", "pg"),
     "court": ("court",),
     "statute": ("statute", "act", "law"),
     "section": ("section", "sec"),
@@ -455,29 +456,117 @@ ROLE_HINTS = {
 }
 
 
+def _control_descriptor(el) -> str:
+    """Text that a person sees when identifying a form control."""
+    bits = [
+        el.get("name", ""),
+        el.get("id", ""),
+        el.get("aria-label", ""),
+        el.get("placeholder", ""),
+        el.get("title", ""),
+    ]
+    if el.get("id"):
+        label = el.find_parent("form")
+        if label:
+            explicit = label.find("label", attrs={"for": el["id"]})
+            if explicit:
+                bits.append(explicit.get_text(" ", strip=True))
+    return " ".join(str(bit) for bit in bits if bit).lower()
+
+
+def _field_kind(el) -> Optional[str]:
+    """Return a submission-safe control kind, never a control from a results filter."""
+    tag = el.name
+    input_type = (el.get("type") or ("select" if tag == "select" else "text")).lower()
+    if el.has_attr("disabled") or el.has_attr("readonly"):
+        return None
+    if tag == "select":
+        return "select"
+    if tag == "textarea":
+        return "textarea"
+    if tag == "button" or input_type in ("submit", "button"):
+        return "submit"
+    if input_type in ("text", "search", "number", "date", "email", "tel", "url", "password", "checkbox", "radio"):
+        return input_type
+    return None
+
+
+def _form_controls(form):
+    """Controls owned by `form`, including HTML5 controls referenced with `form=`."""
+    controls = list(form.find_all(["input", "select", "textarea", "button"]))
+    form_id = form.get("id")
+    if form_id:
+        for control in form.find_all_previous(["input", "select", "textarea", "button"], attrs={"form": form_id}):
+            if control not in controls:
+                controls.append(control)
+        for control in form.find_all_next(["input", "select", "textarea", "button"], attrs={"form": form_id}):
+            if control not in controls:
+                controls.append(control)
+    return controls
+
+
+def _search_form(soup: BeautifulSoup):
+    """Prefer the CitationSearch form, not the independently rendered result-grid filters."""
+    candidates = soup.find_all("form")
+    if not candidates:
+        return None
+
+    def score(form) -> int:
+        text = " ".join(
+            str(form.get(key, "")) for key in ("id", "name", "action", "class")
+        ).lower()
+        controls = _form_controls(form)
+        return (
+            (20 if "citationsearch" in text else 0)
+            + (10 if "search" in text else 0)
+            + (5 if any(_field_kind(control) == "submit" for control in controls) else 0)
+            + min(len(controls), 5)
+        )
+
+    return max(candidates, key=score)
+
+
+def _css_selector(el) -> str:
+    if el.get("id"):
+        return f"#{el['id']}"
+    if el.get("name"):
+        return f'{el.name}[name="{el["name"]}"]'
+    return el.name
+
+
 def introspect_search_form(html: str) -> Dict[str, Any]:
     """Deterministic search-form introspection (Step 0). Returns a SearchFormMapExtraction dict."""
     soup = BeautifulSoup(html or "", "html.parser")
     fields = []
-    for el in soup.find_all(["input", "select", "textarea", "button"]):
+    form = _search_form(soup)
+    for el in _form_controls(form) if form else []:
         name = el.get("name") or el.get("id")
         if not name:
             continue
-        tag = el.name
-        itype = (el.get("type") or ("select" if tag == "select" else "text")).lower()
-        kind = "select" if tag == "select" else ("submit" if itype in ("submit", "button") or tag == "button" else itype if itype in ("text", "checkbox", "radio", "hidden") else "text")
-        options = [o.get("value") or o.get_text(strip=True) for o in el.find_all("option")] if tag == "select" else []
+        kind = _field_kind(el)
+        if kind is None:
+            continue
+        options = [o.get("value") or o.get_text(strip=True) for o in el.find_all("option")] if el.name == "select" else []
         role = None
-        low = name.lower()
+        low = _control_descriptor(el)
         for r, hints in ROLE_HINTS.items():
             if any(h in low for h in hints):
                 role = r
                 break
         if kind == "submit":
             role = "submit"
-        selector = f"{tag}[name=\"{el.get('name')}\"]" if el.get("name") else f"#{el.get('id')}"
+        selector = _css_selector(el)
         fields.append({"name": name, "selector": selector, "kind": kind, "options": [str(o) for o in options][:200], "role": role})
-    table = soup.find("table")
+    tables = soup.find_all("table")
+    def table_score(table) -> int:
+        headers = " ".join(th.get_text(" ", strip=True).lower() for th in table.find_all("th"))
+        attrs = " ".join(str(table.get(key, "")) for key in ("id", "class")).lower()
+        return (
+            sum(5 for token in ("citation", "title", "court", "date") if token in headers)
+            + (3 if any(table.find_all("td")) else 0)
+            + (2 if any(token in attrs for token in ("result", "citation", "grid")) else 0)
+        )
+    table = max(tables, key=table_score) if tables else None
     row_sel = None
     columns: Dict[str, int] = {}
     if table:

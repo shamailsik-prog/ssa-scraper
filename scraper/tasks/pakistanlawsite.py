@@ -33,6 +33,7 @@ from scraper.auth.session_manager import (
     LoginRequired,
     NoActiveSlot,
     PageResult,
+    SearchFormSubmissionError,
     SessionLock,
     SessionLockHeld,
     merge_source_config,
@@ -54,7 +55,7 @@ from scraper.notify import notify
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
-from scraper.tasks.search_map import active_map, map_as_dict, map_search_form, record_parse_result
+from scraper.tasks.search_map import active_map, map_as_dict, map_search_form, mark_map_stale, record_parse_result
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,10 @@ PACING_KEY = "pacing"  # source.config_json.pacing: hour / hour_pages / day / da
 
 class PacingBudgetExceeded(RuntimeError):
     """PAGES_PER_HOUR / PAGES_PER_DAY spent; the run ends, the source stays ACTIVE and Beat resumes it later."""
+
+
+class SearchMapStale(RuntimeError):
+    """The saved CitationSearch map no longer describes a usable result page."""
 
 
 def _aggregate_legacy_pacing(cfg: Dict[str, Any], *, hour_key: str, day_key: str) -> Dict[str, Any]:
@@ -153,11 +158,11 @@ def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict
         if "page_no" in cursor:
             if "page" in fields:
                 values["page"] = str(cursor["page_no"])
+            elif "citation" in fields:
+                values["citation"] = str(cursor["page_no"])
             elif "keyword" in fields:
                 values["keyword"] = f"{query['year']} {query['reporter']} {cursor['page_no']}"
-            elif "citation_no" in fields:
-                values["citation_no"] = str(cursor["page_no"])
-        if "reporter" not in fields and "keyword" in fields and "page_no" not in cursor:
+        if ("reporter" not in fields or "year" not in fields) and "keyword" in fields and "page_no" not in cursor:
             values["keyword"] = f"{query['reporter']} {query['year']}"
     if "statute" in query:
         if "statute" in fields:
@@ -169,6 +174,29 @@ def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict
     if "keyword" in query and "keyword" in fields:
         values["keyword"] = str(query["keyword"])
     return values
+
+
+def unmapped_query_reason(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
+    """Explain why no safely mapped form field can express a frontier query."""
+    values = build_values(search_map, query, cursor)
+    fields = search_map.get("fields") or {}
+    if "reporter" in query:
+        if {"reporter", "year"}.issubset(fields) and ({"page", "citation"} & set(fields)):
+            return None
+        if "keyword" in fields:
+            return None
+        missing = [role for role in ("reporter", "year", "page", "citation", "keyword") if role not in fields]
+        return f"search map cannot express reporter citation query; missing usable roles: {', '.join(missing)}"
+    if "statute" in query:
+        if "statute" in fields or "keyword" in fields:
+            return None
+        missing = [role for role in ("statute", "section", "keyword") if role not in fields]
+        return f"search map cannot express statute query; missing usable roles: {', '.join(missing)}"
+    if "keyword" in query:
+        return None if "keyword" in fields else "search map cannot express keyword query; missing usable role: keyword"
+    if values:
+        return None
+    return "search map cannot express frontier query; no usable mapped fields"
 
 
 # --------------------------------------------------------------------------- pipeline
@@ -315,6 +343,14 @@ class PakistanLawSitePipeline:
 
         page = await self.runner.run(op)
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
+        # A stale map is a page-shape failure, not a terminal frontier outcome.  Once a
+        # fresh map is saved, retry the rows that were paused for remapping.
+        await self.db.execute(
+            update(CrawlFrontier)
+            .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status == "stale")
+            .values(status="pending", last_error=None)
+        )
+        await self.db.flush()
         return map_as_dict(m)
 
     # ---------------------------------------------------------------- one result page
@@ -457,6 +493,8 @@ class PakistanLawSitePipeline:
             went_stale = await record_parse_result(self.db, m, ok=parse_ok, source_name=SOURCE_NAME)
             if went_stale:
                 frontier.status = "stale"
+                frontier.last_error = "search map stale after consecutive result parse failures; remap required"
+                raise SearchMapStale(frontier.last_error)
         self.stats["pages"] += 1
         self.stats["rows"] += len(rows)
         for idx, row in enumerate(rows):
@@ -486,6 +524,11 @@ class PakistanLawSitePipeline:
         page_no = int(frontier.cursor_json.get("page_no") or cov.next_page_to_probe or 1)
         for _ in range(max_probes):
             values = build_values(search_map, frontier.query_json, {"page_no": page_no})
+            reason = unmapped_query_reason(search_map, frontier.query_json, {"page_no": page_no})
+            if reason:
+                frontier.status = "retired"
+                frontier.last_error = reason
+                return
             page = await self.fetch_results(search_map, values)
             self.stats["queries"] += 1
             result = await self.process_result_page(page, search_map, frontier, start_index=int(frontier.cursor_json.get("row_index", 0)) if frontier.cursor_json.get("page_no") == page_no else 0)
@@ -519,9 +562,10 @@ class PakistanLawSitePipeline:
         ever restarts from page one); only a fresh row submits the query."""
         page_idx = int(frontier.cursor_json.get("page") or 1)
         values = build_values(search_map, frontier.query_json, frontier.cursor_json)
-        if not values:
+        reason = unmapped_query_reason(search_map, frontier.query_json, frontier.cursor_json)
+        if reason:
             frontier.status = "retired"
-            frontier.last_error = "search map offers no field for this query"
+            frontier.last_error = reason
             return
         pages_done = 0
         saved_next = frontier.cursor_json.get("next_url") if page_idx > 1 else None
@@ -605,7 +649,16 @@ class PakistanLawSitePipeline:
                         await self.run_tier1(fr, search_map, max_probes_per_volume)
                     else:
                         await self.run_paged_query(fr, search_map, max_pages=10)
-                    fr.last_error = None
+                    if fr.status not in {"stale", "retired"}:
+                        fr.last_error = None
+                except SearchFormSubmissionError as exc:
+                    m = await active_map(self.db, SOURCE_NAME)
+                    if m is not None:
+                        await mark_map_stale(self.db, m, source_name=SOURCE_NAME, reason=str(exc))
+                    fr.status = "stale"
+                    fr.last_error = f"search form submission rejected; remap required: {exc}"
+                    await self.db.flush()
+                    return self.stats
                 except ExplicitBlock as exc:
                     fr.status = "pending"
                     fr.last_error = f"halted: {exc}"
@@ -629,6 +682,9 @@ class PakistanLawSitePipeline:
                     fr.last_error = f"pacing: {exc}"
                     self.stats["pacing_paused"] = True
                     logger.info("PakistanLawSite pacing budget reached: %s; the source stays ACTIVE and Beat resumes it later", exc)
+                    await self.db.flush()
+                    return self.stats
+                except SearchMapStale:
                     await self.db.flush()
                     return self.stats
                 await lock.refresh()

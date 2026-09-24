@@ -65,6 +65,10 @@ class SessionLockHeld(RuntimeError):
     """Another worker already holds the single login-session lock."""
 
 
+class SearchFormSubmissionError(RuntimeError):
+    """A saved search-map control cannot safely be used on the current page."""
+
+
 @dataclass
 class PageResult:
     url: str
@@ -710,9 +714,24 @@ class PlaywrightBrowser:
             if not f:
                 continue
             sel, kind = f["selector"], f.get("kind", "text")
+            if kind not in {"select", "checkbox", "radio", "textarea", "text", "search", "number", "date", "email", "tel", "url", "password"}:
+                raise SearchFormSubmissionError(f"role {role!r} has unsupported control kind {kind!r}")
+            locator_factory = getattr(self._page, "locator", None)
+            if callable(locator_factory):
+                from playwright.async_api import TimeoutError as PWTimeoutError
+
+                try:
+                    control = locator_factory(sel)
+                    ready = await control.is_enabled(timeout=min(2_000, settings.PLAYWRIGHT_TIMEOUT_MS))
+                    if kind not in {"checkbox", "radio"}:
+                        ready = ready and await control.is_editable(timeout=min(2_000, settings.PLAYWRIGHT_TIMEOUT_MS))
+                except PWTimeoutError as exc:
+                    raise SearchFormSubmissionError(f"role {role!r} control did not become ready") from exc
+                if not ready:
+                    raise SearchFormSubmissionError(f"role {role!r} control is disabled or not editable")
             if kind == "select":
                 await self._wrap(self._page.select_option(sel, value=value))
-            elif kind == "checkbox":
+            elif kind in {"checkbox", "radio"}:
                 if value in ("1", "true", "on"):
                     await self._wrap(self._page.check(sel))
                 else:
