@@ -48,7 +48,7 @@ from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
 from scraper.models import Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
-from scraper.security import ExplicitBlock, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
+from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
 
 logger = logging.getLogger(__name__)
 
@@ -253,18 +253,22 @@ async def check_statute_sections(
                 _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"outside the source's allow-list: {str(exc)[:200]}", record_id=section.id)
                 results.append({"label": label, "result": "unreachable", "detail": "url policy"})
                 continue
-            if source.respect_robots and not robots_allows(safe_url):
-                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail="robots.txt disallows the page now", record_id=section.id)
-                results.append({"label": label, "result": "unreachable", "detail": "robots disallow"})
-                continue
-            if pages_opened:
-                await sleep(random.uniform(settings.SCRAPER_DELAY_MIN, settings.SCRAPER_DELAY_MAX))  # per-host pacing, as the public fetcher
-            pages_opened += 1
             try:
+                if source.respect_robots and not robots_allows(safe_url):
+                    _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail="robots.txt disallows the page now", record_id=section.id)
+                    results.append({"label": label, "result": "unreachable", "detail": "robots disallow"})
+                    continue
+                if pages_opened:
+                    await sleep(random.uniform(settings.SCRAPER_DELAY_MIN, settings.SCRAPER_DELAY_MAX))  # per-host pacing, as the public fetcher
+                pages_opened += 1
                 browser = browsers.get(source.source_name)
                 if browser is None:
                     browser = browsers[source.source_name] = await browser_factory(source)
                 page_text, where = await _page_text_in_browser(browser, safe_url)
+            except RobotsUnavailable as exc:
+                _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=section.id)
+                results.append({"label": label, "result": "unreachable", "detail": str(exc)[:200]})
+                continue
             except ExplicitBlock as exc:
                 await _halt_public_source(db, source, str(exc))
                 _record(db, kind="statute_section", label=label, url=prov.source_url, result="unreachable", detail=f"block, source halted: {str(exc)[:300]}", record_id=section.id)

@@ -510,7 +510,7 @@ class PlaywrightBrowser:
             return await coro
         except PWError as exc:
             msg = str(exc)
-            if any(k in msg for k in ("Target closed", "Browser has been closed", "net::ERR_", "Navigation failed", "Timeout", "disconnected", "Connection closed")):
+            if any(k in msg for k in ("Target closed", "Browser has been closed", "net::ERR_", "Navigation failed", "Timeout", "disconnected", "Connection closed", "Download is starting")):
                 raise BrowserDisconnected(msg) from exc
             raise
 
@@ -616,6 +616,8 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
+        # Redirect targets need the same allow-list and SSRF validation as requested URLs.
+        self._assert_url_policy(self._page.url)
         html_text = await self._capture_html()
         metadata: Dict[str, Any] = {}
         if capture_case_description_modal:
@@ -699,8 +701,15 @@ class PlaywrightBrowser:
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(self._context.request.get(url))
+        # context.request follows redirects, so validate the final destination too.
+        self._assert_url_policy(resp.url)
         if resp.status >= 400:
-            raise BrowserDisconnected(f"download HTTP {resp.status}") if resp.status >= 500 else ExplicitBlock("block", f"HTTP {resp.status} on download")
+            if resp.status >= 500:
+                raise BrowserDisconnected(f"download HTTP {resp.status}")
+            verdict = classify_response(resp.status, await self._wrap(resp.text()), resp.url)
+            if verdict.kind == "block":
+                raise ExplicitBlock(verdict.kind, verdict.detail)
+            raise RuntimeError(f"download HTTP {resp.status}")
         return await self._wrap(resp.body())
 
     async def storage_state(self) -> Dict[str, Any]:
