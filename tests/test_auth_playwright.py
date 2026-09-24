@@ -25,6 +25,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import settings
 from scraper.database import SessionLocal
+from scraper.extractors.deterministic import introspect_search_form
 from scraper.fetchers import canonical_text_hash
 from scraper.models import (
     BrowserSessionSlot,
@@ -690,6 +691,14 @@ async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query
     assert frontier.status == "retired"
     assert frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     assert pipeline.stats["queries"] == 0
+
+
+def test_tableless_citation_search_capture_is_classified_as_grid_surface():
+    """The page-content timeout fallback keeps the title but omits the result table."""
+    captured_html = """<html><head><title>Citation Search</title></head><body>
+    <a href="/Login/Logout">Logout</a></body></html>"""
+
+    assert introspect_search_form(captured_html)["surface"] == "grid_surface_no_query_form"
 
 
 async def test_paged_query_retires_with_explicit_unmapped_role_reason(db, login_source):

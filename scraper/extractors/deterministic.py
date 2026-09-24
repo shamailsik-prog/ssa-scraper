@@ -533,7 +533,8 @@ def _surface_classification(soup: BeautifulSoup, form) -> str:
     if form is not None:
         return "query_form"
     controls = soup.find_all(["input", "select", "textarea", "button"])
-    if soup.find("table") is not None and controls:
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if (soup.find("table") is not None and controls) or re.search(r"\bcitation\s*search\b", title, re.IGNORECASE):
         return "grid_surface_no_query_form"
     return "no_query_form"
 
