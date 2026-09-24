@@ -64,7 +64,7 @@ async function load(){
   $('volumes').innerHTML=v.length?'<table><tr><th>reporter</th><th>year</th><th>judgments</th></tr>'+v.map(x=>'<tr>'+cell(x.reporter)+cell(x.year)+cell(x.judgments)+'</tr>').join('')+'</table>':'<p class="note">none yet</p>';
   const sp=d.spot_checks||{};
   const t24=sp.last_24h||{};
-  let sh='<p class="note">Every '+esc(Math.round((sp.every_seconds||0)/60))+' minutes: '+esc((sp.per_run||{}).judgments)+' judgments through the login session and '+esc((sp.per_run||{}).statute_sections)+' statute sections from their public source. Last run: '+when(sp.last_checked_at)+'.</p>';
+  let sh='<p class="note">Every '+esc(Math.round((sp.every_seconds||0)/60))+' minutes: '+esc((sp.per_run||{}).judgments)+' judgments opened through the login session and '+esc((sp.per_run||{}).statute_sections)+' statute sections opened from their public source, each compared on the page as a browser shows it. Last run: '+when(sp.last_checked_at)+'.</p>';
   const keys=Object.keys(t24).sort();
   sh+='<p>Last 24 hours: '+(keys.length?keys.map(k=>'<span class="'+(k.endsWith(':match')?'ok':(k.endsWith(':differs')?'bad':'warn'))+'">'+esc(k)+' '+esc(t24[k])+'</span>').join(' · '):'no checks yet')+'</p>';
   const rec=sp.recent||[];

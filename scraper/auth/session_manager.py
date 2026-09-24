@@ -688,6 +688,11 @@ class PlaywrightBrowser:
         html_text = await self._capture_html()
         return PageResult(url=self._page.url, html=html_text, status=200)
 
+    async def visible_text(self) -> str:
+        """The text of the page as the browser shows it (the rendered document's innerText), the
+        same text a person reading the page in a browser sees."""
+        return await self._wrap(self._page.evaluate("() => (document.body && document.body.innerText) || ''"))
+
     async def download(self, url: str) -> bytes:
         try:
             url = self._assert_url_policy(url)
