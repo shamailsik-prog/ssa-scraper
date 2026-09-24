@@ -4,12 +4,12 @@ Human login rendered inside the dashboard (Amendment §9; Cursor command §2 ite
 The service launches a server-side Chromium, opens the source's login page and streams the
 viewport to the operator over a WebSocket using the Chrome DevTools screencast. Mouse and
 keyboard events from the operator are replayed into the page. The operator types credentials
-and completes any verification. Operators may also save per-slot username/password on the
-trusted host; those values are encrypted at rest and used to pre-fill login fields on demand.
-When the operator confirms, the service checks the page is authenticated, exports cookies and
-localStorage as Playwright storage state, encrypts it and stores it in the chosen slot.
-
-Credentials never appear in prompts, plain database fields or logs.
+and completes any verification. When the operator confirms, the service checks the page is
+authenticated, exports cookies and localStorage as Playwright storage state, encrypts it and
+stores it in the chosen slot. On the operator's instruction of 24 September 2026 a username and
+password may also be saved per slot (Fernet-encrypted); the service then fills the form, ticks the
+box below the password and signs in on its own when a slot is lost. Nothing typed is logged or
+echoed by any API.
 CAPTCHA / verification pages are never solved by code — they are shown to the human.
 """
 
@@ -283,11 +283,10 @@ class LoginSession:
         return await self._context.storage_state()
 
     async def apply_saved_credentials(self, username: str, password: str, *, auto_complete: bool = False) -> Dict[str, Any]:
-        """Fill known PakistanLawSite login fields from encrypted server-side credentials.
-
-        No credentials are logged or returned. The stream remains open so a human can complete
-        CAPTCHA/verification or fix changed selectors.
-        """
+        """Fill the sign-in form from the credentials the operator saved for the slot, tick every
+        box the form still has unticked (the site's "I Agree with the Terms and Conditions" sits
+        below the password), and, when asked, press Sign in. Nothing typed is logged or returned;
+        the stream stays open so a human can finish a verification page."""
         username = (username or "").strip()
         password = password or ""
         if not username or not password:
@@ -306,82 +305,39 @@ class LoginSession:
                 const fire = (el) => {
                   el.dispatchEvent(new Event('input', { bubbles: true }));
                   el.dispatchEvent(new Event('change', { bubbles: true }));
+                  el.dispatchEvent(new Event('click', { bubbles: true }));
                 };
                 const user = pick([
-                  "input[name='Login.UserName']",
-                  "input[name='username']",
-                  "input[name='user']",
-                  "input[id='Login_UserName']",
-                  "input[id='username']",
-                  "input[id='user']",
-                  "input[type='email']",
-                  "input[autocomplete='username']",
-                  "input[name*='user' i]",
-                  "input[id*='user' i]"
+                  "input[name='Login.UserName']", "input[name='username']", "input[name='user']",
+                  "input[id='Login_UserName']", "input[id='username']", "input[id='user']",
+                  "input[type='email']", "input[autocomplete='username']",
+                  "input[name*='user' i]", "input[id*='user' i]"
                 ]);
                 const pass = pick([
-                  "input[name='Login.Password']",
-                  "input[name='password']",
-                  "input[id='Login_Password']",
-                  "input[id='password']",
-                  "input[type='password']",
-                  "input[autocomplete='current-password']",
-                  "input[name*='pass' i]",
-                  "input[id*='pass' i]"
+                  "input[name='Login.Password']", "input[name='password']", "input[id='Login_Password']",
+                  "input[id='password']", "input[type='password']", "input[autocomplete='current-password']",
+                  "input[name*='pass' i]", "input[id*='pass' i]"
                 ]);
-                let checkedTerms = false;
-                // The live sign-in form's terms box is <input type=checkbox class=agreeBox> with no name
-                // or id, and the page refuses the submit until it is ticked; failing that, the only
-                // checkbox inside the sign-in form is the terms box.
-                const formBoxes = pass && pass.form ? Array.from(pass.form.querySelectorAll("input[type='checkbox']")) : [];
-                const terms = pick([
-                  "input[type='checkbox'].agreeBox",
-                  "input[type='checkbox'][class*='agree' i]",
-                  "input[type='checkbox'][name*='agree' i]",
-                  "input[type='checkbox'][id*='agree' i]",
-                  "input[type='checkbox'][name*='term' i]",
-                  "input[type='checkbox'][id*='term' i]"
-                ]) || (formBoxes.length === 1 ? formBoxes[0] : null);
-                if (user) {
-                  user.focus();
-                  user.value = username;
-                  fire(user);
-                }
-                if (pass) {
-                  pass.focus();
-                  pass.value = password;
-                  fire(pass);
-                }
-                if (terms && !terms.checked) {
-                  terms.checked = true;
-                  fire(terms);
-                  checkedTerms = true;
+                if (user) { user.focus(); user.value = username; fire(user); }
+                if (pass) { pass.focus(); pass.value = password; fire(pass); }
+                // The box below the password ("I Agree with the Terms and Conditions") and any
+                // other box the form offers: tick every one that is still unticked.
+                const scope = (pass && pass.form) || (user && user.form) || document;
+                let checked = 0;
+                for (const box of scope.querySelectorAll("input[type='checkbox']")) {
+                  if (!box.checked) { box.checked = true; fire(box); checked += 1; }
                 }
                 let submitted = false;
                 if (autoComplete && user && pass) {
                   const submit = pick([
-                    "button[type='submit']",
-                    "input[type='submit']",
-                    "button[name*='sign' i]",
-                    "button[id*='sign' i]",
-                    "button[name*='login' i]",
-                    "button[id*='login' i]"
+                    "button[type='submit']", "input[type='submit']",
+                    "button[name*='sign' i]", "button[id*='sign' i]", "input[value*='sign' i]",
+                    "button[name*='login' i]", "button[id*='login' i]", "input[value*='login' i]"
                   ]);
-                  if (submit) {
-                    submit.click();
-                    submitted = true;
-                  } else if (pass.form) {
-                    pass.form.requestSubmit ? pass.form.requestSubmit() : pass.form.submit();
-                    submitted = true;
-                  }
+                  if (submit) { submit.click(); submitted = true; }
+                  else if (pass.form) { pass.form.requestSubmit ? pass.form.requestSubmit() : pass.form.submit(); submitted = true; }
                 }
-                return {
-                  applied: !!(user && pass),
-                  submitted,
-                  username_field_found: !!user,
-                  password_field_found: !!pass,
-                  checked_terms: checkedTerms
-                };
+                return { applied: !!(user && pass), submitted, username_field_found: !!user, password_field_found: !!pass, checked_boxes: checked };
               }""",
             {"username": username, "password": password, "autoComplete": auto_complete},
         )

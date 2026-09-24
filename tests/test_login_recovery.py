@@ -140,38 +140,6 @@ async def test_recovery_task_walks_both_slots_and_leaves_alternate_running(db, l
         assert [r.state for r in rows] == ["ACTIVE", "ACTIVE"]
 
 
-async def test_pipeline_refuses_a_slot_another_worker_holds(db, login_source):
-    """One browser per login: a second job that lands on a slot already locked skips instead of
-    opening a second browser on the same cookies."""
-    await _activate(db, login_source, slots=(1,))
-    r = aioredis.from_url(settings.REDIS_URL)
-    await r.delete("corpus:login_session_lock:PakistanLawSite", "corpus:login_session_lock:PakistanLawSite:holders", "corpus:login_session_lock:PakistanLawSite:slot1")
-    holder = SessionLock("PakistanLawSite:slot1", r, max_holders=1)
-    await holder.acquire()
-    try:
-        sc = BrowserScript()
-        pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
-        stats = await pipeline.run(max_queries=1, max_probes_per_volume=1)
-        assert stats.get("skipped") == "slot_in_use" and stats.get("slot") == 1
-        assert sc.log == []
-    finally:
-        await holder.release()
-        await r.aclose()
-
-
-async def test_merge_source_config_keeps_other_keys(db, login_source):
-    from scraper.auth.session_manager import merge_source_config
-
-    await merge_source_config(db, login_source, {"citation_grid_cursor_shard_0": {"row_offset": 10}})
-    await merge_source_config(db, login_source, {"citation_grid_cursor_shard_1": {"row_offset": 20}})
-    await db.commit()
-    async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as fresh:
-        row = (await fresh.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
-        assert row.config_json["citation_grid_cursor_shard_0"] == {"row_offset": 10}
-        assert row.config_json["citation_grid_cursor_shard_1"] == {"row_offset": 20}
-    assert login_source.config_json["citation_grid_cursor_shard_0"] == {"row_offset": 10}
-
-
 class FakeLoginSession:
     """Stands in for browser_login.LoginSession: records what the recovery task asked of it."""
 
@@ -390,6 +358,36 @@ async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_sour
     assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
 
 
+async def test_refused_sign_in_records_the_sites_own_answer(db, login_source, monkeypatch):
+    """When the site refuses the submitted form (wrong password, account already in use), the
+    slot's recovery detail carries the site's own answer rather than only "login page"."""
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+
+    class RefusingSession(FakeLoginSession):
+        async def login_error(self):
+            return "account already in use"
+
+    class RefusingRegistry(FakeRegistry):
+        async def start(self, source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+            sess = RefusingSession(self, slot_number, saved_credentials, auto_complete)
+            self._sessions[source_name] = sess
+            return sess
+
+    reg = RefusingRegistry({"authenticated": False, "verdict": "login", "detail": "login page", "url": MAINPAGE_URL})
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert "failed" in result and result["sign_in"]["detail"] == "site refused the sign-in: account already in use"
+    assert (await _slot(db, 1)).state == "NEEDS_HUMAN_LOGIN"
+    notes = (await db.execute(select(Notification).where(Notification.code == "SLOT_RECOVERY_FAILED"))).scalars().all()
+    assert notes and "site refused the sign-in: account already in use" in notes[-1].message
+
+
 async def test_registry_start_closes_browser_when_login_page_fails(monkeypatch):
     """A half-started login session (Chromium up, login page never loaded) is closed, not leaked."""
     from scraper.auth import browser_login
@@ -455,51 +453,65 @@ async def test_paused_source_is_left_alone_when_admin_paused_or_too_recent(db, l
         assert row.state == "PAUSED"
 
 
-async def test_grid_surface_never_yields_a_form_map_and_revives_a_stale_grid_map(db, login_source):
-    """23 Sep 2026, map v28: a failed compact snapshot returned the full CitationSearch DOM, whose
-    filter form (32 inputs) was mapped as the search form; every later job typed into it and
-    timed out. The grid surface must always give the grid map."""
-    from scraper.models import SearchFormMap
-    from scraper.tasks.search_map import active_map
 
-    await _activate(db, login_source, slots=(1,))
-    # A stale grid map from earlier bounced windows.
-    stale = SearchFormMap(
-        source_name="PakistanLawSite",
-        map_version=27,
-        fields={},
-        result_layout={"row_selector": "#archivedpatientGrid tbody tr", "columns": {"citation": 0, "title": 1, "court": 2}},
-        page_size=None,
-        pagination={},
-        detail_layout={},
-        limits={},
-        dom_hash="x",
-        mapped_by="deterministic",
-        verified_against_dom=True,
-        is_active=True,
-        stale=True,
-        consecutive_parse_failures=5,
-    )
-    db.add(stale)
-    await db.commit()
-    full_dom = (
-        "<html><body><form id='searchForm'>"
-        + "".join(f"<input name='f{i}' type='text'>" for i in range(32))
-        + "<button type='submit'>Search</button></form>"
-        "<table id='archivedpatientGrid'><tbody><tr><td>PLD 2024 SC 1</td><td>A v B</td><td>SC</td></tr></tbody></table>"
-        "<a href='/logout'>Logout</a></body></html>"
-    )
-    sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), full_dom)
-    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), sleep=_nosleep)
-    search_map = await pipeline.ensure_search_map()
-    assert PakistanLawSitePipeline._is_citation_grid_map(search_map), search_map
-    m = await active_map(db, "PakistanLawSite")
-    assert m.map_version == 27 and m.stale is False and m.consecutive_parse_failures == 0
 
-    # With no usable map at all, mapping the full DOM must still not produce a form map.
-    m.is_active = False
+async def test_recovery_never_lifts_a_pause_an_admin_set(db, login_source, monkeypatch):
+    """An admin's pause (flagged from the dashboard) survives a verified slot and a saved-credential
+    sign-in; only a continuity pause is lifted."""
+    from datetime import datetime, timedelta, timezone
+
+    await _bounce_slot(db, login_source, 1)
+    login_source.state = "PAUSED"
+    login_source.state_reason = "stop for the weekend"
+    login_source.config_json = {**(login_source.config_json or {}), "paused_by_admin": True}
+    login_source.state_changed_at = datetime.now(timezone.utc) - timedelta(hours=2)
     await db.commit()
-    search_map = await pipeline.ensure_search_map()
-    assert PakistanLawSitePipeline._is_citation_grid_map(search_map), search_map
-    assert not PakistanLawSitePipeline._has_queryable_search_fields(search_map)
+    mgr = SessionManager(db, login_source)
+    assert mgr.is_admin_paused()
+    await mgr.reactivate_slot(1, "verified", by="recovery")
+    await db.commit()
+    assert login_source.state == "PAUSED"
+    assert await login_recovery.resume_paused_source(db, mgr, now=datetime.now(timezone.utc)) is None
+    assert login_source.state == "PAUSED"
+    # a human's Complete lifts it (specification 3.2)
+    await mgr.save_storage_state(1, {"cookies": [{"name": "sid", "value": "x", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}, by="operator")
+    await db.commit()
+    assert login_source.state == "ACTIVE" and not (login_source.config_json or {}).get("paused_by_admin")
+
+
+async def test_verified_slot_keeps_the_cookies_the_site_renewed(db, login_source, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from scraper.auth.session_manager import PageResult
+
+    await _bounce_slot(db, login_source, 1)
+    slot = await _slot(db, 1)
+    before = slot.storage_state_hash
+    login_source.config_json = {**(login_source.config_json or {}), recovery_key(1): {"attempts": 0, "lost_at": "2026-09-24T00:00:00+00:00", "next_attempt_at": "2026-09-24T00:00:00+00:00", "last_outcome": "scheduled"}}
+    await db.commit()
+
+    class Browser:
+        def __init__(self, state, n):
+            self.state, self.slot_number = state, n
+
+        async def goto(self, url, **kw):
+            return PageResult(url=url, html="<html><body><a href='/logout'>Logout</a><form id='searchForm'></form></body></html>", status=200)
+
+        async def export_storage_state(self):
+            return {"cookies": [{"name": "ASP.NET_SessionId", "value": "renewed-value", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
+
+        async def close(self):
+            pass
+
+    async def factory(state, n):
+        return Browser(state, n)
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    outcome = await recover_slot(db, SessionManager(db, login_source), slot, now=datetime.now(timezone.utc) + timedelta(minutes=1), browser_factory=factory, redis_client=r)
+    await db.commit()
+    await r.aclose()
+    assert outcome.get("recovered") == "verified"
+    slot = await _slot(db, 1)
+    assert slot.state == "ACTIVE" and slot.storage_state_hash != before
+    assert any(c["value"] == "renewed-value" for c in __import__("json").loads(settings.decrypt_value(slot.storage_state_encrypted))["cookies"])

@@ -6,10 +6,13 @@
     POST  /admin/sessions/{source}/login/complete             → verifies auth, stores encrypted state
     POST  /admin/sessions/{source}/login/cancel
     GET   /admin/sessions/{source}                            → slot states
-    GET   /admin/sessions/{source}/credentials                → encrypted credential slot status
-    POST  /admin/sessions/{source}/credentials/{n}            → save encrypted username/password
+    GET   /admin/sessions/{source}/credentials                → saved sign-in status per slot (never values)
+    POST  /admin/sessions/{source}/credentials/{n}            → save username/password (Fernet-encrypted)
     POST  /admin/sessions/{source}/credentials/{n}/clear      → clear saved credentials
     POST  /admin/sessions/{source}/slots/{n}/{pause|resume|clear}
+
+Operator decision of 24 September 2026: a username and password may be saved per slot; the service
+signs in with them when a slot is lost. Values are never echoed by any endpoint.
 """
 
 from __future__ import annotations
@@ -103,20 +106,7 @@ async def slots(source: str, db: AsyncSession = Depends(get_db)) -> Dict[str, An
 async def get_credentials(source: str, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     s = await _source(db, source)
     rows = await SessionManager(db, s).slots()
-    return {
-        "source": source,
-        "slots": [
-            {
-                "slot": r.slot_number,
-                "role": r.role,
-                "username": "CONFIGURED" if r.login_username_encrypted else "NOT CONFIGURED",
-                "password": "CONFIGURED" if r.login_password_encrypted else "NOT CONFIGURED",
-                "updated_at": r.login_credentials_updated_at.isoformat() if r.login_credentials_updated_at else None,
-                "updated_by": r.login_credentials_updated_by,
-            }
-            for r in rows
-        ],
-    }
+    return {"source": source, "slots": [{"slot": r.slot_number, "role": r.role, **_slot_view(r)["credentials"]} for r in rows]}
 
 
 @router.post("/{source}/credentials/{slot}", dependencies=[Depends(require_admin)])
@@ -131,14 +121,7 @@ async def save_credentials(source: str, slot: int, body: SaveCredentials, db: As
     await _slot_or_422(manager, slot)
     row = await manager.save_login_credentials(slot, username, body.password, by=body.saved_by)
     await db.commit()
-    return {
-        "source": source,
-        "slot": row.slot_number,
-        "username": "CONFIGURED",
-        "password": "CONFIGURED",
-        "updated_at": row.login_credentials_updated_at.isoformat() if row.login_credentials_updated_at else None,
-        "updated_by": row.login_credentials_updated_by,
-    }
+    return {"source": source, "slot": row.slot_number, "username": "CONFIGURED", "password": "CONFIGURED", "updated_at": row.login_credentials_updated_at.isoformat() if row.login_credentials_updated_at else None, "updated_by": row.login_credentials_updated_by}
 
 
 @router.post("/{source}/credentials/{slot}/clear", dependencies=[Depends(require_admin)])
@@ -161,7 +144,7 @@ async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(
     if s.state == "HALTED":
         raise HTTPException(409, f"source is HALTED: {s.state_reason}; re-enable after admin review first")
     saved = manager.load_login_credentials(row) if body.use_saved_credentials else None
-    auto_complete = bool(saved and body.auto_complete_if_empty and row.state == "EMPTY")
+    auto_complete = bool(saved and body.auto_complete_if_empty and row.state in ("EMPTY", "NEEDS_HUMAN_LOGIN"))
     viewport = {"width": body.viewport_width, "height": body.viewport_height} if body.viewport_width and body.viewport_height else None
     try:
         sess = await registry.start(
@@ -175,11 +158,11 @@ async def start_login(source: str, body: StartLogin, db: AsyncSession = Depends(
         )
     except LoginSessionError as exc:
         raise HTTPException(409, str(exc))
-    note = "type credentials in the streamed browser"
+    note = "type your username and password in the streamed browser, tick 'I Agree', sign in, then press Complete"
     if saved:
-        note = "saved credentials applied; confirm the page and complete login"
+        note = "saved credentials applied and the boxes ticked; confirm the page and press Complete"
         if auto_complete:
-            note = "saved credentials applied and sign-in was attempted; complete once authenticated"
+            note = "saved credentials applied, boxes ticked and Sign in pressed; press Complete once the page shows you signed in"
     return {
         "status": sess.status,
         "slot": sess.slot_number,

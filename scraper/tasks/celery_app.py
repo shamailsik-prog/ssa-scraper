@@ -1,11 +1,9 @@
 """
 Celery application. Queues:
   * scraper        — public sources (worker-public)
-  * login_session  — PakistanLawSite, concurrency from LOGIN_SESSION_CONCURRENCY (1–2; reporter shards)
+  * login_session  — PakistanLawSite, one worker, concurrency 1 (worker-scraper)
   * embeddings     — worker-embed
-  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-maintenance:
-                     never share this queue with long scrape runs, or dispatch and promotion stall
-                     behind them)
+  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-public)
 Beat owns scheduling; ScrapeGraph 'monitor' jobs are supplemental only and never replace it.
 """
 
@@ -31,6 +29,7 @@ app = Celery(
         "scraper.tasks.embeddings",
         "scraper.tasks.archive_mirror",
         "scraper.tasks.login_recovery",
+        "scraper.tasks.spot_check",
     ],
 )
 app.conf.update(
@@ -54,13 +53,19 @@ app.conf.update(
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
         "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
+        "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
+        "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
     beat_schedule={
-        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
-        # Promotion must keep up with a continuous login-session harvest (hundreds of staged rows per
-        # hour): 500 rows every 5 minutes, on its own worker (see worker-maintenance in docker-compose.yml).
-        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 300, "kwargs": {"limit": 500}},
+        # Specification section 10: dispatch every 30 minutes, promotion every 15 minutes (200 rows).
+        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": 1800},
+        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900, "kwargs": {"limit": 200}},
+        # Operator decision of 24 September 2026: a lost slot is re-verified and, if dead, signed in
+        # again with the saved credentials (runs on the single login-session worker, never beside a job).
         "recover-login-slots": {"task": "scraper.tasks.login_recovery.recover_login_slots", "schedule": settings.LOGIN_RECOVERY_SCHEDULE_SECONDS},
+        # Operator request of 24 September 2026: re-fetch a few promoted records and compare.
+        "spot-check-judgments": {"task": "scraper.tasks.spot_check.spot_check_judgments", "schedule": settings.SPOT_CHECK_SCHEDULE_SECONDS},
+        "spot-check-statutes": {"task": "scraper.tasks.spot_check.spot_check_statutes", "schedule": settings.SPOT_CHECK_SCHEDULE_SECONDS},
         "reconcile-instrument-relations": {
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,

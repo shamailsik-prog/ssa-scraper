@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Type
 from urllib.parse import urljoin, urlsplit
 
@@ -187,52 +187,9 @@ class PublicPipeline:
         return res
 
     async def halt(self, reason: str) -> None:
-        cfg = dict(self.source.config_json or {})
-        retry_enabled = bool(cfg.get("auto_retry_on_block", False))
-        retry_state = dict(cfg.get("block_retry") or {})
-        retry_count = int(retry_state.get("count", 0))
-        cooldown_minutes = int(cfg.get("block_retry_cooldown_minutes") or settings.BLOCK_RETRY_COOLDOWN_MINUTES)
-        retry_limit = int(cfg.get("block_retry_max_attempts") or settings.BLOCK_RETRY_MAX_ATTEMPTS)
+        """An explicit block halts the source exactly as in specification 3.7: HALTED,
+        requires_admin_review, a critical SOURCE_HALTED notification. No cooldown, no retry."""
         now = datetime.now(timezone.utc)
-
-        if retry_enabled and retry_count < retry_limit:
-            retry_count += 1
-            retry_at = now + timedelta(minutes=max(1, cooldown_minutes))
-            retry_state.update(
-                {
-                    "count": retry_count,
-                    "last_reason": reason[:1000],
-                    "last_blocked_at": now.isoformat(),
-                    "retry_at": retry_at.isoformat(),
-                    "limit": retry_limit,
-                }
-            )
-            cfg["block_retry"] = retry_state
-            self.source.config_json = cfg
-            self.source.state = "ACTIVE"
-            self.source.state_reason = (
-                f"explicit block — cooldown retry {retry_count}/{retry_limit} at {retry_at.isoformat()}; "
-                f"reason: {reason[:300]}"
-            )
-            self.source.state_changed_at = now
-            self.source.next_scrape_at = retry_at
-            self.source.requires_admin_review = False
-            self.stats["halted"] = False
-            self.stats["blocked_cooldown"] = True
-            await self.db.flush()
-            await notify(
-                self.db,
-                level="warning",
-                code="SOURCE_BLOCK_COOLDOWN",
-                message=(
-                    f"explicit block — source paused for cooldown retry {retry_count}/{retry_limit} at "
-                    f"{retry_at.isoformat()}; no evasion attempted"
-                ),
-                source_name=self.source.source_name,
-                details={"reason": reason[:500]},
-            )
-            return
-
         self.source.state = "HALTED"
         self.source.state_reason = reason[:1000]
         self.source.state_changed_at = now
@@ -510,11 +467,8 @@ async def run_public_source(
         if own_fetcher:
             await fetcher.__aexit__(None, None, None)
     source.last_scraped_at = datetime.now(timezone.utc)
-    if not pipeline.stats["halted"] and not pipeline.stats.get("blocked_cooldown"):
+    if not pipeline.stats["halted"]:
         source.last_success_at = source.last_scraped_at
-        cfg = dict(source.config_json or {})
-        if cfg.pop("block_retry", None) is not None:
-            source.config_json = cfg
     source.total_pages_scraped += max(0, int(pipeline.stats["fetched"] or 0) - pipeline._persisted_pages)
     source.total_records_extracted += max(0, int(pipeline.stats["staged"] or 0) - pipeline._persisted_staged)
     await db.flush()

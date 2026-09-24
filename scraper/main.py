@@ -18,7 +18,6 @@ from sqlalchemy import func, select, text
 
 from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
-from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
 from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources, status
 from scraper.routers.auth import _ok
 
@@ -84,11 +83,6 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
                 out["sources"] = {s.source_name: s.state for s in (await db.execute(select(ScraperSource))).scalars().all()}
                 out["running_jobs"] = (await db.execute(select(func.count()).select_from(ScraperJob).where(ScraperJob.status == "running"))).scalar()
                 out["embedding_identity_ok"] = await embedding_identity_matches()
-                harvest_mode = await get_harvest_mode(db)
-                out["harvest_mode"] = harvest_mode
-                out["backfill_progress"] = await backfill_progress(
-                    db, source_names=(await selected_source_names(db, "backfill"))
-                )
                 out["read_only_role"] = {
                     "name": settings.SIKANDER_READER_ROLE,
                     "status": "CONFIGURED" if settings.reader_role_configured else "NOT CONFIGURED",

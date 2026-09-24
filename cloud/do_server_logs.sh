@@ -36,7 +36,7 @@ SSH_OPTS=(-i "$KEYDIR/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsF
 if [ "$SERVICES" = "summary" ]; then
   # The corpus numbers as the key-free /status page shows them (the API listens on 127.0.0.1:8000
   # behind Caddy), plus the promotion and archive lines of the last hour.
-  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo "== /status.json" && curl -sS http://127.0.0.1:8000/status.json | python3 -m json.tool && echo && echo "== promotion and archive (last hour)" && docker compose logs --no-color --since 1h worker-public worker-maintenance 2>/dev/null | grep -E "promote_staging_records|mirror_pending|reconcile_storage" | tail -20' 2>&1 \
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo "== /status.json" && curl -sS http://127.0.0.1:8000/status.json | python3 -m json.tool && echo && echo "== promotion and archive (last hour)" && docker compose logs --no-color --since 1h worker-public 2>/dev/null | grep -E "promote_staging_records|mirror_pending|reconcile_storage" | tail -20' 2>&1 \
     | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
   exit 0
 fi

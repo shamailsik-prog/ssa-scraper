@@ -3,7 +3,7 @@ Login-session management for PakistanLawSite (Amendment §9; Cursor command §2,
 
 * Two continuity slots hold Fernet-encrypted Playwright storage state captured by a HUMAN login.
 * Slot states: EMPTY → ACTIVE ↔ NEEDS_HUMAN_LOGIN / PAUSED / HALTED.
-* Login-session lock: exclusive by default; two holders only when harvest concurrency is 2.
+* Login-session lock: one Redis lock (TTL 3600 s, refreshed on every page) refuses a second worker.
 * Ordinary disconnect: wait RECONNECT_SECONDS, reconnect the SAME slot, resume the SAME cursor;
   only if that fails may the alternate slot continue the same cursor. Never restart from page one.
 * Verification / login expiry: slot → NEEDS_HUMAN_LOGIN, notify, continue with another valid slot
@@ -18,14 +18,12 @@ scripted fake in tests; both raise the same exceptions.
 from __future__ import annotations
 
 import asyncio
-import html
 import hashlib
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urlsplit
 
@@ -46,8 +44,6 @@ from scraper.security import (
 )
 
 logger = logging.getLogger(__name__)
-
-ARCHIVED_GRID_SEEK_JS = (Path(__file__).resolve().parent / "archived_grid_seek.js").read_text(encoding="utf-8")
 
 LOCK_KEY = "corpus:login_session_lock:{source}"
 LOCK_TTL_SECONDS = 3600
@@ -140,11 +136,11 @@ def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:
 
 # --------------------------------------------------------------------------- lock
 class SessionLock:
-    def __init__(self, source_name: str, redis_client=None, *, max_holders: int = 1):
-        holders = 1 if int(max_holders or 1) <= 1 else 2
-        self.max_holders = holders
-        self.exclusive_key = LOCK_KEY.format(source=source_name)
-        self.key = self.exclusive_key if holders == 1 else f"{self.exclusive_key}:holders"
+    """The single login-session lock (specification 3.1): one worker at a time per source,
+    TTL LOCK_TTL_SECONDS, refreshed on every page."""
+
+    def __init__(self, source_name: str, redis_client=None):
+        self.key = LOCK_KEY.format(source=source_name)
         self._redis = redis_client
         self._own_client = redis_client is None
         self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
@@ -159,22 +155,7 @@ class SessionLock:
 
     async def acquire(self) -> None:
         r = await self._client()
-        if await r.get(self.exclusive_key) and self.max_holders > 1:
-            raise SessionLockHeld(f"login-session lock {self.exclusive_key} is held by another worker")
-        if self.max_holders == 1:
-            shared = int(await r.scard(f"{self.exclusive_key}:holders") or 0)
-            if shared > 0:
-                raise SessionLockHeld(f"login-session lock {self.exclusive_key}:holders is held by another worker")
-            ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
-        else:
-            ok = await r.eval(
-                "if redis.call('scard', KEYS[1]) < tonumber(ARGV[2]) then redis.call('sadd', KEYS[1], ARGV[1]); redis.call('expire', KEYS[1], ARGV[3]); return 1 else return 0 end",
-                1,
-                self.key,
-                self._token,
-                str(self.max_holders),
-                str(LOCK_TTL_SECONDS),
-            )
+        ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
         if not ok:
             raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
         self._held = True
@@ -182,22 +163,13 @@ class SessionLock:
     async def refresh(self) -> None:
         if self._held:
             r = await self._client()
-            if self.max_holders == 1:
-                ok = await r.eval(
-                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                    1,
-                    self.key,
-                    self._token,
-                    str(LOCK_TTL_SECONDS),
-                )
-            else:
-                ok = await r.eval(
-                    "if redis.call('sismember', KEYS[1], ARGV[1]) == 1 then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                    1,
-                    self.key,
-                    self._token,
-                    str(LOCK_TTL_SECONDS),
-                )
+            ok = await r.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1,
+                self.key,
+                self._token,
+                str(LOCK_TTL_SECONDS),
+            )
             if int(ok or 0) != 1:
                 self._held = False
                 raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
@@ -208,21 +180,13 @@ class SessionLock:
                 return
             r = await self._client()
             # Compare-and-delete in one step: a lock that expired and was taken by another worker
-            # between a read and a delete would otherwise be deleted from under that worker.
-            if self.max_holders == 1:
-                await r.eval(
-                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-                    1,
-                    self.key,
-                    self._token,
-                )
-            else:
-                await r.eval(
-                    "redis.call('srem', KEYS[1], ARGV[1]); if redis.call('scard', KEYS[1]) == 0 then redis.call('del', KEYS[1]) end; return 1",
-                    1,
-                    self.key,
-                    self._token,
-                )
+            # between a GET and a DEL would otherwise be deleted from under that worker.
+            await r.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                self.key,
+                self._token,
+            )
             self._held = False
         finally:
             if self._own_client and self._redis is not None:
@@ -244,10 +208,10 @@ class SessionLock:
 async def merge_source_config(db: AsyncSession, source: ScraperSource, patch: Dict[str, Any]) -> Dict[str, Any]:
     """Merge top-level keys into scraper_sources.config_json atomically (JSONB `||`).
 
-    Two reporter shards run at the same time in two worker processes, each holding its own copy of
-    the source row; writing the whole JSON back from either copy would overwrite the other shard's
-    cursor and pacing counters. Each writer therefore sends only its own keys, and the in-memory
-    row is set to the merged value the database returns."""
+    The connector, the dashboard and the API may each hold their own copy of the source row;
+    writing the whole JSON back from one copy would overwrite what another wrote meanwhile (the
+    cursor, the pacing counters, the current slot). Each writer therefore sends only its own keys,
+    and the in-memory row is set to the merged value the database returns."""
     if not patch:
         return dict(source.config_json or {})
     stmt = (
@@ -309,6 +273,8 @@ class SessionManager:
 
     # ---------------------------------------------------------------- storage state
     async def save_storage_state(self, slot_number: int, storage_state: Dict[str, Any], *, by: str = "human") -> BrowserSessionSlot:
+        """Store the storage state a HUMAN login produced (specification 3.2): the slot becomes
+        ACTIVE and a PAUSED source becomes ACTIVE. This is the only way a session is created."""
         s = await self.slot(slot_number)
         raw = json.dumps(storage_state, separators=(",", ":"))
         s.storage_state_encrypted = settings.encrypt_value(raw)
@@ -318,17 +284,35 @@ class SessionManager:
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
-        await self._resume_source_if_paused()
+        # A human's Complete lifts any pause (specification 3.2); the service's own sign-in never
+        # lifts a pause an admin set.
+        await self._resume_source_if_paused(respect_admin=by in ("auto-recovery", "recovery"))
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active (login by {by})", source_name=self.source.source_name)
         return s
 
-    async def _resume_source_if_paused(self) -> None:
-        if self.source.state == "PAUSED":
-            self.source.state = "ACTIVE"
-            self.source.state_reason = None
-            self.source.state_changed_at = datetime.now(timezone.utc)
-            self.source.next_scrape_at = datetime.now(timezone.utc)
+    def is_admin_paused(self) -> bool:
+        """A pause an admin set from the dashboard (flagged in the source config, or worded so)
+        is never lifted by the service's own recovery; only a human or an admin action lifts it."""
+        if self.source.state != "PAUSED":
+            return False
+        cfg = dict(self.source.config_json or {})
+        if cfg.get("paused_by_admin"):
+            return True
+        return "admin" in (self.source.state_reason or "").lower()
+
+    async def _resume_source_if_paused(self, *, respect_admin: bool = False) -> None:
+        if self.source.state != "PAUSED":
+            return
+        if respect_admin and self.is_admin_paused():
+            return
+        self.source.state = "ACTIVE"
+        self.source.state_reason = None
+        self.source.state_changed_at = datetime.now(timezone.utc)
+        self.source.next_scrape_at = datetime.now(timezone.utc)
+        cfg = dict(self.source.config_json or {})
+        if cfg.get("paused_by_admin"):
+            await merge_source_config(self.db, self.source, {"paused_by_admin": False})
 
     async def reactivate_slot(self, slot_number: int, reason: str, *, by: str = "recovery") -> BrowserSessionSlot:
         """A slot the site had bounced turns out to hold a live session after a cool-down (the site
@@ -337,7 +321,7 @@ class SessionManager:
         s.state = "ACTIVE"
         s.state_reason = reason[:1000]
         s.last_verified_at = datetime.now(timezone.utc)
-        await self._resume_source_if_paused()
+        await self._resume_source_if_paused(respect_admin=True)
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active again: {reason} ({by})", source_name=self.source.source_name)
         return s
@@ -397,12 +381,12 @@ class SessionManager:
         logger.info("slot %s storage state refreshed from the live browser: %s", slot_number, ", ".join(cookie_summary(storage_state)) or "no cookies")
         return digest
 
+    # ---------------------------------------------------------------- saved sign-in (operator decision, 24 September 2026)
     async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
         s = await self.slot(slot_number)
-        now = datetime.now(timezone.utc)
         s.login_username_encrypted = settings.encrypt_value(username.strip())
         s.login_password_encrypted = settings.encrypt_value(password)
-        s.login_credentials_updated_at = now
+        s.login_credentials_updated_at = datetime.now(timezone.utc)
         s.login_credentials_updated_by = by
         await self.db.flush()
         return s
@@ -414,12 +398,7 @@ class SessionManager:
             username = settings.decrypt_value(slot.login_username_encrypted).strip()
             password = settings.decrypt_value(slot.login_password_encrypted)
         except Exception as exc:
-            logger.warning(
-                "Ignoring malformed saved credentials for %s slot %s: %s",
-                self.source.source_name,
-                slot.slot_number,
-                exc,
-            )
+            logger.warning("Ignoring malformed saved credentials for %s slot %s: %s", self.source.source_name, slot.slot_number, exc)
             return None
         if not username or not password:
             return None
@@ -535,364 +514,34 @@ class PlaywrightBrowser:
                 raise BrowserDisconnected(msg) from exc
             raise
 
-    @staticmethod
-    def _header_int(resp, name: str) -> Optional[int]:
-        if resp is None:
-            return None
-        raw = resp.headers.get(name) or resp.headers.get(name.lower())
-        if raw in (None, ""):
-            return None
+    async def _capture_html(self) -> str:
+        """The page's HTML. The authenticated CitationSearch page is a 10-16 MB DOM on which a full
+        serialization can outlast the Playwright timeout; when it does, the search-form map only
+        needs the forms, so those (and the logout link the verdict looks for) are captured on their
+        own instead of treating the page as lost."""
+        timeout = max(5.0, settings.PLAYWRIGHT_TIMEOUT_MS / 1000.0)
         try:
-            return int(str(raw).strip())
-        except Exception:
-            return None
-
-    async def _dom_shape(self) -> Dict[str, Any]:
-        # Keep this evaluate cheap: never walk every DataTables row or serialize
-        # multi-MB innerText/outerHTML here — that is what hung CitationSearch.
+            return await asyncio.wait_for(self._wrap(self._page.content()), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "page.content() exceeded %.0fs on slot %s (%s); capturing the forms only",
+                timeout,
+                self.slot_number,
+                self._page.url if self._page else "?",
+            )
         return await self._wrap(
             self._page.evaluate(
                 """() => {
-                    const body = document.body;
-                    const grid = document.getElementById('archivedpatientGrid');
-                    let archivedpatient_rows = 0;
-                    if (grid) {
-                        const tbody = grid.tBodies && grid.tBodies[0];
-                        archivedpatient_rows = tbody && tbody.rows ? tbody.rows.length : 0;
+                    const parts = [];
+                    const title = document.title ? '<title>' + document.title.replace(/</g, '&lt;') + '</title>' : '';
+                    for (const a of document.querySelectorAll('a[href*="logout" i], a[href*="logoff" i], a[href*="signout" i]')) {
+                        parts.push(a.outerHTML);
                     }
-                    // innerText forces style + layout of the whole document: on the 20k-row
-                    // CitationSearch grid that alone takes seconds. Build the preview from the
-                    // chrome around the grid instead (textContent needs no layout).
-                    let body_preview = '';
-                    if (grid && archivedpatient_rows > 500) {
-                        const parts = [];
-                        const children = body ? body.children : [];
-                        for (let i = 0; i < children.length && parts.join(' ').length < 400; i += 1) {
-                            const el = children[i];
-                            if (!el || el === grid || el.contains(grid) || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
-                            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-                            if (t) parts.push(t);
-                        }
-                        body_preview = parts.join(' ').slice(0, 400);
-                    } else {
-                        body_preview = (body && body.innerText ? body.innerText : '').slice(0, 400);
-                    }
-                    return {
-                        forms: document.forms ? document.forms.length : 0,
-                        inputs: document.querySelectorAll('input').length,
-                        has_archivedpatient_grid: Boolean(grid),
-                        archivedpatient_rows,
-                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                        body_preview,
-                    };
+                    for (const f of document.forms) parts.push(f.outerHTML);
+                    return '<html><head>' + title + '</head><body>' + parts.join('\n') + '</body></html>';
                 }"""
             )
         )
-
-    async def _capture_archived_grid_snapshot(self, *, start_row: int = 0, max_rows_override: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """Compact row extract for archivedpatientGrid without page.content().
-
-        Critical performance rules:
-        - iterate tbody.rows up to maxRows (do NOT Array.from(querySelectorAll(...)))
-        - never read tr.innerHTML (re-serializes huge row markup)
-        - synthesize detail URLs from casetypeid when anchors are absent
-        """
-        max_rows = int(max_rows_override or settings.PLS_ARCHIVED_GRID_MAX_ROWS)
-        safe_start_row = max(0, int(start_row or 0))
-        logger.info(
-            "archivedpatientGrid compact snapshot starting slot=%s max_rows=%s start_row=%s url=%s",
-            self.slot_number,
-            max_rows,
-            safe_start_row,
-            self._page.url if self._page else None,
-        )
-        started = datetime.now(timezone.utc)
-        try:
-            snapshot = await asyncio.wait_for(
-                self._wrap(
-                    self._page.evaluate(
-                        "async ({ maxRows, startRow }) => {\n"
-                        + ARCHIVED_GRID_SEEK_JS
-                        + """
-                    const table = document.getElementById('archivedpatientGrid');
-                    if (!table) return null;
-                    const requestedStartRow = Number.isFinite(Number(startRow)) ? Math.max(0, Math.floor(Number(startRow))) : 0;
-                    let appliedStartRow = 0;
-                    let totalRows = null;
-                    let pageLength = null;
-                    let seekMode = 'none';
-                    try {
-                        const seek = await seekArchivedGridAbsolute(table, startRow, maxRows);
-                        if (seek) {
-                            totalRows = seek.total_rows;
-                            pageLength = seek.page_length;
-                            seekMode = seek.seek_mode || 'none';
-                            if (seekMode === 'datatable' || seekMode === 'dom_absolute') {
-                                appliedStartRow = Number.isFinite(Number(seek.start_row)) ? Math.max(0, Math.floor(Number(seek.start_row))) : 0;
-                            } else {
-                                appliedStartRow = 0;
-                            }
-                        }
-                    } catch (_seekError) {
-                        // Keep compact snapshot resilient; live path is DOM slice, DT is optional.
-                        appliedStartRow = 0;
-                        seekMode = 'none';
-                    }
-                    if (seekMode !== 'datatable' && seekMode !== 'dom_absolute') {
-                        appliedStartRow = 0;
-                        const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
-                        const trCollection = tbody && tbody.rows ? tbody.rows : [];
-                        // Only scroll a row that is actually in this DOM page. Do not map a
-                        // deep start_row onto the last first-page row — that invents an offset.
-                        const inDom = requestedStartRow < trCollection.length ? trCollection[requestedStartRow] : null;
-                        if (inDom && inDom.scrollIntoView) {
-                            try {
-                                inDom.scrollIntoView({ block: 'nearest' });
-                                if (seekMode === 'unavailable' || seekMode === 'none') {
-                                    seekMode = 'scroll';
-                                }
-                            } catch (_scrollError) {
-                                if (seekMode === 'unavailable' || seekMode === 'none') {
-                                    seekMode = 'dom';
-                                }
-                            }
-                        } else if (seekMode === 'unavailable' || seekMode === 'none') {
-                            seekMode = 'dom';
-                        }
-                    }
-                    const headers = Array.from(table.querySelectorAll('thead th')).map((th) => (th.textContent || '').trim());
-                    const normalizedHeaders = headers.map((h) => h.toLowerCase().replace(/\\s+/g, ' ').trim());
-                    const pickIndex = (hints, fallbackIndex) => {
-                        for (let i = 0; i < normalizedHeaders.length; i += 1) {
-                            const header = normalizedHeaders[i];
-                            if (hints.some((hint) => header.includes(hint))) {
-                                return i;
-                            }
-                        }
-                        return fallbackIndex;
-                    };
-                    const nonReadIndexes = normalizedHeaders
-                        .map((h, idx) => ({ h, idx }))
-                        .filter((entry) => !entry.h.includes('read'))
-                        .map((entry) => entry.idx);
-                    const citationIdx = pickIndex(['citation'], nonReadIndexes[0] ?? 0);
-                    const titleIdx = pickIndex(['title', 'party'], nonReadIndexes[1] ?? 1);
-                    const courtIdx = pickIndex(['court'], nonReadIndexes[2] ?? 2);
-                    const cellAt = (cells, idx) => (idx >= 0 && idx < cells.length ? (cells[idx] || '') : '');
-                    const rows = [];
-                    const tbody = (table.tBodies && table.tBodies[0]) || table.querySelector('tbody');
-                    const trCollection = tbody && tbody.rows ? tbody.rows : [];
-                    // Live default: full <tr> list — slice [offset : offset+page_size].
-                    // DataTables fallback already materialized the window; harvest from 0.
-                    const harvestStart = (seekMode === 'dom_absolute') ? appliedStartRow : 0;
-                    const limit = Math.min(trCollection.length || 0, harvestStart + maxRows);
-                    for (let i = harvestStart; i < limit; i += 1) {
-                        const tr = trCollection[i];
-                        if (!tr) continue;
-                        const tdNodes = tr.cells || tr.querySelectorAll('td');
-                        const cells = [];
-                        for (let c = 0; c < tdNodes.length; c += 1) {
-                            cells.push((tdNodes[c].textContent || '').trim());
-                        }
-                        const anchors = tr.querySelectorAll('a[href]');
-                        let detailUrl = null;
-                        let pdfUrl = null;
-                        for (let a = 0; a < anchors.length; a += 1) {
-                            const href = anchors[a].href || '';
-                            if (!href) continue;
-                            if (!pdfUrl && href.toLowerCase().endsWith('.pdf')) {
-                                pdfUrl = href;
-                            } else if (!detailUrl) {
-                                detailUrl = href;
-                            }
-                        }
-                        if (!detailUrl) {
-                            const readControl = tr.querySelector(
-                                'input.courtWiseSearchBtn[casetypeid], .courtWiseSearchBtn[casetypeid], [casetypeid]'
-                            );
-                            const caseTypeId = readControl && readControl.getAttribute('casetypeid')
-                                ? readControl.getAttribute('casetypeid').trim()
-                                : '';
-                            if (caseTypeId) {
-                                detailUrl = `${window.location.origin}/Login/ReferenceCaseLawSearch?CaseName=${encodeURIComponent(caseTypeId)}&court=&Row=0&bookName=undefined`;
-                            }
-                        }
-                        rows.push({
-                            citation: cellAt(cells, citationIdx),
-                            title: cellAt(cells, titleIdx),
-                            court: cellAt(cells, courtIdx),
-                            detail_url: detailUrl,
-                            pdf_url: pdfUrl,
-                        });
-                    }
-                    const nextRoot = document.getElementById('archivedpatientGrid_next');
-                    const nextLink = (nextRoot && nextRoot.querySelector('a'))
-                        || document.querySelector('.dataTables_paginate a.next, a[rel="next"]');
-                    const nextDisabled = nextLink
-                        ? (nextLink.classList.contains('disabled') || (nextLink.parentElement && nextLink.parentElement.classList.contains('disabled')))
-                        : true;
-                    const domTotalRows = trCollection.length || 0;
-                    const resolvedTotalRows = Number.isFinite(totalRows) && totalRows >= 0
-                        ? totalRows
-                        : domTotalRows;
-                    return {
-                        headers,
-                        rows,
-                        next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
-                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
-                        has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
-                        total_rows: resolvedTotalRows,
-                        requested_start_row: requestedStartRow,
-                        start_row: appliedStartRow,
-                        seek_mode: seekMode,
-                        page_length: Number.isFinite(pageLength) && pageLength > 0 ? Math.floor(pageLength) : null,
-                    };
-                }""",
-                        {"maxRows": max_rows, "startRow": safe_start_row},
-                    )
-                ),
-                timeout=max(8.0, float(getattr(settings, "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS", 20) or 20)),
-            )
-        except asyncio.TimeoutError as exc:
-            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-            logger.warning(
-                "archivedpatientGrid compact snapshot timed out after %.1fs slot=%s max_rows=%s",
-                elapsed,
-                self.slot_number,
-                max_rows,
-            )
-            if max_rows > 50:
-                # The page is still open: try a smaller window before treating the browser as gone
-                # (a reconnect re-renders the whole 10-16 MB grid and would time out the same way).
-                smaller = max(50, max_rows // 2)
-                logger.warning("archivedpatientGrid retrying compact snapshot with max_rows=%s", smaller)
-                return await self._capture_archived_grid_snapshot(start_row=start_row, max_rows_override=smaller)
-            raise BrowserDisconnected(
-                f"archivedpatientGrid compact snapshot timed out after {elapsed:.1f}s"
-            ) from exc
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        row_count = len((snapshot or {}).get("rows") or []) if snapshot else 0
-        total_rows = (snapshot or {}).get("total_rows") if snapshot else None
-        logger.info(
-            "archivedpatientGrid compact snapshot done slot=%s rows=%s total_rows=%s start_row=%s seek_mode=%s elapsed=%.1fs",
-            self.slot_number,
-            row_count,
-            total_rows,
-            (snapshot or {}).get("start_row") if snapshot else None,
-            (snapshot or {}).get("seek_mode") if snapshot else None,
-            elapsed,
-        )
-        return snapshot
-
-    @staticmethod
-    def _render_compact_archived_grid_html(snapshot: Dict[str, Any]) -> str:
-        # Body cells are always citation/title/court/read — ignore live DataTables headers
-        # (often include a leading "#") so introspect column indexes stay aligned.
-        headers = ["Citation", "Title", "Court", "Read"]
-        rows = snapshot.get("rows") or []
-        parts: List[str] = ["<html><body>"]
-        if snapshot.get("has_logout"):
-            parts.append("<a href=\"/logout\">Logout</a>")
-        parts.append("<table id=\"archivedpatientGrid\"><thead><tr>")
-        for h in headers:
-            parts.append(f"<th>{html.escape(str(h))}</th>")
-        parts.append("</tr></thead><tbody>")
-        for row in rows:
-            parts.append("<tr>")
-            parts.append(f"<td>{html.escape(str(row.get('citation') or ''))}</td>")
-            parts.append(f"<td>{html.escape(str(row.get('title') or ''))}</td>")
-            parts.append(f"<td>{html.escape(str(row.get('court') or ''))}</td>")
-            href = row.get("detail_url") or row.get("pdf_url")
-            if href:
-                parts.append(f"<td><a href=\"{html.escape(str(href), quote=True)}\">Read</a></td>")
-            else:
-                parts.append("<td></td>")
-            parts.append("</tr>")
-        parts.append("</tbody></table>")
-        if snapshot.get("next_url"):
-            parts.append(f"<a rel=\"next\" href=\"{html.escape(str(snapshot['next_url']), quote=True)}\">Next</a>")
-        preview = snapshot.get("body_preview") or ""
-        if preview:
-            parts.append(f"<div id=\"guard_preview\">{html.escape(str(preview))}</div>")
-        parts.append("</body></html>")
-        return "".join(parts)
-
-    @staticmethod
-    def _render_oversize_stub(dom: Dict[str, Any], *, content_length: Optional[int]) -> str:
-        preview = dom.get("body_preview") or ""
-        fields = [
-            ("inputs", dom.get("inputs", 0)),
-            ("forms", dom.get("forms", 0)),
-            ("content_length", content_length if content_length is not None else "unknown"),
-        ]
-        attrs = " ".join(f"data-{k}=\"{html.escape(str(v), quote=True)}\"" for k, v in fields)
-        return (
-            f"<html><body><div id=\"oversize_guard\" {attrs}>"
-            "oversized page skipped by Playwright guard"
-            "</div>"
-            f"<div id=\"guard_preview\">{html.escape(str(preview))}</div>"
-            "</body></html>"
-        )
-
-    async def _capture_html(self, *, resp=None, archived_grid_start_row: int = 0) -> tuple[str, Dict[str, Any]]:
-        dom = await self._dom_shape()
-        content_length = self._header_int(resp, "content-length")
-        has_grid = bool(dom.get("has_archivedpatient_grid"))
-        oversized = False
-        if content_length is not None and content_length >= settings.PLAYWRIGHT_MAX_HTML_BYTES:
-            oversized = True
-        if int(dom.get("inputs") or 0) >= settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD:
-            oversized = True
-        # CitationSearch often omits Content-Length (chunked/gzip) and can sit under the
-        # input threshold while the live DOM is still ~10-16MB. Always compact when the
-        # archived grid is present — never call page.content() on that surface.
-        if has_grid:
-            snapshot = await self._capture_archived_grid_snapshot(start_row=archived_grid_start_row)
-            if snapshot:
-                html_compact = self._render_compact_archived_grid_html(snapshot)
-                return html_compact, {
-                    "content_guard": "archivedpatientGrid_compact",
-                    "inputs": int(dom.get("inputs") or 0),
-                    "forms": int(dom.get("forms") or 0),
-                    "content_length": content_length,
-                    "rows": len(snapshot.get("rows") or []),
-                    "row_cap": int(settings.PLS_ARCHIVED_GRID_MAX_ROWS),
-                    "total_rows": snapshot.get("total_rows"),
-                    "start_row": snapshot.get("start_row"),
-                    "requested_start_row": snapshot.get("requested_start_row"),
-                    "seek_mode": snapshot.get("seek_mode"),
-                    "page_length": snapshot.get("page_length"),
-                    "oversized_hint": oversized,
-                }
-            logger.warning(
-                "archivedpatientGrid present but compact snapshot failed slot=%s url=%s; refusing page.content()",
-                self.slot_number,
-                self._page.url,
-            )
-            stub = self._render_oversize_stub(dom, content_length=content_length)
-            return stub, {
-                "content_guard": "archivedpatientGrid_snapshot_failed",
-                "inputs": int(dom.get("inputs") or 0),
-                "forms": int(dom.get("forms") or 0),
-                "content_length": content_length,
-                "grid_snapshot_failed": True,
-            }
-        if oversized:
-            logger.warning(
-                "oversized HTML guard tripped for slot=%s url=%s inputs=%s content_length=%s",
-                self.slot_number,
-                self._page.url,
-                dom.get("inputs"),
-                content_length,
-            )
-            stub = self._render_oversize_stub(dom, content_length=content_length)
-            return stub, {
-                "content_guard": "oversize_stub",
-                "inputs": int(dom.get("inputs") or 0),
-                "forms": int(dom.get("forms") or 0),
-                "content_length": content_length,
-            }
-        return await self._wrap(self._page.content()), {}
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
         wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)
@@ -955,7 +604,6 @@ class PlaywrightBrowser:
         )
 
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
-        archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
         try:
             url = self._assert_url_policy(url)
@@ -968,7 +616,8 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
-        html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        html_text = await self._capture_html()
+        metadata: Dict[str, Any] = {}
         if capture_case_description_modal:
             try:
                 modal_meta = await self._capture_case_description_modal()
@@ -1036,8 +685,8 @@ class PlaywrightBrowser:
             await self._wait_for_post_submit_navigation(
                 lambda: self._page.keyboard.press("Enter")
             )
-        html_text, metadata = await self._capture_html(resp=None)
-        return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
+        html_text = await self._capture_html()
+        return PageResult(url=self._page.url, html=html_text, status=200)
 
     async def download(self, url: str) -> bytes:
         try:
@@ -1090,13 +739,9 @@ class ContinuityRunner:
     sleep: Any = asyncio.sleep
     browser: Optional[Browser] = None
     reconnects: int = 0
-    preferred_slot_number: Optional[int] = None
     # Hash of the storage state the current browser was opened with; a live-state refresh is
     # written only while the slot still holds it (compare-and-update).
     opened_state_hash: Optional[str] = None
-    # True for a reporter shard: it may never continue on the other shard's slot, because that slot
-    # is in use by the other shard at the same time (one login per account on the site).
-    exclusive_slot: bool = False
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
@@ -1114,10 +759,6 @@ class ContinuityRunner:
     async def ensure_browser(self) -> Browser:
         if self.browser is not None:
             return self.browser
-        if self.preferred_slot_number:
-            preferred = await self.manager.slot(self.preferred_slot_number)
-            if preferred.state == "ACTIVE":
-                return await self.open(preferred)
         slot = await self.manager.current_slot()
         if slot is None:
             raise NoActiveSlot("no ACTIVE slot")
@@ -1156,8 +797,6 @@ class ContinuityRunner:
             except BrowserDisconnected as exc2:
                 logger.warning("same-slot reconnect failed for slot %s: %s", slot_no, exc2)
                 await self.close()
-                if self.exclusive_slot:
-                    raise
                 alt = await self.manager.alternate_active_slot(slot_no)
                 if alt is None:
                     await self.manager.pause_source(f"slot {slot_no} unreachable after reconnect and no alternate slot")
@@ -1171,8 +810,6 @@ class ContinuityRunner:
         except (LoginRequired, VerificationRequired) as exc:
             await self.close()
             await self.manager.mark_needs_human_login(slot_no, f"{type(exc).__name__}: {exc}")
-            if self.exclusive_slot:
-                raise
             alt = await self.manager.alternate_active_slot(slot_no)
             if alt is None:
                 raise

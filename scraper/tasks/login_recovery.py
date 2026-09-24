@@ -1,6 +1,8 @@
 """
-Automatic re-verification of PakistanLawSite login slots, so a slot the site bounced comes back
-into rotation on its own when the session behind it is in fact still alive.
+Automatic re-verification of PakistanLawSite login slots and, when a slot is dead, sign-in with
+the credentials the operator saved for it (operator decision of 24 September 2026, after the
+working specification's human-only login had been deployed and the operator asked for the saved
+passwords and the automatic login back, with the box below the password ticked).
 
 The site ends a busy session by redirecting to its public login page; the connector then marks the
 slot NEEDS_HUMAN_LOGIN and, when both slots are down, pauses the source. Whether the site ended the
@@ -62,8 +64,7 @@ async def resume_paused_source(db, manager: SessionManager, *, now: Optional[dat
     source = manager.source
     if source.state != "PAUSED":
         return None
-    reason = (source.state_reason or "").lower()
-    if "admin" in reason:
+    if manager.is_admin_paused():
         return None
     if not any(s.state == "ACTIVE" for s in await manager.slots()):
         return None
@@ -72,13 +73,14 @@ async def resume_paused_source(db, manager: SessionManager, *, now: Optional[dat
         changed = changed.replace(tzinfo=timezone.utc)
     if changed is not None and now - changed < timedelta(minutes=SOURCE_RESUME_COOLDOWN_MINUTES):
         return None
-    await manager._resume_source_if_paused()
+    was = source.state_reason or "no reason recorded"
+    await manager._resume_source_if_paused(respect_admin=True)
     await db.flush()
     await notify(
         db,
         level="info",
         code="SOURCE_RESUMED",
-        message=f"resumed: a slot is ACTIVE again (was paused: {source.state_reason or 'no reason recorded'})",
+        message=f"resumed: a slot is ACTIVE again (was paused: {was})",
         source_name=source.source_name,
     )
     return "resumed"
@@ -106,15 +108,17 @@ def _parse(value: Any) -> Optional[datetime]:
 def looks_authenticated(page) -> bool:
     """The search page rendered for this session: the citation grid is there, or the page offers a
     logout, and the URL is not the public login surface."""
-    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
-
     url_low = (page.url or "").lower()
     if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
         return False
-    if PakistanLawSitePipeline._is_citation_grid_surface(page):
-        return True
     low = (page.html or "").lower()
-    return "logout" in low or "log off" in low or "sign out" in low
+    if "archivedpatientgrid" in low or "logout" in low or "log off" in low or "sign out" in low:
+        return True
+    # The authenticated CitationSearch surface may carry neither a grid nor a logout link: the
+    # search page itself, reached without a password form, is the positive sign (same rule as the
+    # human login's Complete check).
+    has_password = 'type="password"' in low or "type='password'" in low
+    return ("citationsearch" in url_low or "searchform" in low) and not has_password
 
 
 async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlot, browser_factory: Callable) -> Dict[str, Any]:
@@ -122,8 +126,15 @@ async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlo
     {"alive": bool, "verdict": kind, "landed": url}; site answers never raise."""
     state = manager.load_storage_state(slot)
     browser = await browser_factory(state, slot.slot_number)
+    renewed_state = None
     try:
         page = await browser.goto(settings.PLS_SEARCH_URL)
+        exporter = getattr(browser, "export_storage_state", None)
+        if callable(exporter):
+            try:
+                renewed_state = await exporter()  # the cookies the site renewed on this load
+            except Exception as exc:
+                logger.debug("verify: storage state export skipped: %s", exc)
     except Exception as exc:  # navigation error or disconnect: not verified, retry later
         return {"alive": False, "verdict": "navigation_error", "detail": str(exc)[:300], "landed": None}
     finally:
@@ -136,7 +147,7 @@ async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlo
     if verdict.kind == "block":
         return {"alive": False, "verdict": "block", "detail": verdict.detail, "landed": landed}
     if verdict.kind == "ok" and looks_authenticated(page):
-        return {"alive": True, "verdict": "ok", "detail": verdict.detail, "landed": landed}
+        return {"alive": True, "verdict": "ok", "detail": verdict.detail, "landed": landed, "renewed_state": renewed_state}
     return {"alive": False, "verdict": verdict.kind, "detail": verdict.detail, "landed": landed}
 
 
@@ -258,11 +269,14 @@ async def recover_slot(
     if next_at is not None and now < next_at:
         return {"waiting_until": record.get("next_attempt_at")}
 
-    slot_lock = SessionLock(f"{source.source_name}:slot{slot.slot_number}", redis_client, max_holders=1)
+    # The recovery task runs on the single login-session worker, so it never runs beside a harvest
+    # job; the source lock is still taken so a stale lock or a second worker is respected.
+    source_lock = SessionLock(source.source_name, redis_client)
     try:
-        await slot_lock.acquire()
+        await source_lock.acquire()
     except SessionLockHeld:
-        return {"skipped": "slot_in_use"}
+        await source_lock.release()  # closes the client the lock opened for itself
+        return {"skipped": "login_session_lock_held"}
     try:
         attempts = int(record.get("attempts", 0) or 0) + 1
         outcome: Dict[str, Any] = {"attempt": attempts}
@@ -277,7 +291,13 @@ async def recover_slot(
                 await merge_source_config(db, source, {key: {**record, "attempts": attempts, "last_attempt_at": _iso(now), "last_outcome": "halted"}})
                 return {**outcome, "halted": True}
             if check["alive"]:
+                renewed = check.pop("renewed_state", None)
                 await manager.reactivate_slot(slot.slot_number, f"stored session verified after cool-down (attempt {attempts})", by="recovery")
+                if renewed:
+                    # Keep the cookies the site renewed on the verifying load, so the next job does
+                    # not open with the ones that were already stale (the slot is ACTIVE again, so
+                    # the compare-and-update applies).
+                    await manager.refresh_storage_state(slot.slot_number, renewed, expected_hash=slot.storage_state_hash)
                 await merge_source_config(db, source, {key: {}})
                 return {**outcome, "recovered": "verified"}
             if check["verdict"] == "verification":
@@ -330,7 +350,7 @@ async def recover_slot(
             )
         return {**outcome, "failed": reason, "next_attempt_at": _iso(next_attempt)}
     finally:
-        await slot_lock.release()
+        await source_lock.release()
 
 
 async def recover_login_slots_async(
