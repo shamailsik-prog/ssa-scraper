@@ -347,28 +347,65 @@ class DropboxAdapter(ArchiveAdapter):
 
 # --------------------------------------------------------------------------- google_drive
 class GoogleDriveAdapter(ArchiveAdapter):
+    """Google Drive through the Drive v3 API.
+
+    Two ways to authenticate, chosen by the target configuration:
+
+    * ``client_id`` + ``client_secret`` + ``refresh_token`` — an OAuth grant from the Google account
+      that owns the folder. Files count against that account's own storage, which is what a personal
+      (gmail.com) Drive needs: a service account has no storage quota of its own and Google refuses
+      its uploads into a personal My Drive (``storageQuotaExceeded``).
+    * ``service_account_json`` — for a Shared Drive of a Google Workspace domain the service account
+      has been added to.
+
+    Every call passes ``supportsAllDrives`` so a ``folder_id`` inside a Shared Drive works.
+    """
+
     target_type = "google_drive"
+    SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], *, service=None):
         super().__init__(config)
-        import json
-
-        from google.oauth2 import service_account  # lazy
-        from googleapiclient.discovery import build
-
-        creds_json = config.get("service_account_json")
-        if not creds_json:
-            raise ArchiveError("google_drive target requires service_account_json")
-        info = json.loads(creds_json) if isinstance(creds_json, str) and creds_json.strip().startswith("{") else None
-        if info is None:
-            creds = service_account.Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
-        else:
-            creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
-        self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
         self.root_folder_id = config.get("folder_id") or config.get("root_folder_id")
         if not self.root_folder_id:
             raise ArchiveError("google_drive target requires folder_id")
+        self.service = service if service is not None else self._build_service(config)
         self._folder_cache: Dict[str, str] = {"": self.root_folder_id}
+
+    @classmethod
+    def _build_service(cls, config: Dict[str, Any]):
+        import json
+
+        from googleapiclient.discovery import build  # lazy
+
+        if config.get("refresh_token"):
+            from google.oauth2.credentials import Credentials  # lazy
+
+            if not (config.get("client_id") and config.get("client_secret")):
+                raise ArchiveError("google_drive OAuth target requires client_id, client_secret and refresh_token")
+            creds = Credentials(
+                token=None,
+                refresh_token=config["refresh_token"],
+                client_id=config["client_id"],
+                client_secret=config["client_secret"],
+                token_uri=config.get("token_uri") or "https://oauth2.googleapis.com/token",
+                scopes=cls.SCOPES,
+            )
+        else:
+            from google.oauth2 import service_account  # lazy
+
+            creds_json = config.get("service_account_json")
+            if not creds_json:
+                raise ArchiveError("google_drive target requires refresh_token (with client_id, client_secret) or service_account_json")
+            info = json.loads(creds_json) if isinstance(creds_json, str) and creds_json.strip().startswith("{") else None
+            if info is None:
+                creds = service_account.Credentials.from_service_account_file(creds_json, scopes=cls.SCOPES)
+            else:
+                creds = service_account.Credentials.from_service_account_info(info, scopes=cls.SCOPES)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    def _list(self, **kwargs):
+        return self.service.files().list(supportsAllDrives=True, includeItemsFromAllDrives=True, **kwargs).execute()
 
     def _folder_for(self, path: str, create: bool) -> Optional[str]:
         path = path.strip("/")
@@ -379,12 +416,12 @@ class GoogleDriveAdapter(ArchiveAdapter):
         if parent is None:
             return None
         q = f"name = '{name.replace(chr(39), chr(92) + chr(39))}' and '{parent}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        res = self.service.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        res = self._list(q=q, fields="files(id)", pageSize=1)
         files = res.get("files", [])
         if files:
             fid = files[0]["id"]
         elif create:
-            fid = self.service.files().create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}, fields="id").execute()["id"]
+            fid = self.service.files().create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}, fields="id", supportsAllDrives=True).execute()["id"]
         else:
             return None
         self._folder_cache[path] = fid
@@ -397,7 +434,7 @@ class GoogleDriveAdapter(ArchiveAdapter):
         if parent is None:
             return None
         q = f"name = '{name.replace(chr(39), chr(92) + chr(39))}' and '{parent}' in parents and trashed = false"
-        files = self.service.files().list(q=q, fields="files(id,size)", pageSize=1).execute().get("files", [])
+        files = self._list(q=q, fields="files(id,size)", pageSize=1).get("files", [])
         return files[0]["id"] if files else None
 
     def ensure_tree(self, key: str) -> None:
@@ -413,7 +450,7 @@ class GoogleDriveAdapter(ArchiveAdapter):
         folder, _, name = k.rpartition("/")
         parent = self._folder_for(folder, create=True)
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=len(data) > 5 * 1024 * 1024)
-        self.service.files().create(body={"name": name, "parents": [parent]}, media_body=media, fields="id").execute()
+        self.service.files().create(body={"name": name, "parents": [parent]}, media_body=media, fields="id", supportsAllDrives=True).execute()
 
     def exists(self, key: str) -> bool:
         return self._file_id(key) is not None
@@ -422,14 +459,14 @@ class GoogleDriveAdapter(ArchiveAdapter):
         fid = self._file_id(key)
         if fid is None:
             return None
-        meta = self.service.files().get(fileId=fid, fields="size").execute()
+        meta = self.service.files().get(fileId=fid, fields="size", supportsAllDrives=True).execute()
         return int(meta.get("size", 0))
 
     def get(self, key: str) -> bytes:
         fid = self._file_id(key)
         if fid is None:
             raise ArchiveError(f"missing {key}")
-        return self.service.files().get_media(fileId=fid).execute()
+        return self.service.files().get_media(fileId=fid, supportsAllDrives=True).execute()
 
     def list(self, prefix: str) -> List[str]:
         out: List[str] = []
@@ -440,7 +477,7 @@ class GoogleDriveAdapter(ArchiveAdapter):
         def walk(folder_id: str, rel: str) -> None:
             page = None
             while True:
-                res = self.service.files().list(q=f"'{folder_id}' in parents and trashed = false", fields="nextPageToken, files(id,name,mimeType)", pageToken=page, pageSize=200).execute()
+                res = self._list(q=f"'{folder_id}' in parents and trashed = false", fields="nextPageToken, files(id,name,mimeType)", pageToken=page, pageSize=200)
                 for f in res.get("files", []):
                     r = f"{rel}/{f['name']}" if rel else f["name"]
                     if f["mimeType"] == "application/vnd.google-apps.folder":

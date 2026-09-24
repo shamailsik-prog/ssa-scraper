@@ -194,7 +194,8 @@ locally), enter the `ADMIN_API_KEY`, and:
    deterministic, AI and reconciled extractions and the audit trail side by side.
 7. **Archive storage** — add targets (`google_drive`, `dropbox`, `onedrive`, `s3_compatible`, `sftp`,
    `smb`, `local_path`); configuration is encrypted at rest and never echoed. *Mirror now* /
-   *Reconcile storage*.
+   *Reconcile storage*. For a personal Google Drive use an OAuth grant, not a service account, and
+   register it with the *connect-google-drive* workflow: `docs/GOOGLE_DRIVE.md`.
 8. **ScrapeGraph** — engine status, breakers, budget, usage ledger, public test URL, and exact env
    setup commands (`cloud/set_env.py`) for DigitalOcean droplet operators.
 
