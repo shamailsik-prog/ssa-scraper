@@ -207,6 +207,25 @@ migrated = []
 s, n = re.subn(r"^LOGIN_SESSION_CONCURRENCY=2\s*$", "LOGIN_SESSION_CONCURRENCY=1", s, flags=re.M)
 if n:
     migrated.append("LOGIN_SESSION_CONCURRENCY 2->1")
+# Specification 3.6 and 11: the login-session pacing numbers are fixed (4.0-9.0 s, 300 pages an
+# hour, 2,500 a day) and "server size never changes these numbers". An earlier release had left
+# PAGES_PER_HOUR=10000 and PAGES_PER_DAY=200000 on the server (seen 24 September 2026), which is
+# the pace that cost the human login; the installer pins the specified values.
+fixed = {"LOGIN_DELAY_MIN": "4.0", "LOGIN_DELAY_MAX": "9.0", "PAGES_PER_HOUR": "300", "PAGES_PER_DAY": "2500"}
+for key, value in fixed.items():
+    m = re.search(rf"^{key}=(.*)$", s, flags=re.M)
+    current = m.group(1).strip() if m else None
+    try:
+        same = current is not None and float(current) == float(value)
+    except ValueError:
+        same = False
+    if same:
+        continue
+    if m:
+        s = re.sub(rf"^{key}=.*$", f"{key}={value}", s, flags=re.M)
+    else:
+        s += ("" if s.endswith("\n") else "\n") + f"{key}={value}\n"
+    migrated.append(f"{key} {current}->{value}")
 removed = []
 for key in (
     "DISPATCH_LOOP_SECONDS", "HARVEST_MODE", "HARVEST_AUTO_SWITCH", "UPDATE_CADENCE_HOURS",
