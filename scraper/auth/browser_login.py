@@ -345,6 +345,33 @@ class LoginSession:
         await self.snapshot()
         return result
 
+    async def login_error(self) -> Optional[str]:
+        """The site's own answer to a refused sign-in, read from the page after the submit settles:
+        "invalid credentials", "account already in use", "account inactive", "terms not accepted",
+        or None."""
+        try:
+            found = await self._page.evaluate(
+                """() => {
+                    const text = (sel) => { const el = document.querySelector(sel); return el ? (el.textContent || '').trim() : ''; };
+                    const html = document.documentElement ? document.documentElement.innerHTML : '';
+                    const red = Array.from(document.querySelectorAll('.red')).some((el) => el.offsetParent !== null);
+                    return {message: text('#LoginErrorMessage'), multi: html.indexOf('ErrorForMultiLoginAccess') >= 0,
+                            inactive: html.indexOf('ErrorForInactiveUserAccount') >= 0, terms: red};
+                }"""
+            )
+        except Exception as exc:
+            logger.debug("login_error: %s", exc)
+            return None
+        if "invalid" in (found.get("message") or "").lower():
+            return "invalid credentials"
+        if found.get("multi"):
+            return "account already in use"
+        if found.get("inactive"):
+            return "account inactive"
+        if found.get("terms"):
+            return "terms not accepted"
+        return None
+
     async def settle(self, timeout_ms: Optional[int] = None) -> None:
         """Let a navigation the page just started (a submitted form) reach DOMContentLoaded, so the
         next check reads the page the site answered with rather than the one being left."""

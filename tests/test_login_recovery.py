@@ -358,6 +358,36 @@ async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_sour
     assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
 
 
+async def test_refused_sign_in_records_the_sites_own_answer(db, login_source, monkeypatch):
+    """When the site refuses the submitted form (wrong password, account already in use), the
+    slot's recovery detail carries the site's own answer rather than only "login page"."""
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+
+    class RefusingSession(FakeLoginSession):
+        async def login_error(self):
+            return "account already in use"
+
+    class RefusingRegistry(FakeRegistry):
+        async def start(self, source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+            sess = RefusingSession(self, slot_number, saved_credentials, auto_complete)
+            self._sessions[source_name] = sess
+            return sess
+
+    reg = RefusingRegistry({"authenticated": False, "verdict": "login", "detail": "login page", "url": MAINPAGE_URL})
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert "failed" in result and result["sign_in"]["detail"] == "site refused the sign-in: account already in use"
+    assert (await _slot(db, 1)).state == "NEEDS_HUMAN_LOGIN"
+    notes = (await db.execute(select(Notification).where(Notification.code == "SLOT_RECOVERY_FAILED"))).scalars().all()
+    assert notes and "site refused the sign-in: account already in use" in notes[-1].message
+
+
 async def test_registry_start_closes_browser_when_login_page_fails(monkeypatch):
     """A half-started login session (Chromium up, login page never loaded) is closed, not leaked."""
     from scraper.auth import browser_login

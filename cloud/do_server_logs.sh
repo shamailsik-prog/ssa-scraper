@@ -6,7 +6,8 @@
 # deploy key derived from DO_TOKEN and prints `docker compose ps` plus the last LINES lines of the
 # chosen services. The admin key and any 64-hex token are scrubbed from the output.
 #
-# Environment: DO_TOKEN (required), SERVICES (default "api worker-scraper"), LINES (default 300)
+# Environment: DO_TOKEN (required), SERVICES (default "api worker-scraper", or "inspect", or
+# "status" for a read-only harvest report), LINES (default 300)
 # =============================================================================
 set -euo pipefail
 
@@ -32,7 +33,7 @@ IP="$(echo "$DROPLET" | jq -r '.networks.v4[] | select(.type=="public") | .ip_ad
 [ -n "$IP" ] && [ "$IP" != "null" ] || die "droplet has no public IPv4 address"
 
 SSH_OPTS=(-i "$KEYDIR/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR)
-if [ "$SERVICES" = "status" ]; then
+if [ "$SERVICES" = "summary" ]; then
   # The corpus numbers as the key-free /status page shows them (the API listens on 127.0.0.1:8000
   # behind Caddy), plus the promotion and archive lines of the last hour.
   ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo "== /status.json" && curl -sS http://127.0.0.1:8000/status.json | python3 -m json.tool && echo && echo "== promotion and archive (last hour)" && docker compose logs --no-color --since 1h worker-public 2>/dev/null | grep -E "promote_staging_records|mirror_pending|reconcile_storage" | tail -20' 2>&1 \
@@ -60,6 +61,58 @@ echo; echo "== SSH logins in the last 48 hours"; journalctl -u ssh --since "48 h
 echo; echo "== recent shell history of root (commands only, last 60)"; tail -60 /root/.bash_history 2>/dev/null
 echo; echo "== docker exec / compose invocations seen by the docker daemon (last 200 journal lines)"; journalctl -u docker --since "48 hours ago" --no-pager 2>/dev/null | tail -20'
   ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
+  exit 0
+fi
+if [ "$SERVICES" = "status" ]; then
+  # Read-only harvest report: corpus counts, source and login-slot states (no credential or
+  # storage-state column is selected), frontier and staging backlogs, recent jobs and
+  # notifications. All sections read one snapshot (a repeatable-read, read-only transaction in the
+  # postgres container); an SQL error fails the run instead of leaving a section out.
+  SQL="BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+\\echo == corpus
+SELECT 'judgment' AS table_name, count(*) FROM judgment UNION ALL SELECT 'citation', count(*) FROM citation
+ UNION ALL SELECT 'statute', count(*) FROM statute UNION ALL SELECT 'statute_section', count(*) FROM statute_section
+ UNION ALL SELECT 'instrument', count(*) FROM instrument UNION ALL SELECT 'source_provenance', count(*) FROM source_provenance;
+\\echo == judgments by source (last 24 h in brackets)
+SELECT coalesce(source_name, '?') AS source_name, count(*) AS total, count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_24h
+ FROM judgment GROUP BY 1 ORDER BY 2 DESC;
+\\echo == speed: pages fetched and judgments/statutes added per hour, last 12 hours
+SELECT date_trunc('hour', fetched_at) AS hour, source_name, count(*) AS pages_fetched FROM source_provenance
+ WHERE fetched_at > now() - interval '12 hours' GROUP BY 1, 2 ORDER BY 1 DESC, 2;
+SELECT date_trunc('hour', created_at) AS hour, count(*) AS judgments_added FROM judgment WHERE created_at > now() - interval '12 hours' GROUP BY 1 ORDER BY 1 DESC;
+SELECT date_trunc('hour', created_at) AS hour, count(*) AS statutes_added FROM statute WHERE created_at > now() - interval '12 hours' GROUP BY 1 ORDER BY 1 DESC;
+\\echo == archive targets (Google Drive and others; configuration is encrypted and not selected)
+SELECT name, target_type, enabled, mirror_login_session_rows, objects_written, pg_size_pretty(bytes_written) AS written,
+ consecutive_failures, last_ok_at, left(coalesce(last_error, ''), 160) AS last_error FROM archive_targets ORDER BY name;
+\\echo == archive objects by target, kind and status (written in last 24 h in brackets)
+SELECT t.name, o.document_kind, o.status, count(*), count(*) FILTER (WHERE o.written_at > now() - interval '24 hours') AS last_24h
+ FROM archive_objects o JOIN archive_targets t ON t.id = o.target_id GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+\\echo == mirror backlog: judgments with no archived copy on any target
+SELECT access_method, count(*) FROM judgment j WHERE NOT EXISTS (SELECT 1 FROM archive_objects o WHERE o.judgment_id = j.id AND o.status = 'written') GROUP BY 1;
+\\echo == latest archive errors
+SELECT t.name, o.created_at, left(o.error, 160) FROM archive_objects o JOIN archive_targets t ON t.id = o.target_id WHERE o.status <> 'written' ORDER BY o.created_at DESC LIMIT 10;
+\\echo == sources
+SELECT source_name, state, left(coalesce(state_reason, ''), 90) AS reason, is_active, last_success_at, next_scrape_at,
+ total_pages_scraped AS pages, total_records_extracted AS records, left(coalesce(last_error, ''), 90) AS last_error
+ FROM scraper_sources ORDER BY source_name;
+\\echo == login slots
+SELECT source_name, slot_number, state, left(coalesce(state_reason, ''), 110) AS reason, logged_in_at, last_verified_at, last_used_at,
+ (login_username_encrypted IS NOT NULL) AS has_saved_credentials FROM browser_session_slots ORDER BY 1, 2;
+\\echo == frontier by source and status
+SELECT source_name, status, count(*) FROM crawl_frontier GROUP BY 1, 2 ORDER BY 1, 2;
+\\echo == staging backlog
+SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging GROUP BY 1, 2, 3
+ UNION ALL SELECT 'statutes', source_name, status, count(*) FROM statutes_staging GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+\\echo == why records are held for review (unreviewed, top reasons per source)
+SELECT source_name, kind, coalesce(details->>'reason_code', left(reason, 70)) AS reason, count(*) FROM quarantine_queue
+ WHERE NOT reviewed GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 25;
+\\echo == jobs in the last 6 hours
+SELECT source_name, status, count(*), max(started_at) AS latest FROM scraper_jobs WHERE started_at > now() - interval '6 hours' GROUP BY 1, 2 ORDER BY 1, 2;
+\\echo == latest notifications
+SELECT created_at, code, left(message, 160) AS message FROM notifications ORDER BY created_at DESC LIMIT 25;
+ROLLBACK;"
+  REMOTE="cd /opt/ssa-scraper && docker compose exec -T postgres sh -c 'psql -X -P pager=off -v ON_ERROR_STOP=1 -U \"\${POSTGRES_USER:-legal}\" -d \"\${POSTGRES_DB:-legal_scraper}\"'"
+  printf '%s\n' "$SQL" | ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
   exit 0
 fi
 ssh "${SSH_OPTS[@]}" "root@$IP" "cd /opt/ssa-scraper && echo '== docker compose ps' && docker compose ps --format 'table {{.Service}}\t{{.Status}}' && echo && echo '== logs (last $LINES lines of: $SERVICES)' && docker compose logs --no-color --tail=$LINES $SERVICES" 2>&1 \
