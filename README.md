@@ -118,7 +118,7 @@ The harvest is meant to run around the clock on the two logins the firm holds (s
 
 | service | role |
 |---|---|
-| `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
+| `api` | FastAPI: `/health`, `/status` (key-free numbers page; "Add to Home Screen" makes it an app), `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
 | `worker-scraper` | Celery, queue `login_session`, concurrency from `LOGIN_SESSION_CONCURRENCY` (1–2) |
 | `worker-public` | Celery, queue `scraper` (public sources) |
 | `worker-maintenance` | Celery, queue `maintenance` (dispatch, promotion, treatment, archive mirror, reconcile) — on its own worker so a slow public scrape can never delay the scheduler or promotion |
@@ -194,8 +194,8 @@ locally), enter the `ADMIN_API_KEY`, and:
    deterministic, AI and reconciled extractions and the audit trail side by side.
 7. **Archive storage** — add targets (`google_drive`, `dropbox`, `onedrive`, `s3_compatible`, `sftp`,
    `smb`, `local_path`); configuration is encrypted at rest and never echoed. *Mirror now* /
-   *Reconcile storage*. For a personal Google Drive use an OAuth grant, not a service account, and
-   register it with the *connect-google-drive* workflow: `docs/GOOGLE_DRIVE.md`.
+   *Reconcile storage*. For a personal Google Drive press *Connect Google Drive* on this tab
+   (one-time Google console setup: `docs/CLOUD_DEPLOYMENT.md` section 3a).
 8. **ScrapeGraph** — engine status, breakers, budget, usage ledger, public test URL, and exact env
    setup commands (`cloud/set_env.py`) for DigitalOcean droplet operators.
 

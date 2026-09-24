@@ -56,6 +56,9 @@ reverted: two login workers, unattended sign-in with the saved credentials, the 
 and the backfill pacing profile stay. Migration 008 restores the credential columns that #123's
 migration 007 dropped; the credentials themselves must be saved again. Do not re-apply #123 without
 a fresh instruction from the operator.
+Kept from #125: the key-free `/status` page and app manifest, the dashboard's Archive storage tab
+with Connect Google Drive, and the atomic release of the login-session lock. #126's pin of the
+login-session pacing to 300 pages an hour applies only to the `updates` profile and is not carried.
 
 ## Decision needed: the specification and the operator's instructions of 23 September conflict
 

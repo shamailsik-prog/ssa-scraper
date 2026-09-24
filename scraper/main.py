@@ -19,7 +19,7 @@ from sqlalchemy import func, select, text
 from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
 from scraper.harvest_mode import backfill_progress, get_harvest_mode, selected_source_names
-from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources
+from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources, status
 from scraper.routers.auth import _ok
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -47,8 +47,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.PROJECT_NAME, version="D-15", lifespan=lifespan, docs_url="/docs" if settings.DEBUG else None, redoc_url=None)
-for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search):
+for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search, status):
     app.include_router(r.router)
+app.include_router(archive.oauth_router)
 
 
 @app.get("/health")
@@ -118,4 +119,4 @@ async def dashboard() -> str:
 
 @app.get("/")
 async def root() -> Dict[str, str]:
-    return {"service": settings.PROJECT_NAME, "dashboard": "/dashboard", "health": "/health"}
+    return {"service": settings.PROJECT_NAME, "dashboard": "/dashboard", "status": "/status", "health": "/health"}

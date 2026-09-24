@@ -33,6 +33,13 @@ IP="$(echo "$DROPLET" | jq -r '.networks.v4[] | select(.type=="public") | .ip_ad
 [ -n "$IP" ] && [ "$IP" != "null" ] || die "droplet has no public IPv4 address"
 
 SSH_OPTS=(-i "$KEYDIR/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR)
+if [ "$SERVICES" = "summary" ]; then
+  # The corpus numbers as the key-free /status page shows them (the API listens on 127.0.0.1:8000
+  # behind Caddy), plus the promotion and archive lines of the last hour.
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo "== /status.json" && curl -sS http://127.0.0.1:8000/status.json | python3 -m json.tool && echo && echo "== promotion and archive (last hour)" && docker compose logs --no-color --since 1h worker-public worker-maintenance 2>/dev/null | grep -E "promote_staging_records|mirror_pending|reconcile_storage" | tail -20' 2>&1 \
+    | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
+  exit 0
+fi
 if [ "$SERVICES" = "inspect" ]; then
   # Read-only inventory of what else runs on the server: anything outside the compose stack that
   # touches the database or the site (a cron job, a timer, a second checkout, a hand edit set aside
@@ -59,8 +66,9 @@ fi
 if [ "$SERVICES" = "status" ]; then
   # Read-only harvest report: corpus counts, source and login-slot states (no credential or
   # storage-state column is selected), frontier and staging backlogs, recent jobs and
-  # notifications. Runs one read-only transaction in the postgres container.
-  SQL="SET default_transaction_read_only = on;
+  # notifications. All sections read one snapshot (a repeatable-read, read-only transaction in the
+  # postgres container); an SQL error fails the run instead of leaving a section out.
+  SQL="BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 \\echo == corpus
 SELECT 'judgment' AS table_name, count(*) FROM judgment UNION ALL SELECT 'citation', count(*) FROM citation
  UNION ALL SELECT 'statute', count(*) FROM statute UNION ALL SELECT 'statute_section', count(*) FROM statute_section
@@ -95,11 +103,15 @@ SELECT source_name, status, count(*) FROM crawl_frontier GROUP BY 1, 2 ORDER BY 
 \\echo == staging backlog
 SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging GROUP BY 1, 2, 3
  UNION ALL SELECT 'statutes', source_name, status, count(*) FROM statutes_staging GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+\\echo == why records are held for review (unreviewed, top reasons per source)
+SELECT source_name, kind, coalesce(details->>'reason_code', left(reason, 70)) AS reason, count(*) FROM quarantine_queue
+ WHERE NOT reviewed GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 25;
 \\echo == jobs in the last 6 hours
 SELECT source_name, status, count(*), max(started_at) AS latest FROM scraper_jobs WHERE started_at > now() - interval '6 hours' GROUP BY 1, 2 ORDER BY 1, 2;
 \\echo == latest notifications
-SELECT created_at, code, left(message, 160) AS message FROM notifications ORDER BY created_at DESC LIMIT 25;"
-  REMOTE="cd /opt/ssa-scraper && docker compose exec -T postgres sh -c 'psql -X -P pager=off -v ON_ERROR_STOP=0 -U \"\${POSTGRES_USER:-legal}\" -d \"\${POSTGRES_DB:-legal_scraper}\"'"
+SELECT created_at, code, left(message, 160) AS message FROM notifications ORDER BY created_at DESC LIMIT 25;
+ROLLBACK;"
+  REMOTE="cd /opt/ssa-scraper && docker compose exec -T postgres sh -c 'psql -X -P pager=off -v ON_ERROR_STOP=1 -U \"\${POSTGRES_USER:-legal}\" -d \"\${POSTGRES_DB:-legal_scraper}\"'"
   printf '%s\n' "$SQL" | ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
   exit 0
 fi

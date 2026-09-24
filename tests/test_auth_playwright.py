@@ -2252,3 +2252,19 @@ async def test_login_scraping_disabled_outside_chambers(db, login_source, monkey
 
 async def _nosleep(_s):
     return None
+
+
+async def test_lock_release_never_deletes_another_workers_lock():
+    """Release is a compare-and-delete: a lock that expired and was taken by another worker in the
+    meantime must survive the first worker's release."""
+    r = aioredis.from_url(settings.REDIS_URL)
+    key = "corpus:login_session_lock:PakistanLawSite"
+    await r.delete(key)
+    lock1 = SessionLock("PakistanLawSite", r)
+    await lock1.acquire()
+    await r.set(key, "another-workers-token", ex=60)  # the TTL ran out and a second worker took it
+    await lock1.release()
+    assert (await r.get(key)) == b"another-workers-token"
+    await r.delete(key)
+    await r.aclose()
+

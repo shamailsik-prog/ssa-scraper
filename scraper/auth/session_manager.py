@@ -207,14 +207,22 @@ class SessionLock:
             if not self._held:
                 return
             r = await self._client()
+            # Compare-and-delete in one step: a lock that expired and was taken by another worker
+            # between a read and a delete would otherwise be deleted from under that worker.
             if self.max_holders == 1:
-                val = await r.get(self.key)
-                if val is not None and (val.decode() if isinstance(val, bytes) else val) == self._token:
-                    await r.delete(self.key)
+                await r.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                )
             else:
-                await r.srem(self.key, self._token)
-                if int(await r.scard(self.key) or 0) == 0:
-                    await r.delete(self.key)
+                await r.eval(
+                    "redis.call('srem', KEYS[1], ARGV[1]); if redis.call('scard', KEYS[1]) == 0 then redis.call('del', KEYS[1]) end; return 1",
+                    1,
+                    self.key,
+                    self._token,
+                )
             self._held = False
         finally:
             if self._own_client and self._redis is not None:

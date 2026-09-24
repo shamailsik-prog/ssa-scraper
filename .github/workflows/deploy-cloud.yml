@@ -32,6 +32,12 @@ on:
         description: "Recorded as DEPLOY_REGION (data-residency note)"
         default: "Frankfurt"
         required: false
+      mirror_login_session_rows:
+        description: "Copy PakistanLawSite judgments to the archive targets that opt in (Google Drive etc.)? keep = leave .env as it is"
+        default: keep
+        type: choice
+        options: [keep, "true", "false"]
+        required: false
 
 concurrency:
   group: deploy-cloud
@@ -66,6 +72,7 @@ jobs:
           REPORTERS: ${{ inputs.reporters }}
           EARLIEST_YEAR: ${{ inputs.earliest_year }}
           DEPLOY_REGION_LABEL: ${{ inputs.deploy_region_label }}
+          MIRROR_LOGIN_SESSION_ROWS: ${{ inputs.mirror_login_session_rows }}
           SUMMARY_FILE: ${{ github.step_summary }}
         run: |
           test -n "$DO_TOKEN" || { echo "::error::Repository secret DO_TOKEN is not set (Settings → Secrets and variables → Actions)"; exit 1; }

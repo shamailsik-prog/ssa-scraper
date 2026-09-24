@@ -391,7 +391,8 @@ class LoginSession:
 
     async def login_error(self) -> Optional[str]:
         """The site's own answer to a refused sign-in, read from the page after the submit settles:
-        "invalid credentials", "account already in use", "terms not accepted", or None."""
+        "invalid credentials", "account already in use", "account inactive", "terms not accepted",
+        or None."""
         try:
             found = await self._page.evaluate(
                 """() => {

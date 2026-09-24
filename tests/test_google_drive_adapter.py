@@ -114,7 +114,7 @@ def test_oauth_refresh_token_builds_user_credentials(monkeypatch):
 def test_oauth_requires_client_and_missing_auth_is_refused():
     with pytest.raises(ArchiveError, match="client_id"):
         GoogleDriveAdapter({"folder_id": "ROOT", "refresh_token": "rtoken"})
-    with pytest.raises(ArchiveError, match="refresh_token"):
+    with pytest.raises(ArchiveError, match="service_account_json"):
         GoogleDriveAdapter({"folder_id": "ROOT"})
     with pytest.raises(ArchiveError, match="folder_id"):
         GoogleDriveAdapter({"refresh_token": "rtoken", "client_id": "c", "client_secret": "s"})
