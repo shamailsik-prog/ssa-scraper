@@ -483,11 +483,11 @@ def _field_kind(el) -> Optional[str]:
     if tag == "select":
         return "select"
     if tag == "textarea":
-        return "textarea"
+        return "text"
     if tag == "button" or input_type in ("submit", "button"):
         return "submit"
     if input_type in ("text", "search", "number", "date", "email", "tel", "url", "password", "checkbox", "radio"):
-        return input_type
+        return input_type if input_type in ("checkbox", "radio") else "text"
     return None
 
 

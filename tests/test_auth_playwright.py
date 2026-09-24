@@ -637,7 +637,7 @@ async def test_search_form_map_prefers_citation_form_over_grid_filters(db, login
     assert "citation_filter" not in {field["name"] for field in m.fields["_all"]}
     assert "title_filter" not in {field["name"] for field in m.fields["_all"]}
     assert m.result_layout["row_selector"] == "table#citationGrid tr"
-    assert m.pagination["next_selector"] == "#nextResults"
+    assert m.pagination["next_selector"] == "a#nextResults"
     assert build_values({"fields": m.fields}, {"reporter": "PLD", "year": 2024}, {"page_no": 3}) == {
         "reporter": "PLD",
         "year": "2024",
