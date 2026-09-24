@@ -156,6 +156,8 @@ def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict
                 values["page"] = str(cursor["page_no"])
             elif "citation" in fields:
                 values["citation"] = str(cursor["page_no"])
+            elif "citation_no" in fields:
+                values["citation_no"] = str(cursor["page_no"])
             elif "keyword" in fields:
                 values["keyword"] = f"{query['year']} {query['reporter']} {cursor['page_no']}"
         if ("reporter" not in fields or "year" not in fields) and "keyword" in fields and "page_no" not in cursor:
@@ -177,7 +179,7 @@ def unmapped_query_reason(search_map: Dict[str, Any], query: Dict[str, Any], cur
     values = build_values(search_map, query, cursor)
     fields = search_map.get("fields") or {}
     if "reporter" in query:
-        if {"reporter", "year"}.issubset(fields) and ({"page", "citation"} & set(fields)):
+        if {"reporter", "year"}.issubset(fields) and ({"page", "citation", "citation_no"} & set(fields)):
             return None
         if "keyword" in fields:
             return None

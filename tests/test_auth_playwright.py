@@ -39,7 +39,7 @@ from scraper.models import (
     SourceProvenance,
 )
 from scraper.security import ExplicitBlock, VerificationRequired
-from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier
+from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, build_values, seed_frontier, unmapped_query_reason
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
 from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, citation_search_hybrid_html, judgment_html, results_html, search_form_html
@@ -643,6 +643,19 @@ async def test_search_form_map_prefers_citation_form_over_grid_filters(db, login
         "year": "2024",
         "citation": "3",
     }
+
+
+def test_legacy_citation_no_search_map_remains_usable():
+    search_map = {"fields": {"reporter": {}, "year": {}, "citation_no": {}}}
+    query = {"reporter": "PLD", "year": 2024}
+    cursor = {"page_no": 3}
+
+    assert build_values(search_map, query, cursor) == {
+        "reporter": "PLD",
+        "year": "2024",
+        "citation_no": "3",
+    }
+    assert unmapped_query_reason(search_map, query, cursor) is None
 
 
 async def test_paged_query_retires_with_explicit_unmapped_role_reason(db, login_source):
