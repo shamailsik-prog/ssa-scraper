@@ -33,7 +33,6 @@ KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "M
 ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", "sftp", "smb", "local_path")
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
-HARVEST_MODES = ("backfill", "updates")
 
 SECRET_FIELD_NAMES = (
     "ENCRYPTION_KEY",
@@ -94,7 +93,6 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: Optional[str] = Field(default=None)
     CELERY_RESULT_BACKEND: Optional[str] = Field(default=None)
     REDIS_CACHE_TTL_SECONDS: int = Field(default=3600)
-    DISPATCH_LOOP_SECONDS: int = Field(default=60, description="Celery Beat cadence for dispatch_due_sources.")
 
     # --------------------------------------------------------------- secrets
     ENCRYPTION_KEY: str = Field(default="", description="Fernet key for browser storage state and archive credentials. Required.")
@@ -132,10 +130,8 @@ class Settings(BaseSettings):
     SCRAPER_RESPECT_ROBOTS: bool = Field(default=True)
     PLAYWRIGHT_ENABLED: bool = Field(default=True)
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
-    PLAYWRIGHT_TIMEOUT_MS: int = Field(default=90000)
+    PLAYWRIGHT_TIMEOUT_MS: int = Field(default=30000)
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
-    PLAYWRIGHT_MAX_HTML_BYTES: int = Field(default=2_000_000, description="Guard: skip full page.content() when HTML responses are larger than this many bytes.")
-    PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD: int = Field(default=5000, description="Guard: skip full page.content() when the DOM input count indicates a huge datatable surface.")
 
     # ------------------------------------------------- login-session sources
     ALLOW_LOGIN_SCRAPING: bool = Field(default=False)
@@ -146,68 +142,12 @@ class Settings(BaseSettings):
     LOGIN_DELAY_MAX: float = Field(default=9.0, description="Seconds between login-session page fetches (maximum).")
     PAGES_PER_HOUR: int = Field(default=300, description="Login-session page budget per hour; the run pauses when spent.")
     PAGES_PER_DAY: int = Field(default=2500, description="Login-session page budget per day; the run pauses when spent.")
-    LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker processes (1-2). With two ACTIVE slots (two logins) and 2, the reporter shards run in parallel, one per login.")
-    LOGIN_AUTO_RECOVER: bool = Field(
-        default=True,
-        description="Recover a lost login slot without a human: LOGIN_RECOVERY_COOLDOWN_MINUTES after the site bounced a "
-        "slot, re-open the stored session and put the slot back if the search page renders; if it is dead, sign in again "
-        "with the credentials the operator saved for the slot and store the new session. Verification/CAPTCHA pages are "
-        "never solved: the slot then waits for a human.",
-    )
-    LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
-    LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
-    LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
-    HARVEST_MODE: str = Field(default="updates", description="Global scheduler mode: backfill (continuous) or updates (steady state).")
-    HARVEST_AUTO_SWITCH: bool = Field(
-        default=True,
-        description="When true, backfill mode automatically switches to updates after the frontier is drained and targets are met.",
-    )
-    UPDATE_CADENCE_HOURS: int = Field(default=6, description="Default per-source scrape interval in updates mode.")
-    BACKFILL_SOURCE_FREQUENCY_MINUTES: int = Field(default=15, description="Default per-source scrape interval in backfill mode.")
-    BACKFILL_TARGET_JUDGMENTS: int = Field(
-        default=0,
-        description="Optional backfill completion target; 0 means no judgment-count threshold is required.",
-    )
-    BACKFILL_TARGET_STATUTES: int = Field(
-        default=0,
-        description="Optional backfill completion target; 0 means no statute-count threshold is required.",
-    )
-    BACKFILL_LOGIN_DELAY_MIN: float = Field(
-        default=6.0,
-        description="Backfill mode minimum delay between login-session page fetches. PakistanLawSite ends a "
-        "login after roughly 500-600 page views in an hour (observed 22-23 Sep 2026: 532 and 373 pages, "
-        "26 and 15 minutes after login, at 0.4-1.0s pacing); 6-9s keeps the account near 380 pages/hour.",
-    )
-    BACKFILL_LOGIN_DELAY_MAX: float = Field(default=9.0, description="Backfill mode maximum delay between login-session page fetches.")
-    BACKFILL_PAGES_PER_HOUR: int = Field(
-        default=450,
-        description="Backfill mode login-session page budget per clock hour: a backstop under the site's observed "
-        "session quota, so the run pauses itself (PacingBudgetExceeded) instead of losing the human login.",
-    )
-    BACKFILL_PAGES_PER_DAY: int = Field(default=200000, description="Backfill mode login-session page budget per day.")
-    BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(default=2, description="Backfill-mode login-session worker concurrency target.")
-    BLOCK_RETRY_COOLDOWN_MINUTES: int = Field(
-        default=120,
-        description="Default cooldown before a blocked public source is retried when auto-retry is enabled.",
-    )
-    BLOCK_RETRY_MAX_ATTEMPTS: int = Field(
-        default=3,
-        description="Default number of cooldown retries for public-source explicit blocks before HALTED.",
-    )
+    LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Login-session worker processes. One login-session worker runs at a time (specification 3.1); any other value is refused.")
     MIRROR_LOGIN_SESSION_ROWS: bool = Field(default=False, description="Whether login_session judgments may be mirrored to archive targets.")
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
-    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=400, description="Maximum rows materialized per compact #archivedpatientGrid snapshot (one window). The snapshot reads cell text only; on a snapshot timeout the window is halved and retried before the page is treated as disconnected.")
-    PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots so CitationSearch cannot hold the login lock for a full Playwright navigation timeout.")
-    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Updates mode: max detail pages fetched per citation-grid window.")
-    PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Updates mode: rows scanned per citation-grid window (can exceed detail fetch cap; known rows are fast-forwarded).")
-    BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=300, description="Backfill mode: max detail pages fetched per citation-grid window.")
-    BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill mode: rows scanned per citation-grid window.")
-    PLS_RUN_MAX_MINUTES: int = Field(default=0, description="Updates mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes (0 = one window per job).")
-    BACKFILL_PLS_RUN_MAX_MINUTES: int = Field(default=50, description="Backfill mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes, so the session is not idle between Beat kicks (0 = one window per job). Keep it under the login-session lock TTL (60 min) and the job stale cut-off.")
-    PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip citation-grid rows whose citation already has a staging row (extracted, promoted, duplicate or quarantined) so a wrap of the grid does not re-download pages that were already preserved.")
     PLS_CASE_DESCRIPTION_WAIT_SECONDS: float = Field(default=6.0, description="How long to wait for the 'Case Description' control to render on a ReferenceCaseLawSearch page before the page is classified as headnote-only.")
     PROMOTE_PREFERRED_SOURCE: str = Field(
         default="PakistanLawSite",
@@ -343,16 +283,6 @@ class Settings(BaseSettings):
         "JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS",
         "JUDGMENT_CITATION_RECONCILE_BATCH_SIZE",
         "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS",
-        "PLAYWRIGHT_MAX_HTML_BYTES",
-        "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
-        "PLS_ARCHIVED_GRID_MAX_ROWS",
-        "PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS",
-        "PLS_CITATION_GRID_MAX_DETAIL",
-        "PLS_CITATION_GRID_SCAN_WINDOW",
-        "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL",
-        "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW",
-        "PLS_RUN_MAX_MINUTES",
-        "BACKFILL_PLS_RUN_MAX_MINUTES",
         "PLS_CASE_DESCRIPTION_WAIT_SECONDS",
         mode="before",
     )
@@ -405,14 +335,6 @@ class Settings(BaseSettings):
             raise ValueError(f"SGAI_MODE must be one of {EXTRACTION_MODES}")
         return v
 
-    @field_validator("HARVEST_MODE")
-    @classmethod
-    def _validate_harvest_mode(cls, v: str) -> str:
-        v = v.strip().lower()
-        if v not in HARVEST_MODES:
-            raise ValueError(f"HARVEST_MODE must be one of {HARVEST_MODES}")
-        return v
-
     @field_validator("PLS_SUBSCRIBED_REPORTERS", "PLS_JOURNALS", "PLS_JOURNALS_B")
     @classmethod
     def _validate_reporters(cls, v: str) -> str:
@@ -441,46 +363,12 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
         if self.PAGES_PER_HOUR <= 0 or self.PAGES_PER_DAY <= 0:
             raise ValueError("PAGES_PER_HOUR and PAGES_PER_DAY must be positive")
-        if self.PLAYWRIGHT_MAX_HTML_BYTES <= 0 or self.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD <= 0:
-            raise ValueError("PLAYWRIGHT_MAX_HTML_BYTES and PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD must be positive")
-        if self.LOGIN_SESSION_CONCURRENCY not in (1, 2):
-            raise ValueError("LOGIN_SESSION_CONCURRENCY must be 1 or 2")
-        if self.LOGIN_RECOVERY_COOLDOWN_MINUTES < 0 or self.LOGIN_RECOVERY_SCHEDULE_SECONDS <= 0 or self.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS < 0:
-            raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
-        if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
-            raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
-        if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:
-            raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS must be positive")
-        if self.PLS_CITATION_GRID_MAX_DETAIL <= 0:
-            raise ValueError("PLS_CITATION_GRID_MAX_DETAIL must be positive")
-        if self.PLS_CITATION_GRID_SCAN_WINDOW <= 0:
-            raise ValueError("PLS_CITATION_GRID_SCAN_WINDOW must be positive")
-        if self.BACKFILL_PLS_CITATION_GRID_MAX_DETAIL <= 0:
-            raise ValueError("BACKFILL_PLS_CITATION_GRID_MAX_DETAIL must be positive")
-        if self.BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW <= 0:
-            raise ValueError("BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW must be positive")
-        if self.PLS_RUN_MAX_MINUTES < 0 or self.BACKFILL_PLS_RUN_MAX_MINUTES < 0:
-            raise ValueError("PLS_RUN_MAX_MINUTES and BACKFILL_PLS_RUN_MAX_MINUTES must be >= 0")
+        if self.LOGIN_SESSION_CONCURRENCY != 1:
+            raise ValueError("LOGIN_SESSION_CONCURRENCY other than 1 is refused: one login-session worker runs at a time")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
         if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:
             raise ValueError("PROMOTE_PREFERRED_SHARE must be in (0, 1]")
-        if self.BACKFILL_LOGIN_DELAY_MIN < 0 or self.BACKFILL_LOGIN_DELAY_MAX < self.BACKFILL_LOGIN_DELAY_MIN:
-            raise ValueError("BACKFILL_LOGIN_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
-        if self.BACKFILL_PAGES_PER_HOUR <= 0 or self.BACKFILL_PAGES_PER_DAY <= 0:
-            raise ValueError("BACKFILL_PAGES_PER_HOUR and BACKFILL_PAGES_PER_DAY must be positive")
-        if self.BACKFILL_LOGIN_SESSION_CONCURRENCY not in (1, 2):
-            raise ValueError("BACKFILL_LOGIN_SESSION_CONCURRENCY must be 1 or 2")
-        if (
-            self.DISPATCH_LOOP_SECONDS <= 0
-            or self.UPDATE_CADENCE_HOURS <= 0
-            or self.BACKFILL_SOURCE_FREQUENCY_MINUTES <= 0
-            or self.BLOCK_RETRY_COOLDOWN_MINUTES <= 0
-            or self.BLOCK_RETRY_MAX_ATTEMPTS <= 0
-        ):
-            raise ValueError("dispatch, cadence, and block-retry settings must be positive")
-        if self.BACKFILL_TARGET_JUDGMENTS < 0 or self.BACKFILL_TARGET_STATUTES < 0:
-            raise ValueError("BACKFILL_TARGET_JUDGMENTS/STATUTES must be >= 0")
         if self.EMBEDDING_DIM <= 0:
             raise ValueError("EMBEDDING_DIM must be positive")
         if self.INSTRUMENT_RELATION_RECONCILE_BATCH_SIZE <= 0:
