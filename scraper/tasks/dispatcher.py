@@ -17,17 +17,7 @@ from sqlalchemy import select
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.auth.session_manager import SessionLockHeld
-from scraper.harvest_mode import (
-    backfill_progress,
-    cadence_for_source,
-    get_harvest_mode,
-    login_pacing_profile,
-    selected_source_names,
-    set_harvest_mode,
-    source_backfill_priority,
-    source_selected_for_mode,
-)
-from scraper.models import BrowserSessionSlot, ScraperJob, ScraperSource
+from scraper.models import ScraperJob, ScraperSource
 from scraper.notify import notify
 
 logger = logging.getLogger(__name__)
@@ -48,15 +38,9 @@ def _running_heartbeat_at(job: ScraperJob) -> Optional[datetime]:
     return max(candidates) if candidates else None
 
 
-async def _active_running_jobs(
-    db,
-    source_name: str,
-    *,
-    now: datetime,
-    max_active: int = 1,
-) -> tuple[list[ScraperJob], bool]:
-    """Return live running jobs while retiring stale/zombie running rows."""
-    keep = max(1, int(max_active or 1))
+async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
+    """Return the newest live running job while retiring stale/zombie running rows. One job per
+    source runs at a time."""
     running_jobs = (
         await db.execute(
             select(ScraperJob).where(
@@ -66,14 +50,14 @@ async def _active_running_jobs(
         )
     ).scalars().all()
     if not running_jobs:
-        return [], False
+        return None, False
     stale_cutoff = now - RUNNING_JOB_STALE_AFTER
     heartbeat_cutoff = now - RUNNING_JOB_HEARTBEAT_STALE_AFTER
     running_jobs.sort(
         key=lambda job: _running_started_at(job) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    active_jobs: list[ScraperJob] = []
+    active_job: Optional[ScraperJob] = None
     mutated = False
     for job in running_jobs:
         started_at = _running_started_at(job)
@@ -81,10 +65,10 @@ async def _active_running_jobs(
         stale = started_at is None or started_at <= stale_cutoff
         if not stale and heartbeat_at is not None and heartbeat_at <= heartbeat_cutoff:
             stale = True
-        if len(active_jobs) >= keep:
+        if active_job is not None:
             stale = True
         if not stale:
-            active_jobs.append(job)
+            active_job = job
             continue
         if job.status != "failed":
             job.status = "failed"
@@ -104,23 +88,22 @@ async def _active_running_jobs(
             job.error_message = reason
             mutated = True
         logger.warning(
-            "Recovered stale running job source=%s job_id=%s started_at=%s active_jobs=%s",
+            "Recovered stale running job source=%s job_id=%s started_at=%s active_job=%s",
             source_name,
             job.id,
             started_at,
-            [active.id for active in active_jobs],
+            active_job.id if active_job is not None else None,
         )
-    return active_jobs, mutated
+    return active_job, mutated
 
 
 async def retire_orphaned_login_jobs(*, reason: str = "login-session worker started", redis_client=None) -> int:
     """Called when the login-session worker boots. Every login-session job still recorded as
     running belonged to the previous worker process (a deploy or crash ended it mid-run), because
     only this worker runs that queue; retire the rows now instead of leaving the source blocked for
-    RUNNING_JOB_HEARTBEAT_STALE_AFTER, and drop the Redis session locks those jobs held (they
-    expire only after LOCK_TTL_SECONDS, an hour, during which every new job skips as
-    "lock held"). The grid cursor is committed per row, so the next job resumes where the dead one
-    stopped."""
+    RUNNING_JOB_HEARTBEAT_STALE_AFTER, and drop the Redis session lock those jobs held (it expires
+    only after LOCK_TTL_SECONDS, an hour, during which every new job skips as "lock held"). The
+    frontier cursor is flushed per detail page, so the next job resumes where the dead one stopped."""
     from scraper.auth.session_manager import LOCK_KEY
 
     now = datetime.now(timezone.utc)
@@ -142,10 +125,7 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
             await db.execute(select(ScraperSource.source_name).where(ScraperSource.access_method == "login_session"))
         ).scalars().all()
     # The locks of the dead processes: only this worker takes them, so none can be live now.
-    keys: list[str] = []
-    for name in source_names:
-        base = LOCK_KEY.format(source=name)
-        keys += [base, f"{base}:holders", f"{base}:slot1", f"{base}:slot2"]
+    keys = [LOCK_KEY.format(source=name) for name in source_names]
     if keys:
         own_client = redis_client is None
         if own_client:
@@ -163,24 +143,6 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
                 except Exception:
                     pass
     return len(rows)
-
-
-async def _active_running_job(db, source_name: str, *, now: datetime) -> tuple[Optional[ScraperJob], bool]:
-    """Return the newest live running job while retiring stale/zombie running rows."""
-    active_jobs, mutated = await _active_running_jobs(db, source_name, now=now, max_active=1)
-    return (active_jobs[0] if active_jobs else None), mutated
-
-
-async def _login_session_max_active(db, source_name: Optional[str] = None) -> int:
-    """How many login-session jobs may run at once for a source: the pacing profile's target,
-    capped by the number of ACTIVE slots. Each concurrent browser needs its own human login; two
-    browsers on one login share one server-side session and the site ends one of them."""
-    mode = await get_harvest_mode(db)
-    target = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
-    if source_name is None or target <= 1:
-        return max(1, target)
-    active_slots = len(await _active_slot_numbers(db, source_name))
-    return max(1, min(target, active_slots))
 
 
 async def _connector_for(source: ScraperSource):
@@ -228,24 +190,12 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 return {"skipped": "PAUSED", "reason": source.state_reason}
         elif source.state == "PAUSED":
             return {"skipped": "PAUSED", "reason": source.state_reason}
-        max_active = 1
-        if source.access_method == "login_session":
-            max_active = await _login_session_max_active(db, source_name)
-        existing_jobs, recovered_stale = await _active_running_jobs(
-            db,
-            source_name,
-            now=datetime.now(timezone.utc),
-            max_active=max_active,
-        )
-        if len(existing_jobs) >= max_active:
+        existing_job, recovered_stale = await _active_running_job(db, source_name, now=datetime.now(timezone.utc))
+        if existing_job is not None:
             if recovered_stale:
                 await db.commit()
-            logger.info(
-                "%s already has %s running job(s); skipping duplicate kick",
-                source_name,
-                len(existing_jobs),
-            )
-            return {"skipped": "already_running", "job_id": str(existing_jobs[0].id)}
+            logger.info("%s already has a running job; skipping duplicate kick", source_name)
+            return {"skipped": "already_running", "job_id": str(existing_job.id)}
         job = ScraperJob(source_id=source.id, source_name=source_name, job_type="scrape", status="running", worker_hostname=socket.gethostname(), started_at=datetime.now(timezone.utc))
         db.add(job)
         await db.commit()
@@ -280,130 +230,40 @@ def run_source_job(self, source_name: str):
 
 
 @shared_task(name="scraper.tasks.dispatcher.run_login_session_job", bind=True, max_retries=0)
-def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_shard=None):
-    """Login-session queue. When concurrency is 2, Beat enqueues one job per reporter shard."""
-    return run_async(run_source(source_name, reporter_shard=reporter_shard))
-
-
-def _running_reporter_shards(running_jobs) -> list[Optional[int]]:
-    """The reporter shard each live job runs (from its heartbeat), None for an unsharded job or
-    one that has not heartbeated yet (treated as unsharded: it may hold any slot)."""
-    shards: list[Optional[int]] = []
-    for job in running_jobs:
-        summary = job.result_summary if isinstance(job.result_summary, dict) else {}
-        shard = summary.get("reporter_shard")
-        shards.append(shard if shard in (0, 1) else None)
-    return shards
-
-
-async def _active_slot_numbers(db, source_name: str) -> list[int]:
-    rows = (
-        await db.execute(
-            select(BrowserSessionSlot.slot_number).where(
-                BrowserSessionSlot.source_name == source_name,
-                BrowserSessionSlot.state == "ACTIVE",
-            )
-        )
-    ).scalars().all()
-    return sorted(int(n) for n in rows)
+def run_login_session_job(self, source_name: str = "PakistanLawSite"):
+    """Login-session queue: one worker, one job at a time (specification 3.1)."""
+    return run_async(run_source(source_name))
 
 
 async def dispatch_due_sources() -> Dict[str, Any]:
-    """Beat entry: enqueue every ACTIVE source whose schedule is due."""
+    """Beat entry (specification 10): enqueue every ACTIVE source whose next_scrape_at is due, then
+    set next_scrape_at = now + scrape_frequency_hours."""
     from scraper.tasks.celery_app import app
 
     now = datetime.now(timezone.utc)
     queued = []
-    mode = settings.HARVEST_MODE
-    auto_switched = False
     async with SessionLocal() as db:
-        mode = await get_harvest_mode(db)
-        if mode == "backfill" and settings.HARVEST_AUTO_SWITCH:
-            selected = await selected_source_names(db, "backfill")
-            progress = await backfill_progress(db, source_names=selected)
-            if progress["complete"]:
-                await set_harvest_mode(
-                    db,
-                    "updates",
-                    changed_by="system",
-                    reason=(
-                        "auto-switch: frontier drained"
-                        f", judgments={progress['judgments_total']}, statutes={progress['statutes_total']}"
-                    ),
-                )
-                await notify(
-                    db,
-                    level="info",
-                    code="HARVEST_MODE_SWITCHED",
-                    message="Backfill completion criteria met; switched to updates cadence.",
-                    source_name=None,
-                    details=progress,
-                )
-                mode = "updates"
-                auto_switched = True
         rows = (
             await db.execute(
                 select(ScraperSource).where(ScraperSource.is_active.is_(True), ScraperSource.state == "ACTIVE")
             )
         ).scalars().all()
-        if mode == "backfill":
-            rows.sort(key=source_backfill_priority)
         for s in rows:
-            if not source_selected_for_mode(s, mode):
-                continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
                 continue
-            concurrency = 1
-            if s.access_method == "login_session":
-                concurrency = await _login_session_max_active(db, s.source_name)
-            running_jobs, _ = await _active_running_jobs(db, s.source_name, now=now, max_active=concurrency)
-            if len(running_jobs) >= concurrency:
-                logger.info(
-                    "skip enqueue %s: %s login-session scrape job(s) already running",
-                    s.source_name,
-                    len(running_jobs),
-                )
+            running_job, _ = await _active_running_job(db, s.source_name, now=now)
+            if running_job is not None:
+                logger.info("skip enqueue %s: a scrape job is already running", s.source_name)
                 continue
             if s.access_method == "login_session":
-                active_slots = await _active_slot_numbers(db, s.source_name)
-                running_shards = _running_reporter_shards(running_jobs)
-                if running_jobs and any(shard not in (0, 1) for shard in running_shards):
-                    # An unsharded job may fail over to any ACTIVE slot: nothing else may start.
-                    logger.info("%s: an unsharded login-session job is running; not enqueuing a shard beside it", s.source_name)
-                    continue
-                if concurrency >= 2 and len(active_slots) >= 2:
-                    # Two shards only when both slots hold a login: each shard runs on its own slot
-                    # (shard n on slot n+1), and a shard whose slot is already served by a running
-                    # job is not started twice.
-                    sent = False
-                    for shard in (0, 1):
-                        if shard in running_shards or (shard + 1) not in active_slots:
-                            continue
-                        app.send_task(
-                            "scraper.tasks.dispatcher.run_login_session_job",
-                            args=(s.source_name,),
-                            kwargs={"reporter_shard": shard},
-                            queue="login_session",
-                        )
-                        queued.append(f"{s.source_name}:shard{shard}")
-                        sent = True
-                    if not sent:
-                        continue
-                elif running_jobs:
-                    # One slot left and a shard already runs on it.
-                    continue
-                else:
-                    if concurrency >= 2:
-                        logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
-                    app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
-                    queued.append(s.source_name)
+                app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
             else:
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
-                queued.append(s.source_name)
-            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+            queued.append(s.source_name)
+            s.next_scrape_at = now + timedelta(hours=max(1, int(s.scrape_frequency_hours or 24)))
         await db.commit()
-    return {"mode": mode, "auto_switched": auto_switched, "queued": queued}
+    return {"queued": queued}
 
 
 @shared_task(name="scraper.tasks.dispatcher.dispatch_due_sources")

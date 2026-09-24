@@ -78,9 +78,9 @@ All flags are optional. The script:
 6. builds the image (Chromium is downloaded into it) and starts all services;
 7. prints the dashboard address and the admin key.
 
-The script never asks for PakistanLawSite credentials. Configure those only from the dashboard's
-**Human login** tab on the trusted chambers host: either type manually each time, or save slot 1/2
-credentials encrypted at rest on the server so they can be reused.
+The script never asks for PakistanLawSite credentials, and the service never stores them: the
+human login on the dashboard's **Human login** tab is the only way a session is created, and only
+the encrypted browser storage state is kept.
 
 Re-running the same command later (with the token lines again while private) updates the code and restarts the stack; `.env` is kept.
 
@@ -90,17 +90,12 @@ Re-running the same command later (with the token lines again while private) upd
 2. **Overview → Not configured**: anything listed there is a value in `/opt/ssa-scraper/.env`
    (`SGAI_API_KEY`, `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` for embeddings, and so on). After
    editing: `cd /opt/ssa-scraper && docker compose up -d`.
-3. **Human login**: optionally save encrypted credentials for slot 1 and slot 2 (primary/alternate)
-   first, then use **Login with saved credentials** to auto-fill (and auto-submit when the slot is
-   empty) or run a fully manual login stream. In manual mode, choose slot 1, **Start login**, tap
-   the username field in the streamed page, type in the box under the picture (on a phone the
-   keyboard opens there; on a computer you can also type straight into the picture), tap the
-   password field, type, tick **I Agree with the Terms and Conditions**, tap **Sign in**, then
-   **Complete**.
-
-   Security tradeoff: saved credentials reduce operator friction during TLS/IP interruptions but
-   keep decryptable credentials on the server. Use this only on a firm-controlled trusted host,
-   rotate by overwriting, and clear unused slots.
+3. **Human login**: choose slot 1, **Start login**, tap the username field in the streamed page,
+   type in the box under the picture (on a phone the keyboard opens there; on a computer you can
+   also type straight into the picture), tap the password field, type, tick **I Agree with the
+   Terms and Conditions**, tap **Sign in**, then **Complete**. Repeat on slot 2 so the alternate
+   slot can continue the same cursor if the primary is lost. Nothing but the encrypted storage
+   state is stored; a slot the site bounces waits for you (`NEEDS_HUMAN_LOGIN` notification).
 
    PakistanLawSite allows one login per account at a time. If the page shows **Logout From All
    Devices**, the account is still logged in elsewhere (your own browser or phone): enter the
@@ -112,32 +107,20 @@ Re-running the same command later (with the token lines again while private) upd
 5. **Sources**: public courts, PakistanCode, the legislatures and the Gazette run on their own
    schedule. The Supreme Court website's robots.txt disallows its judgment path; that source halts
    for your review as the contract requires.
-6. **Backfill mode**: in *Overview*, keep `HARVEST_MODE=backfill` for the initial harvest (paced at
-   6-9 s between PakistanLawSite fetches and 450 pages per hour: the site ends a login after roughly
-   500-600 page views in an hour, and a self-imposed pause costs nothing while a lost login needs a human).
-   Backfill defaults are controlled by environment values such as:
-   `BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`, `BACKFILL_LOGIN_DELAY_MIN/MAX`,
-   `BACKFILL_SOURCE_FREQUENCY_MINUTES`, `BACKFILL_LOGIN_SESSION_CONCURRENCY`,
-   `BACKFILL_PLS_CITATION_GRID_MAX_DETAIL` and `BACKFILL_PLS_RUN_MAX_MINUTES`.
-   Log in on **both** slots (slot 1 and slot 2) and keep `LOGIN_SESSION_CONCURRENCY=2`: the two
-   reporter shards then run in parallel, one browser per login, each under its own 450-page hourly
-   budget. Save the username/password of both logins on the *Human login* tab: a slot the site
-   bounces is re-verified after 15 minutes by the `recover-login-slots` task, and if its session is
-   dead the task signs in again with the saved credentials, so the harvest runs without anyone at
-   the dashboard. Only a verification page or a slot without saved credentials needs a person
-   (`NEEDS_HUMAN_LOGIN` / `SLOT_RECOVERY_FAILED` notifications).
-   Switch to `updates` mode from the dashboard when the corpus is where you want it. Auto-switch
-   happens only when `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached.
-   After updating an existing server, check `.env` against `.env.example` for the PakistanLawSite
-   values (`PLS_*`, `BACKFILL_PLS_*`): the installer keeps the old file, and the old
-   `PLS_CITATION_GRID_MAX_DETAIL=40` caps the harvest. `docs/AUDIT_2026-09-22.md` §4 lists the values.
+6. **Pacing and schedule**: PakistanLawSite runs on one login-session worker
+   (`LOGIN_SESSION_CONCURRENCY=1`; any other value is refused), 4-9 s between fetches, 300 pages an
+   hour and 2,500 a day (`LOGIN_DELAY_MIN/MAX`, `PAGES_PER_HOUR`, `PAGES_PER_DAY`); server size
+   never changes these numbers. Beat dispatches due sources every 30 minutes (each source's
+   `scrape_frequency_hours` sets when it is due again) and promotes staged records every 15
+   minutes. After updating an existing server the installer sets `LOGIN_SESSION_CONCURRENCY=1` in
+   `.env` if a 2 was left there and drops keys the service no longer reads.
 7. **ScrapeGraph setup**: if `/admin/scrapegraph/status` shows `SGAI_API_KEY` as NOT CONFIGURED,
    managed/hybrid extraction will not run. Set the key on-server without putting it on a command
    line:
    `printf '%s' "$SGAI_API_KEY" | python3 /opt/ssa-scraper/cloud/set_env.py SGAI_API_KEY`.
    Use the same helper for `SGAI_DAILY_CREDIT_CAP` and `SGAI_PUBLIC_TEST_URL`.
    Then recreate runtime containers:
-   `cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-maintenance worker-scraper celery-beat`.
+   `cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-scraper celery-beat`.
 
 ## 4. Operating
 
@@ -154,8 +137,8 @@ Backups: the database lives in the `pgdata` volume, original documents under `ra
 encrypted session state in the database. Archive targets are the off-server copy; run
 **Reconcile storage** after restoring anything.
 
-For focused continuity checks after deploy (harvest mode, source controls, and encrypted dual-slot
-saved credentials), run the checklist in `docs/DEPLOY_SMOKE_59_60.md`.
+`docs/SPEC_COMPLIANCE.md` records where the service stands against the operator's working
+specification.
 
 ## 5. What the overlay changes
 

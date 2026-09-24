@@ -49,14 +49,11 @@ validators and tests.
 ### PakistanLawSite — human login and four tiers
 
 1. **Human login.** On the dashboard's *Human login* tab the service opens a server-side Chromium and
-   streams it to you. You can type credentials manually, or save username/password for slot 1 and
-   slot 2 (primary + alternate) so login can be re-established without retyping. Saved credentials
-   are encrypted at rest with `ENCRYPTION_KEY`, never echoed by admin APIs, and can be rotated by
-   overwriting or cleared per slot. On *Complete* it verifies the session can reach
-   `PLS_SEARCH_URL` (CitationSearch) without bouncing to `Login/MainPage`, then encrypts the
-   browser storage state (cookies + localStorage) and keeps scraping headless inside that session.
-   If previously saved slots came from a public MainPage (not CitationSearch), re-login once after
-   deploy so the slot is revalidated. CAPTCHA / verification pages are never solved by code.
+   streams it to you; you type the username and password into it. On *Complete* it verifies the
+   session can reach `PLS_SEARCH_URL` (CitationSearch) without bouncing to `Login/MainPage`, then
+   encrypts the browser storage state (cookies + localStorage) with `ENCRYPTION_KEY` and keeps
+   scraping headless inside that session. The password is never seen, stored, logged or echoed.
+   CAPTCHA / verification pages are never solved by code.
 2. **Search-form map.** Playwright renders the search page; deterministic introspection (optionally
    refined by the LOCAL engine, always re-verified against the DOM) records fields, result layout,
    pagination and a DOM hash. Five consecutive unparseable result pages mark the map stale and alert.
@@ -69,59 +66,36 @@ validators and tests.
    Never from page one; no automatic recovery to the primary. Verification/login expiry → slot
    `NEEDS_HUMAN_LOGIN`, notify, pause if no valid slot. HTTP 403 / "account suspended" / "automated
    access" / CAPTCHA → source **HALTED**, notify, no slot switch, no proxy, no stealth, admin review.
-5. Login-session worker concurrency is environment-controlled (`LOGIN_SESSION_CONCURRENCY`, 1–2).
-   Backfill profile defaults can target dual slots (`BACKFILL_LOGIN_SESSION_CONCURRENCY=2`), while
-   continuity safeguards still require explicit human login in each slot. Two reporter shards are
-   dispatched only when **both** slots are ACTIVE; each shard runs on its own slot and never borrows
-   the other (the site allows one login per account). With one slot, one unsharded job runs.
-6. **Citation grid (the live CitationSearch surface).** The authenticated page is a table of every
-   citation, not a form. The connector walks it in windows of `PLS_ARCHIVED_GRID_MAX_ROWS` rows from a
-   durable row cursor, skips rows already in the corpus or already staged, fetches up to
-   `BACKFILL_PLS_CITATION_GRID_MAX_DETAIL` detail pages per window, commits progress per row, and in
-   backfill mode keeps taking consecutive windows for `BACKFILL_PLS_RUN_MAX_MINUTES` inside one job
-   so the session is never idle between Beat kicks. See `docs/AUDIT_2026-09-22.md` for the
-   throughput model and the defects this replaced.
+5. **One login-session worker at a time.** `LOGIN_SESSION_CONCURRENCY` is 1 and the settings
+   validator refuses any other value; a Redis lock (`corpus:login_session_lock:PakistanLawSite`,
+   TTL 3600 s, refreshed on every page) refuses a second worker. The two slots are continuity
+   slots: the alternate ACTIVE slot continues the same cursor when the primary is lost, never two
+   browsers at once.
+6. **Pacing.** Before every result-page submission and detail fetch the lock is refreshed and the
+   page is counted in `source.config_json.pacing`; past `PAGES_PER_HOUR` (300) or `PAGES_PER_DAY`
+   (2500) the run ends with `pacing: ...`, the source stays ACTIVE and Beat resumes it later;
+   otherwise a random `LOGIN_DELAY_MIN`..`LOGIN_DELAY_MAX` (4.0-9.0 s) pause follows.
 
 Login scraping runs only when `ENVIRONMENT=chambers` **and** `ALLOW_LOGIN_SCRAPING=true`; the
 settings validator refuses any other combination.
-For PakistanLawSite, use `PLAYWRIGHT_TIMEOUT_MS=90000` (default in `.env.example`) to tolerate
-slow CitationSearch responses on the live host.
 
-### Continuous operation on two logins
+### The human login is the only way a session is created
 
-The harvest is meant to run around the clock on the two logins the firm holds (slot 1 and slot 2):
-
-* **Two browsers, two logins, never mixed.** With both slots ACTIVE and `LOGIN_SESSION_CONCURRENCY=2`
-  the dispatcher runs the two reporter shards in parallel, shard 0 on slot 1 and shard 1 on slot 2.
-  A shard whose slot is already served by a running job is not started twice, an unsharded job (one
-  slot left) blocks any shard beside it, and every job holds an exclusive Redis lock on its slot: two
-  browsers on one login would share one server-side session and the site would end it.
-* **Each login has its own budget.** PakistanLawSite ends a session after roughly 500-600 page views
-  in an hour (measured 22-23 September 2026). Page counters are kept per slot
-  (`pacing_slot_<n>` in the source config), and backfill paces each login at 6-9 s between fetches
-  under a 450-page hourly budget, so a run pauses itself before the site does.
-* **A bounced slot comes back on its own.** When the site redirects a slot to its login page the
-  slot is marked `NEEDS_HUMAN_LOGIN`, the other slot carries on, and the `recover-login-slots` Beat
-  task re-opens the stored session after `LOGIN_RECOVERY_COOLDOWN_MINUTES` (15). If the search page
-  renders, the slot is ACTIVE again and a paused source resumes at once. If the site really ended
-  the login, the task signs in again with the username/password the operator saved for that slot
-  (*Human login* → save credentials; encrypted at rest, never logged) in the same server-side
-  browser the streamed human login uses, and stores the new session. A slot that was never logged
-  in but has saved credentials is brought up the same way, so both logins run. Failed attempts
-  back off (15, 30, 60 minutes) and post one `SLOT_RECOVERY_FAILED` notification.
-* **What still needs a person.** A verification/CAPTCHA page at sign-in (never solved by code; the
-  slot waits two hours between attempts and a `NEEDS_HUMAN_LOGIN` notification says so); a slot
-  without saved credentials; an explicit block (HTTP 403/429/451), which halts the source for
-  admin review as before.
+The dashboard's *Human login* tab streams a server-side Chromium to the operator, who types the
+username and password into it, ticks **I Agree with the Terms and Conditions** and signs in; on
+**Complete** the service stores only the Fernet-encrypted browser storage state in the chosen slot.
+No username or password is ever stored, logged or echoed by the service, nothing signs in
+unattended, and a slot the site bounces waits for a person (`NEEDS_HUMAN_LOGIN` notification).
+The site allows one live login per account: logging in to it yourself with the same account ends
+the scraper's session.
 
 ## Services (docker-compose)
 
 | service | role |
 |---|---|
 | `api` | FastAPI: `/health`, `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
-| `worker-scraper` | Celery, queue `login_session`, concurrency from `LOGIN_SESSION_CONCURRENCY` (1–2) |
-| `worker-public` | Celery, queue `scraper` (public sources) |
-| `worker-maintenance` | Celery, queue `maintenance` (dispatch, promotion, treatment, archive mirror, reconcile) — on its own worker so a slow public scrape can never delay the scheduler or promotion |
+| `worker-scraper` | Celery, queue `login_session`, concurrency 1 (PakistanLawSite only) |
+| `worker-public` | Celery, queues `scraper` and `maintenance`, concurrency 2 (public sources, promotion, treatment, archive, dispatch) |
 | `worker-embed` | Celery, queue `embeddings` |
 | `celery-beat` | schedules (see `scraper/tasks/celery_app.py`) |
 | `celery-flower` | Celery monitoring on the compose network |
@@ -174,21 +148,13 @@ locally), enter the `ADMIN_API_KEY`, and:
    `PLS_EARLIEST_YEAR`, `SGAI_API_KEY` (public sources), `SGAI_LOCAL_LLM_BASE_URL/MODEL`
    (PakistanLawSite AI assist), `SGAI_DAILY_CREDIT_CAP`, `OPENAI_API_KEY` (embeddings) in `.env`
    as the firm decides. Blank values stay conservative.
-2. **Harvest mode** — in *Overview*, keep mode on **backfill** for initial download. This enables the
-   backfill pacing profile (`BACKFILL_PAGES_PER_HOUR`, `BACKFILL_PAGES_PER_DAY`,
-   `BACKFILL_LOGIN_DELAY_MIN/MAX`; 6-9 s between fetches and 450 pages per hour, because
-   PakistanLawSite ends a login after roughly 500-600 page views in an hour) and continuous
-   source dispatch. Use **Backfill complete → switch
-   to updates** to move to the 6-hour updates cadence. Auto-switch fires only when
-   `BACKFILL_TARGET_JUDGMENTS` / `BACKFILL_TARGET_STATUTES` are set and reached with the frontier
-   drained; with both at 0 the mode never changes on its own (an empty frontier at first boot used
-   to flip a fresh install into updates mode within a minute).
-3. **Human login** — (optional) save encrypted PakistanLawSite credentials in slot 1 and/or 2, then
-   use **Login with saved credentials** or manual login in the stream; press *Complete* once
-   authenticated. Fill slot 2 as well for dual-slot continuity during backfill.
-4. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source. In *Scheduler /
-   backfill controls* configure per-source update cadence, backfill cadence/priority, and optional
-   block-cooldown retries for stubborn HTTP 403 sources (for example, NasirLawSite).
+2. **Human login** — choose slot 1, **Start login**, type your PakistanLawSite username and
+   password into the streamed browser, tick **I Agree**, sign in, then press **Complete**. Log in
+   on slot 2 as well so the alternate slot can continue the same cursor if the primary is lost.
+3. **Sources** — *Run* PakistanLawSite (trusted host only) and any public source. Beat dispatches
+   every ACTIVE source whose `next_scrape_at` is due every 30 minutes and promotes staged records
+   every 15 minutes.
+4. **Scheduler** — each source's `scrape_frequency_hours` (PakistanLawSite 24 h) sets its cadence.
 5. **Coverage** — tiers, reporter volumes, search maps, frontier.
 6. **Review queue / Check viewer** — promote or reject quarantined records with the raw text, the
    deterministic, AI and reconciled extractions and the audit trail side by side.
@@ -247,8 +213,8 @@ bash scripts/guard_scan.sh      # no stubs, no secrets, no bypass logic
 The suite runs against a real PostgreSQL (pgvector) and Redis and covers privacy, raw-first,
 validation, cache/cost, human login (real Playwright), reconnect, block handling, four-tier
 coverage, public discovery, prompt injection/SSRF, PDF/OCR, archive mirror and database roles.
-For deployment continuity checks tied to harvest mode + dual-slot saved credentials, use
-`docs/DEPLOY_SMOKE_59_60.md`.
+`docs/SPEC_COMPLIANCE.md` records where the service stands against the operator's working
+specification and what was removed on 24 September 2026 to match it.
 
 ## Layout
 
