@@ -153,6 +153,9 @@ class Settings(BaseSettings):
     LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
     LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
     LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
+    SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Operator request of 24 September 2026: every 30 minutes a few promoted records are re-fetched and compared with the corpus.")
+    SPOT_CHECK_JUDGMENTS: int = Field(default=3, description="Promoted PakistanLawSite judgments re-fetched per spot-check run (through the login session, under the ordinary pacing).")
+    SPOT_CHECK_STATUTES: int = Field(default=2, description="Current statute sections re-fetched per spot-check run (public sources).")
     MIRROR_LOGIN_SESSION_ROWS: bool = Field(default=False, description="Whether login_session judgments may be mirrored to archive targets.")
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
@@ -377,6 +380,8 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_SESSION_CONCURRENCY other than 1 is refused: one login-session worker runs at a time")
         if self.LOGIN_RECOVERY_COOLDOWN_MINUTES < 0 or self.LOGIN_RECOVERY_SCHEDULE_SECONDS <= 0 or self.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS < 0:
             raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
+        if self.SPOT_CHECK_SCHEDULE_SECONDS <= 0 or self.SPOT_CHECK_JUDGMENTS < 0 or self.SPOT_CHECK_STATUTES < 0:
+            raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
         if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:

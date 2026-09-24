@@ -903,4 +903,21 @@ class SchemaMigration(Base):
     applied_at: Mapped[datetime] = _created()
 
 
+class SpotCheck(Base):
+    """One re-fetch of a promoted record compared with what the corpus holds (operator request,
+    24 September 2026). Internal table; nothing here is a contract for the reader role."""
+
+    __tablename__ = "spot_check"
+    __table_args__ = (Index("ix_spot_check_checked_at", "checked_at"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    kind: Mapped[str] = mapped_column(String(30), nullable=False, comment="judgment|statute_section")
+    label: Mapped[str] = mapped_column(String(300), nullable=False)
+    record_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    source_url: Mapped[Optional[str]] = mapped_column(String(1000))
+    result: Mapped[str] = mapped_column(String(20), nullable=False, comment="match|differs|unreachable|login_required|skipped")
+    similarity: Mapped[Optional[float]] = mapped_column(Float)
+    detail: Mapped[Optional[str]] = mapped_column(String(1000))
+    checked_at: Mapped[datetime] = _created()
+
+
 INTERNAL_TABLES = tuple(t for t in Base.metadata.tables.keys() if t not in CONTRACT_TABLES)

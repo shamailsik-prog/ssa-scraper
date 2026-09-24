@@ -34,6 +34,7 @@ th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase
   <section><h2>Sources</h2><div class="wrap" id="sources"></div></section>
   <section><h2>PakistanLawSite login slots and pacing today</h2><div class="wrap" id="pls"></div></section>
   <section><h2>Judgments by reporter and year</h2><div class="wrap" id="volumes"></div></section>
+  <section><h2>Spot checks: records re-fetched from the source and compared</h2><div class="wrap" id="spot"></div></section>
   <section><h2>Open notifications</h2><div class="wrap" id="notes"></div></section>
 </main>
 <script>
@@ -61,6 +62,14 @@ async function load(){
   $('pls').innerHTML=pls.map(s=>{const p=s.pacing_today||{};return '<p><strong>'+esc(s.source)+'</strong>: current slot '+esc(s.current_slot)+'; pages today '+esc(p.pages_today)+' of '+esc(p.limit_per_day)+', this hour '+esc(p.pages_this_hour)+' of '+esc(p.limit_per_hour)+'</p><table><tr><th>slot</th><th>state</th><th>reason</th><th>logged in</th><th>last used</th><th>saved sign-in</th></tr>'+(s.slots||[]).map(x=>'<tr>'+cell(x.slot)+'<td class="'+stateClass(x.state)+'">'+esc(x.state)+'</td>'+cell(x.reason)+cell(when(x.logged_in_at))+cell(when(x.last_used_at))+cell(x.saved_sign_in?'yes':'no')+'</tr>').join('')+'</table>'}).join('')||'<p class="note">no login-session source</p>';
   const v=d.judgments_by_reporter_year||[];
   $('volumes').innerHTML=v.length?'<table><tr><th>reporter</th><th>year</th><th>judgments</th></tr>'+v.map(x=>'<tr>'+cell(x.reporter)+cell(x.year)+cell(x.judgments)+'</tr>').join('')+'</table>':'<p class="note">none yet</p>';
+  const sp=d.spot_checks||{};
+  const t24=sp.last_24h||{};
+  let sh='<p class="note">Every '+esc(Math.round((sp.every_seconds||0)/60))+' minutes: '+esc((sp.per_run||{}).judgments)+' judgments through the login session and '+esc((sp.per_run||{}).statute_sections)+' statute sections from their public source. Last run: '+when(sp.last_checked_at)+'.</p>';
+  const keys=Object.keys(t24).sort();
+  sh+='<p>Last 24 hours: '+(keys.length?keys.map(k=>'<span class="'+(k.endsWith(':match')?'ok':(k.endsWith(':differs')?'bad':'warn'))+'">'+esc(k)+' '+esc(t24[k])+'</span>').join(' · '):'no checks yet')+'</p>';
+  const rec=sp.recent||[];
+  sh+=rec.length?'<table><tr><th>when</th><th>kind</th><th>record</th><th>result</th><th>similarity</th><th>detail</th></tr>'+rec.map(x=>'<tr>'+cell(when(x.at))+cell(x.kind)+cell(x.label)+'<td class="'+(x.result==='match'?'ok':(x.result==='differs'?'bad':'warn'))+'">'+esc(x.result)+'</td>'+cell(x.similarity==null?'-':x.similarity)+cell(x.detail)+'</tr>').join('')+'</table>':'';
+  $('spot').innerHTML=sh;
   const n=d.open_notifications||[];
   $('notes').innerHTML=n.length?'<table><tr><th>when</th><th>level</th><th>code</th><th>source</th><th>message</th></tr>'+n.map(x=>'<tr>'+cell(when(x.at))+'<td class="'+(x.level==='critical'||x.level==='error'?'bad':'warn')+'">'+esc(x.level)+'</td>'+cell(x.code)+cell(x.source)+cell(x.message)+'</tr>').join('')+'</table>':'<p class="note">none</p>';
 }

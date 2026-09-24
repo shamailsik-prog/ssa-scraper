@@ -217,7 +217,10 @@ The suite runs against a real PostgreSQL (pgvector) and Redis and covers privacy
 validation, cache/cost, human login (real Playwright), reconnect, block handling, four-tier
 coverage, public discovery, prompt injection/SSRF, PDF/OCR, archive mirror and database roles.
 `docs/SPEC_COMPLIANCE.md` records where the service stands against the operator's working
-specification and what was removed on 24 September 2026 to match it.
+specification, what was removed on 24 September 2026 to match it, and what the operator asked
+to have back the same day (the saved sign-in) or added (the `/status` page, Connect Google Drive,
+the 30-minute spot checks that re-fetch a few judgments and statute sections and compare them
+with the corpus).
 
 ## Layout
 

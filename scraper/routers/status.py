@@ -33,6 +33,7 @@ from scraper.models import (
     ScraperJob,
     ScraperSource,
     ScraperStaging,
+    SpotCheck,
     Statute,
     StatuteSection,
 )
@@ -174,8 +175,27 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             await db.execute(select(Notification).where(Notification.acknowledged.is_(False)).order_by(Notification.created_at.desc()).limit(15))
         ).scalars().all()
     ]
+    day_ago = now - timedelta(hours=24)
+    spot_totals_24h = {
+        f"{kind}:{result}": int(n)
+        for kind, result, n in (
+            await db.execute(select(SpotCheck.kind, SpotCheck.result, func.count()).where(SpotCheck.checked_at >= day_ago).group_by(SpotCheck.kind, SpotCheck.result))
+        ).all()
+    }
+    spot_recent = [
+        {"at": _iso(r.checked_at), "kind": r.kind, "label": r.label, "result": r.result, "similarity": r.similarity, "detail": r.detail}
+        for r in (await db.execute(select(SpotCheck).order_by(SpotCheck.checked_at.desc()).limit(20))).scalars().all()
+    ]
+    last_spot = (await db.execute(select(func.max(SpotCheck.checked_at)))).scalar()
     return {
         "generated_at": _iso(now),
+        "spot_checks": {
+            "every_seconds": settings.SPOT_CHECK_SCHEDULE_SECONDS,
+            "per_run": {"judgments": settings.SPOT_CHECK_JUDGMENTS, "statute_sections": settings.SPOT_CHECK_STATUTES},
+            "last_checked_at": _iso(last_spot),
+            "last_24h": spot_totals_24h,
+            "recent": spot_recent,
+        },
         "totals": {
             "judgments": judgments,
             "citations": await _count(db, select(func.count()).select_from(Citation)),
