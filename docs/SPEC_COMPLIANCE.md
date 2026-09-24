@@ -48,6 +48,15 @@ left as it runs today until the operator answers.
 | 8 | Migrations 001, 002 | 001–006 (instrument mentions, relation graphs, saved login credentials) | Pre-existing evolution of the schema; contract tables unchanged. |
 | 6 | Notification codes listed | Also `SLOT_RECOVERED`, `SLOT_RECOVERY_FAILED`, `SOURCE_RESUMED`, `HARVEST_MODE_SWITCHED`, `SOURCE_BLOCK_COOLDOWN` | Added with the features above. |
 
+## Operator's decision (24 September 2026, 03:25 UTC)
+
+Asked again after #123 ("follow the specification literally") had been merged and deployed, the operator
+chose **automatic operation as fast as the site allows, with no human login required**. #123 was
+reverted: two login workers, unattended sign-in with the saved credentials, the citation-grid surface
+and the backfill pacing profile stay. Migration 008 restores the credential columns that #123's
+migration 007 dropped; the credentials themselves must be saved again. Do not re-apply #123 without
+a fresh instruction from the operator.
+
 ## Decision needed: the specification and the operator's instructions of 23 September conflict
 
 1. **One login-session worker (spec 1, 3.1, 11: `LOGIN_SESSION_CONCURRENCY` other than 1 refused)**
