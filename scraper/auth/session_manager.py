@@ -708,6 +708,9 @@ class PlaywrightBrowser:
             return
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
+        surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+        if surface == "grid_surface_no_query_form":
+            raise SearchFormSubmissionError("CitationSearch surface is grid_surface_no_query_form; no query form is available")
         fields = search_map.get("fields") or {}
         for role, value in values.items():
             f = fields.get(role)

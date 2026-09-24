@@ -506,24 +506,37 @@ def _form_controls(form):
 
 
 def _search_form(soup: BeautifulSoup):
-    """Prefer the CitationSearch form, not the independently rendered result-grid filters."""
-    candidates = soup.find_all("form")
-    if not candidates:
-        return None
-
-    def score(form) -> int:
-        text = " ".join(
+    """Return the actual CitationSearch query form, never generic grid/filter chrome."""
+    candidates = []
+    for form in soup.find_all("form"):
+        identity = " ".join(
             str(form.get(key, "")) for key in ("id", "name", "action", "class")
         ).lower()
         controls = _form_controls(form)
-        return (
-            (20 if "citationsearch" in text else 0)
-            + (10 if "search" in text else 0)
-            + (5 if any(_field_kind(control) == "submit" for control in controls) else 0)
-            + min(len(controls), 5)
-        )
+        usable_fields = [control for control in controls if _field_kind(control) not in (None, "submit")]
+        # PLS query submissions target CitationSearch. Requiring that explicit identity is
+        # intentionally stricter than accepting a form merely because it has "search" in a
+        # class/name: DataTables and result grids commonly use that wording for filters.
+        if "citationsearch" in identity and usable_fields:
+            candidates.append((form, controls))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda candidate: (
+            5 if any(_field_kind(control) == "submit" for control in candidate[1]) else 0
+        ) + min(len(candidate[1]), 5),
+    )[0]
 
-    return max(candidates, key=score)
+
+def _surface_classification(soup: BeautifulSoup, form) -> str:
+    if form is not None:
+        return "query_form"
+    controls = soup.find_all(["input", "select", "textarea", "button"])
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if (soup.find("table") is not None and controls) or re.search(r"\bcitation\s*search\b", title, re.IGNORECASE):
+        return "grid_surface_no_query_form"
+    return "no_query_form"
 
 
 def _css_selector(el) -> str:
@@ -539,6 +552,7 @@ def introspect_search_form(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html or "", "html.parser")
     fields = []
     form = _search_form(soup)
+    surface = _surface_classification(soup, form)
     for el in _form_controls(form) if form else []:
         name = el.get("name") or el.get("id")
         if not name:
@@ -582,4 +596,6 @@ def introspect_search_form(html: str) -> Dict[str, Any]:
     if nxt:
         next_sel = f"a#{nxt.get('id')}" if nxt.get("id") else ("a." + ".".join(nxt.get("class")) if nxt.get("class") else "a[rel=next]")
     data = SearchFormMapExtraction(fields=fields, result_row_selector=row_sel, result_columns=columns, pagination_next_selector=next_sel, page_size=None, detail_link_selector="a[href]" if table else None, extractor_confidence=0.9 if fields else 0.2)
-    return data.model_dump(mode="json")
+    result = data.model_dump(mode="json")
+    result["surface"] = surface
+    return result

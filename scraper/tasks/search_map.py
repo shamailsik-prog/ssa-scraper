@@ -39,6 +39,12 @@ def dom_hash(html: str) -> str:
 def verify_selectors(html: str, proposal: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only DOM-resolving controls that the browser can safely submit."""
     soup = BeautifulSoup(html or "", "html.parser")
+    if proposal.get("surface") == "grid_surface_no_query_form":
+        # A rendered CitationSearch grid may expose editable-looking DataTables filters.
+        # They are not a query form and must never become fill targets.
+        out = dict(proposal)
+        out["fields"] = []
+        return out
     verified_fields = []
     for f in proposal.get("fields") or []:
         sel = f.get("selector")
@@ -82,7 +88,11 @@ def build_map_record(proposal: Dict[str, Any], html: str, mapped_by: str) -> Dic
         "page_size": proposal.get("page_size"),
         "pagination": {"next_selector": proposal.get("pagination_next_selector")},
         "detail_layout": {"detail_link_selector": proposal.get("detail_link_selector") or "a[href]", "pdf_link_selector": "a[href$='.pdf']"},
-        "limits": {"reporters_offered": reporter_opts[:100], "max_results_per_page": proposal.get("page_size")},
+        "limits": {
+            "reporters_offered": reporter_opts[:100],
+            "max_results_per_page": proposal.get("page_size"),
+            "surface": proposal.get("surface") or "no_query_form",
+        },
         "dom_hash": dom_hash(html),
         "mapped_by": mapped_by,
     }
@@ -95,7 +105,17 @@ async def active_map(db: AsyncSession, source_name: str) -> Optional[SearchFormM
 
 
 def map_as_dict(m: SearchFormMap) -> Dict[str, Any]:
-    return {"fields": m.fields, "result_layout": m.result_layout, "page_size": m.page_size, "pagination": m.pagination, "detail_layout": m.detail_layout, "limits": m.limits, "map_version": m.map_version, "dom_hash": m.dom_hash}
+    return {
+        "fields": m.fields,
+        "result_layout": m.result_layout,
+        "page_size": m.page_size,
+        "pagination": m.pagination,
+        "detail_layout": m.detail_layout,
+        "limits": m.limits,
+        "surface": (m.limits or {}).get("surface"),
+        "map_version": m.map_version,
+        "dom_hash": m.dom_hash,
+    }
 
 
 async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *, local_engine: Optional[LocalScrapeGraphEngine] = None) -> SearchFormMap:
@@ -103,7 +123,7 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
     proposal = introspect_search_form(html)
     mapped_by = "deterministic"
     engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
-    if engine.configured and settings.SGAI_ENABLED and source.ai_extract_enabled:
+    if proposal.get("surface") != "grid_surface_no_query_form" and engine.configured and settings.SGAI_ENABLED and source.ai_extract_enabled:
         inp = ExtractionInput(source_name=source.source_name, access_method=source.access_method, content_hash=hashlib.sha256(html.encode()).hexdigest(), html=html, url=source.source_url)
         res = await engine.extract("search_form_map", inp)
         if res.ok and res.data:
