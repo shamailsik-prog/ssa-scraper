@@ -1,9 +1,11 @@
 """
 Celery application. Queues:
   * scraper        — public sources (worker-public)
-  * login_session  — PakistanLawSite, one worker, concurrency 1 (worker-scraper)
+  * login_session  — PakistanLawSite, concurrency from LOGIN_SESSION_CONCURRENCY (1–2; reporter shards)
   * embeddings     — worker-embed
-  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-public)
+  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-maintenance:
+                     never share this queue with long scrape runs, or dispatch and promotion stall
+                     behind them)
 Beat owns scheduling; ScrapeGraph 'monitor' jobs are supplemental only and never replace it.
 """
 
@@ -28,6 +30,7 @@ app = Celery(
         "scraper.tasks.treatment",
         "scraper.tasks.embeddings",
         "scraper.tasks.archive_mirror",
+        "scraper.tasks.login_recovery",
     ],
 )
 app.conf.update(
@@ -50,11 +53,14 @@ app.conf.update(
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
+        "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
     },
     beat_schedule={
-        # Specification section 10: dispatch every 30 minutes, promotion every 15 minutes (200 rows).
-        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": 1800},
-        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900, "kwargs": {"limit": 200}},
+        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
+        # Promotion must keep up with a continuous login-session harvest (hundreds of staged rows per
+        # hour): 500 rows every 5 minutes, on its own worker (see worker-maintenance in docker-compose.yml).
+        "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 300, "kwargs": {"limit": 500}},
+        "recover-login-slots": {"task": "scraper.tasks.login_recovery.recover_login_slots", "schedule": settings.LOGIN_RECOVERY_SCHEDULE_SECONDS},
         "reconcile-instrument-relations": {
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,

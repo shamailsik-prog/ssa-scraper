@@ -4,12 +4,12 @@ Human login rendered inside the dashboard (Amendment §9; Cursor command §2 ite
 The service launches a server-side Chromium, opens the source's login page and streams the
 viewport to the operator over a WebSocket using the Chrome DevTools screencast. Mouse and
 keyboard events from the operator are replayed into the page. The operator types credentials
-and completes any verification. When the operator confirms, the service checks the page is
-authenticated, exports cookies and localStorage as Playwright storage state, encrypts it and
-stores it in the chosen slot. This human login is the only way a session is created.
+and completes any verification. Operators may also save per-slot username/password on the
+trusted host; those values are encrypted at rest and used to pre-fill login fields on demand.
+When the operator confirms, the service checks the page is authenticated, exports cookies and
+localStorage as Playwright storage state, encrypts it and stores it in the chosen slot.
 
-The password is never seen, stored, logged or echoed: nothing but the encrypted storage state
-is kept.
+Credentials never appear in prompts, plain database fields or logs.
 CAPTCHA / verification pages are never solved by code — they are shown to the human.
 """
 
@@ -57,6 +57,7 @@ class LoginSession:
     _page: Any = None
     _cdp: Any = None
     viewport: Dict[str, int] = field(default_factory=lambda: {"width": 1280, "height": 800})
+    last_autofill: Optional[Dict[str, Any]] = None
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
@@ -281,6 +282,107 @@ class LoginSession:
     async def export_storage_state(self) -> Dict[str, Any]:
         return await self._context.storage_state()
 
+    async def apply_saved_credentials(self, username: str, password: str, *, auto_complete: bool = False) -> Dict[str, Any]:
+        """Fill known PakistanLawSite login fields from encrypted server-side credentials.
+
+        No credentials are logged or returned. The stream remains open so a human can complete
+        CAPTCHA/verification or fix changed selectors.
+        """
+        username = (username or "").strip()
+        password = password or ""
+        if not username or not password:
+            result = {"applied": False, "submitted": False, "reason": "missing username/password"}
+            self.last_autofill = result
+            return result
+        result = await self._page.evaluate(
+            """({username, password, autoComplete}) => {
+                const pick = (selectors) => {
+                  for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) return el;
+                  }
+                  return null;
+                };
+                const fire = (el) => {
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const user = pick([
+                  "input[name='Login.UserName']",
+                  "input[name='username']",
+                  "input[name='user']",
+                  "input[id='Login_UserName']",
+                  "input[id='username']",
+                  "input[id='user']",
+                  "input[type='email']",
+                  "input[autocomplete='username']",
+                  "input[name*='user' i]",
+                  "input[id*='user' i]"
+                ]);
+                const pass = pick([
+                  "input[name='Login.Password']",
+                  "input[name='password']",
+                  "input[id='Login_Password']",
+                  "input[id='password']",
+                  "input[type='password']",
+                  "input[autocomplete='current-password']",
+                  "input[name*='pass' i]",
+                  "input[id*='pass' i]"
+                ]);
+                let checkedTerms = false;
+                const terms = pick([
+                  "input[type='checkbox'][name*='agree' i]",
+                  "input[type='checkbox'][id*='agree' i]",
+                  "input[type='checkbox'][name*='term' i]",
+                  "input[type='checkbox'][id*='term' i]"
+                ]);
+                if (user) {
+                  user.focus();
+                  user.value = username;
+                  fire(user);
+                }
+                if (pass) {
+                  pass.focus();
+                  pass.value = password;
+                  fire(pass);
+                }
+                if (terms && !terms.checked) {
+                  terms.checked = true;
+                  fire(terms);
+                  checkedTerms = true;
+                }
+                let submitted = false;
+                if (autoComplete && user && pass) {
+                  const submit = pick([
+                    "button[type='submit']",
+                    "input[type='submit']",
+                    "button[name*='sign' i]",
+                    "button[id*='sign' i]",
+                    "button[name*='login' i]",
+                    "button[id*='login' i]"
+                  ]);
+                  if (submit) {
+                    submit.click();
+                    submitted = true;
+                  } else if (pass.form) {
+                    pass.form.requestSubmit ? pass.form.requestSubmit() : pass.form.submit();
+                    submitted = true;
+                  }
+                }
+                return {
+                  applied: !!(user && pass),
+                  submitted,
+                  username_field_found: !!user,
+                  password_field_found: !!pass,
+                  checked_terms: checkedTerms
+                };
+              }""",
+            {"username": username, "password": password, "autoComplete": auto_complete},
+        )
+        self.last_autofill = result
+        await self.snapshot()
+        return result
+
     async def settle(self, timeout_ms: Optional[int] = None) -> None:
         """Let a navigation the page just started (a submitted form) reach DOMContentLoaded, so the
         next check reads the page the site answered with rather than the one being left."""
@@ -319,6 +421,8 @@ class LoginSessionRegistry:
         login_url: str,
         started_by: str = "operator",
         viewport: Optional[Dict[str, int]] = None,
+        saved_credentials: Optional[Dict[str, str]] = None,
+        auto_complete: bool = False,
     ) -> LoginSession:
         """Open a browser for the human login. If one is already open for this source and slot (the
         operator reloaded the dashboard or lost the connection), it is reused rather than refused; a
@@ -333,6 +437,8 @@ class LoginSessionRegistry:
                     existing.status = "awaiting_human"
                     if wanted:
                         await existing.resize(wanted)
+                    if saved_credentials:
+                        await existing.apply_saved_credentials(saved_credentials.get("username", ""), saved_credentials.get("password", ""), auto_complete=auto_complete)
                     return existing
                 await existing.close()
                 self._sessions.pop(source_name, None)
@@ -341,6 +447,8 @@ class LoginSessionRegistry:
                 sess.viewport = wanted
             try:
                 await sess.start()
+                if saved_credentials:
+                    await sess.apply_saved_credentials(saved_credentials.get("username", ""), saved_credentials.get("password", ""), auto_complete=auto_complete)
             except BaseException:
                 # A browser launched but the login page never came (navigation timeout, lost page):
                 # the session is not registered yet, so close its Playwright objects here or they leak.
