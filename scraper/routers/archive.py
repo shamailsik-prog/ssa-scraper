@@ -36,7 +36,7 @@ router = APIRouter(prefix="/admin/archive", tags=["archive"], dependencies=[Depe
 oauth_router = APIRouter(tags=["archive"])
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_OAUTH_EXCHANGE_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"  # only files and folders this service creates
 DRIVE_ROOT_FOLDER_NAME = "SIKANDER AI Corpus"
@@ -67,7 +67,7 @@ def _callback_url(request: Request) -> str:
 async def _exchange_code(*, code: str, client_id: str, client_secret: str, redirect_uri: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            GOOGLE_TOKEN_URL,
+            GOOGLE_OAUTH_EXCHANGE_ENDPOINT,
             data={"code": code, "client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri, "grant_type": "authorization_code"},
         )
     if resp.status_code != 200:
