@@ -190,12 +190,15 @@ async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, 
     if callable(settle):
         await settle()  # the submitted form's navigation reaches the page the site answered with
     await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
+    login_error = getattr(sess, "login_error", None)
+    refused = await login_error() if callable(login_error) else None
     check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
     landed = safe_url_for_record(check.get("url") or "")
     if check.get("verdict") in ("verification", "block"):
         return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}
     if not check.get("authenticated"):
-        return {"stored": False, "verdict": check.get("verdict", "login"), "detail": check.get("detail"), "landed": landed}
+        detail = f"site refused the sign-in: {refused}" if refused else check.get("detail")
+        return {"stored": False, "verdict": check.get("verdict", "login"), "detail": detail, "landed": landed}
     result = await registry.complete(source_name, manager)
     return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
 

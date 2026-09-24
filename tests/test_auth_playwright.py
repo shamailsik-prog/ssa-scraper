@@ -314,6 +314,54 @@ async def test_human_login_autofills_saved_credentials_and_can_submit(fixture_se
         await reg.cancel("PakistanLawSite")
 
 
+async def test_autofill_ticks_the_live_unnamed_agree_box_so_the_submit_is_not_refused(fixture_server):
+    """The live sign-in form's terms box is <input type=checkbox class=agreeBox> with no name or id,
+    and the page's submit handler refuses the form until it is ticked (24 September 2026)."""
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add(
+        "/login",
+        "<html><body><form id=mainLoginForm action='/Login/Login' method=post "
+        "onsubmit=\"if(!document.querySelector('.agreeBox').checked){document.querySelector('.red').style.display='block';return false;}"
+        "document.getElementById('out').textContent='posted:'+u.value;return false;\">"
+        "<input id=u name='Login.UserName'><input id=loginPass name='Login.Password' type='password'>"
+        "<input type=checkbox class=agreeBox value=''>I Agree<span class=red style='display:none'>Please agree</span>"
+        "<button class='btn login_btn_tablet' type=submit>Login</button></form>"
+        "<div id=LoginErrorMessage></div><div id=out></div></body></html>",
+    )
+    reg = LoginSessionRegistry()
+    sess = await reg.start(
+        "PakistanLawSite",
+        1,
+        fixture_server.url("/login"),
+        saved_credentials={"username": "stored-user", "password": "stored-pass"},
+        auto_complete=True,
+    )
+    try:
+        await sess._page.wait_for_timeout(300)
+        data = await sess._page.evaluate("() => ({agree: document.querySelector('.agreeBox').checked, out: document.getElementById('out').textContent})")
+        assert data == {"agree": True, "out": "posted:stored-user"}
+        assert sess.last_autofill["checked_terms"] is True and sess.last_autofill["submitted"] is True
+        assert await sess.login_error() is None
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
+async def test_login_error_reads_the_sites_refusal(fixture_server):
+    from scraper.auth.browser_login import LoginSessionRegistry
+
+    fixture_server.add("/login", "<html><body><div id=LoginErrorMessage>Invalid Username or Password</div></body></html>")
+    fixture_server.add("/multi", "<html><body><div id=primary><!-- ErrorForMultiLoginAccess -->Account already in use</div></body></html>")
+    reg = LoginSessionRegistry()
+    sess = await reg.start("PakistanLawSite", 1, fixture_server.url("/login"))
+    try:
+        assert await sess.login_error() == "invalid credentials"
+        await sess._page.goto(fixture_server.url("/multi"))
+        assert await sess.login_error() == "account already in use"
+    finally:
+        await reg.cancel("PakistanLawSite")
+
+
 async def test_is_authenticated_rejects_public_mainpage(fixture_server):
     from scraper.auth.browser_login import LoginSessionRegistry
 

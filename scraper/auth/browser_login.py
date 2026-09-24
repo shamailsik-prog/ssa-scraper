@@ -330,12 +330,18 @@ class LoginSession:
                   "input[id*='pass' i]"
                 ]);
                 let checkedTerms = false;
+                // The live sign-in form's terms box is <input type=checkbox class=agreeBox> with no name
+                // or id, and the page refuses the submit until it is ticked; failing that, the only
+                // checkbox inside the sign-in form is the terms box.
+                const formBoxes = pass && pass.form ? Array.from(pass.form.querySelectorAll("input[type='checkbox']")) : [];
                 const terms = pick([
+                  "input[type='checkbox'].agreeBox",
+                  "input[type='checkbox'][class*='agree' i]",
                   "input[type='checkbox'][name*='agree' i]",
                   "input[type='checkbox'][id*='agree' i]",
                   "input[type='checkbox'][name*='term' i]",
                   "input[type='checkbox'][id*='term' i]"
-                ]);
+                ]) || (formBoxes.length === 1 ? formBoxes[0] : null);
                 if (user) {
                   user.focus();
                   user.value = username;
@@ -382,6 +388,32 @@ class LoginSession:
         self.last_autofill = result
         await self.snapshot()
         return result
+
+    async def login_error(self) -> Optional[str]:
+        """The site's own answer to a refused sign-in, read from the page after the submit settles:
+        "invalid credentials", "account already in use", "terms not accepted", or None."""
+        try:
+            found = await self._page.evaluate(
+                """() => {
+                    const text = (sel) => { const el = document.querySelector(sel); return el ? (el.textContent || '').trim() : ''; };
+                    const html = document.documentElement ? document.documentElement.innerHTML : '';
+                    const red = Array.from(document.querySelectorAll('.red')).some((el) => el.offsetParent !== null);
+                    return {message: text('#LoginErrorMessage'), multi: html.indexOf('ErrorForMultiLoginAccess') >= 0,
+                            inactive: html.indexOf('ErrorForInactiveUserAccount') >= 0, terms: red};
+                }"""
+            )
+        except Exception as exc:
+            logger.debug("login_error: %s", exc)
+            return None
+        if "invalid" in (found.get("message") or "").lower():
+            return "invalid credentials"
+        if found.get("multi"):
+            return "account already in use"
+        if found.get("inactive"):
+            return "account inactive"
+        if found.get("terms"):
+            return "terms not accepted"
+        return None
 
     async def settle(self, timeout_ms: Optional[int] = None) -> None:
         """Let a navigation the page just started (a submitted form) reach DOMContentLoaded, so the
