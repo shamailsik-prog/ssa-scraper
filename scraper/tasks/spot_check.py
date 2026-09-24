@@ -187,6 +187,7 @@ async def public_browser_factory(source: ScraperSource, *, allow_private_for_tes
         document_cdn_hosts=list(source.document_cdn_hosts or []),
         enforce_policy_on_requests=True,  # every request the page makes, redirects included
         allow_private_for_tests=allow_private_for_tests,
+        user_agent=settings.SCRAPER_USER_AGENT,  # the agent the robots rules were evaluated for
     )
     return await browser.start()
 

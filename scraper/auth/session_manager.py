@@ -467,6 +467,7 @@ class PlaywrightBrowser:
         document_cdn_hosts: Optional[List[str]] = None,
         enforce_policy_on_requests: bool = False,
         allow_private_for_tests: Optional[bool] = None,
+        user_agent: Optional[str] = None,
     ):
         self.slot_number = slot_number
         self._storage_state = storage_state
@@ -478,6 +479,10 @@ class PlaywrightBrowser:
         # link-local or metadata address. Disallowed requests are aborted.
         self._enforce_policy_on_requests = enforce_policy_on_requests
         self._allow_private = bool(settings.DEBUG) if allow_private_for_tests is None else bool(allow_private_for_tests)
+        # None keeps Chromium's own User-Agent (the login browser looks like the operator's
+        # browser); a public source's browser identifies itself as the public fetcher does, so the
+        # robots rules evaluated for that agent are the ones that apply to the request made.
+        self._user_agent = user_agent
         host = ""
         try:
             from urllib.parse import urlparse
@@ -531,7 +536,7 @@ class PlaywrightBrowser:
 
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(headless=self._headless, executable_path=settings.PLAYWRIGHT_EXECUTABLE_PATH or None)
-        self._context = await self._browser.new_context(storage_state=self._storage_state, user_agent=None)
+        self._context = await self._browser.new_context(storage_state=self._storage_state, user_agent=self._user_agent)
         if self._enforce_policy_on_requests:
             await self._context.route("**/*", self._route_request)
         self._page = await self._context.new_page()
