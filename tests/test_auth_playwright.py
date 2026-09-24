@@ -665,7 +665,7 @@ async def test_search_form_map_prefers_citation_form_over_grid_filters(db, login
 async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query_form(db, login_source):
     m = await map_search_form(db, login_source, citation_search_grid_only_html())
 
-    assert m.fields == {"_all": []}
+    assert m.fields == {}
     assert m.limits["surface"] == "grid_surface_no_query_form"
     assert m.result_layout["row_selector"] == "table#citationGrid tr"
 
