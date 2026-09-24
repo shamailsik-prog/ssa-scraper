@@ -31,6 +31,7 @@ DOMAIN=""
 REPORTERS=""
 EARLIEST=""
 REGION=""
+MIRROR_ROWS=""
 SKIP_DOCKER=0
 SKIP_FIREWALL=0
 PREPARE_ONLY=0
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
     --reporters) REPORTERS="$2"; shift 2;;
     --earliest-year) EARLIEST="$2"; shift 2;;
     --region) REGION="$2"; shift 2;;
+    --mirror-login-session-rows) MIRROR_ROWS="$2"; shift 2;;
     --dir) DIR="$2"; shift 2;;
     --branch) BRANCH="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
@@ -57,6 +59,7 @@ log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
+case "$MIRROR_ROWS" in ""|true|false) ;; *) die "--mirror-login-session-rows must be true or false";; esac
 case "$BRANCH$DIR$DOMAIN$REPORTERS$EARLIEST$REGION" in *[\'\"\;\`]*) die "quotes, semicolons and backticks are not allowed in options";; esac
 
 # ---------------------------------------------------------------- packages
@@ -227,6 +230,21 @@ if migrated:
 if removed:
     print("  removed from .env (no longer read):", ", ".join(removed))
 RECONCILE
+fi
+
+# The deployment flag of specification 7.6: PakistanLawSite judgments reach an archive target only
+# when this is true AND the target opted in. Set from the deploy-cloud workflow input.
+if [ -n "$MIRROR_ROWS" ] && [ -f .env ]; then
+  MIRROR_ROWS="$MIRROR_ROWS" python3 - <<'PY'
+import os, re
+s = open(".env").read()
+line = "MIRROR_LOGIN_SESSION_ROWS=" + os.environ["MIRROR_ROWS"]
+s, n = re.subn(r"^MIRROR_LOGIN_SESSION_ROWS=.*$", line, s, flags=re.M)
+if n == 0:
+    s += ("" if s.endswith("\n") else "\n") + line + "\n"
+open(".env", "w").write(s)
+print("  MIRROR_LOGIN_SESSION_ROWS set to", os.environ["MIRROR_ROWS"])
+PY
 fi
 
 # Reuse a previously configured domain on updates unless --domain overrides it.

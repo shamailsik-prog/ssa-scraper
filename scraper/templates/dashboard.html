@@ -30,6 +30,7 @@
   <button onclick="show('sources')">Sources</button>
   <button onclick="show('login')">Human login</button>
   <button onclick="show('review')">Review queue</button>
+  <button onclick="show('archive')">Archive storage</button>
   <button onclick="show('jobs')">Jobs</button>
 </nav>
 <main>
@@ -79,6 +80,35 @@
       <div id="reviewList"></div>
     </section>
   </div>
+  <div id="archive" hidden>
+    <section>
+      <h2>Connect Google Drive</h2>
+      <p class="note">Paste the OAuth client id and secret from your Google Cloud project once (the steps are in docs/CLOUD_DEPLOYMENT.md, "Connect Google Drive"), press Connect, sign in on Google's page with your Google username and password, press Allow. The service creates the folder "SIKANDER AI Corpus" in your Drive and copies judgments into it every 30 minutes. Your Google password never reaches this service.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <label>Client id <input id="gdClientId" size="40" autocomplete="off"></label>
+        <label>Client secret <input id="gdClientSecret" type="password" size="28" autocomplete="off"></label>
+        <label><input id="gdMirrorPls" type="checkbox" checked> include PakistanLawSite judgments</label>
+        <button class="primary" onclick="connectDrive()">Connect Google Drive</button>
+        <span id="gdMeta" class="note"></span>
+      </div>
+    </section>
+    <section>
+      <h2>Archive targets</h2>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button onclick="archiveAction('/admin/archive/mirror')">Mirror now</button><button onclick="archiveAction('/admin/archive/reconcile')">Reconcile storage</button><span id="archiveMeta" class="note"></span></div>
+      <div id="archiveList" style="margin-top:10px"></div>
+    </section>
+    <section>
+      <h2>Add another target (Dropbox, OneDrive, S3, SFTP, SMB, folder on the server)</h2>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <label>Name <input id="tName" size="14"></label>
+        <label>Type <select id="tType"><option>dropbox</option><option>onedrive</option><option>s3_compatible</option><option>sftp</option><option>smb</option><option>local_path</option><option>google_drive</option></select></label>
+        <label>Root <input id="tRoot" size="20" placeholder="folder or path"></label>
+        <label>Config JSON <input id="tConfig" size="40" placeholder='{"token":"..."}'></label>
+        <label><input id="tMirrorPls" type="checkbox"> include PakistanLawSite judgments</label>
+        <button onclick="addTarget()">Save target</button>
+      </div>
+    </section>
+  </div>
   <div id="jobs" hidden>
     <section>
       <h2>Jobs</h2>
@@ -88,7 +118,7 @@
 </main>
 <script>
 const $=id=>document.getElementById(id);
-const TABS=['overview','corpus','sources','login','review','jobs'];
+const TABS=['overview','corpus','sources','login','review','archive','jobs'];
 let KEY='';
 let offset=0;
 try{KEY=localStorage.getItem('corpus_admin_key')||''}catch(e){}
@@ -112,6 +142,7 @@ function show(tab){
   if(tab==='sources') loadSources();
   if(tab==='login') loadLogin();
   if(tab==='review') loadReview();
+  if(tab==='archive') loadArchive();
   if(tab==='jobs') loadJobs();
 }
 async function refresh(){
@@ -189,6 +220,41 @@ async function loadReview(){
     $('reviewMeta').textContent=(Array.isArray(items)?items.length:0)+' open items';
     $('reviewList').innerHTML='<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
   }catch(e){$('reviewMeta').textContent='error: '+e.message}
+}
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'X-API-Key':KEY,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+  const t=await r.text(); let d=null; try{d=JSON.parse(t)}catch(e){d={raw:t}}
+  if(!r.ok) throw Error((d&&d.detail)||r.status);
+  return d;
+}
+async function loadArchive(){
+  try{
+    const d=await get('/admin/archive');
+    const flag=d.mirror_login_session_rows_deployment_flag;
+    $('archiveMeta').textContent='deployment flag MIRROR_LOGIN_SESSION_ROWS='+flag+(flag?'':' (PakistanLawSite judgments are NOT copied until the deploy-cloud workflow is run with mirror_login_session_rows=true)');
+    const ts=d.targets||[];
+    $('archiveList').innerHTML=ts.length?'<table><tr><th>target</th><th>type</th><th>enabled</th><th>takes PakistanLawSite rows</th><th>objects written</th><th>failed</th><th>last ok</th><th>last error</th><th></th></tr>'+ts.map(t=>'<tr>'+cell(t.name)+cell(t.type)+cell(t.enabled?'yes':'no')+cell(t.mirror_login_session_rows?'yes':'no')+cell(t.objects_written)+cell(t.objects_failed)+cell(t.last_ok_at||'-')+cell(t.last_error||'')+'<td><button onclick="targetAction(\''+esc(t.name)+'\',\'test\')">Test</button> <button onclick="targetAction(\''+esc(t.name)+'\',\''+(t.enabled?'disable':'enable')+'\')">'+(t.enabled?'Disable':'Enable')+'</button></td></tr>').join('')+'</table>':'<p class="note">No archive target yet. Connect Google Drive above or add one below.</p>';
+  }catch(e){$('archiveMeta').textContent='error: '+e.message}
+}
+async function targetAction(name,action){
+  try{const d=await post('/admin/archive/targets/'+encodeURIComponent(name)+'/'+action);$('archiveMeta').textContent=name+' '+action+': '+JSON.stringify(d);loadArchive();}catch(e){$('archiveMeta').textContent=name+' '+action+' failed: '+e.message}
+}
+async function archiveAction(url){
+  $('archiveMeta').textContent='running…';
+  try{const d=await post(url);$('archiveMeta').textContent=JSON.stringify(d).slice(0,400);loadArchive();}catch(e){$('archiveMeta').textContent='failed: '+e.message}
+}
+async function addTarget(){
+  let cfg=null; const raw=$('tConfig').value.trim();
+  if(raw){try{cfg=JSON.parse(raw)}catch(e){$('archiveMeta').textContent='Config JSON is not valid JSON';return}}
+  try{await post('/admin/archive/targets',{name:$('tName').value.trim(),target_type:$('tType').value,root_path:$('tRoot').value.trim(),config:cfg,enabled:true,mirror_login_session_rows:$('tMirrorPls').checked});$('tConfig').value='';loadArchive();}catch(e){$('archiveMeta').textContent='save failed: '+e.message}
+}
+async function connectDrive(){
+  $('gdMeta').textContent='opening Google sign-in…';
+  try{
+    const d=await post('/admin/archive/google-drive/connect',{client_id:$('gdClientId').value.trim(),client_secret:$('gdClientSecret').value,mirror_login_session_rows:$('gdMirrorPls').checked});
+    $('gdClientSecret').value='';
+    window.location.href=d.authorization_url;
+  }catch(e){$('gdMeta').textContent='could not start: '+e.message}
 }
 async function loadJobs(){
   try{

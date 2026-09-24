@@ -48,6 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.PROJECT_NAME, version="D-15", lifespan=lifespan, docs_url="/docs" if settings.DEBUG else None, redoc_url=None)
 for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search, status):
     app.include_router(r.router)
+app.include_router(archive.oauth_router)
 
 
 @app.get("/health")

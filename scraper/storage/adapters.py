@@ -346,6 +346,36 @@ class DropboxAdapter(ArchiveAdapter):
 
 
 # --------------------------------------------------------------------------- google_drive
+def google_drive_credentials(config: Dict[str, Any]):
+    """Either the operator's own Google sign-in (refresh token from the dashboard's Connect Google
+    Drive button) or a service-account file/JSON; the refresh token wins when both are present."""
+    import json
+
+    refresh_token = config.get("refresh_token")
+    if refresh_token:
+        from google.oauth2.credentials import Credentials  # lazy
+
+        if not (config.get("client_id") and config.get("client_secret")):
+            raise ArchiveError("google_drive target with a refresh_token also needs client_id and client_secret")
+        return Credentials(
+            None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=config["client_id"],
+            client_secret=config["client_secret"],
+            scopes=[config.get("scope") or "https://www.googleapis.com/auth/drive.file"],
+        )
+    from google.oauth2 import service_account  # lazy
+
+    creds_json = config.get("service_account_json")
+    if not creds_json:
+        raise ArchiveError("google_drive target requires a Google sign-in (Connect Google Drive) or service_account_json")
+    info = json.loads(creds_json) if isinstance(creds_json, str) and creds_json.strip().startswith("{") else None
+    if info is None:
+        return service_account.Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
+    return service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+
+
 class GoogleDriveAdapter(ArchiveAdapter):
     target_type = "google_drive"
 
@@ -353,17 +383,9 @@ class GoogleDriveAdapter(ArchiveAdapter):
         super().__init__(config)
         import json
 
-        from google.oauth2 import service_account  # lazy
         from googleapiclient.discovery import build
 
-        creds_json = config.get("service_account_json")
-        if not creds_json:
-            raise ArchiveError("google_drive target requires service_account_json")
-        info = json.loads(creds_json) if isinstance(creds_json, str) and creds_json.strip().startswith("{") else None
-        if info is None:
-            creds = service_account.Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
-        else:
-            creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+        creds = google_drive_credentials(config)
         self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
         self.root_folder_id = config.get("folder_id") or config.get("root_folder_id")
         if not self.root_folder_id:

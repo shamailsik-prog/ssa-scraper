@@ -240,3 +240,62 @@ def test_status_page_and_numbers_need_no_key_and_carry_no_secrets(client, admin_
     assert manifest.status_code == 200 and manifest.json()["start_url"] == "/status"
     assert client.get("/static/icon.svg").headers["content-type"].startswith("image/svg+xml")
     assert client.get("/dashboard").text.count('rel="manifest"') == 1
+
+
+def test_connect_google_drive_flow_stores_encrypted_refresh_token_and_creates_folder(client, admin_headers, monkeypatch):
+    """Connect returns Google's consent URL bound to a single-use state; the callback (no admin key,
+    the state is the credential) exchanges the code, creates the Drive folder and stores the client
+    secret and refresh token Fernet-encrypted in a google_drive target that /status reports."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from scraper.routers import archive as archive_router
+
+    r = client.post("/admin/archive/google-drive/connect", json={"client_id": "1234567890-abc.apps.googleusercontent.com", "client_secret": "GOCSPX-supersecret", "mirror_login_session_rows": True}, headers=admin_headers)
+    assert r.status_code == 200, r.text
+    url = r.json()["authorization_url"]
+    q = parse_qs(urlsplit(url).query)
+    assert q["client_id"] == ["1234567890-abc.apps.googleusercontent.com"] and q["access_type"] == ["offline"] and q["prompt"] == ["consent"]
+    assert q["scope"] == ["https://www.googleapis.com/auth/drive.file"] and q["redirect_uri"][0].endswith("/oauth/google-drive/callback")
+    state = q["state"][0]
+    assert client.post("/admin/archive/google-drive/connect", json={"client_id": "x", "client_secret": "y"}).status_code == 401
+    assert client.get("/oauth/google-drive/callback?state=unknown&code=abc").status_code == 400
+
+    seen = {}
+
+    async def fake_exchange(*, code, client_id, client_secret, redirect_uri):
+        seen.update(code=code, client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri)
+        return {"access_token": "ya29.access", "refresh_token": "1//refresh-token-value", "expires_in": 3599}
+
+    async def fake_folder(access_token):
+        seen["access_token"] = access_token
+        return "folder-id-123"
+
+    monkeypatch.setattr(archive_router, "_exchange_code", fake_exchange)
+    monkeypatch.setattr(archive_router, "_create_root_folder", fake_folder)
+    done = client.get(f"/oauth/google-drive/callback?state={state}&code=4/0AbCd")
+    assert done.status_code == 200 and "Google Drive connected" in done.text
+    assert seen["code"] == "4/0AbCd" and seen["client_secret"] == "GOCSPX-supersecret" and seen["access_token"] == "ya29.access"
+    assert client.get(f"/oauth/google-drive/callback?state={state}&code=again").status_code == 400  # single use
+    listing = client.get("/admin/archive", headers=admin_headers)
+    body = listing.text
+    target = next(t for t in listing.json()["targets"] if t["name"] == "google_drive")
+    assert target["type"] == "google_drive" and target["enabled"] is True
+    assert "refresh-token-value" not in body and "GOCSPX" not in body
+    public = client.get("/status.json").json()
+    assert public["archive"]["google_drive"]["configured"] is True
+    assert "refresh-token-value" not in json.dumps(public) and "GOCSPX" not in json.dumps(public)
+    from scraper.models import ArchiveTarget
+    from scraper.storage.archive import target_config
+    from scraper.storage.adapters import google_drive_credentials
+    from sqlalchemy import select
+    from scraper.database import SessionLocal, run_async
+
+    async def _cfg():
+        async with SessionLocal() as db:
+            t = (await db.execute(select(ArchiveTarget).where(ArchiveTarget.name == "google_drive"))).scalars().first()
+            return target_config(t)
+
+    cfg = run_async(_cfg())
+    assert cfg["refresh_token"] == "1//refresh-token-value" and cfg["folder_id"] == "folder-id-123"
+    creds = google_drive_credentials(cfg)
+    assert creds.refresh_token == "1//refresh-token-value" and creds.client_id == "1234567890-abc.apps.googleusercontent.com"

@@ -122,6 +122,53 @@ Re-running the same command later (with the token lines again while private) upd
    Then recreate runtime containers:
    `cd /opt/ssa-scraper && docker compose up -d --force-recreate api worker-public worker-scraper celery-beat`.
 
+## 3a. Connect Google Drive (copies of the judgments in your own Drive)
+
+The service cannot sign in to Google with a username and password; Google allows a program in
+only through an "OAuth client" that belongs to your Google account. Creating one is done once
+and takes about ten clicks. After that, connecting is a button and Google's own sign-in page.
+
+**Once, in Google's console (about ten minutes):**
+
+1. Open https://console.cloud.google.com and sign in with the Google account whose Drive should
+   hold the copies.
+2. At the top, open the project menu and press **New project**. Name it `SIKANDER Corpus`, press
+   **Create**, then make sure it is selected in the project menu.
+3. In the left menu open **APIs & Services → Library**, search for **Google Drive API**, open it
+   and press **Enable**.
+4. Open **APIs & Services → OAuth consent screen** (Google may call it "Google Auth platform →
+   Branding"). Choose **External**, press **Create**. App name `SIKANDER Corpus`, your e-mail as
+   the support e-mail and as the developer contact, then **Save and continue** through the
+   remaining steps (no scopes need adding here).
+5. Under **Audience** (or on the consent screen page) press **Publish app** and confirm. This
+   matters: an app left in "Testing" loses its permission after seven days.
+6. Open **APIs & Services → Credentials**, press **Create credentials → OAuth client ID**.
+   Application type **Web application**, name `SIKANDER dashboard`. Under **Authorised redirect
+   URIs** press **Add URI** and enter exactly your dashboard address followed by
+   `/oauth/google-drive/callback`, for example `https://corpus.example.com/oauth/google-drive/callback`
+   or `https://203.0.113.10/oauth/google-drive/callback`. Press **Create**.
+7. Google shows a **Client ID** (ends in `.apps.googleusercontent.com`) and a **Client secret**
+   (starts with `GOCSPX-`). Copy both.
+
+**Then, on the dashboard (one minute):**
+
+8. Open the **Archive storage** tab, paste the client id and client secret, keep *include
+   PakistanLawSite judgments* ticked, press **Connect Google Drive**.
+9. Google's sign-in page opens: enter your Google username and password, and if Google says the
+   app is not verified press *Advanced* and continue (it is your own app; the only permission it
+   asks for is to manage files it creates itself). Press **Allow**.
+10. You land back on the service with "Google Drive connected". A folder named **SIKANDER AI
+    Corpus** now exists in your Drive; the service copies judgments into it every 30 minutes and
+    the Archive storage tab and the `/status` page show how many.
+
+**One deployment switch:** PakistanLawSite judgments are copied only when the deployment flag
+`MIRROR_LOGIN_SESSION_ROWS` is on as well (specification 7.6). Run the **deploy-cloud** workflow
+once with *mirror_login_session_rows* set to `true`; public-court judgments are copied without it.
+
+The client secret and the permission Google grants are stored Fernet-encrypted in the
+`archive_targets` table and never echoed by the API. To revoke, remove the app under your Google
+account's *Security → Third-party access*, and disable the target on the dashboard.
+
 ## 4. Operating
 
 ```bash
