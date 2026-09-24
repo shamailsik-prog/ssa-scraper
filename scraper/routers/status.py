@@ -199,7 +199,7 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
                 "configured": bool(google_drive),
                 "note": None
                 if google_drive
-                else "No Google Drive target exists. Add one on the dashboard's Archive tab (type google_drive) with the service-account JSON and the shared folder ID.",
+                else "No Google Drive target exists. On the dashboard's Archive storage tab press Connect Google Drive and sign in with your Google account (docs/CLOUD_DEPLOYMENT.md, section 3a).",
                 "targets": google_drive,
             },
             "targets": targets,

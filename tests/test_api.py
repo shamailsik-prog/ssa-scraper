@@ -233,7 +233,7 @@ def test_status_page_and_numbers_need_no_key_and_carry_no_secrets(client, admin_
     assert "judgments_promoted_today" in data["movement"]
     pls = next(s for s in data["sources"] if s["source"] == "PakistanLawSite")
     assert pls["access"] == "login_session" and len(pls["slots"]) == 2 and pls["pacing_today"]["limit_per_hour"] == 300
-    assert data["archive"]["google_drive"]["configured"] is False and "google_drive" in data["archive"]["google_drive"]["note"]
+    assert data["archive"]["google_drive"]["configured"] is False and "Connect Google Drive" in data["archive"]["google_drive"]["note"]
     blob = json.dumps(data).lower()
     assert "password" not in blob and "storage_state" not in blob and "config_encrypted" not in blob
     manifest = client.get("/manifest.webmanifest")
