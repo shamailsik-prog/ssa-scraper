@@ -56,6 +56,28 @@ done
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+stash_local_server_edits() {
+  local stamp before after status
+  status="$(git -C "$DIR" status --porcelain --untracked-files=no || true)"
+  before="$(git -C "$DIR" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  git -C "$DIR" stash push -q -m "install.sh $stamp: local edits set aside before deploying $BRANCH" >/dev/null 2>&1 || true
+  after="$(git -C "$DIR" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+  if [ -z "$after" ] || [ "$after" = "$before" ]; then
+    return 1
+  fi
+  if [ -n "$status" ]; then
+    log "Local edits found in $DIR (set aside in a git stash, not deployed):"
+    printf '%s\n' "$status" | sed 's/^/    /'
+  else
+    log "Local edits in $DIR were set aside before deploying (git status missed them):"
+    git -C "$DIR" stash show --name-only --format='' refs/stash | sed 's/^/    /'
+  fi
+  git -C "$DIR" update-ref "refs/server-edits/$stamp" refs/stash
+  log "  saved as refs/server-edits/$stamp (git stash list also shows it)"
+  return 0
+}
+
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 case "$BRANCH$DIR$DOMAIN$REPORTERS$EARLIEST$REGION" in *[\'\"\;\`]*) die "quotes, semicolons and backticks are not allowed in options";; esac
 
@@ -112,17 +134,15 @@ if [ -d "$DIR/.git" ]; then
   # A file edited by hand on the server would make the checkout abort and leave the old code
   # running. Set such edits aside in a stash (never deleted, recoverable with `git stash list`)
   # and say so: the deployed code must be the fetched commit.
-  if [ -n "$(git -C "$DIR" status --porcelain --untracked-files=no)" ]; then
-    log "Local edits found in $DIR (set aside in a git stash, not deployed):"
-    git -C "$DIR" status --porcelain --untracked-files=no | sed 's/^/    /'
-    STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-    git -C "$DIR" stash push -q -m "install.sh $STAMP: local edits set aside before deploying $BRANCH"
+  if stash_local_server_edits; then
     # A stash entry lives only in the reflog and can be garbage-collected after 30 days; a plain
     # ref keeps the saved state for good: `git -C /opt/ssa-scraper log refs/server-edits/<stamp>`.
-    git -C "$DIR" update-ref "refs/server-edits/$STAMP" refs/stash
-    log "  saved as refs/server-edits/$STAMP (git stash list also shows it)"
+    :
   fi
-  git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD
+  if ! git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD; then
+    stash_local_server_edits || die "checkout failed and no stashable local edits were found in $DIR; fix the checkout manually and re-run"
+    git -C "$DIR" checkout -q -B "$BRANCH" FETCH_HEAD
+  fi
 else
   log "Cloning $REPO ($BRANCH) into $DIR"
   "${GIT[@]}" clone -q -b "$BRANCH" "$REPO" "$DIR" || die "clone failed. If the repository is private, export GH_TOKEN (see the header of this script) and re-run."
