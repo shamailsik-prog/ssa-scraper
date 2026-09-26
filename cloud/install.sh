@@ -378,6 +378,19 @@ if ! printf '%s\n' "$CRON_NOW" | grep -Fq "$KEEPALIVE_MARK"; then
   { printf '%s\n' "$CRON_NOW"; printf '%s\n' "$KEEPALIVE_MARK"; printf '%s\n' "$KEEPALIVE_LINE"; } | crontab -
 fi
 
+# Auto-deploy merged main to this host (waits for PLS idle; fail-safe build).
+if [ -x "$DIR/scripts/auto_deploy.sh" ]; then
+  bash "$DIR/scripts/auto_deploy.sh" --install-cron
+else
+  AUTODEPLOY_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
+  AUTODEPLOY_LINE="*/15 * * * * cd $DIR && /bin/bash scripts/auto_deploy.sh >> state/auto_deploy.log 2>&1"
+  CRON_NOW="$(crontab -l 2>/dev/null || true)"
+  if ! printf '%s\n' "$CRON_NOW" | grep -Fq "$AUTODEPLOY_MARK"; then
+    log "Installing host auto-deploy cron (every 15 minutes)"
+    { printf '%s\n' "$CRON_NOW"; printf '%s\n' "$AUTODEPLOY_MARK"; printf '%s\n' "$AUTODEPLOY_LINE"; } | crontab -
+  fi
+fi
+
 ADMIN_KEY="$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2-)"
 cat <<EOF
 
