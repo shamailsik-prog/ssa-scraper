@@ -35,6 +35,7 @@ MIRROR_ROWS=""
 SKIP_DOCKER=0
 SKIP_FIREWALL=0
 PREPARE_ONLY=0
+DEPLOY_ONLY=0
 
 usage() { sed -n '2,24p' "$0"; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
@@ -50,6 +51,7 @@ while [ $# -gt 0 ]; do
     --skip-docker-install) SKIP_DOCKER=1; shift;;
     --skip-firewall) SKIP_FIREWALL=1; shift;;
     --prepare-only) PREPARE_ONLY=1; shift;;
+    --deploy-only) DEPLOY_ONLY=1; shift;;
     -h|--help) usage 0;;
     *) echo "unknown option: $1"; usage 1;;
   esac
@@ -57,6 +59,55 @@ done
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+install_managed_host_crons() {
+  local cron_now keepalive_mark keepalive_line autodeploy_mark autodeploy_line
+  keepalive_mark="# ssa-scraper PLS keepalive (backup; Beat owns the primary schedule)"
+  keepalive_line="0 * * * * cd $DIR && /bin/bash scripts/pls_keepalive_cron.sh >> state/pls_keepalive.log 2>&1"
+  autodeploy_mark="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
+  autodeploy_line="*/15 * * * * cd $DIR && /bin/bash scripts/auto_deploy.sh >> state/auto_deploy.log 2>&1"
+  cron_now="$(crontab -l 2>/dev/null || true)"
+  if ! printf '%s\n' "$cron_now" | grep -Fq "$keepalive_mark"; then
+    log "Installing host keepalive cron backup (hourly conditional pls_keepalive_cron.sh)"
+    { printf '%s\n' "$cron_now"; printf '%s\n' "$keepalive_mark"; printf '%s\n' "$keepalive_line"; } | crontab -
+    cron_now="$(crontab -l 2>/dev/null || true)"
+  fi
+  if ! printf '%s\n' "$cron_now" | grep -Fq "$autodeploy_mark"; then
+    log "Installing host auto-deploy cron (every 15 minutes)"
+    { printf '%s\n' "$cron_now"; printf '%s\n' "$autodeploy_mark"; printf '%s\n' "$autodeploy_line"; } | crontab -
+  fi
+}
+
+if [ "$DEPLOY_ONLY" = 1 ]; then
+  [ -d "$DIR/.git" ] || die "deploy-only: not a git checkout at $DIR"
+  cd "$DIR"
+  mkdir -p state
+  if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+  fi
+  install_managed_host_crons
+  # shellcheck disable=SC2206
+  services=(${AUTO_DEPLOY_SERVICES:-api worker-scraper worker-public celery-beat})
+  log "deploy-only: building ${services[*]}"
+  if ! docker compose build "${services[@]}"; then
+    die "deploy-only: docker compose build failed (existing containers unchanged)"
+  fi
+  log "deploy-only: starting ${services[*]}"
+  if ! docker compose up -d --no-build "${services[@]}"; then
+    die "deploy-only: docker compose up failed"
+  fi
+  log "deploy-only: waiting for API health"
+  for i in $(seq 1 40); do
+    if docker compose ps --format '{{.Service}} {{.Health}}' 2>/dev/null | grep -q '^api healthy'; then
+      exit 0
+    fi
+    sleep 5
+  done
+  die "deploy-only: API did not become healthy"
+fi
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 case "$MIRROR_ROWS" in ""|true|false) ;; *) die "--mirror-login-session-rows must be true or false";; esac
@@ -316,27 +367,16 @@ EOF
   ACCESS_URL="https://${PUBLIC_IP}/dashboard   (self-signed certificate: accept the browser warning once)"
 fi
 
-# ---------------------------------------------------------------- server-side automation outside the repository
-# The service re-verifies and, with saved credentials, re-establishes its own logins
-# (recover-login-slots), and Beat dispatches its own jobs. Cron entries found on the server that log in to PakistanLawSite
-# or dispatch jobs from outside the compose stack fight the service: every extra login ends the
-# session the worker is using (the site allows one live session per account), which is what made
-# the harvest lose its login every 30 minutes on 23 September 2026. They are not part of this
-# repository. The root crontab is backed up to state/ before the lines are removed, and any
-# running dispatch loop is stopped.
-log "Checking for server-side automation outside the repository"
+# ---------------------------------------------------------------- legacy host automation (never touch managed keepalive / auto-deploy crons)
+log "Checking for legacy automation outside the repository"
 CRON_NOW="$(crontab -l 2>/dev/null || true)"
-if printf '%s\n' "$CRON_NOW" | grep -Eq 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory'; then
-  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-  printf '%s\n' "$CRON_NOW" > "state/crontab.backup.$STAMP"
-  chmod 600 "state/crontab.backup.$STAMP"
-  log "Removing cron entries that log in or dispatch outside the service (backup: state/crontab.backup.$STAMP):"
-  printf '%s\n' "$CRON_NOW" | grep -E 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory' | sed 's/^/    /'
-  printf '%s\n' "$CRON_NOW" | grep -Ev 'pls_keepalive|backfill_dispatch_loop|ClearLoginHistory' | crontab - || crontab -r || true
+if printf '%s\n' "$CRON_NOW" | grep -Eq 'backfill_dispatch_loop|ClearLoginHistory'; then
+  log "NOTE: root crontab still lists legacy backfill/ClearLoginHistory entries (not removed automatically):"
+  printf '%s\n' "$CRON_NOW" | grep -E 'backfill_dispatch_loop|ClearLoginHistory' | sed 's/^/    /'
 fi
-if pgrep -f 'backfill_dispatch_loop|pls_keepalive' >/dev/null 2>&1; then
-  log "Stopping dispatch/keepalive loop processes running outside the service"
-  pkill -f 'backfill_dispatch_loop|pls_keepalive' || true
+if pgrep -f 'backfill_dispatch_loop' >/dev/null 2>&1; then
+  log "Stopping legacy backfill_dispatch_loop only (never kill PLS harvest or keepalive)"
+  pkill -f 'backfill_dispatch_loop' || true
 fi
 
 # ---------------------------------------------------------------- firewall
@@ -369,27 +409,7 @@ done
 docker compose ps --format 'table {{.Service}}\t{{.Status}}'
 docker compose ps --format '{{.Service}} {{.Health}}' | grep -q '^api healthy' || die "API did not become healthy; run: docker compose logs api"
 
-# Backup host keepalive: Celery Beat runs the primary keepalive; this cron line is idempotent insurance.
-KEEPALIVE_MARK="# ssa-scraper PLS keepalive (backup; Beat owns the primary schedule)"
-KEEPALIVE_LINE="0 * * * * cd $DIR && docker compose exec -T api python scripts/pls_server_login.py >> state/pls_keepalive.log 2>&1"
-CRON_NOW="$(crontab -l 2>/dev/null || true)"
-if ! printf '%s\n' "$CRON_NOW" | grep -Fq "$KEEPALIVE_MARK"; then
-  log "Installing host keepalive cron backup (hourly pls_server_login.py)"
-  { printf '%s\n' "$CRON_NOW"; printf '%s\n' "$KEEPALIVE_MARK"; printf '%s\n' "$KEEPALIVE_LINE"; } | crontab -
-fi
-
-# Auto-deploy merged main to this host (waits for PLS idle; fail-safe build).
-if [ -x "$DIR/scripts/auto_deploy.sh" ]; then
-  bash "$DIR/scripts/auto_deploy.sh" --install-cron
-else
-  AUTODEPLOY_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
-  AUTODEPLOY_LINE="*/15 * * * * cd $DIR && /bin/bash scripts/auto_deploy.sh >> state/auto_deploy.log 2>&1"
-  CRON_NOW="$(crontab -l 2>/dev/null || true)"
-  if ! printf '%s\n' "$CRON_NOW" | grep -Fq "$AUTODEPLOY_MARK"; then
-    log "Installing host auto-deploy cron (every 15 minutes)"
-    { printf '%s\n' "$CRON_NOW"; printf '%s\n' "$AUTODEPLOY_MARK"; printf '%s\n' "$AUTODEPLOY_LINE"; } | crontab -
-  fi
-fi
+install_managed_host_crons
 
 ADMIN_KEY="$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2-)"
 cat <<EOF

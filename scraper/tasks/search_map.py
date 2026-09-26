@@ -118,13 +118,43 @@ def map_as_dict(m: SearchFormMap) -> Dict[str, Any]:
     }
 
 
-async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *, local_engine: Optional[LocalScrapeGraphEngine] = None) -> SearchFormMap:
+async def map_search_form(
+    db: AsyncSession,
+    source: ScraperSource,
+    html: str,
+    *,
+    local_engine: Optional[LocalScrapeGraphEngine] = None,
+    page_url: str = "",
+) -> SearchFormMap:
     """Create a new map version from the rendered search page HTML.
 
     A CitationSearch grid without its query form is recorded for diagnostics, but is
     immediately stale: its DataTables controls are not harvest inputs and the next
     runner invocation must render the page again.
+
+    Login bounces and off-page landings (23 Sep 2026: slot 2 saved a stale map from a bad page)
+    must never replace the active map.
     """
+    from scraper.auth.session_manager import LoginRequired
+    from scraper.tasks.login_recovery import looks_authenticated
+
+    class _Surface:
+        pass
+
+    surface = _Surface()
+    surface.html = html or ""
+    surface.url = page_url or (source.source_url or "")
+    if not looks_authenticated(surface):
+        prev = await active_map(db, source.source_name)
+        if prev is not None:
+            logger.warning(
+                "refusing to overwrite search map v%s from login/off-page HTML (url=%s)",
+                prev.map_version,
+                (page_url or "")[:200],
+            )
+            return prev
+        raise LoginRequired("cannot map search form from login or off-page surface")
+
     proposal = introspect_search_form(html)
     mapped_by = "deterministic"
     engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()

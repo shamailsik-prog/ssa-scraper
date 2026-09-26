@@ -501,7 +501,7 @@ class PakistanLawSitePipeline:
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
                 return cached
-        m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
+        m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine, page_url=page.url)
         if not m.stale:
             await self.db.execute(
                 update(CrawlFrontier)

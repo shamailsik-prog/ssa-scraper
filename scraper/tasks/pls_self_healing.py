@@ -18,6 +18,7 @@ from scraper.pls_grid_health import (
     SOURCE_NAME,
     grid_harvest_incomplete,
     grid_rows_remaining,
+    pls_harvest_in_progress,
     pls_judgment_counts,
     pls_last_judgment_at,
     pls_source_config,
@@ -39,6 +40,9 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
         return {"skipped": "login_scraping_disabled"}
     outcomes: Dict[str, Any] = {"probed": [], "recovered": []}
     async with SessionLocal() as db:
+        busy = await pls_harvest_in_progress(db)
+        if busy:
+            return {"skipped": "harvest_in_progress", "reason": busy}
         source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
         if source is None:
             return {"skipped": "no source"}
