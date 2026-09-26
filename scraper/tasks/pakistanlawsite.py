@@ -198,6 +198,11 @@ def unmapped_query_reason(search_map: Dict[str, Any], query: Dict[str, Any], cur
     return "search map cannot express frontier query; no usable mapped fields"
 
 
+def is_grid_surface_without_query_form(search_map: Dict[str, Any]) -> bool:
+    surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+    return surface == "grid_surface_no_query_form"
+
+
 # --------------------------------------------------------------------------- pipeline
 class PakistanLawSitePipeline:
     def __init__(
@@ -342,17 +347,27 @@ class PakistanLawSitePipeline:
 
         page = await self.runner.run(op)
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
-        # A stale map is a page-shape failure, not a terminal frontier outcome.  Once a
-        # fresh map is saved, retry the rows that were paused for remapping.
-        await self.db.execute(
-            update(CrawlFrontier)
-            .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status == "stale")
-            .values(status="pending", last_error=None)
-        )
+        # A stale map is a page-shape failure, not a terminal frontier outcome. Only
+        # a harvestable replacement may reopen rows paused for remapping; reopening
+        # them after another grid-only capture would immediately re-stale them.
+        if not m.stale:
+            await self.db.execute(
+                update(CrawlFrontier)
+                .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status == "stale")
+                .values(status="pending", last_error=None)
+            )
         await self.db.flush()
         return map_as_dict(m)
 
     # ---------------------------------------------------------------- one result page
+    async def mark_frontier_stale_for_grid_surface(self, frontier: CrawlFrontier, reason: str) -> None:
+        """Keep grid-only CitationSearch captures remappable rather than terminal."""
+        m = await active_map(self.db, SOURCE_NAME)
+        if m is not None:
+            await mark_map_stale(self.db, m, source_name=SOURCE_NAME, reason=reason)
+        frontier.status = "stale"
+        frontier.last_error = f"{reason}; remap required"
+
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         async def op(browser: Browser) -> PageResult:
             await browser.goto(settings.PLS_SEARCH_URL)
@@ -526,6 +541,9 @@ class PakistanLawSitePipeline:
             values = build_values(search_map, frontier.query_json, {"page_no": page_no})
             reason = unmapped_query_reason(search_map, frontier.query_json, {"page_no": page_no})
             if reason:
+                if is_grid_surface_without_query_form(search_map):
+                    await self.mark_frontier_stale_for_grid_surface(frontier, reason)
+                    return
                 frontier.status = "retired"
                 frontier.last_error = reason
                 return
@@ -564,6 +582,9 @@ class PakistanLawSitePipeline:
         values = build_values(search_map, frontier.query_json, frontier.cursor_json)
         reason = unmapped_query_reason(search_map, frontier.query_json, frontier.cursor_json)
         if reason:
+            if is_grid_surface_without_query_form(search_map):
+                await self.mark_frontier_stale_for_grid_surface(frontier, reason)
+                return
             frontier.status = "retired"
             frontier.last_error = reason
             return

@@ -669,6 +669,9 @@ async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query
     assert m.fields == {}
     assert m.limits["surface"] == "grid_surface_no_query_form"
     assert m.result_layout["row_selector"] == "table#citationGrid tr"
+    assert m.stale
+    notes = (await db.execute(select(Notification.code, Notification.message))).all()
+    assert ("SEARCH_MAP_GRID_SURFACE_STALE", "CitationSearch grid-only surface captured; query form unavailable, map marked stale and remap required") in notes
 
     pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
     frontier = CrawlFrontier(
@@ -688,9 +691,38 @@ async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query
         max_pages=1,
     )
 
-    assert frontier.status == "retired"
-    assert frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available"
+    assert frontier.status == "stale"
+    assert frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available; remap required"
     assert pipeline.stats["queries"] == 0
+
+
+async def test_real_query_form_remap_reopens_grid_surface_frontier(db, login_source):
+    await _activate(db, login_source)
+    grid_map = await map_search_form(db, login_source, citation_search_grid_only_html())
+    frontier = CrawlFrontier(
+        source_name="PakistanLawSite",
+        tier=3,
+        query_key="t3:grid-remap",
+        query_json={"keyword": "constitutional"},
+        cursor_json={"page": 1},
+        status="stale",
+        last_error="CitationSearch surface is grid_surface_no_query_form; no query form is available; remap required",
+    )
+    db.add(frontier)
+    await db.commit()
+
+    script = BrowserScript()
+    script.page(("goto", settings.PLS_SEARCH_URL), citation_search_hybrid_html())
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=script.factory(), sleep=_nosleep)
+    search_map = await pipeline.ensure_search_map()
+    await db.refresh(frontier)
+
+    assert grid_map.stale
+    assert search_map["surface"] == "query_form"
+    assert frontier.status == "pending"
+    assert frontier.last_error is None
+    active = (await db.execute(select(SearchFormMap).where(SearchFormMap.is_active.is_(True)))).scalars().one()
+    assert active.map_version == 2 and not active.stale
 
 
 def test_tableless_citation_search_capture_is_classified_as_grid_surface():
