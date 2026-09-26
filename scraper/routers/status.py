@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pathlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse, Response
@@ -187,6 +187,36 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
         for r in (await db.execute(select(SpotCheck).order_by(SpotCheck.checked_at.desc()).limit(20))).scalars().all()
     ]
     last_spot = (await db.execute(select(func.max(SpotCheck.checked_at)))).scalar()
+    pakistanlawsite_harvest: Optional[Dict[str, Any]] = None
+    pls_source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))
+    ).scalar_one_or_none()
+    if pls_source is not None:
+        cfg = dict(pls_source.config_json or {})
+        cursor = dict(cfg.get("citation_grid_cursor") or {})
+        progress = dict(cfg.get("citation_grid_progress") or {})
+        if not cursor and isinstance(progress.get("citation_grid_cursor"), dict):
+            cursor = dict(progress.get("citation_grid_cursor") or {})
+        pls_judgments = by_source.get("PakistanLawSite", 0)
+        last_judgment_at = (
+            await db.execute(
+                select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite")
+            )
+        ).scalar()
+        last_success = pls_source.last_success_at
+        stalled = False
+        if last_success is not None:
+            stalled = (now - last_success) > timedelta(hours=6)
+        pakistanlawsite_harvest = {
+            "judgments": pls_judgments,
+            "citation_grid_cursor": {
+                "row_offset": int(cursor.get("row_offset", 0) or 0),
+                "total_rows": int(cursor.get("last_total_rows", 0) or 0) if cursor.get("last_total_rows") is not None else None,
+            },
+            "last_judgment_at": _iso(last_judgment_at),
+            "last_success_at": _iso(last_success),
+            "stalled": stalled,
+        }
     return {
         "generated_at": _iso(now),
         "spot_checks": {
@@ -226,6 +256,7 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "mirror_login_session_rows_setting": settings.MIRROR_LOGIN_SESSION_ROWS,
         },
         "open_notifications": open_notifications,
+        "pakistanlawsite_harvest": pakistanlawsite_harvest,
     }
 
 

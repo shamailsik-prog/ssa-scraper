@@ -132,6 +132,8 @@ class Settings(BaseSettings):
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
     PLAYWRIGHT_TIMEOUT_MS: int = Field(default=30000)
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
+    PLAYWRIGHT_MAX_HTML_BYTES: int = Field(default=2_000_000, description="Guard: skip full page.content() when HTML responses are larger than this many bytes.")
+    PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD: int = Field(default=500, description="When a page has at least this many input elements, treat it as oversized for HTML capture guards.")
 
     # ------------------------------------------------- login-session sources
     ALLOW_LOGIN_SCRAPING: bool = Field(default=False)
@@ -182,6 +184,13 @@ class Settings(BaseSettings):
     PLS_USER_B: str = Field(default="")
     PLS_PASS_B: SecretStr = Field(default=SecretStr(""))
     PLS_JOURNALS_B: str = Field(default="")
+    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=400, description="Maximum rows materialized per compact #archivedpatientGrid snapshot (one window).")
+    PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Max detail pages fetched per citation-grid window.")
+    PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Rows scanned per citation-grid window (known rows are fast-forwarded).")
+    PLS_CITATION_GRID_FLUSH_EVERY: int = Field(default=1, description="Commit citation-grid cursor progress after this many rows within a window.")
+    PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip grid rows whose citation already has a staging row (extracted, promoted, duplicate or quarantined).")
+    PLS_RUN_MAX_MINUTES: int = Field(default=0, description="Keep harvesting consecutive citation-grid windows inside one job for up to this many minutes (0 = one window per job).")
 
     # ----------------------------------------------------------- pdf/storage
     PDF_STORAGE_PATH: str = Field(default="/app/live")
@@ -297,6 +306,13 @@ class Settings(BaseSettings):
         "JUDGMENT_CITATION_RECONCILE_BATCH_SIZE",
         "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS",
         "PLS_CASE_DESCRIPTION_WAIT_SECONDS",
+        "PLAYWRIGHT_MAX_HTML_BYTES",
+        "PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD",
+        "PLS_ARCHIVED_GRID_MAX_ROWS",
+        "PLS_CITATION_GRID_MAX_DETAIL",
+        "PLS_CITATION_GRID_SCAN_WINDOW",
+        "PLS_CITATION_GRID_FLUSH_EVERY",
+        "PLS_RUN_MAX_MINUTES",
         mode="before",
     )
     @classmethod
@@ -384,6 +400,18 @@ class Settings(BaseSettings):
             raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
+        if self.PLAYWRIGHT_MAX_HTML_BYTES <= 0 or self.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD <= 0:
+            raise ValueError("PLAYWRIGHT_MAX_HTML_BYTES and PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD must be positive")
+        if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
+        if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS must be positive")
+        if self.PLS_CITATION_GRID_MAX_DETAIL <= 0 or self.PLS_CITATION_GRID_SCAN_WINDOW <= 0:
+            raise ValueError("PLS_CITATION_GRID_MAX_DETAIL and PLS_CITATION_GRID_SCAN_WINDOW must be positive")
+        if self.PLS_CITATION_GRID_FLUSH_EVERY <= 0:
+            raise ValueError("PLS_CITATION_GRID_FLUSH_EVERY must be positive")
+        if self.PLS_RUN_MAX_MINUTES < 0:
+            raise ValueError("PLS_RUN_MAX_MINUTES must be >= 0")
         if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:
             raise ValueError("PROMOTE_PREFERRED_SHARE must be in (0, 1]")
         if self.EMBEDDING_DIM <= 0:
