@@ -507,11 +507,24 @@ class PlaywrightBrowser:
         headless: Optional[bool] = None,
         allow_list: Optional[List[str]] = None,
         document_cdn_hosts: Optional[List[str]] = None,
+        enforce_policy_on_requests: bool = False,
+        allow_private_for_tests: Optional[bool] = None,
+        user_agent: Optional[str] = None,
     ):
         self.slot_number = slot_number
         self._storage_state = storage_state
         self.base_url = base_url
         self._headless = settings.PLAYWRIGHT_HEADLESS if headless is None else headless
+        # With enforce_policy_on_requests every request the browser makes is checked before it
+        # leaves: a navigation (a redirect included) must pass the full URL policy, and any other
+        # request (script, style, image, XHR) must at least not reach a private, loopback,
+        # link-local or metadata address. Disallowed requests are aborted.
+        self._enforce_policy_on_requests = enforce_policy_on_requests
+        self._allow_private = bool(settings.DEBUG) if allow_private_for_tests is None else bool(allow_private_for_tests)
+        # None keeps Chromium's own User-Agent (the login browser looks like the operator's
+        # browser); a public source's browser identifies itself as the public fetcher does, so the
+        # robots rules evaluated for that agent are the ones that apply to the request made.
+        self._user_agent = user_agent
         host = ""
         try:
             from urllib.parse import urlparse
@@ -531,15 +544,41 @@ class PlaywrightBrowser:
             url,
             self._allow_list,
             document_cdn_hosts=self._document_cdn_hosts,
-            allow_private_for_tests=bool(settings.DEBUG),
+            allow_private_for_tests=self._allow_private,
         )
+
+    def request_allowed(self, url: str, resource_type: str = "document") -> bool:
+        """Whether a request the page wants to make may leave: navigations under the full URL
+        policy (allow-list and address guard), everything else under the address guard alone."""
+        if resource_type == "document":
+            try:
+                self._assert_url_policy(url)
+                return True
+            except URLPolicyError:
+                return False
+        from scraper.security import METADATA_HOSTS, resolve_is_safe
+
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in ("http", "https") or not host or host in METADATA_HOSTS:
+            return False
+        return True if self._allow_private else resolve_is_safe(host)
+
+    async def _route_request(self, route, request) -> None:
+        if self.request_allowed(request.url, request.resource_type):
+            await route.continue_()
+        else:
+            logger.info("browser request aborted by policy: %s (%s)", safe_url_for_record(request.url), request.resource_type)
+            await route.abort("blockedbyclient")
 
     async def start(self) -> "PlaywrightBrowser":
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(headless=self._headless, executable_path=settings.PLAYWRIGHT_EXECUTABLE_PATH or None)
-        self._context = await self._browser.new_context(storage_state=self._storage_state, user_agent=None)
+        self._context = await self._browser.new_context(storage_state=self._storage_state, user_agent=self._user_agent)
+        if self._enforce_policy_on_requests:
+            await self._context.route("**/*", self._route_request)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(settings.PLAYWRIGHT_TIMEOUT_MS)
         self._page.set_default_navigation_timeout(settings.PLAYWRIGHT_TIMEOUT_MS)
@@ -552,7 +591,7 @@ class PlaywrightBrowser:
             return await coro
         except PWError as exc:
             msg = str(exc)
-            if any(k in msg for k in ("Target closed", "Browser has been closed", "net::ERR_", "Navigation failed", "Timeout", "disconnected", "Connection closed")):
+            if any(k in msg for k in ("Target closed", "Browser has been closed", "net::ERR_", "Navigation failed", "Timeout", "disconnected", "Connection closed", "Download is starting")):
                 raise BrowserDisconnected(msg) from exc
             raise
 
