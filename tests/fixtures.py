@@ -88,6 +88,16 @@ def citation_search_hybrid_html() -> str:
     </body></html>"""
 
 
+def citation_search_empty_session_shell_html() -> str:
+    """Broken CitationSearch render: logged-out or failed session with no chrome."""
+    return "<html><head><title></title></head><body></body></html>"
+
+
+def citation_search_no_query_form_html() -> str:
+    """Non-empty title but no query form and no archivedpatientGrid (maps no_query_form)."""
+    return "<html><head><title>Pakistan Law Site</title></head><body><p>Loading…</p></body></html>"
+
+
 def citation_search_grid_only_html() -> str:
     """CitationSearch result grid with DataTables-style filters but no query form."""
     return """<html><body>

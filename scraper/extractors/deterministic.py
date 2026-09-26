@@ -529,13 +529,35 @@ def _search_form(soup: BeautifulSoup):
     )[0]
 
 
+def _has_archived_patient_grid(soup: BeautifulSoup) -> bool:
+    for el in soup.find_all(id=True):
+        if re.search(r"archivedpatientgrid", str(el.get("id") or ""), re.IGNORECASE):
+            return True
+    return False
+
+
+def _has_logout_link(soup: BeautifulSoup) -> bool:
+    for anchor in soup.find_all("a", href=True):
+        href = (anchor.get("href") or "").lower()
+        if "logout" in href or "logoff" in href:
+            return True
+        text = anchor.get_text(" ", strip=True).lower()
+        if "log off" in text or "sign out" in text:
+            return True
+    return False
+
+
 def _surface_classification(soup: BeautifulSoup, form) -> str:
     if form is not None:
         return "query_form"
+    if _has_archived_patient_grid(soup):
+        return "grid_surface_no_query_form"
     controls = soup.find_all(["input", "select", "textarea", "button"])
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     if (soup.find("table") is not None and controls) or re.search(r"\bcitation\s*search\b", title, re.IGNORECASE):
         return "grid_surface_no_query_form"
+    if not title and not _has_logout_link(soup):
+        return "login_required"
     return "no_query_form"
 
 

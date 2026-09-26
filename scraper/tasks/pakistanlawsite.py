@@ -43,6 +43,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.extractors.deterministic import introspect_search_form
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
@@ -259,6 +260,16 @@ def is_grid_surface_without_query_form(search_map: Dict[str, Any]) -> bool:
     return surface == "grid_surface_no_query_form"
 
 
+def is_unharvestable_search_surface(search_map: Dict[str, Any]) -> bool:
+    """Surfaces that cannot drive tier frontiers: mark stale, never retire rows."""
+    surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+    if surface in ("grid_surface_no_query_form", "no_query_form", "login_required"):
+        return True
+    fields = search_map.get("fields") or {}
+    usable = [key for key in fields if key != "_all"]
+    return not usable and not (fields.get("_all") or [])
+
+
 # --------------------------------------------------------------------------- pipeline
 class PakistanLawSitePipeline:
     def __init__(
@@ -470,6 +481,16 @@ class PakistanLawSitePipeline:
         return "full_judgment", None
 
     # ---------------------------------------------------------------- search map
+    def _raise_if_login_required_shell(self, page: PageResult) -> None:
+        guard = str((page.metadata or {}).get("content_guard") or "")
+        if guard in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
+            return
+        probe = introspect_search_form(page.html or "")
+        if probe.get("surface") != "login_required":
+            return
+        where = f" (landed on {page.url})" if page.url else ""
+        raise LoginRequired(f"CitationSearch session shell (empty title, no logout, no query form, no grid){where}")
+
     async def ensure_search_map(self, *, archived_grid_start_row: int = 0) -> Dict[str, Any]:
         """Render the search surface once and map it. The rendered page is kept so the first
         citation-grid window can reuse it instead of loading the 10-16 MB CitationSearch DOM twice."""
@@ -481,6 +502,12 @@ class PakistanLawSitePipeline:
             return page
 
         page = await self.runner.run(op)
+        if not getattr(self, "_search_surface_remap_attempted", False):
+            probe = introspect_search_form(page.html or "")
+            if probe.get("surface") == "login_required":
+                self._search_surface_remap_attempted = True
+                page = await self.runner.run(op)
+        self._raise_if_login_required_shell(page)
         self._surface_page = page
         self._surface_page_start_row = start_row
         m = await active_map(self.db, SOURCE_NAME)
@@ -982,12 +1009,18 @@ class PakistanLawSitePipeline:
         return result
 
     # ---------------------------------------------------------------- one result page
-    async def mark_frontier_stale_for_grid_surface(self, frontier: CrawlFrontier, reason: str) -> None:
+    async def mark_frontier_stale_for_unmapped_surface(
+        self,
+        frontier: CrawlFrontier,
+        reason: str,
+        *,
+        code: str = "SEARCH_MAP_GRID_SURFACE_STALE",
+    ) -> None:
         m = await active_map(self.db, SOURCE_NAME)
         if m is not None:
-            await mark_map_stale(self.db, m, source_name=SOURCE_NAME, reason=reason)
+            await mark_map_stale(self.db, m, source_name=SOURCE_NAME, reason=f"{code}: {reason}")
         frontier.status = "stale"
-        frontier.last_error = f"{reason}; remap required"
+        frontier.last_error = f"{code}: {reason}; remap required"
 
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         async def op(browser: Browser) -> PageResult:
@@ -1159,11 +1192,17 @@ class PakistanLawSitePipeline:
             values = build_values(search_map, frontier.query_json, {"page_no": page_no})
             reason = unmapped_query_reason(search_map, frontier.query_json, {"page_no": page_no})
             if reason:
-                if is_grid_surface_without_query_form(search_map):
-                    await self.mark_frontier_stale_for_grid_surface(frontier, reason)
+                if is_unharvestable_search_surface(search_map):
+                    surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+                    stale_code = (
+                        "SEARCH_MAP_NO_QUERY_FORM_STALE"
+                        if surface in ("no_query_form", "login_required")
+                        else "SEARCH_MAP_GRID_SURFACE_STALE"
+                    )
+                    await self.mark_frontier_stale_for_unmapped_surface(frontier, reason, code=stale_code)
                     return
                 frontier.status = "retired"
-                frontier.last_error = reason
+                frontier.last_error = reason or "search map cannot express frontier query"
                 return
             page = await self.fetch_results(search_map, values)
             self.stats["queries"] += 1
@@ -1198,11 +1237,17 @@ class PakistanLawSitePipeline:
         values = build_values(search_map, frontier.query_json, frontier.cursor_json)
         reason = unmapped_query_reason(search_map, frontier.query_json, frontier.cursor_json)
         if reason:
-            if is_grid_surface_without_query_form(search_map):
-                await self.mark_frontier_stale_for_grid_surface(frontier, reason)
+            if is_unharvestable_search_surface(search_map):
+                surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
+                stale_code = (
+                    "SEARCH_MAP_NO_QUERY_FORM_STALE"
+                    if surface in ("no_query_form", "login_required")
+                    else "SEARCH_MAP_GRID_SURFACE_STALE"
+                )
+                await self.mark_frontier_stale_for_unmapped_surface(frontier, reason, code=stale_code)
                 return
             frontier.status = "retired"
-            frontier.last_error = reason
+            frontier.last_error = reason or "search map cannot express frontier query"
             return
         pages_done = 0
         page = await self.fetch_results(search_map, values)
@@ -1366,7 +1411,8 @@ class PakistanLawSitePipeline:
                         await self.run_tier1(fr, search_map, max_probes_per_volume)
                     else:
                         await self.run_paged_query(fr, search_map, max_pages=10)
-                    fr.last_error = None
+                    if fr.status not in ("retired", "stale"):
+                        fr.last_error = None
                 except ExplicitBlock as exc:
                     fr.status = "pending"
                     fr.last_error = f"halted: {exc}"
