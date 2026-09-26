@@ -35,6 +35,9 @@ die() {
   exit 1
 }
 
+# shellcheck source=scripts/pls_host_lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/pls_host_lib.sh"
+
 install_cron() {
   local cron_line="*/15 * * * * cd $DIR && /bin/bash scripts/auto_deploy.sh >> state/auto_deploy.log 2>&1"
   local cron_now
@@ -46,50 +49,9 @@ install_cron() {
   { printf '%s\n' "$cron_now"; printf '%s\n' "$CRON_MARK"; printf '%s\n' "$cron_line"; } | crontab -
 }
 
-redis_cli() {
-  docker compose exec -T redis redis-cli "$@"
-}
-
-pls_redis_lock_busy() {
-  local key exists
-  if ! docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx redis; then
-    return 1
-  fi
-  for key in \
-    "corpus:login_session_lock:PakistanLawSite" \
-    "corpus:login_session_lock:PakistanLawSite:holders" \
-    "corpus:login_session_lock:PakistanLawSite:slot1" \
-    "corpus:login_session_lock:PakistanLawSite:slot2"; do
-    exists="$(redis_cli EXISTS "$key" 2>/dev/null | tr -d '\r' || echo 0)"
-    if [ "$exists" = "1" ]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-pls_running_jobs() {
-  # Running harvest/login rows for PakistanLawSite (login_session queue).
-  docker compose exec -T postgres psql -U "${POSTGRES_USER:-corpus}" -d "${POSTGRES_DB:-corpus}" -tAc \
-    "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null \
-    | tr -d ' \r\n' || echo "0"
-}
-
-pls_login_busy() {
-  if pls_redis_lock_busy; then
-    return 0
-  fi
-  local n
-  n="$(pls_running_jobs)"
-  if [ -n "$n" ] && [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-    return 0
-  fi
-  return 1
-}
-
 wait_for_pls_idle() {
   local waited=0
-  while pls_login_busy; do
+  while pls_host_harvest_busy; do
     if [ "$waited" -ge "$WAIT_MAX_SECONDS" ]; then
       log "PLS still busy after ${waited}s (lock or running job); deferring deploy to next cron tick"
       exit 0
@@ -220,27 +182,13 @@ main() {
   fi
   read -r -a services <<<"$services_line"
 
-  log "building services (fail-safe): ${services[*]}"
-  if ! docker compose build "${services[@]}"; then
-    log "docker compose build FAILED — leaving existing containers running"
+  export AUTO_DEPLOY_SERVICES="${services[*]}"
+  log "rolling out via cloud/install.sh --deploy-only (fail-safe): ${services[*]}"
+  if ! SSA_SCRAPER_DIR="$DIR" bash "$DIR/cloud/install.sh" --deploy-only --dir "$DIR" --skip-docker-install --skip-firewall; then
+    log "install.sh --deploy-only FAILED — leaving existing containers running"
     git reset --hard "$old_sha" || true
     exit 1
   fi
-
-  log "rolling out: ${services[*]}"
-  if ! docker compose up -d --no-build "${services[@]}"; then
-    log "docker compose up FAILED after successful build — containers may be partially updated; not updating tip_sha"
-    exit 1
-  fi
-
-  # Wait for API health before maintenance exec.
-  local i
-  for i in $(seq 1 40); do
-    if docker compose ps --format '{{.Service}} {{.Health}}' 2>/dev/null | grep -q '^api healthy'; then
-      break
-    fi
-    sleep 5
-  done
 
   run_reset_frontier_once "$new_sha"
   printf '%s\n' "$new_sha" >"$TIP_FILE"
