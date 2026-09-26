@@ -91,6 +91,8 @@ class Browser(Protocol):
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult: ...
 
+    async def visible_text(self) -> str: ...
+
     async def download(self, url: str) -> bytes: ...
 
     async def close(self) -> None: ...
@@ -1104,6 +1106,10 @@ class PlaywrightBrowser:
             )
         html_text, metadata = await self._capture_html(resp=None)
         return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
+
+    async def visible_text(self) -> str:
+        """The text of the page as the browser shows it (the rendered document's innerText)."""
+        return await self._wrap(self._page.evaluate("() => (document.body && document.body.innerText) || ''"))
 
     async def download(self, url: str) -> bytes:
         try:
