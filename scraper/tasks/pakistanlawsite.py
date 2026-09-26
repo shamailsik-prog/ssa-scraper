@@ -70,6 +70,24 @@ DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "C
 # dom_absolute = primary live path; offset-th <tr> confirmed in DOM (New Bot / droplet).
 # datatable = optional fallback when DataTables is present and page.info().start lands (#101).
 CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
+PACING_KEY = "pacing"  # source.config_json.pacing: hour / hour_pages / day / day_pages (specification 3.6)
+
+
+def _aggregate_legacy_pacing(cfg: Dict[str, Any], *, hour_key: str, day_key: str) -> Dict[str, Any]:
+    """Sum the `pacing_slot_<n>` counters an earlier release kept per login slot, for the current
+    hour and day only, into one `pacing` object."""
+    hour_pages = 0
+    day_pages = 0
+    for name, value in cfg.items():
+        if not (isinstance(name, str) and name.startswith("pacing_slot_") and isinstance(value, dict)):
+            continue
+        if value.get("hour") == hour_key:
+            hour_pages += int(value.get("hour_pages", 0) or 0)
+        if value.get("day") == day_key:
+            day_pages += int(value.get("day_pages", 0) or 0)
+    if not hour_pages and not day_pages:
+        return {}
+    return {"hour": hour_key, "hour_pages": hour_pages, "day": day_key, "day_pages": day_pages}
 
 
 _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
@@ -113,12 +131,6 @@ def citation_grid_cursor_key(reporter_shard: Optional[int]) -> str:
     if reporter_shard in (0, 1):
         return f"citation_grid_cursor_shard_{reporter_shard}"
     return "citation_grid_cursor"
-
-
-def pacing_key(slot_number: int) -> str:
-    """config_json key of one slot's page counters. The site's quota is per account (per login), so
-    the budgets are kept per slot, not per source."""
-    return f"pacing_slot_{int(slot_number or 0)}"
 
 
 class PacingBudgetExceeded(RuntimeError):
@@ -268,7 +280,6 @@ class PakistanLawSitePipeline:
         self.reporter_shard_reporters: List[str] = []
         self._other_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
-        self._slot_lock: Optional[SessionLock] = None
         self._surface_page: Optional[PageResult] = None
         self._surface_page_start_row: Optional[int] = None
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "citation_grid_windows": 0}
@@ -276,30 +287,19 @@ class PakistanLawSitePipeline:
         self.pacing_profile = login_pacing_profile("updates")
 
     # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
-    async def _pacing_slot_number(self) -> int:
-        browser = self.runner.browser
-        if browser is not None:
-            return int(getattr(browser, "slot_number", 0) or 0)
-        preferred = getattr(self.runner, "preferred_slot_number", None)
-        if preferred:
-            return int(preferred)
-        current = await self.manager.current_slot()
-        return int(current.slot_number) if current is not None else 0
-
     async def _charge_page(self) -> None:
-        """Count one login-session page against the hourly and daily budgets of the slot in use,
-        then pace. Counters are per slot (the site's quota is per account) and are merged into the
-        source row atomically, so a shard on the other slot never overwrites them."""
+        """Specification 3.6: refresh the lock, count the page in source.config_json.pacing, enforce
+        budgets from the active harvest pacing profile, then sleep LOGIN_DELAY_MIN..MAX."""
         if self._session_lock is not None:
             await self._session_lock.refresh()
-        if self._slot_lock is not None:
-            await self._slot_lock.refresh()
         now = datetime.now(timezone.utc)
-        key = pacing_key(await self._pacing_slot_number())
+        key = PACING_KEY
         cfg = dict(self.source.config_json or {})
         pacing = dict(cfg.get(key) or {})
         hour_key = now.strftime("%Y-%m-%dT%H")
         day_key = now.strftime("%Y-%m-%d")
+        if not pacing:
+            pacing = _aggregate_legacy_pacing(cfg, hour_key=hour_key, day_key=day_key)
         if pacing.get("hour") != hour_key:
             pacing["hour"], pacing["hour_pages"] = hour_key, 0
         if pacing.get("day") != day_key:
@@ -313,9 +313,9 @@ class PakistanLawSitePipeline:
         pages_per_day = int(self.pacing_profile["pages_per_day"])
         pages_per_hour = int(self.pacing_profile["pages_per_hour"])
         if pacing["day_pages"] > pages_per_day:
-            raise PacingBudgetExceeded(f"PAGES_PER_DAY={pages_per_day} spent for {day_key} on {key}")
+            raise PacingBudgetExceeded(f"PAGES_PER_DAY={pages_per_day} spent for {day_key}")
         if pacing["hour_pages"] > pages_per_hour:
-            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={pages_per_hour} spent for {hour_key} on {key}")
+            raise PacingBudgetExceeded(f"PAGES_PER_HOUR={pages_per_hour} spent for {hour_key}")
         await self.sleep(random.uniform(float(self.pacing_profile["login_delay_min"]), float(self.pacing_profile["login_delay_max"])))
 
     async def _heartbeat_job(self) -> None:
