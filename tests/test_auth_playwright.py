@@ -68,6 +68,15 @@ class _FakePage:
         self.calls = []
         self.keyboard = SimpleNamespace(press=self._press)
         self.case_description_modal_payload = None
+        self.dom_shape = {
+            "forms": 1,
+            "inputs": 2,
+            "has_archivedpatient_grid": False,
+            "archivedpatient_rows": 0,
+            "has_logout": True,
+            "body_preview": "ok",
+        }
+        self.archived_grid_snapshot = None
 
     async def goto(self, url, **kwargs):
         self.calls.append(("goto", url, kwargs))
@@ -104,6 +113,27 @@ class _FakePage:
         self.calls.append(("evaluate", script, args))
         if "#ExceptionResponseScreen1" in script:
             return self.case_description_modal_payload
+        if "has_archivedpatient_grid" in script:
+            return dict(self.dom_shape)
+        if "maxRows" in script and "startRow" in script:
+            snap = self.archived_grid_snapshot
+            if not snap:
+                return None
+            rows = list(snap.get("rows") or [])
+            max_rows = int((args[0] or {}).get("maxRows") if args and isinstance(args[0], dict) else len(rows))
+            start_row = int((args[0] or {}).get("startRow") if args and isinstance(args[0], dict) else 0)
+            return {
+                "headers": snap.get("headers") or ["Citation", "Title", "Court", "Read"],
+                "rows": rows[start_row : start_row + max_rows],
+                "next_url": snap.get("next_url"),
+                "body_preview": snap.get("body_preview") or "grid",
+                "has_logout": bool(snap.get("has_logout", True)),
+                "total_rows": int(snap.get("total_rows", len(rows))),
+                "requested_start_row": start_row,
+                "start_row": start_row,
+                "seek_mode": snap.get("seek_mode", "dom_absolute"),
+                "page_length": snap.get("page_length"),
+            }
         return None
 
 
@@ -1064,6 +1094,15 @@ async def test_page_capture_falls_back_to_forms_when_content_outlasts_the_timeou
 
     async def evaluate(script, *args):
         page.calls.append(("evaluate", script, args))
+        if "has_archivedpatient_grid" in script:
+            return {
+                "forms": 1,
+                "inputs": 2,
+                "has_archivedpatient_grid": False,
+                "archivedpatient_rows": 0,
+                "has_logout": True,
+                "body_preview": "ok",
+            }
         assert "document.forms" in script
         return '<html><head><title>Citation Search</title></head><body><a href="/Login/Logout">Logout</a><form id="f"><select name="book"></select></form></body></html>'
 
@@ -1157,4 +1196,70 @@ async def test_human_login_autofills_saved_credentials_and_can_submit(fixture_se
         assert sess.last_autofill and sess.last_autofill["applied"] and sess.last_autofill["submitted"]
     finally:
         await reg.cancel("PakistanLawSite")
+
+
+async def test_playwright_goto_uses_compact_table_guard_for_oversized_archived_grid():
+    page = _FakePage(html="<html><body>oversized</body></html>")
+    page.dom_shape = {
+        "forms": 0,
+        "inputs": settings.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD + 100,
+        "has_archivedpatient_grid": True,
+        "archivedpatient_rows": 2,
+        "has_logout": True,
+        "body_preview": "citation table",
+    }
+    page.archived_grid_snapshot = {
+        "headers": ["Citation", "Title", "Court", "Read"],
+        "rows": [
+            {
+                "citation": "PLD 2024 SC 11",
+                "title": "A v B",
+                "court": "Supreme Court",
+                "detail_url": "https://www.pakistanlawsite.com/case/11",
+                "pdf_url": None,
+            }
+        ],
+        "total_rows": 20568,
+        "seek_mode": "dom_absolute",
+    }
+    browser = PlaywrightBrowser(STATE, 1, base_url=settings.PLS_BASE_URL)
+    browser._page = page
+    result = await browser.goto(settings.PLS_SEARCH_URL)
+    assert result.metadata["content_guard"] == "archivedpatientGrid_compact"
+    assert 'id="archivedpatientGrid"' in result.html
+    assert "PLD 2024 SC 11" in result.html
+
+
+def test_pipeline_is_citation_grid_map_when_archived_grid_without_form_fields():
+    search_map = {
+        "fields": {},
+        "result_layout": {"row_selector": "table#archivedpatientGrid tbody tr", "columns": {"citation": 0, "title": 1, "court": 2}},
+    }
+    assert PakistanLawSitePipeline._is_citation_grid_map(search_map)
+    assert not PakistanLawSitePipeline._has_queryable_search_fields(search_map)
+
+
+async def test_pipeline_run_uses_citation_grid_path(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    sc = BrowserScript()
+    grid_html = """
+    <html><body><a href="/logout">Logout</a>
+    <table id="archivedpatientGrid"><thead><tr><th>Citation</th><th>Title</th><th>Court</th><th>Read</th></tr></thead>
+    <tbody><tr><td>PLD 2024 SC 9001</td><td>Party v State</td><td>Supreme Court</td>
+    <td><a href="https://www.pakistanlawsite.com/case/9001">Read</a></td></tr></tbody></table></body></html>
+    """
+    sc.page(("goto", settings.PLS_SEARCH_URL), grid_html)
+    sc.page(
+        ("goto", "https://www.pakistanlawsite.com/case/9001"),
+        judgment_html("PLD 2024 SC 9001", title="Party v State"),
+    )
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=1)
+    await r.aclose()
+    assert stats.get("surface_mode") == "citation_grid"
+    assert stats.get("pages", 0) >= 1
 
