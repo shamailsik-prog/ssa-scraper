@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -46,11 +47,12 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
+    judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
-from scraper.models import CrawlCoverage, CrawlFrontier, ScraperJob, ScraperSource, StatuteSection, Statute
+from scraper.models import CrawlCoverage, CrawlFrontier, Citation, Judgment, ScraperJob, ScraperSource, ScraperStaging, StatuteSection, Statute
 from scraper.notify import notify
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
@@ -63,6 +65,8 @@ SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
 PACING_KEY = "pacing"  # source.config_json.pacing: hour / hour_pages / day / day_pages (specification 3.6)
+MAX_CITATION_GRID_WINDOWS_PER_RUN = 500
+CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
 
 
 class PacingBudgetExceeded(RuntimeError):
@@ -220,7 +224,9 @@ class PakistanLawSitePipeline:
         self.job_id = job_id
         self.sleep = sleep
         self._session_lock: Optional[SessionLock] = None
-        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0}
+        self._surface_page: Optional[PageResult] = None
+        self._surface_page_start_row: Optional[int] = None
+        self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0}
 
     # ---------------------------------------------------------------- pacing (LOGIN_DELAY_*, PAGES_PER_*)
     async def _charge_page(self) -> None:
@@ -327,32 +333,563 @@ class PakistanLawSitePipeline:
             return "headnote", f"{signal.reason_code}:{signal.signal}"
         return "full_judgment", None
 
+    @staticmethod
+    def _has_queryable_search_fields(search_map: Dict[str, Any]) -> bool:
+        fields = search_map.get("fields") or {}
+        return any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no"))
+
+    @staticmethod
+    def _is_citation_grid_surface(page: PageResult) -> bool:
+        marker = str((page.metadata or {}).get("content_guard") or "")
+        if marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
+            return True
+        low = (page.html or "").lower()
+        return "id=\"archivedpatientgrid\"" in low or "id='archivedpatientgrid'" in low
+
+    @staticmethod
+    def _uses_compact_citation_grid_columns(page: PageResult) -> bool:
+        marker = str((page.metadata or {}).get("content_guard") or "")
+        return marker in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed")
+
+    @classmethod
+    def _is_citation_grid_map(cls, search_map: Dict[str, Any]) -> bool:
+        row_sel = str(((search_map.get("result_layout") or {}).get("row_selector") or "")).lower()
+        if "archivedpatientgrid" not in row_sel:
+            return False
+        return not cls._has_queryable_search_fields(search_map)
+
+    @staticmethod
+    def _with_compact_citation_grid_columns(search_map: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(search_map or {})
+        layout = dict(normalized.get("result_layout") or {})
+        columns = dict(layout.get("columns") or {})
+        columns["citation"] = 0
+        columns["title"] = 1
+        columns["court"] = 2
+        layout["columns"] = columns
+        normalized["result_layout"] = layout
+        return normalized
+
+    @staticmethod
+    def _is_reference_case_surface(page: PageResult) -> bool:
+        candidates = [
+            page.url or "",
+            str((page.metadata or {}).get("requested_url") or ""),
+            str((page.metadata or {}).get("final_url") or ""),
+        ]
+        return any(re.search(r"ReferenceCaseLawSearch", value, flags=re.IGNORECASE) for value in candidates)
+
+    @classmethod
+    def _classify_document_type(
+        cls,
+        *,
+        page: PageResult,
+        selected_text: str,
+        modal_text: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        if cls._is_reference_case_surface(page):
+            selector_found = bool((page.metadata or {}).get("case_description_selector_found"))
+            if not selector_found:
+                return "headnote", "case_description_selector_missing"
+            if not (modal_text or "").strip():
+                return "headnote", "case_description_modal_empty"
+        signal = detect_headnotes_only(raw_text=selected_text, raw_html=page.html)
+        if signal is not None:
+            return "headnote", f"{signal.reason_code}:{signal.signal}"
+        return "full_judgment", None
+
     # ---------------------------------------------------------------- search map
-    async def ensure_search_map(self) -> Dict[str, Any]:
-        """Specification 3.3: reuse the active, non-stale SearchFormMap; otherwise render
-        PLS_SEARCH_URL (a block/login/verification verdict stops here) and introspect the form."""
-        m = await active_map(self.db, SOURCE_NAME)
-        if m is not None and not m.stale:
-            return map_as_dict(m)
+    async def ensure_search_map(self, *, archived_grid_start_row: int = 0) -> Dict[str, Any]:
+        """Render the search surface once and map it. The rendered page is kept so the first
+        citation-grid window can reuse it instead of loading the 10-16 MB CitationSearch DOM twice."""
+        start_row = max(0, int(archived_grid_start_row or 0))
 
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(settings.PLS_SEARCH_URL)
+            page = await browser.goto(settings.PLS_SEARCH_URL, archived_grid_start_row=start_row)
             raise_for_verdict(page)
             return page
 
         page = await self.runner.run(op)
+        self._surface_page = page
+        self._surface_page_start_row = start_row
+        m = await active_map(self.db, SOURCE_NAME)
+        grid_surface = self._is_citation_grid_surface(page)
+        if m is not None and (not m.stale or grid_surface):
+            cached = map_as_dict(m)
+            if grid_surface:
+                if self._is_citation_grid_map(cached):
+                    if m.stale:
+                        # Empty or bounced windows are not the map's fault: the grid is the surface.
+                        m.stale = False
+                        m.consecutive_parse_failures = 0
+                        await self.db.flush()
+                        logger.info("PakistanLawSite grid map v%s revived: the citation grid is still the surface", m.map_version)
+                    if self._uses_compact_citation_grid_columns(page):
+                        return self._with_compact_citation_grid_columns(cached)
+                    return cached
+                logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
+            elif self._has_queryable_search_fields(cached):
+                return cached
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine)
-        # A stale map is a page-shape failure, not a terminal frontier outcome.  Once a
-        # fresh map is saved, retry the rows that were paused for remapping.
         await self.db.execute(
             update(CrawlFrontier)
             .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status == "stale")
             .values(status="pending", last_error=None)
         )
         await self.db.flush()
-        return map_as_dict(m)
 
-    # ---------------------------------------------------------------- one result page
+        mapped = map_as_dict(m)
+        if grid_surface and self._has_queryable_search_fields(mapped):
+            # The full CitationSearch DOM (a failed compact snapshot returns it) carries the filter
+            # form beside the grid; mapping those inputs would flip the connector into form mode
+            # and every later job would type into fields that mean nothing (23 Sep 2026, map v28).
+            m.fields = {}
+            layout = dict(m.result_layout or {})
+            layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
+            m.result_layout = layout
+            await self.db.flush()
+            logger.info("PakistanLawSite map v%s reduced to the citation grid: the surface is the grid, not a form", m.map_version)
+            mapped = map_as_dict(m)
+        return mapped
+
+    def _citation_grid_limits(self) -> Dict[str, int]:
+        max_detail = max(1, int(settings.PLS_CITATION_GRID_MAX_DETAIL))
+        scan_window = max(max_detail, int(settings.PLS_CITATION_GRID_SCAN_WINDOW))
+        run_minutes = max(0, int(settings.PLS_RUN_MAX_MINUTES))
+        return {"max_detail": max_detail, "scan_window": scan_window, "run_minutes": run_minutes}
+
+
+    def _citation_grid_cursor(self) -> tuple[str, Dict[str, Any], int]:
+        cfg = dict(self.source.config_json or {})
+        cursor_key = "citation_grid_cursor"
+        cursor = dict(cfg.get(cursor_key) or {})
+        try:
+            row_offset = int(cursor.get("row_offset", 0) or 0)
+        except Exception:
+            row_offset = 0
+        return cursor_key, cursor, max(0, row_offset)
+
+
+    async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
+        """CitationSearch is an authenticated citation table, not a form: walk it window by window.
+
+        One window = one compact snapshot of up to PLS_ARCHIVED_GRID_MAX_ROWS rows at the cursor,
+        then detail fetches for the rows not yet in the corpus. In backfill mode the loop keeps
+        taking consecutive windows for BACKFILL_PLS_RUN_MAX_MINUTES so the session is busy for the
+        whole job instead of stopping after one window and idling until the next Beat kick. Every
+        row's progress is committed as it happens, so a worker restart resumes at the same row."""
+        limits = self._citation_grid_limits()
+        deadline = time.monotonic() + limits["run_minutes"] * 60 if limits["run_minutes"] > 0 else None
+        self.stats["surface_mode"] = "citation_grid"
+        self.stats["citation_grid_run_minutes"] = limits["run_minutes"]
+        windows = 0
+        while True:
+            outcome = await self._run_citation_grid_window(search_map, limits)
+            windows += 1
+            self.stats["citation_grid_windows"] = windows
+            await self._persist_live_session()
+            if deadline is None:
+                break
+            if outcome["rows"] == 0:
+                logger.info("PakistanLawSite citation-grid window returned no rows; ending the run")
+                break
+            if outcome["wrapped"]:
+                logger.info("PakistanLawSite citation-grid cursor wrapped around the grid; ending the run")
+                break
+            if outcome["cursor_unconfirmed"]:
+                # The site could not be asked for the requested row: do not spend the whole budget
+                # re-reading the first window again and again.
+                break
+            if time.monotonic() >= deadline:
+                logger.info("PakistanLawSite citation-grid run budget of %s minutes spent after %s windows", limits["run_minutes"], windows)
+                break
+            if windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
+                break
+
+    async def _run_citation_grid_window(self, search_map: Dict[str, Any], limits: Dict[str, int]) -> Dict[str, Any]:
+        await self._charge_page()
+        cursor_key, cursor, row_offset = self._citation_grid_cursor()
+        max_detail = limits["max_detail"]
+        scan_window = limits["scan_window"]
+        result: Dict[str, Any] = {"rows": 0, "processed": 0, "start_offset": row_offset, "next_offset": row_offset, "wrapped": False, "cursor_unconfirmed": False}
+
+        # Reuse the page ensure_search_map() already rendered when it was asked for this exact row.
+        page: Optional[PageResult] = None
+        if self._surface_page is not None and self._surface_page_start_row == row_offset:
+            page = self._surface_page
+        self._surface_page = None
+        self._surface_page_start_row = None
+        if page is None:
+
+            async def op(browser: Browser) -> PageResult:
+                loaded = await browser.goto(settings.PLS_SEARCH_URL, archived_grid_start_row=row_offset)
+                raise_for_verdict(loaded)
+                return loaded
+
+            page = await self.runner.run(op)
+        extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
+        outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
+        rows = outcome.data.get("result_rows") or []
+        m = await active_map(self.db, SOURCE_NAME)
+        if m is not None and rows:
+            # A window with rows proves the grid map; an empty window (a bounce, the end of the
+            # grid) says nothing about it and must not mark it stale.
+            await record_parse_result(self.db, m, ok=True, source_name=SOURCE_NAME)
+        self.stats["queries"] += 1
+        self.stats["pages"] += 1
+        self.stats["rows"] += len(rows)
+        if not rows:
+            self.stats["misses"] += 1
+            return result
+        row_count = len(rows)
+        result["rows"] = row_count
+        total_rows_meta = (page.metadata or {}).get("total_rows")
+        try:
+            total_rows = int(total_rows_meta) if total_rows_meta is not None else None
+        except Exception:
+            total_rows = None
+        if total_rows is None:
+            try:
+                total_rows = int(cursor.get("last_total_rows"))
+            except Exception:
+                total_rows = None
+        if total_rows is None or total_rows <= 0:
+            total_rows = row_count
+        if row_offset >= total_rows:
+            row_offset = row_offset % total_rows
+        start_row_meta = (page.metadata or {}).get("start_row")
+        seek_mode = str((page.metadata or {}).get("seek_mode") or "").strip().lower()
+        try:
+            snapshot_start_row = int(start_row_meta) if start_row_meta is not None else 0
+        except Exception:
+            snapshot_start_row = 0
+        snapshot_start_row = max(0, snapshot_start_row)
+        self.stats["citation_grid_seek_mode"] = seek_mode or "none"
+        if seek_mode not in CONFIRMED_CITATION_GRID_SEEK_MODES and snapshot_start_row > 0:
+            logger.warning(
+                "PakistanLawSite citation-grid snapshot reported start_row=%s for seek_mode=%s; normalizing to 0",
+                snapshot_start_row,
+                seek_mode,
+            )
+            snapshot_start_row = 0
+        window_contains_offset = snapshot_start_row <= row_offset < snapshot_start_row + row_count
+        seek_confirmed = seek_mode in CONFIRMED_CITATION_GRID_SEEK_MODES
+        if row_offset > 0 and (not seek_confirmed or not window_contains_offset):
+            logger.error(
+                "PakistanLawSite citation-grid seek failed; refusing to harvest from row 0 or move cursor "
+                "row_offset=%s snapshot_start=%s rows=%s seek_mode=%s",
+                row_offset,
+                snapshot_start_row,
+                row_count,
+                seek_mode or "none",
+            )
+            self.stats["citation_grid_seek_failed"] = True
+            self.stats["citation_grid_offset"] = row_offset
+            self.stats["citation_grid_snapshot_start"] = snapshot_start_row
+            self.stats["citation_grid_rows_seen"] = row_count
+            return result
+        start_offset = row_offset
+        start_in_window = row_offset - snapshot_start_row
+        remaining_rows_in_window = max(0, row_count - start_in_window)
+        remaining_rows_total = max(0, total_rows - start_offset)
+        take_cap = min(scan_window, row_count)
+        take_count = min(take_cap, remaining_rows_in_window, remaining_rows_total)
+        cfg = dict(self.source.config_json or {})
+        raw_flush_every = cfg.get("citation_grid_flush_every", getattr(settings, "PLS_CITATION_GRID_FLUSH_EVERY", 1))
+        try:
+            flush_every = int(raw_flush_every or 1)
+        except Exception:
+            flush_every = 1
+        flush_every = max(1, flush_every)
+        selected_indexes = [start_in_window + i for i in range(take_count)]
+        self.stats["citation_grid_scan_window"] = scan_window
+        self.stats["citation_grid_detail_cap"] = max_detail
+        lookup_keys = set()
+        for idx in selected_indexes:
+            raw = str(rows[idx].get("citation") or "").strip()
+            if not raw:
+                continue
+            lookup_keys.add(raw)
+            normalized = normalise_citation(raw)
+            if normalized:
+                lookup_keys.add(normalized)
+        known_citations: set[str] = set()
+        full_ready_citations: set[str] = set()
+        staged_citations: set[str] = set()
+        if lookup_keys:
+            existing_judgments = (
+                await self.db.execute(
+                    select(Judgment.canonical_citation, Judgment.full_text, Judgment.judge_names).where(
+                        Judgment.canonical_citation.in_(list(lookup_keys))
+                    )
+                )
+            ).all()
+            for canonical, full_text, judge_names in existing_judgments:
+                key = str(canonical)
+                known_citations.add(key)
+                if judgment_is_full_ready(full_text, judge_names):
+                    full_ready_citations.add(key)
+            existing_citations = (
+                await self.db.execute(
+                    select(Citation.citation_string, Judgment.full_text, Judgment.judge_names)
+                    .join(Judgment, Judgment.id == Citation.judgment_id)
+                    .where(Citation.citation_string.in_(list(lookup_keys)))
+                )
+            ).all()
+            for citation_string, full_text, judge_names in existing_citations:
+                key = str(citation_string)
+                known_citations.add(key)
+                if judgment_is_full_ready(full_text, judge_names):
+                    full_ready_citations.add(key)
+            if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
+                # Pages already preserved and staged (waiting for promotion, promoted, duplicate or
+                # quarantined for review) are not downloaded again when the cursor wraps.
+                staged_rows = (
+                    await self.db.execute(
+                        select(ScraperStaging.extracted_citation).where(
+                            ScraperStaging.source_name == SOURCE_NAME,
+                            ScraperStaging.extracted_citation.in_(list(lookup_keys)),
+                            ScraperStaging.status.in_(["extracted", "promoted", "duplicate", "quarantined"]),
+                        )
+                    )
+                ).all()
+                for (citation_string,) in staged_rows:
+                    if citation_string:
+                        staged_citations.add(str(citation_string))
+        logger.info(
+            "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s staged=%s seek_mode=%s",
+            start_offset,
+            start_in_window,
+            take_count,
+            row_count,
+            total_rows,
+            max_detail,
+            scan_window,
+            flush_every,
+            len(full_ready_citations),
+            len(staged_citations),
+            seek_mode or "none",
+        )
+        staged_before = self.stats["staged"]
+        duplicates_before = self.stats["duplicates"]
+        url_less_skips = 0
+        known_citation_skips = 0
+        staged_citation_skips = 0
+        detail_attempts = 0
+        processed_rows_total = 0
+        self.stats.setdefault("citation_grid_offset", start_offset)
+        self.stats["citation_grid_window_offset"] = start_offset
+        self.stats["citation_grid_snapshot_start"] = snapshot_start_row
+        self.stats["citation_grid_rows_seen"] = row_count
+        details_since_flush = 0
+        staged_since_flush = 0
+        last_committed_offset = start_offset
+
+        def next_offset_after(processed_rows: int) -> int:
+            if total_rows <= 0:
+                return start_offset + processed_rows
+            absolute = start_offset + processed_rows
+            if absolute >= total_rows:
+                return absolute % total_rows
+            return absolute
+
+        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
+            nonlocal last_committed_offset
+            try:
+                offset_before = int(cursor.get("row_offset", last_committed_offset) or 0)
+            except Exception:
+                offset_before = last_committed_offset
+            cursor.update(
+                {
+                    "row_offset": next_offset,
+                    "last_start_offset": start_offset,
+                    "last_take_count": processed_rows,
+                    "last_rows_seen": row_count,
+                    "last_total_rows": total_rows,
+                    "last_snapshot_start_row": snapshot_start_row,
+                    "last_seek_mode": seek_mode or "none",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            if total_rows > 0 and next_offset < start_offset:
+                cursor["wrapped_at"] = cursor["updated_at"]
+                cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
+            patch = {cursor_key: cursor}
+            if True:
+                patch["citation_grid_cursor"] = cursor
+            # Atomic top-level merge: the other shard's cursor and counters are never overwritten.
+            await merge_source_config(self.db, self.source, patch)
+            self.stats["citation_grid_next_offset"] = next_offset
+            self.stats["known_citation_skips"] = known_citation_skips
+            self.stats["staged_citation_skips"] = staged_citation_skips
+            await self._heartbeat_job()
+            await self.db.flush()
+            await self.db.commit()
+            logger.info(
+                "PakistanLawSite citation-grid flush offset_before=%s offset_after=%s staged_this_flush=%s details_this_flush=%s processed_rows=%s",
+                offset_before,
+                next_offset,
+                staged_this_flush,
+                details_this_flush,
+                processed_rows,
+            )
+            last_committed_offset = next_offset
+
+        for idx, row_idx in enumerate(selected_indexes):
+            row = rows[row_idx]
+            processed_rows_total = idx + 1
+            citation_key = (row.get("citation") or "").strip()
+            citation_norm = normalise_citation(citation_key) if citation_key else ""
+            is_full_ready = (citation_norm and citation_norm in full_ready_citations) or (
+                citation_key and citation_key in full_ready_citations
+            )
+            is_known = (citation_norm and citation_norm in known_citations) or (
+                citation_key and citation_key in known_citations
+            )
+            is_staged = (citation_norm and citation_norm in staged_citations) or (
+                citation_key and citation_key in staged_citations
+            )
+            if is_full_ready or is_staged:
+                if is_full_ready:
+                    known_citation_skips += 1
+                    self.stats["known_citation_skips"] = known_citation_skips
+                else:
+                    staged_citation_skips += 1
+                    self.stats["staged_citation_skips"] = staged_citation_skips
+                    self.stats["duplicates"] += 1
+                if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
+                    next_offset = next_offset_after(idx + 1)
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx + 1,
+                    )
+                    details_since_flush = 0
+                    staged_since_flush = 0
+                continue
+            if is_known:
+                self.stats["incomplete_citation_refetch"] = self.stats.get("incomplete_citation_refetch", 0) + 1
+            if detail_attempts >= max_detail:
+                processed_rows_total = idx
+                next_offset = next_offset_after(idx)
+                if idx > 0:
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx,
+                    )
+                logger.info(
+                    "PakistanLawSite citation-grid detail cap reached attempts=%s max_detail=%s processed_rows=%s known_skips=%s",
+                    detail_attempts,
+                    max_detail,
+                    idx,
+                    known_citation_skips,
+                )
+                break
+            detail_url = row.get("detail_url") or row.get("pdf_url")
+            if not detail_url:
+                url_less_skips += 1
+                self.stats["url_less_skips"] += 1
+                logger.warning(
+                    "PakistanLawSite citation-grid row missing detail URL; skipping row_index=%s citation=%r title=%r",
+                    row_idx,
+                    row.get("citation"),
+                    row.get("title"),
+                )
+                if (idx + 1) == len(selected_indexes):
+                    next_offset = next_offset_after(idx + 1)
+                    await flush_citation_grid_progress(
+                        next_offset,
+                        staged_this_flush=staged_since_flush,
+                        details_this_flush=details_since_flush,
+                        processed_rows=idx + 1,
+                    )
+                    details_since_flush = 0
+                    staged_since_flush = 0
+                continue
+            if idx == 0 or (idx + 1) % 5 == 0 or (idx + 1) == len(selected_indexes):
+                logger.info(
+                    "PakistanLawSite citation-grid detail progress %s/%s staged=%s duplicates=%s known_skips=%s",
+                    idx + 1,
+                    len(selected_indexes),
+                    self.stats["staged"] - staged_before,
+                    self.stats["duplicates"] - duplicates_before,
+                    known_citation_skips,
+                )
+            route = {
+                "tier": "citation_grid",
+                "query": {"surface": "archivedpatientGrid"},
+                "cursor": {
+                    "row_index": row_idx,
+                    "absolute_row_index": snapshot_start_row + row_idx,
+                },
+                "row_index": row_idx,
+                "absolute_row_index": snapshot_start_row + row_idx,
+                "slot": self.runner.browser.slot_number if self.runner.browser else None,
+            }
+            detail = await self.fetch_detail(detail_url)
+            detail_attempts += 1
+            result_kind = await self.preserve_and_extract(detail, route, row)
+            details_since_flush += 1
+            if result_kind == "staged":
+                staged_since_flush += 1
+            if details_since_flush >= flush_every or (idx + 1) == len(selected_indexes):
+                next_offset = next_offset_after(idx + 1)
+                await flush_citation_grid_progress(
+                    next_offset,
+                    staged_this_flush=staged_since_flush,
+                    details_this_flush=details_since_flush,
+                    processed_rows=idx + 1,
+                )
+                details_since_flush = 0
+                staged_since_flush = 0
+        if url_less_skips:
+            logger.warning(
+                "PakistanLawSite citation-grid skipped %s/%s rows with no detail URL",
+                url_less_skips,
+                len(selected_indexes),
+            )
+        if known_citation_skips or staged_citation_skips:
+            logger.info(
+                "PakistanLawSite citation-grid fast-forwarded %s known full citations and %s already-staged citations out of %s rows",
+                known_citation_skips,
+                staged_citation_skips,
+                len(selected_indexes),
+            )
+        staged_delta = self.stats["staged"] - staged_before
+        if selected_indexes and staged_delta == 0:
+            duplicate_delta = self.stats["duplicates"] - duplicates_before
+            logger.warning(
+                "PakistanLawSite citation-grid produced rows but staged=0 (rows=%s duplicates=%s url_less_skips=%s known_skips=%s)",
+                processed_rows_total or len(selected_indexes),
+                duplicate_delta,
+                url_less_skips,
+                known_citation_skips,
+            )
+            if processed_rows_total and url_less_skips >= processed_rows_total and known_citation_skips == 0:
+                raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
+        next_offset = next_offset_after(processed_rows_total)
+        if last_committed_offset != next_offset:
+            await flush_citation_grid_progress(
+                next_offset,
+                staged_this_flush=0,
+                details_this_flush=0,
+                processed_rows=processed_rows_total,
+            )
+        wrapped = bool(total_rows > 0 and next_offset < start_offset)
+        result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped})
+        logger.info(
+            "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",
+            start_offset,
+            next_offset,
+            wrapped,
+        )
+        return result
+
+    # ---------------------------------------------------------------- search map
+        # ---------------------------------------------------------------- one result page
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         async def op(browser: Browser) -> PageResult:
             await browser.goto(settings.PLS_SEARCH_URL)
@@ -629,8 +1166,16 @@ class PakistanLawSitePipeline:
                 self.stats["paused"] = True
                 return self.stats
             self.stats["slot"] = slot.slot_number
+            row_offset = int((dict(self.source.config_json or {}).get("citation_grid_cursor") or {}).get("row_offset", 0) or 0)
+            search_map = await self.ensure_search_map(archived_grid_start_row=row_offset)
+            if self._is_citation_grid_map(search_map):
+                logger.info("PakistanLawSite using citation-grid surface mode (archivedpatientGrid)")
+                await self.run_citation_grid_surface(search_map)
+                self.source.last_scraped_at = datetime.now(timezone.utc)
+                self.source.last_success_at = self.source.last_scraped_at
+                await self.db.flush()
+                return self.stats
             await seed_frontier(self.db, self.source)
-            search_map = await self.ensure_search_map()
             now = datetime.now(timezone.utc)
             q = (
                 select(CrawlFrontier)
