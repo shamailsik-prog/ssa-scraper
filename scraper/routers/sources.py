@@ -358,10 +358,12 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
     now = datetime.now(timezone.utc)
     if body.action == "pause":
         s.state, s.state_reason = "PAUSED", body.reason or "paused by admin"
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": True}
     elif body.action == "resume":
         if s.state == "HALTED":
             raise HTTPException(409, "a HALTED source needs re_enable with reviewed_by")
         s.state, s.state_reason = "ACTIVE", None
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": False}
     elif body.action == "retry_now":
         if s.state == "HALTED" and not body.reviewed_by:
             raise HTTPException(422, "retry_now on HALTED sources requires reviewed_by")
@@ -371,6 +373,7 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
         s.next_scrape_at = now
         cfg = dict(s.config_json or {})
         cfg.pop("block_retry", None)
+        cfg["paused_by_admin"] = False
         s.config_json = cfg
         for sl in (
             await db.execute(
@@ -387,6 +390,7 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
         if not body.reviewed_by:
             raise HTTPException(422, "re_enable requires reviewed_by (admin review of the block)")
         s.state, s.state_reason, s.requires_admin_review = "ACTIVE", f"re-enabled by {body.reviewed_by}: {body.reason or ''}", False
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": False}
         for sl in (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == s.source_name, BrowserSessionSlot.state == "HALTED"))).scalars().all():
             sl.state, sl.state_reason = "NEEDS_HUMAN_LOGIN", "re-enabled after block review; fresh human login required"
     elif body.action == "clear_block_retry":
@@ -402,6 +406,7 @@ async def change_state(name: str, body: StateChange, db: AsyncSession = Depends(
         s.state_reason = body.reason or "enabled by admin"
         s.requires_admin_review = False
         s.next_scrape_at = now
+        s.config_json = {**(s.config_json or {}), "paused_by_admin": False}
     else:
         raise HTTPException(422, "action must be pause|resume|retry_now|re_enable|clear_block_retry|disable|enable")
     s.state_changed_at = now

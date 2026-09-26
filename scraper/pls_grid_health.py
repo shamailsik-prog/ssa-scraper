@@ -88,6 +88,8 @@ def grid_harvest_incomplete(cfg: Dict[str, Any]) -> bool:
 def pls_zero_query_grid_failure(stats: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
     if stats.get("skipped") or stats.get("paused") or stats.get("halted") or stats.get("pacing_paused"):
         return None
+    if stats.get("citation_grid_seek_failed"):
+        return "citation-grid seek failed; cursor was not advanced"
     if stats.get("surface_mode") != "citation_grid":
         return None
     queries = int(stats.get("queries") or 0)

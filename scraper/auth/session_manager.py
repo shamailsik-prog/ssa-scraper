@@ -159,22 +159,28 @@ class SessionLock:
 
     async def acquire(self) -> None:
         r = await self._client()
-        if await r.get(self.exclusive_key) and self.max_holders > 1:
-            raise SessionLockHeld(f"login-session lock {self.exclusive_key} is held by another worker")
-        if self.max_holders == 1:
-            shared = int(await r.scard(f"{self.exclusive_key}:holders") or 0)
-            if shared > 0:
-                raise SessionLockHeld(f"login-session lock {self.exclusive_key}:holders is held by another worker")
-            ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
-        else:
-            ok = await r.eval(
-                "if redis.call('scard', KEYS[1]) < tonumber(ARGV[2]) then redis.call('sadd', KEYS[1], ARGV[1]); redis.call('expire', KEYS[1], ARGV[3]); return 1 else return 0 end",
-                1,
-                self.key,
-                self._token,
-                str(self.max_holders),
-                str(LOCK_TTL_SECONDS),
-            )
+        shared_key = f"{self.exclusive_key}:holders"
+        # The exclusive and shared forms protect the same login. Check and acquire both keys in
+        # one script so a recovery browser cannot overlap a dual-shard harvest browser.
+        ok = await r.eval(
+            """
+            if tonumber(ARGV[2]) == 1 then
+                if redis.call('exists', KEYS[1]) == 1 or redis.call('scard', KEYS[2]) > 0 then return 0 end
+                return redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3]) and 1 or 0
+            end
+            if redis.call('exists', KEYS[1]) == 1 then return 0 end
+            if redis.call('scard', KEYS[2]) >= tonumber(ARGV[2]) then return 0 end
+            redis.call('sadd', KEYS[2], ARGV[1])
+            redis.call('expire', KEYS[2], ARGV[3])
+            return 1
+            """,
+            2,
+            self.exclusive_key,
+            shared_key,
+            self._token,
+            str(self.max_holders),
+            str(LOCK_TTL_SECONDS),
+        )
         if not ok:
             raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
         self._held = True
@@ -318,7 +324,7 @@ class SessionManager:
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
-        await self._resume_source_if_paused()
+        await self._resume_source_if_paused(respect_admin=by in ("auto-recovery", "recovery"))
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active (login by {by})", source_name=self.source.source_name)
         return s
@@ -754,7 +760,9 @@ class PlaywrightBrowser:
                         headers,
                         rows,
                         next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
-                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
+                        // Do not read document.body.innerText here: it forces layout of the entire
+                        // CitationSearch grid regardless of the compact row window.
+                        body_preview: '',
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
                         total_rows: resolvedTotalRows,
                         requested_start_row: requestedStartRow,
@@ -983,6 +991,10 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
+        try:
+            self._assert_url_policy(self._page.url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
         html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
         if capture_case_description_modal:
             try:
@@ -1060,8 +1072,14 @@ class PlaywrightBrowser:
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(self._context.request.get(url))
+        try:
+            self._assert_url_policy(resp.url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
         if resp.status >= 400:
-            raise BrowserDisconnected(f"download HTTP {resp.status}") if resp.status >= 500 else ExplicitBlock("block", f"HTTP {resp.status} on download")
+            if resp.status >= 500:
+                raise BrowserDisconnected(f"download HTTP {resp.status}")
+            raise RuntimeError(f"download HTTP {resp.status}")
         return await self._wrap(resp.body())
 
     async def storage_state(self) -> Dict[str, Any]:

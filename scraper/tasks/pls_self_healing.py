@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 from celery import shared_task
 from sqlalchemy import select, update
 
-from scraper.auth.session_manager import SessionManager, merge_source_config
+from scraper.auth.session_manager import SessionLock, SessionLockHeld, SessionManager, merge_source_config
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.models import BrowserSessionSlot, CrawlFrontier, ScraperSource
@@ -46,7 +46,16 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
         slots = await manager.slots()
         for slot in slots:
             if slot.state == "ACTIVE":
-                check = await verify_stored_session(manager, slot, playwright_browser_factory)
+                lock = SessionLock(source.source_name)
+                try:
+                    await lock.acquire()
+                except SessionLockHeld:
+                    outcomes["probed"].append({"slot": slot.slot_number, "skipped": "login_session_lock_held"})
+                    continue
+                try:
+                    check = await verify_stored_session(manager, slot, playwright_browser_factory)
+                finally:
+                    await lock.release()
                 alive = bool(check.get("alive"))
                 outcomes["probed"].append({"slot": slot.slot_number, "alive": alive, "verdict": check.get("verdict")})
                 if alive:
@@ -99,7 +108,18 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
             manager = SessionManager(db, source)
             for slot in await manager.slots():
                 if slot.state == "ACTIVE":
-                    check = await verify_stored_session(manager, slot, playwright_browser_factory)
+                    lock = SessionLock(source.source_name)
+                    try:
+                        await lock.acquire()
+                    except SessionLockHeld:
+                        watch.setdefault("recovery", []).append(
+                            {"slot": slot.slot_number, "skipped": "login_session_lock_held"}
+                        )
+                        continue
+                    try:
+                        check = await verify_stored_session(manager, slot, playwright_browser_factory)
+                    finally:
+                        await lock.release()
                     if not check.get("alive"):
                         await manager.mark_needs_human_login(slot.slot_number, "stall watchdog probe failed")
                 rec = await recover_slot(db, manager, slot)

@@ -648,6 +648,7 @@ class PakistanLawSitePipeline:
             self.stats["citation_grid_offset"] = row_offset
             self.stats["citation_grid_snapshot_start"] = snapshot_start_row
             self.stats["citation_grid_rows_seen"] = row_count
+            result["cursor_unconfirmed"] = True
             return result
         start_offset = row_offset
         start_in_window = row_offset - snapshot_start_row
