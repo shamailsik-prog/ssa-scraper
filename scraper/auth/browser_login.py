@@ -323,10 +323,12 @@ class LoginSession:
                 // The box below the password ("I Agree with the Terms and Conditions") and any
                 // other box the form offers: tick every one that is still unticked.
                 const scope = (pass && pass.form) || (user && user.form) || document;
+                const boxes = Array.from(scope.querySelectorAll("input[type='checkbox']"));
                 let checked = 0;
-                for (const box of scope.querySelectorAll("input[type='checkbox']")) {
+                for (const box of boxes) {
                   if (!box.checked) { box.checked = true; fire(box); checked += 1; }
                 }
+                const still_unchecked = boxes.filter((box) => !box.checked).length;
                 let submitted = false;
                 if (autoComplete && user && pass) {
                   const submit = pick([
@@ -343,7 +345,9 @@ class LoginSession:
                   username_field_found: !!user,
                   password_field_found: !!pass,
                   checked_boxes: checked,
-                  checked_terms: checked > 0
+                  checkbox_count: boxes.length,
+                  all_checkboxes_checked: still_unchecked === 0,
+                  checked_terms: boxes.length === 0 || still_unchecked === 0
                 };
               }""",
             {"username": username, "password": password, "autoComplete": auto_complete},

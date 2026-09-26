@@ -2254,6 +2254,56 @@ async def _nosleep(_s):
     return None
 
 
+async def test_citation_grid_login_surface_triggers_relogin_and_one_retry(db, login_source, monkeypatch):
+    """A mid-harvest LoginRequired must not end the job as a quiet success; recover once and retry."""
+    from scraper.auth.session_manager import LoginRequired
+
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "PLS_CITATION_GRID_MAX_DETAIL", 2)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 0)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 0, "last_total_rows": 100},
+    }
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 801", "Case 801", "Supreme Court", "https://www.pakistanlawsite.com/case/801"),
+        ("PLD 2024 SC 802", "Case 802", "Supreme Court", "https://www.pakistanlawsite.com/case/802"),
+    ]
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = lambda browser: _archived_grid_seek_result(rows, browser)
+    for citation, title, _court, detail_url in rows:
+        sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    original_fetch = pipeline.fetch_detail
+    login_bounces = {"n": 0}
+
+    async def fetch_with_one_login_bounce(url):
+        login_bounces["n"] += 1
+        if login_bounces["n"] == 1:
+            raise LoginRequired("login surface URL (landed on https://www.pakistanlawsite.com/Login/MainPage)")
+        return await original_fetch(url)
+
+    pipeline.fetch_detail = fetch_with_one_login_bounce
+    recovery_calls = {"n": 0}
+
+    async def fake_recover(_exc):
+        recovery_calls["n"] += 1
+        return True
+
+    pipeline._recover_slot_after_login_loss = fake_recover
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    assert recovery_calls["n"] == 1
+    assert stats.get("login_recovery_retries") == 1
+    assert stats.get("staged", 0) >= 1
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset", 0) >= 0
+
+
 async def test_lock_release_never_deletes_another_workers_lock():
     """Release is a compare-and-delete: a lock that expired and was taken by another worker in the
     meantime must survive the first worker's release."""

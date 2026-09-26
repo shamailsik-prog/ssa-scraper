@@ -197,6 +197,14 @@ async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, 
             "detail": "sign-in form not recognised; nothing submitted",
             "landed": safe_url_for_record(state.get("url") or ""),
         }
+    checkbox_count = int(autofill.get("checkbox_count") or 0)
+    if checkbox_count > 0 and not autofill.get("all_checkboxes_checked"):
+        return {
+            "stored": False,
+            "verdict": "login",
+            "detail": "terms/agree checkbox could not be ticked before sign-in",
+            "landed": safe_url_for_record(getattr(sess, "last_url", None) or ""),
+        }
     settle = getattr(sess, "settle", None)
     if callable(settle):
         await settle()  # the submitted form's navigation reaches the page the site answered with
@@ -209,6 +217,11 @@ async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, 
         return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}
     if not check.get("authenticated"):
         detail = f"site refused the sign-in: {refused}" if refused else check.get("detail")
+        if refused == "terms not accepted":
+            detail = "site refused the sign-in: terms not accepted (agree checkbox)"
+        url_low = (check.get("url") or "").lower()
+        if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
+            detail = detail or "still on the public login page after sign-in"
         return {"stored": False, "verdict": check.get("verdict", "login"), "detail": detail, "landed": landed}
     result = await registry.complete(source_name, manager)
     return {"stored": bool(result.get("stored")), "verdict": result.get("verdict", "ok"), "detail": result.get("detail"), "landed": landed}
