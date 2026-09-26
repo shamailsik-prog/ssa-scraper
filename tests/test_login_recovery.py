@@ -286,6 +286,7 @@ async def test_unattended_sign_in_end_to_end_with_real_browser(db, login_source,
     fixture_server.add("/Login/Login", "<html><body>signed in</body></html>")
     # The authenticated page sets the session cookie the slot must end up holding.
     fixture_server.add("/Login/CitationSearch", GRID_HTML.replace("<body>", "<body><script>document.cookie='ASP.NET_SessionId=e2e; path=/';</script>"))
+    fixture_server.add("/Login/Check", GRID_HTML)
     monkeypatch.setattr(settings, "PLS_LOGIN_URL", fixture_server.url("/"))
     base = fixture_server.url("").rstrip("/")
     monkeypatch.setattr(settings, "PLS_BASE_URL", base)

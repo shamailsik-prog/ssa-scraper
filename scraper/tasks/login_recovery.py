@@ -106,12 +106,22 @@ def _parse(value: Any) -> Optional[datetime]:
 
 
 def looks_authenticated(page) -> bool:
-    """Session is alive when /Login/Check shows a logout link and no login form."""
+    """Authenticated dashboard (/Login/Check) or a harvestable CitationSearch surface."""
+    from scraper.extractors.deterministic import introspect_search_form
     from scraper.pls_navigation import check_page_login_required_reason
 
-    if check_page_login_required_reason(page.html or "", page.url or ""):
+    url_low = (page.url or "").lower()
+    if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
         return False
-    return True
+    if "/login/check" in url_low:
+        return check_page_login_required_reason(page.html or "", page.url or "") is None
+    probe = introspect_search_form(page.html or "")
+    if probe.get("surface") in ("query_form", "grid_surface_no_query_form", "no_query_form"):
+        return True
+    low = (page.html or "").lower()
+    if "archivedpatientgrid" in low or "logout" in low or "log off" in low or "sign out" in low:
+        return True
+    return check_page_login_required_reason(page.html or "", page.url or "") is None
 
 
 async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlot, browser_factory: Callable) -> Dict[str, Any]:
