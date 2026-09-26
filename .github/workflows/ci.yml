@@ -51,6 +51,8 @@ jobs:
         run: python -m compileall -q scraper migrations
       - name: Forbidden-pattern scan (no stubs, no secrets, no bypass logic)
         run: bash scripts/guard_scan.sh
+      - name: Validate auto-deploy script
+        run: bash -n scripts/auto_deploy.sh
       - name: Tests against PostgreSQL + Redis
         run: pytest -q
       - name: Validate compose file
