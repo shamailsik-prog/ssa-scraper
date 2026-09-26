@@ -231,8 +231,13 @@ class LoginSession:
             current_path = path.rstrip("/")
             expected_match = current_path == expected_path or current_path.startswith(expected_path + "/")
 
-        search_surface = "citationsearch" in path or "id=\"searchform\"" in low or "id='searchform'" in low
-        positive_auth_signal = has_logout or search_surface
+        from scraper.extractors.deterministic import introspect_search_form
+
+        probe = introspect_search_form(html)
+        search_surface = probe.get("surface") == "query_form" or "id=\"searchform\"" in low or "id='searchform'" in low
+        positive_auth_signal = has_logout or search_surface or probe.get("surface") == "grid_surface_no_query_form"
+        if probe.get("surface") == "login_required":
+            positive_auth_signal = False
         blocked_by_login_surface = has_password or has_login_form or public_login_url
         ok = verdict.kind == "ok" and positive_auth_signal and not blocked_by_login_surface and expected_match
         return {

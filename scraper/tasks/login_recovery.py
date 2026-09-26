@@ -108,17 +108,20 @@ def _parse(value: Any) -> Optional[datetime]:
 def looks_authenticated(page) -> bool:
     """The search page rendered for this session: the citation grid is there, or the page offers a
     logout, and the URL is not the public login surface."""
+    from scraper.extractors.deterministic import introspect_search_form
+
     url_low = (page.url or "").lower()
     if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
         return False
+    probe = introspect_search_form(page.html or "")
+    if probe.get("surface") == "login_required":
+        return False
+    if probe.get("surface") == "query_form":
+        return True
     low = (page.html or "").lower()
     if "archivedpatientgrid" in low or "logout" in low or "log off" in low or "sign out" in low:
         return True
-    # The authenticated CitationSearch surface may carry neither a grid nor a logout link: the
-    # search page itself, reached without a password form, is the positive sign (same rule as the
-    # human login's Complete check).
-    has_password = 'type="password"' in low or "type='password'" in low
-    return ("citationsearch" in url_low or "searchform" in low) and not has_password
+    return False
 
 
 async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlot, browser_factory: Callable) -> Dict[str, Any]:

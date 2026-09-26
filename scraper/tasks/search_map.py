@@ -147,7 +147,12 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
             mapped_by = "deterministic+local_ai"
     verified = verify_selectors(html, proposal)
     record = build_map_record(verified, html, mapped_by)
-    grid_surface = record["limits"]["surface"] == "grid_surface_no_query_form"
+    surface = record["limits"]["surface"]
+    grid_surface = surface == "grid_surface_no_query_form"
+    no_query_surface = surface == "no_query_form"
+    login_required_surface = surface == "login_required"
+    field_count = len(record["fields"].get("_all") or [])
+    mark_stale = grid_surface or login_required_surface or (no_query_surface and field_count == 0)
     prev = await active_map(db, source.source_name)
     version = (prev.map_version + 1) if prev else 1
     if prev is not None:
@@ -165,8 +170,8 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
         mapped_by=mapped_by,
         verified_against_dom=True,
         is_active=True,
-        stale=grid_surface,
-        consecutive_parse_failures=settings.SEARCH_MAP_STALE_FAILURES if grid_surface else 0,
+        stale=mark_stale,
+        consecutive_parse_failures=settings.SEARCH_MAP_STALE_FAILURES if mark_stale else 0,
     )
     db.add(m)
     await db.flush()
@@ -176,6 +181,15 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
             level="error",
             code="SEARCH_MAP_GRID_SURFACE_STALE",
             message="CitationSearch grid-only surface captured; query form unavailable, map marked stale and remap required",
+            source_name=source.source_name,
+        )
+        return m
+    if login_required_surface or (no_query_surface and field_count == 0):
+        await notify(
+            db,
+            level="error",
+            code="SEARCH_MAP_NO_QUERY_FORM_STALE",
+            message="CitationSearch mapped with no query form and no harvestable fields; map marked stale and remap required",
             source_name=source.source_name,
         )
         return m
