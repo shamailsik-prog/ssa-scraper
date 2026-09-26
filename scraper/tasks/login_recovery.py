@@ -106,22 +106,12 @@ def _parse(value: Any) -> Optional[datetime]:
 
 
 def looks_authenticated(page) -> bool:
-    """The search page rendered for this session: the citation grid is there, or the page offers a
-    logout, and the URL is not the public login surface."""
-    from scraper.extractors.deterministic import introspect_search_form
+    """Session is alive when /Login/Check shows a logout link and no login form."""
+    from scraper.pls_navigation import check_page_login_required_reason
 
-    url_low = (page.url or "").lower()
-    if any(p in url_low for p in ("/login/mainpage", "/login/login", "/login/index")):
+    if check_page_login_required_reason(page.html or "", page.url or ""):
         return False
-    probe = introspect_search_form(page.html or "")
-    if probe.get("surface") == "login_required":
-        return False
-    if probe.get("surface") == "query_form":
-        return True
-    low = (page.html or "").lower()
-    if "archivedpatientgrid" in low or "logout" in low or "log off" in low or "sign out" in low:
-        return True
-    return False
+    return True
 
 
 async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlot, browser_factory: Callable) -> Dict[str, Any]:
@@ -131,7 +121,9 @@ async def verify_stored_session(manager: SessionManager, slot: BrowserSessionSlo
     browser = await browser_factory(state, slot.slot_number)
     renewed_state = None
     try:
-        page = await browser.goto(settings.PLS_SEARCH_URL)
+        from scraper.pls_navigation import pls_check_url
+
+        page = await browser.goto(pls_check_url())
         exporter = getattr(browser, "export_storage_state", None)
         if callable(exporter):
             try:
@@ -214,7 +206,9 @@ async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, 
     await asyncio.sleep(max(0.0, float(settings.LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS)))
     login_error = getattr(sess, "login_error", None)
     refused = await login_error() if callable(login_error) else None
-    check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
+    from scraper.pls_navigation import pls_check_url
+
+    check = await sess.is_authenticated_for(pls_check_url())
     landed = safe_url_for_record(check.get("url") or "")
     if check.get("verdict") in ("verification", "block"):
         return {"stored": False, "verdict": check.get("verdict"), "detail": check.get("detail"), "landed": landed}

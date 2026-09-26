@@ -89,8 +89,21 @@ def citation_search_hybrid_html() -> str:
 
 
 def citation_search_empty_session_shell_html() -> str:
-    """Broken CitationSearch render: logged-out or failed session with no chrome."""
-    return "<html><head><title></title></head><body></body></html>"
+    """Bare CitationSearch GET fragment (valid session; not a login bounce)."""
+    return "<html><head><title></title></head><body>No more result found on your search</body></html>"
+
+
+def pls_check_dashboard_html() -> str:
+    """Authenticated dashboard shell that loads citation search via AJAX."""
+    return """<html><head><title>Pakistan Law Site</title></head><body>
+    <a href="/logout">Logout</a>
+    <div id="rightmenu"></div>
+    <a href="/Login/GetStatuesSearch">Citation Search</a>
+    <table><tr><th>News</th></tr><tr><td>Update</td></tr></table>
+    <script>
+    $.ajax({url:'/Login/GetStatuesSearch', success:function(d){ $('#rightmenu').html(d);}});
+    </script>
+    </body></html>"""
 
 
 def citation_search_no_query_form_html() -> str:
@@ -264,6 +277,11 @@ class FakeBrowser:
     async def goto(self, url: str, **kwargs) -> PageResult:
         self.calls.append(("goto", url, self.slot_number, kwargs))
         return self.script.respond(("goto", url), self)
+
+    async def goto_citation_search(self, **kwargs) -> PageResult:
+        from scraper.pls_navigation import open_citation_search
+
+        return await open_citation_search(self, **kwargs)
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         key = ("search", tuple(sorted(values.items())))
