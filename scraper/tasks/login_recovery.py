@@ -203,7 +203,7 @@ async def _sign_in(registry, manager: SessionManager, slot: BrowserSessionSlot, 
             "stored": False,
             "verdict": "login",
             "detail": "terms/agree checkbox could not be ticked before sign-in",
-            "landed": safe_url_for_record(sess.last_url or ""),
+            "landed": safe_url_for_record(getattr(sess, "last_url", None) or ""),
         }
     settle = getattr(sess, "settle", None)
     if callable(settle):

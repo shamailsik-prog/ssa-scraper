@@ -149,6 +149,7 @@ class FakeLoginSession:
         self.started_by = "auto-recovery"
         self.status = "awaiting_human"
         self.last_autofill = {"applied": bool(saved_credentials), "submitted": bool(saved_credentials and auto_complete)}
+        self.last_url = settings.PLS_LOGIN_URL
         self.registry.log.append(("start", slot_number, dict(saved_credentials or {}), auto_complete))
 
     async def is_authenticated(self):
