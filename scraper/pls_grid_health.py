@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scraper.models import Judgment, ScraperSource
+from scraper.config import settings
+from scraper.models import Judgment, ScraperJob, ScraperSource
 
 SOURCE_NAME = "PakistanLawSite"
 
@@ -114,6 +115,43 @@ async def pls_judgment_counts(db: AsyncSession) -> Tuple[int, Dict[str, int]]:
 
 async def pls_last_judgment_at(db: AsyncSession) -> Optional[datetime]:
     return (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == SOURCE_NAME))).scalar()
+
+
+_PLS_LOCK_KEYS = (
+    "corpus:login_session_lock:PakistanLawSite",
+    "corpus:login_session_lock:PakistanLawSite:holders",
+    "corpus:login_session_lock:PakistanLawSite:slot1",
+    "corpus:login_session_lock:PakistanLawSite:slot2",
+)
+
+
+async def pls_harvest_in_progress(db: AsyncSession) -> Optional[str]:
+    """Return a short reason when a PLS harvest/login job holds the session lock or is running."""
+    import redis.asyncio as aioredis
+
+    try:
+        r = aioredis.from_url(settings.REDIS_URL)
+        try:
+            for key in _PLS_LOCK_KEYS:
+                if await r.exists(key):
+                    return f"redis:{key}"
+        finally:
+            await r.aclose()
+    except Exception:
+        pass
+    running = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(ScraperJob)
+                .where(ScraperJob.source_name == SOURCE_NAME, ScraperJob.status == "running")
+            )
+        ).scalar()
+        or 0
+    )
+    if running > 0:
+        return f"running_jobs:{running}"
+    return None
 
 
 async def pls_source_config(db: AsyncSession) -> Dict[str, Any]:
