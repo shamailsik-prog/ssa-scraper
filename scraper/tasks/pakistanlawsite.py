@@ -120,6 +120,22 @@ def pacing_key(slot_number: int) -> str:
     return f"pacing_slot_{int(slot_number or 0)}"
 
 
+def _aggregate_legacy_pacing(cfg: Dict[str, Any], *, hour_key: str, day_key: str) -> Dict[str, Any]:
+    """Sum per-slot pacing counters from an earlier release for the current hour/day only."""
+    hour_pages = 0
+    day_pages = 0
+    for name, value in cfg.items():
+        if not (isinstance(name, str) and name.startswith("pacing_slot_") and isinstance(value, dict)):
+            continue
+        if value.get("hour") == hour_key:
+            hour_pages += int(value.get("hour_pages", 0) or 0)
+        if value.get("day") == day_key:
+            day_pages += int(value.get("day_pages", 0) or 0)
+    if not hour_pages and not day_pages:
+        return {}
+    return {"hour": hour_key, "hour_pages": hour_pages, "day": day_key, "day_pages": day_pages}
+
+
 class PacingBudgetExceeded(RuntimeError):
     """PAGES_PER_HOUR / PAGES_PER_DAY spent; the run pauses and Beat resumes it later."""
 
