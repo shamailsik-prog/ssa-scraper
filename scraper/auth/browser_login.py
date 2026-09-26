@@ -232,11 +232,12 @@ class LoginSession:
             expected_match = current_path == expected_path or current_path.startswith(expected_path + "/")
 
         from scraper.extractors.deterministic import introspect_search_form
+        from scraper.pls_navigation import check_page_login_required_reason
 
         probe = introspect_search_form(html)
         search_surface = probe.get("surface") == "query_form" or "id=\"searchform\"" in low or "id='searchform'" in low
         positive_auth_signal = has_logout or search_surface or probe.get("surface") == "grid_surface_no_query_form"
-        if probe.get("surface") == "login_required":
+        if "/login/check" in path and check_page_login_required_reason(html, current_url):
             positive_auth_signal = False
         blocked_by_login_surface = has_password or has_login_form or public_login_url
         ok = verdict.kind == "ok" and positive_auth_signal and not blocked_by_login_surface and expected_match
@@ -472,7 +473,9 @@ class LoginSessionRegistry:
         if sess is None:
             raise LoginSessionError("no open login session")
         if source_name == "PakistanLawSite":
-            check = await sess.is_authenticated_for(settings.PLS_SEARCH_URL)
+            from scraper.pls_navigation import pls_check_url
+
+            check = await sess.is_authenticated_for(pls_check_url())
         else:
             check = await sess.is_authenticated()
         if not check["authenticated"]:

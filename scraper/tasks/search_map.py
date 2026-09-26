@@ -180,9 +180,8 @@ async def map_search_form(
     surface = record["limits"]["surface"]
     grid_surface = surface == "grid_surface_no_query_form"
     no_query_surface = surface == "no_query_form"
-    login_required_surface = surface == "login_required"
     field_count = len(record["fields"].get("_all") or [])
-    mark_stale = grid_surface or login_required_surface or (no_query_surface and field_count == 0)
+    mark_stale = grid_surface or (no_query_surface and field_count == 0)
     prev = await active_map(db, source.source_name)
     version = (prev.map_version + 1) if prev else 1
     if prev is not None:
@@ -214,7 +213,7 @@ async def map_search_form(
             source_name=source.source_name,
         )
         return m
-    if login_required_surface or (no_query_surface and field_count == 0):
+    if no_query_surface and field_count == 0:
         await notify(
             db,
             level="error",

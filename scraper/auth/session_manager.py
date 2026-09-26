@@ -1018,6 +1018,43 @@ class PlaywrightBrowser:
             )
         )
 
+    async def activate_citation_search_from_dashboard(
+        self,
+        *,
+        check_page: PageResult,
+        discovery: List[Dict[str, Any]],
+        archived_grid_start_row: int = 0,
+    ) -> Optional[PageResult]:
+        """Click a dashboard citation-search control when link navigation is required."""
+        selectors = [
+            'a[href*="GetStatuesSearch" i]',
+            'a[href*="GetStatue" i]',
+            'a[href*="CitationSearch" i]',
+        ]
+        for selector in selectors:
+            locator = self._page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+            except Exception:
+                continue
+            try:
+                async with self._page.expect_navigation(
+                    wait_until="domcontentloaded",
+                    timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
+                ):
+                    await self._wrap(locator.click())
+            except Exception:
+                await self._wrap(locator.click())
+            html_text, metadata = await self._capture_html(archived_grid_start_row=archived_grid_start_row)
+            return PageResult(
+                url=self._page.url,
+                html=html_text,
+                status=200,
+                metadata={**(metadata or {}), "requested_url": check_page.url, "final_url": self._page.url},
+            )
+        return None
+
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))

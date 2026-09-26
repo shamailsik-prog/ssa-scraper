@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from scraper.auth.session_manager import SessionLock, SessionManager
 from scraper.config import settings
+from scraper.pls_navigation import pls_check_url
 from scraper.models import BrowserSessionSlot, Notification, ScraperSource
 from scraper.tasks import login_recovery
 from scraper.tasks.login_recovery import recover_slot, recovery_key
@@ -41,7 +42,7 @@ async def test_bounced_slot_is_scheduled_then_verified_and_reactivated(db, login
     assert login_source.state == "PAUSED"
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), GRID_HTML)
+    sc.page(("goto", pls_check_url()), GRID_HTML)
 
     first = await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
     assert "scheduled" in first
@@ -67,7 +68,7 @@ async def test_bounced_slot_without_saved_credentials_backs_off(db, login_source
     mgr = await _bounce_slot(db, login_source)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
 
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
@@ -79,7 +80,7 @@ async def test_bounced_slot_without_saved_credentials_backs_off(db, login_source
     assert datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
     assert (await _slot(db, 1)).state == "NEEDS_HUMAN_LOGIN"
     # Only a goto of the search page with the stored session; no login page, no form submission.
-    assert [k for k, _ in sc.log] == [("goto", settings.PLS_SEARCH_URL)]
+    assert [k for k, _ in sc.log] == [("goto", pls_check_url())]
     notes = (await db.execute(select(Notification).where(Notification.code == "SLOT_RECOVERY_FAILED"))).scalars().all()
     assert len(notes) == 1 and "no saved credentials" in notes[0].message and "human login" in notes[0].message
 
@@ -98,7 +99,7 @@ async def test_explicit_block_during_reverify_halts_source(db, login_source, mon
     mgr = await _bounce_slot(db, login_source)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), "<html>forbidden</html>", status=403)
+    sc.page(("goto", pls_check_url()), "<html>forbidden</html>", status=403)
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
     await db.commit()
@@ -128,7 +129,7 @@ async def test_recovery_task_walks_both_slots_and_leaves_alternate_running(db, l
     await db.commit()
     assert login_source.state == "ACTIVE"  # slot 2 still serves
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), GRID_HTML)
+    sc.page(("goto", pls_check_url()), GRID_HTML)
     t0 = datetime.now(timezone.utc)
     first = await login_recovery.recover_login_slots_async(now=t0, browser_factory=sc.factory())
     assert "scheduled" in first["PakistanLawSite:1"] and first["PakistanLawSite:2"] == {"skipped": "ACTIVE"}
@@ -217,7 +218,7 @@ async def test_dead_session_is_signed_in_again_with_saved_credentials(db, login_
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
     reg = FakeRegistry(AUTHENTICATED)
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
@@ -242,7 +243,7 @@ async def test_verification_page_at_sign_in_waits_for_a_human(db, login_source, 
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
     reg = FakeRegistry(VERIFICATION)
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
@@ -285,13 +286,17 @@ async def test_unattended_sign_in_end_to_end_with_real_browser(db, login_source,
     fixture_server.add("/Login/Login", "<html><body>signed in</body></html>")
     # The authenticated page sets the session cookie the slot must end up holding.
     fixture_server.add("/Login/CitationSearch", GRID_HTML.replace("<body>", "<body><script>document.cookie='ASP.NET_SessionId=e2e; path=/';</script>"))
+    fixture_server.add("/Login/Check", GRID_HTML)
     monkeypatch.setattr(settings, "PLS_LOGIN_URL", fixture_server.url("/"))
+    base = fixture_server.url("").rstrip("/")
+    monkeypatch.setattr(settings, "PLS_BASE_URL", base)
+    monkeypatch.setattr(settings, "PLS_CHECK_URL", fixture_server.url("/Login/Check"))
     monkeypatch.setattr(settings, "PLS_SEARCH_URL", fixture_server.url("/Login/CitationSearch"))
     mgr = await _bounce_slot(db, login_source)
     await _save_credentials(db, 1, username="e2e-user", password="e2e-pass")
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)  # stored session: dead
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)  # stored session: dead
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
     await db.commit()
@@ -311,7 +316,7 @@ async def test_block_at_sign_in_halts_source_and_slot(db, login_source, monkeypa
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
     reg = FakeRegistry(BLOCKED)
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
@@ -327,7 +332,7 @@ async def test_verification_when_reopening_stored_session_waits_for_a_human(db, 
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), "<html><body>Please verify you are human</body></html>")
+    sc.page(("goto", pls_check_url()), "<html><body>Please verify you are human</body></html>")
     reg = FakeRegistry(AUTHENTICATED)
     await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
@@ -344,7 +349,7 @@ async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_sour
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
 
     class ExplodingRegistry(FakeRegistry):
         async def start(self, *a, **k):
@@ -365,7 +370,7 @@ async def test_sign_in_refused_when_agree_checkbox_not_ticked(db, login_source, 
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
 
     class TermsRegistry(FakeRegistry):
         async def start(self, source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
@@ -395,7 +400,7 @@ async def test_refused_sign_in_records_the_sites_own_answer(db, login_source, mo
     await _save_credentials(db, 1)
     t0 = datetime.now(timezone.utc)
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+    sc.page(("goto", pls_check_url()), MAINPAGE_HTML, url=MAINPAGE_URL)
 
     class RefusingSession(FakeLoginSession):
         async def login_error(self):
