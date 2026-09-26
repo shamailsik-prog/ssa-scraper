@@ -3,7 +3,7 @@ Login-session management for PakistanLawSite (Amendment §9; Cursor command §2,
 
 * Two continuity slots hold Fernet-encrypted Playwright storage state captured by a HUMAN login.
 * Slot states: EMPTY → ACTIVE ↔ NEEDS_HUMAN_LOGIN / PAUSED / HALTED.
-* Login-session lock: one Redis lock (TTL 3600 s, refreshed on every page) refuses a second worker.
+* Login-session lock: exclusive by default; two holders only when harvest concurrency is 2.
 * Ordinary disconnect: wait RECONNECT_SECONDS, reconnect the SAME slot, resume the SAME cursor;
   only if that fails may the alternate slot continue the same cursor. Never restart from page one.
 * Verification / login expiry: slot → NEEDS_HUMAN_LOGIN, notify, continue with another valid slot
@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import html
-from pathlib import Path
 import hashlib
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urlsplit
 
@@ -69,10 +69,6 @@ class SessionLockHeld(RuntimeError):
     """Another worker already holds the single login-session lock."""
 
 
-class SearchFormSubmissionError(RuntimeError):
-    """A saved search-map control cannot safely be used on the current page."""
-
-
 @dataclass
 class PageResult:
     url: str
@@ -94,6 +90,8 @@ class Browser(Protocol):
     async def goto(self, url: str, **kwargs: Any) -> PageResult: ...
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult: ...
+
+    async def visible_text(self) -> str: ...
 
     async def download(self, url: str) -> bytes: ...
 
@@ -144,11 +142,11 @@ def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:
 
 # --------------------------------------------------------------------------- lock
 class SessionLock:
-    """The single login-session lock (specification 3.1): one worker at a time per source,
-    TTL LOCK_TTL_SECONDS, refreshed on every page."""
-
-    def __init__(self, source_name: str, redis_client=None):
-        self.key = LOCK_KEY.format(source=source_name)
+    def __init__(self, source_name: str, redis_client=None, *, max_holders: int = 1):
+        holders = 1 if int(max_holders or 1) <= 1 else 2
+        self.max_holders = holders
+        self.exclusive_key = LOCK_KEY.format(source=source_name)
+        self.key = self.exclusive_key if holders == 1 else f"{self.exclusive_key}:holders"
         self._redis = redis_client
         self._own_client = redis_client is None
         self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
@@ -163,7 +161,28 @@ class SessionLock:
 
     async def acquire(self) -> None:
         r = await self._client()
-        ok = await r.set(self.key, self._token, nx=True, ex=LOCK_TTL_SECONDS)
+        shared_key = f"{self.exclusive_key}:holders"
+        # The exclusive and shared forms protect the same login. Check and acquire both keys in
+        # one script so a recovery browser cannot overlap a dual-shard harvest browser.
+        ok = await r.eval(
+            """
+            if tonumber(ARGV[2]) == 1 then
+                if redis.call('exists', KEYS[1]) == 1 or redis.call('scard', KEYS[2]) > 0 then return 0 end
+                return redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3]) and 1 or 0
+            end
+            if redis.call('exists', KEYS[1]) == 1 then return 0 end
+            if redis.call('scard', KEYS[2]) >= tonumber(ARGV[2]) then return 0 end
+            redis.call('sadd', KEYS[2], ARGV[1])
+            redis.call('expire', KEYS[2], ARGV[3])
+            return 1
+            """,
+            2,
+            self.exclusive_key,
+            shared_key,
+            self._token,
+            str(self.max_holders),
+            str(LOCK_TTL_SECONDS),
+        )
         if not ok:
             raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
         self._held = True
@@ -171,13 +190,22 @@ class SessionLock:
     async def refresh(self) -> None:
         if self._held:
             r = await self._client()
-            ok = await r.eval(
-                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                1,
-                self.key,
-                self._token,
-                str(LOCK_TTL_SECONDS),
-            )
+            if self.max_holders == 1:
+                ok = await r.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                    str(LOCK_TTL_SECONDS),
+                )
+            else:
+                ok = await r.eval(
+                    "if redis.call('sismember', KEYS[1], ARGV[1]) == 1 then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                    str(LOCK_TTL_SECONDS),
+                )
             if int(ok or 0) != 1:
                 self._held = False
                 raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
@@ -188,13 +216,21 @@ class SessionLock:
                 return
             r = await self._client()
             # Compare-and-delete in one step: a lock that expired and was taken by another worker
-            # between a GET and a DEL would otherwise be deleted from under that worker.
-            await r.eval(
-                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-                1,
-                self.key,
-                self._token,
-            )
+            # between a read and a delete would otherwise be deleted from under that worker.
+            if self.max_holders == 1:
+                await r.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    self.key,
+                    self._token,
+                )
+            else:
+                await r.eval(
+                    "redis.call('srem', KEYS[1], ARGV[1]); if redis.call('scard', KEYS[1]) == 0 then redis.call('del', KEYS[1]) end; return 1",
+                    1,
+                    self.key,
+                    self._token,
+                )
             self._held = False
         finally:
             if self._own_client and self._redis is not None:
@@ -216,10 +252,10 @@ class SessionLock:
 async def merge_source_config(db: AsyncSession, source: ScraperSource, patch: Dict[str, Any]) -> Dict[str, Any]:
     """Merge top-level keys into scraper_sources.config_json atomically (JSONB `||`).
 
-    The connector, the dashboard and the API may each hold their own copy of the source row;
-    writing the whole JSON back from one copy would overwrite what another wrote meanwhile (the
-    cursor, the pacing counters, the current slot). Each writer therefore sends only its own keys,
-    and the in-memory row is set to the merged value the database returns."""
+    Two reporter shards run at the same time in two worker processes, each holding its own copy of
+    the source row; writing the whole JSON back from either copy would overwrite the other shard's
+    cursor and pacing counters. Each writer therefore sends only its own keys, and the in-memory
+    row is set to the merged value the database returns."""
     if not patch:
         return dict(source.config_json or {})
     stmt = (
@@ -281,8 +317,6 @@ class SessionManager:
 
     # ---------------------------------------------------------------- storage state
     async def save_storage_state(self, slot_number: int, storage_state: Dict[str, Any], *, by: str = "human") -> BrowserSessionSlot:
-        """Store the storage state a HUMAN login produced (specification 3.2): the slot becomes
-        ACTIVE and a PAUSED source becomes ACTIVE. This is the only way a session is created."""
         s = await self.slot(slot_number)
         raw = json.dumps(storage_state, separators=(",", ":"))
         s.storage_state_encrypted = settings.encrypt_value(raw)
@@ -292,16 +326,13 @@ class SessionManager:
         s.logged_in_by = by
         s.logged_in_at = datetime.now(timezone.utc)
         s.last_verified_at = s.logged_in_at
-        # A human's Complete lifts any pause (specification 3.2); the service's own sign-in never
-        # lifts a pause an admin set.
         await self._resume_source_if_paused(respect_admin=by in ("auto-recovery", "recovery"))
         await self.db.flush()
         await notify(self.db, level="info", code="SLOT_ACTIVE", message=f"slot {slot_number} active (login by {by})", source_name=self.source.source_name)
         return s
 
     def is_admin_paused(self) -> bool:
-        """A pause an admin set from the dashboard (flagged in the source config, or worded so)
-        is never lifted by the service's own recovery; only a human or an admin action lifts it."""
+        """A pause an admin set from the dashboard is never lifted by automatic recovery."""
         if self.source.state != "PAUSED":
             return False
         cfg = dict(self.source.config_json or {})
@@ -389,12 +420,12 @@ class SessionManager:
         logger.info("slot %s storage state refreshed from the live browser: %s", slot_number, ", ".join(cookie_summary(storage_state)) or "no cookies")
         return digest
 
-    # ---------------------------------------------------------------- saved sign-in (operator decision, 24 September 2026)
     async def save_login_credentials(self, slot_number: int, username: str, password: str, *, by: str = "operator") -> BrowserSessionSlot:
         s = await self.slot(slot_number)
+        now = datetime.now(timezone.utc)
         s.login_username_encrypted = settings.encrypt_value(username.strip())
         s.login_password_encrypted = settings.encrypt_value(password)
-        s.login_credentials_updated_at = datetime.now(timezone.utc)
+        s.login_credentials_updated_at = now
         s.login_credentials_updated_by = by
         await self.db.flush()
         return s
@@ -406,7 +437,12 @@ class SessionManager:
             username = settings.decrypt_value(slot.login_username_encrypted).strip()
             password = settings.decrypt_value(slot.login_password_encrypted)
         except Exception as exc:
-            logger.warning("Ignoring malformed saved credentials for %s slot %s: %s", self.source.source_name, slot.slot_number, exc)
+            logger.warning(
+                "Ignoring malformed saved credentials for %s slot %s: %s",
+                self.source.source_name,
+                slot.slot_number,
+                exc,
+            )
             return None
         if not username or not password:
             return None
@@ -522,8 +558,6 @@ class PlaywrightBrowser:
                 return True
             except URLPolicyError:
                 return False
-        from urllib.parse import urlsplit
-
         from scraper.security import METADATA_HOSTS, resolve_is_safe
 
         parts = urlsplit(url)
@@ -767,7 +801,9 @@ class PlaywrightBrowser:
                         headers,
                         rows,
                         next_url: !nextDisabled && nextLink && nextLink.href ? nextLink.href : null,
-                        body_preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
+                        // Do not read document.body.innerText here: it forces layout of the entire
+                        // CitationSearch grid regardless of the compact row window.
+                        body_preview: '',
                         has_logout: Boolean(document.querySelector('a[href*="logout" i], a[href*="logoff" i]')),
                         total_rows: resolvedTotalRows,
                         requested_start_row: requestedStartRow,
@@ -864,8 +900,6 @@ class PlaywrightBrowser:
 
     async def _capture_html(self, *, resp=None, archived_grid_start_row: int = 0) -> tuple[str, Dict[str, Any]]:
         dom = await self._dom_shape()
-        if not isinstance(dom, dict):
-            dom = {}
         content_length = self._header_int(resp, "content-length")
         has_grid = bool(dom.get("has_archivedpatient_grid"))
         oversized = False
@@ -922,30 +956,7 @@ class PlaywrightBrowser:
                 "forms": int(dom.get("forms") or 0),
                 "content_length": content_length,
             }
-        timeout = max(5.0, settings.PLAYWRIGHT_TIMEOUT_MS / 1000.0)
-        try:
-            return await asyncio.wait_for(self._wrap(self._page.content()), timeout=timeout), {}
-        except asyncio.TimeoutError:
-            logger.warning(
-                "page.content() exceeded %.0fs on slot %s (%s); capturing the forms only",
-                timeout,
-                self.slot_number,
-                self._page.url if self._page else "?",
-            )
-        forms_html = await self._wrap(
-            self._page.evaluate(
-                """() => {
-                    const parts = [];
-                    const title = document.title ? '<title>' + document.title.replace(/</g, '&lt;') + '</title>' : '';
-                    for (const a of document.querySelectorAll('a[href*="logout" i], a[href*="logoff" i], a[href*="signout" i]')) {
-                        parts.push(a.outerHTML);
-                    }
-                    for (const f of document.forms) parts.push(f.outerHTML);
-                    return '<html><head>' + title + '</head><body>' + parts.join('\\n') + '</body></html>';
-                }"""
-            )
-        )
-        return forms_html, {}
+        return await self._wrap(self._page.content()), {}
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
         wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)
@@ -1008,6 +1019,7 @@ class PlaywrightBrowser:
         )
 
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
+        archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
         try:
             url = self._assert_url_policy(url)
@@ -1020,11 +1032,11 @@ class PlaywrightBrowser:
                 timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
             )
         )
-        # Redirect targets need the same allow-list and SSRF validation as requested URLs.
-        self._assert_url_policy(self._page.url)
-        archived_grid_start_row = int(kwargs.get("archived_grid_start_row", 0) or 0)
-        html_text, capture_metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
-        metadata: Dict[str, Any] = dict(capture_metadata or {})
+        try:
+            self._assert_url_policy(self._page.url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
+        html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
         if capture_case_description_modal:
             try:
                 modal_meta = await self._capture_case_description_modal()
@@ -1068,33 +1080,15 @@ class PlaywrightBrowser:
             return
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
-        surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
-        if surface == "grid_surface_no_query_form":
-            raise SearchFormSubmissionError("CitationSearch surface is grid_surface_no_query_form; no query form is available")
         fields = search_map.get("fields") or {}
         for role, value in values.items():
             f = fields.get(role)
             if not f:
                 continue
             sel, kind = f["selector"], f.get("kind", "text")
-            if kind not in {"select", "checkbox", "radio", "textarea", "text", "search", "number", "date", "email", "tel", "url", "password"}:
-                raise SearchFormSubmissionError(f"role {role!r} has unsupported control kind {kind!r}")
-            locator_factory = getattr(self._page, "locator", None)
-            if callable(locator_factory):
-                from playwright.async_api import TimeoutError as PWTimeoutError
-
-                try:
-                    control = locator_factory(sel)
-                    ready = await control.is_enabled(timeout=min(2_000, settings.PLAYWRIGHT_TIMEOUT_MS))
-                    if kind not in {"checkbox", "radio"}:
-                        ready = ready and await control.is_editable(timeout=min(2_000, settings.PLAYWRIGHT_TIMEOUT_MS))
-                except PWTimeoutError as exc:
-                    raise SearchFormSubmissionError(f"role {role!r} control did not become ready") from exc
-                if not ready:
-                    raise SearchFormSubmissionError(f"role {role!r} control is disabled or not editable")
             if kind == "select":
                 await self._wrap(self._page.select_option(sel, value=value))
-            elif kind in {"checkbox", "radio"}:
+            elif kind == "checkbox":
                 if value in ("1", "true", "on"):
                     await self._wrap(self._page.check(sel))
                 else:
@@ -1111,11 +1105,10 @@ class PlaywrightBrowser:
                 lambda: self._page.keyboard.press("Enter")
             )
         html_text, metadata = await self._capture_html(resp=None)
-        return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata or {})
+        return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
 
     async def visible_text(self) -> str:
-        """The text of the page as the browser shows it (the rendered document's innerText), the
-        same text a person reading the page in a browser sees."""
+        """The text of the page as the browser shows it (the rendered document's innerText)."""
         return await self._wrap(self._page.evaluate("() => (document.body && document.body.innerText) || ''"))
 
     async def download(self, url: str) -> bytes:
@@ -1124,14 +1117,13 @@ class PlaywrightBrowser:
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(self._context.request.get(url))
-        # context.request follows redirects, so validate the final destination too.
-        self._assert_url_policy(resp.url)
+        try:
+            self._assert_url_policy(resp.url)
+        except URLPolicyError as exc:
+            raise ExplicitBlock("url_policy", str(exc)) from exc
         if resp.status >= 400:
             if resp.status >= 500:
                 raise BrowserDisconnected(f"download HTTP {resp.status}")
-            verdict = classify_response(resp.status, await self._wrap(resp.text()), resp.url)
-            if verdict.kind == "block":
-                raise ExplicitBlock(verdict.kind, verdict.detail)
             raise RuntimeError(f"download HTTP {resp.status}")
         return await self._wrap(resp.body())
 
@@ -1176,9 +1168,13 @@ class ContinuityRunner:
     sleep: Any = asyncio.sleep
     browser: Optional[Browser] = None
     reconnects: int = 0
+    preferred_slot_number: Optional[int] = None
     # Hash of the storage state the current browser was opened with; a live-state refresh is
     # written only while the slot still holds it (compare-and-update).
     opened_state_hash: Optional[str] = None
+    # True for a reporter shard: it may never continue on the other shard's slot, because that slot
+    # is in use by the other shard at the same time (one login per account on the site).
+    exclusive_slot: bool = False
 
     async def open(self, slot: BrowserSessionSlot) -> Browser:
         state = self.manager.load_storage_state(slot)
@@ -1196,6 +1192,10 @@ class ContinuityRunner:
     async def ensure_browser(self) -> Browser:
         if self.browser is not None:
             return self.browser
+        if self.preferred_slot_number:
+            preferred = await self.manager.slot(self.preferred_slot_number)
+            if preferred.state == "ACTIVE":
+                return await self.open(preferred)
         slot = await self.manager.current_slot()
         if slot is None:
             raise NoActiveSlot("no ACTIVE slot")
@@ -1234,6 +1234,8 @@ class ContinuityRunner:
             except BrowserDisconnected as exc2:
                 logger.warning("same-slot reconnect failed for slot %s: %s", slot_no, exc2)
                 await self.close()
+                if self.exclusive_slot:
+                    raise
                 alt = await self.manager.alternate_active_slot(slot_no)
                 if alt is None:
                     await self.manager.pause_source(f"slot {slot_no} unreachable after reconnect and no alternate slot")
@@ -1247,6 +1249,8 @@ class ContinuityRunner:
         except (LoginRequired, VerificationRequired) as exc:
             await self.close()
             await self.manager.mark_needs_human_login(slot_no, f"{type(exc).__name__}: {exc}")
+            if self.exclusive_slot:
+                raise
             alt = await self.manager.alternate_active_slot(slot_no)
             if alt is None:
                 raise

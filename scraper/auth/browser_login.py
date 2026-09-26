@@ -337,7 +337,14 @@ class LoginSession:
                   if (submit) { submit.click(); submitted = true; }
                   else if (pass.form) { pass.form.requestSubmit ? pass.form.requestSubmit() : pass.form.submit(); submitted = true; }
                 }
-                return { applied: !!(user && pass), submitted, username_field_found: !!user, password_field_found: !!pass, checked_boxes: checked };
+                return {
+                  applied: !!(user && pass),
+                  submitted,
+                  username_field_found: !!user,
+                  password_field_found: !!pass,
+                  checked_boxes: checked,
+                  checked_terms: checked > 0
+                };
               }""",
             {"username": username, "password": password, "autoComplete": auto_complete},
         )

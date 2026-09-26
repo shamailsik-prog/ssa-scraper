@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pathlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse, Response
@@ -21,6 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import get_db
+from scraper.pls_grid_health import (
+    citation_grid_progress_view,
+    grid_harvest_incomplete,
+    grid_rows_remaining,
+    pls_source_config,
+)
 from scraper.models import (
     ArchiveObject,
     ArchiveTarget,
@@ -187,36 +193,8 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
         for r in (await db.execute(select(SpotCheck).order_by(SpotCheck.checked_at.desc()).limit(20))).scalars().all()
     ]
     last_spot = (await db.execute(select(func.max(SpotCheck.checked_at)))).scalar()
-    pakistanlawsite_harvest: Optional[Dict[str, Any]] = None
-    pls_source = (
-        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))
-    ).scalar_one_or_none()
-    if pls_source is not None:
-        cfg = dict(pls_source.config_json or {})
-        cursor = dict(cfg.get("citation_grid_cursor") or {})
-        progress = dict(cfg.get("citation_grid_progress") or {})
-        if not cursor and isinstance(progress.get("citation_grid_cursor"), dict):
-            cursor = dict(progress.get("citation_grid_cursor") or {})
-        pls_judgments = by_source.get("PakistanLawSite", 0)
-        last_judgment_at = (
-            await db.execute(
-                select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite")
-            )
-        ).scalar()
-        last_success = pls_source.last_success_at
-        stalled = False
-        if last_success is not None:
-            stalled = (now - last_success) > timedelta(hours=6)
-        pakistanlawsite_harvest = {
-            "judgments": pls_judgments,
-            "citation_grid_cursor": {
-                "row_offset": int(cursor.get("row_offset", 0) or 0),
-                "total_rows": int(cursor.get("last_total_rows", 0) or 0) if cursor.get("last_total_rows") is not None else None,
-            },
-            "last_judgment_at": _iso(last_judgment_at),
-            "last_success_at": _iso(last_success),
-            "stalled": stalled,
-        }
+    pls_cfg = await pls_source_config(db)
+    pls_watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
     return {
         "generated_at": _iso(now),
         "spot_checks": {
@@ -241,6 +219,15 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "staged_waiting_for_promotion": staging_by_status.get("extracted", 0),
             "staging_by_status": staging_by_status,
         },
+        "pakistanlawsite": {
+            "citation_grid_progress": citation_grid_progress_view("PakistanLawSite", pls_cfg),
+            "citation_grid_rows_remaining": grid_rows_remaining(pls_cfg),
+            "last_judgment_at": _iso(
+                (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
+            ),
+            "stalled": bool(pls_watch.get("stalled")),
+            "grid_incomplete": grid_harvest_incomplete(pls_cfg),
+        },
         "judgments_by_source": by_source,
         "judgments_by_reporter_year": by_reporter_year,
         "sources": sources,
@@ -256,7 +243,6 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "mirror_login_session_rows_setting": settings.MIRROR_LOGIN_SESSION_ROWS,
         },
         "open_notifications": open_notifications,
-        "pakistanlawsite_harvest": pakistanlawsite_harvest,
     }
 
 

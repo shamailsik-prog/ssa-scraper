@@ -30,6 +30,7 @@ app = Celery(
         "scraper.tasks.archive_mirror",
         "scraper.tasks.login_recovery",
         "scraper.tasks.spot_check",
+        "scraper.tasks.pls_self_healing",
     ],
 )
 app.conf.update(
@@ -53,16 +54,25 @@ app.conf.update(
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
         "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
+        "scraper.tasks.pls_self_healing.pls_keepalive_hourly": {"queue": "login_session"},
+        "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
     beat_schedule={
-        # Specification section 10: dispatch every 30 minutes, promotion every 15 minutes (200 rows).
-        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": 1800},
+        "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900, "kwargs": {"limit": 200}},
         # Operator decision of 24 September 2026: a lost slot is re-verified and, if dead, signed in
         # again with the saved credentials (runs on the single login-session worker, never beside a job).
         "recover-login-slots": {"task": "scraper.tasks.login_recovery.recover_login_slots", "schedule": settings.LOGIN_RECOVERY_SCHEDULE_SECONDS},
+        "pls-keepalive": {
+            "task": "scraper.tasks.pls_self_healing.pls_keepalive_hourly",
+            "schedule": settings.PLS_KEEPALIVE_SCHEDULE_SECONDS,
+        },
+        "pls-stall-watchdog": {
+            "task": "scraper.tasks.pls_self_healing.pls_stall_watchdog",
+            "schedule": settings.PLS_STALL_WATCHDOG_SECONDS,
+        },
         # Operator request of 24 September 2026: re-fetch a few promoted records and compare.
         "spot-check-judgments": {"task": "scraper.tasks.spot_check.spot_check_judgments", "schedule": settings.SPOT_CHECK_SCHEDULE_SECONDS},
         "spot-check-statutes": {"task": "scraper.tasks.spot_check.spot_check_statutes", "schedule": settings.SPOT_CHECK_SCHEDULE_SECONDS},

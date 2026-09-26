@@ -119,7 +119,12 @@ def map_as_dict(m: SearchFormMap) -> Dict[str, Any]:
 
 
 async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *, local_engine: Optional[LocalScrapeGraphEngine] = None) -> SearchFormMap:
-    """Create a new active map version from the rendered search page HTML."""
+    """Create a new map version from the rendered search page HTML.
+
+    A CitationSearch grid without its query form is recorded for diagnostics, but is
+    immediately stale: its DataTables controls are not harvest inputs and the next
+    runner invocation must render the page again.
+    """
     proposal = introspect_search_form(html)
     mapped_by = "deterministic"
     engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
@@ -142,6 +147,7 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
             mapped_by = "deterministic+local_ai"
     verified = verify_selectors(html, proposal)
     record = build_map_record(verified, html, mapped_by)
+    grid_surface = record["limits"]["surface"] == "grid_surface_no_query_form"
     prev = await active_map(db, source.source_name)
     version = (prev.map_version + 1) if prev else 1
     if prev is not None:
@@ -159,9 +165,20 @@ async def map_search_form(db: AsyncSession, source: ScraperSource, html: str, *,
         mapped_by=mapped_by,
         verified_against_dom=True,
         is_active=True,
+        stale=grid_surface,
+        consecutive_parse_failures=settings.SEARCH_MAP_STALE_FAILURES if grid_surface else 0,
     )
     db.add(m)
     await db.flush()
+    if grid_surface:
+        await notify(
+            db,
+            level="error",
+            code="SEARCH_MAP_GRID_SURFACE_STALE",
+            message="CitationSearch grid-only surface captured; query form unavailable, map marked stale and remap required",
+            source_name=source.source_name,
+        )
+        return m
     await notify(db, level="info", code="SEARCH_MAP_UPDATED", message=f"search form mapped (version {version}, {mapped_by}, {len(record['fields'].get('_all', []))} fields)", source_name=source.source_name)
     return m
 

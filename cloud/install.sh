@@ -369,6 +369,15 @@ done
 docker compose ps --format 'table {{.Service}}\t{{.Status}}'
 docker compose ps --format '{{.Service}} {{.Health}}' | grep -q '^api healthy' || die "API did not become healthy; run: docker compose logs api"
 
+# Backup host keepalive: Celery Beat runs the primary keepalive; this cron line is idempotent insurance.
+KEEPALIVE_MARK="# ssa-scraper PLS keepalive (backup; Beat owns the primary schedule)"
+KEEPALIVE_LINE="0 * * * * cd $DIR && docker compose exec -T api python scripts/pls_server_login.py >> state/pls_keepalive.log 2>&1"
+CRON_NOW="$(crontab -l 2>/dev/null || true)"
+if ! printf '%s\n' "$CRON_NOW" | grep -Fq "$KEEPALIVE_MARK"; then
+  log "Installing host keepalive cron backup (hourly pls_server_login.py)"
+  { printf '%s\n' "$CRON_NOW"; printf '%s\n' "$KEEPALIVE_MARK"; printf '%s\n' "$KEEPALIVE_LINE"; } | crontab -
+fi
+
 ADMIN_KEY="$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2-)"
 cat <<EOF
 

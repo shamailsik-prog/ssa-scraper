@@ -374,14 +374,40 @@ async def seed_data() -> None:
             "data_residency_note": settings.DATA_RESIDENCY_NOTE or "NOT CONFIGURED",
             "schema_contract": "annex-a-v1",
             "scrapegraph_schema_version": str(settings.SGAI_SCHEMA_VERSION),
+            "harvest_mode": settings.HARVEST_MODE,
+            "harvest_mode_changed_at": datetime.now(timezone.utc).isoformat(),
+            "harvest_mode_changed_by": "seed",
+            "harvest_mode_reason": "initial seed",
             "service_started_at": datetime.now(timezone.utc).isoformat(),
         }
         existing_meta = {m.key: m for m in (await db.execute(select(CorpusMetadata))).scalars().all()}
+        stored_mode = existing_meta.get("harvest_mode")
+        stored_by = existing_meta.get("harvest_mode_changed_by")
+        stored_reason = existing_meta.get("harvest_mode_reason")
+        if (
+            stored_mode is not None
+            and stored_mode.value == "updates"
+            and settings.HARVEST_MODE == "backfill"
+            and stored_by is not None
+            and stored_by.value == "system"
+            and (stored_reason.value if stored_reason is not None else "").startswith("auto-switch")
+            and not (settings.BACKFILL_TARGET_JUDGMENTS or settings.BACKFILL_TARGET_STATUTES)
+        ):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            stored_mode.value = "backfill"
+            stored_by.value = "system"
+            stored_reason.value = "repair: undid a targetless auto-switch to updates (see docs/AUDIT_2026-09-22.md F1)"
+            changed_at = existing_meta.get("harvest_mode_changed_at")
+            if changed_at is not None:
+                changed_at.value = now_iso
+            logger.warning("harvest_mode restored to backfill: the stored 'updates' came from a targetless auto-switch")
         for k, v in meta.items():
             if k in existing_meta:
                 if k in ("embedding_model", "embedding_dim") and existing_meta[k].value != v:
                     # Do not silently change the recorded embedding identity; the embedding worker refuses to run.
                     logger.error("corpus_metadata %s=%s differs from configured %s; embedding worker will refuse", k, existing_meta[k].value, v)
+                    continue
+                if k in ("harvest_mode", "harvest_mode_changed_at", "harvest_mode_changed_by", "harvest_mode_reason"):
                     continue
                 existing_meta[k].value = v
             else:

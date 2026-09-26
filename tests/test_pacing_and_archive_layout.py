@@ -52,7 +52,7 @@ async def test_daily_page_budget_pauses_run_and_delays_between_pages(db, login_s
     fr = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.tier == 1))).scalars().first()
     assert fr.status == "pending" and fr.last_error.startswith("pacing")
     assert login_source.state == "ACTIVE"  # not halted, not paused: Beat resumes it on the next window
-    assert (login_source.config_json or {}).get("pacing", {}).get("day_pages") == 4  # source.config_json.pacing (specification 3.6)
+    assert (login_source.config_json or {}).get("pacing_slot_1", {}).get("day_pages") == 4
 
 
 def test_archive_layout_reported_vs_unreported():
@@ -97,4 +97,4 @@ async def test_first_run_after_the_switch_counts_what_the_slots_already_charged_
     await db.commit()
     await r.aclose()
     assert stats["pacing_paused"] is True and stats["pages_charged"] == 2  # 2 already charged today + 2 = 4 > 3
-    assert (login_source.config_json or {}).get("pacing", {}).get("day_pages") == 4
+    assert (login_source.config_json or {}).get("pacing_slot_1", {}).get("day_pages") == 4
