@@ -267,6 +267,13 @@ async def test_human_login_browser_stream_and_completion(db, login_source, fixtu
 
     fixture_server.add("/login", LOGIN_PAGE)
     fixture_server.add("/Login/CitationSearch", search_form_html())
+    fixture_server.add(
+        "/Login/Check",
+        search_form_html().replace("<body>", "<body><a href='/logout'>Logout</a>"),
+    )
+    base = fixture_server.url("").rstrip("/")
+    monkeypatch.setattr(settings, "PLS_BASE_URL", base)
+    monkeypatch.setattr(settings, "PLS_CHECK_URL", fixture_server.url("/Login/Check"))
     monkeypatch.setattr(settings, "PLS_SEARCH_URL", fixture_server.url("/Login/CitationSearch"))
     reg = LoginSessionRegistry()
     sess = await reg.start("PakistanLawSite", 2, fixture_server.url("/login"), started_by="advocate")
