@@ -695,6 +695,27 @@ async def test_search_form_map_fails_closed_for_grid_filter_chrome_without_query
     assert frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available; remap required"
     assert pipeline.stats["queries"] == 0
 
+    tier1_frontier = CrawlFrontier(
+        source_name="PakistanLawSite",
+        tier=1,
+        query_key="t1:PLD:2024",
+        query_json={"reporter": "PLD", "year": 2024},
+        cursor_json={"page_no": 1},
+    )
+    await pipeline.run_tier1(
+        tier1_frontier,
+        {
+            "fields": m.fields,
+            "limits": m.limits,
+            "surface": m.limits["surface"],
+        },
+        max_probes=1,
+    )
+
+    assert tier1_frontier.status == "stale"
+    assert tier1_frontier.last_error == "CitationSearch surface is grid_surface_no_query_form; no query form is available; remap required"
+    assert pipeline.stats["queries"] == 0
+
 
 async def test_real_query_form_remap_reopens_grid_surface_frontier(db, login_source):
     await _activate(db, login_source)
