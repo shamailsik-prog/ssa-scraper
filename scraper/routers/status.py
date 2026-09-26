@@ -21,6 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import get_db
+from scraper.pls_grid_health import (
+    citation_grid_progress_view,
+    grid_harvest_incomplete,
+    grid_rows_remaining,
+    pls_source_config,
+)
 from scraper.models import (
     ArchiveObject,
     ArchiveTarget,
@@ -187,6 +193,8 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
         for r in (await db.execute(select(SpotCheck).order_by(SpotCheck.checked_at.desc()).limit(20))).scalars().all()
     ]
     last_spot = (await db.execute(select(func.max(SpotCheck.checked_at)))).scalar()
+    pls_cfg = await pls_source_config(db)
+    pls_watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
     return {
         "generated_at": _iso(now),
         "spot_checks": {
@@ -210,6 +218,15 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "last_promotion_at": _iso(latest_promotion),
             "staged_waiting_for_promotion": staging_by_status.get("extracted", 0),
             "staging_by_status": staging_by_status,
+        },
+        "pakistanlawsite": {
+            "citation_grid_progress": citation_grid_progress_view("PakistanLawSite", pls_cfg),
+            "citation_grid_rows_remaining": grid_rows_remaining(pls_cfg),
+            "last_judgment_at": _iso(
+                (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
+            ),
+            "stalled": bool(pls_watch.get("stalled")),
+            "grid_incomplete": grid_harvest_incomplete(pls_cfg),
         },
         "judgments_by_source": by_source,
         "judgments_by_reporter_year": by_reporter_year,

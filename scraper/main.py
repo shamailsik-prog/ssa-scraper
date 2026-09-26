@@ -73,6 +73,30 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
         async with SessionLocal() as db:
             await db.execute(text("SELECT 1"))
             out["db_connected"] = True
+            from scraper.pls_grid_health import (
+                citation_grid_progress_view,
+                grid_harvest_incomplete,
+                grid_rows_remaining,
+                pls_judgment_counts,
+                pls_last_judgment_at,
+                pls_source_config,
+            )
+
+            pls_cfg = await pls_source_config(db)
+            total_j, by_source = await pls_judgment_counts(db)
+            last_j = await pls_last_judgment_at(db)
+            watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
+            out["judgments"] = total_j
+            out["judgments_by_source"] = by_source
+            out["pakistanlawsite"] = {
+                "judgments": by_source.get("PakistanLawSite", 0),
+                "citation_grid_progress": citation_grid_progress_view("PakistanLawSite", pls_cfg),
+                "citation_grid_rows_remaining": grid_rows_remaining(pls_cfg),
+                "last_judgment_at": last_j.isoformat() if last_j else None,
+                "stalled": bool(watch.get("stalled")) or (
+                    grid_harvest_incomplete(pls_cfg) and bool(watch.get("stalled_at"))
+                ),
+            }
             if privileged:
                 from scraper.models import Judgment, QuarantineQueue, ScraperJob, ScraperSource, Statute, StatuteSection
 

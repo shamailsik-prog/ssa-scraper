@@ -38,9 +38,10 @@ def test_local_mode_without_endpoint_requires_fail_open():
     assert Settings(**BASE, SGAI_MODE="scrapegraph_local", SGAI_FAIL_OPEN_TO_DETERMINISTIC=True)
 
 
-def test_login_session_concurrency_other_than_one_is_refused():
+def test_login_session_concurrency_must_be_one_or_two():
     assert Settings(**BASE, LOGIN_SESSION_CONCURRENCY=1)
-    for value in (0, 2, 3):
+    assert Settings(**BASE, LOGIN_SESSION_CONCURRENCY=2)
+    for value in (0, 3):
         with pytest.raises(ValidationError):
             Settings(**BASE, LOGIN_SESSION_CONCURRENCY=value)
 

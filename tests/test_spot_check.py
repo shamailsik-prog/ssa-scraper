@@ -53,7 +53,7 @@ async def test_judgment_spot_check_matches_and_flags_a_changed_page(db, login_so
     assert by_label["PLD 2024 SC 9002"]["result"] == "differs" and 0 < by_label["PLD 2024 SC 9002"]["similarity"] < 1
     rows = (await db.execute(select(SpotCheck).where(SpotCheck.kind == "judgment"))).scalars().all()
     assert {r.label: r.result for r in rows} == {"PLD 2024 SC 9001": "match", "PLD 2024 SC 9002": "differs"}
-    assert (login_source.config_json or {}).get("pacing", {}).get("day_pages") == 2  # charged like any other page
+    assert (login_source.config_json or {}).get("pacing_slot_1", {}).get("day_pages") == 2  # charged like any other page
 
 
 async def test_judgment_spot_check_login_page_ends_the_run_and_marks_the_slot(db, login_source):

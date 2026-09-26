@@ -36,7 +36,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=1 -n scraper-login@%h --loglevel=INFO
+    command: celery -A scraper.tasks.celery_app worker -Q login_session --concurrency=${LOGIN_SESSION_CONCURRENCY:-2} -n scraper-login@%h --loglevel=INFO
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-login@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
