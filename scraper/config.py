@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD", "GBLR", "PLJ", "NLR", "KLR", "PCRLJ")
 ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", "sftp", "smb", "local_path")
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
+HARVEST_MODES = ("backfill", "updates")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
 
 SECRET_FIELD_NAMES = (
@@ -132,6 +133,8 @@ class Settings(BaseSettings):
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
     PLAYWRIGHT_TIMEOUT_MS: int = Field(default=30000)
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
+    PLAYWRIGHT_MAX_HTML_BYTES: int = Field(default=2_000_000, description="Guard: skip full page.content() when HTML responses are larger than this many bytes.")
+    PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD: int = Field(default=5000, description="Guard: skip full page.content() when the DOM input count indicates a huge datatable surface.")
 
     # ------------------------------------------------- login-session sources
     ALLOW_LOGIN_SCRAPING: bool = Field(default=False)
@@ -182,6 +185,25 @@ class Settings(BaseSettings):
     PLS_USER_B: str = Field(default="")
     PLS_PASS_B: SecretStr = Field(default=SecretStr(""))
     PLS_JOURNALS_B: str = Field(default="")
+    HARVEST_MODE: str = Field(default="updates", description="Global scheduler mode: backfill (continuous) or updates (steady state).")
+    BACKFILL_SOURCE_FREQUENCY_MINUTES: int = Field(default=15, description="Default per-source scrape interval in backfill mode.")
+    BACKFILL_TARGET_JUDGMENTS: int = Field(default=0, description="Backfill completion target for judgments (0 = frontier-driven only).")
+    BACKFILL_TARGET_STATUTES: int = Field(default=0, description="Backfill completion target for statutes (0 = frontier-driven only).")
+    BACKFILL_LOGIN_DELAY_MIN: float = Field(default=6.0, description="Backfill mode minimum delay between login-session page fetches.")
+    BACKFILL_LOGIN_DELAY_MAX: float = Field(default=9.0, description="Backfill mode maximum delay between login-session page fetches.")
+    BACKFILL_PAGES_PER_HOUR: int = Field(default=450, description="Backfill mode login-session page budget per hour.")
+    BACKFILL_PAGES_PER_DAY: int = Field(default=200000, description="Backfill mode login-session page budget per day.")
+    BACKFILL_LOGIN_SESSION_CONCURRENCY: int = Field(default=1, description="Legacy backfill concurrency target; capped to LOGIN_SESSION_CONCURRENCY at runtime.")
+    UPDATE_CADENCE_HOURS: int = Field(default=24, description="Default scrape cadence in updates mode.")
+    PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=400, description="Maximum rows materialized per compact #archivedpatientGrid snapshot (one window).")
+    PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots.")
+    PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=120, description="Updates mode: max detail pages fetched per citation-grid window.")
+    PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=200, description="Updates mode: rows scanned per citation-grid window.")
+    BACKFILL_PLS_CITATION_GRID_MAX_DETAIL: int = Field(default=300, description="Backfill mode: max detail pages fetched per citation-grid window.")
+    BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW: int = Field(default=600, description="Backfill mode: rows scanned per citation-grid window.")
+    PLS_RUN_MAX_MINUTES: int = Field(default=0, description="Updates mode: consecutive citation-grid windows per job (0 = one window).")
+    BACKFILL_PLS_RUN_MAX_MINUTES: int = Field(default=50, description="Backfill mode: consecutive citation-grid windows per job.")
+    PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip grid rows whose citation is already staged or promoted.")
 
     # ----------------------------------------------------------- pdf/storage
     PDF_STORAGE_PATH: str = Field(default="/app/live")
@@ -348,6 +370,14 @@ class Settings(BaseSettings):
             raise ValueError(f"SGAI_MODE must be one of {EXTRACTION_MODES}")
         return v
 
+    @field_validator("HARVEST_MODE")
+    @classmethod
+    def _validate_harvest_mode(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in HARVEST_MODES:
+            raise ValueError(f"HARVEST_MODE must be one of {HARVEST_MODES}")
+        return v
+
     @field_validator("PLS_SUBSCRIBED_REPORTERS", "PLS_JOURNALS", "PLS_JOURNALS_B")
     @classmethod
     def _validate_reporters(cls, v: str) -> str:
@@ -384,6 +414,20 @@ class Settings(BaseSettings):
             raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
         if self.PLS_CASE_DESCRIPTION_WAIT_SECONDS < 0:
             raise ValueError("PLS_CASE_DESCRIPTION_WAIT_SECONDS must be >= 0")
+        if self.PLAYWRIGHT_MAX_HTML_BYTES <= 0 or self.PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD <= 0:
+            raise ValueError("PLAYWRIGHT_MAX_HTML_BYTES and PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD must be positive")
+        if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
+        if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:
+            raise ValueError("PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS must be positive")
+        if self.PLS_CITATION_GRID_MAX_DETAIL <= 0:
+            raise ValueError("PLS_CITATION_GRID_MAX_DETAIL must be positive")
+        if self.PLS_CITATION_GRID_SCAN_WINDOW <= 0:
+            raise ValueError("PLS_CITATION_GRID_SCAN_WINDOW must be positive")
+        if self.BACKFILL_PLS_CITATION_GRID_MAX_DETAIL <= 0:
+            raise ValueError("BACKFILL_PLS_CITATION_GRID_MAX_DETAIL must be positive")
+        if self.BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW <= 0:
+            raise ValueError("BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW must be positive")
         if not 0 < float(self.PROMOTE_PREFERRED_SHARE) <= 1:
             raise ValueError("PROMOTE_PREFERRED_SHARE must be in (0, 1]")
         if self.EMBEDDING_DIM <= 0:
