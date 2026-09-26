@@ -1241,6 +1241,38 @@ class PakistanLawSitePipeline:
             page = await self.fetch_detail(nxt)
             self.stats["pages"] += 0
 
+    async def _recover_slot_after_login_loss(self, exc: Exception) -> bool:
+        """Mark the slot dead, run saved-credential sign-in, and return True when ACTIVE again."""
+        from scraper.tasks.login_recovery import recover_slot
+
+        slot_no = self.stats.get("slot")
+        if slot_no is None and self.runner.browser is not None:
+            slot_no = self.runner.browser.slot_number
+        if slot_no is None:
+            return False
+        slot_no = int(slot_no)
+        logger.warning(
+            "PakistanLawSite login lost on slot %s during harvest (%s); attempting automated re-login",
+            slot_no,
+            exc,
+        )
+        await self.manager.mark_needs_human_login(slot_no, f"login lost during harvest: {str(exc)[:300]}")
+        await self.db.flush()
+        try:
+            await self.runner.close()
+        except Exception:
+            pass
+        self.runner.browser = None
+        slot = await self.manager.slot(slot_no)
+        outcome = await recover_slot(self.db, self.manager, slot)
+        self.stats.setdefault("login_recovery", []).append({"slot": slot_no, **outcome})
+        await self.db.flush()
+        if outcome.get("recovered"):
+            await self.db.commit()
+            refreshed = await self.manager.slot(slot_no)
+            return refreshed.state == "ACTIVE"
+        return False
+
     # ---------------------------------------------------------------- main loop
     async def run(self, *, max_queries: int = 20, max_probes_per_volume: int = 60) -> Dict[str, Any]:
         self._assert_permitted()
@@ -1317,25 +1349,46 @@ class PakistanLawSitePipeline:
                     self.reporter_shard,
                     self.reporter_shard_reporters or "all",
                 )
+                # Never mask a login bounce by switching to the other slot: re-login this slot and retry.
+                self.runner.exclusive_slot = True
                 stopped_clean = True
-                try:
-                    await self.run_citation_grid_surface(search_map)
-                except ExplicitBlock as exc:
-                    stopped_clean = False
-                    self.stats["halted"] = True
-                    self.stats["stop_reason"] = f"halted: {exc}"
-                except (LoginRequired, VerificationRequired, NoActiveSlot) as exc:
-                    stopped_clean = False
-                    self.stats["paused"] = True
-                    self.stats["stop_reason"] = f"paused: {exc}"
-                except BrowserDisconnected as exc:
-                    stopped_clean = False
-                    self.stats["paused"] = True
-                    self.stats["stop_reason"] = f"disconnected: {exc}"
-                except PacingBudgetExceeded as exc:
-                    self.stats["pacing_paused"] = True
-                    self.stats["stop_reason"] = f"pacing: {exc}"
-                    logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
+                login_retries = 0
+                while True:
+                    try:
+                        await self.run_citation_grid_surface(search_map)
+                        break
+                    except ExplicitBlock as exc:
+                        stopped_clean = False
+                        self.stats["halted"] = True
+                        self.stats["stop_reason"] = f"halted: {exc}"
+                        break
+                    except LoginRequired as exc:
+                        stopped_clean = False
+                        if login_retries < 1 and await self._recover_slot_after_login_loss(exc):
+                            login_retries += 1
+                            self.stats["login_recovery_retries"] = login_retries
+                            self._surface_page = None
+                            grid_start_row = self._citation_grid_cursor()[2]
+                            search_map = await self.ensure_search_map(archived_grid_start_row=grid_start_row)
+                            continue
+                        self.stats["paused"] = True
+                        self.stats["stop_reason"] = f"paused: {exc}"
+                        break
+                    except (VerificationRequired, NoActiveSlot) as exc:
+                        stopped_clean = False
+                        self.stats["paused"] = True
+                        self.stats["stop_reason"] = f"paused: {exc}"
+                        break
+                    except BrowserDisconnected as exc:
+                        stopped_clean = False
+                        self.stats["paused"] = True
+                        self.stats["stop_reason"] = f"disconnected: {exc}"
+                        break
+                    except PacingBudgetExceeded as exc:
+                        self.stats["pacing_paused"] = True
+                        self.stats["stop_reason"] = f"pacing: {exc}"
+                        logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
+                        break
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 if stopped_clean:
                     self.source.last_success_at = self.source.last_scraped_at

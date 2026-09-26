@@ -358,6 +358,34 @@ async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_sour
     assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
 
 
+async def test_sign_in_refused_when_agree_checkbox_not_ticked(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    await _save_credentials(db, 1)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), MAINPAGE_HTML, url=MAINPAGE_URL)
+
+    class TermsRegistry(FakeRegistry):
+        async def start(self, source_name, slot_number, login_url, started_by="operator", viewport=None, saved_credentials=None, auto_complete=False):
+            sess = await super().start(source_name, slot_number, login_url, started_by, viewport, saved_credentials, auto_complete)
+            sess.last_autofill = {
+                "applied": True,
+                "submitted": True,
+                "checkbox_count": 1,
+                "all_checkboxes_checked": False,
+                "checked_terms": False,
+            }
+            return sess
+
+    reg = TermsRegistry(AUTHENTICATED)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory(), registry_factory=lambda: reg)
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory(), registry_factory=lambda: reg)
+    await db.commit()
+    assert "failed" in result
+    assert "terms/agree checkbox" in (result.get("sign_in") or {}).get("detail", "")
+
+
 async def test_refused_sign_in_records_the_sites_own_answer(db, login_source, monkeypatch):
     """When the site refuses the submitted form (wrong password, account already in use), the
     slot's recovery detail carries the site's own answer rather than only "login page"."""
