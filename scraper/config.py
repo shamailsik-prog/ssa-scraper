@@ -203,6 +203,7 @@ class Settings(BaseSettings):
     EXPORT_LOGIN_SESSION_FULL_TEXT: bool = Field(default=False)
     PLS_BASE_URL: str = Field(default="https://www.pakistanlawsite.com")
     PLS_LOGIN_URL: str = Field(default="https://www.pakistanlawsite.com/")
+    PLS_CHECK_URL: str = Field(default="https://www.pakistanlawsite.com/Login/Check")
     PLS_SEARCH_URL: str = Field(default="https://www.pakistanlawsite.com/Login/CitationSearch")
     PLS_ARCHIVED_GRID_MAX_ROWS: int = Field(default=400, description="Maximum rows materialized per compact #archivedpatientGrid snapshot (one window). The snapshot reads cell text only; on a snapshot timeout the window is halved and retried before the page is treated as disconnected.")
     PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS: float = Field(default=20.0, description="Hard timeout for compact #archivedpatientGrid snapshots so CitationSearch cannot hold the login lock for a full Playwright navigation timeout.")

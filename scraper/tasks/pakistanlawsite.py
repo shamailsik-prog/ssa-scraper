@@ -43,7 +43,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.extractors.deterministic import introspect_search_form
+from scraper.pls_navigation import open_citation_search_for_harvest
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
@@ -263,7 +263,7 @@ def is_grid_surface_without_query_form(search_map: Dict[str, Any]) -> bool:
 def is_unharvestable_search_surface(search_map: Dict[str, Any]) -> bool:
     """Surfaces that cannot drive tier frontiers: mark stale, never retire rows."""
     surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
-    if surface in ("grid_surface_no_query_form", "no_query_form", "login_required"):
+    if surface in ("grid_surface_no_query_form", "no_query_form"):
         return True
     fields = search_map.get("fields") or {}
     usable = [key for key in fields if key != "_all"]
@@ -481,33 +481,15 @@ class PakistanLawSitePipeline:
         return "full_judgment", None
 
     # ---------------------------------------------------------------- search map
-    def _raise_if_login_required_shell(self, page: PageResult) -> None:
-        guard = str((page.metadata or {}).get("content_guard") or "")
-        if guard in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
-            return
-        probe = introspect_search_form(page.html or "")
-        if probe.get("surface") != "login_required":
-            return
-        where = f" (landed on {page.url})" if page.url else ""
-        raise LoginRequired(f"CitationSearch session shell (empty title, no logout, no query form, no grid){where}")
-
     async def ensure_search_map(self, *, archived_grid_start_row: int = 0) -> Dict[str, Any]:
         """Render the search surface once and map it. The rendered page is kept so the first
         citation-grid window can reuse it instead of loading the 10-16 MB CitationSearch DOM twice."""
         start_row = max(0, int(archived_grid_start_row or 0))
 
         async def op(browser: Browser) -> PageResult:
-            page = await browser.goto(settings.PLS_SEARCH_URL, archived_grid_start_row=start_row)
-            raise_for_verdict(page)
-            return page
+            return await open_citation_search_for_harvest(browser, archived_grid_start_row=start_row)
 
         page = await self.runner.run(op)
-        if not getattr(self, "_search_surface_remap_attempted", False):
-            probe = introspect_search_form(page.html or "")
-            if probe.get("surface") == "login_required":
-                self._search_surface_remap_attempted = True
-                page = await self.runner.run(op)
-        self._raise_if_login_required_shell(page)
         self._surface_page = page
         self._surface_page_start_row = start_row
         m = await active_map(self.db, SOURCE_NAME)
@@ -626,7 +608,7 @@ class PakistanLawSitePipeline:
         if page is None:
 
             async def op(browser: Browser) -> PageResult:
-                loaded = await browser.goto(settings.PLS_SEARCH_URL, archived_grid_start_row=row_offset)
+                loaded = await open_citation_search_for_harvest(browser, archived_grid_start_row=row_offset)
                 raise_for_verdict(loaded)
                 return loaded
 
@@ -1024,7 +1006,7 @@ class PakistanLawSitePipeline:
 
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         async def op(browser: Browser) -> PageResult:
-            await browser.goto(settings.PLS_SEARCH_URL)
+            await open_citation_search_for_harvest(browser)
             page = await browser.submit_search(search_map, values)
             raise_for_verdict(page)
             return page
@@ -1196,7 +1178,7 @@ class PakistanLawSitePipeline:
                     surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
                     stale_code = (
                         "SEARCH_MAP_NO_QUERY_FORM_STALE"
-                        if surface in ("no_query_form", "login_required")
+                        if surface == "no_query_form"
                         else "SEARCH_MAP_GRID_SURFACE_STALE"
                     )
                     await self.mark_frontier_stale_for_unmapped_surface(frontier, reason, code=stale_code)
@@ -1241,7 +1223,7 @@ class PakistanLawSitePipeline:
                 surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
                 stale_code = (
                     "SEARCH_MAP_NO_QUERY_FORM_STALE"
-                    if surface in ("no_query_form", "login_required")
+                    if surface == "no_query_form"
                     else "SEARCH_MAP_GRID_SURFACE_STALE"
                 )
                 await self.mark_frontier_stale_for_unmapped_surface(frontier, reason, code=stale_code)

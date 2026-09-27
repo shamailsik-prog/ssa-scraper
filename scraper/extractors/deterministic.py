@@ -556,8 +556,6 @@ def _surface_classification(soup: BeautifulSoup, form) -> str:
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     if (soup.find("table") is not None and controls) or re.search(r"\bcitation\s*search\b", title, re.IGNORECASE):
         return "grid_surface_no_query_form"
-    if not title and not _has_logout_link(soup):
-        return "login_required"
     return "no_query_form"
 
 
