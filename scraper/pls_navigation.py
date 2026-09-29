@@ -197,6 +197,28 @@ def _ordered_navigation_candidates(discovery: List[Dict[str, str]]) -> List[Dict
     return candidates
 
 
+async def _submit_warmup_citation_query_form(
+    browser: Browser,
+    html: str,
+    *,
+    via: str,
+) -> Optional[PageResult]:
+    """POST the CitationSearch query form using warmup field values."""
+    probe = introspect_search_form(html or "")
+    if probe.get("surface") != "query_form":
+        return None
+    search_map = _probe_to_search_map(probe)
+    if not search_map.get("fields"):
+        return None
+    values = _warmup_search_values(probe)
+    page = await browser.submit_search(search_map, values)
+    page.metadata = {
+        **(page.metadata or {}),
+        "pls_citation_search_nav": {"via": via, "warmup_values": values},
+    }
+    return page
+
+
 async def _submit_dashboard_citation_form(
     browser: Browser,
     *,
@@ -207,17 +229,12 @@ async def _submit_dashboard_citation_form(
     probe = introspect_search_form(check_html or "")
     if probe.get("surface") != "query_form":
         return None
-    search_map = _probe_to_search_map(probe)
-    if not search_map.get("fields"):
-        return None
-    values = _warmup_search_values(probe)
     await browser.goto(check_url)
-    page = await browser.submit_search(search_map, values)
-    page.metadata = {
-        **(page.metadata or {}),
-        "pls_citation_search_nav": {"via": "dashboard_form_submit", "warmup_values": values},
-    }
-    return page
+    return await _submit_warmup_citation_query_form(
+        browser,
+        check_html,
+        via="dashboard_form_submit",
+    )
 
 
 async def open_citation_search(browser: Browser, *, archived_grid_start_row: int = 0) -> PageResult:
@@ -273,6 +290,43 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
             page.metadata = {**(page.metadata or {}), "pls_citation_search_nav": nav_meta}
             return page
 
+    last_kind_before_fallback = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
+    if last_kind_before_fallback == "citation_search_form_only":
+        citation_form_page = await _submit_warmup_citation_query_form(
+            browser,
+            last_page.html or "",
+            via="citation_search_form_submit",
+        )
+        if citation_form_page is not None:
+            nav_meta["attempts"].append(
+                _attempt_record(
+                    citation_form_page,
+                    {"kind": "citation_form", "label": "citation_search_form_submit"},
+                    extra={
+                        "warmup": (citation_form_page.metadata or {}).get("pls_citation_search_nav", {}).get(
+                            "warmup_values"
+                        )
+                    },
+                )
+            )
+            if citation_search_surface_is_harvestable(citation_form_page.html or "", citation_form_page.metadata):
+                citation_form_page.metadata = {
+                    **(citation_form_page.metadata or {}),
+                    "pls_citation_search_nav": {**nav_meta, "via": "citation_search_form_submit"},
+                }
+                return citation_form_page
+            submit_kind = classify_pls_page(
+                citation_form_page.html or "",
+                citation_form_page.url or "",
+                citation_form_page.metadata,
+            )
+            if submit_kind == "citation_search_no_results":
+                last_page = citation_form_page
+            else:
+                after_probe = introspect_search_form(citation_form_page.html or "")
+                if after_probe.get("surface") == "query_form":
+                    last_page = citation_form_page
+
     form_page = await _submit_dashboard_citation_form(
         browser,
         check_url=check_url,
@@ -320,12 +374,17 @@ async def open_citation_search_for_harvest(browser: Browser, *, archived_grid_st
             page_type=page_type,
             page=page,
         )
-    if not citation_search_surface_is_harvestable(page.html or "", page.metadata):
-        nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
-        raise CitationSearchNavigationFailed(
-            f"CitationSearch navigation did not reach #archivedpatientGrid; attempts={len(nav.get('attempts') or [])}",
-            page_type=page_type,
-            page=page,
-        )
-    raise_for_verdict(page)
-    return page
+    if citation_search_surface_is_harvestable(page.html or "", page.metadata):
+        raise_for_verdict(page)
+        return page
+    probe = introspect_search_form(page.html or "")
+    if probe.get("surface") == "query_form" and (probe.get("fields") or []):
+        # Authenticated CitationSearch query form (form-based harvest); not a grid-only chrome page.
+        raise_for_verdict(page)
+        return page
+    nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
+    raise CitationSearchNavigationFailed(
+        f"CitationSearch navigation did not reach #archivedpatientGrid; attempts={len(nav.get('attempts') or [])}",
+        page_type=page_type,
+        page=page,
+    )
