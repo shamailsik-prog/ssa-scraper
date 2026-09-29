@@ -22,4 +22,6 @@ if pls_host_harvest_busy; then
   exit 0
 fi
 
-exec docker compose exec -T api python scripts/pls_server_login.py
+# Run as a package module so PYTHONPATH=/app always resolves `scraper` (scripts/pls_server_login.py
+# fails with ModuleNotFoundError when the container cwd or PYTHONPATH is not the repo root).
+exec docker compose exec -T -w /app api python -m scraper.tasks.pls_self_healing

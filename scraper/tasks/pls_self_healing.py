@@ -178,3 +178,13 @@ def pls_keepalive_hourly():
 @shared_task(name="scraper.tasks.pls_self_healing.pls_stall_watchdog")
 def pls_stall_watchdog():
     return run_async(stall_watchdog_pakistanlawsite())
+
+
+def _pls_keepalive_cli() -> int:
+    result = run_async(keepalive_pakistanlawsite_slots())
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_pls_keepalive_cli())

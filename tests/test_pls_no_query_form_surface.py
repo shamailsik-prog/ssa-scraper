@@ -16,6 +16,7 @@ from scraper.pls_navigation import (
     citation_search_surface_is_harvestable,
     classify_pls_page,
     discover_citation_search_entrypoints,
+    open_citation_grid_for_window,
     open_citation_search,
     open_citation_search_for_harvest,
     pls_check_url,
@@ -206,6 +207,56 @@ async def test_citation_search_form_only_triggers_form_fallback_attempt(fixture_
     assert "direct_referer" in kinds
     assert "citation_form" in kinds
     assert any(isinstance(c[0], tuple) and c[0][0] == "search" for c in browser.calls)
+
+
+async def test_no_results_stub_retries_dashboard_route_and_records_skipped_form(fixture_server, monkeypatch):
+    _wire_pls_urls(fixture_server, monkeypatch)
+    fixture_server.add("/Login/Check", pls_check_dashboard_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    fixture_server.add("/Login/CitationSearch", citation_search_empty_session_shell_html())
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
+    sc.page(
+        ("goto", fixture_server.url("/Login/GetStatuesSearch")),
+        pls_whats_new_table_html(),
+        url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    sc.page(("goto", settings.PLS_SEARCH_URL), citation_search_empty_session_shell_html(), url=settings.PLS_SEARCH_URL)
+    browser = await sc.factory()({}, 1)
+    page = await open_citation_search(browser)
+    nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
+    kinds = [a.get("kind") for a in nav.get("attempts") or []]
+    assert "dashboard_refresh" in kinds
+    assert any(a.get("skipped") == "no_query_form_on_login_check" for a in nav.get("attempts") or [])
+
+
+async def test_open_citation_grid_for_window_fast_reload_retries_dashboard_on_stub(fixture_server, monkeypatch):
+    _wire_pls_urls(fixture_server, monkeypatch)
+    fixture_server.add("/Login/Check", pls_check_dashboard_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    stub = citation_search_empty_session_shell_html()
+    grid = citation_search_archived_grid_html()
+    fast_calls = {"n": 0}
+
+    def citation_search_goto(browser, goto_kwargs=None):
+        referer = (goto_kwargs or {}).get("referer") or ""
+        if "/Login/Check" in referer and fast_calls["n"] == 0:
+            fast_calls["n"] += 1
+            return PageResult(url=settings.PLS_SEARCH_URL, html=stub, status=200)
+        return PageResult(url=settings.PLS_SEARCH_URL, html=grid, status=200)
+
+    sc = BrowserScript()
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = citation_search_goto
+    sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
+    sc.page(
+        ("goto", fixture_server.url("/Login/GetStatuesSearch")),
+        pls_whats_new_table_html(),
+        url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    browser = await sc.factory()({}, 1)
+    page = await open_citation_grid_for_window(browser, archived_grid_start_row=6000)
+    assert "archivedpatientGrid" in (page.html or "")
+    assert fast_calls["n"] == 1
 
 
 async def test_open_citation_search_for_harvest_rejects_no_results_stub(fixture_server, monkeypatch):
