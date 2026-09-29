@@ -11,15 +11,17 @@ TIP_FILE="state/tip_sha.txt"
 RESET_MARKER="state/reset_retired_frontier_sha.txt"
 CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 
-# PLS stack (shared corpus-service image).
-DEFAULT_APP_SERVICES=(api worker-scraper worker-public celery-beat)
+# PLS stack (shared corpus-service image). Beat is never started unless it was already running.
+DEFAULT_APP_SERVICES=(api worker-scraper worker-public)
 ALL_APP_SERVICES=(api worker-scraper worker-public worker-embed celery-beat celery-flower)
 
-WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-3300}"  # just under 55m (15m cron cadence)
+WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-600}"  # bounded wait before deploy when beat was running
 WAIT_POLL_SECONDS="${AUTO_DEPLOY_WAIT_POLL_SECONDS:-30}"
+DRY_RUN=0
 
 usage() {
   sed -n '2,8p' "$0"
+  printf '\n  --dry-run   log actions without git merge, compose, or beat changes\n'
   exit "${1:-0}"
 }
 
@@ -116,6 +118,10 @@ run_reset_frontier_once() {
     return 0
   fi
   log "Running reset-retired-frontier for $sha"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would run reset-retired-frontier for $sha"
+    return 0
+  fi
   if docker compose exec -T api python -m scraper.tasks.pls_admin reset-retired-frontier; then
     mkdir -p "$DIR/state"
     printf '%s\n' "$sha" >"$marker"
@@ -127,6 +133,7 @@ run_reset_frontier_once() {
 main() {
   case "${1:-}" in
     -h|--help) usage 0 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --install-cron)
       install_cron
       exit 0
@@ -147,7 +154,11 @@ main() {
   fi
 
   log "auto_deploy: fetch $REMOTE $BRANCH"
-  git fetch "$REMOTE" "$BRANCH"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would git fetch $REMOTE $BRANCH"
+  else
+    git fetch "$REMOTE" "$BRANCH"
+  fi
 
   local new_sha old_sha deployed_sha
   new_sha="$(git rev-parse "$REMOTE/$BRANCH")"
@@ -161,14 +172,32 @@ main() {
 
   if [ "$old_sha" = "$new_sha" ] && [ -z "$deployed_sha" ]; then
     log "checkout already at $new_sha; recording tip_sha without rollout"
-    printf '%s\n' "$new_sha" >"$TIP_FILE"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "dry-run: would record tip_sha=$new_sha"
+    else
+      printf '%s\n' "$new_sha" >"$TIP_FILE"
+    fi
     exit 0
   fi
 
-  wait_for_pls_idle
+  local beat_was_running=0
+  if pls_host_beat_running; then
+    beat_was_running=1
+    log "celery-beat is running; stopping beat before deploy and waiting for PLS idle"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "dry-run: would stop celery-beat"
+    else
+      pls_host_stop_beat
+    fi
+    wait_for_pls_idle
+  else
+    log "celery-beat is not running; deploy will not start beat"
+  fi
 
   log "deploying $old_sha -> $new_sha"
-  if ! git merge --ff-only "$REMOTE/$BRANCH"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would git merge --ff-only $REMOTE/$BRANCH"
+  elif ! git merge --ff-only "$REMOTE/$BRANCH"; then
     die "fast-forward merge failed; manual intervention required"
   fi
 
@@ -176,23 +205,58 @@ main() {
   services_line="$(services_for_diff "$old_sha" "$new_sha" || true)"
   if [ -z "$services_line" ]; then
     log "no service-impacting files changed; recording tip_sha only"
-    printf '%s\n' "$new_sha" >"$TIP_FILE"
-    run_reset_frontier_once "$new_sha"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "dry-run: would record tip_sha=$new_sha"
+    else
+      printf '%s\n' "$new_sha" >"$TIP_FILE"
+      run_reset_frontier_once "$new_sha"
+    fi
+    if [ "$beat_was_running" = 1 ]; then
+      if [ "$DRY_RUN" = 1 ]; then
+        log "dry-run: would restart celery-beat"
+      else
+        pls_host_start_beat
+      fi
+    fi
     exit 0
   fi
   read -r -a services <<<"$services_line"
+  if [ "$beat_was_running" = 0 ]; then
+    local filtered=()
+    for svc in "${services[@]}"; do
+      [ "$svc" = "celery-beat" ] && continue
+      filtered+=("$svc")
+    done
+    services=("${filtered[@]}")
+  fi
 
   export AUTO_DEPLOY_SERVICES="${services[*]}"
   log "rolling out via cloud/install.sh --deploy-only (fail-safe): ${services[*]}"
-  if ! SSA_SCRAPER_DIR="$DIR" bash "$DIR/cloud/install.sh" --deploy-only --dir "$DIR" --skip-docker-install --skip-firewall; then
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would run install.sh --deploy-only with AUTO_DEPLOY_SERVICES=${services[*]}"
+  elif ! SSA_SCRAPER_DIR="$DIR" bash "$DIR/cloud/install.sh" --deploy-only --dir "$DIR" --skip-docker-install --skip-firewall; then
     log "install.sh --deploy-only FAILED — leaving existing containers running"
     git reset --hard "$old_sha" || true
+    if [ "$beat_was_running" = 1 ]; then
+      pls_host_start_beat || true
+    fi
     exit 1
   fi
 
-  run_reset_frontier_once "$new_sha"
-  printf '%s\n' "$new_sha" >"$TIP_FILE"
-  log "deploy complete; tip_sha=$new_sha"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would record tip_sha=$new_sha and run reset-retired-frontier"
+  else
+    run_reset_frontier_once "$new_sha"
+    printf '%s\n' "$new_sha" >"$TIP_FILE"
+  fi
+  if [ "$beat_was_running" = 1 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      log "dry-run: would restart celery-beat"
+    else
+      pls_host_start_beat
+    fi
+  fi
+  log "deploy complete; tip_sha=$new_sha beat_restarted=$beat_was_running"
 }
 
 main "$@"

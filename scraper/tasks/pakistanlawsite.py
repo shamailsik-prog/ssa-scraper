@@ -37,6 +37,7 @@ from scraper.auth.session_manager import (
     SessionLock,
     SessionLockHeld,
     merge_source_config,
+    release_page_result,
     SessionManager,
     playwright_browser_factory,
     raise_for_verdict,
@@ -656,8 +657,14 @@ class PakistanLawSitePipeline:
                 raise
             self._citation_grid_fast_reload = True
         extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
-        outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
+        grid_html = page.html
+        grid_url = page.url
+        grid_metadata = dict(page.metadata or {})
+        outcome = await extractor.extract_result_rows(html=grid_html, search_map=search_map, base_url=grid_url)
         rows = outcome.data.get("result_rows") or []
+        release_page_result(page)
+        page = None
+        del grid_html
         m = await active_map(self.db, SOURCE_NAME)
         if m is not None and rows:
             # A window with rows proves the grid map; an empty window (a bounce, the end of the
@@ -671,7 +678,7 @@ class PakistanLawSitePipeline:
             return result
         row_count = len(rows)
         result["rows"] = row_count
-        total_rows_meta = (page.metadata or {}).get("total_rows")
+        total_rows_meta = grid_metadata.get("total_rows")
         try:
             total_rows = int(total_rows_meta) if total_rows_meta is not None else None
         except Exception:
@@ -685,8 +692,8 @@ class PakistanLawSitePipeline:
             total_rows = row_count
         if row_offset >= total_rows:
             row_offset = row_offset % total_rows
-        start_row_meta = (page.metadata or {}).get("start_row")
-        seek_mode = str((page.metadata or {}).get("seek_mode") or "").strip().lower()
+        start_row_meta = grid_metadata.get("start_row")
+        seek_mode = str(grid_metadata.get("seek_mode") or "").strip().lower()
         try:
             snapshot_start_row = int(start_row_meta) if start_row_meta is not None else 0
         except Exception:
@@ -976,6 +983,7 @@ class PakistanLawSitePipeline:
             detail = await self.fetch_detail(detail_url)
             detail_attempts += 1
             result_kind = await self.preserve_and_extract(detail, route, row)
+            release_page_result(detail)
             details_since_flush += 1
             if result_kind == "staged":
                 staged_since_flush += 1
@@ -1030,6 +1038,7 @@ class PakistanLawSitePipeline:
             next_offset,
             wrapped,
         )
+        rows.clear()
         return result
 
     # ---------------------------------------------------------------- one result page

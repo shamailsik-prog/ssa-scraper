@@ -10,7 +10,7 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
-from scraper.auth.session_manager import Browser, LoginRequired, PageResult, raise_for_verdict
+from scraper.auth.session_manager import Browser, LoginRequired, PageResult, raise_for_verdict, trim_pls_citation_search_nav
 from scraper.config import settings
 from scraper.extractors.deterministic import _has_archived_patient_grid, _has_logout_link, introspect_search_form
 
@@ -238,7 +238,10 @@ async def _walk_navigation_candidates(
         nav_meta["attempts"].append(attempt)
         last_page = page
         if citation_search_surface_is_harvestable(page.html or "", page.metadata):
-            page.metadata = {**(page.metadata or {}), "pls_citation_search_nav": nav_meta}
+            page.metadata = {
+                **(page.metadata or {}),
+                "pls_citation_search_nav": trim_pls_citation_search_nav(nav_meta),
+            }
             return page
     assert last_page is not None
     return last_page
@@ -444,7 +447,7 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
     )
     last_page.metadata = {
         **(last_page.metadata or {}),
-        "pls_citation_search_nav": nav_meta,
+        "pls_citation_search_nav": trim_pls_citation_search_nav(nav_meta),
         "pls_page_type": last_kind,
     }
     return last_page
