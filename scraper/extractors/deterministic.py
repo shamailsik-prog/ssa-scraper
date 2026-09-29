@@ -449,6 +449,7 @@ ROLE_HINTS = {
     "citation": ("citation_no", "cite_no", "citationnumber"),
     "page": ("page", "pg"),
     "court": ("court",),
+    "category": ("category",),
     "statute": ("statute", "act", "law"),
     "section": ("section", "sec"),
     "keyword": ("keyword", "search", "q", "party", "text", "query", "words"),

@@ -1058,17 +1058,18 @@ class PlaywrightBrowser:
     async def goto(self, url: str, **kwargs: Any) -> PageResult:
         archived_grid_start_row = kwargs.get("archived_grid_start_row", 0)
         capture_case_description_modal = bool(kwargs.get("capture_case_description_modal", False))
+        referer = (kwargs.get("referer") or "").strip() or None
         try:
             url = self._assert_url_policy(url)
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
-        resp = await self._wrap(
-            self._page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=settings.PLAYWRIGHT_TIMEOUT_MS,
-            )
-        )
+        goto_kwargs: Dict[str, Any] = {
+            "wait_until": "domcontentloaded",
+            "timeout": settings.PLAYWRIGHT_TIMEOUT_MS,
+        }
+        if referer:
+            goto_kwargs["referer"] = referer
+        resp = await self._wrap(self._page.goto(url, **goto_kwargs))
         try:
             self._assert_url_policy(self._page.url)
         except URLPolicyError as exc:
@@ -1092,6 +1093,8 @@ class PlaywrightBrowser:
         final_url = self._page.url
         metadata["requested_url"] = requested_url
         metadata["final_url"] = final_url
+        if referer:
+            metadata["referer"] = referer
         has_case_content = bool(re.search(r"Citation\s*Name\s*:", html_text or "", flags=re.IGNORECASE))
         requested_reference_path = bool(re.search(r"ReferenceCaseLawSearch", requested_url or "", flags=re.IGNORECASE))
         rewrite_login_check = (
