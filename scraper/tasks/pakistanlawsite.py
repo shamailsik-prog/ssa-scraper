@@ -43,7 +43,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.pls_navigation import open_citation_search_for_harvest
+from scraper.pls_navigation import CitationSearchNavigationFailed, open_citation_search_for_harvest
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
@@ -489,7 +489,18 @@ class PakistanLawSitePipeline:
         async def op(browser: Browser) -> PageResult:
             return await open_citation_search_for_harvest(browser, archived_grid_start_row=start_row)
 
-        page = await self.runner.run(op)
+        try:
+            page = await self.runner.run(op)
+        except CitationSearchNavigationFailed as exc:
+            logger.error(
+                "PakistanLawSite CitationSearch navigation failed (page_type=%s): %s",
+                exc.page_type,
+                exc,
+            )
+            m = await active_map(self.db, SOURCE_NAME)
+            if m is not None:
+                return map_as_dict(m)
+            raise LoginRequired(str(exc)) from exc
         self._surface_page = page
         self._surface_page_start_row = start_row
         m = await active_map(self.db, SOURCE_NAME)

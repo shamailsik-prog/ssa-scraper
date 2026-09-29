@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -18,11 +19,46 @@ logger = logging.getLogger(__name__)
 _LOGIN_PATH_MARKERS = ("/login/mainpage", "/login/login", "/login/index")
 
 
+class CitationSearchNavigationFailed(RuntimeError):
+    """CitationSearch did not render #archivedpatientGrid (session may still be valid)."""
+
+    def __init__(self, message: str, *, page_type: str = "other", page: Optional[PageResult] = None):
+        super().__init__(message)
+        self.page_type = page_type
+        self.page = page
+_NO_RESULTS_STUB_RE = re.compile(r"no\s+more\s+result\s+found\s+on\s+your\s+search", re.IGNORECASE)
+
+
 def pls_check_url() -> str:
     explicit = (getattr(settings, "PLS_CHECK_URL", None) or "").strip()
     if explicit:
         return explicit
     return f"{settings.PLS_BASE_URL.rstrip('/')}/Login/Check"
+
+
+def classify_pls_page(html: str, url: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
+    """Classify an authenticated PLS HTML surface for harvest diagnostics."""
+    if citation_search_surface_is_harvestable(html or "", metadata):
+        return "citation_search_grid"
+    text = (html or "")[:50_000]
+    if _NO_RESULTS_STUB_RE.search(text):
+        return "citation_search_no_results"
+    url_low = (url or "").lower()
+    if "/login/check" in url_low and check_page_login_required_reason(html or "", url) is None:
+        probe = introspect_search_form(html or "")
+        if probe.get("surface") == "query_form":
+            return "dashboard_with_citation_form"
+        return "dashboard"
+    probe = introspect_search_form(html or "")
+    if probe.get("surface") == "query_form":
+        return "citation_search_form_only"
+    if probe.get("surface") == "grid_surface_no_query_form":
+        return "citation_search_grid_chrome_only"
+    if probe.get("surface") == "no_query_form":
+        return "citation_search_empty_shell"
+    if check_page_login_required_reason(html or "", url):
+        return "login_or_check_failure"
+    return "other"
 
 
 def discover_citation_search_entrypoints(html: str, base_url: str) -> List[Dict[str, str]]:
@@ -92,11 +128,96 @@ def citation_search_surface_is_harvestable(html: str, metadata: Optional[Dict[st
     return _has_archived_patient_grid(soup)
 
 
+def _probe_to_search_map(probe: Dict[str, Any]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    for field in probe.get("fields") or []:
+        role = field.get("role") or field.get("name")
+        if not role:
+            continue
+        fields[str(role)] = {
+            "name": field.get("name"),
+            "selector": field.get("selector"),
+            "kind": field.get("kind") or "text",
+        }
+    return {"fields": fields}
+
+
+def _warmup_search_values(probe: Dict[str, Any]) -> Dict[str, str]:
+    """Default citation-search warmup values (year, reporter, court, category) from settings."""
+    values: Dict[str, str] = {}
+    reporters = list(settings.subscribed_reporters or [])
+    current_year = datetime.now(timezone.utc).year
+    year = int(getattr(settings, "PLS_EARLIEST_YEAR", 0) or 0) or current_year
+    fields_by_role = {f.get("role"): f for f in (probe.get("fields") or []) if f.get("role")}
+    if "year" in fields_by_role:
+        values["year"] = str(year)
+    if "reporter" in fields_by_role and reporters:
+        rep_field = fields_by_role["reporter"]
+        opts = rep_field.get("options") or []
+        pick = reporters[0]
+        if opts and pick not in opts:
+            for candidate in reporters:
+                if candidate in opts:
+                    pick = candidate
+                    break
+        values["reporter"] = pick
+    for role in ("court", "category"):
+        field = fields_by_role.get(role)
+        if not field:
+            continue
+        opts = [str(o) for o in (field.get("options") or []) if str(o).strip()]
+        if opts:
+            values[role] = opts[0]
+    return values
+
+
+def _attempt_record(page: PageResult, candidate: Dict[str, str], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    record: Dict[str, Any] = {
+        "kind": candidate.get("kind"),
+        "label": candidate.get("label"),
+        "url": page.url,
+        "surface": introspect_search_form(page.html or "").get("surface"),
+        "page_type": classify_pls_page(page.html or "", page.url or "", page.metadata),
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
 def _ordered_navigation_candidates(discovery: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    order = {"ajax": 0, "link": 1, "direct": 9}
+    order = {"ajax": 0, "link": 1, "direct_referer": 2, "direct": 9}
     candidates = sorted(discovery, key=lambda item: order.get(item.get("kind") or "link", 5))
-    candidates.append({"kind": "direct", "url": settings.PLS_SEARCH_URL, "label": "PLS_SEARCH_URL"})
+    candidates.append(
+        {
+            "kind": "direct_referer",
+            "url": settings.PLS_SEARCH_URL,
+            "label": "PLS_SEARCH_URL with Referer=/Login/Check",
+        }
+    )
     return candidates
+
+
+async def _submit_dashboard_citation_form(
+    browser: Browser,
+    *,
+    check_url: str,
+    check_html: str,
+    archived_grid_start_row: int,
+) -> Optional[PageResult]:
+    probe = introspect_search_form(check_html or "")
+    if probe.get("surface") != "query_form":
+        return None
+    search_map = _probe_to_search_map(probe)
+    if not search_map.get("fields"):
+        return None
+    values = _warmup_search_values(probe)
+    await browser.goto(check_url)
+    page = await browser.submit_search(search_map, values)
+    page.metadata = {
+        **(page.metadata or {}),
+        "pls_citation_search_nav": {"via": "dashboard_form_submit", "warmup_values": values},
+    }
+    return page
 
 
 async def open_citation_search(browser: Browser, *, archived_grid_start_row: int = 0) -> PageResult:
@@ -129,36 +250,82 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
                 return clicked
             if clicked is not None:
                 nav_meta["attempts"].append(
-                    {
-                        "kind": "dashboard_click",
-                        "surface": introspect_search_form(clicked.html or "").get("surface"),
-                        "url": clicked.url,
-                    }
+                    _attempt_record(
+                        clicked,
+                        {"kind": "dashboard_click", "label": "dashboard_click"},
+                    )
                 )
         except Exception as exc:
             logger.warning("PakistanLawSite dashboard citation-search click failed: %s", exc)
             nav_meta["click_error"] = str(exc)[:300]
 
     last_page = check_page
+    referer = check_page.url or check_url
     for candidate in _ordered_navigation_candidates(discovery):
-        page = await browser.goto(candidate["url"], archived_grid_start_row=archived_grid_start_row)
-        attempt = {
-            "kind": candidate.get("kind"),
-            "label": candidate.get("label"),
-            "url": page.url,
-            "surface": introspect_search_form(page.html or "").get("surface"),
-        }
+        goto_kwargs: Dict[str, Any] = {"archived_grid_start_row": archived_grid_start_row}
+        if candidate.get("kind") == "direct_referer":
+            goto_kwargs["referer"] = referer
+        page = await browser.goto(candidate["url"], **goto_kwargs)
+        attempt = _attempt_record(page, candidate)
         nav_meta["attempts"].append(attempt)
         last_page = page
         if citation_search_surface_is_harvestable(page.html or "", page.metadata):
             page.metadata = {**(page.metadata or {}), "pls_citation_search_nav": nav_meta}
             return page
 
-    last_page.metadata = {**(last_page.metadata or {}), "pls_citation_search_nav": nav_meta}
+    form_page = await _submit_dashboard_citation_form(
+        browser,
+        check_url=check_url,
+        check_html=check_page.html or "",
+        archived_grid_start_row=archived_grid_start_row,
+    )
+    if form_page is not None:
+        nav_meta["attempts"].append(
+            _attempt_record(
+                form_page,
+                {"kind": "dashboard_form", "label": "dashboard_citation_form_submit"},
+                extra={"warmup": (form_page.metadata or {}).get("pls_citation_search_nav", {}).get("warmup_values")},
+            )
+        )
+        last_page = form_page
+        if citation_search_surface_is_harvestable(form_page.html or "", form_page.metadata):
+            form_page.metadata = {
+                **(form_page.metadata or {}),
+                "pls_citation_search_nav": {**nav_meta, "via": "dashboard_form_submit"},
+            }
+            return form_page
+
+    last_kind = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
+    logger.error(
+        "PakistanLawSite citation-search navigation failed: final page_type=%s url=%s attempts=%s",
+        last_kind,
+        last_page.url,
+        nav_meta.get("attempts"),
+    )
+    last_page.metadata = {
+        **(last_page.metadata or {}),
+        "pls_citation_search_nav": nav_meta,
+        "pls_page_type": last_kind,
+    }
     return last_page
 
 
 async def open_citation_search_for_harvest(browser: Browser, *, archived_grid_start_row: int = 0) -> PageResult:
     page = await open_citation_search(browser, archived_grid_start_row=archived_grid_start_row)
+    page_type = classify_pls_page(page.html or "", page.url or "", page.metadata)
+    page.metadata = {**(page.metadata or {}), "pls_page_type": page_type}
+    if page_type == "citation_search_no_results":
+        raise CitationSearchNavigationFailed(
+            "CitationSearch returned the no-results stub (not #archivedpatientGrid)",
+            page_type=page_type,
+            page=page,
+        )
+    if not citation_search_surface_is_harvestable(page.html or "", page.metadata):
+        nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
+        raise CitationSearchNavigationFailed(
+            f"CitationSearch navigation did not reach #archivedpatientGrid; attempts={len(nav.get('attempts') or [])}",
+            page_type=page_type,
+            page=page,
+        )
     raise_for_verdict(page)
     return page

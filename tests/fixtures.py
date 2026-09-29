@@ -106,6 +106,26 @@ def pls_check_dashboard_html() -> str:
     </body></html>"""
 
 
+def pls_check_dashboard_with_citation_form_html() -> str:
+    """Authenticated /Login/Check with the in-page Citation Search POST form (live site shape)."""
+    return """<html><head><title>Pakistan Law Site</title></head><body>
+    <a href="/logout">Logout</a>
+    <form id="frmCitationSearch" action="/Login/CitationSearch" method="post">
+      <input type="hidden" name="__RequestVerificationToken" value="fixture-token" />
+      <label for="txtYear">Enter Year</label>
+      <input id="txtYear" name="Year" type="number" required />
+      <label for="ddlCourt">Court</label>
+      <select id="ddlCourt" name="Court"><option value="SC">Supreme Court</option></select>
+      <label for="ddlCategory">Category</label>
+      <select id="ddlCategory" name="Category"><option value="0">All</option></select>
+      <button id="btnCitationSearch" type="submit" name="btnSearch">Citation Search</button>
+    </form>
+    <script>
+    $.ajax({url:'/Login/GetStatuesSearch', success:function(d){ $('#rightmenu').html(d);}});
+    </script>
+    </body></html>"""
+
+
 def citation_search_no_query_form_html() -> str:
     """Non-empty title but no query form and no archivedpatientGrid (maps no_query_form)."""
     return "<html><head><title>Pakistan Law Site</title></head><body><p>Loading…</p></body></html>"
@@ -295,7 +315,7 @@ class FakeBrowser:
 
     async def goto(self, url: str, **kwargs) -> PageResult:
         self.calls.append(("goto", url, self.slot_number, kwargs))
-        return self.script.respond(("goto", url), self)
+        return self.script.respond(("goto", url), self, goto_kwargs=kwargs)
 
     async def goto_citation_search(self, **kwargs) -> PageResult:
         from scraper.pls_navigation import open_citation_search
@@ -342,14 +362,18 @@ class BrowserScript:
     def fail_once(self, key, exc) -> None:
         self.failures.setdefault(key, []).append(exc)
 
-    def respond(self, key, browser: FakeBrowser) -> PageResult:
+    def respond(self, key, browser: FakeBrowser, goto_kwargs: Optional[Dict[str, Any]] = None) -> PageResult:
         self.log.append((key, browser.slot_number))
         pending = self.failures.get(key)
         if pending:
             exc = pending.pop(0)
             raise exc
         if key in self.routes:
-            return self.routes[key](browser)
+            handler = self.routes[key]
+            try:
+                return handler(browser, goto_kwargs=goto_kwargs or {})
+            except TypeError:
+                return handler(browser)
         if key[0] == "search" and self.default_search:
             return self.default_search(dict(key[1]), browser)
         if key[0] == "goto":
