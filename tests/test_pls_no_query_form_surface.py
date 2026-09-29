@@ -178,6 +178,36 @@ async def test_dashboard_form_submit_reaches_archived_grid(fixture_server, monke
     assert nav.get("via") == "dashboard_form_submit"
 
 
+async def test_citation_search_form_only_triggers_form_fallback_attempt(fixture_server, monkeypatch):
+    """Form-only CitationSearch (no grid) must POST warmup before failing harvest without a grid."""
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 2024)
+    _wire_pls_urls(fixture_server, monkeypatch)
+    fixture_server.add("/Login/Check", pls_check_dashboard_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    fixture_server.add("/Login/CitationSearch", search_form_html())
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
+    sc.page(
+        ("goto", fixture_server.url("/Login/GetStatuesSearch")),
+        pls_whats_new_table_html(),
+        url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    sc.page(("goto", settings.PLS_SEARCH_URL), search_form_html(), url=settings.PLS_SEARCH_URL)
+    sc.default_search = lambda values, browser: PageResult(
+        url=settings.PLS_SEARCH_URL,
+        html=citation_search_empty_session_shell_html(),
+    )
+    browser = await sc.factory()({}, 1)
+    with pytest.raises(CitationSearchNavigationFailed, match="no-results stub") as raised:
+        await open_citation_search_for_harvest(browser)
+    nav = ((raised.value.page.metadata if raised.value.page else {}) or {}).get("pls_citation_search_nav") or {}
+    kinds = [a.get("kind") for a in nav.get("attempts") or []]
+    assert "direct_referer" in kinds
+    assert "citation_form" in kinds
+    assert any(isinstance(c[0], tuple) and c[0][0] == "search" for c in browser.calls)
+
+
 async def test_open_citation_search_for_harvest_rejects_no_results_stub(fixture_server, monkeypatch):
     _wire_pls_urls(fixture_server, monkeypatch)
     fixture_server.add("/Login/Check", pls_check_dashboard_html())
