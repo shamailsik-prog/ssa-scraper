@@ -4,6 +4,7 @@ import pytest
 
 from scraper.auth.session_manager import LoginRequired
 from scraper.tasks.search_map import active_map, map_search_form
+from tests.fixtures import search_form_html
 
 
 MAINPAGE_HTML = """<html><body><form id="mainLoginForm">
@@ -16,7 +17,7 @@ async def test_login_page_does_not_overwrite_active_search_map(db, login_source)
     first = await map_search_form(
         db,
         login_source,
-        '<html><body><form><input name="reporter"><input name="year"></form></body></html>',
+        search_form_html(),
         page_url="https://www.pakistanlawsite.com/Login/CitationSearch",
     )
     version = first.map_version
