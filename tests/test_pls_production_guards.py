@@ -35,3 +35,16 @@ def test_host_auto_deploy_and_keepalive_scripts_exist():
     assert Path("scripts/auto_deploy.sh").is_file()
     assert Path("scripts/pls_keepalive_cron.sh").is_file()
     assert Path("scripts/pls_host_lib.sh").is_file()
+
+
+def test_pls_keepalive_cron_runs_self_healing_module_in_container():
+    text = Path("scripts/pls_keepalive_cron.sh").read_text(encoding="utf-8")
+    assert "python -m scraper.tasks.pls_self_healing" in text
+    assert "exec docker compose exec" in text
+    assert "python scripts/pls_server_login.py" not in text
+
+
+def test_pls_self_healing_module_is_keepalive_cli_entrypoint():
+    text = Path("scraper/tasks/pls_self_healing.py").read_text(encoding="utf-8")
+    assert 'if __name__ == "__main__"' in text
+    assert "keepalive_pakistanlawsite_slots" in text

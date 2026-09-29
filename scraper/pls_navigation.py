@@ -219,6 +219,110 @@ async def _submit_warmup_citation_query_form(
     return page
 
 
+async def _walk_navigation_candidates(
+    browser: Browser,
+    *,
+    discovery: List[Dict[str, str]],
+    referer: str,
+    nav_meta: Dict[str, Any],
+    archived_grid_start_row: int,
+) -> PageResult:
+    """Try discovered entrypoints and direct_referer; return the last page loaded."""
+    last_page: Optional[PageResult] = None
+    for candidate in _ordered_navigation_candidates(discovery):
+        goto_kwargs: Dict[str, Any] = {"archived_grid_start_row": archived_grid_start_row}
+        if candidate.get("kind") == "direct_referer":
+            goto_kwargs["referer"] = referer
+        page = await browser.goto(candidate["url"], **goto_kwargs)
+        attempt = _attempt_record(page, candidate)
+        nav_meta["attempts"].append(attempt)
+        last_page = page
+        if citation_search_surface_is_harvestable(page.html or "", page.metadata):
+            page.metadata = {**(page.metadata or {}), "pls_citation_search_nav": nav_meta}
+            return page
+    assert last_page is not None
+    return last_page
+
+
+async def _apply_query_form_fallbacks(
+    browser: Browser,
+    *,
+    check_url: str,
+    check_html: str,
+    last_page: PageResult,
+    nav_meta: Dict[str, Any],
+    archived_grid_start_row: int,
+) -> PageResult:
+    """CitationSearch form POST and dashboard form POST after candidate navigation misses the grid."""
+    last_kind_before_fallback = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
+    if last_kind_before_fallback == "citation_search_form_only":
+        citation_form_page = await _submit_warmup_citation_query_form(
+            browser,
+            last_page.html or "",
+            via="citation_search_form_submit",
+        )
+        if citation_form_page is not None:
+            nav_meta["attempts"].append(
+                _attempt_record(
+                    citation_form_page,
+                    {"kind": "citation_form", "label": "citation_search_form_submit"},
+                    extra={
+                        "warmup": (citation_form_page.metadata or {}).get("pls_citation_search_nav", {}).get(
+                            "warmup_values"
+                        )
+                    },
+                )
+            )
+            if citation_search_surface_is_harvestable(citation_form_page.html or "", citation_form_page.metadata):
+                citation_form_page.metadata = {
+                    **(citation_form_page.metadata or {}),
+                    "pls_citation_search_nav": {**nav_meta, "via": "citation_search_form_submit"},
+                }
+                return citation_form_page
+            submit_kind = classify_pls_page(
+                citation_form_page.html or "",
+                citation_form_page.url or "",
+                citation_form_page.metadata,
+            )
+            if submit_kind == "citation_search_no_results":
+                last_page = citation_form_page
+            else:
+                after_probe = introspect_search_form(citation_form_page.html or "")
+                if after_probe.get("surface") == "query_form":
+                    last_page = citation_form_page
+
+    form_page = await _submit_dashboard_citation_form(
+        browser,
+        check_url=check_url,
+        check_html=check_html,
+        archived_grid_start_row=archived_grid_start_row,
+    )
+    if form_page is not None:
+        nav_meta["attempts"].append(
+            _attempt_record(
+                form_page,
+                {"kind": "dashboard_form", "label": "dashboard_citation_form_submit"},
+                extra={"warmup": (form_page.metadata or {}).get("pls_citation_search_nav", {}).get("warmup_values")},
+            )
+        )
+        last_page = form_page
+        if citation_search_surface_is_harvestable(form_page.html or "", form_page.metadata):
+            form_page.metadata = {
+                **(form_page.metadata or {}),
+                "pls_citation_search_nav": {**nav_meta, "via": "dashboard_form_submit"},
+            }
+            return form_page
+    elif introspect_search_form(check_html or "").get("surface") != "query_form":
+        nav_meta["attempts"].append(
+            {
+                "kind": "dashboard_form",
+                "label": "dashboard_citation_form_submit",
+                "skipped": "no_query_form_on_login_check",
+            }
+        )
+    return last_page
+
+
 async def _submit_dashboard_citation_form(
     browser: Browser,
     *,
@@ -276,78 +380,60 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
             logger.warning("PakistanLawSite dashboard citation-search click failed: %s", exc)
             nav_meta["click_error"] = str(exc)[:300]
 
-    last_page = check_page
     referer = check_page.url or check_url
-    for candidate in _ordered_navigation_candidates(discovery):
-        goto_kwargs: Dict[str, Any] = {"archived_grid_start_row": archived_grid_start_row}
-        if candidate.get("kind") == "direct_referer":
-            goto_kwargs["referer"] = referer
-        page = await browser.goto(candidate["url"], **goto_kwargs)
-        attempt = _attempt_record(page, candidate)
-        nav_meta["attempts"].append(attempt)
-        last_page = page
-        if citation_search_surface_is_harvestable(page.html or "", page.metadata):
-            page.metadata = {**(page.metadata or {}), "pls_citation_search_nav": nav_meta}
-            return page
+    last_page = await _walk_navigation_candidates(
+        browser,
+        discovery=discovery,
+        referer=referer,
+        nav_meta=nav_meta,
+        archived_grid_start_row=archived_grid_start_row,
+    )
+    if citation_search_surface_is_harvestable(last_page.html or "", last_page.metadata):
+        return last_page
 
-    last_kind_before_fallback = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
-    if last_kind_before_fallback == "citation_search_form_only":
-        citation_form_page = await _submit_warmup_citation_query_form(
-            browser,
-            last_page.html or "",
-            via="citation_search_form_submit",
-        )
-        if citation_form_page is not None:
-            nav_meta["attempts"].append(
-                _attempt_record(
-                    citation_form_page,
-                    {"kind": "citation_form", "label": "citation_search_form_submit"},
-                    extra={
-                        "warmup": (citation_form_page.metadata or {}).get("pls_citation_search_nav", {}).get(
-                            "warmup_values"
-                        )
-                    },
-                )
-            )
-            if citation_search_surface_is_harvestable(citation_form_page.html or "", citation_form_page.metadata):
-                citation_form_page.metadata = {
-                    **(citation_form_page.metadata or {}),
-                    "pls_citation_search_nav": {**nav_meta, "via": "citation_search_form_submit"},
-                }
-                return citation_form_page
-            submit_kind = classify_pls_page(
-                citation_form_page.html or "",
-                citation_form_page.url or "",
-                citation_form_page.metadata,
-            )
-            if submit_kind == "citation_search_no_results":
-                last_page = citation_form_page
-            else:
-                after_probe = introspect_search_form(citation_form_page.html or "")
-                if after_probe.get("surface") == "query_form":
-                    last_page = citation_form_page
-
-    form_page = await _submit_dashboard_citation_form(
+    last_page = await _apply_query_form_fallbacks(
         browser,
         check_url=check_url,
         check_html=check_page.html or "",
+        last_page=last_page,
+        nav_meta=nav_meta,
         archived_grid_start_row=archived_grid_start_row,
     )
-    if form_page is not None:
+    if citation_search_surface_is_harvestable(last_page.html or "", last_page.metadata):
+        return last_page
+
+    last_kind = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
+    if last_kind == "citation_search_no_results" and not nav_meta.get("stub_dashboard_recovery"):
+        nav_meta["stub_dashboard_recovery"] = True
+        fresh_check = await browser.goto(check_url)
         nav_meta["attempts"].append(
             _attempt_record(
-                form_page,
-                {"kind": "dashboard_form", "label": "dashboard_citation_form_submit"},
-                extra={"warmup": (form_page.metadata or {}).get("pls_citation_search_nav", {}).get("warmup_values")},
+                fresh_check,
+                {"kind": "dashboard_refresh", "label": "refresh_login_check_after_no_results_stub"},
             )
         )
-        last_page = form_page
-        if citation_search_surface_is_harvestable(form_page.html or "", form_page.metadata):
-            form_page.metadata = {
-                **(form_page.metadata or {}),
-                "pls_citation_search_nav": {**nav_meta, "via": "dashboard_form_submit"},
-            }
-            return form_page
+        fresh_base = f"{urlsplit(fresh_check.url or check_url).scheme}://{urlsplit(fresh_check.url or check_url).netloc}"
+        fresh_discovery = discover_citation_search_entrypoints(fresh_check.html or "", fresh_base)
+        fresh_referer = fresh_check.url or check_url
+        last_page = await _walk_navigation_candidates(
+            browser,
+            discovery=fresh_discovery,
+            referer=fresh_referer,
+            nav_meta=nav_meta,
+            archived_grid_start_row=archived_grid_start_row,
+        )
+        if citation_search_surface_is_harvestable(last_page.html or "", last_page.metadata):
+            return last_page
+        last_page = await _apply_query_form_fallbacks(
+            browser,
+            check_url=check_url,
+            check_html=fresh_check.html or "",
+            last_page=last_page,
+            nav_meta=nav_meta,
+            archived_grid_start_row=archived_grid_start_row,
+        )
+        if citation_search_surface_is_harvestable(last_page.html or "", last_page.metadata):
+            return last_page
 
     last_kind = classify_pls_page(last_page.html or "", last_page.url or "", last_page.metadata)
     logger.error(
@@ -362,6 +448,58 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
         "pls_page_type": last_kind,
     }
     return last_page
+
+
+def _raise_unless_citation_grid_harvestable(page: PageResult) -> PageResult:
+    """Grid harvest only: #archivedpatientGrid required (never the no-results stub)."""
+    page_type = classify_pls_page(page.html or "", page.url or "", page.metadata)
+    page.metadata = {**(page.metadata or {}), "pls_page_type": page_type}
+    if page_type == "citation_search_no_results":
+        raise CitationSearchNavigationFailed(
+            "CitationSearch returned the no-results stub (not #archivedpatientGrid)",
+            page_type=page_type,
+            page=page,
+        )
+    if not citation_search_surface_is_harvestable(page.html or "", page.metadata):
+        nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
+        raise CitationSearchNavigationFailed(
+            f"CitationSearch navigation did not reach #archivedpatientGrid; attempts={len(nav.get('attempts') or [])}",
+            page_type=page_type,
+            page=page,
+        )
+    raise_for_verdict(page)
+    return page
+
+
+async def open_citation_grid_for_window(
+    browser: Browser,
+    *,
+    archived_grid_start_row: int = 0,
+) -> PageResult:
+    """Reload the citation grid for the next window: fast referer GET, then one full dashboard navigation on stub."""
+    check_url = pls_check_url()
+    page = await browser.goto(
+        settings.PLS_SEARCH_URL,
+        referer=check_url,
+        archived_grid_start_row=archived_grid_start_row,
+    )
+    page.metadata = {
+        **(page.metadata or {}),
+        "pls_citation_search_nav": {"via": "citation_grid_fast_reload", "attempts": []},
+    }
+    if citation_search_surface_is_harvestable(page.html or "", page.metadata):
+        return _raise_unless_citation_grid_harvestable(page)
+
+    page_type = classify_pls_page(page.html or "", page.url or "", page.metadata)
+    if page_type == "citation_search_no_results":
+        logger.warning(
+            "PakistanLawSite citation-grid fast reload returned no-results stub at row=%s; retrying via dashboard navigation once",
+            archived_grid_start_row,
+        )
+        page = await open_citation_search(browser, archived_grid_start_row=archived_grid_start_row)
+        return _raise_unless_citation_grid_harvestable(page)
+
+    return _raise_unless_citation_grid_harvestable(page)
 
 
 async def open_citation_search_for_harvest(browser: Browser, *, archived_grid_start_row: int = 0) -> PageResult:

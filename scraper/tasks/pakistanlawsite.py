@@ -43,7 +43,11 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.pls_navigation import CitationSearchNavigationFailed, open_citation_search_for_harvest
+from scraper.pls_navigation import (
+    CitationSearchNavigationFailed,
+    open_citation_grid_for_window,
+    open_citation_search_for_harvest,
+)
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     extract_before_jj_judge_names,
@@ -299,6 +303,7 @@ class PakistanLawSitePipeline:
         self._slot_lock: Optional[SessionLock] = None
         self._surface_page: Optional[PageResult] = None
         self._surface_page_start_row: Optional[int] = None
+        self._citation_grid_fast_reload: bool = False
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "citation_grid_windows": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
@@ -581,10 +586,27 @@ class PakistanLawSitePipeline:
         self.stats["citation_grid_run_minutes"] = limits["run_minutes"]
         windows = 0
         while True:
-            outcome = await self._run_citation_grid_window(search_map, limits)
+            try:
+                outcome = await self._run_citation_grid_window(search_map, limits)
+            except CitationSearchNavigationFailed as exc:
+                if exc.page_type == "citation_search_no_results":
+                    logger.info(
+                        "PakistanLawSite citation-grid: no-results stub after dashboard retry; "
+                        "stopping run cleanly without changing cursor or search map (row_offset unchanged)"
+                    )
+                    self.stats["citation_grid_stub_stop"] = True
+                    break
+                raise
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
+            if outcome.get("citation_grid_stub_stop"):
+                logger.info(
+                    "PakistanLawSite citation-grid: intermittent no-results stub; "
+                    "stopping run cleanly without changing cursor or search map"
+                )
+                self.stats["citation_grid_stub_stop"] = True
+                break
             if deadline is None:
                 break
             if outcome["rows"] == 0:
@@ -619,11 +641,20 @@ class PakistanLawSitePipeline:
         if page is None:
 
             async def op(browser: Browser) -> PageResult:
+                if self._citation_grid_fast_reload:
+                    return await open_citation_grid_for_window(browser, archived_grid_start_row=row_offset)
                 loaded = await open_citation_search_for_harvest(browser, archived_grid_start_row=row_offset)
                 raise_for_verdict(loaded)
                 return loaded
 
-            page = await self.runner.run(op)
+            try:
+                page = await self.runner.run(op)
+            except CitationSearchNavigationFailed as exc:
+                if exc.page_type == "citation_search_no_results":
+                    result["citation_grid_stub_stop"] = True
+                    return result
+                raise
+            self._citation_grid_fast_reload = True
         extractor = HybridExtractor(self.db, self.source, local=self.local_engine)
         outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
         rows = outcome.data.get("result_rows") or []

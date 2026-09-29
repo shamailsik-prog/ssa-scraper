@@ -47,7 +47,19 @@ from scraper.tasks.pakistanlawsite import (
 )
 from scraper.tasks.promotion import promote_judgment_staging, promote_staging_records
 from scraper.tasks.search_map import map_search_form
-from tests.fixtures import BLOCK_PAGE, LOGIN_PAGE, VERIFICATION_PAGE, BrowserScript, FakeBrowser, judgment_html, results_html, search_form_html
+from tests.fixtures import (
+    BLOCK_PAGE,
+    LOGIN_PAGE,
+    VERIFICATION_PAGE,
+    BrowserScript,
+    FakeBrowser,
+    citation_search_empty_session_shell_html,
+    judgment_html,
+    pls_check_dashboard_html,
+    pls_whats_new_table_html,
+    results_html,
+    search_form_html,
+)
 
 STATE = {"cookies": [{"name": "sid", "value": "abc", "domain": "www.pakistanlawsite.com", "path": "/"}], "origins": []}
 
@@ -1899,6 +1911,70 @@ async def test_pipeline_shard_never_borrows_the_other_shards_slot(db, login_sour
     assert stats["paused"] is False
     assert login_source.state == "ACTIVE"
     assert sc.log == []
+
+
+async def test_pipeline_citation_grid_stub_stops_cleanly_without_stale_map(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_MAX_DETAIL", 1)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_CITATION_GRID_SCAN_WINDOW", 1)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 30)
+    from scraper.harvest_mode import set_harvest_mode
+
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="stub-stop-test")
+    await _activate(db, login_source)
+    login_source.config_json = {
+        **(login_source.config_json or {}),
+        "citation_grid_cursor": {"row_offset": 6000, "last_total_rows": 7000},
+    }
+    db.add(
+        SearchFormMap(
+            source_name=login_source.source_name,
+            map_version=1,
+            fields={},
+            result_layout={"row_selector": "#archivedpatientGrid tbody tr"},
+            page_size=None,
+            pagination={},
+            detail_layout={},
+            limits={"surface": "grid_surface_no_query_form"},
+            dom_hash="grid-map",
+            mapped_by="test",
+            verified_against_dom=True,
+            is_active=True,
+            stale=False,
+        )
+    )
+    await db.commit()
+    row = ("PLD 2024 SC 6000", "Case 6000", "Supreme Court", "https://www.pakistanlawsite.com/case/6000")
+    sc = BrowserScript()
+    stub = citation_search_empty_session_shell_html()
+
+    def grid(browser, goto_kwargs=None):
+        start = int((goto_kwargs or {}).get("archived_grid_start_row", 0) or 0)
+        if start >= 6001:
+            return PageResult(url=settings.PLS_SEARCH_URL, html=stub, status=200)
+        return PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html=_archived_grid_html([row]),
+            status=200,
+            metadata={"total_rows": 7000, "start_row": start, "requested_start_row": start, "seek_mode": "dom_absolute"},
+        )
+
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = grid
+    check_url = settings.PLS_CHECK_URL
+    sc.page(("goto", check_url), pls_check_dashboard_html(), url=check_url)
+    get_statues = f"{urlsplit(check_url).scheme}://{urlsplit(check_url).netloc}/Login/GetStatuesSearch"
+    sc.page(("goto", get_statues), pls_whats_new_table_html(), url=get_statues)
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    m = (await db.execute(select(SearchFormMap).where(SearchFormMap.is_active.is_(True)))).scalars().first()
+    assert stats.get("citation_grid_stub_stop") is True
+    assert m is not None and m.stale is False
+    assert (login_source.config_json.get("citation_grid_cursor") or {}).get("row_offset") == 6001
 
 
 async def test_pipeline_citation_grid_backfill_run_takes_consecutive_windows(db, login_source, monkeypatch):
