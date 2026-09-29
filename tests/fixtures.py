@@ -341,6 +341,9 @@ class FakeBrowser:
         self.calls.append(("export_storage_state", self.slot_number))
         return state
 
+    async def release_citation_grid_dom(self) -> None:
+        return None
+
     async def close(self) -> None:
         self.closed = True
 

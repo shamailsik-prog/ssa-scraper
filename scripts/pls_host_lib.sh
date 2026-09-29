@@ -41,3 +41,18 @@ pls_host_harvest_busy() {
   fi
   return 1
 }
+
+# True when the celery-beat service container is running (not merely defined).
+pls_host_beat_running() {
+  docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx celery-beat
+}
+
+pls_host_stop_beat() {
+  if pls_host_beat_running; then
+    docker compose stop celery-beat
+  fi
+}
+
+pls_host_start_beat() {
+  docker compose up -d --no-build celery-beat
+}

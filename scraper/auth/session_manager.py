@@ -82,6 +82,44 @@ class PageResult:
         return classify_response(self.status, self.html, self.url)
 
 
+_MAX_PLS_CITATION_NAV_ATTEMPTS = 24
+_PLS_PAGE_HEAVY_METADATA_KEYS = frozenset(
+    {
+        "case_description_modal_text",
+        "pls_citation_search_nav",
+    }
+)
+
+
+def trim_pls_citation_search_nav(nav: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Bound navigation diagnostics kept on PageResult.metadata (fast reload runs many windows)."""
+    if not nav:
+        return {}
+    slim = dict(nav)
+    attempts = list(slim.get("attempts") or [])
+    if len(attempts) > _MAX_PLS_CITATION_NAV_ATTEMPTS:
+        slim["attempts"] = attempts[-_MAX_PLS_CITATION_NAV_ATTEMPTS :]
+        slim["attempts_truncated"] = len(attempts)
+    discovered = slim.get("discovered")
+    if isinstance(discovered, list) and len(discovered) > 32:
+        slim["discovered"] = discovered[:32]
+        slim["discovered_truncated"] = len(discovered)
+    return slim
+
+
+def release_page_result(page: Optional[PageResult]) -> None:
+    """Drop large HTML and harvest nav blobs so multi-window jobs do not retain every surface."""
+    if page is None:
+        return
+    page.html = ""
+    page.pdf_bytes = None
+    meta = page.metadata
+    if not meta:
+        return
+    for key in _PLS_PAGE_HEAVY_METADATA_KEYS:
+        meta.pop(key, None)
+
+
 class Browser(Protocol):
     """What the pipeline needs from a browser bound to one slot's storage state."""
 
@@ -94,6 +132,8 @@ class Browser(Protocol):
     async def visible_text(self) -> str: ...
 
     async def download(self, url: str) -> bytes: ...
+
+    async def release_citation_grid_dom(self) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -914,7 +954,7 @@ class PlaywrightBrowser:
             snapshot = await self._capture_archived_grid_snapshot(start_row=archived_grid_start_row)
             if snapshot:
                 html_compact = self._render_compact_archived_grid_html(snapshot)
-                return html_compact, {
+                metadata = {
                     "content_guard": "archivedpatientGrid_compact",
                     "inputs": int(dom.get("inputs") or 0),
                     "forms": int(dom.get("forms") or 0),
@@ -928,6 +968,9 @@ class PlaywrightBrowser:
                     "page_length": snapshot.get("page_length"),
                     "oversized_hint": oversized,
                 }
+                snapshot.clear()
+                await self.release_citation_grid_dom()
+                return html_compact, metadata
             logger.warning(
                 "archivedpatientGrid present but compact snapshot failed slot=%s url=%s; refusing page.content()",
                 self.slot_number,
@@ -1074,7 +1117,14 @@ class PlaywrightBrowser:
             self._assert_url_policy(self._page.url)
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
-        html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        try:
+            html_text, metadata = await self._capture_html(resp=resp, archived_grid_start_row=archived_grid_start_row)
+        finally:
+            if resp is not None:
+                try:
+                    await resp.finished()
+                except Exception:
+                    pass
         if capture_case_description_modal:
             try:
                 modal_meta = await self._capture_case_description_modal()
@@ -1150,6 +1200,21 @@ class PlaywrightBrowser:
     async def visible_text(self) -> str:
         """The text of the page as the browser shows it (the rendered document's innerText)."""
         return await self._wrap(self._page.evaluate("() => (document.body && document.body.innerText) || ''"))
+
+    async def release_citation_grid_dom(self) -> None:
+        """Navigate away from CitationSearch after a compact snapshot so the live grid DOM is freed."""
+        if self._page is None:
+            return
+        try:
+            await self._wrap(
+                self._page.goto(
+                    "about:blank",
+                    wait_until="domcontentloaded",
+                    timeout=min(15_000, int(settings.PLAYWRIGHT_TIMEOUT_MS)),
+                )
+            )
+        except Exception as exc:
+            logger.debug("release_citation_grid_dom slot=%s: %s", self.slot_number, exc)
 
     async def download(self, url: str) -> bytes:
         try:
