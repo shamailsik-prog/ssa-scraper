@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
-from scraper.extractors.deterministic import introspect_search_form
+from scraper.extractors.deterministic import _has_archived_patient_grid, introspect_search_form
 from scraper.extractors.scrapegraph_base import ExtractionInput
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.models import ScraperSource, SearchFormMap
@@ -155,7 +155,22 @@ async def map_search_form(
             return prev
         raise LoginRequired("cannot map search form from login or off-page surface")
 
+    soup = BeautifulSoup(html or "", "html.parser")
     proposal = introspect_search_form(html)
+    has_grid = _has_archived_patient_grid(soup)
+    has_query_form = proposal.get("surface") == "query_form"
+    if not has_grid and not has_query_form:
+        prev = await active_map(db, source.source_name)
+        if prev is not None:
+            logger.warning(
+                "refusing to overwrite search map v%s from non-grid HTML without query form "
+                "(url=%s surface=%s)",
+                prev.map_version,
+                (page_url or "")[:200],
+                proposal.get("surface"),
+            )
+            return prev
+        raise LoginRequired("cannot map search form without archivedpatientGrid or query form")
     mapped_by = "deterministic"
     engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
     if proposal.get("surface") != "grid_surface_no_query_form" and engine.configured and settings.SGAI_ENABLED and source.ai_extract_enabled:

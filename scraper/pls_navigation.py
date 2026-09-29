@@ -78,15 +78,18 @@ def check_page_login_required_reason(html: str, url: str = "") -> Optional[str]:
 
 
 def citation_search_surface_is_harvestable(html: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """True only when the live citation table (#archivedpatientGrid) is present.
+
+    Dashboard AJAX fragments and whatsNewTable-style pages may classify as
+    grid_surface_no_query_form without the real citation grid; they must not
+    short-circuit navigation before the direct /Login/CitationSearch load.
+    """
     meta = metadata or {}
     guard = str(meta.get("content_guard") or "")
     if guard in ("archivedpatientGrid_compact", "archivedpatientGrid_snapshot_failed"):
         return True
     soup = BeautifulSoup(html or "", "html.parser")
-    if _has_archived_patient_grid(soup):
-        return True
-    probe = introspect_search_form(html or "")
-    return probe.get("surface") in ("query_form", "grid_surface_no_query_form")
+    return _has_archived_patient_grid(soup)
 
 
 def _ordered_navigation_candidates(discovery: List[Dict[str, str]]) -> List[Dict[str, str]]:

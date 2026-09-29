@@ -111,6 +111,25 @@ def citation_search_no_query_form_html() -> str:
     return "<html><head><title>Pakistan Law Site</title></head><body><p>Loading…</p></body></html>"
 
 
+def pls_whats_new_table_html() -> str:
+    """Dashboard AJAX fragment: table chrome without #archivedpatientGrid (production #139)."""
+    return """<html><body>
+    <table id="whatsNewTable"><thead><tr><th>What's New</th></tr></thead>
+      <tbody><tr><td>Site update</td></tr></tbody>
+    </table>
+    <label>Filter <input name="news_filter" type="search"></label>
+    </body></html>"""
+
+
+def citation_search_archived_grid_html() -> str:
+    """Authenticated CitationSearch citation table surface."""
+    return """<html><body>
+    <table id="archivedpatientGrid"><thead><tr><th>Citation</th><th>Title</th></tr></thead>
+      <tbody><tr><td>PLD 2024 SC 1</td><td><a href="/case/1">Party v State</a></td></tr></tbody>
+    </table>
+    </body></html>"""
+
+
 def citation_search_grid_only_html() -> str:
     """CitationSearch result grid with DataTables-style filters but no query form."""
     return """<html><body>

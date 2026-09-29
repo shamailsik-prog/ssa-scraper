@@ -9,9 +9,10 @@ from sqlalchemy import func, select
 from scraper.auth.session_manager import PageResult
 from scraper.config import settings
 from scraper.extractors.deterministic import introspect_search_form
-from scraper.models import CrawlFrontier, Notification, SearchFormMap
+from scraper.models import CrawlFrontier, SearchFormMap
 from scraper.pls_navigation import (
     check_page_login_required_reason,
+    citation_search_surface_is_harvestable,
     discover_citation_search_entrypoints,
     open_citation_search,
     pls_check_url,
@@ -20,10 +21,11 @@ from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
 from scraper.tasks.search_map import map_search_form
 from tests.fixtures import (
     BrowserScript,
+    citation_search_archived_grid_html,
     citation_search_empty_session_shell_html,
     citation_search_grid_only_html,
-    citation_search_no_query_form_html,
     pls_check_dashboard_html,
+    pls_whats_new_table_html,
     search_form_html,
 )
 from tests.test_auth_playwright import _activate, _nosleep
@@ -64,35 +66,52 @@ def test_logged_in_grid_surface_classification_unchanged():
     assert probe["fields"] == []
 
 
-async def test_open_citation_search_uses_check_then_ajax_not_bare_direct(fixture_server, monkeypatch):
+def test_whats_new_table_is_not_harvestable_citation_surface():
+    assert not citation_search_surface_is_harvestable(pls_whats_new_table_html())
+    assert introspect_search_form(pls_whats_new_table_html())["surface"] == "grid_surface_no_query_form"
+
+
+def test_archived_patient_grid_is_harvestable_citation_surface():
+    assert citation_search_surface_is_harvestable(citation_search_archived_grid_html())
+
+
+async def test_open_citation_search_rejects_whats_new_then_falls_back_to_direct(fixture_server, monkeypatch):
     _wire_pls_urls(fixture_server, monkeypatch)
     fixture_server.add("/Login/Check", pls_check_dashboard_html())
-    fixture_server.add("/Login/GetStatuesSearch", search_form_html())
-    fixture_server.add("/Login/CitationSearch", citation_search_empty_session_shell_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    fixture_server.add("/Login/CitationSearch", citation_search_archived_grid_html())
     sc = BrowserScript()
     sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
-    sc.page(("goto", settings.PLS_SEARCH_URL), citation_search_empty_session_shell_html(), url=settings.PLS_SEARCH_URL)
     sc.page(
         ("goto", fixture_server.url("/Login/GetStatuesSearch")),
-        search_form_html(),
+        pls_whats_new_table_html(),
         url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        citation_search_archived_grid_html(),
+        url=settings.PLS_SEARCH_URL,
     )
     browser = await sc.factory()({}, 1)
     page = await open_citation_search(browser, archived_grid_start_row=0)
     nav = (page.metadata or {}).get("pls_citation_search_nav") or {}
     assert nav.get("discovered"), "expected diagnosable discovery metadata"
-    assert introspect_search_form(page.html)["surface"] == "query_form"
+    assert citation_search_surface_is_harvestable(page.html or "")
+    assert "archivedpatientGrid" in (page.html or "")
     goto_urls = [call[1] for call in browser.calls if call[0] == "goto"]
     assert goto_urls[0] == settings.PLS_CHECK_URL
     assert any("GetStatuesSearch" in url for url in goto_urls)
+    assert goto_urls[-1] == settings.PLS_SEARCH_URL
 
 
-async def test_map_bare_fragment_marks_stale_with_notification(db, login_source):
-    m = await map_search_form(db, login_source, citation_search_empty_session_shell_html())
-    assert m.stale is True
-    assert (m.limits or {}).get("surface") == "no_query_form"
-    codes = (await db.execute(select(Notification.code))).scalars().all()
-    assert "SEARCH_MAP_NO_QUERY_FORM_STALE" in codes
+async def test_map_non_grid_page_does_not_create_search_map(db, login_source):
+    from scraper.auth.session_manager import LoginRequired
+
+    before = (await db.execute(select(func.count()).select_from(SearchFormMap))).scalar()
+    with pytest.raises(LoginRequired):
+        await map_search_form(db, login_source, pls_whats_new_table_html())
+    after = (await db.execute(select(func.count()).select_from(SearchFormMap))).scalar()
+    assert after == before
 
 
 async def test_pipeline_bare_fragment_with_valid_check_stale_not_login(db, login_source, fixture_server, monkeypatch):
@@ -100,16 +119,20 @@ async def test_pipeline_bare_fragment_with_valid_check_stale_not_login(db, login
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 2020)
     _wire_pls_urls(fixture_server, monkeypatch)
     fixture_server.add("/Login/Check", pls_check_dashboard_html())
-    fixture_server.add("/Login/GetStatuesSearch", citation_search_empty_session_shell_html())
-    fixture_server.add("/Login/CitationSearch", citation_search_empty_session_shell_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    fixture_server.add("/Login/CitationSearch", citation_search_archived_grid_html())
     await _activate(db, login_source)
     sc = BrowserScript()
     sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
-    sc.page(("goto", settings.PLS_SEARCH_URL), citation_search_empty_session_shell_html(), url=settings.PLS_SEARCH_URL)
     sc.page(
         ("goto", fixture_server.url("/Login/GetStatuesSearch")),
-        citation_search_empty_session_shell_html(),
+        pls_whats_new_table_html(),
         url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        citation_search_archived_grid_html(),
+        url=settings.PLS_SEARCH_URL,
     )
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
@@ -117,9 +140,9 @@ async def test_pipeline_bare_fragment_with_valid_check_stale_not_login(db, login
     await pipeline.run(max_queries=1, max_probes_per_volume=1)
     await db.commit()
     await r.aclose()
-    stale_rows = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.status == "stale"))).scalars().all()
-    assert stale_rows
-    assert any("SEARCH_MAP_NO_QUERY_FORM_STALE" in (fr.last_error or "") for fr in stale_rows)
+    maps = (await db.execute(select(SearchFormMap))).scalars().all()
+    assert maps
+    assert any("archivedpatientgrid" in str((m.result_layout or {}).get("row_selector") or "").lower() for m in maps)
     retired = (
         await db.execute(select(func.count()).select_from(CrawlFrontier).where(CrawlFrontier.status == "retired"))
     ).scalar()
@@ -132,12 +155,39 @@ async def test_no_query_form_frontier_marked_stale_not_retired(db, login_source,
     monkeypatch.setattr(settings, "VOLUME_END_GAP", 40)
     _wire_pls_urls(fixture_server, monkeypatch)
     fixture_server.add("/Login/Check", pls_check_dashboard_html())
-    fixture_server.add("/Login/CitationSearch", citation_search_no_query_form_html())
+    fixture_server.add("/Login/GetStatuesSearch", pls_whats_new_table_html())
+    fixture_server.add("/Login/CitationSearch", citation_search_empty_session_shell_html())
     await _activate(db, login_source)
-    await map_search_form(db, login_source, citation_search_no_query_form_html())
+    db.add(
+        SearchFormMap(
+            source_name=login_source.source_name,
+            map_version=1,
+            fields={},
+            result_layout={"row_selector": "table tr"},
+            page_size=None,
+            pagination={},
+            detail_layout={},
+            limits={"surface": "no_query_form"},
+            dom_hash="seeded-no-query",
+            mapped_by="test",
+            verified_against_dom=True,
+            is_active=True,
+            stale=True,
+        )
+    )
+    await db.flush()
     sc = BrowserScript()
     sc.page(("goto", settings.PLS_CHECK_URL), pls_check_dashboard_html(), url=settings.PLS_CHECK_URL)
-    sc.page(("goto", settings.PLS_SEARCH_URL), citation_search_no_query_form_html(), url=settings.PLS_SEARCH_URL)
+    sc.page(
+        ("goto", fixture_server.url("/Login/GetStatuesSearch")),
+        pls_whats_new_table_html(),
+        url=fixture_server.url("/Login/GetStatuesSearch"),
+    )
+    sc.page(
+        ("goto", settings.PLS_SEARCH_URL),
+        citation_search_empty_session_shell_html(),
+        url=settings.PLS_SEARCH_URL,
+    )
     sc.default_search = lambda values, browser: PageResult(url="https://www.pakistanlawsite.com/r", html=search_form_html())
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete("corpus:login_session_lock:PakistanLawSite")
