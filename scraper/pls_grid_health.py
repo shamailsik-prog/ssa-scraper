@@ -83,6 +83,8 @@ def journals_all_done(cfg: Dict[str, Any], journals: List[str], *, now: Optional
 
 
 def citation_grid_cursor_keys(cfg: Dict[str, Any]) -> List[str]:
+    if settings.PLS_GRID_JOURNAL_ROTATION and settings.grid_journals and not journal_rotation_off(cfg):
+        return [journal_cursor_key(j) for j in settings.grid_journals]
     journal_keys = journal_cursor_keys(cfg)
     if journal_keys and settings.PLS_GRID_JOURNAL_ROTATION and not journal_rotation_off(cfg):
         return journal_keys
@@ -103,6 +105,18 @@ def citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[s
         "job_key": "PakistanLawSite:archivedpatientGrid",
         "citation_grid_cursor": cursor_view,
     }
+    journal_keys = [
+        k
+        for k in citation_grid_cursor_keys(cfg)
+        if isinstance(k, str) and k.startswith(JOURNAL_CURSOR_PREFIX)
+    ]
+    for journal_key in journal_keys:
+        journal_raw = cfg.get(journal_key)
+        if isinstance(journal_raw, dict):
+            journal_view = dict(journal_raw)
+            journal_offset = _to_int(journal_raw.get("row_offset"))
+            journal_view["row_offset"] = journal_offset if journal_offset is not None else 0
+            status[journal_key] = journal_view
     for shard in (0, 1):
         shard_key = f"citation_grid_cursor_shard_{shard}"
         shard_raw = cfg.get(shard_key)
@@ -111,19 +125,27 @@ def citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[s
             shard_offset = _to_int(shard_raw.get("row_offset"))
             shard_view["row_offset"] = shard_offset if shard_offset is not None else 0
             status[shard_key] = shard_view
+    flush_cursor = cursor
+    active_journal = cfg.get("citation_grid_journal")
+    if active_journal:
+        active_key = journal_cursor_key(str(active_journal))
+        active_raw = cfg.get(active_key)
+        if isinstance(active_raw, dict):
+            flush_cursor = active_raw
     last_flush: Dict[str, Any] = {}
-    last_start_offset = _to_int(cursor.get("last_start_offset"))
+    last_start_offset = _to_int(flush_cursor.get("last_start_offset"))
     if last_start_offset is not None:
         last_flush["offset_before"] = last_start_offset
-    if row_offset is not None:
-        last_flush["offset_after"] = row_offset
-    last_take_count = _to_int(cursor.get("last_take_count"))
+    flush_offset = _to_int(flush_cursor.get("row_offset"))
+    if flush_offset is not None:
+        last_flush["offset_after"] = flush_offset
+    last_take_count = _to_int(flush_cursor.get("last_take_count"))
     if last_take_count is not None:
         last_flush["processed_rows"] = last_take_count
     for field in ("offset_before", "offset_after", "staged_this_flush", "processed_rows"):
         if field in last_flush:
             continue
-        parsed = _to_int(cursor.get(field))
+        parsed = _to_int(flush_cursor.get(field))
         if parsed is not None:
             last_flush[field] = parsed
     if last_flush:
@@ -143,12 +165,14 @@ def grid_rows_remaining(cfg: Dict[str, Any], *, now: Optional[datetime] = None) 
     for key in citation_grid_cursor_keys(cfg):
         cur = cfg.get(key)
         if not isinstance(cur, dict):
+            remaining = max(remaining, 1)
             continue
         total = _to_int(cur.get("last_total_rows")) or 0
         offset = _to_int(cur.get("row_offset")) or 0
         if total <= 0:
+            remaining = max(remaining, 1)
             continue
-        if cursor_saturated(cur, now=now):
+        if cursor_saturated(cur, now=now) or journal_unsupported(cur, now=now):
             continue
         remaining = max(remaining, max(0, min(total, total - offset)))
     return remaining
@@ -228,18 +252,26 @@ def lap_update(cur: Dict[str, Any], *, total_rows: int, window: Dict[str, int], 
 def grid_saturation_view(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     shards: Dict[str, Any] = {}
-    for key in citation_grid_cursor_keys(cfg):
+    keys = citation_grid_cursor_keys(cfg)
+    for key in keys:
         cur = cfg.get(key)
         if not isinstance(cur, dict):
+            shards[key] = {"saturated": False, "saturated_at": None, "reason": None, "lap": None, "last_lap": None}
             continue
+        idle = cursor_saturated(cur, now=now) or journal_unsupported(cur, now=now)
         shards[key] = {
-            "saturated": cursor_saturated(cur, now=now),
+            "saturated": idle,
             "saturated_at": cur.get("saturated_at"),
-            "reason": cur.get("saturated_reason"),
+            "reason": cur.get("saturated_reason") or cur.get("unsupported_reason"),
             "lap": cur.get("lap"),
             "last_lap": cur.get("last_lap"),
         }
-    return {"shards": shards, "all_saturated": bool(shards) and all(v["saturated"] for v in shards.values()), "recheck_hours": saturated_recheck_hours()}
+    all_idle = bool(keys) and all(
+        isinstance(cfg.get(key), dict)
+        and (cursor_saturated(cfg.get(key), now=now) or journal_unsupported(cfg.get(key), now=now))
+        for key in keys
+    )
+    return {"shards": shards, "all_saturated": all_idle, "recheck_hours": saturated_recheck_hours()}
 
 
 # --------------------------------------------------------------------------- stalled alarm

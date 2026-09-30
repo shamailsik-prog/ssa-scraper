@@ -1842,6 +1842,9 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
     never reached: promotion silently stops while harvesting continues.
     Extracted work uses a preferred-source share so public oldest-first cannot starve PakistanLawSite.
     """
+    from scraper.heartbeat import beat
+
+    await beat("promotion")
     counts = {"promoted": 0, "duplicate": 0, "quarantined": 0, "statutes_promoted": 0, "statutes_duplicate": 0, "statutes_quarantined": 0}
     async with SessionLocal() as db:
         unqueued = (

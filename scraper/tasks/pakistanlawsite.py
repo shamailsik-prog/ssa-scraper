@@ -1266,7 +1266,19 @@ class PakistanLawSitePipeline:
         )
         wrapped = bool(total_rows > 0 and next_offset < start_offset)
         # the window read up to the grid's last row (a whole-grid window from row 0 ends a lap without "wrapping")
-        reached_end = bool(total_rows > 0 and start_offset + processed_rows_total >= total_rows)
+        max_snapshot_rows = int(getattr(settings, "PLS_ARCHIVED_GRID_MAX_ROWS", 400) or 400)
+        compact_window_is_full_grid = (
+            not total_rows_known
+            and total_rows_meta is None
+            and row_count > 0
+            and row_count < max_snapshot_rows
+            and processed_rows_total >= row_count
+        )
+        reached_end = bool(
+            total_rows > 0
+            and start_offset + processed_rows_total >= total_rows
+            and (total_rows_known or compact_window_is_full_grid)
+        )
         result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped, "reached_end": reached_end})
         logger.info(
             "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",

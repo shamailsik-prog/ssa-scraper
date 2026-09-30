@@ -627,6 +627,7 @@ async def open_citation_grid_for_journal(browser: Browser, journal: str, *, arch
         page_type = classify_pls_page(page.html or "", page.url or "", page.metadata)
         if page_type == "citation_search_no_results":
             raise CitationSearchNavigationFailed(f"journal {journal}: the site returned no results", page_type=page_type, page=page)
+        raise_for_verdict(page)
         raise JournalNotOffered(f"submitting {journal} did not reach the citation grid (page_type={page_type})")
     raise_for_verdict(page)
     return page

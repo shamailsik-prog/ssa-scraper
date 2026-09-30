@@ -50,6 +50,9 @@ async def embed_texts(texts: List[str], *, client: Optional[httpx.AsyncClient] =
 
 async def process_embedding_queue(limit: Optional[int] = None, *, client: Optional[httpx.AsyncClient] = None) -> Dict[str, int]:
     counts = {"embedded": 0, "skipped_login_session": 0, "failed": 0, "refused": 0}
+    from scraper.heartbeat import beat
+
+    await beat("embeddings")
     if not await embedding_identity_matches():
         logger.error("embedding identity mismatch: corpus_metadata differs from EMBEDDING_MODEL/EMBEDDING_DIM; refusing to run")
         counts["refused"] = 1

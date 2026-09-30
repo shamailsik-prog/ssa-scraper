@@ -212,6 +212,9 @@ async def _connector_for(source: ScraperSource):
 
 
 async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
+    from scraper.heartbeat import beat
+
+    await beat("login_session" if source_name == "PakistanLawSite" else "public")
     async with SessionLocal() as db:
         source = (
             await db.execute(
@@ -331,7 +334,10 @@ async def _active_slot_numbers(db, source_name: str) -> list[int]:
 
 async def dispatch_due_sources() -> Dict[str, Any]:
     """Beat entry: enqueue every ACTIVE source whose schedule is due."""
+    from scraper.heartbeat import beat
     from scraper.tasks.celery_app import app
+
+    await beat("dispatch")  # Beat is alive and the maintenance queue is being served
 
     now = datetime.now(timezone.utc)
     queued = []

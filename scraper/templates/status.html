@@ -8,31 +8,53 @@
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
 <meta name="theme-color" content="#7a1f1f">
 <style>
-:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--bad:#a12626;--warn:#8a5a00}
+:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--bad:#a12626;--warn:#8a5a00;--okbg:#e6f2ea;--badbg:#f8e5e5;--warnbg:#f7eedb;--bar:#e9e4d8}
+@media (prefers-color-scheme:dark){:root{--bg:#151412;--panel:#1f1d1a;--ink:#ece8df;--muted:#a39d92;--line:#35322c;--accent:#d27a6a;--ok:#6cc58f;--bad:#ef7b7b;--warn:#e0b25c;--okbg:#1d3326;--badbg:#3a1f1f;--warnbg:#382d17;--bar:#2e2b26}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Georgia,"Times New Roman",serif}
 header{padding:14px 16px;border-bottom:2px solid var(--accent);background:var(--panel)}header h1{margin:0;font-size:20px}
-.note{color:var(--muted);font-size:12px}main{max-width:1100px;margin:0 auto;padding:16px}
+.note{color:var(--muted);font-size:12px}main{max-width:1180px;margin:0 auto;padding:16px}
+.banner{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-weight:700;border:1px solid var(--line)}
+.banner.ok{background:var(--okbg);color:var(--ok)}.banner.warn{background:var(--warnbg);color:var(--warn)}.banner.down{background:var(--badbg);color:var(--bad)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
-.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:10px 12px}
-.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:26px;font-weight:700}
+.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:10px 12px;text-decoration:none;color:inherit;display:block}
+a.tile:hover{border-color:var(--accent)}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.sub{color:var(--muted);font-size:12px}
 section{padding:12px 14px;margin-bottom:14px}section h2{margin:0 0 8px;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
-.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.wrap{overflow:auto}a{color:var(--accent)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}.cols section{margin-bottom:0}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.06em}td.n,th.n{text-align:right}
+.ok{color:var(--ok)}.bad,.down{color:var(--bad)}.warn{color:var(--warn)}.wrap{overflow:auto}a{color:var(--accent)}
+.lights{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px 14px}
+.light{display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px solid var(--line)}.dot{width:10px;height:10px;border-radius:50%;flex:none;transform:translateY(1px)}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.down{background:var(--bad)}.light b{font-weight:600}
+.bar{height:8px;background:var(--bar);border-radius:4px;overflow:hidden;min-width:80px}.bar>i{display:block;height:100%;background:var(--accent)}
+.pill{display:inline-block;padding:0 7px;border-radius:9px;font-size:11px;border:1px solid var(--line)}
+details summary{cursor:pointer;color:var(--muted);font-size:12px;margin-top:6px}
 </style>
 </head>
 <body>
 <header>
-  <h1>SIKANDER AI corpus — status</h1>
+  <h1>SIKANDER AI corpus</h1>
   <div class="note" id="stamp">loading…</div>
-  <div class="note">Numbers only, refreshed every 60 s. Actions and records: <a href="/dashboard">dashboard</a> (admin key). On a phone use "Add to Home Screen" to keep this page as an app.</div>
+  <div class="note">Numbers only, refreshed every 30 s. Browse and open records: <a href="/dashboard">dashboard</a> (admin key). On a phone use "Add to Home Screen" to keep this page as an app.</div>
 </header>
 <main>
+  <div class="banner" id="banner">checking…</div>
   <div class="tiles" id="tiles"></div>
-  <section><h2>Movement</h2><div id="movement"></div></section>
-  <section><h2>Google Drive and archive targets</h2><div class="wrap" id="archive"></div></section>
-  <section><h2>Sources</h2><div class="wrap" id="sources"></div></section>
+  <section><h2>Everything connected?</h2><div class="lights" id="health"></div></section>
+  <div class="cols">
+    <section><h2>Speed right now</h2><div class="wrap" id="speed"></div></section>
+    <section><h2>Movement</h2><div id="movement"></div></section>
+  </div>
+  <section style="margin-top:14px"><h2>Progress: PakistanLawSite journals</h2><div class="wrap" id="journals"></div></section>
+  <div class="cols">
+    <section><h2>Progress: public sources (PakistanCode, courts, legislatures)</h2><div class="wrap" id="public"></div></section>
+    <section><h2>Progress: Google Drive and archive copies</h2><div class="wrap" id="archiveprog"></div></section>
+  </div>
+  <section style="margin-top:14px"><h2>Sources</h2><div class="wrap" id="sources"></div></section>
   <section><h2>PakistanLawSite login slots and pacing today</h2><div class="wrap" id="pls"></div></section>
+  <section><h2>Archive targets in detail</h2><div class="wrap" id="archive"></div></section>
   <section><h2>Judgments by reporter and year</h2><div class="wrap" id="volumes"></div></section>
   <section><h2>Spot checks: records re-fetched from the source and compared</h2><div class="wrap" id="spot"></div></section>
   <section><h2>Open notifications</h2><div class="wrap" id="notes"></div></section>
@@ -41,39 +63,72 @@ th{color:var(--muted);font-weight:normal;font-size:11px;text-transform:uppercase
 const $=id=>document.getElementById(id);
 const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const when=v=>v?new Date(v).toLocaleString():'-';
-const tile=(l,v,c)=>'<div class="tile"><div class="label">'+esc(l)+'</div><div class="value '+(c||'')+'">'+esc(v)+'</div></div>';
+const num=v=>v==null?'-':Number(v).toLocaleString();
+const tile=(l,v,sub,href,c)=>(href?'<a class="tile" href="'+href+'">':'<div class="tile">')+'<div class="label">'+esc(l)+'</div><div class="value '+(c||'')+'">'+esc(num(v))+'</div>'+(sub?'<div class="sub">'+esc(sub)+'</div>':'')+(href?'</a>':'</div>');
 const cell=v=>'<td>'+esc(v==null?'-':v)+'</td>';
+const ncell=v=>'<td class="n">'+esc(num(v))+'</td>';
+const bar=p=>'<div class="bar" title="'+esc(p==null?'unknown':p+'%')+'"><i style="width:'+Math.max(0,Math.min(100,p||0))+'%"></i></div>';
 function stateClass(s){return s==='ACTIVE'?'ok':(s==='HALTED'||s==='DISABLED'?'bad':'warn')}
+function hours(h){if(h==null)return '-';if(h===0)return 'done';if(h<1)return Math.round(h*60)+' min';if(h<48)return h.toFixed(1)+' h';return (h/24).toFixed(1)+' days'}
 async function load(){
   let d;
-  try{const r=await fetch('/status.json',{cache:'no-store'});d=await r.json();}catch(e){$('stamp').textContent='status unavailable: '+e;return;}
+  try{const r=await fetch('/status.json',{cache:'no-store'});d=await r.json();}catch(e){$('stamp').textContent='status unavailable: '+e;$('banner').className='banner down';$('banner').textContent='The corpus service is not answering';return;}
   $('stamp').textContent='as of '+when(d.generated_at);
-  const t=d.totals||{},m=d.movement||{};
-  $('tiles').innerHTML=tile('Judgments',t.judgments)+tile('Citations',t.citations)+tile('Statutes',t.statutes)+tile('Sections',t.statute_sections)+tile('Instruments',t.instruments)+tile('Promoted today',m.judgments_promoted_today,m.judgments_promoted_today?'ok':'')+tile('Last 7 days',m.judgments_promoted_last_7_days)+tile('Review queue',t.review_queue_open,t.review_queue_open?'warn':'');
-  $('movement').innerHTML='<table><tr><th>last promotion</th><th>staged, waiting for promotion</th><th>staging by status</th></tr><tr>'+cell(when(m.last_promotion_at))+cell(m.staged_waiting_for_promotion)+cell(JSON.stringify(m.staging_by_status||{}))+'</tr></table>';
+  const h=d.health||{checks:[]};
+  const down=h.checks.filter(c=>c.state==='down'),warn=h.checks.filter(c=>c.state==='warn');
+  $('banner').className='banner '+(h.overall||'warn');
+  $('banner').textContent=h.overall==='ok'?'Everything is connected and working':(h.overall==='down'?down.length+' part(s) down: '+down.map(c=>c.name).join(', '):warn.length+' part(s) need attention: '+warn.map(c=>c.name).join(', '));
+  if(d.stalled&&d.stalled_reason==='no_output_while_harvesting'){$('banner').className='banner down';$('banner').textContent+=' · no new judgment for '+d.hours_since_last_judgment+' h while harvesting';}
+  const t=d.totals||{},m=d.movement||{},ss=d.sources_summary||{};
+  $('tiles').innerHTML=tile('Websites / sources',ss.total,(ss.active||0)+' running, '+(ss.paused||0)+' paused'+(ss.halted?', '+ss.halted+' halted':''))
+    +tile('Judgments',t.judgments,'+'+num(m.judgments_promoted_today)+' today','/dashboard#browse')
+    +tile('Citations',t.citations,null,'/dashboard#browse')
+    +tile('Statutes / acts',t.statutes,null,'/dashboard#browse')
+    +tile('Statute sections',t.statute_sections)
+    +tile('Other instruments',t.instruments,'rules, notifications, ordinances')
+    +tile('Last 7 days',m.judgments_promoted_last_7_days,'judgments added')
+    +tile('Review queue',t.review_queue_open,'set aside for a person',null,t.review_queue_open?'warn':'');
+  $('health').innerHTML=h.checks.map(c=>'<div class="light"><span class="dot '+esc(c.state)+'"></span><div><b>'+esc(c.name)+'</b><div class="sub">'+esc(c.detail||'')+'</div></div></div>').join('');
+  const sp=d.speed||{};const w=['15m','1h','24h'];
+  let s='<table><tr><th></th>'+w.map(k=>'<th class="n">last '+k+'</th>').join('')+'</tr>';
+  s+='<tr><td>pages fetched</td>'+w.map(k=>ncell((sp[k]||{}).pages)).join('')+'</tr>';
+  s+='<tr><td>pages per hour</td>'+w.map(k=>ncell((sp[k]||{}).pages_per_hour)).join('')+'</tr>';
+  s+='<tr><td>judgments added</td>'+w.map(k=>ncell((sp[k]||{}).judgments)).join('')+'</tr>';
+  s+='<tr><td>judgments per hour</td>'+w.map(k=>ncell((sp[k]||{}).judgments_per_hour)).join('')+'</tr>';
+  s+='<tr><td>statutes added</td>'+w.map(k=>ncell((sp[k]||{}).statutes)).join('')+'</tr>';
+  s+='<tr><td>statute sections added</td>'+w.map(k=>ncell((sp[k]||{}).statute_sections)).join('')+'</tr></table>';
+  const bs=sp.by_source_last_hour||[];
+  s+='<p class="note">Last hour by source: '+(bs.length?bs.map(x=>esc(x.source)+' '+num(x.pages_last_hour)).join(' · '):'no pages fetched')+'</p>';
+  $('speed').innerHTML=s;
+  $('movement').innerHTML='<table><tr><td>last judgment added</td>'+cell(when(m.last_promotion_at))+'</tr><tr><td>staged, waiting for promotion</td>'+ncell(m.staged_waiting_for_promotion)+'</tr><tr><td>hours since the last PakistanLawSite judgment</td>'+ncell(d.hours_since_last_judgment)+'</tr><tr><td>PakistanLawSite state</td>'+cell(d.stalled?'stalled ('+(d.stalled_reason||'?').replace(/_/g,' ')+')':'moving')+'</tr></table>';
+  const pr=d.progress||{};
+  const js=pr.pakistanlawsite_journals||[];
+  $('journals').innerHTML=js.length?'<table><tr><th>journal</th><th>state</th><th class="n">in corpus</th><th class="n">grid rows</th><th>this lap</th><th class="n">%</th><th>note</th></tr>'+js.map(x=>'<tr><td><b>'+esc(x.journal)+'</b></td><td class="'+(x.state==='walking'?'ok':(x.state==='set aside'?'bad':'warn'))+'">'+esc(x.state)+'</td>'+ncell(x.judgments_in_corpus)+ncell(x.grid_rows)+'<td>'+bar(x.lap_pct)+'</td>'+ncell(x.lap_pct)+cell(x.note)+'</tr>').join('')+'</table><p class="note">Each journal is selected in the site\'s citation search and its list walked in turn; citations already in the corpus are skipped, not downloaded again.</p>':'<p class="note">no journal configured</p>';
+  const pub=pr.public_sources||[];
+  $('public').innerHTML=pub.length?'<table><tr><th>source</th><th>state</th><th class="n">done</th><th class="n">pending</th><th>progress</th></tr>'+pub.map(x=>'<tr>'+cell(x.source)+'<td class="'+stateClass(x.state)+'">'+esc(x.state)+'</td>'+ncell(x.done)+ncell(x.pending)+'<td>'+bar(x.pct)+'</td></tr>').join('')+'</table>':'<p class="note">no public-source queue yet</p>';
+  const ar=pr.archive||[];
+  $('archiveprog').innerHTML=ar.length?'<table><tr><th>copy</th><th class="n">copied</th><th class="n">missing</th><th>progress</th><th class="n">per hour</th><th class="n">time left</th></tr>'+ar.map(x=>'<tr>'+cell(x.target)+ncell((x.judgments_total||0)-(x.judgments_missing||0))+ncell(x.judgments_missing)+'<td>'+bar(x.pct)+'</td>'+ncell(x.judgments_per_hour)+'<td class="n">'+esc(hours(x.eta_hours))+'</td></tr>').join('')+'</table>':'<p class="note">no archive target enabled</p>';
+  $('sources').innerHTML='<table><tr><th>source</th><th>state</th><th>reason</th><th class="n">judgments</th><th>last success</th><th>next run</th><th>last job</th></tr>'+(d.sources||[]).map(x=>{const j=x.last_job||{};return '<tr>'+cell(x.source)+'<td class="'+stateClass(x.state)+'">'+esc(x.state)+'</td>'+cell(x.reason)+ncell(x.judgments)+cell(when(x.last_success_at))+cell(when(x.next_scrape_at))+cell(j.status?j.status+' '+when(j.started_at)+' pages '+j.pages+' staged '+j.staged+(j.outcome?' — '+j.outcome:''):'-')+'</tr>'}).join('')+'</table><p class="note">Pause or resume a source on the <a href="/dashboard">dashboard</a>\'s Sources tab.</p>';
+  const pls=(d.sources||[]).filter(x=>x.access==='login_session');
+  $('pls').innerHTML=pls.map(x=>{const p=x.pacing_today||{};return '<p><strong>'+esc(x.source)+'</strong>: current slot '+esc(x.current_slot)+'; pages today '+num(p.pages_today)+' of '+num(p.limit_per_day)+', this hour '+num(p.pages_this_hour)+' of '+num(p.limit_per_hour)+'</p><table><tr><th>slot</th><th>state</th><th>reason</th><th>logged in</th><th>last used</th><th>saved sign-in</th></tr>'+(x.slots||[]).map(y=>'<tr>'+cell(y.slot)+'<td class="'+stateClass(y.state)+'">'+esc(y.state)+'</td>'+cell(y.reason)+cell(when(y.logged_in_at))+cell(when(y.last_used_at))+cell(y.saved_sign_in?'yes':'no')+'</tr>').join('')+'</table>'}).join('')||'<p class="note">no login-session source</p>';
   const g=(d.archive||{}).google_drive||{};
   let a='<p class="'+(g.configured?'ok':'bad')+'"><strong>Google Drive: '+(g.configured?'configured':'NOT CONFIGURED')+'</strong>'+(g.note?' — '+esc(g.note):'')+'</p>';
   const ts=(d.archive||{}).targets||[];
-  a+='<table><tr><th>target</th><th>type</th><th>enabled</th><th>takes PakistanLawSite rows</th><th>judgments mirrored</th><th>objects</th><th>last written</th><th>last ok</th><th>failures</th><th>last error</th></tr>'+ts.map(x=>'<tr>'+cell(x.name)+cell(x.type)+cell(x.enabled?'yes':'no')+cell(x.mirrors_pakistanlawsite?'yes':'no')+cell(x.judgments_mirrored)+cell(JSON.stringify(x.objects||{}))+cell(when(x.last_written_at))+cell(when(x.last_ok_at))+cell(x.consecutive_failures)+cell(x.last_error)+'</tr>').join('')+'</table>';
-  if(!ts.length)a+='<p class="note">No archive target yet.</p>';
+  a+='<table><tr><th>target</th><th>type</th><th>enabled</th><th>takes PakistanLawSite rows</th><th class="n">judgments mirrored</th><th>last written</th><th>last ok</th><th class="n">failures</th><th>last error</th></tr>'+ts.map(x=>'<tr>'+cell(x.name)+cell(x.type)+cell(x.enabled?'yes':'no')+cell(x.mirrors_pakistanlawsite?'yes':'no')+ncell(x.judgments_mirrored)+cell(when(x.last_written_at))+cell(when(x.last_ok_at))+ncell(x.consecutive_failures)+cell(x.last_error)+'</tr>').join('')+'</table>';
   $('archive').innerHTML=a;
-  $('sources').innerHTML='<table><tr><th>source</th><th>state</th><th>reason</th><th>judgments</th><th>last success</th><th>next run</th><th>last job</th></tr>'+(d.sources||[]).map(s=>{const j=s.last_job||{};return '<tr>'+cell(s.source)+'<td class="'+stateClass(s.state)+'">'+esc(s.state)+'</td>'+cell(s.reason)+cell(s.judgments)+cell(when(s.last_success_at))+cell(when(s.next_scrape_at))+cell(j.status?j.status+' '+when(j.started_at)+' pages '+j.pages+' staged '+j.staged+(j.outcome?' — '+j.outcome:''):'-')+'</tr>'}).join('')+'</table>';
-  const pls=(d.sources||[]).filter(s=>s.access==='login_session');
-  $('pls').innerHTML=pls.map(s=>{const p=s.pacing_today||{};return '<p><strong>'+esc(s.source)+'</strong>: current slot '+esc(s.current_slot)+'; pages today '+esc(p.pages_today)+' of '+esc(p.limit_per_day)+', this hour '+esc(p.pages_this_hour)+' of '+esc(p.limit_per_hour)+'</p><table><tr><th>slot</th><th>state</th><th>reason</th><th>logged in</th><th>last used</th><th>saved sign-in</th></tr>'+(s.slots||[]).map(x=>'<tr>'+cell(x.slot)+'<td class="'+stateClass(x.state)+'">'+esc(x.state)+'</td>'+cell(x.reason)+cell(when(x.logged_in_at))+cell(when(x.last_used_at))+cell(x.saved_sign_in?'yes':'no')+'</tr>').join('')+'</table>'}).join('')||'<p class="note">no login-session source</p>';
   const v=d.judgments_by_reporter_year||[];
-  $('volumes').innerHTML=v.length?'<table><tr><th>reporter</th><th>year</th><th>judgments</th></tr>'+v.map(x=>'<tr>'+cell(x.reporter)+cell(x.year)+cell(x.judgments)+'</tr>').join('')+'</table>':'<p class="note">none yet</p>';
-  const sp=d.spot_checks||{};
-  const t24=sp.last_24h||{};
-  let sh='<p class="note">Every '+esc(Math.round((sp.every_seconds||0)/60))+' minutes: '+esc((sp.per_run||{}).judgments)+' judgments opened through the login session and '+esc((sp.per_run||{}).statute_sections)+' statute sections opened from their public source, each compared on the page as a browser shows it. Last run: '+when(sp.last_checked_at)+'.</p>';
-  const keys=Object.keys(t24).sort();
+  const byRep={};v.forEach(x=>{(byRep[x.reporter]=byRep[x.reporter]||[]).push(x)});
+  $('volumes').innerHTML=v.length?Object.keys(byRep).sort().map(r=>{const rows=byRep[r];const tot=rows.reduce((a,x)=>a+x.judgments,0);return '<details><summary><b>'+esc(r)+'</b> — '+num(tot)+' judgments, '+rows.length+' years</summary><table><tr><th>year</th><th class="n">judgments</th></tr>'+rows.map(x=>'<tr>'+cell(x.year)+ncell(x.judgments)+'</tr>').join('')+'</table></details>'}).join(''):'<p class="note">none yet</p>';
+  const sc=d.spot_checks||{};const t24=sc.last_24h||{};const keys=Object.keys(t24).sort();
+  let sh='<p class="note">Every '+esc(Math.round((sc.every_seconds||0)/60))+' minutes: '+esc((sc.per_run||{}).judgments)+' judgments and '+esc((sc.per_run||{}).statute_sections)+' statute sections re-opened at their source and compared. Last run: '+when(sc.last_checked_at)+'.</p>';
   sh+='<p>Last 24 hours: '+(keys.length?keys.map(k=>'<span class="'+(k.endsWith(':match')?'ok':(k.endsWith(':differs')?'bad':'warn'))+'">'+esc(k)+' '+esc(t24[k])+'</span>').join(' · '):'no checks yet')+'</p>';
-  const rec=sp.recent||[];
-  sh+=rec.length?'<table><tr><th>when</th><th>kind</th><th>record</th><th>result</th><th>similarity</th><th>detail</th></tr>'+rec.map(x=>'<tr>'+cell(when(x.at))+cell(x.kind)+cell(x.label)+'<td class="'+(x.result==='match'?'ok':(x.result==='differs'?'bad':'warn'))+'">'+esc(x.result)+'</td>'+cell(x.similarity==null?'-':x.similarity)+cell(x.detail)+'</tr>').join('')+'</table>':'';
+  const rec=sc.recent||[];
+  sh+=rec.length?'<details><summary>recent checks</summary><table><tr><th>when</th><th>kind</th><th>record</th><th>result</th><th class="n">similarity</th><th>detail</th></tr>'+rec.map(x=>'<tr>'+cell(when(x.at))+cell(x.kind)+cell(x.label)+'<td class="'+(x.result==='match'?'ok':(x.result==='differs'?'bad':'warn'))+'">'+esc(x.result)+'</td>'+ncell(x.similarity)+cell(x.detail)+'</tr>').join('')+'</table></details>':'';
   $('spot').innerHTML=sh;
   const n=d.open_notifications||[];
   $('notes').innerHTML=n.length?'<table><tr><th>when</th><th>level</th><th>code</th><th>source</th><th>message</th></tr>'+n.map(x=>'<tr>'+cell(when(x.at))+'<td class="'+(x.level==='critical'||x.level==='error'?'bad':'warn')+'">'+esc(x.level)+'</td>'+cell(x.code)+cell(x.source)+cell(x.message)+'</tr>').join('')+'</table>':'<p class="note">none</p>';
 }
-load();setInterval(load,60000);
+load();setInterval(load,30000);
 </script>
 </body>
 </html>

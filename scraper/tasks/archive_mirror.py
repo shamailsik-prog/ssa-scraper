@@ -15,6 +15,9 @@ MIRROR_LOCK_KEY = 0x55A_A2C1  # pg advisory lock: one mirror run at a time
 
 
 async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
+    from scraper.heartbeat import beat
+
+    await beat("archive_mirror")
     async with SessionLocal() as db:
         # A backlog run on Google Drive can outlast the Beat interval. A second run would pick the same
         # oldest judgments, upload duplicate files (Drive allows two files with one name) and then block
