@@ -161,6 +161,9 @@ class Settings(BaseSettings):
     PLS_STALL_WATCHDOG_SECONDS: int = Field(default=1800, description="Celery Beat cadence for citation-grid stall watchdog.")
     PLS_STALL_NO_PROMOTION_HOURS: float = Field(default=6.0, description="/status stalled=true (and a PLS_NO_NEW_JUDGMENTS notification) when no PakistanLawSite judgment was promoted for this many hours.")
     PLS_SATURATED_RECHECK_HOURS: float = Field(default=12.0, description="A citation-grid shard whose last full lap staged nothing new is not scheduled again for this many hours.")
+    PLS_GRID_JOURNAL_ROTATION: bool = Field(default=True, description="Walk the citation grid once per journal: select each journal in the site's citation-search form and give it its own cursor. Off, or when the form offers no journal choice, the default grid (the site's last or default search) is walked.")
+    PLS_GRID_JOURNALS: str = Field(default="", description="Comma-separated journals for the per-journal grid walk, in order; blank = PLS_SUBSCRIBED_REPORTERS.")
+    PLS_GRID_JOURNAL_MIN_MATCH: float = Field(default=0.5, description="Share of a journal grid's rows that must carry the requested journal's citations; below it the journal is marked unsupported (the form did not filter) and skipped until the saturation recheck.")
     PLS_CITATION_GRID_SKIP_FLUSH_EVERY: int = Field(default=50, description="Commit the grid cursor every N rows that are only skipped (known, already staged, other shard); rows that fetch a detail page still commit every PLS_CITATION_GRID_FLUSH_EVERY.")
     MIRROR_BACKLOG_PER_RUN: int = Field(default=300, description="Oldest-first backlog judgments the archive mirror writes per target per run, in addition to the newest ones.")
     MIRROR_LAG_ALERT_HOURS: float = Field(default=3.0, description="Alert (ARCHIVE_MIRROR_LAG) when a target has unmirrored judgments and its newest mirrored judgment is older than this.")
@@ -577,6 +580,11 @@ class Settings(BaseSettings):
     @property
     def subscribed_reporters(self) -> List[str]:
         return [x for x in self.PLS_SUBSCRIBED_REPORTERS.split(",") if x]
+
+    @property
+    def grid_journals(self) -> List[str]:
+        raw = self.PLS_GRID_JOURNALS or self.PLS_SUBSCRIBED_REPORTERS
+        return list(dict.fromkeys(x.strip() for x in (raw or "").split(",") if x.strip()))
 
     @property
     def tier3_vocabulary(self) -> List[str]:

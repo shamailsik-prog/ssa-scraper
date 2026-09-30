@@ -377,3 +377,19 @@ def test_only_bad_pages_are_refetched_not_real_judgments():
     assert r("citation 1984 CLC 1 already belongs to judgment X", 20000, {}, "") is False
     # bounded: after QUARANTINE_REFETCH_MAX attempts the row is left alone
     assert r("subscription_chrome", 9000, {"refetch_count": 3}, "") is False
+
+
+def test_dispatch_saturation_waits_for_every_journal(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNALS", "")
+    sat = {"saturated_at": (NOW - timedelta(hours=1)).isoformat()}
+    # the default (CLC) grid is saturated, but PLD has not been walked: not saturated
+    cfg = {"citation_grid_cursor": dict(sat), "citation_grid_cursor_journal_CLC": dict(sat)}
+    assert dispatch_saturated(cfg, None, now=NOW) is False
+    cfg["citation_grid_cursor_journal_PLD"] = {"unsupported_at": (NOW - timedelta(hours=1)).isoformat()}
+    assert dispatch_saturated(cfg, None, now=NOW) is True
+    # rotation found no dropdown: the default grid's own saturation decides again
+    cfg2 = {"citation_grid_cursor": dict(sat), "citation_grid_journal_rotation_off": {"at": (NOW - timedelta(hours=1)).isoformat()}}
+    assert dispatch_saturated(cfg2, None, now=NOW) is True

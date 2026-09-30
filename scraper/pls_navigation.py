@@ -529,3 +529,104 @@ async def open_citation_search_for_harvest(browser: Browser, *, archived_grid_st
         page_type=page_type,
         page=page,
     )
+
+
+# --------------------------------------------------------------------------- per-journal citation grid
+class JournalNotOffered(RuntimeError):
+    """The form has a journal dropdown, but this journal cannot be selected or its submit reached no grid."""
+
+
+def _norm_journal(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _label_head(label: str) -> str:
+    """The journal abbreviation a label starts with: "PLD - All Pakistan Legal Decisions" -> "PLD"."""
+    return re.split(r"\s+[-–:|]\s*|\s*\(", (label or "").strip(), maxsplit=1)[0]
+
+
+def match_journal_option(journal: str, field: Dict[str, Any]) -> Optional[str]:
+    """The <option> value that selects `journal` in the form's journal/reporter dropdown, or None.
+
+    Exact matches on the value or the whole label win; then a label whose leading abbreviation is
+    the journal ("P Cr. L J (Criminal)" for PCrLJ). Punctuation and spacing are ignored."""
+    want = _norm_journal(journal)
+    if not want:
+        return None
+    pairs: List[List[str]] = [list(p) for p in (field.get("option_labels") or []) if p]
+    if not pairs:
+        pairs = [[str(o), str(o)] for o in (field.get("options") or [])]
+    for value, label in pairs:
+        if _norm_journal(value) == want or _norm_journal(label) == want:
+            return value
+    heads = [(value, _norm_journal(_label_head(label))) for value, label in pairs]
+    hits = [value for value, head in heads if head == want]
+    return hits[0] if len(hits) == 1 else None
+
+
+def journal_field(probe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The journal/reporter <select> of an introspected form, if it has one with choices."""
+    for field in probe.get("fields") or []:
+        if field.get("role") == "reporter" and field.get("kind") == "select" and (field.get("options") or field.get("option_labels")):
+            return field
+    return None
+
+
+def describe_search_form(probe: Dict[str, Any], *, max_options: int = 40) -> str:
+    """One log line describing a form's controls (names, roles, kinds, first option labels): no values typed."""
+    parts = []
+    for field in probe.get("fields") or []:
+        labels = [p[1] for p in (field.get("option_labels") or [])][:max_options]
+        opt = f" options={labels}" if labels else ""
+        parts.append(f"{field.get('name')}[{field.get('kind')}/{field.get('role') or '-'}]{opt}")
+    return f"surface={probe.get('surface')} fields={len(probe.get('fields') or [])}: " + "; ".join(parts)
+
+
+async def _journal_form_source(browser: Browser, check_page: PageResult) -> tuple[Optional[str], Dict[str, Any]]:
+    """Where the journal dropdown lives: the dashboard HTML, else the live CitationSearch page's controls."""
+    probe = introspect_search_form(check_page.html or "")
+    if probe.get("surface") == "query_form" and journal_field(probe):
+        return "dashboard", probe
+    live = getattr(browser, "live_search_form_html", None)
+    if callable(live):
+        await browser.goto(settings.PLS_SEARCH_URL, referer=check_page.url or pls_check_url())
+        html = await live()
+        live_probe = introspect_search_form(html or "")
+        if live_probe.get("surface") == "query_form" and journal_field(live_probe):
+            return "citation_search_page", live_probe
+        return None, live_probe
+    return None, probe
+
+
+async def open_citation_grid_for_journal(browser: Browser, journal: str, *, archived_grid_start_row: int = 0) -> Optional[PageResult]:
+    """Submit the site's citation-search form with `journal` selected and return the grid it lists.
+
+    None when no form with a journal dropdown is found: the caller then walks the default grid as before.
+    JournalNotOffered when the dropdown exists but this journal cannot be walked (the others still can). The returned page is checked by the caller for rows
+    that really belong to `journal` (a form that ignores the choice must not pass for a filter)."""
+    check_url = pls_check_url()
+    check_page = await browser.goto(check_url)
+    login_reason = check_page_login_required_reason(check_page.html or "", check_page.url or check_url)
+    if login_reason:
+        raise LoginRequired(f"{login_reason} (landed on {check_page.url or check_url})")
+    where, probe = await _journal_form_source(browser, check_page)
+    logger.info("PakistanLawSite journal form probe (%s): %s", where or "not found", describe_search_form(probe))
+    if where is None:
+        return None
+    field = journal_field(probe)
+    value = match_journal_option(journal, field or {})
+    if value is None:
+        raise JournalNotOffered(f"{journal} is not an option of the form's {(field or {}).get('name')} dropdown")
+    search_map = _probe_to_search_map(probe)
+    page = await browser.submit_search(search_map, {"reporter": value}, archived_grid_start_row=archived_grid_start_row)
+    page.metadata = {
+        **(page.metadata or {}),
+        "pls_citation_search_nav": {"via": f"journal_form_{where}", "journal": journal, "journal_value": value, "attempts": []},
+    }
+    if not citation_search_surface_is_harvestable(page.html or "", page.metadata):
+        page_type = classify_pls_page(page.html or "", page.url or "", page.metadata)
+        if page_type == "citation_search_no_results":
+            raise CitationSearchNavigationFailed(f"journal {journal}: the site returned no results", page_type=page_type, page=page)
+        raise JournalNotOffered(f"submitting {journal} did not reach the citation grid (page_type={page_type})")
+    raise_for_verdict(page)
+    return page

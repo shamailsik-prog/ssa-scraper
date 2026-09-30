@@ -21,7 +21,71 @@ def _to_int(value: Any) -> Optional[int]:
         return None
 
 
+JOURNAL_CURSOR_PREFIX = "citation_grid_cursor_journal_"
+JOURNAL_ROTATION_OFF_KEY = "citation_grid_journal_rotation_off"
+
+
+def journal_cursor_key(journal: str) -> str:
+    """config_json key of one journal's grid cursor ("PCrLJ" -> citation_grid_cursor_journal_PCrLJ)."""
+    import re as _re
+
+    return JOURNAL_CURSOR_PREFIX + _re.sub(r"[^A-Za-z0-9]", "", journal or "")
+
+
+def journal_rotation_off(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    """True while the last probe found no usable journal dropdown (rechecked after PLS_SATURATED_RECHECK_HOURS)."""
+    off = cfg.get(JOURNAL_ROTATION_OFF_KEY)
+    at = parse_iso(off.get("at")) if isinstance(off, dict) else None
+    if at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - at).total_seconds() < saturated_recheck_hours() * 3600
+
+
+def journal_unsupported(cur: Any, *, now: Optional[datetime] = None) -> bool:
+    """True while a journal's grid did not carry that journal's citations (the form ignored the choice)."""
+    if not isinstance(cur, dict):
+        return False
+    at = parse_iso(cur.get("unsupported_at"))
+    if at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - at).total_seconds() < saturated_recheck_hours() * 3600
+
+
+def journal_cursor_keys(cfg: Dict[str, Any]) -> List[str]:
+    return sorted(k for k in cfg if isinstance(k, str) and k.startswith(JOURNAL_CURSOR_PREFIX))
+
+
+def journals_for_shard(reporter_shard: Optional[int]) -> List[str]:
+    """The configured journals a reporter shard walks (the pipeline splits the subscribed reporters the same way)."""
+    import re as _re
+
+    from scraper.tasks.pakistanlawsite import split_reporter_shards  # lazy: that module imports this one
+
+    journals = list(settings.grid_journals)
+    if reporter_shard not in (0, 1):
+        return journals
+    left, right = split_reporter_shards(settings.subscribed_reporters)
+    allowed = {_re.sub(r"[^a-z0-9]", "", r.lower()) for r in (left if reporter_shard == 0 else right)}
+    return [j for j in journals if _re.sub(r"[^a-z0-9]", "", j.lower()) in allowed]
+
+
+def journals_all_done(cfg: Dict[str, Any], journals: List[str], *, now: Optional[datetime] = None) -> bool:
+    """Every configured journal has a cursor and each is saturated or unsupported (nothing left to walk)."""
+    if not journals:
+        return False
+    for journal in journals:
+        cur = cfg.get(journal_cursor_key(journal))
+        if not isinstance(cur, dict) or not (cursor_saturated(cur, now=now) or journal_unsupported(cur, now=now)):
+            return False
+    return True
+
+
 def citation_grid_cursor_keys(cfg: Dict[str, Any]) -> List[str]:
+    journal_keys = journal_cursor_keys(cfg)
+    if journal_keys and settings.PLS_GRID_JOURNAL_ROTATION and not journal_rotation_off(cfg):
+        return journal_keys
     shard_keys = [k for k in cfg if k.startswith("citation_grid_cursor_shard_")]
     if shard_keys:
         return sorted(shard_keys)
@@ -115,7 +179,12 @@ def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
 
 
 def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:
-    """Scheduler guard: do not enqueue a job for a shard (or the unsharded walk) whose grid is saturated."""
+    """Scheduler guard: do not enqueue a job for a shard (or the unsharded walk) whose grid is saturated.
+
+    With the per-journal walk on, the default grid's cursor says nothing about the other journals: the
+    walk is saturated only when every configured journal is saturated or unsupported."""
+    if settings.PLS_GRID_JOURNAL_ROTATION and settings.grid_journals and not journal_rotation_off(cfg, now=now):
+        return journals_all_done(cfg, journals_for_shard(reporter_shard), now=now)
     return cursor_saturated(cfg.get(grid_cursor_key_for_shard(reporter_shard)), now=now)
 
 

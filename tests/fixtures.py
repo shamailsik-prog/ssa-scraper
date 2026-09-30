@@ -322,10 +322,10 @@ class FakeBrowser:
 
         return await open_citation_search(self, **kwargs)
 
-    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
+    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs) -> PageResult:
         key = ("search", tuple(sorted(values.items())))
         self.calls.append((key, self.slot_number))
-        return self.script.respond(key, self)
+        return self.script.respond(key, self, goto_kwargs=kwargs)
 
     async def download(self, url: str) -> bytes:
         self.calls.append(("download", url, self.slot_number))

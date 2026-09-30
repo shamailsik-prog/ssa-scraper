@@ -128,6 +128,7 @@ class SearchFormField(_Strict):
     selector: str
     kind: Literal["text", "select", "checkbox", "radio", "hidden", "submit"]
     options: List[str] = Field(default_factory=list)
+    option_labels: List[List[str]] = Field(default_factory=list)  # [value, visible label] per <option>
     role: Optional[str] = None  # reporter|year|page|court|statute|section|keyword|citation_no|submit
 
 

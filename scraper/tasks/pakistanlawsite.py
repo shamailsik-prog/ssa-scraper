@@ -46,6 +46,9 @@ from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.pls_navigation import (
     CitationSearchNavigationFailed,
+    JournalNotOffered,
+    _norm_journal,
+    open_citation_grid_for_journal,
     open_citation_grid_for_window,
     open_citation_search_for_harvest,
 )
@@ -60,7 +63,14 @@ from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Citation, CrawlCoverage, CrawlFrontier, Judgment, ScraperJob, ScraperSource, ScraperStaging, StatuteSection, Statute
 from scraper.notify import notify
-from scraper.pls_grid_health import lap_update
+from scraper.pls_grid_health import (
+    JOURNAL_ROTATION_OFF_KEY,
+    cursor_saturated,
+    journal_cursor_key,
+    journal_rotation_off,
+    journal_unsupported,
+    lap_update,
+)
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
@@ -332,6 +342,9 @@ class PakistanLawSitePipeline:
         self._surface_page: Optional[PageResult] = None
         self._surface_page_start_row: Optional[int] = None
         self._citation_grid_fast_reload: bool = False
+        # Per-journal grid walk: the journal whose grid the current window reads (None = the default grid).
+        self.grid_journal: Optional[str] = None
+        self._journal_rotation_disabled: bool = False
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "citation_grid_windows": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
@@ -590,8 +603,74 @@ class PakistanLawSitePipeline:
         scan_window = max(max_detail, scan_window)
         return {"max_detail": max_detail, "scan_window": scan_window, "run_minutes": max(0, run_minutes)}
 
+    # ---------------------------------------------------------------- per-journal grid walk
+    def _journal_candidates(self) -> List[str]:
+        """Journals this job may walk, in configured order (a reporter shard walks only its own journals)."""
+        if not settings.PLS_GRID_JOURNAL_ROTATION or self._journal_rotation_disabled:
+            return []
+        if journal_rotation_off(dict(self.source.config_json or {})):
+            return []
+        journals = list(settings.grid_journals)
+        if self.reporter_shard_reporters:
+            allowed = {_norm_journal(r) for r in self.reporter_shard_reporters}
+            journals = [j for j in journals if _norm_journal(j) in allowed]
+        return journals
+
+    def _journal_available(self, journal: str) -> bool:
+        cur = (self.source.config_json or {}).get(journal_cursor_key(journal))
+        return not (cursor_saturated(cur) or journal_unsupported(cur))
+
+    def _pick_grid_journal(self, *, after: Optional[str] = None) -> Optional[str]:
+        """The next journal with grid work left, round-robin from `after` (or from the one last walked)."""
+        journals = self._journal_candidates()
+        if not journals:
+            return None
+        start = after or (self.source.config_json or {}).get("citation_grid_journal")
+        order = journals
+        if start in journals:
+            i = journals.index(start)
+            order = journals[i + 1 :] + journals[: i + 1] if after else journals[i:] + journals[:i]
+        for journal in order:
+            if self._journal_available(journal):
+                return journal
+        return None
+
+    async def _set_grid_journal(self, journal: Optional[str]) -> None:
+        self.grid_journal = journal
+        self._citation_grid_fast_reload = False
+        self.stats["citation_grid_journal"] = journal
+        if journal:
+            await merge_source_config(self.db, self.source, {"citation_grid_journal": journal})
+            await self.db.commit()
+
+    async def _mark_journal_unsupported(self, journal: str, reason: str) -> None:
+        logger.warning("PakistanLawSite journal %s set aside until the recheck: %s", journal, reason)
+        key = journal_cursor_key(journal)
+        cur = dict((self.source.config_json or {}).get(key) or {})
+        cur.update({"unsupported_at": datetime.now(timezone.utc).isoformat(), "unsupported_reason": reason[:300]})
+        await merge_source_config(self.db, self.source, {key: cur})
+        await self.db.commit()
+        self.stats.setdefault("citation_grid_journals_unsupported", []).append(journal)
+
+    async def _disable_journal_rotation(self, reason: str) -> None:
+        """No usable journal dropdown: walk the default grid, and do not probe again until the recheck."""
+        logger.warning("PakistanLawSite per-journal grid walk unavailable: %s; walking the default grid", reason)
+        self._journal_rotation_disabled = True
+        self.grid_journal = None
+        self.stats["citation_grid_journal_rotation"] = f"off: {reason}"
+        await merge_source_config(self.db, self.source, {JOURNAL_ROTATION_OFF_KEY: {"at": datetime.now(timezone.utc).isoformat(), "reason": reason[:300]}})
+        await self.db.commit()
+
     def _citation_grid_cursor(self) -> tuple[str, Dict[str, Any], int]:
         cfg = dict(self.source.config_json or {})
+        if self.grid_journal:
+            cursor_key = journal_cursor_key(self.grid_journal)
+            cursor = dict(cfg.get(cursor_key) or {})
+            try:
+                row_offset = int(cursor.get("row_offset", 0) or 0)
+            except Exception:
+                row_offset = 0
+            return cursor_key, cursor, max(0, row_offset)
         cursor_key = citation_grid_cursor_key(self.reporter_shard)
         cursor = dict(cfg.get(cursor_key) or cfg.get("citation_grid_cursor") or {})
         try:
@@ -612,6 +691,19 @@ class PakistanLawSitePipeline:
         deadline = time.monotonic() + limits["run_minutes"] * 60 if limits["run_minutes"] > 0 else None
         self.stats["surface_mode"] = "citation_grid"
         self.stats["citation_grid_run_minutes"] = limits["run_minutes"]
+        journals = self._journal_candidates()
+        if journals:
+            first = self._pick_grid_journal()
+            if first is None:
+                cfg = dict(self.source.config_json or {})
+                if all(journal_unsupported(cfg.get(journal_cursor_key(j))) for j in journals):
+                    await self._disable_journal_rotation("every journal was set aside: the form does not filter by journal")
+                else:
+                    self.stats["citation_grid_journals_done"] = True
+                    logger.info("PakistanLawSite per-journal grid walk: every journal is saturated or set aside; nothing to walk until the recheck")
+                    return
+            else:
+                await self._set_grid_journal(first)
         windows = 0
         while True:
             try:
@@ -635,6 +727,21 @@ class PakistanLawSitePipeline:
                 )
                 self.stats["citation_grid_stub_stop"] = True
                 break
+            if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
+                outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
+            ):
+                # This journal's lap ended (or it was set aside): move on to the next journal with work left.
+                nxt = self._pick_grid_journal(after=self.grid_journal)
+                logger.info("PakistanLawSite per-journal grid walk: %s done for now; next journal %s", self.grid_journal, nxt or "(none)")
+                if nxt is None or nxt in (self.stats.get("citation_grid_journals_walked") or []):
+                    # every journal with work left had its turn in this job: the next job resumes the rotation
+                    if nxt is not None:
+                        await self._set_grid_journal(nxt)
+                    break
+                await self._set_grid_journal(nxt)
+                if deadline is None or time.monotonic() >= deadline or windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
+                    break
+                continue
             if deadline is None:
                 break
             if outcome["rows"] == 0:
@@ -660,9 +767,36 @@ class PakistanLawSitePipeline:
         scan_window = limits["scan_window"]
         result: Dict[str, Any] = {"rows": 0, "processed": 0, "start_offset": row_offset, "next_offset": row_offset, "wrapped": False, "cursor_unconfirmed": False}
 
-        # Reuse the page ensure_search_map() already rendered when it was asked for this exact row.
         page: Optional[PageResult] = None
-        if self._surface_page is not None and self._surface_page_start_row == row_offset:
+        if self.grid_journal:
+            journal = self.grid_journal
+
+            async def journal_op(browser: Browser) -> Optional[PageResult]:
+                return await open_citation_grid_for_journal(browser, journal, archived_grid_start_row=row_offset)
+
+            try:
+                page = await self.runner.run(journal_op)
+            except JournalNotOffered as exc:
+                await self._mark_journal_unsupported(journal, str(exc))
+                result["journal_done"] = True
+                return result
+            except CitationSearchNavigationFailed as exc:
+                if exc.page_type == "citation_search_no_results":
+                    await self._mark_journal_unsupported(journal, "the site lists no results for this journal")
+                    result["journal_done"] = True
+                    return result
+                raise
+            if page is not None:
+                walked = self.stats.setdefault("citation_grid_journals_walked", [])
+                if journal not in walked:
+                    walked.append(journal)
+            if page is None:
+                await self._disable_journal_rotation(f"no usable journal dropdown for {journal}")
+                cursor_key, cursor, row_offset = self._citation_grid_cursor()
+                result.update({"start_offset": row_offset, "next_offset": row_offset})
+        # Reuse the page ensure_search_map() already rendered when it was asked for this exact row
+        # (that page is the default grid, so never for a journal window).
+        if page is None and not self.grid_journal and self._surface_page is not None and self._surface_page_start_row == row_offset:
             page = self._surface_page
         self._surface_page = None
         self._surface_page_start_row = None
@@ -705,6 +839,16 @@ class PakistanLawSitePipeline:
             return result
         row_count = len(rows)
         result["rows"] = row_count
+        if self.grid_journal:
+            # The form must really have filtered: a grid of another journal's rows (the choice ignored) would
+            # be walked under the wrong cursor. Below PLS_GRID_JOURNAL_MIN_MATCH the journal is set aside.
+            want = _norm_journal(self.grid_journal)
+            matched = sum(1 for r in rows if _norm_journal(reporter_from_citation(str(r.get("citation") or ""))) == want)
+            self.stats["citation_grid_journal_match"] = f"{matched}/{row_count}"
+            if matched < float(settings.PLS_GRID_JOURNAL_MIN_MATCH) * row_count:
+                await self._mark_journal_unsupported(self.grid_journal, f"only {matched} of {row_count} grid rows carry {self.grid_journal} citations")
+                result["journal_done"] = True
+                return result
         total_rows_meta = grid_metadata.get("total_rows")
         try:
             total_rows = int(total_rows_meta) if total_rows_meta is not None else None
@@ -908,7 +1052,7 @@ class PakistanLawSitePipeline:
                 cursor["wrapped_at"] = cursor["updated_at"]
                 cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
             patch = {cursor_key: cursor}
-            if cursor_key == "citation_grid_cursor" or self.reporter_shard is None:
+            if cursor_key == "citation_grid_cursor" or (self.reporter_shard is None and not self.grid_journal):
                 patch["citation_grid_cursor"] = cursor
             # Atomic top-level merge: the other shard's cursor and counters are never overwritten.
             await merge_source_config(self.db, self.source, patch)
@@ -1121,7 +1265,9 @@ class PakistanLawSitePipeline:
             count_wrap=last_committed_offset != next_offset,
         )
         wrapped = bool(total_rows > 0 and next_offset < start_offset)
-        result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped})
+        # the window read up to the grid's last row (a whole-grid window from row 0 ends a lap without "wrapping")
+        reached_end = bool(total_rows > 0 and start_offset + processed_rows_total >= total_rows)
+        result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped, "reached_end": reached_end})
         logger.info(
             "PakistanLawSite citation-grid cursor window complete start_offset=%s next_offset=%s wrap=%s",
             start_offset,
