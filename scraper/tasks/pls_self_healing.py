@@ -143,7 +143,8 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
         watch = dict(cfg.get(WATCHDOG_META_KEY) or {})
         prev_sig = watch.get("signature")
         prev_dt = parse_iso(watch.get("signature_at"))
-        if prev_sig is None or not signatures_equal(prev_sig, sig):
+        # A watch written before signature_at existed starts its frozen episode now, or it never arms.
+        if prev_sig is None or not signatures_equal(prev_sig, sig) or prev_dt is None:
             watch["signature"], watch["signature_at"] = sig, now.isoformat()
             await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
             await db.commit()

@@ -410,6 +410,10 @@ async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: 
             )
         )
     ).scalars().all()
+    from scraper.tasks.pakistanlawsite import _FINAL_QUARANTINE  # lazy: pakistanlawsite imports this module's callers
+
+    # a merits quarantine (a real citation conflict) still needs a person; only bad-page captures are superseded
+    others = [o for o in others if not _FINAL_QUARANTINE.search(o.quarantine_reason or "")]
     closed = 0
     for old in others:
         old.status = "duplicate"
@@ -419,7 +423,7 @@ async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: 
             item.reviewed = True
             item.reviewed_by = "system"
             item.reviewed_at = datetime.now(timezone.utc)
-            item.resolution = "promoted"
+            item.resolution = "superseded"
             item.resolution_notes = f"superseded: {cit} was promoted from a later capture"
             closed += 1
     if others:

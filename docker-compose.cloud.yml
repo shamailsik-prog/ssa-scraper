@@ -15,7 +15,7 @@ services:
   # e.g. the Google Drive OAuth redirect_uri. Scoped to the api service only.
   api:
     environment:
-      FORWARDED_ALLOW_IPS: "*"
+      FORWARDED_ALLOW_IPS: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
 
   caddy:
     image: caddy:2-alpine

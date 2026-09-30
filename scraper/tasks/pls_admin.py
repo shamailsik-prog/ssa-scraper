@@ -79,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
             async with SessionLocal() as db:
                 src = (await db.execute(sa_select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
                 cfg = (src.config_json or {}) if src else {}
-                total = max([int((cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])
+                from scraper.pls_grid_health import grid_total_rows
+
+                total = grid_total_rows(cfg)
                 return await grid_accounting(db, total_rows=total)
 
         print(json.dumps(run_async(report()), indent=2))

@@ -80,6 +80,7 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
 
 
 RETRY_DELAYS = (1.0, 3.0)
+JUDGMENT_OBJECT_COUNT = 3  # document (original or rendered copy) + judgment.txt + metadata.json
 
 
 async def _retry(fn, *args):
@@ -206,56 +207,48 @@ class ArchiveMirror:
             return True
         return bool(settings.MIRROR_LOGIN_SESSION_ROWS and target.mirror_login_session_rows)
 
+    def _have_subquery(self, t: ArchiveTarget):
+        """Per judgment, how many of its objects target `t` holds. A 'mismatch' object counts as present (it
+        needs a human or the reconcile, not a retry); 'failed' and 'missing' are retried."""
+        return (
+            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
+            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
+            .group_by(ArchiveObject.judgment_id)
+            .subquery()
+        )
+
     def _policy_clause(self, t: ArchiveTarget):
-        """SQL form of _policy_allows: login-session rows are excluded in the query itself, so ineligible rows can
-        never fill the LIMIT window and starve the eligible ones behind them."""
-        if settings.MIRROR_LOGIN_SESSION_ROWS and t.mirror_login_session_rows:
+        """SQL form of _policy_allows: a target that may not hold login-session rows never counts them as
+        owed. Filtering in Python after the LIMIT let those rows fill the oldest-first window for good."""
+        if self._policy_allows(t, "login_session"):
             return None
         return func.lower(func.coalesce(Judgment.access_method, "")) != "login_session"
 
     async def backlog_judgments(self, t: ArchiveTarget, limit: int, *, exclude=frozenset()) -> List[Judgment]:
-        """Oldest judgments that lack a full set of objects on target `t`. A 'mismatch' object counts as
-        present (it needs a human or the reconcile, not a retry); 'failed' and 'missing' are retried."""
+        """Oldest judgments that lack a full set of objects on target `t` and that the target may hold."""
         if limit <= 0:
             return []
-        have = (
-            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
-            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
-            .group_by(ArchiveObject.judgment_id)
-            .subquery()
-        )
-        q = (
-            select(Judgment)
-            .outerjoin(have, have.c.jid == Judgment.id)
-            .where(func.coalesce(have.c.c, 0) < 3)
-            .order_by(Judgment.promoted_at.asc())
-            .limit(limit + len(exclude))
-        )
-        clause = self._policy_clause(t)
-        if clause is not None:
-            q = q.where(clause)
-        rows = (await self.db.execute(q)).scalars().all()
-        return [j for j in rows if j.id not in exclude and self._policy_allows(t, j.access_method)][:limit]
+        have = self._have_subquery(t)
+        q = select(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < JUDGMENT_OBJECT_COUNT)
+        policy = self._policy_clause(t)
+        if policy is not None:
+            q = q.where(policy)
+        if exclude:
+            q = q.where(Judgment.id.notin_(list(exclude)))
+        return list((await self.db.execute(q.order_by(Judgment.promoted_at.asc()).limit(limit))).scalars().all())
 
     async def lag(self, t: ArchiveTarget) -> Dict[str, Any]:
-        """How far behind the corpus this target is."""
-        clause = self._policy_clause(t)
+        """How far behind the corpus this target is (judgments it may hold)."""
+        policy = self._policy_clause(t)
         total_q = select(func.count()).select_from(Judgment)
-        if clause is not None:
-            total_q = total_q.where(clause)
+        have = self._have_subquery(t)
+        unmirrored_q = select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < JUDGMENT_OBJECT_COUNT)
+        if policy is not None:
+            total_q, unmirrored_q = total_q.where(policy), unmirrored_q.where(policy)
         total = int((await self.db.execute(total_q)).scalar() or 0)
-        have = (
-            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
-            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
-            .group_by(ArchiveObject.judgment_id)
-            .subquery()
-        )
-        un_q = select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < 3)
-        if clause is not None:
-            un_q = un_q.where(clause)
-        unmirrored = int((await self.db.execute(un_q)).scalar() or 0)
+        unmirrored = int((await self.db.execute(unmirrored_q)).scalar() or 0)
         last_written = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
-        return {"judgments_total": total, "judgments_unmirrored": unmirrored, "last_written_at": last_written.isoformat() if last_written else None}
+        return {"judgments_total": total, "judgments_unmirrored": unmirrored, "last_written_at": last_written.isoformat() if last_written else None, "_last_written": last_written}
 
     async def alert_on_lag(self) -> List[str]:
         """ARCHIVE_MIRROR_LAG once per target while it has unmirrored judgments and has written nothing for
@@ -268,7 +261,7 @@ class ArchiveMirror:
         now = datetime.now(timezone.utc)
         for t in await self.targets():
             lag = await self.lag(t)
-            last = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
+            last = lag.pop("_last_written")
             stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
             problem = lag["judgments_unmirrored"] > 0 and stale
             code_msg = f"ARCHIVE_MIRROR_LAG:{t.name}"
@@ -313,9 +306,9 @@ class ArchiveMirror:
                     summary["skipped_policy"] += 1
                     continue
                 already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+                if already >= JUDGMENT_OBJECT_COUNT:
+                    continue  # complete on this target: skip the PDF render entirely
                 objs = await self.judgment_objects(j)
-                if already >= len(objs):
-                    continue
                 for obj in objs:
                     try:
                         status = await self._write(t, adapter, obj, judgment_id=j.id, prov_id=j.source_provenance_id, access_method=j.access_method)
@@ -354,26 +347,51 @@ class ArchiveMirror:
             index_rows = []
         return {"targets": len(targets), "summary": self.summary}
 
+    @staticmethod
+    def _statute_key(jurisdiction: Optional[str], name: Optional[str], section_number: Optional[str], version_no: Any) -> str:
+        return f"Statutes/{slug(jurisdiction or 'Federal', 30)}/{slug(name)}/{slug(section_number, 40)}/v{version_no}.txt"
+
+    @staticmethod
+    def _instrument_key(inst_id: Any, date_: Any, title: Optional[str], number: Optional[str], full_text_hash: Optional[str]) -> str:
+        year = date_.year if date_ else "undated"
+        return f"Instruments/{year}/{slug(title or number or str(inst_id), 100)}_{full_text_hash[:10] if full_text_hash else str(inst_id)[:8]}.txt"
+
     async def mirror_statutes(self, limit: int = 500) -> Dict[str, Any]:
         targets = await self.targets()
-        all_rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()))).all()
+        # Key columns only: the section text is fetched for the (at most `limit`) versions a target lacks.
+        key_rows = (
+            await self.db.execute(
+                select(StatuteSectionVersion.id, Statute.jurisdiction, Statute.name, StatuteSection.section_number, StatuteSectionVersion.version_no)
+                .join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id)
+                .join(Statute, Statute.id == StatuteSection.statute_id)
+                .order_by(StatuteSectionVersion.created_at.desc())
+            )
+        ).all()
         out: Dict[str, int] = {}
         for t in targets:
             done = await self._written_keys(t, "Statutes/")
-            rows = [
-                r for r in all_rows
-                if f"Statutes/{slug(r[2].jurisdiction or 'Federal', 30)}/{slug(r[2].name)}/{slug(r[1].section_number, 40)}/v{r[0].version_no}.txt" not in done
-            ][:limit]
+            pending = [(r[0], key) for r in key_rows if (key := self._statute_key(r[1], r[2], r[3], r[4])) not in done][:limit]
+            if not pending:
+                out[t.name] = 0
+                continue
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
                 t.last_error = f"adapter init: {exc}"[:2000]
                 continue
+            bodies = {
+                vid: (text_, prov)
+                for vid, text_, prov in (
+                    await self.db.execute(
+                        select(StatuteSectionVersion.id, StatuteSectionVersion.section_text, StatuteSectionVersion.source_provenance_id).where(StatuteSectionVersion.id.in_([vid for vid, _ in pending]))
+                    )
+                ).all()
+            }
             n = 0
-            for ver, sec, st in rows:
-                key = f"Statutes/{slug(st.jurisdiction or 'Federal', 30)}/{slug(st.name)}/{slug(sec.section_number, 40)}/v{ver.version_no}.txt"
+            for vid, key in pending:
+                text_, prov = bodies.get(vid, ("", None))
                 try:
-                    status = await self._write(t, adapter, {"key": key, "data": ver.section_text.encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=ver.source_provenance_id)
+                    status = await self._write(t, adapter, {"key": key, "data": (text_ or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=prov)
                     n += status == "written"
                 except Exception as exc:
                     logger.warning("archive %s: %s failed: %s", t.name, key, exc)
@@ -388,25 +406,32 @@ class ArchiveMirror:
         from scraper.models import Instrument
 
         targets = await self.targets()
-        all_rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()))).scalars().all()
+        key_rows = (
+            await self.db.execute(select(Instrument.id, Instrument.date, Instrument.title, Instrument.number, Instrument.full_text_hash).order_by(Instrument.created_at.desc()))
+        ).all()
         out: Dict[str, int] = {}
         for t in targets:
             done = await self._written_keys(t, "Instruments/")
-            rows = [
-                i for i in all_rows
-                if f"Instruments/{i.date.year if i.date else 'undated'}/{slug(i.title or i.number or str(i.id), 100)}_{i.full_text_hash[:10] if i.full_text_hash else str(i.id)[:8]}.txt" not in done
-            ][:limit]
+            pending = [(r[0], key) for r in key_rows if (key := self._instrument_key(*r)) not in done][:limit]
+            if not pending:
+                out[t.name] = 0
+                continue
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
                 t.last_error = f"adapter init: {exc}"[:2000]
                 continue
+            bodies = {
+                iid: (text_, prov)
+                for iid, text_, prov in (
+                    await self.db.execute(select(Instrument.id, Instrument.full_text, Instrument.source_provenance_id).where(Instrument.id.in_([iid for iid, _ in pending])))
+                ).all()
+            }
             n = 0
-            for inst in rows:
-                year = inst.date.year if inst.date else "undated"
-                key = f"Instruments/{year}/{slug(inst.title or inst.number or str(inst.id), 100)}_{inst.full_text_hash[:10] if inst.full_text_hash else str(inst.id)[:8]}.txt"
+            for iid, key in pending:
+                text_, prov = bodies.get(iid, ("", None))
                 try:
-                    status = await self._write(t, adapter, {"key": key, "data": (inst.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=inst.source_provenance_id)
+                    status = await self._write(t, adapter, {"key": key, "data": (text_ or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=prov)
                     n += status == "written"
                 except Exception as exc:
                     logger.warning("archive %s: %s failed: %s", t.name, key, exc)

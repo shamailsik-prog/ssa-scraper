@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.models import EmbeddingQueue, Judgment
-from scraper.security import is_login_session
 
 
 def embedding_idle_reason() -> Optional[str]:

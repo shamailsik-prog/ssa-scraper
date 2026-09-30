@@ -69,22 +69,32 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
     (bad pages are re-fetched by the grid walk instead, see quarantined_capture_retryable)."""
     from scraper.tasks.promotion import promote_judgment_staging
 
+    from scraper.config import settings
+    from scraper.models import ScraperSource
+
     directory = await load_court_directory(db)
+    source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
+    min_confidence = float((source.extraction_min_confidence if source else None) or settings.SGAI_DEFAULT_MIN_CONFIDENCE)
     counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}}
-    rows = (
+    ids = (
         await db.execute(
-            select(ScraperStaging)
+            select(ScraperStaging.id)
             .where(ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.status == "quarantined", ScraperStaging.promoted_to_id.is_(None))
             .order_by(ScraperStaging.created_at)
             .limit(limit)
         )
     ).scalars().all()
-    for st in rows:
+    # One row at a time, re-selected after each commit/rollback: a rollback expires every loaded instance,
+    # and touching an expired attribute under AsyncSession raises instead of lazy-loading.
+    for st_id in ids:
+        st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == st_id))).scalars().first()
+        if st is None:
+            continue
         counts["scanned"] += 1
         text = st.raw_text or ""
         meta = {"citation": st.extracted_citation, "title": st.extracted_title, "court": st.extracted_court, "url": st.source_url}
         dj = det.extract_judgment_deterministic(html=None, text=text, source_meta=meta)
-        out = reconcile_judgment(deterministic=dj, ai=None, raw_text=text, court_directory=directory, min_confidence=0.85)
+        out = reconcile_judgment(deterministic=dj, ai=None, raw_text=text, court_directory=directory, min_confidence=min_confidence)
         if out.quarantine:
             counts["still_quarantined"] += 1
             key = (out.quarantine_reason or "")[:40]
@@ -106,7 +116,10 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
         st.reconciled_json = reconciled
         st.confidence_score = out.confidence
         st.validation_errors = out.errors
-        st.extracted_citation = (reconciled.get("citations") or [st.extracted_citation])[0]
+        found = reconciled.get("citations") or []
+        # keep the grid row's own citation when the page carries it; a headnote-cited case must not replace it
+        if not (st.extracted_citation and st.extracted_citation in found):
+            st.extracted_citation = (found or [st.extracted_citation])[0]
         st.status = "extracted"
         st.quarantine_reason = None
         await db.flush()
@@ -115,7 +128,7 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
             await db.commit()
         except Exception:
             await db.rollback()
-            logger.exception("requalify: promotion failed for %s", st.id)
+            logger.exception("requalify: promotion failed for %s", st_id)
             counts["still_quarantined"] += 1
             continue
         if result == "promoted":

@@ -27,6 +27,7 @@ from scraper.pls_grid_health import (
     grid_harvest_incomplete,
     grid_rows_remaining,
     grid_saturation_view,
+    grid_total_rows,
     pls_source_config,
 )
 from scraper.models import (
@@ -266,14 +267,11 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
         "pakistanlawsite": {
             "citation_grid_progress": citation_grid_progress_view("PakistanLawSite", pls_cfg),
             "citation_grid_rows_remaining": grid_rows_remaining(pls_cfg),
-            "last_judgment_at": _iso(
-                (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
-            ),
-            **stall,
+            **stall,  # carries last_judgment_at
             "grid_incomplete": grid_harvest_incomplete(pls_cfg),
             "search_harvest": await _pls_search_harvest_summary(db),
             "grid_saturation": saturation,
-            "grid_accounting": await grid_accounting(db, total_rows=max([int((pls_cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])),
+            "grid_accounting": await grid_accounting(db, total_rows=grid_total_rows(pls_cfg)),
         },
         "judgments_by_source": by_source,
         "judgments_by_reporter_year": by_reporter_year,
