@@ -1,0 +1,29 @@
+name: apply-patch
+# Branch-only helper (never merged to main): applies patches/*.patch on top of main and pushes fix/<suffix>.
+on:
+  push:
+    branches: ['apply/**']
+    paths: ['patches/**']
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patches onto main and push fix branch
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_REF_NAME#apply/}"
+          mkdir -p /tmp/p && cp patches/*.patch /tmp/p/
+          git config user.name "Grok Bot (for Shamail Sikander)"
+          git config user.email "shamailsik-prog@users.noreply.github.com"
+          git checkout -B "fix/${suffix}" origin/main
+          for f in $(ls /tmp/p/*.patch | sort); do
+            echo "applying $f"
+            git apply --index --whitespace=nowarn "$f"
+            git commit -q -m "$(head -1 "$f" | sed 's/^Subject: //')" || true
+          done
+          git push --force origin "fix/${suffix}"
