@@ -1,0 +1,435 @@
+diff --git a/scraper/pls_search_harvest_core.py b/scraper/pls_search_harvest_core.py
+index 6ef1e79..a0f4977 100644
+--- a/scraper/pls_search_harvest_core.py
++++ b/scraper/pls_search_harvest_core.py
+@@ -13 +13 @@ from scraper.parsers.citation_extractor import normalise_citation
+-_QUERY_KEY_ORDER = ("reporter", "year", "court", "category", "keyword", "statute", "section")
++_QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
+@@ -26 +26 @@ def normalize_query_json(query: Dict[str, Any]) -> Dict[str, Any]:
+-        if key == "year":
++        if key in ("year", "month", "page_from", "page_to"):
+@@ -106,0 +107,9 @@ def build_harvest_form_values(
++    for role in ("month", "bench", "party_initial", "citation"):
++        if role in fields and query_json.get(role) is not None:
++            values[role] = str(query_json[role])
++    # judge / party / citation text with no dedicated field is searched through the free-text keyword box
++    for role in ("judge", "party", "citation"):
++        if query_json.get(role) and role not in fields and "keyword" in fields and "keyword" not in values:
++            values["keyword"] = str(query_json[role])
++        elif query_json.get(role) and role in fields:
++            values[role] = str(query_json[role])
+@@ -120,3 +129,6 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
+-    reason = unmapped_query_reason(search_map, tier_query, tier_cursor)
+-    if reason:
+-        return reason
++    if any(k in tier_query for k in ("reporter", "statute", "keyword")):
++        reason = unmapped_query_reason(search_map, tier_query, tier_cursor)
++        if reason:
++            return reason
++    elif (search_map.get("surface") or (search_map.get("limits") or {}).get("surface")) == "grid_surface_no_query_form":
++        return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
+@@ -127,0 +140,6 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
++    for role in ("month", "bench", "party_initial"):
++        if query_json.get(role) is not None and role not in fields:
++            return f"search map cannot express {role} filter; missing role: {role}"
++    for role in ("judge", "party", "citation"):
++        if query_json.get(role) and role not in fields and "keyword" not in fields:
++            return f"search map cannot express {role} query; missing roles: {role}, keyword"
+@@ -178,0 +197,5 @@ def parse_total_results_from_html(html: str) -> Optional[int]:
++SPLIT_ORDER = ("month", "court", "bench", "party_initial", "keyword")
++_MONTHS = list(range(1, 13))
++_LEGACY_ROLES = frozenset({"court", "keyword"})
++
++
+@@ -185,0 +209,2 @@ def split_oversized_query(
++    available_roles: Optional[Iterable[str]] = None,
++    bench_options: Sequence[str] = (),
+@@ -187,2 +212,6 @@ def split_oversized_query(
+-    """When site_total exceeds the cap, return finer child queries (court, then keyword prefix)."""
+-    if site_total <= result_cap:
++    """A result list that reaches the site's cap is NOT complete. Return narrower child queries, narrowing by the
++    first dimension of SPLIT_ORDER (month, court, bench, party first letter, keyword) that the parent has not
++    used yet and that the search form can express (`available_roles`; default is the legacy court/keyword pair).
++    Returns [] only when every expressible dimension is already used; the caller must then mark the job failed
++    (exhausted), never done."""
++    if site_total < result_cap:
+@@ -189,0 +219 @@ def split_oversized_query(
++    roles = set(available_roles) if available_roles is not None else set(_LEGACY_ROLES)
+@@ -191,5 +221,14 @@ def split_oversized_query(
+-    if not normalized.get("court") and court_options:
+-        return [normalize_query_json({**normalized, "court": court}) for court in court_options if court]
+-    if not normalized.get("keyword"):
+-        splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
+-        return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
++    for dim in SPLIT_ORDER:
++        if dim in normalized or (dim == "month" and "month" not in roles):
++            continue
++        if dim == "month":
++            return [normalize_query_json({**normalized, "month": m}) for m in _MONTHS]
++        if dim == "court" and court_options:
++            return [normalize_query_json({**normalized, "court": c}) for c in court_options if c]
++        if dim == "bench" and "bench" in roles and bench_options:
++            return [normalize_query_json({**normalized, "bench": b}) for b in bench_options if b]
++        if dim == "party_initial" and "party_initial" in roles:
++            return [normalize_query_json({**normalized, "party_initial": ch}) for ch in _ALPHA_KEYWORD_SPLITS]
++        if dim == "keyword":
++            splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
++            return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
+@@ -198,0 +238,62 @@ def split_oversized_query(
++def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
++    """True when a result list must be treated as truncated: the site total reaches the cap, or (no total shown)
++    the pages ended exactly at the cap."""
++    if site_total is not None:
++        return int(site_total) >= result_cap
++    return rows_seen >= result_cap
++
++
++def iter_extended_plan_queries(
++    *,
++    years: Sequence[int],
++    courts: Sequence[str] = (),
++    judges: Sequence[str] = (),
++    statutes: Sequence[Dict[str, Any]] = (),
++    keywords: Sequence[str] = (),
++    parties: Sequence[str] = (),
++) -> Iterable[Dict[str, Any]]:
++    """Phase-2 seed families beyond journal x year. Every value comes from data we hold (court directory, judge
++    table, statute table, caller keyword list); nothing is invented."""
++    for court in courts:
++        for year in years:
++            yield normalize_query_json({"court": court, "year": year})
++    for judge in judges:
++        for year in years:
++            yield normalize_query_json({"judge": judge, "year": year})
++    for st in statutes:
++        name = st.get("statute")
++        if not name:
++            continue
++        sections = st.get("sections") or [None]
++        for sec in sections:
++            yield normalize_query_json({"statute": name, "section": sec})
++    for kw in keywords:
++        for court in courts or [None]:
++            yield normalize_query_json({"keyword": kw, "court": court})
++    for word in parties:
++        for year in years:
++            yield normalize_query_json({"party": word, "year": year})
++
++
++def cited_citations_in_text(text: str) -> List[str]:
++    """Citations that appear verbatim in a judgment body (snowball candidates). Only strings the citation grammar
++    matches in the text are returned; none are constructed."""
++    from scraper.parsers.citation_extractor import extract_citations
++
++    out: List[str] = []
++    seen: Set[str] = set()
++    for hit in extract_citations(text or ""):
++        norm = hit.get("normalized")
++        if norm and norm not in seen and hit.get("page"):
++            seen.add(norm)
++            out.append(norm)
++    return out
++
++
++def page_continuity_gaps(pages: Sequence[int], *, max_step: int = 60) -> List[Tuple[int, int]]:
++    """Consecutive starting pages of one reporter-year that are further apart than `max_step` pages: a judgment
++    is rarely longer than that, so the jump marks a probable hole (returned as (from_page, to_page))."""
++    ordered = sorted({int(p) for p in pages if p is not None})
++    return [(a, b) for a, b in zip(ordered, ordered[1:]) if b - a > max_step]
++
++
+diff --git a/scraper/routers/status.py b/scraper/routers/status.py
+index eeda519..730f490 100644
+--- a/scraper/routers/status.py
++++ b/scraper/routers/status.py
+@@ -25,0 +26 @@ from scraper.pls_grid_health import (
++    compute_stalled,
+@@ -27,0 +29 @@ from scraper.pls_grid_health import (
++    grid_saturation_view,
+@@ -224 +226,12 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
+-    pls_watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
++    saturation = grid_saturation_view(pls_cfg, now=now)
++    pls_last = (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
++    pls_source_row = next((s for s in sources if s["source"] == "PakistanLawSite"), None)
++    stall = compute_stalled(
++        last_promotion_at=pls_last,
++        now=now,
++        saturation=saturation,
++        harvest_paused=bool(pls_cfg.get("paused_by_admin")) or (pls_source_row is not None and pls_source_row["state"] != "ACTIVE"),
++    )
++    from scraper.tasks.embedding_health import embedding_health
++    from scraper.pls_accounting import grid_accounting
++
+@@ -226,0 +240,4 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
++        "stalled": stall["stalled"],
++        "stalled_reason": stall["stalled_reason"],
++        "hours_since_last_judgment": stall["hours_since_last_judgment"],
++        "embeddings": await embedding_health(db, now=now),
+@@ -255 +272 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
+-            "stalled": bool(pls_watch.get("stalled")),
++            **stall,
+@@ -257,0 +275,2 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
++            "grid_saturation": saturation,
++            "grid_accounting": await grid_accounting(db, total_rows=max([int((pls_cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])),
+diff --git a/scraper/storage/archive.py b/scraper/storage/archive.py
+index 6e24ab6..f62c770 100644
+--- a/scraper/storage/archive.py
++++ b/scraper/storage/archive.py
+@@ -81,0 +82,16 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
++RETRY_DELAYS = (1.0, 3.0)
++
++
++async def _retry(fn, *args):
++    """Run an adapter call, retrying transient failures ('The read operation timed out' from Drive)."""
++    for delay in (*RETRY_DELAYS, None):
++        try:
++            return await fn(*args)
++        except ObjectExists:
++            raise
++        except Exception:
++            if delay is None:
++                raise
++            await asyncio.sleep(delay)
++
++
+@@ -106 +122 @@ class ArchiveMirror:
+-            meta = {"court": j.court_name, "title": j.case_title, "citation": j.canonical_citation, "source_name": j.source_name, "source_url": j.source_url, "content_hash": j.full_text_hash, "rendered_at": datetime.now(timezone.utc).isoformat(), "access_method": j.access_method}
++            meta = {"court": j.court_name, "title": j.case_title, "citation": j.canonical_citation, "source_name": j.source_name, "source_url": j.source_url, "content_hash": j.full_text_hash, "rendered_at": (j.promoted_at or j.created_at or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat(), "access_method": j.access_method}
+@@ -133,0 +150 @@ class ArchiveMirror:
++        stored_size: Optional[int] = None
+@@ -135,0 +153,6 @@ class ArchiveMirror:
++            if obj["kind"] == "rendered_copy":
++                # A rendered copy is derived from the preserved text and, before the render was made
++                # deterministic, embedded its render time: the same judgment hashed differently on every run
++                # and 7,000 healthy objects were flagged 'mismatch'. The key is the identity; reconcile
++                # verifies the stored size.
++                return "exists"
+@@ -142 +165 @@ class ArchiveMirror:
+-            exists = await asyncio.to_thread(adapter.exists, key)
++            exists = await _retry(asyncio.to_thread, adapter.exists, key)
+@@ -144,2 +167,7 @@ class ArchiveMirror:
+-                size = await asyncio.to_thread(adapter.size, key)
+-                status = "written" if size == len(data) else "mismatch"
++                size = await _retry(asyncio.to_thread, adapter.size, key)
++                if obj["kind"] == "rendered_copy" and size:
++                    # derived copy already stored: adopt the stored object, never compare it with a re-render
++                    stored_size = size
++                    status = "written"
++                else:
++                    status = "written" if size == len(data) else "mismatch"
+@@ -147 +175 @@ class ArchiveMirror:
+-                await asyncio.to_thread(adapter.put, key, data, obj.get("content_type", "application/octet-stream"))
++                await _retry(asyncio.to_thread, adapter.put, key, data, obj.get("content_type", "application/octet-stream"))
+@@ -162 +190 @@ class ArchiveMirror:
+-            ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status=status, written_at=datetime.now(timezone.utc))
++            ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=stored_size or len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status=status, written_at=datetime.now(timezone.utc))
+@@ -169,2 +197,2 @@ class ArchiveMirror:
+-            ledger.byte_size = len(data)
+-        if status == "written":
++            ledger.byte_size = stored_size or len(data)
++        if status == "written" and stored_size is None:
+@@ -180,0 +209,62 @@ class ArchiveMirror:
++    async def backlog_judgments(self, t: ArchiveTarget, limit: int, *, exclude=frozenset()) -> List[Judgment]:
++        """Oldest judgments that lack a full set of objects on target `t`. A 'mismatch' object counts as
++        present (it needs a human or the reconcile, not a retry); 'failed' and 'missing' are retried."""
++        if limit <= 0:
++            return []
++        have = (
++            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
++            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
++            .group_by(ArchiveObject.judgment_id)
++            .subquery()
++        )
++        q = (
++            select(Judgment)
++            .outerjoin(have, have.c.jid == Judgment.id)
++            .where(func.coalesce(have.c.c, 0) < 3)
++            .order_by(Judgment.promoted_at.asc())
++            .limit(limit + len(exclude))
++        )
++        rows = (await self.db.execute(q)).scalars().all()
++        return [j for j in rows if j.id not in exclude and self._policy_allows(t, j.access_method)][:limit]
++
++    async def lag(self, t: ArchiveTarget) -> Dict[str, Any]:
++        """How far behind the corpus this target is."""
++        total = int((await self.db.execute(select(func.count()).select_from(Judgment))).scalar() or 0)
++        have = (
++            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
++            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
++            .group_by(ArchiveObject.judgment_id)
++            .subquery()
++        )
++        unmirrored = int(
++            (await self.db.execute(select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < 3))).scalar() or 0
++        )
++        last_written = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
++        return {"judgments_total": total, "judgments_unmirrored": unmirrored, "last_written_at": last_written.isoformat() if last_written else None}
++
++    async def alert_on_lag(self) -> List[str]:
++        """ARCHIVE_MIRROR_LAG once per target while it has unmirrored judgments and has written nothing for
++        MIRROR_LAG_ALERT_HOURS; acknowledged again when writes resume or the target catches up."""
++        from datetime import timedelta
++
++        from scraper.models import Notification
++
++        raised: List[str] = []
++        now = datetime.now(timezone.utc)
++        for t in await self.targets():
++            lag = await self.lag(t)
++            last = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
++            stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
++            problem = lag["judgments_unmirrored"] > 0 and stale
++            code_msg = f"ARCHIVE_MIRROR_LAG:{t.name}"
++            open_alert = (
++                await self.db.execute(select(Notification).where(Notification.code == "ARCHIVE_MIRROR_LAG", Notification.source_name == t.name, Notification.acknowledged.is_(False)).limit(1))
++            ).scalars().first()
++            if problem and open_alert is None:
++                await notify(self.db, level="warning", code="ARCHIVE_MIRROR_LAG", source_name=t.name, message=f"{t.name}: {lag['judgments_unmirrored']} of {lag['judgments_total']} judgments not mirrored and nothing written since {lag['last_written_at']}", details=lag)
++                raised.append(code_msg)
++            elif not problem and open_alert is not None:
++                open_alert.acknowledged = True
++        await self.db.flush()
++        return raised
++
+@@ -182 +272 @@ class ArchiveMirror:
+-    async def mirror_pending(self, limit: int = 200) -> Dict[str, Any]:
++    async def mirror_pending(self, limit: int = 200, *, backlog_limit: Optional[int] = None) -> Dict[str, Any]:
+@@ -186 +276 @@ class ArchiveMirror:
+-        judgments = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
++        newest = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
+@@ -189 +279,7 @@ class ArchiveMirror:
+-            summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0})
++            summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0, "backlog": 0})
++            # The newest `limit` judgments were the only ones ever considered, so once promotion moved on the
++            # older ones were never mirrored (13.8k of 19.7k on Drive). Every run now also takes the OLDEST
++            # judgments this target still lacks, so the backlog always shrinks.
++            backlog = await self.backlog_judgments(t, settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit, exclude={j.id for j in newest})
++            judgments = list(newest) + backlog
++            summary["backlog"] += len(backlog)
+@@ -248 +344 @@ class ArchiveMirror:
+-        rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()).limit(limit))).all()
++        all_rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()))).all()
+@@ -250,0 +347,5 @@ class ArchiveMirror:
++            done = await self._written_keys(t, "Statutes/")
++            rows = [
++                r for r in all_rows
++                if f"Statutes/{slug(r[2].jurisdiction or 'Federal', 30)}/{slug(r[2].name)}/{slug(r[1].section_number, 40)}/v{r[0].version_no}.txt" not in done
++            ][:limit]
+@@ -266,0 +368,4 @@ class ArchiveMirror:
++    async def _written_keys(self, t: ArchiveTarget, prefix: str) -> set:
++        rows = (await self.db.execute(select(ArchiveObject.object_key).where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.object_key.like(prefix + "%")))).scalars().all()
++        return set(rows)
++
+@@ -271 +376 @@ class ArchiveMirror:
+-        rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()).limit(limit))).scalars().all()
++        all_rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()))).scalars().all()
+@@ -273,0 +379,5 @@ class ArchiveMirror:
++            done = await self._written_keys(t, "Instruments/")
++            rows = [
++                i for i in all_rows
++                if f"Instruments/{i.date.year if i.date else 'undated'}/{slug(i.title or i.number or str(i.id), 100)}_{i.full_text_hash[:10] if i.full_text_hash else str(i.id)[:8]}.txt" not in done
++            ][:limit]
+diff --git a/scraper/tasks/archive_mirror.py b/scraper/tasks/archive_mirror.py
+index 4687667..af0553e 100644
+--- a/scraper/tasks/archive_mirror.py
++++ b/scraper/tasks/archive_mirror.py
+@@ -18,0 +19 @@ async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
++        result["lag_alerts"] = await mirror.alert_on_lag()
+diff --git a/scraper/tasks/dispatcher.py b/scraper/tasks/dispatcher.py
+index 587d8e6..319bbf0 100644
+--- a/scraper/tasks/dispatcher.py
++++ b/scraper/tasks/dispatcher.py
+@@ -31,0 +32 @@ from scraper.notify import notify
++from scraper.pls_grid_health import dispatch_saturated
+@@ -136 +137,4 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
+-            job.status = "failed"
++            # A restart is not a defect of the job: its cursor is committed per row and the next job resumes
++            # at the same row. Recorded as 'interrupted' so restarts do not inflate the failed-jobs count
++            # (12 "failed" jobs in 48h were all this).
++            job.status = "interrupted"
+@@ -138 +142 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
+-            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); retired at worker start."
++            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); interrupted at worker start, resumes from its committed cursor."
+@@ -272,0 +277,4 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
++                if not (isinstance(stats, dict) and (stats.get("skipped") or stats.get("paused") or stats.get("halted") or stats.get("stop_reason"))):
++                    # a clean run supersedes the last recorded error (a stale "login surface URL" message
++                    # stayed on the PLS source for days after the slot had recovered)
++                    source.last_error = None
+@@ -329,0 +338 @@ async def dispatch_due_sources() -> Dict[str, Any]:
++    skipped_saturated: list[str] = []
+@@ -395,0 +405,4 @@ async def dispatch_due_sources() -> Dict[str, Any]:
++                        if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
++                            logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
++                            skipped_saturated.append(f"{s.source_name}:shard{shard}")
++                            continue
+@@ -404,0 +418,2 @@ async def dispatch_due_sources() -> Dict[str, Any]:
++                        if skipped_saturated:
++                            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+@@ -409,0 +425,5 @@ async def dispatch_due_sources() -> Dict[str, Any]:
++                    if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), None, now=now):
++                        logger.info("skip enqueue %s: the unsharded grid walk is saturated; recheck later", s.source_name)
++                        skipped_saturated.append(s.source_name)
++                        s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
++                        continue
+@@ -419 +439 @@ async def dispatch_due_sources() -> Dict[str, Any]:
+-    return {"mode": mode, "auto_switched": auto_switched, "queued": queued}
++    return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}
+diff --git a/scraper/tasks/embedding_health.py b/scraper/tasks/embedding_health.py
+new file mode 100644
+index 0000000..fd7c8f6
+--- /dev/null
++++ b/scraper/tasks/embedding_health.py
+@@ -0,0 +1,53 @@
++"""Embedding-queue health: why nothing drains, and an alert when the queue stalls (audit 2026-09-30: 0 of 19,753
++judgments embedded, 27,027 queued, worker logging 'OPENAI_API_KEY NOT CONFIGURED; embeddings idle' every 5 minutes)."""
++
++from __future__ import annotations
++
++from datetime import datetime, timedelta, timezone
++from typing import Any, Dict, Optional
++
++from sqlalchemy import func, select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from scraper.config import settings
++from scraper.models import EmbeddingQueue, Judgment
++from scraper.security import is_login_session
++
++
++def embedding_idle_reason() -> Optional[str]:
++    """None when the worker can embed; otherwise the exact reason it will not."""
++    if not settings.OPENAI_API_KEY:
++        return "OPENAI_API_KEY not configured (no embedding backend)"
++    return None
++
++
++async def embedding_health(db: AsyncSession, *, now: Optional[datetime] = None) -> Dict[str, Any]:
++    now = now or datetime.now(timezone.utc)
++    by_status = {s: int(n) for s, n in (await db.execute(select(EmbeddingQueue.status, func.count()).group_by(EmbeddingQueue.status))).all()}
++    oldest = (await db.execute(select(func.min(EmbeddingQueue.created_at)).where(EmbeddingQueue.status == "pending"))).scalar()
++    last_done = (await db.execute(select(func.max(EmbeddingQueue.last_attempt_at)).where(EmbeddingQueue.status == "done"))).scalar()
++    embedded = int((await db.execute(select(func.count()).select_from(Judgment).where(Judgment.embedding.isnot(None)))).scalar() or 0)
++    total = int((await db.execute(select(func.count()).select_from(Judgment))).scalar() or 0)
++    idle = embedding_idle_reason()
++    blockers = []
++    if idle:
++        blockers.append(idle)
++    if not settings.EMBED_LOGIN_SESSION_ROWS_EXTERNALLY and settings.OPENAI_API_KEY:
++        blockers.append("EMBED_LOGIN_SESSION_ROWS_EXTERNALLY=false: login-session (PakistanLawSite) text is not sent to an external model")
++    if oldest is not None and oldest.tzinfo is None:
++        oldest = oldest.replace(tzinfo=timezone.utc)
++    pending = by_status.get("pending", 0)
++    oldest_age_h = round((now - oldest).total_seconds() / 3600.0, 1) if oldest else None
++    threshold = float(settings.EMBED_QUEUE_ALERT_HOURS)
++    stalled = bool(pending and oldest_age_h is not None and oldest_age_h >= threshold and not (last_done and now - last_done < timedelta(hours=threshold)))
++    return {
++        "judgments_embedded": embedded,
++        "judgments_total": total,
++        "queue": by_status,
++        "pending": pending,
++        "oldest_pending_age_hours": oldest_age_h,
++        "last_embedded_at": last_done.isoformat() if last_done else None,
++        "draining": bool(pending == 0 or (last_done and now - last_done < timedelta(hours=threshold))),
++        "stalled": stalled,
++        "blockers": blockers,
++    }
