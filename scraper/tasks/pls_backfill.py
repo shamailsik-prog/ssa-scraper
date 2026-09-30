@@ -99,6 +99,14 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
             counts["still_quarantined"] += 1
             key = (out.quarantine_reason or "")[:40]
             counts["still_by_reason"][key] = counts["still_by_reason"].get(key, 0) + 1
+            if not dry_run:
+                # keep the ledger truthful: the reason the row is set aside NOW, not the one from before the fixes
+                st.quarantine_reason = out.quarantine_reason
+                st.validation_errors = out.errors
+                st.confidence_score = out.confidence
+                if out.data:
+                    st.reconciled_json = {**(st.reconciled_json or {}), **dict(out.data)}
+                await db.commit()
             continue
         if dry_run:
             counts["promoted"] += 1

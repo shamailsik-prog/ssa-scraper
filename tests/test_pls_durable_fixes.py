@@ -198,20 +198,20 @@ async def test_evaluate_pls_stall_alarms_once_and_recovers(db):
 
 # ------------------------------------------------------------------ quarantine refetch and citation order
 @pytest.mark.parametrize(
-    "reason,length,route,expected",
+    "reason,length,route,head,expected",
     [
-        ("citation 2021 CLC 5 already belongs to judgment 2020 SCMR 1", 800, {}, False),
-        ("confidence 0.8 below threshold 0.85", 20000, {}, True),
-        ("headnote_only", 20000, None, True),
-        ("login_stub", 100, {"refetch_count": 3}, False),
-        (None, 900, {}, True),
-        (None, 20000, {}, False),
+        ("citation 2021 CLC 5 already belongs to judgment 2020 SCMR 1", 800, {}, "Error Code: 700", False),
+        ("confidence 0.8 below threshold 0.85", 20000, {}, "", False),  # merits: requalify, not the walk
+        ("headnote_only", 20000, None, "", True),
+        ("login_stub", 100, {"refetch_count": 3}, "", False),
+        ("confidence 0.35 below threshold 0.85", 900, {}, "Error Code: 700 Sorry, something went wrong", True),
+        (None, 900, {}, "Muhammad Akram v. The State", False),
     ],
 )
-def test_quarantined_capture_retryable(reason, length, route, expected):
+def test_quarantined_capture_retryable(reason, length, route, head, expected):
     from scraper.tasks.pakistanlawsite import quarantined_capture_retryable
 
-    assert quarantined_capture_retryable(reason, length, route) is expected
+    assert quarantined_capture_retryable(reason, length, route, head) is expected
 
 
 def test_grid_row_citation_leads_even_when_a_cited_case_comes_first():
@@ -347,3 +347,33 @@ def test_status_exposes_stalled_fields(client):
     assert "stalled" in body and "stalled_reason" in body
     assert "stalled" in body["pakistanlawsite"] and "grid_saturation" in body["pakistanlawsite"]
     assert "embeddings" in body
+
+
+async def test_mirror_backlog_is_not_starved_by_ineligible_login_rows(db, tmp_path, monkeypatch):
+    from scraper.config import settings
+    from scraper.storage.archive import ArchiveMirror
+
+    monkeypatch.setattr(settings, "MIRROR_LOGIN_SESSION_ROWS", False)
+    for i in range(4):  # the OLDEST rows are login-session rows the policy never mirrors
+        db.add(Judgment(canonical_citation=f"2001 CLC {i + 1}", full_text="t" * 100, full_text_hash=f"ls{i}", source_name="PakistanLawSite", access_method="login_session", promoted_at=NOW - timedelta(days=30, hours=i)))
+    pub = Judgment(canonical_citation="2002 CLC 9", full_text="p" * 100, full_text_hash="pub", source_name="PakistanLawSite", access_method="public", promoted_at=NOW - timedelta(days=1))
+    db.add(pub)
+    t = ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a"))
+    db.add(t)
+    await db.commit()
+    got = await ArchiveMirror(db).backlog_judgments(t, 2)
+    assert [j.id for j in got] == [pub.id]
+    assert (await ArchiveMirror(db).lag(t))["judgments_unmirrored"] == 1
+
+
+def test_only_bad_pages_are_refetched_not_real_judgments():
+    from scraper.tasks.pakistanlawsite import quarantined_capture_retryable as r
+
+    assert r("no citation supported by source", 60, {}, "Error Code:700 Sorry Something went wrong") is True
+    assert r("subscription_chrome", 9000, {}, "") is True
+    assert r("headnote_only: not eligible", 5000, {}, "") is True
+    # a short but real judgment quarantined on confidence / court / conflict is final for the walk
+    assert r("confidence 0.8 below threshold 0.85", 796, {}, "1990 C L C 1205 [Peshawar] Before ...") is False
+    assert r("citation 1984 CLC 1 already belongs to judgment X", 20000, {}, "") is False
+    # bounded: after QUARANTINE_REFETCH_MAX attempts the row is left alone
+    assert r("subscription_chrome", 9000, {"refetch_count": 3}, "") is False

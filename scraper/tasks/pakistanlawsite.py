@@ -89,24 +89,25 @@ PLS_STUB_PAGE_MAX_BYTES = 3000  # a capture smaller than this (octet_length) is 
 # quarantined on the merits (a real citation conflict or a human decision): never fetched again
 _FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|reviewed|rejected")
 _RETRYABLE_QUARANTINE = re.compile(
-    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|court unknown|no citation supported|"
-    r"not in court directory|confidence [0-9.]+ below threshold|promotion error|full_text hash changed"
+    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
 )
+_ERROR_PAGE = re.compile(r"(?i)error code\s*:?\s*\d+|sorry,?\s+something went wrong|service unavailable|access denied|session (?:has )?expired")
 
 
-def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any) -> bool:
-    """A quarantined capture that is a bad PAGE (error page, chrome, headnote-only, stub) is fetched again
-    at most QUARANTINE_REFETCH_MAX times; a capture quarantined on the merits (a real citation conflict
-    or a human decision) is final. Without this every quarantined row was skipped for ever as 'staged'."""
+def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any, head: Optional[str] = None) -> bool:
+    """A quarantined capture that is a bad PAGE (site error page, subscription chrome, headnote-only, login stub)
+    is fetched again at most QUARANTINE_REFETCH_MAX times. A capture quarantined on the merits (a citation
+    conflict, low confidence on a real judgment, a court the directory lacks) is final for the walk: those go
+    through `pls_admin requalify-quarantine` instead. Without this every quarantined row, including the 182
+    'Error Code:700' captures, was skipped for ever as 'staged'."""
     route = route_json if isinstance(route_json, dict) else {}
     if int(route.get("refetch_count") or 0) >= QUARANTINE_REFETCH_MAX:
         return False
     if _FINAL_QUARANTINE.search(reason or ""):
         return False
-    if _RETRYABLE_QUARANTINE.search(reason or ""):
+    if (text_len or 0) < PLS_STUB_PAGE_MAX_BYTES and _ERROR_PAGE.search(head or ""):
         return True
-    # no recognised reason: a short capture is an error/empty page, a long one was judged on its merits
-    return (text_len or 0) < PLS_STUB_PAGE_MAX_BYTES
+    return bool(_RETRYABLE_QUARANTINE.search(reason or ""))
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -825,6 +826,7 @@ class PakistanLawSitePipeline:
                             ScraperStaging.quarantine_reason,
                             func.octet_length(ScraperStaging.raw_text),
                             ScraperStaging.route_json,
+                            func.left(ScraperStaging.raw_text, 400),
                         ).where(
                             ScraperStaging.source_name == SOURCE_NAME,
                             ScraperStaging.extracted_citation.in_(list(lookup_keys)),
@@ -832,10 +834,10 @@ class PakistanLawSitePipeline:
                         )
                     )
                 ).all()
-                for st_id, citation_string, st_status, st_reason, st_len, st_route in staged_rows:
+                for st_id, citation_string, st_status, st_reason, st_len, st_route, st_head in staged_rows:
                     if not citation_string:
                         continue
-                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route):
+                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route, st_head):
                         refetch_staging_ids.setdefault(str(citation_string), []).append(st_id)
                         continue
                     staged_citations.add(str(citation_string))
@@ -882,7 +884,7 @@ class PakistanLawSitePipeline:
                 return absolute % total_rows
             return absolute
 
-        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
+        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int, count_wrap: bool = True) -> None:
             nonlocal last_committed_offset
             try:
                 offset_before = int(cursor.get("row_offset", last_committed_offset) or 0)
@@ -902,7 +904,7 @@ class PakistanLawSitePipeline:
             )
             # Count a wrap once, when the cursor crosses from the window's start back past the grid's end;
             # later flushes of the same window (and the ledger flush at the end) must not count it again.
-            if total_rows > 0 and next_offset < start_offset <= offset_before:
+            if count_wrap and total_rows > 0 and next_offset < start_offset <= offset_before:
                 cursor["wrapped_at"] = cursor["updated_at"]
                 cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
             patch = {cursor_key: cursor}
@@ -1109,11 +1111,14 @@ class PakistanLawSitePipeline:
         if cursor.get("saturated_at") and not was_saturated:
             logger.warning("PakistanLawSite citation-grid %s SATURATED: %s", cursor_key, cursor.get("saturated_reason"))
             self.stats["citation_grid_saturated"] = cursor.get("saturated_reason")
+        # The lap ledger must be persisted even when the last per-row flush already committed this offset; in that
+        # case the wrap was counted there and must not be counted again.
         await flush_citation_grid_progress(
             next_offset,
             staged_this_flush=0,
             details_this_flush=0,
             processed_rows=processed_rows_total,
+            count_wrap=last_committed_offset != next_offset,
         )
         wrapped = bool(total_rows > 0 and next_offset < start_offset)
         result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped})

@@ -104,6 +104,9 @@ def build_harvest_form_values(
             values[role] = str(query_json[role])
     if "keyword" in fields and query_json.get("keyword") and "keyword" not in values:
         values["keyword"] = str(query_json["keyword"])
+    if "year" in fields and query_json.get("year") and "year" not in values:
+        # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
+        values["year"] = str(query_json["year"])
     for role in ("month", "bench", "party_initial", "citation"):
         if role in fields and query_json.get(role) is not None:
             values[role] = str(query_json[role])
@@ -137,6 +140,8 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
         return "search map cannot express court filter; missing role: court"
     if query_json.get("category") and "category" not in fields:
         return "search map cannot express category filter; missing role: category"
+    if query_json.get("year") and "reporter" not in query_json and "year" not in fields:
+        return "search map cannot express year filter; missing role: year"
     for role in ("month", "bench", "party_initial"):
         if query_json.get(role) is not None and role not in fields:
             return f"search map cannot express {role} filter; missing role: {role}"

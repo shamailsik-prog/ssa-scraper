@@ -205,9 +205,9 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         # the extractor puts first. Any other citation found in the top of the page is a case cited in
         # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
         # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
-        # The grid row's citation (staging.extracted_citation) wins over list order when it was found.
-        row_cit = normalise_citation(st.extracted_citation) if st.extracted_citation else None
-        cits = [row_cit] if row_cit and row_cit in cits else cits[:1]
+        own = normalise_citation(st.extracted_citation) if st.extracted_citation else None
+        # the staging row's citation is the grid row's identity; the page-text order of citations is not
+        cits = [own] if own else cits[:1]
     full_text = strip_leading_judgment_chrome(st.raw_text or "")
     if full_text != (st.raw_text or ""):
         st.raw_text = full_text
@@ -318,6 +318,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 queue.attempts = 0
                 queue.error_message = None
             await db.flush()
+            await _supersede_quarantine(db, st, existing)
             return "promoted"
         st.status = "duplicate"
         st.promoted_to_id = existing.id
@@ -337,6 +338,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                     parts = _parse_citation_parts(c)
                     db.add(Citation(judgment_id=existing.id, citation_string=c, raw_string=c, reporter=parts["reporter"], year=parts["year"], page=parts["page"], is_primary=False, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
         await db.flush()
+        await _supersede_quarantine(db, st, existing)
         return "duplicate"
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     j = Judgment(

@@ -68,3 +68,13 @@ def test_unmapped_reason_for_new_roles():
     assert "month" in (unmapped_harvest_reason(smap, {"reporter": "PLD", "year": 2020, "month": 3}, {}) or "")
     assert unmapped_harvest_reason(smap, {"judge": "X", "year": 2020}, {}) is None
     assert SPLIT_ORDER == ("month", "court", "bench", "party_initial", "keyword")
+
+
+def test_year_only_seed_submits_the_year():
+    from scraper.pls_search_harvest_core import build_harvest_form_values
+
+    smap = {"fields": {"court": {}, "year": {}, "keyword": {}}}
+    vals = build_harvest_form_values(smap, {"court": "SC", "year": 2020}, {})
+    assert vals.get("year") == "2020" and vals.get("court") == "SC"
+    no_year = {"fields": {"court": {}, "keyword": {}}}
+    assert "year" in (unmapped_harvest_reason(no_year, {"court": "SC", "year": 2020}, {}) or "")
