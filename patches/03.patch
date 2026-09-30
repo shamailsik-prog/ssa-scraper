@@ -1,0 +1,445 @@
+diff --git a/scraper/tasks/pls_search_harvest.py b/scraper/tasks/pls_search_harvest.py
+index aee6a76..0fa46f9 100644
+--- a/scraper/tasks/pls_search_harvest.py
++++ b/scraper/tasks/pls_search_harvest.py
+@@ -46,0 +47,4 @@ from scraper.pls_search_harvest_core import (
++    cited_citations_in_text,
++    is_capped,
++    iter_extended_plan_queries,
++    page_continuity_gaps,
+@@ -158,0 +163,105 @@ async def seed_search_harvest_plan(
++async def seed_extended_plan(
++    db: AsyncSession,
++    *,
++    dry_run: bool = False,
++    keywords: Optional[List[str]] = None,
++    parties: Optional[List[str]] = None,
++    judge_limit: int = 300,
++    statute_limit: int = 40,
++    sections_per_statute: int = 25,
++) -> Dict[str, Any]:
++    """Phase 2 families beyond journal x year: court x year, judge x year, statute (per section for the Acts we hold),
++    keyword x court, party-word x year. Values come from the court directory, judge and statute tables and the caller
++    lists (never invented). Idempotent (query_key unique)."""
++    from scraper.models import Court, Judge, Statute, StatuteSection
++
++    now_year = datetime.now(timezone.utc).year
++    earliest = int(settings.PLS_EARLIEST_YEAR or 0) or now_year
++    years = years_for_plan(earliest, now_year)
++    smap = {}
++    m = await active_map(db, SOURCE_NAME)
++    if m is not None:
++        smap = map_as_dict(m)
++    courts = _court_options_from_map(smap) or [c for (c,) in (await db.execute(select(Court.name).where(Court.is_active.is_(True)))).all()]
++    judges = [n for (n,) in (await db.execute(select(Judge.name).limit(judge_limit))).all() if n]
++    statutes = []
++    for st_id, st_name in (await db.execute(select(Statute.id, Statute.name).limit(statute_limit))).all():
++        secs = [r for (r,) in (await db.execute(select(StatuteSection.section_number).where(StatuteSection.statute_id == st_id).limit(sections_per_statute))).all()]
++        statutes.append({"statute": st_name, "sections": secs})
++    existing = {r for (r,) in (await db.execute(select(PlsSearchHarvestQuery.query_key).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).all()}
++    to_add = []
++    for q in iter_extended_plan_queries(years=years, courts=courts, judges=judges, statutes=statutes, keywords=keywords or [], parties=parties or []):
++        key = make_query_key(q)
++        if key in existing:
++            continue
++        existing.add(key)
++        to_add.append(PlsSearchHarvestQuery(source_name=SOURCE_NAME, query_key=key, query_json=q, status="pending", priority=300))
++    if not dry_run:
++        for row in to_add:
++            db.add(row)
++        await db.flush()
++    return {("would_insert" if dry_run else "inserted"): len(to_add), "courts": len(courts), "judges": len(judges), "statutes": len(statutes), "years": len(years)}
++
++
++async def seed_snowball(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
++    """Phase 5: citations that appear inside downloaded PLS judgments but are not in the corpus become citation
++    lookups. A round that adds no new query means the snowball has converged."""
++    from scraper.models import Judgment
++
++    rows = (await db.execute(select(Judgment.id, Judgment.full_text).where(Judgment.source_name == SOURCE_NAME).order_by(Judgment.promoted_at.desc()).limit(limit))).all()
++    cited: Set[str] = set()
++    for _id, text_ in rows:
++        cited.update(cited_citations_in_text(text_ or ""))
++    known = set()
++    cl = list(cited)
++    for i in range(0, len(cl), 1000):
++        known |= await load_known_citation_keys(db, set(cl[i : i + 1000]))
++    fresh = sorted(cited - known)
++    existing = {r for (r,) in (await db.execute(select(PlsSearchHarvestQuery.query_key).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).all()}
++    added = 0
++    for cit in fresh:
++        q = normalize_query_json({"citation": cit})
++        key = make_query_key(q)
++        if key in existing:
++            continue
++        existing.add(key)
++        added += 1
++        if not dry_run:
++            db.add(PlsSearchHarvestQuery(source_name=SOURCE_NAME, query_key=key, query_json=q, status="pending", priority=200))
++    if not dry_run:
++        await db.flush()
++    return {"judgments_scanned": len(rows), "distinct_cited": len(cited), "not_in_corpus": len(fresh), "queries_added": added, "converged": added == 0}
++
++
++async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> Dict[str, Any]:
++    """Phase 6 proof: job-queue state, capped-but-unsplit jobs (never complete), page-continuity holes per reporter
++    and year, the site-total comparison, and a random known-citation test against the corpus."""
++    from sqlalchemy import func
++
++    from scraper.models import Citation, Judgment
++
++    status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
++    cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
++    capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
++    exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
++    totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
++    page_rows = (await db.execute(select(Citation.reporter, Citation.year, Citation.page).join(Judgment, Judgment.id == Citation.judgment_id).where(Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True), Citation.page.isnot(None)))).all()
++    by_ry: Dict[Any, List[int]] = {}
++    for rep, yr, pg in page_rows:
++        by_ry.setdefault((rep, yr), []).append(pg)
++    holes = {f"{rep} {yr}": page_continuity_gaps(pgs) for (rep, yr), pgs in by_ry.items()}
++    holes = {k: v for k, v in holes.items() if v}
++    sample = (await db.execute(select(Judgment.canonical_citation).where(Judgment.source_name == SOURCE_NAME).order_by(func.random()).limit(known_sample))).scalars().all()
++    known = await load_known_citation_keys(db, set(sample)) if sample else set()
++    return {
++        "queue": status_counts,
++        "done_but_capped": capped_open,
++        "capped_exhausted_not_complete": exhausted,
++        "site_total_done_queries": int(totals[0]),
++        "rows_known_done_queries": int(totals[1]),
++        "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
++        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
++        "complete": bool(status_counts.get("pending", 0) + status_counts.get("in_progress", 0) + status_counts.get("failed", 0) + capped_open == 0 and not holes),
++    }
++
++
+@@ -363 +472,3 @@ class SearchHarvestRunner:
+-                if site_total and site_total > cap:
++                if is_capped(site_total, rows_seen, cap):
++                    # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
++                    # loudly when nothing narrower can be expressed.
+@@ -366 +477 @@ class SearchHarvestRunner:
+-                        int(site_total),
++                        int(site_total if site_total is not None else rows_seen),
+@@ -368,0 +480,2 @@ class SearchHarvestRunner:
++                        available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword"},
++                        bench_options=[str(o) for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []],
+@@ -371 +484 @@ class SearchHarvestRunner:
+-                        await self._enqueue_split_children(query_row, children, site_total, cap)
++                        await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
+@@ -373 +486 @@ class SearchHarvestRunner:
+-                        query_row.split_reason = f"site_total={site_total} > cap={cap}"
++                        query_row.split_reason = f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
+@@ -374,0 +488,3 @@ class SearchHarvestRunner:
++                    query_row.status = "failed"
++                    query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
++                    break
+@@ -557,0 +674,50 @@ def cli_run(argv: Optional[List[str]] = None) -> int:
++
++
++def cli_extended_plan(argv: Optional[List[str]] = None) -> int:
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--keyword", action="append", default=[])
++    parser.add_argument("--party", action="append", default=[])
++    args = parser.parse_args(argv)
++
++    async def _run():
++        async with SessionLocal() as db:
++            out = await seed_extended_plan(db, dry_run=args.dry_run, keywords=args.keyword, parties=args.party)
++            await db.commit()
++            return out
++
++    print(json.dumps(_run_sync(_run()), indent=2))
++    return 0
++
++
++def _run_sync(coro):
++    return run_async(coro)
++
++
++def cli_snowball(argv: Optional[List[str]] = None) -> int:
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--limit", type=int, default=2000)
++    args = parser.parse_args(argv)
++
++    async def _run():
++        async with SessionLocal() as db:
++            out = await seed_snowball(db, limit=args.limit, dry_run=args.dry_run)
++            await db.commit()
++            return out
++
++    print(json.dumps(run_async(_run()), indent=2))
++    return 0
++
++
++def cli_completeness(argv: Optional[List[str]] = None) -> int:
++    async def _run():
++        async with SessionLocal() as db:
++            return await completeness_report(db)
++
++    print(json.dumps(run_async(_run()), indent=2, default=str))
++    return 0
+diff --git a/scraper/tasks/pls_self_healing.py b/scraper/tasks/pls_self_healing.py
+index d986706..f99f141 100644
+--- a/scraper/tasks/pls_self_healing.py
++++ b/scraper/tasks/pls_self_healing.py
+@@ -10 +10 @@ from celery import shared_task
+-from sqlalchemy import select, update
++from sqlalchemy import func, or_, select, update
+@@ -15 +15 @@ from scraper.database import SessionLocal, run_async
+-from scraper.models import BrowserSessionSlot, CrawlFrontier, ScraperSource
++from scraper.models import RETIRED_WITHOUT_REASON, BrowserSessionSlot, CrawlFrontier, Notification, ScraperSource
+@@ -18,0 +19 @@ from scraper.pls_grid_health import (
++    compute_stalled,
+@@ -19,0 +21,2 @@ from scraper.pls_grid_health import (
++    grid_saturation_view,
++    parse_iso,
+@@ -75,0 +79,46 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
++async def evaluate_pls_stall(db, source: ScraperSource, *, now: Optional[datetime] = None) -> Dict[str, Any]:
++    """Compute the stalled alarm from the corpus itself and notify once per episode.
++
++    stalled == no PakistanLawSite judgment promoted for PLS_STALL_NO_PROMOTION_HOURS. Cursor movement is
++    deliberately ignored: the citation grid advanced every window for 31 hours (2026-09-28 15:26 UTC
++    to 2026-09-30) while nothing was promoted, and the old cursor-signature watchdog never fired."""
++    now = now or datetime.now(timezone.utc)
++    cfg = dict(source.config_json or {})
++    last_at = await pls_last_judgment_at(db)
++    saturation = grid_saturation_view(cfg, now=now)
++    paused = source.state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
++    verdict = compute_stalled(last_promotion_at=last_at, now=now, saturation=saturation, harvest_paused=paused)
++    watch = dict(cfg.get(WATCHDOG_META_KEY) or {})
++    was_stalled = bool(watch.get("stalled"))
++    watch.update({k: verdict[k] for k in ("stalled", "stalled_reason", "hours_since_last_judgment", "threshold_hours")})
++    watch["checked_at"] = now.isoformat()
++    if verdict["stalled"] and not was_stalled:
++        watch["stalled_at"] = now.isoformat()
++        open_alarm = (
++            await db.execute(
++                select(Notification).where(Notification.code == "PLS_NO_NEW_JUDGMENTS", Notification.acknowledged.is_(False)).limit(1)
++            )
++        ).scalars().first()
++        if open_alarm is None:
++            await notify(
++                db,
++                level="warning" if verdict["stalled_reason"] != "harvest_paused" else "info",
++                code="PLS_NO_NEW_JUDGMENTS",
++                message=(
++                    f"PakistanLawSite promoted no new judgment for {verdict['hours_since_last_judgment']} h "
++                    f"(threshold {verdict['threshold_hours']} h; reason: {verdict['stalled_reason']})"
++                ),
++                source_name=SOURCE_NAME,
++                details={**verdict, "saturation": saturation},
++            )
++    if not verdict["stalled"] and was_stalled:
++        watch.pop("stalled_at", None)
++        watch["recovered_at"] = now.isoformat()
++        for n in (
++            await db.execute(select(Notification).where(Notification.code == "PLS_NO_NEW_JUDGMENTS", Notification.acknowledged.is_(False)))
++        ).scalars().all():
++            n.acknowledged = True
++    await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
++    return verdict
++
++
+@@ -77,2 +125,0 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
+-    if not settings.login_scraping_effective:
+-        return {"skipped": "login_scraping_disabled"}
+@@ -83,0 +131,6 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
++        verdict = await evaluate_pls_stall(db, source, now=now)
++        await db.commit()
++        result: Dict[str, Any] = dict(verdict)
++        if not settings.login_scraping_effective:
++            result["recovery"] = "login_scraping_disabled"
++            return result
+@@ -85,4 +138,3 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
+-        if not grid_harvest_incomplete(cfg):
+-            await merge_source_config(db, source, {WATCHDOG_META_KEY: {"stalled": False, "checked_at": now.isoformat()}})
+-            await db.commit()
+-            return {"stalled": False, "reason": "grid complete"}
++        if not grid_harvest_incomplete(cfg) or verdict["stalled_reason"] != "no_output_while_harvesting":
++            # paused, saturated or complete: nothing to un-wedge (a saturated grid is not a fault)
++            return result
+@@ -93,39 +145,32 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
+-        prev_at = watch.get("checked_at")
+-        stalled = False
+-        if prev_sig is not None and signatures_equal(prev_sig, sig):
+-            try:
+-                prev_dt = datetime.fromisoformat(str(prev_at))
+-                if prev_dt.tzinfo is None:
+-                    prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+-            except (TypeError, ValueError):
+-                prev_dt = now - STALL_AFTER
+-            if now - prev_dt >= STALL_AFTER:
+-                stalled = True
+-        else:
+-            watch = {"signature": sig, "checked_at": now.isoformat(), "stalled": False}
+-        if stalled:
+-            logger.warning(
+-                "PLS STALL WATCHDOG: citation grid has %s rows remaining but cursor/judgments unchanged for %s hours",
+-                grid_rows_remaining(cfg),
+-                int(STALL_AFTER.total_seconds() // 3600),
+-            )
+-            manager = SessionManager(db, source)
+-            for slot in await manager.slots():
+-                if slot.state == "ACTIVE":
+-                    lock = SessionLock(source.source_name)
+-                    try:
+-                        await lock.acquire()
+-                    except SessionLockHeld:
+-                        watch.setdefault("recovery", []).append(
+-                            {"slot": slot.slot_number, "skipped": "login_session_lock_held"}
+-                        )
+-                        continue
+-                    try:
+-                        check = await verify_stored_session(manager, slot, playwright_browser_factory)
+-                    finally:
+-                        await lock.release()
+-                    if not check.get("alive"):
+-                        await manager.mark_needs_human_login(slot.slot_number, "stall watchdog probe failed")
+-                rec = await recover_slot(db, manager, slot)
+-                watch.setdefault("recovery", []).append(rec)
+-            from scraper.tasks.celery_app import app
++        prev_dt = parse_iso(watch.get("signature_at"))
++        if prev_sig is None or not signatures_equal(prev_sig, sig):
++            watch["signature"], watch["signature_at"] = sig, now.isoformat()
++            await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
++            await db.commit()
++            return result
++        if prev_dt is None or now - prev_dt < STALL_AFTER:
++            return result
++        # Real hang: harvest "running" with cursors AND judgments frozen. Probe the slots and requeue.
++        logger.warning(
++            "PLS STALL WATCHDOG: %s grid rows remaining but cursors and judgments unchanged for %s hours",
++            grid_rows_remaining(cfg),
++            int(STALL_AFTER.total_seconds() // 3600),
++        )
++        manager = SessionManager(db, source)
++        recovery: list = []
++        for slot in await manager.slots():
++            if slot.state == "ACTIVE":
++                lock = SessionLock(source.source_name)
++                try:
++                    await lock.acquire()
++                except SessionLockHeld:
++                    recovery.append({"slot": slot.slot_number, "skipped": "login_session_lock_held"})
++                    continue
++                try:
++                    check = await verify_stored_session(manager, slot, playwright_browser_factory)
++                finally:
++                    await lock.release()
++                if not check.get("alive"):
++                    await manager.mark_needs_human_login(slot.slot_number, "stall watchdog probe failed")
++            recovery.append(await recover_slot(db, manager, slot))
++        from scraper.tasks.celery_app import app
+@@ -133,14 +178,2 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
+-            app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
+-            await notify(
+-                db,
+-                level="warning",
+-                code="PLS_HARVEST_STALLED",
+-                message=f"PakistanLawSite citation grid stalled with {grid_rows_remaining(cfg)} rows remaining; slots probed and harvest requeued",
+-                source_name=SOURCE_NAME,
+-            )
+-            watch["stalled"] = True
+-            watch["stalled_at"] = now.isoformat()
+-        else:
+-            watch["signature"] = sig
+-            watch["checked_at"] = now.isoformat()
+-            watch["stalled"] = False
++        app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
++        watch["recovery"], watch["signature_at"] = recovery, now.isoformat()
+@@ -149 +182,2 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
+-        return {"stalled": stalled, "rows_remaining": grid_rows_remaining(cfg), "judgments": total_j}
++        result["recovery"] = recovery
++        return result
+@@ -165,0 +200,15 @@ async def reset_retired_pls_search_map_frontier_db(db) -> int:
++async def reset_retired_pls_frontier_without_reason_db(db, *, dry_run: bool = False) -> int:
++    """Retired rows that were never run (last_run_at null) and carry no last_error were not retired by the crawler.
++    Put them back to pending; the model guard makes sure this can no longer be produced by the ORM."""
++    cond = (
++        CrawlFrontier.source_name == SOURCE_NAME,
++        CrawlFrontier.status == "retired",
++        or_(CrawlFrontier.last_error.is_(None), CrawlFrontier.last_error == "", CrawlFrontier.last_error == RETIRED_WITHOUT_REASON),
++        CrawlFrontier.last_run_at.is_(None),
++    )
++    if dry_run:
++        return int((await db.execute(select(func.count()).select_from(CrawlFrontier).where(*cond))).scalar() or 0)
++    result = await db.execute(update(CrawlFrontier).where(*cond).values(status="pending", last_error=None, attempts=0))
++    return int(result.rowcount or 0)
++
++
+diff --git a/scraper/tasks/promotion.py b/scraper/tasks/promotion.py
+index c753a90..326fa09 100644
+--- a/scraper/tasks/promotion.py
++++ b/scraper/tasks/promotion.py
+@@ -56,0 +57 @@ from scraper.parsers.bench_parser import normalise_judge_name
++from scraper.parsers.case_metadata import parse_case_metadata
+@@ -201,0 +203,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++    if st.source_name == "PakistanLawSite":
++        # A PLS judgment page carries exactly one reporter citation: the one its grid row names, which
++        # the extractor puts first. Any other citation found in the top of the page is a case cited in
++        # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
++        # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
++        cits = cits[:1]
+@@ -219 +226,3 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
+-        alt = (await db.execute(select(Citation).where(Citation.citation_string.in_(cits)))).scalars().first()
++        # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
++        # just means that string is not ours to attach: drop it and promote under the canonical one.
++        alt = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
+@@ -329,0 +339 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
+@@ -330,0 +341,3 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++        docket_number=meta.docket_number if meta else None,
++        petitioner=meta.petitioner if meta else None,
++        respondent=meta.respondent if meta else None,
+@@ -344 +357 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
+-        headnotes=data.get("headnotes"),
++        headnotes=(data.get("headnotes") or (meta.headnotes if meta else None)),
+@@ -376,0 +390 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++    await _supersede_quarantine(db, st, j)
+@@ -379,0 +394,32 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: Judgment) -> int:
++    """A judgment was promoted from `st`: earlier quarantined captures of the same citation (a stub,
++    an error page, a headnote-only page fetched before the full page) are superseded. Close their
++    review-queue entries so the queue only holds work that still needs a person."""
++    cit = st.extracted_citation or judgment.canonical_citation
++    others = (
++        await db.execute(
++            select(ScraperStaging).where(
++                ScraperStaging.source_name == st.source_name,
++                ScraperStaging.extracted_citation == cit,
++                ScraperStaging.status == "quarantined",
++                ScraperStaging.id != st.id,
++            )
++        )
++    ).scalars().all()
++    closed = 0
++    for old in others:
++        old.status = "duplicate"
++        old.promoted_to_id = judgment.id
++        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == old.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
++        for item in items:
++            item.reviewed = True
++            item.reviewed_by = "system"
++            item.reviewed_at = datetime.now(timezone.utc)
++            item.resolution = "promoted"
++            item.resolution_notes = f"superseded: {cit} was promoted from a later capture"
++            closed += 1
++    if others:
++        await db.flush()
++    return closed
++
++
+diff --git a/tests/test_dispatcher.py b/tests/test_dispatcher.py
+index 83f71bf..06418fa 100644
+--- a/tests/test_dispatcher.py
++++ b/tests/test_dispatcher.py
+@@ -436 +436 @@ async def test_worker_start_retires_orphaned_login_session_jobs(db):
+-        assert rows["PakistanLawSite"].status == "failed" and "worker started" in rows["PakistanLawSite"].error_message
++        assert rows["PakistanLawSite"].status == "interrupted" and "worker started" in rows["PakistanLawSite"].error_message
