@@ -607,6 +607,13 @@ class PlaywrightBrowser:
         return True if self._allow_private else resolve_is_safe(host)
 
     async def _route_request(self, route, request) -> None:
+        if getattr(settings, "PLS_BLOCK_HEAVY_RESOURCES", False) and request.resource_type in (
+            "image",
+            "media",
+            "font",
+        ):
+            await route.abort("blockedbyclient")
+            return
         if self.request_allowed(request.url, request.resource_type):
             await route.continue_()
         else:

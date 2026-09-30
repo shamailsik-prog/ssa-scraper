@@ -10,7 +10,7 @@ CONTRACT TABLES (Layer 17 Annex A; the only tables `sikander_reader` may SELECT)
 INTERNAL TABLES (never granted to the reader role):
     scraper_sources, scraper_jobs, scraper_staging, statutes_staging, quarantine_queue,
     embedding_queue, browser_session_slots, search_form_map, crawl_frontier, crawl_coverage,
-    extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation, archive_targets, archive_objects, sgai_usage_daily,
+    pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation, archive_targets, archive_objects, sgai_usage_daily,
     notifications, schema_migrations
 
 The vector dimension is read from EMBEDDING_DIM (Annex B-6); the model/dimension pair is
@@ -762,6 +762,42 @@ class CrawlFrontier(Base):
     last_error: Mapped[Optional[str]] = mapped_column(String(1000))
     last_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     next_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class PlsSearchHarvestQuery(Base):
+    """Resumable search-bar queries for PakistanLawSite gap harvesting (distinct from crawl_frontier tiers)."""
+
+    __tablename__ = "pls_search_harvest_query"
+    __table_args__ = (
+        UniqueConstraint("source_name", "query_key", name="uq_pls_search_harvest_query"),
+        Index("ix_pls_search_harvest_status_prio", "source_name", "status", "priority"),
+        Index("ix_pls_search_harvest_gap", "source_name", "gap_size"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    query_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    query_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    parent_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("pls_search_harvest_query.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+        comment="pending|in_progress|done|split|skipped|failed",
+    )
+    priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
+    site_total_results: Mapped[Optional[int]] = mapped_column(Integer)
+    pages_enumerated: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    rows_seen: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    rows_known: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    rows_new: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    gap_size: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    cursor_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    split_reason: Mapped[Optional[str]] = mapped_column(String(500))
+    last_error: Mapped[Optional[str]] = mapped_column(String(1000))
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 

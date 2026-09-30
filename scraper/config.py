@@ -226,6 +226,38 @@ class Settings(BaseSettings):
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
+    PLS_SEARCH_HARVEST_ENABLED: bool = Field(
+        default=False,
+        description="When true, Celery Beat may schedule pls_search_harvest_tick (one search query per tick).",
+    )
+    PLS_SEARCH_HARVEST_SCHEDULE_SECONDS: int = Field(
+        default=3600,
+        description="Beat interval for pls_search_harvest_tick when PLS_SEARCH_HARVEST_ENABLED=1.",
+    )
+    PLS_SEARCH_RESULT_CAP: int = Field(
+        default=500,
+        description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
+    )
+    PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
+        default=0,
+        description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
+    )
+    PLS_BROWSER_RECYCLE_WINDOWS: int = Field(
+        default=12,
+        description="Recycle the Playwright browser after this many search-harvest windows/pages.",
+    )
+    PLS_BROWSER_RSS_LIMIT_MB: float = Field(
+        default=900.0,
+        description="Soft RSS limit (MiB): recycle browser when exceeded.",
+    )
+    PLS_BROWSER_RSS_HARD_MB: float = Field(
+        default=1200.0,
+        description="Hard RSS limit (MiB): stop the harvest run cleanly before OOM.",
+    )
+    PLS_BLOCK_HEAVY_RESOURCES: bool = Field(
+        default=True,
+        description="Block image/font/media requests in Playwright to reduce CitationSearch memory use.",
+    )
     PLS_MAX_FAILOVER_RETRIES: int = Field(default=0)  # legacy; automatic failover past a block is forbidden
     PLS_SESSION_TTL_MINUTES: int = Field(default=720)
     # Legacy automated-login names. Accepted so old .env files do not break; never used to log in.
