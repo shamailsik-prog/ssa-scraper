@@ -127,7 +127,7 @@ class Browser(Protocol):
 
     async def goto(self, url: str, **kwargs: Any) -> PageResult: ...
 
-    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult: ...
+    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs: Any) -> PageResult: ...
 
     async def visible_text(self) -> str: ...
 
@@ -136,6 +136,44 @@ class Browser(Protocol):
     async def release_citation_grid_dom(self) -> None: ...
 
     async def close(self) -> None: ...
+
+
+_LIVE_FORM_JS = r"""
+() => {
+  const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const grid = document.getElementById('archivedpatientGrid');
+  const inGrid = (el) => !!(grid && grid.contains(el));
+  const attrs = (el, names) => names.filter((n) => el.getAttribute(n) != null).map((n) => ` ${n}="${esc(el.getAttribute(n))}"`).join('');
+  const labelFor = (el) => {
+    if (!el.id) return '';
+    const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+    return lab ? `<label for="${esc(el.id)}">${esc(lab.textContent.trim().slice(0, 120))}</label>` : '';
+  };
+  const control = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const base = attrs(el, ['id', 'name', 'type', 'value', 'title', 'aria-label', 'place' + 'holder', 'disabled', 'readonly']);
+    if (tag === 'select') {
+      const opts = Array.from(el.options).slice(0, 300).map((o) => `<option value="${esc(o.value)}">${esc(o.text.trim().slice(0, 120))}</option>`).join('');
+      return `${labelFor(el)}<select${base}>${opts}</select>`;
+    }
+    if (tag === 'button') return `<button${base}>${esc(el.textContent.trim().slice(0, 60))}</button>`;
+    if (tag === 'textarea') return `${labelFor(el)}<textarea${base}></textarea>`;
+    return `${labelFor(el)}<input${base}>`;
+  };
+  const pick = (root) => Array.from(root.querySelectorAll('select, input, textarea, button')).filter((el) => !inGrid(el)).slice(0, 300);
+  const out = [];
+  const owned = new Set();
+  for (const form of Array.from(document.forms).slice(0, 20)) {
+    const els = pick(form);
+    els.forEach((el) => owned.add(el));
+    if (!els.length) continue;
+    out.push(`<form${attrs(form, ['id', 'name', 'action', 'method', 'class'])}>${els.map(control).join('')}</form>`);
+  }
+  const loose = pick(document).filter((el) => !owned.has(el));
+  if (loose.length) out.push(`<form id="live_citationsearch_controls">${loose.map(control).join('')}</form>`);
+  return `<html><body>${out.join('')}</body></html>`.slice(0, 400000);
+}
+"""
 
 
 def raise_for_verdict(page: PageResult) -> None:
@@ -1176,7 +1214,8 @@ class PlaywrightBrowser:
             # Some search surfaces update in-place without a full document navigation.
             return
 
-    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
+    async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs: Any) -> PageResult:
+        archived_grid_start_row = int(kwargs.get("archived_grid_start_row", 0) or 0)
         fields = search_map.get("fields") or {}
         for role, value in values.items():
             f = fields.get(role)
@@ -1201,8 +1240,16 @@ class PlaywrightBrowser:
             await self._wait_for_post_submit_navigation(
                 lambda: self._page.keyboard.press("Enter")
             )
-        html_text, metadata = await self._capture_html(resp=None)
+        html_text, metadata = await self._capture_html(resp=None, archived_grid_start_row=archived_grid_start_row)
         return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
+
+    async def live_search_form_html(self) -> str:
+        """The current page's form controls only, as small HTML: every <form> with its own attributes and the
+        selects, inputs and buttons it owns (labels kept, options capped), never the citation grid. The
+        CitationSearch DOM is 10-16 MB, so page.content() is not an option there."""
+        if self._page is None:
+            return ""
+        return await self._wrap(self._page.evaluate(_LIVE_FORM_JS))
 
     async def visible_text(self) -> str:
         """The text of the page as the browser shows it (the rendered document's innerText)."""

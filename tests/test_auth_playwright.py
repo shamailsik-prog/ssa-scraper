@@ -2440,3 +2440,149 @@ async def test_lock_release_never_deletes_another_workers_lock():
     await r.delete(key)
     await r.aclose()
 
+
+
+# ------------------------------------------------------------------ per-journal citation grid
+JOURNAL_FORM_CHECK_PAGE = (
+    "<html><body><a href='/logout'>Logout</a>"
+    "<form id='CitationSearchForm' action='/Login/CitationSearch' method='post'>"
+    "<label for='ddlBook'>Journal</label>"
+    "<select id='ddlBook' name='ddlBook'>"
+    "<option value='1'>PLD - All Pakistan Legal Decisions</option>"
+    "<option value='2'>SCMR - Supreme Court Monthly Review</option>"
+    "<option value='3'>CLC - Civil Law Cases</option>"
+    "</select>"
+    "<button type='submit' name='btnSearch'>Search</button>"
+    "</form></body></html>"
+)
+
+
+def _journal_script(grids, *, default_rows):
+    """Dashboard with a journal dropdown; each journal value submits to its own grid."""
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_CHECK_URL), JOURNAL_FORM_CHECK_PAGE)
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(default_rows))
+    for value, rows in grids.items():
+        sc.page(("search", (("reporter", value),)), _archived_grid_html(rows), url=settings.PLS_SEARCH_URL)
+        for citation, title, _court, detail_url in rows:
+            sc.page(("goto", detail_url), judgment_html(citation, title=title))
+    return sc
+
+
+async def _run_pls(db, login_source, sc):
+    r = aioredis.from_url(settings.REDIS_URL)
+    await r.delete("corpus:login_session_lock:PakistanLawSite")
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+    stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
+    await db.commit()
+    await r.aclose()
+    return stats
+
+
+def _case_gotos(sc):
+    return [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
+
+
+def test_match_journal_option_by_value_label_and_abbreviation():
+    from scraper.pls_navigation import match_journal_option
+
+    field = {"option_labels": [["1", "PLD - All Pakistan Legal Decisions"], ["7", "P Cr. L J (Criminal)"], ["9", "PLC"], ["10", "PLC (C.S.)"], ["SCMR", "Supreme Court Monthly Review"]]}
+    assert match_journal_option("PLD", field) == "1"
+    assert match_journal_option("PCrLJ", field) == "7"
+    assert match_journal_option("PLC", field) == "9"  # the exact label wins over "PLC (C.S.)"
+    assert match_journal_option("SCMR", field) == "SCMR"
+    assert match_journal_option("YLR", field) is None
+
+
+async def test_pipeline_walks_each_journal_grid_with_its_own_cursor(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,SCMR")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    pld = [("PLD 2024 SC 5001", "Case 5001", "Supreme Court", "https://www.pakistanlawsite.com/case/5001"),
+           ("PLD 2023 SC 5002", "Case 5002", "Supreme Court", "https://www.pakistanlawsite.com/case/5002")]
+    scmr = [("2024 SCMR 6001", "Case 6001", "Supreme Court", "https://www.pakistanlawsite.com/case/6001")]
+    clc = [("2024 CLC 7001", "Case 7001", "Lahore High Court", "https://www.pakistanlawsite.com/case/7001")]
+    sc = _journal_script({"1": pld, "2": scmr}, default_rows=clc)
+    first = await _run_pls(db, login_source, sc)
+    assert first["citation_grid_journals_walked"] == ["PLD"]
+    assert _case_gotos(sc) == [row[3] for row in pld]
+    sc.log.clear()
+    second = await _run_pls(db, login_source, sc)
+    assert second["citation_grid_journals_walked"] == ["SCMR"]
+    assert _case_gotos(sc) == [scmr[0][3]]
+    await db.refresh(login_source)
+    cfg = login_source.config_json
+    assert cfg["citation_grid_cursor_journal_PLD"]["last_total_rows"] == 2
+    assert cfg["citation_grid_cursor_journal_SCMR"]["last_total_rows"] == 1
+    assert cfg["citation_grid_journal"] == "PLD"  # SCMR's lap ended too: the pointer moved on round-robin
+    assert "row_offset" not in (cfg.get("citation_grid_cursor") or {})  # the default grid's cursor is left alone
+    staged = {c for (c,) in (await db.execute(select(ScraperStaging.extracted_citation))).all()}
+    assert {"PLD 2024 SC 5001", "PLD 2023 SC 5002", "2024 SCMR 6001"} <= staged
+    assert "2024 CLC 7001" not in staged
+
+
+async def test_journal_grid_that_ignores_the_choice_is_set_aside(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,SCMR")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    clc = [("2024 CLC 7101", "Case 7101", "Lahore High Court", "https://www.pakistanlawsite.com/case/7101"),
+           ("2024 CLC 7102", "Case 7102", "Lahore High Court", "https://www.pakistanlawsite.com/case/7102")]
+    sc = _journal_script({"1": clc, "2": clc}, default_rows=clc)  # the form returns CLC whatever is chosen
+    stats = await _run_pls(db, login_source, sc)
+    assert _case_gotos(sc) == []  # CLC rows are never harvested under the PLD cursor
+    await db.refresh(login_source)
+    assert login_source.config_json["citation_grid_cursor_journal_PLD"]["unsupported_at"]
+    assert "PLD" in stats["citation_grid_journals_unsupported"]
+
+
+async def test_no_journal_dropdown_falls_back_to_the_default_grid(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    clc = [("2024 CLC 7201", "Case 7201", "Lahore High Court", "https://www.pakistanlawsite.com/case/7201")]
+    sc = BrowserScript()
+    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(clc))
+    sc.page(("goto", clc[0][3]), judgment_html(clc[0][0], title=clc[0][1]))
+    stats = await _run_pls(db, login_source, sc)
+    assert stats["citation_grid_journal_rotation"].startswith("off:")
+    assert _case_gotos(sc) == [clc[0][3]]
+    await db.refresh(login_source)
+    assert login_source.config_json["citation_grid_journal_rotation_off"]["at"]
+
+
+async def test_backfill_job_moves_through_every_journal_in_one_run(db, login_source, monkeypatch):
+    from scraper.harvest_mode import set_harvest_mode
+
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,SCMR")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    monkeypatch.setattr(settings, "BACKFILL_PLS_RUN_MAX_MINUTES", 30)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 1)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="journal loop")
+    await _activate(db, login_source)
+    pld = [("PLD 2024 SC 5301", "Case 5301", "Supreme Court", "https://www.pakistanlawsite.com/case/5301")]
+    scmr = [("2024 SCMR 6301", "Case 6301", "Supreme Court", "https://www.pakistanlawsite.com/case/6301")]
+    sc = _journal_script({"1": pld, "2": scmr}, default_rows=[("2024 CLC 7301", "Case 7301", "Lahore High Court", "https://www.pakistanlawsite.com/case/7301")])
+    stats = await _run_pls(db, login_source, sc)
+    assert stats["citation_grid_journals_walked"] == ["PLD", "SCMR"]
+    assert _case_gotos(sc) == [pld[0][3], scmr[0][3]]
+    # a second backfill job finds both journals' laps ended with new work, walks them again and stages nothing new
+    sc.log.clear()
+    again = await _run_pls(db, login_source, sc)
+    assert _case_gotos(sc) == []
+    assert again["staged"] == 0
+
+
+async def test_journal_missing_from_the_dropdown_is_set_aside_alone(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "YLR,PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    pld = [("PLD 2024 SC 5401", "Case 5401", "Supreme Court", "https://www.pakistanlawsite.com/case/5401")]
+    sc = _journal_script({"1": pld}, default_rows=[("2024 CLC 7401", "Case 7401", "Lahore High Court", "https://www.pakistanlawsite.com/case/7401")])
+    first = await _run_pls(db, login_source, sc)  # YLR is not offered by the form
+    assert first["citation_grid_journals_unsupported"] == ["YLR"]
+    await db.refresh(login_source)
+    assert "citation_grid_journal_rotation_off" not in login_source.config_json
+    sc.log.clear()
+    second = await _run_pls(db, login_source, sc)
+    assert second["citation_grid_journals_walked"] == ["PLD"]
+    assert _case_gotos(sc) == [pld[0][3]]

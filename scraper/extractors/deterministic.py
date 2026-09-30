@@ -594,7 +594,9 @@ def introspect_search_form(html: str) -> Dict[str, Any]:
         kind = _field_kind(el)
         if kind is None:
             continue
-        options = [o.get("value") or o.get_text(strip=True) for o in el.find_all("option")] if el.name == "select" else []
+        option_els = el.find_all("option") if el.name == "select" else []
+        options = [o.get("value") or o.get_text(strip=True) for o in option_els]
+        option_labels = [[str(o.get("value") if o.get("value") is not None else o.get_text(strip=True)), o.get_text(" ", strip=True)] for o in option_els][:200]
         role = None
         low = _control_descriptor(el)
         for r, hints in ROLE_HINTS.items():
@@ -604,7 +606,7 @@ def introspect_search_form(html: str) -> Dict[str, Any]:
         if kind == "submit":
             role = "submit"
         selector = _css_selector(el)
-        fields.append({"name": name, "selector": selector, "kind": kind, "options": [str(o) for o in options][:200], "role": role})
+        fields.append({"name": name, "selector": selector, "kind": kind, "options": [str(o) for o in options][:200], "option_labels": option_labels, "role": role})
     tables = soup.find_all("table")
     def table_score(table) -> int:
         headers = " ".join(th.get_text(" ", strip=True).lower() for th in table.find_all("th"))

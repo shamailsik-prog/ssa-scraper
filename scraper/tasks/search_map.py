@@ -79,7 +79,7 @@ def build_map_record(proposal: Dict[str, Any], html: str, mapped_by: str) -> Dic
     for f in proposal.get("fields") or []:
         role = f.get("role")
         if role and role not in fields:
-            fields[role] = {"name": f["name"], "selector": f["selector"], "kind": f["kind"], "options": f.get("options") or []}
+            fields[role] = {"name": f["name"], "selector": f["selector"], "kind": f["kind"], "options": f.get("options") or [], "option_labels": f.get("option_labels") or []}
         fields.setdefault("_all", []).append({"name": f["name"], "selector": f["selector"], "kind": f["kind"], "role": role})
     reporter_opts = (fields.get("reporter") or {}).get("options") or []
     return {
