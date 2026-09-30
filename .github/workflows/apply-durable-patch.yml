@@ -1,0 +1,25 @@
+name: apply-durable-patch
+on:
+  push:
+    branches: ["apply/pls-durable-2026-09-30"]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: verify chunks, apply, push
+        run: |
+          git fetch origin main
+          cd patches && sha256sum -c SHA256S; rc=$?; cd ..
+          test $rc -eq 0 || { echo "chunk checksum mismatch"; exit 1; }
+          cat patches/*.patch > /tmp/p.patch
+          git checkout -q -B work origin/main
+          git apply --unidiff-zero --index /tmp/p.patch
+          git config user.name "grok-bot"
+          git config user.email "shamailsik@gmail.com"
+          git commit -q -m "fix(pls): durable fixes for promotion stall, stalled alarm, mirror backlog, metadata, embed health, search-harvest strategy guards"
+          git push -f origin HEAD:refs/heads/fix/pls-durable-2026-09-30
