@@ -46,6 +46,33 @@ from scraper.models import (
 
 router = APIRouter(tags=["status"])
 
+
+async def _pls_search_harvest_summary(db: AsyncSession) -> Dict[str, Any]:
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.pakistanlawsite import SOURCE_NAME
+
+    pending = (
+        await db.execute(
+            select(func.count()).select_from(PlsSearchHarvestQuery).where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+            )
+        )
+    ).scalar()
+    top_gap = (
+        await db.execute(
+            select(PlsSearchHarvestQuery)
+            .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME)
+            .order_by(PlsSearchHarvestQuery.gap_size.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    return {
+        "pending_or_in_progress": int(pending or 0),
+        "top_gap_size": int(top_gap.gap_size) if top_gap else 0,
+        "top_gap_query_key": top_gap.query_key if top_gap else None,
+    }
+
 _TEMPLATES = pathlib.Path(__file__).resolve().parent.parent / "templates"
 _MANIFEST = (
     '{"name":"SIKANDER AI Corpus","short_name":"Corpus","start_url":"/status","display":"standalone",'
@@ -227,6 +254,7 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             ),
             "stalled": bool(pls_watch.get("stalled")),
             "grid_incomplete": grid_harvest_incomplete(pls_cfg),
+            "search_harvest": await _pls_search_harvest_summary(db),
         },
         "judgments_by_source": by_source,
         "judgments_by_reporter_year": by_reporter_year,
@@ -249,6 +277,14 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
 @router.get("/status.json")
 async def status_json(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     return await status_payload(db)
+
+
+@router.get("/pls-search-harvest/gap-report.json")
+async def pls_search_harvest_gap_report(db: AsyncSession = Depends(get_db), limit: int = 200) -> Dict[str, Any]:
+    from scraper.tasks.pls_search_harvest import gap_report_rows
+
+    rows = await gap_report_rows(db, limit=limit)
+    return {"queries": rows, "count": len(rows)}
 
 
 @router.get("/status", response_class=HTMLResponse)

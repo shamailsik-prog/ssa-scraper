@@ -31,6 +31,7 @@ app = Celery(
         "scraper.tasks.login_recovery",
         "scraper.tasks.spot_check",
         "scraper.tasks.pls_self_healing",
+        "scraper.tasks.pls_search_harvest",
     ],
 )
 app.conf.update(
@@ -56,6 +57,7 @@ app.conf.update(
         "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
         "scraper.tasks.pls_self_healing.pls_keepalive_hourly": {"queue": "login_session"},
         "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
+        "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
@@ -94,6 +96,12 @@ if settings.TREATMENT_RECONCILE_ENABLED:
             "lookback_hours": settings.TREATMENT_RECONCILE_LOOKBACK_HOURS,
             "batch_size": settings.TREATMENT_RECONCILE_BATCH_SIZE,
         },
+    }
+if settings.PLS_SEARCH_HARVEST_ENABLED:
+    app.conf.beat_schedule["pls-search-harvest"] = {
+        "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+        "schedule": settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS,
+        "kwargs": {"priority_gaps": True},
     }
 if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
     app.conf.beat_schedule["reconcile-judgment-citation-relations"] = {
