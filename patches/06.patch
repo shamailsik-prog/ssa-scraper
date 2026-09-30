@@ -1,0 +1,61 @@
+diff --git a/scraper/tasks/pakistanlawsite.py b/scraper/tasks/pakistanlawsite.py
+index 113f2c2..6f56790 100644
+--- a/scraper/tasks/pakistanlawsite.py
++++ b/scraper/tasks/pakistanlawsite.py
+@@ -89,2 +89 @@
+-    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|court unknown|no citation supported|"
+-    r"not in court directory|confidence [0-9.]+ below threshold|promotion error|full_text hash changed"
++    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
+@@ -91,0 +91 @@
++_ERROR_PAGE = re.compile(r"(?i)error code\s*:?\s*\d+|sorry,?\s+something went wrong|service unavailable|access denied|session (?:has )?expired")
+@@ -94,4 +94,6 @@
+-def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any) -> bool:
+-    """A quarantined capture that is a bad PAGE (error page, chrome, headnote-only, stub) is fetched again
+-    at most QUARANTINE_REFETCH_MAX times; a capture quarantined on the merits (a real citation conflict
+-    or a human decision) is final. Without this every quarantined row was skipped for ever as 'staged'."""
++def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any, head: Optional[str] = None) -> bool:
++    """A quarantined capture that is a bad PAGE (site error page, subscription chrome, headnote-only, login stub)
++    is fetched again at most QUARANTINE_REFETCH_MAX times. A capture quarantined on the merits (a citation
++    conflict, low confidence on a real judgment, a court the directory lacks) is final for the walk: those go
++    through `pls_admin requalify-quarantine` instead. Without this every quarantined row, including the 182
++    'Error Code:700' captures, was skipped for ever as 'staged'."""
+@@ -101 +103 @@
+-    if (text_len or 0) < 3000:
++    if (text_len or 0) < 3000 and _ERROR_PAGE.search(head or ""):
+@@ -815,0 +818 @@
++                            func.left(ScraperStaging.raw_text, 400),
+@@ -824 +827 @@
+-                for citation_string, st_status, st_reason, st_len, st_route in staged_rows:
++                for citation_string, st_status, st_reason, st_len, st_route, st_head in staged_rows:
+@@ -827 +830 @@
+-                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route):
++                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route, st_head):
+@@ -871 +874 @@
+-        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
++        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int, count_wrap: bool = True) -> None:
+@@ -889 +892 @@
+-            if total_rows > 0 and next_offset < start_offset:
++            if count_wrap and total_rows > 0 and next_offset < start_offset:
+@@ -1085,0 +1089,2 @@
++        # The lap ledger must be persisted even when the last per-row flush already committed this offset; in that
++        # case the wrap was counted there and must not be counted again.
+@@ -1090,0 +1096 @@
++            count_wrap=last_committed_offset != next_offset,
+diff --git a/tests/test_pls_durable_fixes.py b/tests/test_pls_durable_fixes.py
+index ebe958d..dd83749 100644
+--- a/tests/test_pls_durable_fixes.py
++++ b/tests/test_pls_durable_fixes.py
+@@ -294,0 +295,13 @@
++
++
++def test_only_bad_pages_are_refetched_not_real_judgments():
++    from scraper.tasks.pakistanlawsite import quarantined_capture_retryable as r
++
++    assert r("no citation supported by source", 60, {}, "Error Code:700 Sorry Something went wrong") is True
++    assert r("subscription_chrome", 9000, {}, "") is True
++    assert r("headnote_only: not eligible", 5000, {}, "") is True
++    # a short but real judgment quarantined on confidence / court / conflict is final for the walk
++    assert r("confidence 0.8 below threshold 0.85", 796, {}, "1990 C L C 1205 [Peshawar] Before ...") is False
++    assert r("citation 1984 CLC 1 already belongs to judgment X", 20000, {}, "") is False
++    # bounded: after QUARANTINE_REFETCH_MAX attempts the row is left alone
++    assert r("subscription_chrome", 9000, {"refetch_count": 3}, "") is False
