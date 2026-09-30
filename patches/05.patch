@@ -1,0 +1,117 @@
+diff --git a/scraper/main.py b/scraper/main.py
+index 4c249ef..a7c4b11 100644
+--- a/scraper/main.py
++++ b/scraper/main.py
+@@ -89,0 +90,3 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
++            from scraper.models import ScraperSource as _Src
++
++            _pls_state = (await db.execute(select(_Src.state).where(_Src.source_name == "PakistanLawSite"))).scalar()
+@@ -94 +97,2 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
+-                harvest_paused=bool(pls_cfg.get("paused_by_admin")),
++                # same rule as /status and the watchdog: an operator pause or any non-ACTIVE source is "paused"
++                harvest_paused=bool(pls_cfg.get("paused_by_admin")) or (_pls_state is not None and _pls_state != "ACTIVE"),
+diff --git a/scraper/pls_search_harvest_core.py b/scraper/pls_search_harvest_core.py
+index a0f4977..efcdcde 100644
+--- a/scraper/pls_search_harvest_core.py
++++ b/scraper/pls_search_harvest_core.py
+@@ -106,0 +107,3 @@ def build_harvest_form_values(
++    if "year" in fields and query_json.get("year") and "year" not in values:
++        # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
++        values["year"] = str(query_json["year"])
+@@ -139,0 +143,2 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
++    if query_json.get("year") and "reporter" not in query_json and "year" not in fields:
++        return "search map cannot express year filter; missing role: year"
+diff --git a/scraper/storage/archive.py b/scraper/storage/archive.py
+index f62c770..80ea031 100644
+--- a/scraper/storage/archive.py
++++ b/scraper/storage/archive.py
+@@ -208,0 +209,7 @@ class ArchiveMirror:
++    def _policy_clause(self, t: ArchiveTarget):
++        """SQL form of _policy_allows: login-session rows are excluded in the query itself, so ineligible rows can
++        never fill the LIMIT window and starve the eligible ones behind them."""
++        if settings.MIRROR_LOGIN_SESSION_ROWS and t.mirror_login_session_rows:
++            return None
++        return func.lower(func.coalesce(Judgment.access_method, "")) != "login_session"
++
+@@ -226,0 +234,3 @@ class ArchiveMirror:
++        clause = self._policy_clause(t)
++        if clause is not None:
++            q = q.where(clause)
+@@ -232 +242,5 @@ class ArchiveMirror:
+-        total = int((await self.db.execute(select(func.count()).select_from(Judgment))).scalar() or 0)
++        clause = self._policy_clause(t)
++        total_q = select(func.count()).select_from(Judgment)
++        if clause is not None:
++            total_q = total_q.where(clause)
++        total = int((await self.db.execute(total_q)).scalar() or 0)
+@@ -239,3 +253,4 @@ class ArchiveMirror:
+-        unmirrored = int(
+-            (await self.db.execute(select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < 3))).scalar() or 0
+-        )
++        un_q = select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < 3)
++        if clause is not None:
++            un_q = un_q.where(clause)
++        unmirrored = int((await self.db.execute(un_q)).scalar() or 0)
+diff --git a/scraper/tasks/pls_backfill.py b/scraper/tasks/pls_backfill.py
+index 3c742e8..e019467 100644
+--- a/scraper/tasks/pls_backfill.py
++++ b/scraper/tasks/pls_backfill.py
+@@ -91,0 +92,8 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
++            if not dry_run:
++                # keep the ledger truthful: the reason the row is set aside NOW, not the one from before the fixes
++                st.quarantine_reason = out.quarantine_reason
++                st.validation_errors = out.errors
++                st.confidence_score = out.confidence
++                if out.data:
++                    st.reconciled_json = {**(st.reconciled_json or {}), **dict(out.data)}
++                await db.commit()
+diff --git a/scraper/tasks/promotion.py b/scraper/tasks/promotion.py
+index 326fa09..2a8bc87 100644
+--- a/scraper/tasks/promotion.py
++++ b/scraper/tasks/promotion.py
+@@ -208 +208,3 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
+-        cits = cits[:1]
++        own = normalise_citation(st.extracted_citation) if st.extracted_citation else None
++        # the staging row's citation is the grid row's identity; the page-text order of citations is not
++        cits = [own] if own else cits[:1]
+@@ -318,0 +321 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++            await _supersede_quarantine(db, st, existing)
+@@ -337,0 +341 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
++        await _supersede_quarantine(db, st, existing)
+diff --git a/tests/test_pls_durable_fixes.py b/tests/test_pls_durable_fixes.py
+index 1e6df0a..ebe958d 100644
+--- a/tests/test_pls_durable_fixes.py
++++ b/tests/test_pls_durable_fixes.py
+@@ -277,0 +278,17 @@ def test_status_exposes_stalled_fields(client):
++
++
++async def test_mirror_backlog_is_not_starved_by_ineligible_login_rows(db, tmp_path, monkeypatch):
++    from scraper.config import settings
++    from scraper.storage.archive import ArchiveMirror
++
++    monkeypatch.setattr(settings, "MIRROR_LOGIN_SESSION_ROWS", False)
++    for i in range(4):  # the OLDEST rows are login-session rows the policy never mirrors
++        db.add(Judgment(canonical_citation=f"2001 CLC {i + 1}", full_text="t" * 100, full_text_hash=f"ls{i}", source_name="PakistanLawSite", access_method="login_session", promoted_at=NOW - timedelta(days=30, hours=i)))
++    pub = Judgment(canonical_citation="2002 CLC 9", full_text="p" * 100, full_text_hash="pub", source_name="PakistanLawSite", access_method="public", promoted_at=NOW - timedelta(days=1))
++    db.add(pub)
++    t = ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a"))
++    db.add(t)
++    await db.commit()
++    got = await ArchiveMirror(db).backlog_judgments(t, 2)
++    assert [j.id for j in got] == [pub.id]
++    assert (await ArchiveMirror(db).lag(t))["judgments_unmirrored"] == 1
+diff --git a/tests/test_pls_search_harvest_strategy.py b/tests/test_pls_search_harvest_strategy.py
+index e5fe088..504c55a 100644
+--- a/tests/test_pls_search_harvest_strategy.py
++++ b/tests/test_pls_search_harvest_strategy.py
+@@ -70,0 +71,10 @@ def test_unmapped_reason_for_new_roles():
++
++
++def test_year_only_seed_submits_the_year():
++    from scraper.pls_search_harvest_core import build_harvest_form_values
++
++    smap = {"fields": {"court": {}, "year": {}, "keyword": {}}}
++    vals = build_harvest_form_values(smap, {"court": "SC", "year": 2020}, {})
++    assert vals.get("year") == "2020" and vals.get("court") == "SC"
++    no_year = {"fields": {"court": {}, "keyword": {}}}
++    assert "year" in (unmapped_harvest_reason(no_year, {"court": "SC", "year": 2020}, {}) or "")
