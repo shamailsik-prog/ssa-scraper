@@ -1,6 +1,6 @@
 diff --git a/tests/test_pls_durable_fixes.py b/tests/test_pls_durable_fixes.py
 new file mode 100644
-index 0000000..46e2b05
+index 0000000..1e6df0a
 --- /dev/null
 +++ b/tests/test_pls_durable_fixes.py
 @@ -0,0 +1,277 @@
@@ -281,7 +281,6 @@ index 0000000..46e2b05
 +    assert "stalled" in body and "stalled_reason" in body
 +    assert "stalled" in body["pakistanlawsite"] and "grid_saturation" in body["pakistanlawsite"]
 +    assert "embeddings" in body
-+
 diff --git a/tests/test_pls_search_harvest_strategy.py b/tests/test_pls_search_harvest_strategy.py
 new file mode 100644
 index 0000000..e5fe088
