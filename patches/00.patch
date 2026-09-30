@@ -1,0 +1,489 @@
+diff --git a/.gitignore b/.gitignore
+index 882d118..6679b46 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,0 +13,8 @@ venv/
++
++# droplet-local clutter: never commit hand-made backups or hot patches (deploy from git only)
++*.bak
++*.bak.*
++*.bak-*
++.hotpatch-*/
++debug/
++*.OPS_NOTES
+diff --git a/docker-compose.cloud.yml b/docker-compose.cloud.yml
+index e20d2ee..6c50d78 100644
+--- a/docker-compose.cloud.yml
++++ b/docker-compose.cloud.yml
+@@ -13,0 +14,6 @@ services:
++  # Trust X-Forwarded-Proto/Host from Caddy (docker network) so the API builds https:// URLs,
++  # e.g. the Google Drive OAuth redirect_uri. Scoped to the api service only.
++  api:
++    environment:
++      FORWARDED_ALLOW_IPS: "*"
++
+diff --git a/scraper/config.py b/scraper/config.py
+index 98adf3a..8c7ad6a 100644
+--- a/scraper/config.py
++++ b/scraper/config.py
+@@ -161,0 +162,6 @@ class Settings(BaseSettings):
++    PLS_STALL_NO_PROMOTION_HOURS: float = Field(default=6.0, description="/status stalled=true (and a PLS_NO_NEW_JUDGMENTS notification) when no PakistanLawSite judgment was promoted for this many hours.")
++    PLS_SATURATED_RECHECK_HOURS: float = Field(default=12.0, description="A citation-grid shard whose last full lap staged nothing new is not scheduled again for this many hours.")
++    PLS_CITATION_GRID_SKIP_FLUSH_EVERY: int = Field(default=50, description="Commit the grid cursor every N rows that are only skipped (known, already staged, other shard); rows that fetch a detail page still commit every PLS_CITATION_GRID_FLUSH_EVERY.")
++    MIRROR_BACKLOG_PER_RUN: int = Field(default=300, description="Oldest-first backlog judgments the archive mirror writes per target per run, in addition to the newest ones.")
++    MIRROR_LAG_ALERT_HOURS: float = Field(default=3.0, description="Alert (ARCHIVE_MIRROR_LAG) when a target has unmirrored judgments and its newest mirrored judgment is older than this.")
++    EMBED_QUEUE_ALERT_HOURS: float = Field(default=6.0, description="Alert (EMBED_QUEUE_STALLED) when pending embeddings are older than this and none were embedded in that time.")
+diff --git a/scraper/extractors/deterministic.py b/scraper/extractors/deterministic.py
+index a0c623a..6002966 100644
+--- a/scraper/extractors/deterministic.py
++++ b/scraper/extractors/deterministic.py
+@@ -175,5 +175,14 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str],
+-    for c in cits[:3]:
+-        if c.get("year"):
+-            year = c["year"]
+-            evidence["year"] = c["raw"]
+-            break
++    if hint:
++        # The grid row's own citation is the judgment's identity; its year is the year. Taking the year
++        # of the first citation found in the page text instead picked up cited cases and page chrome
++        # ("year 2026 disagrees with citation year 1980") and quarantined ~200 good judgments.
++        hint_hits = extract_citations(hint)
++        if hint_hits and hint_hits[0].get("year"):
++            year = hint_hits[0]["year"]
++            evidence["year"] = f"result row: {hint}"
++    if year is None:
++        for c in cits[:3]:
++            if c.get("year"):
++                year = c["year"]
++                evidence["year"] = c["raw"]
++                break
+diff --git a/scraper/extractors/validation.py b/scraper/extractors/validation.py
+index 2df7fa0..94099d1 100644
+--- a/scraper/extractors/validation.py
++++ b/scraper/extractors/validation.py
+@@ -24,0 +25,7 @@ MANDATORY_INSTRUMENT_FIELDS = ("type", "full_text")
++PLS_COURT_LABELS = {
++    "supreme court azad kashmir": "Azad Jammu and Kashmir Supreme Court",
++    "supreme court of azad kashmir": "Azad Jammu and Kashmir Supreme Court",
++    "high court azad kashmir": "High Court of Azad Jammu and Kashmir",
++    "high court of azad kashmir": "High Court of Azad Jammu and Kashmir",
++    "azad j k": "High Court of Azad Jammu and Kashmir",
++}
+@@ -60,0 +68,6 @@ def court_in_directory(court: Optional[str], directory: Dict[str, str]) -> Optio
++    if key in directory:
++        return directory[key]
++    # PLS labels courts with hyphenated upper-case slugs ("SUPREME-COURT-AZAD-KASHMIR")
++    key = re.sub(r"[\s\-]+", " ", key).strip()
++    if key in PLS_COURT_LABELS:
++        return directory.get(PLS_COURT_LABELS[key].lower()) or PLS_COURT_LABELS[key]
+diff --git a/scraper/main.py b/scraper/main.py
+index 29b0b53..4c249ef 100644
+--- a/scraper/main.py
++++ b/scraper/main.py
+@@ -88 +88,8 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
+-            watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
++            from scraper.pls_grid_health import compute_stalled, grid_saturation_view
++
++            saturation = grid_saturation_view(pls_cfg)
++            stall = compute_stalled(
++                last_promotion_at=last_j,
++                saturation=saturation,
++                harvest_paused=bool(pls_cfg.get("paused_by_admin")),
++            )
+@@ -90,0 +98,2 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
++            out["stalled"] = stall["stalled"]
++            out["stalled_reason"] = stall["stalled_reason"]
+@@ -96,3 +105,2 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
+-                "stalled": bool(watch.get("stalled")) or (
+-                    grid_harvest_incomplete(pls_cfg) and bool(watch.get("stalled_at"))
+-                ),
++                **stall,
++                "grid_saturation": saturation,
+diff --git a/scraper/models.py b/scraper/models.py
+index 4068e3d..0ce9a6c 100644
+--- a/scraper/models.py
++++ b/scraper/models.py
+@@ -26,0 +27 @@ from pgvector.sqlalchemy import Vector
++from sqlalchemy import event
+@@ -803,0 +805,12 @@ class PlsSearchHarvestQuery(Base):
++RETIRED_WITHOUT_REASON = "retired without a recorded reason (guard)"
++
++
++@event.listens_for(CrawlFrontier, "before_insert")
++@event.listens_for(CrawlFrontier, "before_update")
++def _frontier_retired_needs_reason(mapper, connection, fr) -> None:
++    """A retired frontier row must always say why. 2,445 rows were once retired with an empty last_error, which
++    made them impossible to tell from a legitimate retirement (and impossible to reset safely). Any ORM path
++    that retires a row without a reason now records that fact instead of leaving the field empty."""
++    if fr.status == "retired" and not (fr.last_error or "").strip():
++        fr.last_error = RETIRED_WITHOUT_REASON
++
+diff --git a/scraper/parsers/bench_parser.py b/scraper/parsers/bench_parser.py
+index 10a421e..d76ddd4 100644
+--- a/scraper/parsers/bench_parser.py
++++ b/scraper/parsers/bench_parser.py
+@@ -53,0 +54,16 @@ def normalise_judge_name(raw: str) -> str:
++_OCR_DIGITS = str.maketrans({"1": "l", "0": "o", "5": "s", "8": "B"})
++
++
++def _fix_ocr_name(piece: str) -> str:
++    """The PLS scans of older volumes read 'Ilyas' as '1lyas', 'Ajmal' as 'Ajma1': a digit that sits
++    inside a word of letters is an OCR slip, not part of a name."""
++    def word(w: str) -> str:
++        if not re.search(r"[A-Za-z]", w) or not re.search(r"\d", w):
++            return w
++        if re.fullmatch(r"[1lI]{2}[a-z]+", w):  # 1lyas / 11yas -> Ilyas
++            return "Il" + w[2:]
++        return w.translate(_OCR_DIGITS)
++
++    return " ".join(word(w) for w in piece.split())
++
++
+@@ -57 +73 @@ def _split_names(blob: str) -> List[str]:
+-        n = normalise_judge_name(piece)
++        n = normalise_judge_name(_fix_ocr_name(piece))
+diff --git a/scraper/parsers/case_metadata.py b/scraper/parsers/case_metadata.py
+new file mode 100644
+index 0000000..370f29f
+--- /dev/null
++++ b/scraper/parsers/case_metadata.py
+@@ -0,0 +1,130 @@
++"""Case-header metadata from a PakistanLawSite judgment: parties, docket number, headnotes.
++
++The preserved text of a PLS judgment starts with a fixed header (citation line, [court], "Before
++<judges>"), then the title block, a docket line and the headnote paragraphs:
++
++    1990 C L C 1205 / [Peshawar] / Before Muhammad Bashir Khan Jehangiri, J
++    Mst. KAUSAR BIBI---Petitioner
++    versus
++    MUHAMMAD MUSHTAQ and 6 others---Respondents
++    Civil Revision No.329 of 1989, decided on 22nd November, 1989.
++    (a) Civil Procedure Code (V of 1908)--- ...
++
++Everything here is deterministic and derived only from the preserved text (raw-first rule): a value
++that is not present in the text is left None, never guessed.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import List, Optional
++
++_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
++_DASH_TABLE = {ord(c): "-" for c in _DASHES}
++_ROLES = (
++    r"(?:Petitioner|Respondent|Appellant|Applicant|Plaintiff|Defendant|Complainant|Accused|Opponent|Objector|"
++    r"Caveator|Revisionist|Informant|Decree[- ]?holder|Judgment[- ]?debtor|Contemnor|Intervenor|Interveners?|Proforma Respondent)"
++)
++_VERSUS = re.compile(r"(?:^|\s)(?:versus|vs)\.?(?=\s|$)", re.I)
++_RESP_ROLE = re.compile(rf"\s*-*\s*\b{_ROLES}s?\b", re.I)
++_PET_ROLE_TAIL = re.compile(rf"\s*-+\s*{_ROLES}s?\s*[.,;]?\s*$|\s+{_ROLES}s?\s*[.,;]?\s*$", re.I)
++_DECIDED = re.compile(r"(?:decided|heard)\s+on\b", re.I)
++_DECIDED_SENTENCE = re.compile(r",?\s*(?:decided|heard)\s+on\b[^\n]{0,100}?\b(?:19|20)\d{2}\b\s*[.,]?", re.I)
++_DOCKET_OK = re.compile(r"\b(?:Nos?\.?|Numbers?)\b.*\bof\s+(?:19|20)\d{2}\b|\b(?:19|20)\d{2}\b", re.I | re.S)
++_BODY_LINE = re.compile(
++    r"^(?:JUDGMENT|JUDGEMENT|ORDER|SHORT ORDER|Dates? of hearing\b|[A-Z][A-Za-z .'\-]{3,60},\s*(?:C\.?J\.?|J\.?|JJ\.?)\s*[.\-])",
++)
++_COUNSEL_LINE = re.compile(
++    rf"(?i)\bfor\s+(?:the\s+)?(?:{_ROLES}s?|State|Appellants?|Respondents?|Petitioners?|Interveners?|Applicants?)\b\s*\.?\s*$"
++)
++
++
++@dataclass
++class CaseMetadata:
++    petitioner: Optional[str] = None
++    respondent: Optional[str] = None
++    docket_number: Optional[str] = None
++    headnotes: Optional[str] = None
++
++
++def _clean(s: str) -> str:
++    return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip(" \t.,;:-")
++
++
++def _norm_lines(text: str) -> List[str]:
++    return [ln.strip() for ln in text.replace("\xa0", " ").translate(_DASH_TABLE).split("\n") if ln.strip()]
++
++
++def _title_start(lines: List[str]) -> int:
++    """Line index after the citation line, [court] and 'Before ...' lines."""
++    idx = 0
++    for i in range(min(len(lines), 5)):
++        ln = lines[i]
++        low = ln.lower()
++        if low.startswith(("before", "coram")) or (i <= 2 and re.match(r"^[\[(][A-Za-z].{1,70}[\])]$", ln)):
++            idx = i + 1
++    return idx
++
++
++def parse_case_metadata(text: Optional[str]) -> CaseMetadata:
++    out = CaseMetadata()
++    if not text:
++        return out
++    lines = _norm_lines(text[:40000])
++    if not lines:
++        return out
++    start = _title_start(lines)
++    block_lines = lines[start : start + 16]
++    block = " ".join(block_lines)
++    headnote_from_line = start
++    vs = _VERSUS.search(block)
++    after_role = ""
++    if vs:
++        pet = block[: vs.start()]
++        rest = block[vs.end() :]
++        rm = _RESP_ROLE.search(rest)
++        if rm:
++            res = rest[: rm.start()]
++            after_role = rest[rm.end() :]
++            after_role = re.sub(r"^\s*-*\s*s?\s*[.,;]?\s*", "", after_role)
++        else:
++            res = rest[:200]
++        pet = _PET_ROLE_TAIL.sub("", pet.strip())
++        out.petitioner = _clean(pet)[:1000] or None
++        out.respondent = _clean(res)[:1000] or None
++    else:
++        pm = re.search(rf"^(.{{3,400}}?)\s*-{{1,}}\s*{_ROLES}s?\b", block, re.I)
++        if pm:
++            out.petitioner = _clean(pm.group(1))[:1000] or None
++            after_role = block[pm.end() :]
++    # docket: what follows the respondent role, up to ", decided on"
++    if after_role:
++        cut = _DECIDED.search(after_role)
++        cand = after_role[: cut.start()] if cut else after_role[:200]
++        cand = _clean(cand)
++        if cand and len(cand) <= 300 and _DOCKET_OK.search(cand) and re.search(r"\d", cand):
++            out.docket_number = cand[:300]
++    # headnotes: start after the "decided on ..." sentence (or the respondent line), stop at the body
++    consumed = 0
++    hd = _DECIDED_SENTENCE.search("\n".join(lines[start : start + 20]))
++    if hd:
++        consumed = len("\n".join(lines[start : start + 20])[: hd.end()].split("\n"))  # lines covered incl. the current
++        headnote_from_line = start + consumed
++    elif vs:
++        headnote_from_line = start + min(len(block_lines), 4)
++    hn: List[str] = []
++    for ln in lines[headnote_from_line : headnote_from_line + 250]:
++        if hn and (_BODY_LINE.match(ln) or _COUNSEL_LINE.search(ln)):
++            break
++        if not hn and _COUNSEL_LINE.search(ln):
++            break
++        if re.fullmatch(r"[-\s]+", ln):
++            continue
++        hn.append(ln)
++        if sum(len(x) for x in hn) > 8000:
++            break
++    joined = "\n".join(hn).strip()
++    if len(joined) >= 40:
++        out.headnotes = joined
++    return out
+diff --git a/scraper/parsers/pdf_writer.py b/scraper/parsers/pdf_writer.py
+index 6715450..3472f23 100644
+--- a/scraper/parsers/pdf_writer.py
++++ b/scraper/parsers/pdf_writer.py
+@@ -49,0 +50 @@ def _build(buffer_or_path, meta: Dict[str, object], cleaned_text: str) -> None:
++        invariant=1,  # byte-stable output: no wall-clock CreationDate/ID, so the write-once ledger hash never drifts
+diff --git a/scraper/pls_accounting.py b/scraper/pls_accounting.py
+new file mode 100644
+index 0000000..763cfb5
+--- /dev/null
++++ b/scraper/pls_accounting.py
+@@ -0,0 +1,53 @@
++"""Where every row of the PakistanLawSite citation grid stands (audit of 2026-09-30: ~815 of 20,568 rows unaccounted for).
++
++Judgments are counted by identity (their own citation); the rest of the grid is classified from the staging
++ledger by the reason it was set aside. What is left after both is `not_captured`: rows the walk has not been
++able to preserve (unreachable detail page, duplicate grid rows, or not walked yet)."""
++
++from __future__ import annotations
++
++from typing import Any, Dict
++
++from sqlalchemy import text
++from sqlalchemy.ext.asyncio import AsyncSession
++
++_CLASS_SQL = """
++WITH q AS (
++    SELECT DISTINCT ON (s.extracted_citation)
++        s.extracted_citation AS cit, s.quarantine_reason AS reason, length(s.raw_text) AS len
++    FROM scraper_staging s
++    WHERE s.source_name = 'PakistanLawSite' AND s.status = 'quarantined' AND s.extracted_citation IS NOT NULL
++      AND NOT EXISTS (SELECT 1 FROM judgment j WHERE j.canonical_citation = s.extracted_citation)
++    ORDER BY s.extracted_citation, s.created_at DESC
++)
++SELECT CASE
++    WHEN reason LIKE 'citation % already belongs%' THEN 'citation_conflict'
++    WHEN reason LIKE 'headnote_only%' OR reason LIKE '%notes_on_cases%' OR reason LIKE '%body_short%' OR reason LIKE '%body_missing%' THEN 'headnote_only_or_stub_page'
++    WHEN reason LIKE 'subscription_chrome%' OR reason LIKE 'login_stub%' THEN 'chrome_or_login_page'
++    WHEN reason LIKE 'no citation%' THEN 'no_citation'
++    WHEN reason LIKE 'confidence%' AND coalesce(len, 0) < 3000 THEN 'error_or_empty_page'
++    WHEN reason LIKE 'confidence%' THEN 'low_confidence_full_text'
++    ELSE 'other'
++END AS cls, count(*) AS n
++FROM q GROUP BY 1
++"""
++
++
++async def grid_accounting(db: AsyncSession, *, total_rows: int) -> Dict[str, Any]:
++    judgments = int((await db.execute(text("SELECT count(*) FROM judgment WHERE source_name = 'PakistanLawSite'"))).scalar() or 0)
++    classes = {row[0]: int(row[1]) for row in (await db.execute(text(_CLASS_SQL))).all()}
++    unresolved = sum(classes.values())
++    review_open = int(
++        (await db.execute(text("SELECT count(*) FROM quarantine_queue WHERE reviewed = false AND source_name = 'PakistanLawSite'"))).scalar() or 0
++    )
++    total = int(total_rows or 0)
++    not_captured = max(0, total - judgments - unresolved) if total else None
++    return {
++        "grid_rows": total or None,
++        "judgments": judgments,
++        "set_aside_unresolved": unresolved,
++        "set_aside_by_class": classes,
++        "not_captured": not_captured,
++        "accounted_pct": round(100.0 * (judgments + unresolved) / total, 2) if total else None,
++        "review_queue_open": review_open,
++    }
+diff --git a/scraper/pls_grid_health.py b/scraper/pls_grid_health.py
+index 5dbc109..158a3f9 100644
+--- a/scraper/pls_grid_health.py
++++ b/scraper/pls_grid_health.py
+@@ -70,2 +70,8 @@ def citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[s
+-def grid_rows_remaining(cfg: Dict[str, Any]) -> int:
+-    """Approximate rows left across all shard cursors (0 when unknown or complete)."""
++def grid_rows_remaining(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> int:
++    """Rows left in the current lap of the grid (0 when unknown, complete or saturated).
++
++    Every shard walks the SAME grid (a shard only decides which rows it detail-fetches), so the
++    shards' remainders must not be added up: two shards on a 20,568 row grid used to report
++    32,336 "remaining" rows, more than the grid holds. The figure is the largest remainder of any
++    shard that still has work; a shard whose last full lap found nothing new is saturated and
++    counts as 0 until its recheck is due."""
+@@ -81 +87,3 @@ def grid_rows_remaining(cfg: Dict[str, Any]) -> int:
+-        remaining += max(0, total - offset)
++        if cursor_saturated(cur, now=now):
++            continue
++        remaining = max(remaining, max(0, min(total, total - offset)))
+@@ -84,0 +93,123 @@ def grid_rows_remaining(cfg: Dict[str, Any]) -> int:
++# --------------------------------------------------------------------------- saturation
++def saturated_recheck_hours() -> float:
++    return float(getattr(settings, "PLS_SATURATED_RECHECK_HOURS", 12) or 12)
++
++
++def cursor_saturated(cur: Any, *, now: Optional[datetime] = None) -> bool:
++    """True while a cursor's last COMPLETE lap of the grid staged nothing new and its recheck is not due.
++
++    Re-walking a saturated shard costs a page load per window and produces nothing (the audit of
++    2026-09-30 saw 20,568 rows scanned for 0 staged), so the scheduler leaves it alone until the
++    recheck interval has passed."""
++    if not isinstance(cur, dict):
++        return False
++    at = parse_iso(cur.get("saturated_at"))
++    if at is None:
++        return False
++    now = now or datetime.now(timezone.utc)
++    return (now - at).total_seconds() < saturated_recheck_hours() * 3600
++
++
++def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
++    return f"citation_grid_cursor_shard_{reporter_shard}" if reporter_shard in (0, 1) else "citation_grid_cursor"
++
++
++def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:
++    """Scheduler guard: do not enqueue a job for a shard (or the unsharded walk) whose grid is saturated."""
++    return cursor_saturated(cfg.get(grid_cursor_key_for_shard(reporter_shard)), now=now)
++
++
++def lap_update(cur: Dict[str, Any], *, total_rows: int, window: Dict[str, int], now: datetime) -> Dict[str, Any]:
++    """Fold one finished window into the cursor's lap ledger and judge saturation once a lap is full.
++
++    A lap is `total_rows` processed rows (the walk is cyclic, so the start offset does not matter).
++    Counters: rows, in_shard (rows this shard may fetch), fetched (detail pages), staged (NEW staging
++    rows), known (already a judgment), staged_skips (already staged), url_less. When a lap ends with
++    staged == 0 the cursor is marked saturated; any new staging clears the mark."""
++    lap = dict(cur.get("lap") or {})
++    for k in ("rows", "in_shard", "fetched", "staged", "known", "staged_skips", "url_less", "grid_duplicates"):
++        lap[k] = int(lap.get(k) or 0) + int(window.get(k) or 0)
++    lap.setdefault("started_at", now.isoformat())
++    lap["total_rows"] = total_rows
++    if window.get("staged"):
++        cur.pop("saturated_at", None)
++        cur.pop("saturated_reason", None)
++    if total_rows > 0 and lap["rows"] >= total_rows:
++        done = dict(lap)
++        done["finished_at"] = now.isoformat()
++        cur["last_lap"] = done
++        if int(done.get("staged") or 0) == 0:
++            cur["saturated_at"] = now.isoformat()
++            cur["saturated_total_rows"] = total_rows
++            cur["saturated_reason"] = (
++                f"full lap of {done['rows']} rows staged 0 new "
++                f"(in_shard={done.get('in_shard')}, known={done.get('known')}, already_staged={done.get('staged_skips')}, "
++                f"fetched={done.get('fetched')}, url_less={done.get('url_less')})"
++            )
++        else:
++            cur.pop("saturated_at", None)
++            cur.pop("saturated_reason", None)
++        lap = {"rows": 0, "in_shard": 0, "fetched": 0, "staged": 0, "known": 0, "staged_skips": 0, "url_less": 0, "grid_duplicates": 0, "started_at": now.isoformat(), "total_rows": total_rows}
++    cur["lap"] = lap
++    return cur
++
++
++def grid_saturation_view(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
++    now = now or datetime.now(timezone.utc)
++    shards: Dict[str, Any] = {}
++    for key in citation_grid_cursor_keys(cfg):
++        cur = cfg.get(key)
++        if not isinstance(cur, dict):
++            continue
++        shards[key] = {
++            "saturated": cursor_saturated(cur, now=now),
++            "saturated_at": cur.get("saturated_at"),
++            "reason": cur.get("saturated_reason"),
++            "lap": cur.get("lap"),
++            "last_lap": cur.get("last_lap"),
++        }
++    return {"shards": shards, "all_saturated": bool(shards) and all(v["saturated"] for v in shards.values()), "recheck_hours": saturated_recheck_hours()}
++
++
++# --------------------------------------------------------------------------- stalled alarm
++def stall_threshold_hours() -> float:
++    return float(getattr(settings, "PLS_STALL_NO_PROMOTION_HOURS", 6) or 6)
++
++
++def compute_stalled(
++    *,
++    last_promotion_at: Optional[datetime],
++    now: Optional[datetime] = None,
++    threshold_hours: Optional[float] = None,
++    saturation: Optional[Dict[str, Any]] = None,
++    harvest_paused: bool = False,
++) -> Dict[str, Any]:
++    """The alarm the audit asked for: stalled == no new judgment for `threshold_hours`, computed from the
++    corpus itself (never from cursors, which advance while nothing is produced).
++
++    `reason` says why: harvest_paused (operator), grid_saturated (every shard finished a full lap with
++    nothing new: the site has nothing more for the subscribed reporters), or no_output_while_harvesting
++    (a real fault: work is running and yields nothing)."""
++    now = now or datetime.now(timezone.utc)
++    threshold = float(threshold_hours if threshold_hours is not None else stall_threshold_hours())
++    if last_promotion_at is not None and last_promotion_at.tzinfo is None:
++        last_promotion_at = last_promotion_at.replace(tzinfo=timezone.utc)
++    idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)
++    stalled = idle_hours is None or idle_hours >= threshold
++    reason = None
++    if stalled:
++        if harvest_paused:
++            reason = "harvest_paused"
++        elif saturation and saturation.get("all_saturated"):
++            reason = "grid_saturated"
++        else:
++            reason = "no_output_while_harvesting"
++    return {
++        "stalled": bool(stalled),
++        "stalled_reason": reason,
++        "hours_since_last_judgment": None if idle_hours is None else round(idle_hours, 2),
++        "threshold_hours": threshold,
++        "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
++    }
++
++
