@@ -58,8 +58,9 @@ def _parse(value: Optional[str]) -> Optional[datetime]:
 
 async def _ping_workers() -> Optional[Dict[str, bool]]:
     """{worker base name: alive} from a Celery broadcast ping, cached for 30 s. None when the broker is unreachable."""
-    if _PING_CACHE["workers"] is not None and time.monotonic() - _PING_CACHE["at"] < _PING_TTL_SECONDS:
-        return _PING_CACHE["workers"]
+    cached = _PING_CACHE["workers"]
+    if cached and time.monotonic() - _PING_CACHE["at"] < _PING_TTL_SECONDS:
+        return cached
 
     def _ping() -> Optional[List[Dict[str, Any]]]:
         from scraper.tasks.celery_app import app
@@ -76,6 +77,8 @@ async def _ping_workers() -> Optional[Dict[str, bool]]:
     for reply in replies:
         for node in reply:
             alive[str(node).split("@", 1)[0]] = True
+    if not alive:
+        return None
     _PING_CACHE.update({"at": time.monotonic(), "workers": alive})
     return alive
 
@@ -241,7 +244,19 @@ async def progress_section(db: AsyncSession, *, pls_cfg: Dict[str, Any], by_repo
         lag = await mirror.lag(t)
         lag.pop("_last_written", None)
         written_hour = int(
-            (await db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written", ArchiveObject.written_at >= now - timedelta(hours=1)))).scalar() or 0
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(ArchiveObject)
+                    .where(
+                        ArchiveObject.target_id == t.id,
+                        ArchiveObject.status == "written",
+                        ArchiveObject.judgment_id.isnot(None),
+                        ArchiveObject.written_at >= now - timedelta(hours=1),
+                    )
+                )
+            ).scalar()
+            or 0
         )
         per_hour = written_hour / 3.0  # three objects per judgment
         remaining = int(lag["judgments_unmirrored"])
