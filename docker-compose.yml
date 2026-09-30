@@ -58,6 +58,21 @@ services:
       retries: 5
       start_period: 40s
 
+  # Dedicated capacity for dispatch, promotion and the archive mirror, so long public-source jobs on
+  # worker-public can never hold them up (worker-public still serves this queue as a fallback).
+  worker-maintenance:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+    command: celery -A scraper.tasks.celery_app worker -Q maintenance --concurrency=2 -n maintenance@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d maintenance@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
   worker-embed:
     <<: *app
     depends_on:

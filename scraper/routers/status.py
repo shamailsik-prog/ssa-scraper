@@ -235,9 +235,19 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
     )
     from scraper.tasks.embedding_health import embedding_health
     from scraper.pls_accounting import grid_accounting
+    from scraper.dashboard_metrics import health_section, progress_section, speed_section
 
     return {
         "generated_at": _iso(now),
+        "health": await health_section(sources=sources, targets=targets, now=now),
+        "speed": await speed_section(db, now=now),
+        "progress": await progress_section(db, pls_cfg=pls_cfg, by_reporter_year=by_reporter_year, now=now),
+        "sources_summary": {
+            "total": len(sources),
+            "active": sum(1 for s in sources if s["state"] == "ACTIVE"),
+            "paused": sum(1 for s in sources if s["state"] == "PAUSED"),
+            "halted": sum(1 for s in sources if s["state"] == "HALTED"),
+        },
         "stalled": stall["stalled"],
         "stalled_reason": stall["stalled_reason"],
         "hours_since_last_judgment": stall["hours_since_last_judgment"],
