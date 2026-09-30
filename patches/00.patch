@@ -144,7 +144,7 @@ index 10a421e..d76ddd4 100644
 +        n = normalise_judge_name(_fix_ocr_name(piece))
 diff --git a/scraper/parsers/case_metadata.py b/scraper/parsers/case_metadata.py
 new file mode 100644
-index 0000000..370f29f
+index 0000000..d105f60
 --- /dev/null
 +++ b/scraper/parsers/case_metadata.py
 @@ -0,0 +1,130 @@
