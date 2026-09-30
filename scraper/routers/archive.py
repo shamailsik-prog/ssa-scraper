@@ -21,7 +21,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import ARCHIVE_TARGET_TYPES, settings
@@ -29,6 +29,7 @@ from scraper.database import get_db
 from scraper.models import ArchiveTarget
 from scraper.routers.auth import require_admin
 from scraper.storage.archive import ArchiveMirror, archive_status
+from scraper.tasks.archive_mirror import MIRROR_LOCK_KEY
 
 router = APIRouter(prefix="/admin/archive", tags=["archive"], dependencies=[Depends(require_admin)])
 # Google sends the browser back here after the operator presses Allow. The browser carries no admin
@@ -288,6 +289,9 @@ async def target_action(name: str, action: str, db: AsyncSession = Depends(get_d
 
 @router.post("/mirror")
 async def mirror_now(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    got = (await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": MIRROR_LOCK_KEY})).scalar()
+    if not got:
+        return {"skipped": "mirror_run_in_progress"}
     mirror = ArchiveMirror(db)
     result = await mirror.mirror_pending()
     result["statutes"] = await mirror.mirror_statutes()
