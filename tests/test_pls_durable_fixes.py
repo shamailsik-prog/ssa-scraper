@@ -220,6 +220,22 @@ async def test_mirror_backlog_pass_reaches_old_judgments(db, tmp_path, monkeypat
     assert lag["judgments_unmirrored"] == 0
 
 
+async def test_mirror_run_skips_while_another_run_holds_the_lock(db, tmp_path):
+    from sqlalchemy import text
+
+    from scraper.tasks import archive_mirror
+
+    await _mk_judgments(db, 2)
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a")))
+    await db.commit()
+    # `db` stands in for a mirror run that is still going: its transaction holds the run lock
+    assert (await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": archive_mirror.MIRROR_LOCK_KEY})).scalar()
+    assert await archive_mirror.mirror_pending(limit=10) == {"skipped": "mirror_run_in_progress"}
+    await db.rollback()  # the first run ends, releasing the lock
+    result = await archive_mirror.mirror_pending(limit=10)
+    assert result["summary"]["local"]["written"] > 0
+
+
 async def test_rendered_copy_is_byte_stable_across_runs(db):
     from scraper.storage.archive import ArchiveMirror
 

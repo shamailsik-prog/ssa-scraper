@@ -886,7 +886,9 @@ class PakistanLawSitePipeline:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            if total_rows > 0 and next_offset < start_offset:
+            # Count a wrap once, when the cursor crosses from the window's start back past the grid's end;
+            # later flushes of the same window (and the ledger flush at the end) must not count it again.
+            if total_rows > 0 and next_offset < start_offset <= offset_before:
                 cursor["wrapped_at"] = cursor["updated_at"]
                 cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
             patch = {cursor_key: cursor}
