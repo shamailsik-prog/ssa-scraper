@@ -107,6 +107,8 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
                 counts["embedded"] += 1
             await db.commit()
             await asyncio.sleep(max(0.0, 60.0 / max(1, settings.EMBEDDING_RPM_LIMIT)))
+    # every run, not only the no-key one: API failures also leave rows pending, and a drained queue clears the alert
+    await _alert_if_queue_stalled()
     return counts
 
 

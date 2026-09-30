@@ -131,7 +131,9 @@ def lap_update(cur: Dict[str, Any], *, total_rows: int, window: Dict[str, int], 
         lap[k] = int(lap.get(k) or 0) + int(window.get(k) or 0)
     lap.setdefault("started_at", now.isoformat())
     lap["total_rows"] = total_rows
-    if window.get("staged"):
+    grew = total_rows > int(cur.get("saturated_total_rows") or 0) > 0
+    if window.get("staged") or grew:
+        # new work, or the site listed more rows than the lap that found nothing: no longer saturated
         cur.pop("saturated_at", None)
         cur.pop("saturated_reason", None)
     if total_rows > 0 and lap["rows"] >= total_rows:
@@ -211,6 +213,12 @@ def compute_stalled(
         "threshold_hours": threshold,
         "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
     }
+
+
+def grid_total_rows(cfg: Dict[str, Any]) -> int:
+    """The grid's size as the latest window saw it, over every cursor (0 when unknown)."""
+    keys = ("citation_grid_cursor", *citation_grid_cursor_keys(cfg))
+    return max([_to_int((cfg.get(k) or {}).get("last_total_rows")) or 0 for k in keys if isinstance(cfg.get(k), dict)] or [0])
 
 
 def grid_harvest_incomplete(cfg: Dict[str, Any]) -> bool:

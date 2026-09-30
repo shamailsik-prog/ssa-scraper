@@ -2079,17 +2079,25 @@ async def test_pipeline_citation_grid_skips_rows_already_staged(db, login_source
     stats = await pipeline.run(max_queries=5, max_probes_per_volume=5)
     await db.commit()
     assert stats["staged"] == 2
-    # Nothing promoted yet (promotion runs on its own schedule); a second pass over the same rows must
-    # not download them again.
-    login_source.config_json = {k: v for k, v in (login_source.config_json or {}).items() if not k.startswith("citation_grid_cursor")}
+    # Nothing promoted yet (promotion runs on its own schedule). Both captures were quarantined for low
+    # confidence, a bad-page reason: they are fetched again at most QUARANTINE_REFETCH_MAX times, then skipped.
+    # A capture quarantined on the merits (a citation conflict) is final and never fetched again.
+    from scraper.tasks.pakistanlawsite import QUARANTINE_REFETCH_MAX
+
+    conflict = (await db.execute(select(ScraperStaging).where(ScraperStaging.extracted_citation == "PLD 2024 SC 4002"))).scalars().one()
+    conflict.quarantine_reason = "citation PLD 2024 SC 4002 already belongs to another judgment"
     await db.commit()
-    sc.log.clear()
-    pipeline2 = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
-    stats2 = await pipeline2.run(max_queries=5, max_probes_per_volume=5)
-    await db.commit()
+    fetches = []
+    for _ in range(QUARANTINE_REFETCH_MAX + 1):
+        login_source.config_json = {k: v for k, v in (login_source.config_json or {}).items() if not k.startswith("citation_grid_cursor")}
+        await db.commit()
+        sc.log.clear()
+        pipeline2 = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), redis_client=r, sleep=_nosleep)
+        stats2 = await pipeline2.run(max_queries=5, max_probes_per_volume=5)
+        await db.commit()
+        fetches.append([entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]])
     await r.aclose()
-    detail_calls = [entry[0][1] for entry in sc.log if entry[0][0] == "goto" and "/case/" in entry[0][1]]
-    assert detail_calls == []
+    assert fetches == [["https://www.pakistanlawsite.com/case/4001"]] * QUARANTINE_REFETCH_MAX + [[]]
     assert stats2["staged_citation_skips"] == 2
     assert stats2["staged"] == 0
     assert stats2["citation_grid_next_offset"] == 0

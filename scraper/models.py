@@ -169,6 +169,7 @@ class Judgment(Base):
         Index("ix_judgment_reporter", "reporter"),
         Index("ix_judgment_decision_date", "decision_date"),
         Index("ix_judgment_access_method", "access_method"),
+        Index("ix_judgment_source_promoted", "source_name", "promoted_at"),
         Index("ix_judgment_title_trgm", "case_title", postgresql_using="gin", postgresql_ops={"case_title": "gin_trgm_ops"}),
         Index("ix_judgment_citation_trgm", "canonical_citation", postgresql_using="gin", postgresql_ops={"canonical_citation": "gin_trgm_ops"}),
         Index(
@@ -573,6 +574,7 @@ class ScraperStaging(Base):
         Index("ix_staging_content_hash", "content_hash"),
         Index("ix_staging_status", "status"),
         Index("ix_staging_created", "created_at"),
+        Index("ix_staging_source_citation", "source_name", "extracted_citation"),
         CheckConstraint("confidence_score >= 0 AND confidence_score <= 1", name="ck_staging_confidence"),
         CheckConstraint("status IN ('pending','extracted','promoted','quarantined','duplicate','failed')", name="ck_staging_status"),
     )
@@ -647,7 +649,7 @@ class QuarantineQueue(Base):
     """The review queue."""
 
     __tablename__ = "quarantine_queue"
-    __table_args__ = (Index("ix_quarantine_reviewed", "reviewed"), Index("ix_quarantine_created", "created_at"))
+    __table_args__ = (Index("ix_quarantine_reviewed", "reviewed"), Index("ix_quarantine_created", "created_at"), Index("ix_quarantine_staging", "staging_id"))
     id: Mapped[uuid.UUID] = _uuid_pk()
     staging_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("scraper_staging.id", ondelete="CASCADE"))
     statutes_staging_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("statutes_staging.id", ondelete="CASCADE"))
@@ -663,7 +665,7 @@ class QuarantineQueue(Base):
     reviewed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
     reviewed_by: Mapped[Optional[str]] = mapped_column(String(200))
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
-    resolution: Mapped[Optional[str]] = mapped_column(String(30), comment="promoted|rejected|remapped")
+    resolution: Mapped[Optional[str]] = mapped_column(String(30), comment="promoted|rejected|remapped|superseded")
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()

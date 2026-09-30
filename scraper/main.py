@@ -75,7 +75,6 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
             out["db_connected"] = True
             from scraper.pls_grid_health import (
                 citation_grid_progress_view,
-                grid_harvest_incomplete,
                 grid_rows_remaining,
                 pls_judgment_counts,
                 pls_last_judgment_at,

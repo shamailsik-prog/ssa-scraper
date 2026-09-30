@@ -205,7 +205,9 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         # the extractor puts first. Any other citation found in the top of the page is a case cited in
         # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
         # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
-        cits = cits[:1]
+        # The grid row's citation (staging.extracted_citation) wins over list order when it was found.
+        row_cit = normalise_citation(st.extracted_citation) if st.extracted_citation else None
+        cits = [row_cit] if row_cit and row_cit in cits else cits[:1]
     full_text = strip_leading_judgment_chrome(st.raw_text or "")
     if full_text != (st.raw_text or ""):
         st.raw_text = full_text
@@ -406,6 +408,10 @@ async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: 
             )
         )
     ).scalars().all()
+    from scraper.tasks.pakistanlawsite import _FINAL_QUARANTINE  # lazy: pakistanlawsite imports this module's callers
+
+    # a merits quarantine (a real citation conflict) still needs a person; only bad-page captures are superseded
+    others = [o for o in others if not _FINAL_QUARANTINE.search(o.quarantine_reason or "")]
     closed = 0
     for old in others:
         old.status = "duplicate"
@@ -415,7 +421,7 @@ async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: 
             item.reviewed = True
             item.reviewed_by = "system"
             item.reviewed_at = datetime.now(timezone.utc)
-            item.resolution = "promoted"
+            item.resolution = "superseded"
             item.resolution_notes = f"superseded: {cit} was promoted from a later capture"
             closed += 1
     if others:

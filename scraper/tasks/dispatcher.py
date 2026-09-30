@@ -140,7 +140,7 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
             job.status = "interrupted"
             job.finished_at = now
             job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); interrupted at worker start, resumes from its committed cursor."
-            logger.warning("Retired orphaned login-session job source=%s job_id=%s", job.source_name, job.id)
+            logger.warning("Interrupted orphaned login-session job source=%s job_id=%s", job.source_name, job.id)
         await db.commit()
         source_names = (
             await db.execute(select(ScraperSource.source_name).where(ScraperSource.access_method == "login_session"))
@@ -399,12 +399,14 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     # (shard n on slot n+1), and a shard whose slot is already served by a running
                     # job is not started twice.
                     sent = False
+                    this_source_saturated = False
                     for shard in (0, 1):
                         if shard in running_shards or (shard + 1) not in active_slots:
                             continue
                         if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
                             logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
                             skipped_saturated.append(f"{s.source_name}:shard{shard}")
+                            this_source_saturated = True
                             continue
                         app.send_task(
                             "scraper.tasks.dispatcher.run_login_session_job",
@@ -415,7 +417,7 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         queued.append(f"{s.source_name}:shard{shard}")
                         sent = True
                     if not sent:
-                        if skipped_saturated:
+                        if this_source_saturated:
                             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
                         continue
                 elif running_jobs:

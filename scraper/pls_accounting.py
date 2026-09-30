@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 _CLASS_SQL = """
 WITH q AS (
     SELECT DISTINCT ON (s.extracted_citation)
-        s.extracted_citation AS cit, s.quarantine_reason AS reason, length(s.raw_text) AS len
+        s.extracted_citation AS cit, s.quarantine_reason AS reason, octet_length(s.raw_text) AS len
     FROM scraper_staging s
     WHERE s.source_name = 'PakistanLawSite' AND s.status = 'quarantined' AND s.extracted_citation IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM judgment j WHERE j.canonical_citation = s.extracted_citation)

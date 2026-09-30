@@ -83,6 +83,20 @@ def test_full_lap_without_staging_marks_saturated_and_new_staging_clears():
     assert "saturated_at" not in cur
 
 
+def test_grid_growth_clears_saturation():
+    cur = {}
+    lap_update(cur, total_rows=100, window=_window(rows=100, known=100), now=NOW)
+    assert cur["saturated_at"] and cur["saturated_total_rows"] == 100
+    lap_update(cur, total_rows=104, window=_window(rows=4, known=4), now=NOW)  # the site listed 4 more rows
+    assert "saturated_at" not in cur
+
+
+def test_unknown_grid_size_never_saturates():
+    cur = {}
+    lap_update(cur, total_rows=0, window=_window(rows=400, known=400), now=NOW)  # size fell back to one window
+    assert "saturated_at" not in cur
+
+
 def test_lap_with_staging_is_not_saturated():
     cur = {}
     lap_update(cur, total_rows=50, window=_window(rows=50, staged=2), now=NOW)
@@ -182,6 +196,32 @@ async def test_evaluate_pls_stall_alarms_once_and_recovers(db):
     assert alarms[0].acknowledged is True
 
 
+# ------------------------------------------------------------------ quarantine refetch and citation order
+@pytest.mark.parametrize(
+    "reason,length,route,expected",
+    [
+        ("citation 2021 CLC 5 already belongs to judgment 2020 SCMR 1", 800, {}, False),
+        ("confidence 0.8 below threshold 0.85", 20000, {}, True),
+        ("headnote_only", 20000, None, True),
+        ("login_stub", 100, {"refetch_count": 3}, False),
+        (None, 900, {}, True),
+        (None, 20000, {}, False),
+    ],
+)
+def test_quarantined_capture_retryable(reason, length, route, expected):
+    from scraper.tasks.pakistanlawsite import quarantined_capture_retryable
+
+    assert quarantined_capture_retryable(reason, length, route) is expected
+
+
+def test_grid_row_citation_leads_even_when_a_cited_case_comes_first():
+    from scraper.extractors.deterministic import extract_judgment_deterministic
+
+    text = "Muhammad Akram v. The State 1984 CLC 2384 rel.\n2021 CLC 1001\nLAHORE HIGH COURT\nJUDGMENT\nThe facts are these."
+    out = extract_judgment_deterministic(html=None, text=text, source_meta={"citation": "2021 CLC 1001"})
+    assert out["citations"][0] == "2021 CLC 1001"
+
+
 # ------------------------------------------------------------------ mirror
 async def _mk_judgments(db, n):
     js = []
@@ -218,6 +258,22 @@ async def test_mirror_backlog_pass_reaches_old_judgments(db, tmp_path, monkeypat
     assert done == {j.id for j in js}
     lag = await ArchiveMirror(db).lag((await db.execute(select(ArchiveTarget))).scalars().first())
     assert lag["judgments_unmirrored"] == 0
+
+
+async def test_mirror_backlog_skips_rows_the_target_may_not_hold(db, tmp_path, monkeypatch):
+    from scraper.config import settings
+    from scraper.storage.archive import ArchiveMirror
+
+    monkeypatch.setattr(settings, "MIRROR_LOGIN_SESSION_ROWS", False)
+    js = await _mk_judgments(db, 6)
+    for j in js[:4]:  # the oldest four are login-session rows this target never receives
+        j.access_method = "login_session"
+    t = ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a"))
+    db.add(t)
+    await db.commit()
+    backlog = await ArchiveMirror(db).backlog_judgments(t, 2)
+    assert [j.id for j in backlog] == [js[4].id, js[5].id]
+    assert (await ArchiveMirror(db).lag(t))["judgments_total"] == 2
 
 
 async def test_mirror_run_skips_while_another_run_holds_the_lock(db, tmp_path):

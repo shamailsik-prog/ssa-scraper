@@ -144,6 +144,10 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
         if hn and hn not in own:
             own.insert(0, hn)
             evidence.setdefault("citations", f"result row: {hint}")
+        elif hn and own[0] != hn:
+            # the result row names this judgment's own citation: it leads even when a cited case came first
+            own.remove(hn)
+            own.insert(0, hn)
     cited = [c for c in dict.fromkeys(cited) if c not in own]
     bench = parse_bench(raw_text)
     if bench.evidence:

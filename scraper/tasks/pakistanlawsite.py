@@ -85,6 +85,9 @@ for _reporter in KNOWN_REPORTERS:
 
 
 QUARANTINE_REFETCH_MAX = 3
+PLS_STUB_PAGE_MAX_CHARS = 3000  # a capture shorter than this is an error, stub or empty page
+# quarantined on the merits (a real citation conflict or a human decision): never fetched again
+_FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|reviewed|rejected")
 _RETRYABLE_QUARANTINE = re.compile(
     r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|court unknown|no citation supported|"
     r"not in court directory|confidence [0-9.]+ below threshold|promotion error|full_text hash changed"
@@ -98,9 +101,12 @@ def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int]
     route = route_json if isinstance(route_json, dict) else {}
     if int(route.get("refetch_count") or 0) >= QUARANTINE_REFETCH_MAX:
         return False
-    if (text_len or 0) < 3000:
+    if _FINAL_QUARANTINE.search(reason or ""):
+        return False
+    if _RETRYABLE_QUARANTINE.search(reason or ""):
         return True
-    return bool(_RETRYABLE_QUARANTINE.search(reason or ""))
+    # no recognised reason: a short capture is an error/empty page, a long one was judged on its merits
+    return (text_len or 0) < PLS_STUB_PAGE_MAX_CHARS
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -708,6 +714,8 @@ class PakistanLawSitePipeline:
                 total_rows = int(cursor.get("last_total_rows"))
             except Exception:
                 total_rows = None
+        # A lap is judged against the grid's real size only; a one-window fallback must never read as a full lap.
+        total_rows_known = total_rows is not None and total_rows > 0 and total_rows_meta is not None
         if total_rows is None or total_rows <= 0:
             total_rows = row_count
         if row_offset >= total_rows:
@@ -774,6 +782,8 @@ class PakistanLawSitePipeline:
         known_citations: set[str] = set()
         full_ready_citations: set[str] = set()
         staged_citations: set[str] = set()
+        # citation -> quarantined staging rows that are bad pages worth fetching again (bounded by refetch_count)
+        refetch_staging_ids: Dict[str, List[Any]] = {}
         if lookup_keys:
             existing_judgments = (
                 await self.db.execute(
@@ -804,14 +814,16 @@ class PakistanLawSitePipeline:
                     full_ready_citations.add(key)
             if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
                 # Pages already preserved and staged (waiting for promotion, promoted, duplicate or
-                # quarantined for review) are not downloaded again when the cursor wraps.
+                # quarantined on the merits) are not downloaded again when the cursor wraps. A quarantined
+                # bad page (quarantined_capture_retryable) is fetched again, at most QUARANTINE_REFETCH_MAX times.
                 staged_rows = (
                     await self.db.execute(
                         select(
+                            ScraperStaging.id,
                             ScraperStaging.extracted_citation,
                             ScraperStaging.status,
                             ScraperStaging.quarantine_reason,
-                            func.length(ScraperStaging.raw_text),
+                            func.octet_length(ScraperStaging.raw_text),
                             ScraperStaging.route_json,
                         ).where(
                             ScraperStaging.source_name == SOURCE_NAME,
@@ -820,16 +832,18 @@ class PakistanLawSitePipeline:
                         )
                     )
                 ).all()
-                retryable: set[str] = set()
-                for citation_string, st_status, st_reason, st_len, st_route in staged_rows:
+                for st_id, citation_string, st_status, st_reason, st_len, st_route in staged_rows:
                     if not citation_string:
                         continue
                     if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route):
-                        retryable.add(str(citation_string))
+                        refetch_staging_ids.setdefault(str(citation_string), []).append(st_id)
                         continue
                     staged_citations.add(str(citation_string))
                 # a citation with any non-retryable staging row stays skipped; otherwise it is fetched again
-                self.stats["quarantine_refetch_rows"] = self.stats.get("quarantine_refetch_rows", 0) + len(retryable - staged_citations)
+                for cit in list(refetch_staging_ids):
+                    if cit in staged_citations:
+                        del refetch_staging_ids[cit]
+                self.stats["quarantine_refetch_rows"] = self.stats.get("quarantine_refetch_rows", 0) + len(refetch_staging_ids)
         logger.info(
             "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s staged=%s seek_mode=%s",
             start_offset,
@@ -1022,6 +1036,16 @@ class PakistanLawSitePipeline:
                 "absolute_row_index": snapshot_start_row + row_idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
+            refetch_ids = refetch_staging_ids.get(citation_norm) or refetch_staging_ids.get(citation_key) or []
+            if refetch_ids:
+                # Count the attempt before fetching, whatever comes back: a page whose bytes change on every
+                # fetch creates a new staging row each time and would otherwise be refetched on every lap.
+                # ORM objects (not a bulk UPDATE) so the identity map that stage_judgment reuses stays current.
+                for old_st in (await self.db.execute(select(ScraperStaging).where(ScraperStaging.id.in_(refetch_ids)))).scalars():
+                    old_route = dict(old_st.route_json or {})
+                    old_route["refetch_count"] = int(old_route.get("refetch_count") or 0) + 1
+                    old_st.route_json = old_route
+                await self.db.flush()
             detail = await self.fetch_detail(detail_url)
             detail_attempts += 1
             result_kind = await self.preserve_and_extract(detail, route, row)
@@ -1070,7 +1094,7 @@ class PakistanLawSitePipeline:
         # shard that has nothing left to give). Any newly staged row clears the mark.
         lap_update(
             cursor,
-            total_rows=total_rows,
+            total_rows=total_rows if total_rows_known else 0,
             window={
                 "rows": processed_rows_total,
                 "in_shard": max(0, processed_rows_total - other_shard_rows),
@@ -1202,9 +1226,6 @@ class PakistanLawSitePipeline:
             if route not in routes:
                 routes.append(route)
                 staging.route_json = {**(staging.route_json or {}), "routes": routes}
-            if staging.status == "quarantined":
-                # the same bad page came back: count it so the grid stops asking after QUARANTINE_REFETCH_MAX
-                staging.route_json = {**(staging.route_json or {}), "refetch_count": int((staging.route_json or {}).get("refetch_count") or 0) + 1}
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
