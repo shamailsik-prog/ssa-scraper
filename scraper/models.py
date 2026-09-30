@@ -24,6 +24,7 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from pgvector.sqlalchemy import Vector
+from sqlalchemy import event
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -800,6 +801,18 @@ class PlsSearchHarvestQuery(Base):
     last_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
+
+RETIRED_WITHOUT_REASON = "retired without a recorded reason (guard)"
+
+
+@event.listens_for(CrawlFrontier, "before_insert")
+@event.listens_for(CrawlFrontier, "before_update")
+def _frontier_retired_needs_reason(mapper, connection, fr) -> None:
+    """A retired frontier row must always say why. 2,445 rows were once retired with an empty last_error, which
+    made them impossible to tell from a legitimate retirement (and impossible to reset safely). Any ORM path
+    that retires a row without a reason now records that fact instead of leaving the field empty."""
+    if fr.status == "retired" and not (fr.last_error or "").strip():
+        fr.last_error = RETIRED_WITHOUT_REASON
 
 
 class CrawlCoverage(Base):

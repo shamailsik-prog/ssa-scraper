@@ -79,6 +79,22 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
     return cfg
 
 
+RETRY_DELAYS = (1.0, 3.0)
+
+
+async def _retry(fn, *args):
+    """Run an adapter call, retrying transient failures ('The read operation timed out' from Drive)."""
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            return await fn(*args)
+        except ObjectExists:
+            raise
+        except Exception:
+            if delay is None:
+                raise
+            await asyncio.sleep(delay)
+
+
 class ArchiveMirror:
     def __init__(self, db: AsyncSession, *, adapter_factory=build_adapter):
         self.db = db
@@ -103,7 +119,7 @@ class ArchiveMirror:
         if original:
             objs.append({"key": f"{prefix}/original.pdf", "data": original, "kind": "original_pdf", "content_type": "application/pdf"})
         else:
-            meta = {"court": j.court_name, "title": j.case_title, "citation": j.canonical_citation, "source_name": j.source_name, "source_url": j.source_url, "content_hash": j.full_text_hash, "rendered_at": datetime.now(timezone.utc).isoformat(), "access_method": j.access_method}
+            meta = {"court": j.court_name, "title": j.case_title, "citation": j.canonical_citation, "source_name": j.source_name, "source_url": j.source_url, "content_hash": j.full_text_hash, "rendered_at": (j.promoted_at or j.created_at or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat(), "access_method": j.access_method}
             objs.append({"key": f"{prefix}/rendered_copy.pdf", "data": render_judgment_pdf_bytes(meta, j.full_text or ""), "kind": "rendered_copy", "content_type": "application/pdf"})
         objs.append({"key": f"{prefix}/judgment.txt", "data": (j.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"})
         metadata = {
@@ -131,20 +147,32 @@ class ArchiveMirror:
         key = obj["key"]
         data: bytes = obj["data"]
         h = hashlib.sha256(data).hexdigest()
+        stored_size: Optional[int] = None
         ledger = (await self.db.execute(select(ArchiveObject).where(ArchiveObject.target_id == target.id, ArchiveObject.object_key == key))).scalars().first()
         if ledger is not None and ledger.status == "written":
+            if obj["kind"] == "rendered_copy":
+                # A rendered copy is derived from the preserved text and, before the render was made
+                # deterministic, embedded its render time: the same judgment hashed differently on every run
+                # and 7,000 healthy objects were flagged 'mismatch'. The key is the identity; reconcile
+                # verifies the stored size.
+                return "exists"
             if ledger.content_hash != h:
                 ledger.status = "mismatch"
                 ledger.error = "new content differs from the write-once object"
                 return "mismatch"
             return "exists"
         try:
-            exists = await asyncio.to_thread(adapter.exists, key)
+            exists = await _retry(asyncio.to_thread, adapter.exists, key)
             if exists:
-                size = await asyncio.to_thread(adapter.size, key)
-                status = "written" if size == len(data) else "mismatch"
+                size = await _retry(asyncio.to_thread, adapter.size, key)
+                if obj["kind"] == "rendered_copy" and size:
+                    # derived copy already stored: adopt the stored object, never compare it with a re-render
+                    stored_size = size
+                    status = "written"
+                else:
+                    status = "written" if size == len(data) else "mismatch"
             else:
-                await asyncio.to_thread(adapter.put, key, data, obj.get("content_type", "application/octet-stream"))
+                await _retry(asyncio.to_thread, adapter.put, key, data, obj.get("content_type", "application/octet-stream"))
                 status = "written"
         except ObjectExists:
             status = "written"
@@ -159,15 +187,15 @@ class ArchiveMirror:
             await self.db.flush()
             raise
         if ledger is None:
-            ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status=status, written_at=datetime.now(timezone.utc))
+            ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=stored_size or len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status=status, written_at=datetime.now(timezone.utc))
             self.db.add(ledger)
         else:
             ledger.status = status
             ledger.error = None
             ledger.written_at = datetime.now(timezone.utc)
             ledger.content_hash = h
-            ledger.byte_size = len(data)
-        if status == "written":
+            ledger.byte_size = stored_size or len(data)
+        if status == "written" and stored_size is None:
             target.objects_written += 1
             target.bytes_written += len(data)
         await self.db.flush()
@@ -178,15 +206,98 @@ class ArchiveMirror:
             return True
         return bool(settings.MIRROR_LOGIN_SESSION_ROWS and target.mirror_login_session_rows)
 
+    def _policy_clause(self, t: ArchiveTarget):
+        """SQL form of _policy_allows: login-session rows are excluded in the query itself, so ineligible rows can
+        never fill the LIMIT window and starve the eligible ones behind them."""
+        if settings.MIRROR_LOGIN_SESSION_ROWS and t.mirror_login_session_rows:
+            return None
+        return func.lower(func.coalesce(Judgment.access_method, "")) != "login_session"
+
+    async def backlog_judgments(self, t: ArchiveTarget, limit: int, *, exclude=frozenset()) -> List[Judgment]:
+        """Oldest judgments that lack a full set of objects on target `t`. A 'mismatch' object counts as
+        present (it needs a human or the reconcile, not a retry); 'failed' and 'missing' are retried."""
+        if limit <= 0:
+            return []
+        have = (
+            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
+            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
+            .group_by(ArchiveObject.judgment_id)
+            .subquery()
+        )
+        q = (
+            select(Judgment)
+            .outerjoin(have, have.c.jid == Judgment.id)
+            .where(func.coalesce(have.c.c, 0) < 3)
+            .order_by(Judgment.promoted_at.asc())
+            .limit(limit + len(exclude))
+        )
+        clause = self._policy_clause(t)
+        if clause is not None:
+            q = q.where(clause)
+        rows = (await self.db.execute(q)).scalars().all()
+        return [j for j in rows if j.id not in exclude and self._policy_allows(t, j.access_method)][:limit]
+
+    async def lag(self, t: ArchiveTarget) -> Dict[str, Any]:
+        """How far behind the corpus this target is."""
+        clause = self._policy_clause(t)
+        total_q = select(func.count()).select_from(Judgment)
+        if clause is not None:
+            total_q = total_q.where(clause)
+        total = int((await self.db.execute(total_q)).scalar() or 0)
+        have = (
+            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
+            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
+            .group_by(ArchiveObject.judgment_id)
+            .subquery()
+        )
+        un_q = select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < 3)
+        if clause is not None:
+            un_q = un_q.where(clause)
+        unmirrored = int((await self.db.execute(un_q)).scalar() or 0)
+        last_written = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
+        return {"judgments_total": total, "judgments_unmirrored": unmirrored, "last_written_at": last_written.isoformat() if last_written else None}
+
+    async def alert_on_lag(self) -> List[str]:
+        """ARCHIVE_MIRROR_LAG once per target while it has unmirrored judgments and has written nothing for
+        MIRROR_LAG_ALERT_HOURS; acknowledged again when writes resume or the target catches up."""
+        from datetime import timedelta
+
+        from scraper.models import Notification
+
+        raised: List[str] = []
+        now = datetime.now(timezone.utc)
+        for t in await self.targets():
+            lag = await self.lag(t)
+            last = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
+            stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
+            problem = lag["judgments_unmirrored"] > 0 and stale
+            code_msg = f"ARCHIVE_MIRROR_LAG:{t.name}"
+            open_alert = (
+                await self.db.execute(select(Notification).where(Notification.code == "ARCHIVE_MIRROR_LAG", Notification.source_name == t.name, Notification.acknowledged.is_(False)).limit(1))
+            ).scalars().first()
+            if problem and open_alert is None:
+                await notify(self.db, level="warning", code="ARCHIVE_MIRROR_LAG", source_name=t.name, message=f"{t.name}: {lag['judgments_unmirrored']} of {lag['judgments_total']} judgments not mirrored and nothing written since {lag['last_written_at']}", details=lag)
+                raised.append(code_msg)
+            elif not problem and open_alert is not None:
+                open_alert.acknowledged = True
+        await self.db.flush()
+        return raised
+
     # ------------------------------------------------------------------ mirror run
-    async def mirror_pending(self, limit: int = 200) -> Dict[str, Any]:
+    async def mirror_pending(self, limit: int = 200, *, backlog_limit: Optional[int] = None) -> Dict[str, Any]:
         targets = await self.targets()
         if not targets:
             return {"targets": 0, "note": "no archive targets configured"}
-        judgments = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
+        newest = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
         index_rows: List[List[str]] = []
         for t in targets:
-            summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0})
+            summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0, "backlog": 0})
+            # The newest `limit` judgments were the only ones ever considered, so once promotion moved on the
+            # older ones were never mirrored (13.8k of 19.7k on Drive). Every run now also takes the OLDEST
+            # judgments this target still lacks, so the backlog always shrinks.
+            backlog = await self.backlog_judgments(t, settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit, exclude={j.id for j in newest})
+            judgments = list(newest) + backlog
+            summary["backlog"] += len(backlog)
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
@@ -245,9 +356,14 @@ class ArchiveMirror:
 
     async def mirror_statutes(self, limit: int = 500) -> Dict[str, Any]:
         targets = await self.targets()
-        rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()).limit(limit))).all()
+        all_rows = (await self.db.execute(select(StatuteSectionVersion, StatuteSection, Statute).join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id).join(Statute, Statute.id == StatuteSection.statute_id).order_by(StatuteSectionVersion.created_at.desc()))).all()
         out: Dict[str, int] = {}
         for t in targets:
+            done = await self._written_keys(t, "Statutes/")
+            rows = [
+                r for r in all_rows
+                if f"Statutes/{slug(r[2].jurisdiction or 'Federal', 30)}/{slug(r[2].name)}/{slug(r[1].section_number, 40)}/v{r[0].version_no}.txt" not in done
+            ][:limit]
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
@@ -264,13 +380,22 @@ class ArchiveMirror:
             out[t.name] = n
         return out
 
+    async def _written_keys(self, t: ArchiveTarget, prefix: str) -> set:
+        rows = (await self.db.execute(select(ArchiveObject.object_key).where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.object_key.like(prefix + "%")))).scalars().all()
+        return set(rows)
+
     async def mirror_instruments(self, limit: int = 500) -> Dict[str, Any]:
         from scraper.models import Instrument
 
         targets = await self.targets()
-        rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()).limit(limit))).scalars().all()
+        all_rows = (await self.db.execute(select(Instrument).order_by(Instrument.created_at.desc()))).scalars().all()
         out: Dict[str, int] = {}
         for t in targets:
+            done = await self._written_keys(t, "Instruments/")
+            rows = [
+                i for i in all_rows
+                if f"Instruments/{i.date.year if i.date else 'undated'}/{slug(i.title or i.number or str(i.id), 100)}_{i.full_text_hash[:10] if i.full_text_hash else str(i.id)[:8]}.txt" not in done
+            ][:limit]
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:

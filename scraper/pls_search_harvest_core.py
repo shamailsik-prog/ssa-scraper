@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from scraper.config import KNOWN_REPORTERS
 from scraper.parsers.citation_extractor import normalise_citation
 
-_QUERY_KEY_ORDER = ("reporter", "year", "court", "category", "keyword", "statute", "section")
+_QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
 
 _ALPHA_KEYWORD_SPLITS = [chr(c) for c in range(ord("a"), ord("z") + 1)]
 
@@ -23,7 +23,7 @@ def normalize_query_json(query: Dict[str, Any]) -> Dict[str, Any]:
         text = str(value).strip()
         if not text:
             continue
-        if key == "year":
+        if key in ("year", "month", "page_from", "page_to"):
             out[key] = int(text)
         else:
             out[key] = text
@@ -104,6 +104,18 @@ def build_harvest_form_values(
             values[role] = str(query_json[role])
     if "keyword" in fields and query_json.get("keyword") and "keyword" not in values:
         values["keyword"] = str(query_json["keyword"])
+    if "year" in fields and query_json.get("year") and "year" not in values:
+        # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
+        values["year"] = str(query_json["year"])
+    for role in ("month", "bench", "party_initial", "citation"):
+        if role in fields and query_json.get(role) is not None:
+            values[role] = str(query_json[role])
+    # judge / party / citation text with no dedicated field is searched through the free-text keyword box
+    for role in ("judge", "party", "citation"):
+        if query_json.get(role) and role not in fields and "keyword" in fields and "keyword" not in values:
+            values["keyword"] = str(query_json[role])
+        elif query_json.get(role) and role in fields:
+            values[role] = str(query_json[role])
     if "page" in fields:
         page = cursor.get("page") or cursor.get("page_no") or 1
         values["page"] = str(page)
@@ -117,14 +129,25 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
     tier_cursor = dict(cursor)
     if "page" in cursor and "page_no" not in cursor:
         tier_cursor["page_no"] = cursor["page"]
-    reason = unmapped_query_reason(search_map, tier_query, tier_cursor)
-    if reason:
-        return reason
+    if any(k in tier_query for k in ("reporter", "statute", "keyword")):
+        reason = unmapped_query_reason(search_map, tier_query, tier_cursor)
+        if reason:
+            return reason
+    elif (search_map.get("surface") or (search_map.get("limits") or {}).get("surface")) == "grid_surface_no_query_form":
+        return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     fields = search_map.get("fields") or {}
     if query_json.get("court") and "court" not in fields:
         return "search map cannot express court filter; missing role: court"
     if query_json.get("category") and "category" not in fields:
         return "search map cannot express category filter; missing role: category"
+    if query_json.get("year") and "reporter" not in query_json and "year" not in fields:
+        return "search map cannot express year filter; missing role: year"
+    for role in ("month", "bench", "party_initial"):
+        if query_json.get(role) is not None and role not in fields:
+            return f"search map cannot express {role} filter; missing role: {role}"
+    for role in ("judge", "party", "citation"):
+        if query_json.get(role) and role not in fields and "keyword" not in fields:
+            return f"search map cannot express {role} query; missing roles: {role}, keyword"
     if not build_harvest_form_values(search_map, query_json, cursor):
         return "search map cannot express harvest query; no usable mapped fields"
     return None
@@ -176,6 +199,11 @@ def parse_total_results_from_html(html: str) -> Optional[int]:
     return None
 
 
+SPLIT_ORDER = ("month", "court", "bench", "party_initial", "keyword")
+_MONTHS = list(range(1, 13))
+_LEGACY_ROLES = frozenset({"court", "keyword"})
+
+
 def split_oversized_query(
     query_json: Dict[str, Any],
     site_total: int,
@@ -183,17 +211,95 @@ def split_oversized_query(
     result_cap: int,
     court_options: Sequence[str],
     keyword_splits: Optional[Sequence[str]] = None,
+    available_roles: Optional[Iterable[str]] = None,
+    bench_options: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
-    """When site_total exceeds the cap, return finer child queries (court, then keyword prefix)."""
-    if site_total <= result_cap:
+    """A result list that reaches the site's cap is NOT complete. Return narrower child queries, narrowing by the
+    first dimension of SPLIT_ORDER (month, court, bench, party first letter, keyword) that the parent has not
+    used yet and that the search form can express (`available_roles`; default is the legacy court/keyword pair).
+    Returns [] only when every expressible dimension is already used; the caller must then mark the job failed
+    (exhausted), never done."""
+    if site_total < result_cap:
         return []
+    roles = set(available_roles) if available_roles is not None else set(_LEGACY_ROLES)
     normalized = normalize_query_json(query_json)
-    if not normalized.get("court") and court_options:
-        return [normalize_query_json({**normalized, "court": court}) for court in court_options if court]
-    if not normalized.get("keyword"):
-        splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
-        return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
+    for dim in SPLIT_ORDER:
+        if dim in normalized or (dim == "month" and "month" not in roles):
+            continue
+        if dim == "month":
+            return [normalize_query_json({**normalized, "month": m}) for m in _MONTHS]
+        if dim == "court" and court_options:
+            return [normalize_query_json({**normalized, "court": c}) for c in court_options if c]
+        if dim == "bench" and "bench" in roles and bench_options:
+            return [normalize_query_json({**normalized, "bench": b}) for b in bench_options if b]
+        if dim == "party_initial" and "party_initial" in roles:
+            return [normalize_query_json({**normalized, "party_initial": ch}) for ch in _ALPHA_KEYWORD_SPLITS]
+        if dim == "keyword":
+            splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
+            return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
     return []
+
+
+def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
+    """True when a result list must be treated as truncated: the site total reaches the cap, or (no total shown)
+    the pages ended exactly at the cap."""
+    if site_total is not None:
+        return int(site_total) >= result_cap
+    return rows_seen >= result_cap
+
+
+def iter_extended_plan_queries(
+    *,
+    years: Sequence[int],
+    courts: Sequence[str] = (),
+    judges: Sequence[str] = (),
+    statutes: Sequence[Dict[str, Any]] = (),
+    keywords: Sequence[str] = (),
+    parties: Sequence[str] = (),
+) -> Iterable[Dict[str, Any]]:
+    """Phase-2 seed families beyond journal x year. Every value comes from data we hold (court directory, judge
+    table, statute table, caller keyword list); nothing is invented."""
+    for court in courts:
+        for year in years:
+            yield normalize_query_json({"court": court, "year": year})
+    for judge in judges:
+        for year in years:
+            yield normalize_query_json({"judge": judge, "year": year})
+    for st in statutes:
+        name = st.get("statute")
+        if not name:
+            continue
+        sections = st.get("sections") or [None]
+        for sec in sections:
+            yield normalize_query_json({"statute": name, "section": sec})
+    for kw in keywords:
+        for court in courts or [None]:
+            yield normalize_query_json({"keyword": kw, "court": court})
+    for word in parties:
+        for year in years:
+            yield normalize_query_json({"party": word, "year": year})
+
+
+def cited_citations_in_text(text: str) -> List[str]:
+    """Citations that appear verbatim in a judgment body (snowball candidates). Only strings the citation grammar
+    matches in the text are returned; none are constructed."""
+    from scraper.parsers.citation_extractor import extract_citations
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for hit in extract_citations(text or ""):
+        norm = hit.get("normalized")
+        if norm and norm not in seen and hit.get("page"):
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def page_continuity_gaps(pages: Sequence[int], *, max_step: int = 60) -> List[Tuple[int, int]]:
+    """Consecutive starting pages of one reporter-year that are further apart than `max_step` pages: a judgment
+    is rarely longer than that, so the jump marks a probable hole (returned as (from_page, to_page))."""
+    ordered = sorted({int(p) for p in pages if p is not None})
+    return [(a, b) for a, b in zip(ordered, ordered[1:]) if b - a > max_step]
 
 
 def gap_report_sort_key(entry: Dict[str, Any]) -> Tuple[int, int, str]:

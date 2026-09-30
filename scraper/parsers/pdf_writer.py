@@ -47,6 +47,7 @@ def _build(buffer_or_path, meta: Dict[str, object], cleaned_text: str) -> None:
         author="SIKANDER AI corpus service",
         subject=RENDERED_COPY_LABEL,
         creator="SIKANDER AI corpus service (reportlab)",
+        invariant=1,  # byte-stable output: no wall-clock CreationDate/ID, so the write-once ledger hash never drifts
     )
     styles = getSampleStyleSheet()
     m = {k: _xml_escape(str(meta.get(k, "") or "")) for k in ("court", "title", "citation", "source_name", "source_url", "content_hash", "rendered_at", "access_method")}

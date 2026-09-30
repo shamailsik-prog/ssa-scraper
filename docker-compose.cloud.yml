@@ -11,6 +11,12 @@
 # every keystroke typed into the streamed browser pass through this proxy, so TLS is not optional.
 
 services:
+  # Trust X-Forwarded-Proto/Host from Caddy (docker network) so the API builds https:// URLs,
+  # e.g. the Google Drive OAuth redirect_uri. Scoped to the api service only.
+  api:
+    environment:
+      FORWARDED_ALLOW_IPS: "*"
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped

@@ -22,6 +22,13 @@ from scraper.parsers.citation_extractor import extract_citations, normalise_cita
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
 MANDATORY_STATUTE_FIELDS = ("statute_name", "sections")
 MANDATORY_INSTRUMENT_FIELDS = ("type", "full_text")
+PLS_COURT_LABELS = {
+    "supreme court azad kashmir": "Azad Jammu and Kashmir Supreme Court",
+    "supreme court of azad kashmir": "Azad Jammu and Kashmir Supreme Court",
+    "high court azad kashmir": "High Court of Azad Jammu and Kashmir",
+    "high court of azad kashmir": "High Court of Azad Jammu and Kashmir",
+    "azad j k": "High Court of Azad Jammu and Kashmir",
+}
 JUDGE_NAME_CHROME_RE = re.compile(r"(?i)(obtaining\s+subscription|update\s+subscriber|^\s*read\s*$)")
 
 
@@ -58,6 +65,12 @@ def court_in_directory(court: Optional[str], directory: Dict[str, str]) -> Optio
     if not court:
         return None
     key = _norm_ws(court).replace(".", "")
+    if key in directory:
+        return directory[key]
+    # PLS labels courts with hyphenated upper-case slugs ("SUPREME-COURT-AZAD-KASHMIR")
+    key = re.sub(r"[\s\-]+", " ", key).strip()
+    if key in PLS_COURT_LABELS:
+        return directory.get(PLS_COURT_LABELS[key].lower()) or PLS_COURT_LABELS[key]
     if key in directory:
         return directory[key]
     for alias, canon in directory.items():

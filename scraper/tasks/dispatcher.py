@@ -29,6 +29,7 @@ from scraper.harvest_mode import (
 )
 from scraper.models import BrowserSessionSlot, ScraperJob, ScraperSource
 from scraper.notify import notify
+from scraper.pls_grid_health import dispatch_saturated
 
 logger = logging.getLogger(__name__)
 RUNNING_JOB_STALE_AFTER = timedelta(hours=3)
@@ -133,9 +134,12 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
             )
         ).scalars().all()
         for job in rows:
-            job.status = "failed"
+            # A restart is not a defect of the job: its cursor is committed per row and the next job resumes
+            # at the same row. Recorded as 'interrupted' so restarts do not inflate the failed-jobs count
+            # (12 "failed" jobs in 48h were all this).
+            job.status = "interrupted"
             job.finished_at = now
-            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); retired at worker start."
+            job.error_message = f"{reason}: this job's process is gone (recorded running since {_running_started_at(job)}); interrupted at worker start, resumes from its committed cursor."
             logger.warning("Retired orphaned login-session job source=%s job_id=%s", job.source_name, job.id)
         await db.commit()
         source_names = (
@@ -270,6 +274,10 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 logger.warning("%s job failed: %s", source_name, zero_fail)
             else:
                 job.status = "done"
+                if not (isinstance(stats, dict) and (stats.get("skipped") or stats.get("paused") or stats.get("halted") or stats.get("stop_reason"))):
+                    # a clean run supersedes the last recorded error (a stale "login surface URL" message
+                    # stayed on the PLS source for days after the slot had recovered)
+                    source.last_error = None
         except SessionLockHeld:
             job.status = "done"
             job.error_message = None
@@ -327,6 +335,7 @@ async def dispatch_due_sources() -> Dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     queued = []
+    skipped_saturated: list[str] = []
     mode = settings.HARVEST_MODE
     auto_switched = False
     async with SessionLocal() as db:
@@ -393,6 +402,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     for shard in (0, 1):
                         if shard in running_shards or (shard + 1) not in active_slots:
                             continue
+                        if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
+                            logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
+                            skipped_saturated.append(f"{s.source_name}:shard{shard}")
+                            continue
                         app.send_task(
                             "scraper.tasks.dispatcher.run_login_session_job",
                             args=(s.source_name,),
@@ -402,11 +415,18 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         queued.append(f"{s.source_name}:shard{shard}")
                         sent = True
                     if not sent:
+                        if skipped_saturated:
+                            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
                         continue
                 elif running_jobs:
                     # One slot left and a shard already runs on it.
                     continue
                 else:
+                    if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), None, now=now):
+                        logger.info("skip enqueue %s: the unsharded grid walk is saturated; recheck later", s.source_name)
+                        skipped_saturated.append(s.source_name)
+                        s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                        continue
                     if concurrency >= 2:
                         logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
                     app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
@@ -416,7 +436,7 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 queued.append(s.source_name)
             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
         await db.commit()
-    return {"mode": mode, "auto_switched": auto_switched, "queued": queued}
+    return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}
 
 
 @shared_task(name="scraper.tasks.dispatcher.dispatch_due_sources")
