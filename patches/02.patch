@@ -1,0 +1,360 @@
+diff --git a/scraper/tasks/embeddings.py b/scraper/tasks/embeddings.py
+index 27f595c..08c8434 100644
+--- a/scraper/tasks/embeddings.py
++++ b/scraper/tasks/embeddings.py
+@@ -58,0 +59 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
++        await _alert_if_queue_stalled()
+@@ -111,0 +113,27 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
++async def _alert_if_queue_stalled() -> None:
++    """One open EMBED_QUEUE_STALLED notification while pending rows sit undrained past EMBED_QUEUE_ALERT_HOURS."""
++    from scraper.models import Notification
++    from scraper.notify import notify
++    from scraper.tasks.embedding_health import embedding_health
++
++    async with SessionLocal() as db:
++        health = await embedding_health(db)
++        open_alert = (
++            await db.execute(select(Notification).where(Notification.code == "EMBED_QUEUE_STALLED", Notification.acknowledged.is_(False)).limit(1))
++        ).scalars().first()
++        if health["stalled"] and open_alert is None:
++            await notify(
++                db,
++                level="warning",
++                code="EMBED_QUEUE_STALLED",
++                message=(
++                    f"{health['pending']} embeddings pending, oldest {health['oldest_pending_age_hours']} h, none embedded recently. "
++                    f"Blocked by: {'; '.join(health['blockers']) or 'unknown'}"
++                ),
++                details=health,
++            )
++        elif not health["stalled"] and open_alert is not None:
++            open_alert.acknowledged = True
++        await db.commit()
++
++
+diff --git a/scraper/tasks/pakistanlawsite.py b/scraper/tasks/pakistanlawsite.py
+index e993a59..113f2c2 100644
+--- a/scraper/tasks/pakistanlawsite.py
++++ b/scraper/tasks/pakistanlawsite.py
+@@ -27 +27 @@ from typing import Any, Callable, Dict, List, Optional
+-from sqlalchemy import select, update
++from sqlalchemy import func, select, update
+@@ -62,0 +63 @@ from scraper.notify import notify
++from scraper.pls_grid_health import lap_update
+@@ -85,0 +87,19 @@ for _reporter in KNOWN_REPORTERS:
++QUARANTINE_REFETCH_MAX = 3
++_RETRYABLE_QUARANTINE = re.compile(
++    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|court unknown|no citation supported|"
++    r"not in court directory|confidence [0-9.]+ below threshold|promotion error|full_text hash changed"
++)
++
++
++def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any) -> bool:
++    """A quarantined capture that is a bad PAGE (error page, chrome, headnote-only, stub) is fetched again
++    at most QUARANTINE_REFETCH_MAX times; a capture quarantined on the merits (a real citation conflict
++    or a human decision) is final. Without this every quarantined row was skipped for ever as 'staged'."""
++    route = route_json if isinstance(route_json, dict) else {}
++    if int(route.get("refetch_count") or 0) >= QUARANTINE_REFETCH_MAX:
++        return False
++    if (text_len or 0) < 3000:
++        return True
++    return bool(_RETRYABLE_QUARANTINE.search(reason or ""))
++
++
+@@ -739,0 +760 @@ class PakistanLawSitePipeline:
++        skip_flush_every = max(1, int(getattr(settings, "PLS_CITATION_GRID_SKIP_FLUSH_EVERY", 50) or 50))
+@@ -742,0 +764 @@ class PakistanLawSitePipeline:
++        was_saturated = bool(cursor.get("saturated_at"))
+@@ -767,0 +790,3 @@ class PakistanLawSitePipeline:
++            # Only a citation that is its judgment's OWN (is_primary) marks a grid row known. Alternate
++            # citation rows were harvested from headnotes ("X v. Y 1984 CLC 2384 rel.") and belong to
++            # other cases: treating them as known hid ~120 real grid rows from the walk for good.
+@@ -772 +797 @@ class PakistanLawSitePipeline:
+-                    .where(Citation.citation_string.in_(list(lookup_keys)))
++                    .where(Citation.citation_string.in_(list(lookup_keys)), Citation.is_primary.is_(True))
+@@ -785 +810,7 @@ class PakistanLawSitePipeline:
+-                        select(ScraperStaging.extracted_citation).where(
++                        select(
++                            ScraperStaging.extracted_citation,
++                            ScraperStaging.status,
++                            ScraperStaging.quarantine_reason,
++                            func.length(ScraperStaging.raw_text),
++                            ScraperStaging.route_json,
++                        ).where(
+@@ -792,3 +823,10 @@ class PakistanLawSitePipeline:
+-                for (citation_string,) in staged_rows:
+-                    if citation_string:
+-                        staged_citations.add(str(citation_string))
++                retryable: set[str] = set()
++                for citation_string, st_status, st_reason, st_len, st_route in staged_rows:
++                    if not citation_string:
++                        continue
++                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route):
++                        retryable.add(str(citation_string))
++                        continue
++                    staged_citations.add(str(citation_string))
++                # a citation with any non-retryable staging row stays skipped; otherwise it is fetched again
++                self.stats["quarantine_refetch_rows"] = self.stats.get("quarantine_refetch_rows", 0) + len(retryable - staged_citations)
+@@ -815,0 +854 @@ class PakistanLawSitePipeline:
++        other_shard_rows = 0
+@@ -883 +922,2 @@ class PakistanLawSitePipeline:
+-                    if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
++                    other_shard_rows += 1
++                    if (idx + 1) % skip_flush_every == 0 or (idx + 1) == len(selected_indexes):
+@@ -911 +951 @@ class PakistanLawSitePipeline:
+-                if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
++                if (idx + 1) % skip_flush_every == 0 or (idx + 1) == len(selected_indexes):
+@@ -1026,7 +1066,26 @@ class PakistanLawSitePipeline:
+-        if last_committed_offset != next_offset:
+-            await flush_citation_grid_progress(
+-                next_offset,
+-                staged_this_flush=0,
+-                details_this_flush=0,
+-                processed_rows=processed_rows_total,
+-            )
++        # Lap ledger: one full lap of the grid that stages nothing new marks this cursor saturated, and the
++        # scheduler leaves it alone until PLS_SATURATED_RECHECK_HOURS have passed (no more re-walking a
++        # shard that has nothing left to give). Any newly staged row clears the mark.
++        lap_update(
++            cursor,
++            total_rows=total_rows,
++            window={
++                "rows": processed_rows_total,
++                "in_shard": max(0, processed_rows_total - other_shard_rows),
++                "fetched": detail_attempts,
++                "staged": self.stats["staged"] - staged_before,
++                "known": known_citation_skips,
++                "staged_skips": staged_citation_skips,
++                "url_less": url_less_skips,
++            },
++            now=datetime.now(timezone.utc),
++        )
++        if cursor.get("saturated_at") and not was_saturated:
++            logger.warning("PakistanLawSite citation-grid %s SATURATED: %s", cursor_key, cursor.get("saturated_reason"))
++            self.stats["citation_grid_saturated"] = cursor.get("saturated_reason")
++        await flush_citation_grid_progress(
++            next_offset,
++            staged_this_flush=0,
++            details_this_flush=0,
++            processed_rows=processed_rows_total,
++        )
+@@ -1143,0 +1203,3 @@ class PakistanLawSitePipeline:
++            if staging.status == "quarantined":
++                # the same bad page came back: count it so the grid stops asking after QUARANTINE_REFETCH_MAX
++                staging.route_json = {**(staging.route_json or {}), "refetch_count": int((staging.route_json or {}).get("refetch_count") or 0) + 1}
+@@ -1177,0 +1240,3 @@ class PakistanLawSitePipeline:
++        row_cit = normalise_citation(str(row.get("citation") or "")) if row.get("citation") else ""
++        if row_cit and row_cit in (reconciled.get("citations") or []):
++            staging.extracted_citation = row_cit
+diff --git a/scraper/tasks/pls_admin.py b/scraper/tasks/pls_admin.py
+index ae4619f..2ea21d5 100644
+--- a/scraper/tasks/pls_admin.py
++++ b/scraper/tasks/pls_admin.py
+@@ -23,0 +24,8 @@ def main(argv: list[str] | None = None) -> int:
++    ext = sub.add_parser("search-harvest-plan-extended", help="Seed court/judge/statute/keyword/party x year queries")
++    ext.add_argument("--dry-run", action="store_true")
++    ext.add_argument("--keyword", action="append", default=[])
++    ext.add_argument("--party", action="append", default=[])
++    snow = sub.add_parser("search-harvest-snowball", help="Queue citations found inside downloaded judgments that are not yet in the corpus")
++    snow.add_argument("--dry-run", action="store_true")
++    snow.add_argument("--limit", type=int, default=2000)
++    sub.add_parser("search-harvest-completeness", help="Completeness proof: queue state, capped jobs, page-continuity holes, known-citation test")
+@@ -28,0 +37,8 @@ def main(argv: list[str] | None = None) -> int:
++    sub.add_parser("reset-retired-frontier-no-reason", help="Reset never-run frontier rows that were retired with no last_error").add_argument("--dry-run", action="store_true")
++    meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
++    meta.add_argument("--dry-run", action="store_true")
++    meta.add_argument("--limit", type=int, default=None)
++    req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
++    req.add_argument("--dry-run", action="store_true")
++    req.add_argument("--limit", type=int, default=2000)
++    sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
+@@ -29,0 +46,41 @@ def main(argv: list[str] | None = None) -> int:
++    if args.command == "reset-retired-frontier-no-reason":
++        from scraper.database import SessionLocal
++        from scraper.tasks.pls_self_healing import reset_retired_pls_frontier_without_reason_db
++
++        async def go():
++            async with SessionLocal() as db:
++                n = await reset_retired_pls_frontier_without_reason_db(db, dry_run=args.dry_run)
++                if not args.dry_run:
++                    await db.commit()
++                return n
++
++        print({"would_reset" if args.dry_run else "reset": run_async(go())})
++        return 0
++    if args.command == "backfill-metadata":
++        from scraper.tasks.pls_backfill import run_backfill_metadata
++
++        print(run_async(run_backfill_metadata(dry_run=args.dry_run, limit=args.limit)))
++        return 0
++    if args.command == "requalify-quarantine":
++        from scraper.tasks.pls_backfill import run_requalify
++
++        print(run_async(run_requalify(dry_run=args.dry_run, limit=args.limit)))
++        return 0
++    if args.command == "grid-report":
++        import json
++
++        from sqlalchemy import select as sa_select
++
++        from scraper.database import SessionLocal
++        from scraper.models import ScraperSource
++        from scraper.pls_accounting import grid_accounting
++
++        async def report():
++            async with SessionLocal() as db:
++                src = (await db.execute(sa_select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
++                cfg = (src.config_json or {}) if src else {}
++                total = max([int((cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])
++                return await grid_accounting(db, total_rows=total)
++
++        print(json.dumps(run_async(report()), indent=2))
++        return 0
+@@ -56,0 +114,12 @@ def main(argv: list[str] | None = None) -> int:
++    if args.command == "search-harvest-plan-extended":
++        from scraper.tasks.pls_search_harvest import cli_extended_plan
++
++        return cli_extended_plan((["--dry-run"] if args.dry_run else []) + [x for k in args.keyword for x in ("--keyword", k)] + [x for p_ in args.party for x in ("--party", p_)])
++    if args.command == "search-harvest-snowball":
++        from scraper.tasks.pls_search_harvest import cli_snowball
++
++        return cli_snowball((["--dry-run"] if args.dry_run else []) + ["--limit", str(args.limit)])
++    if args.command == "search-harvest-completeness":
++        from scraper.tasks.pls_search_harvest import cli_completeness
++
++        return cli_completeness([])
+diff --git a/scraper/tasks/pls_backfill.py b/scraper/tasks/pls_backfill.py
+new file mode 100644
+index 0000000..3c742e8
+--- /dev/null
++++ b/scraper/tasks/pls_backfill.py
+@@ -0,0 +1,129 @@
++"""Idempotent PakistanLawSite backfills: case metadata for existing judgments, and re-evaluation of quarantined
++captures with the corrected extractor. Both only ever ADD information; neither deletes rows or touches raw text."""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Dict, Optional
++
++from sqlalchemy import or_, select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from scraper.database import SessionLocal
++from scraper.extractors import deterministic as det
++from scraper.extractors.hybrid_extractor import load_court_directory
++from scraper.extractors.validation import reconcile_judgment
++from scraper.models import Judgment, ScraperStaging
++from scraper.parsers.case_metadata import parse_case_metadata
++
++logger = logging.getLogger(__name__)
++
++SOURCE_NAME = "PakistanLawSite"
++
++
++async def backfill_case_metadata(db: AsyncSession, *, batch: int = 500, limit: Optional[int] = None, dry_run: bool = False) -> Dict[str, int]:
++    """Fill docket_number / petitioner / respondent / headnotes from the preserved full text, only where the column is
++    still empty (never overwrites a value). Keyset-paged by id so it is safe to re-run and to interrupt."""
++    counts = {"scanned": 0, "updated": 0, "docket_number": 0, "petitioner": 0, "respondent": 0, "headnotes": 0}
++    last_id = None
++    while True:
++        q = (
++            select(Judgment)
++            .where(
++                Judgment.source_name == SOURCE_NAME,
++                or_(Judgment.docket_number.is_(None), Judgment.petitioner.is_(None), Judgment.respondent.is_(None), Judgment.headnotes.is_(None)),
++            )
++            .order_by(Judgment.id)
++            .limit(batch)
++        )
++        if last_id is not None:
++            q = q.where(Judgment.id > last_id)
++        rows = (await db.execute(q)).scalars().all()
++        if not rows:
++            break
++        for j in rows:
++            last_id = j.id
++            counts["scanned"] += 1
++            meta = parse_case_metadata(j.full_text or "")
++            changed = False
++            for col in ("docket_number", "petitioner", "respondent", "headnotes"):
++                value = getattr(meta, col)
++                if value and not getattr(j, col):
++                    if not dry_run:
++                        setattr(j, col, value)
++                    counts[col] += 1
++                    changed = True
++            counts["updated"] += int(changed)
++            if limit and counts["scanned"] >= limit:
++                break
++        if not dry_run:
++            await db.commit()
++        if limit and counts["scanned"] >= limit:
++            break
++    return counts
++
++
++async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
++    """Re-run the (deterministic, no-AI) extraction + validation on quarantined PLS captures whose citation is still not
++    a judgment. Rows that now validate are re-promoted; rows that still fail stay quarantined with their new reason
++    (bad pages are re-fetched by the grid walk instead, see quarantined_capture_retryable)."""
++    from scraper.tasks.promotion import promote_judgment_staging
++
++    directory = await load_court_directory(db)
++    counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}}
++    rows = (
++        await db.execute(
++            select(ScraperStaging)
++            .where(ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.status == "quarantined", ScraperStaging.promoted_to_id.is_(None))
++            .order_by(ScraperStaging.created_at)
++            .limit(limit)
++        )
++    ).scalars().all()
++    for st in rows:
++        counts["scanned"] += 1
++        text = st.raw_text or ""
++        meta = {"citation": st.extracted_citation, "title": st.extracted_title, "court": st.extracted_court, "url": st.source_url}
++        dj = det.extract_judgment_deterministic(html=None, text=text, source_meta=meta)
++        out = reconcile_judgment(deterministic=dj, ai=None, raw_text=text, court_directory=directory, min_confidence=0.85)
++        if out.quarantine:
++            counts["still_quarantined"] += 1
++            key = (out.quarantine_reason or "")[:40]
++            counts["still_by_reason"][key] = counts["still_by_reason"].get(key, 0) + 1
++            continue
++        if dry_run:
++            counts["promoted"] += 1
++            continue
++        reconciled = dict(out.data or {})
++        reconciled["document_type"] = (st.reconciled_json or {}).get("document_type") or reconciled.get("document_type")
++        st.reconciled_json = reconciled
++        st.confidence_score = out.confidence
++        st.validation_errors = out.errors
++        st.extracted_citation = (reconciled.get("citations") or [st.extracted_citation])[0]
++        st.status = "extracted"
++        st.quarantine_reason = None
++        await db.flush()
++        try:
++            result = await promote_judgment_staging(db, st)
++            await db.commit()
++        except Exception:
++            await db.rollback()
++            logger.exception("requalify: promotion failed for %s", st.id)
++            counts["still_quarantined"] += 1
++            continue
++        if result == "promoted":
++            counts["promoted"] += 1
++        elif result == "duplicate":
++            counts["duplicate"] += 1
++        else:
++            counts["still_quarantined"] += 1
++    return counts
++
++
++async def run_backfill_metadata(**kw) -> Dict[str, int]:
++    async with SessionLocal() as db:
++        return await backfill_case_metadata(db, **kw)
++
++
++async def run_requalify(**kw) -> Dict[str, Any]:
++    async with SessionLocal() as db:
++        return await requalify_quarantined(db, **kw)
