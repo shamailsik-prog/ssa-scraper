@@ -56,6 +56,7 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
         return counts
     if not settings.OPENAI_API_KEY:
         logger.info("OPENAI_API_KEY NOT CONFIGURED; embeddings idle")
+        await _alert_if_queue_stalled()
         return counts
     limit = limit or settings.EMBEDDING_BATCH_SIZE
     async with SessionLocal() as db:
@@ -107,6 +108,33 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
             await db.commit()
             await asyncio.sleep(max(0.0, 60.0 / max(1, settings.EMBEDDING_RPM_LIMIT)))
     return counts
+
+
+async def _alert_if_queue_stalled() -> None:
+    """One open EMBED_QUEUE_STALLED notification while pending rows sit undrained past EMBED_QUEUE_ALERT_HOURS."""
+    from scraper.models import Notification
+    from scraper.notify import notify
+    from scraper.tasks.embedding_health import embedding_health
+
+    async with SessionLocal() as db:
+        health = await embedding_health(db)
+        open_alert = (
+            await db.execute(select(Notification).where(Notification.code == "EMBED_QUEUE_STALLED", Notification.acknowledged.is_(False)).limit(1))
+        ).scalars().first()
+        if health["stalled"] and open_alert is None:
+            await notify(
+                db,
+                level="warning",
+                code="EMBED_QUEUE_STALLED",
+                message=(
+                    f"{health['pending']} embeddings pending, oldest {health['oldest_pending_age_hours']} h, none embedded recently. "
+                    f"Blocked by: {'; '.join(health['blockers']) or 'unknown'}"
+                ),
+                details=health,
+            )
+        elif not health["stalled"] and open_alert is not None:
+            open_alert.acknowledged = True
+        await db.commit()
 
 
 @shared_task(name="scraper.tasks.embeddings.process_embedding_queue")

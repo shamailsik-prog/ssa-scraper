@@ -44,6 +44,10 @@ from scraper.pls_search_harvest_core import (
     parse_total_results_from_html,
     partition_rows_by_known,
     reporters_for_plan,
+    cited_citations_in_text,
+    is_capped,
+    iter_extended_plan_queries,
+    page_continuity_gaps,
     split_oversized_query,
     unmapped_harvest_reason,
     years_for_plan,
@@ -154,6 +158,111 @@ async def seed_search_harvest_plan(
         db.add(row)
     await db.flush()
     return {"inserted": len(to_add), "reporters": len(reporters), "years": len(years)}
+
+
+async def seed_extended_plan(
+    db: AsyncSession,
+    *,
+    dry_run: bool = False,
+    keywords: Optional[List[str]] = None,
+    parties: Optional[List[str]] = None,
+    judge_limit: int = 300,
+    statute_limit: int = 40,
+    sections_per_statute: int = 25,
+) -> Dict[str, Any]:
+    """Phase 2 families beyond journal x year: court x year, judge x year, statute (per section for the Acts we hold),
+    keyword x court, party-word x year. Values come from the court directory, judge and statute tables and the caller
+    lists (never invented). Idempotent (query_key unique)."""
+    from scraper.models import Court, Judge, Statute, StatuteSection
+
+    now_year = datetime.now(timezone.utc).year
+    earliest = int(settings.PLS_EARLIEST_YEAR or 0) or now_year
+    years = years_for_plan(earliest, now_year)
+    smap = {}
+    m = await active_map(db, SOURCE_NAME)
+    if m is not None:
+        smap = map_as_dict(m)
+    courts = _court_options_from_map(smap) or [c for (c,) in (await db.execute(select(Court.name).where(Court.is_active.is_(True)))).all()]
+    judges = [n for (n,) in (await db.execute(select(Judge.name).limit(judge_limit))).all() if n]
+    statutes = []
+    for st_id, st_name in (await db.execute(select(Statute.id, Statute.name).limit(statute_limit))).all():
+        secs = [r for (r,) in (await db.execute(select(StatuteSection.section_number).where(StatuteSection.statute_id == st_id).limit(sections_per_statute))).all()]
+        statutes.append({"statute": st_name, "sections": secs})
+    existing = {r for (r,) in (await db.execute(select(PlsSearchHarvestQuery.query_key).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).all()}
+    to_add = []
+    for q in iter_extended_plan_queries(years=years, courts=courts, judges=judges, statutes=statutes, keywords=keywords or [], parties=parties or []):
+        key = make_query_key(q)
+        if key in existing:
+            continue
+        existing.add(key)
+        to_add.append(PlsSearchHarvestQuery(source_name=SOURCE_NAME, query_key=key, query_json=q, status="pending", priority=300))
+    if not dry_run:
+        for row in to_add:
+            db.add(row)
+        await db.flush()
+    return {("would_insert" if dry_run else "inserted"): len(to_add), "courts": len(courts), "judges": len(judges), "statutes": len(statutes), "years": len(years)}
+
+
+async def seed_snowball(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
+    """Phase 5: citations that appear inside downloaded PLS judgments but are not in the corpus become citation
+    lookups. A round that adds no new query means the snowball has converged."""
+    from scraper.models import Judgment
+
+    rows = (await db.execute(select(Judgment.id, Judgment.full_text).where(Judgment.source_name == SOURCE_NAME).order_by(Judgment.promoted_at.desc()).limit(limit))).all()
+    cited: Set[str] = set()
+    for _id, text_ in rows:
+        cited.update(cited_citations_in_text(text_ or ""))
+    known = set()
+    cl = list(cited)
+    for i in range(0, len(cl), 1000):
+        known |= await load_known_citation_keys(db, set(cl[i : i + 1000]))
+    fresh = sorted(cited - known)
+    existing = {r for (r,) in (await db.execute(select(PlsSearchHarvestQuery.query_key).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).all()}
+    added = 0
+    for cit in fresh:
+        q = normalize_query_json({"citation": cit})
+        key = make_query_key(q)
+        if key in existing:
+            continue
+        existing.add(key)
+        added += 1
+        if not dry_run:
+            db.add(PlsSearchHarvestQuery(source_name=SOURCE_NAME, query_key=key, query_json=q, status="pending", priority=200))
+    if not dry_run:
+        await db.flush()
+    return {"judgments_scanned": len(rows), "distinct_cited": len(cited), "not_in_corpus": len(fresh), "queries_added": added, "converged": added == 0}
+
+
+async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> Dict[str, Any]:
+    """Phase 6 proof: job-queue state, capped-but-unsplit jobs (never complete), page-continuity holes per reporter
+    and year, the site-total comparison, and a random known-citation test against the corpus."""
+    from sqlalchemy import func
+
+    from scraper.models import Citation, Judgment
+
+    status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
+    cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+    capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
+    exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
+    totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
+    page_rows = (await db.execute(select(Citation.reporter, Citation.year, Citation.page).join(Judgment, Judgment.id == Citation.judgment_id).where(Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True), Citation.page.isnot(None)))).all()
+    by_ry: Dict[Any, List[int]] = {}
+    for rep, yr, pg in page_rows:
+        by_ry.setdefault((rep, yr), []).append(pg)
+    holes = {f"{rep} {yr}": page_continuity_gaps(pgs) for (rep, yr), pgs in by_ry.items()}
+    holes = {k: v for k, v in holes.items() if v}
+    sample = (await db.execute(select(Judgment.canonical_citation).where(Judgment.source_name == SOURCE_NAME).order_by(func.random()).limit(known_sample))).scalars().all()
+    known = await load_known_citation_keys(db, set(sample)) if sample else set()
+    return {
+        "queue": status_counts,
+        "done_but_capped": capped_open,
+        "capped_exhausted_not_complete": exhausted,
+        "site_total_done_queries": int(totals[0]),
+        "rows_known_done_queries": int(totals[1]),
+        "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
+        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
+        "complete": bool(status_counts.get("pending", 0) + status_counts.get("in_progress", 0) + status_counts.get("failed", 0) + capped_open == 0 and not holes),
+    }
 
 
 async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[str, Any]]:
@@ -360,18 +469,25 @@ class SearchHarvestRunner:
                 query_row.status = "in_progress"
                 break
             if not nxt:
-                if site_total and site_total > cap:
+                if is_capped(site_total, rows_seen, cap):
+                    # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
+                    # loudly when nothing narrower can be expressed.
                     children = split_oversized_query(
                         query_json,
-                        int(site_total),
+                        int(site_total if site_total is not None else rows_seen),
                         result_cap=cap,
                         court_options=_court_options_from_map(search_map),
+                        available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword"},
+                        bench_options=[str(o) for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []],
                     )
                     if children:
-                        await self._enqueue_split_children(query_row, children, site_total, cap)
+                        await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
-                        query_row.split_reason = f"site_total={site_total} > cap={cap}"
+                        query_row.split_reason = f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
                         break
+                    query_row.status = "failed"
+                    query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                    break
                 query_row.status = "done"
                 query_row.cursor_json = {"page": 1, "row_index": 0}
                 break
@@ -554,4 +670,54 @@ def cli_run(argv: Optional[List[str]] = None) -> int:
             )
 
     print(json.dumps(run_async(_run()), indent=2))
+    return 0
+
+
+def cli_extended_plan(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--keyword", action="append", default=[])
+    parser.add_argument("--party", action="append", default=[])
+    args = parser.parse_args(argv)
+
+    async def _run():
+        async with SessionLocal() as db:
+            out = await seed_extended_plan(db, dry_run=args.dry_run, keywords=args.keyword, parties=args.party)
+            await db.commit()
+            return out
+
+    print(json.dumps(_run_sync(_run()), indent=2))
+    return 0
+
+
+def _run_sync(coro):
+    return run_async(coro)
+
+
+def cli_snowball(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int, default=2000)
+    args = parser.parse_args(argv)
+
+    async def _run():
+        async with SessionLocal() as db:
+            out = await seed_snowball(db, limit=args.limit, dry_run=args.dry_run)
+            await db.commit()
+            return out
+
+    print(json.dumps(run_async(_run()), indent=2))
+    return 0
+
+
+def cli_completeness(argv: Optional[List[str]] = None) -> int:
+    async def _run():
+        async with SessionLocal() as db:
+            return await completeness_report(db)
+
+    print(json.dumps(run_async(_run()), indent=2, default=str))
     return 0

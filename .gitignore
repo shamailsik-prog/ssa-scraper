@@ -10,3 +10,11 @@ blackletter_state/
 *.log
 .venv/
 venv/
+
+# droplet-local clutter: never commit hand-made backups or hot patches (deploy from git only)
+*.bak
+*.bak.*
+*.bak-*
+.hotpatch-*/
+debug/
+*.OPS_NOTES

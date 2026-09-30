@@ -172,11 +172,20 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     if dev:
         evidence["decision_date"] = dev
     year = None
-    for c in cits[:3]:
-        if c.get("year"):
-            year = c["year"]
-            evidence["year"] = c["raw"]
-            break
+    if hint:
+        # The grid row's own citation is the judgment's identity; its year is the year. Taking the year
+        # of the first citation found in the page text instead picked up cited cases and page chrome
+        # ("year 2026 disagrees with citation year 1980") and quarantined ~200 good judgments.
+        hint_hits = extract_citations(hint)
+        if hint_hits and hint_hits[0].get("year"):
+            year = hint_hits[0]["year"]
+            evidence["year"] = f"result row: {hint}"
+    if year is None:
+        for c in cits[:3]:
+            if c.get("year"):
+                year = c["year"]
+                evidence["year"] = c["raw"]
+                break
     if year is None and ddate:
         year = ddate.year
         evidence["year"] = dev or str(ddate)

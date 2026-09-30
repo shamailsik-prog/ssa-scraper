@@ -433,5 +433,5 @@ async def test_worker_start_retires_orphaned_login_session_jobs(db):
         await r.aclose()
     async with __import__("scraper.database", fromlist=["SessionLocal"]).SessionLocal() as fresh:
         rows = {j.source_name: j for j in (await fresh.execute(select(ScraperJob))).scalars().all()}
-        assert rows["PakistanLawSite"].status == "failed" and "worker started" in rows["PakistanLawSite"].error_message
+        assert rows["PakistanLawSite"].status == "interrupted" and "worker started" in rows["PakistanLawSite"].error_message
         assert rows["PakistanCode"].status == "running"

@@ -51,10 +51,26 @@ def normalise_judge_name(raw: str) -> str:
     return " ".join(part.capitalize() if part.isupper() or part.islower() else part for part in s.split())
 
 
+_OCR_DIGITS = str.maketrans({"1": "l", "0": "o", "5": "s", "8": "B"})
+
+
+def _fix_ocr_name(piece: str) -> str:
+    """The PLS scans of older volumes read 'Ilyas' as '1lyas', 'Ajmal' as 'Ajma1': a digit that sits
+    inside a word of letters is an OCR slip, not part of a name."""
+    def word(w: str) -> str:
+        if not re.search(r"[A-Za-z]", w) or not re.search(r"\d", w):
+            return w
+        if re.fullmatch(r"[1lI]{2}[a-z]+", w):  # 1lyas / 11yas -> Ilyas
+            return "Il" + w[2:]
+        return w.translate(_OCR_DIGITS)
+
+    return " ".join(word(w) for w in piece.split())
+
+
 def _split_names(blob: str) -> List[str]:
     names: List[str] = []
     for piece in SPLIT.split(blob):
-        n = normalise_judge_name(piece)
+        n = normalise_judge_name(_fix_ocr_name(piece))
         if JUDGE_CHROME_NOISE.search(n):
             continue
         if len(n) >= 4 and len(n.split()) <= 6 and not re.search(r"\d", n):

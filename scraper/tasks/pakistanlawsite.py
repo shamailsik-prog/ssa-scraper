@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -60,6 +60,7 @@ from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Citation, CrawlCoverage, CrawlFrontier, Judgment, ScraperJob, ScraperSource, ScraperStaging, StatuteSection, Statute
 from scraper.notify import notify
+from scraper.pls_grid_health import lap_update
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
@@ -81,6 +82,27 @@ _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
 _REPORTER_BY_UPPER: Dict[str, str] = {}
 for _reporter in KNOWN_REPORTERS:
     _REPORTER_BY_UPPER.setdefault(_reporter.upper(), _reporter)
+
+
+QUARANTINE_REFETCH_MAX = 3
+_RETRYABLE_QUARANTINE = re.compile(
+    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
+)
+_ERROR_PAGE = re.compile(r"(?i)error code\s*:?\s*\d+|sorry,?\s+something went wrong|service unavailable|access denied|session (?:has )?expired")
+
+
+def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int], route_json: Any, head: Optional[str] = None) -> bool:
+    """A quarantined capture that is a bad PAGE (site error page, subscription chrome, headnote-only, login stub)
+    is fetched again at most QUARANTINE_REFETCH_MAX times. A capture quarantined on the merits (a citation
+    conflict, low confidence on a real judgment, a court the directory lacks) is final for the walk: those go
+    through `pls_admin requalify-quarantine` instead. Without this every quarantined row, including the 182
+    'Error Code:700' captures, was skipped for ever as 'staged'."""
+    route = route_json if isinstance(route_json, dict) else {}
+    if int(route.get("refetch_count") or 0) >= QUARANTINE_REFETCH_MAX:
+        return False
+    if (text_len or 0) < 3000 and _ERROR_PAGE.search(head or ""):
+        return True
+    return bool(_RETRYABLE_QUARANTINE.search(reason or ""))
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -737,9 +759,11 @@ class PakistanLawSitePipeline:
         except Exception:
             flush_every = 1
         flush_every = max(1, flush_every)
+        skip_flush_every = max(1, int(getattr(settings, "PLS_CITATION_GRID_SKIP_FLUSH_EVERY", 50) or 50))
         selected_indexes = [start_in_window + i for i in range(take_count)]
         self.stats["citation_grid_scan_window"] = scan_window
         self.stats["citation_grid_detail_cap"] = max_detail
+        was_saturated = bool(cursor.get("saturated_at"))
         lookup_keys = set()
         for idx in selected_indexes:
             raw = str(rows[idx].get("citation") or "").strip()
@@ -765,11 +789,14 @@ class PakistanLawSitePipeline:
                 known_citations.add(key)
                 if judgment_is_full_ready(full_text, judge_names):
                     full_ready_citations.add(key)
+            # Only a citation that is its judgment's OWN (is_primary) marks a grid row known. Alternate
+            # citation rows were harvested from headnotes ("X v. Y 1984 CLC 2384 rel.") and belong to
+            # other cases: treating them as known hid ~120 real grid rows from the walk for good.
             existing_citations = (
                 await self.db.execute(
                     select(Citation.citation_string, Judgment.full_text, Judgment.judge_names)
                     .join(Judgment, Judgment.id == Citation.judgment_id)
-                    .where(Citation.citation_string.in_(list(lookup_keys)))
+                    .where(Citation.citation_string.in_(list(lookup_keys)), Citation.is_primary.is_(True))
                 )
             ).all()
             for citation_string, full_text, judge_names in existing_citations:
@@ -782,16 +809,30 @@ class PakistanLawSitePipeline:
                 # quarantined for review) are not downloaded again when the cursor wraps.
                 staged_rows = (
                     await self.db.execute(
-                        select(ScraperStaging.extracted_citation).where(
+                        select(
+                            ScraperStaging.extracted_citation,
+                            ScraperStaging.status,
+                            ScraperStaging.quarantine_reason,
+                            func.length(ScraperStaging.raw_text),
+                            ScraperStaging.route_json,
+                            func.left(ScraperStaging.raw_text, 400),
+                        ).where(
                             ScraperStaging.source_name == SOURCE_NAME,
                             ScraperStaging.extracted_citation.in_(list(lookup_keys)),
                             ScraperStaging.status.in_(["extracted", "promoted", "duplicate", "quarantined"]),
                         )
                     )
                 ).all()
-                for (citation_string,) in staged_rows:
-                    if citation_string:
-                        staged_citations.add(str(citation_string))
+                retryable: set[str] = set()
+                for citation_string, st_status, st_reason, st_len, st_route, st_head in staged_rows:
+                    if not citation_string:
+                        continue
+                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route, st_head):
+                        retryable.add(str(citation_string))
+                        continue
+                    staged_citations.add(str(citation_string))
+                # a citation with any non-retryable staging row stays skipped; otherwise it is fetched again
+                self.stats["quarantine_refetch_rows"] = self.stats.get("quarantine_refetch_rows", 0) + len(retryable - staged_citations)
         logger.info(
             "PakistanLawSite citation-grid cursor start_offset=%s start_in_window=%s take_count=%s rows=%s total_rows=%s max_detail=%s scan_window=%s flush_every=%s known_full=%s staged=%s seek_mode=%s",
             start_offset,
@@ -813,6 +854,7 @@ class PakistanLawSitePipeline:
         staged_citation_skips = 0
         detail_attempts = 0
         processed_rows_total = 0
+        other_shard_rows = 0
         self.stats.setdefault("citation_grid_offset", start_offset)
         self.stats["citation_grid_window_offset"] = start_offset
         self.stats["citation_grid_snapshot_start"] = snapshot_start_row
@@ -829,7 +871,7 @@ class PakistanLawSitePipeline:
                 return absolute % total_rows
             return absolute
 
-        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int) -> None:
+        async def flush_citation_grid_progress(next_offset: int, *, staged_this_flush: int, details_this_flush: int, processed_rows: int, count_wrap: bool = True) -> None:
             nonlocal last_committed_offset
             try:
                 offset_before = int(cursor.get("row_offset", last_committed_offset) or 0)
@@ -847,7 +889,7 @@ class PakistanLawSitePipeline:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            if total_rows > 0 and next_offset < start_offset:
+            if count_wrap and total_rows > 0 and next_offset < start_offset:
                 cursor["wrapped_at"] = cursor["updated_at"]
                 cursor["wraps"] = int(cursor.get("wraps", 0) or 0) + 1
             patch = {cursor_key: cursor}
@@ -880,7 +922,8 @@ class PakistanLawSitePipeline:
                 row_reporter = reporter_from_citation(citation_key)
                 if not self._row_in_shard(row_reporter):
                     self.stats["reporter_skips"] = self.stats.get("reporter_skips", 0) + 1
-                    if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
+                    other_shard_rows += 1
+                    if (idx + 1) % skip_flush_every == 0 or (idx + 1) == len(selected_indexes):
                         next_offset = next_offset_after(idx + 1)
                         await flush_citation_grid_progress(
                             next_offset,
@@ -908,7 +951,7 @@ class PakistanLawSitePipeline:
                     staged_citation_skips += 1
                     self.stats["staged_citation_skips"] = staged_citation_skips
                     self.stats["duplicates"] += 1
-                if (idx + 1) % flush_every == 0 or (idx + 1) == len(selected_indexes):
+                if (idx + 1) % skip_flush_every == 0 or (idx + 1) == len(selected_indexes):
                     next_offset = next_offset_after(idx + 1)
                     await flush_citation_grid_progress(
                         next_offset,
@@ -1023,13 +1066,35 @@ class PakistanLawSitePipeline:
             if processed_rows_total and url_less_skips >= processed_rows_total and known_citation_skips == 0:
                 raise RuntimeError("citation-grid returned rows but none had a detail URL; refusing false-success run")
         next_offset = next_offset_after(processed_rows_total)
-        if last_committed_offset != next_offset:
-            await flush_citation_grid_progress(
-                next_offset,
-                staged_this_flush=0,
-                details_this_flush=0,
-                processed_rows=processed_rows_total,
-            )
+        # Lap ledger: one full lap of the grid that stages nothing new marks this cursor saturated, and the
+        # scheduler leaves it alone until PLS_SATURATED_RECHECK_HOURS have passed (no more re-walking a
+        # shard that has nothing left to give). Any newly staged row clears the mark.
+        lap_update(
+            cursor,
+            total_rows=total_rows,
+            window={
+                "rows": processed_rows_total,
+                "in_shard": max(0, processed_rows_total - other_shard_rows),
+                "fetched": detail_attempts,
+                "staged": self.stats["staged"] - staged_before,
+                "known": known_citation_skips,
+                "staged_skips": staged_citation_skips,
+                "url_less": url_less_skips,
+            },
+            now=datetime.now(timezone.utc),
+        )
+        if cursor.get("saturated_at") and not was_saturated:
+            logger.warning("PakistanLawSite citation-grid %s SATURATED: %s", cursor_key, cursor.get("saturated_reason"))
+            self.stats["citation_grid_saturated"] = cursor.get("saturated_reason")
+        # The lap ledger must be persisted even when the last per-row flush already committed this offset; in that
+        # case the wrap was counted there and must not be counted again.
+        await flush_citation_grid_progress(
+            next_offset,
+            staged_this_flush=0,
+            details_this_flush=0,
+            processed_rows=processed_rows_total,
+            count_wrap=last_committed_offset != next_offset,
+        )
         wrapped = bool(total_rows > 0 and next_offset < start_offset)
         result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped})
         logger.info(
@@ -1141,6 +1206,9 @@ class PakistanLawSitePipeline:
             if route not in routes:
                 routes.append(route)
                 staging.route_json = {**(staging.route_json or {}), "routes": routes}
+            if staging.status == "quarantined":
+                # the same bad page came back: count it so the grid stops asking after QUARANTINE_REFETCH_MAX
+                staging.route_json = {**(staging.route_json or {}), "refetch_count": int((staging.route_json or {}).get("refetch_count") or 0) + 1}
             self.stats["duplicates"] += 1
             return "duplicate"
         await self.db.flush()
@@ -1175,6 +1243,9 @@ class PakistanLawSitePipeline:
             validation_errors.append("headnote_only: not eligible for full_judgment promotion")
         staging.validation_errors = validation_errors
         staging.extracted_citation = (reconciled.get("citations") or [None])[0]
+        row_cit = normalise_citation(str(row.get("citation") or "")) if row.get("citation") else ""
+        if row_cit and row_cit in (reconciled.get("citations") or []):
+            staging.extracted_citation = row_cit
         staging.extracted_title = reconciled.get("case_title")
         staging.extracted_court = reconciled.get("court")
         staging.extracted_year = reconciled.get("year")

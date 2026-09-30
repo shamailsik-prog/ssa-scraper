@@ -23,8 +23,10 @@ from scraper.config import settings
 from scraper.database import get_db
 from scraper.pls_grid_health import (
     citation_grid_progress_view,
+    compute_stalled,
     grid_harvest_incomplete,
     grid_rows_remaining,
+    grid_saturation_view,
     pls_source_config,
 )
 from scraper.models import (
@@ -221,9 +223,24 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
     ]
     last_spot = (await db.execute(select(func.max(SpotCheck.checked_at)))).scalar()
     pls_cfg = await pls_source_config(db)
-    pls_watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
+    saturation = grid_saturation_view(pls_cfg, now=now)
+    pls_last = (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
+    pls_source_row = next((s for s in sources if s["source"] == "PakistanLawSite"), None)
+    stall = compute_stalled(
+        last_promotion_at=pls_last,
+        now=now,
+        saturation=saturation,
+        harvest_paused=bool(pls_cfg.get("paused_by_admin")) or (pls_source_row is not None and pls_source_row["state"] != "ACTIVE"),
+    )
+    from scraper.tasks.embedding_health import embedding_health
+    from scraper.pls_accounting import grid_accounting
+
     return {
         "generated_at": _iso(now),
+        "stalled": stall["stalled"],
+        "stalled_reason": stall["stalled_reason"],
+        "hours_since_last_judgment": stall["hours_since_last_judgment"],
+        "embeddings": await embedding_health(db, now=now),
         "spot_checks": {
             "every_seconds": settings.SPOT_CHECK_SCHEDULE_SECONDS,
             "per_run": {"judgments": settings.SPOT_CHECK_JUDGMENTS, "statute_sections": settings.SPOT_CHECK_STATUTES},
@@ -252,9 +269,11 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "last_judgment_at": _iso(
                 (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
             ),
-            "stalled": bool(pls_watch.get("stalled")),
+            **stall,
             "grid_incomplete": grid_harvest_incomplete(pls_cfg),
             "search_harvest": await _pls_search_harvest_summary(db),
+            "grid_saturation": saturation,
+            "grid_accounting": await grid_accounting(db, total_rows=max([int((pls_cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])),
         },
         "judgments_by_source": by_source,
         "judgments_by_reporter_year": by_reporter_year,
