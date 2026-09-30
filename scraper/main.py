@@ -85,17 +85,25 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
             pls_cfg = await pls_source_config(db)
             total_j, by_source = await pls_judgment_counts(db)
             last_j = await pls_last_judgment_at(db)
-            watch = dict(pls_cfg.get("pls_stall_watchdog") or {})
+            from scraper.pls_grid_health import compute_stalled, grid_saturation_view
+
+            saturation = grid_saturation_view(pls_cfg)
+            stall = compute_stalled(
+                last_promotion_at=last_j,
+                saturation=saturation,
+                harvest_paused=bool(pls_cfg.get("paused_by_admin")),
+            )
             out["judgments"] = total_j
             out["judgments_by_source"] = by_source
+            out["stalled"] = stall["stalled"]
+            out["stalled_reason"] = stall["stalled_reason"]
             out["pakistanlawsite"] = {
                 "judgments": by_source.get("PakistanLawSite", 0),
                 "citation_grid_progress": citation_grid_progress_view("PakistanLawSite", pls_cfg),
                 "citation_grid_rows_remaining": grid_rows_remaining(pls_cfg),
                 "last_judgment_at": last_j.isoformat() if last_j else None,
-                "stalled": bool(watch.get("stalled")) or (
-                    grid_harvest_incomplete(pls_cfg) and bool(watch.get("stalled_at"))
-                ),
+                **stall,
+                "grid_saturation": saturation,
             }
             if privileged:
                 from scraper.models import Judgment, QuarantineQueue, ScraperJob, ScraperSource, Statute, StatuteSection

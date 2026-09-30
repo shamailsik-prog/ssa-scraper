@@ -67,8 +67,14 @@ def citation_grid_progress_view(source_name: str, cfg: Dict[str, Any]) -> Dict[s
     return status
 
 
-def grid_rows_remaining(cfg: Dict[str, Any]) -> int:
-    """Approximate rows left across all shard cursors (0 when unknown or complete)."""
+def grid_rows_remaining(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> int:
+    """Rows left in the current lap of the grid (0 when unknown, complete or saturated).
+
+    Every shard walks the SAME grid (a shard only decides which rows it detail-fetches), so the
+    shards' remainders must not be added up: two shards on a 20,568 row grid used to report
+    32,336 "remaining" rows, more than the grid holds. The figure is the largest remainder of any
+    shard that still has work; a shard whose last full lap found nothing new is saturated and
+    counts as 0 until its recheck is due."""
     remaining = 0
     for key in citation_grid_cursor_keys(cfg):
         cur = cfg.get(key)
@@ -78,8 +84,133 @@ def grid_rows_remaining(cfg: Dict[str, Any]) -> int:
         offset = _to_int(cur.get("row_offset")) or 0
         if total <= 0:
             continue
-        remaining += max(0, total - offset)
+        if cursor_saturated(cur, now=now):
+            continue
+        remaining = max(remaining, max(0, min(total, total - offset)))
     return remaining
+
+
+# --------------------------------------------------------------------------- saturation
+def saturated_recheck_hours() -> float:
+    return float(getattr(settings, "PLS_SATURATED_RECHECK_HOURS", 12) or 12)
+
+
+def cursor_saturated(cur: Any, *, now: Optional[datetime] = None) -> bool:
+    """True while a cursor's last COMPLETE lap of the grid staged nothing new and its recheck is not due.
+
+    Re-walking a saturated shard costs a page load per window and produces nothing (the audit of
+    2026-09-30 saw 20,568 rows scanned for 0 staged), so the scheduler leaves it alone until the
+    recheck interval has passed."""
+    if not isinstance(cur, dict):
+        return False
+    at = parse_iso(cur.get("saturated_at"))
+    if at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - at).total_seconds() < saturated_recheck_hours() * 3600
+
+
+def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
+    return f"citation_grid_cursor_shard_{reporter_shard}" if reporter_shard in (0, 1) else "citation_grid_cursor"
+
+
+def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:
+    """Scheduler guard: do not enqueue a job for a shard (or the unsharded walk) whose grid is saturated."""
+    return cursor_saturated(cfg.get(grid_cursor_key_for_shard(reporter_shard)), now=now)
+
+
+def lap_update(cur: Dict[str, Any], *, total_rows: int, window: Dict[str, int], now: datetime) -> Dict[str, Any]:
+    """Fold one finished window into the cursor's lap ledger and judge saturation once a lap is full.
+
+    A lap is `total_rows` processed rows (the walk is cyclic, so the start offset does not matter).
+    Counters: rows, in_shard (rows this shard may fetch), fetched (detail pages), staged (NEW staging
+    rows), known (already a judgment), staged_skips (already staged), url_less. When a lap ends with
+    staged == 0 the cursor is marked saturated; any new staging clears the mark."""
+    lap = dict(cur.get("lap") or {})
+    for k in ("rows", "in_shard", "fetched", "staged", "known", "staged_skips", "url_less", "grid_duplicates"):
+        lap[k] = int(lap.get(k) or 0) + int(window.get(k) or 0)
+    lap.setdefault("started_at", now.isoformat())
+    lap["total_rows"] = total_rows
+    if window.get("staged"):
+        cur.pop("saturated_at", None)
+        cur.pop("saturated_reason", None)
+    if total_rows > 0 and lap["rows"] >= total_rows:
+        done = dict(lap)
+        done["finished_at"] = now.isoformat()
+        cur["last_lap"] = done
+        if int(done.get("staged") or 0) == 0:
+            cur["saturated_at"] = now.isoformat()
+            cur["saturated_total_rows"] = total_rows
+            cur["saturated_reason"] = (
+                f"full lap of {done['rows']} rows staged 0 new "
+                f"(in_shard={done.get('in_shard')}, known={done.get('known')}, already_staged={done.get('staged_skips')}, "
+                f"fetched={done.get('fetched')}, url_less={done.get('url_less')})"
+            )
+        else:
+            cur.pop("saturated_at", None)
+            cur.pop("saturated_reason", None)
+        lap = {"rows": 0, "in_shard": 0, "fetched": 0, "staged": 0, "known": 0, "staged_skips": 0, "url_less": 0, "grid_duplicates": 0, "started_at": now.isoformat(), "total_rows": total_rows}
+    cur["lap"] = lap
+    return cur
+
+
+def grid_saturation_view(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    shards: Dict[str, Any] = {}
+    for key in citation_grid_cursor_keys(cfg):
+        cur = cfg.get(key)
+        if not isinstance(cur, dict):
+            continue
+        shards[key] = {
+            "saturated": cursor_saturated(cur, now=now),
+            "saturated_at": cur.get("saturated_at"),
+            "reason": cur.get("saturated_reason"),
+            "lap": cur.get("lap"),
+            "last_lap": cur.get("last_lap"),
+        }
+    return {"shards": shards, "all_saturated": bool(shards) and all(v["saturated"] for v in shards.values()), "recheck_hours": saturated_recheck_hours()}
+
+
+# --------------------------------------------------------------------------- stalled alarm
+def stall_threshold_hours() -> float:
+    return float(getattr(settings, "PLS_STALL_NO_PROMOTION_HOURS", 6) or 6)
+
+
+def compute_stalled(
+    *,
+    last_promotion_at: Optional[datetime],
+    now: Optional[datetime] = None,
+    threshold_hours: Optional[float] = None,
+    saturation: Optional[Dict[str, Any]] = None,
+    harvest_paused: bool = False,
+) -> Dict[str, Any]:
+    """The alarm the audit asked for: stalled == no new judgment for `threshold_hours`, computed from the
+    corpus itself (never from cursors, which advance while nothing is produced).
+
+    `reason` says why: harvest_paused (operator), grid_saturated (every shard finished a full lap with
+    nothing new: the site has nothing more for the subscribed reporters), or no_output_while_harvesting
+    (a real fault: work is running and yields nothing)."""
+    now = now or datetime.now(timezone.utc)
+    threshold = float(threshold_hours if threshold_hours is not None else stall_threshold_hours())
+    if last_promotion_at is not None and last_promotion_at.tzinfo is None:
+        last_promotion_at = last_promotion_at.replace(tzinfo=timezone.utc)
+    idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)
+    stalled = idle_hours is None or idle_hours >= threshold
+    reason = None
+    if stalled:
+        if harvest_paused:
+            reason = "harvest_paused"
+        elif saturation and saturation.get("all_saturated"):
+            reason = "grid_saturated"
+        else:
+            reason = "no_output_while_harvesting"
+    return {
+        "stalled": bool(stalled),
+        "stalled_reason": reason,
+        "hours_since_last_judgment": None if idle_hours is None else round(idle_hours, 2),
+        "threshold_hours": threshold,
+        "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
+    }
 
 
 def grid_harvest_incomplete(cfg: Dict[str, Any]) -> bool:

@@ -7,16 +7,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from celery import shared_task
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 
 from scraper.auth.session_manager import SessionLock, SessionLockHeld, SessionManager, merge_source_config
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.models import BrowserSessionSlot, CrawlFrontier, ScraperSource
+from scraper.models import RETIRED_WITHOUT_REASON, BrowserSessionSlot, CrawlFrontier, Notification, ScraperSource
 from scraper.notify import notify
 from scraper.pls_grid_health import (
     SOURCE_NAME,
+    compute_stalled,
     grid_harvest_incomplete,
+    grid_saturation_view,
+    parse_iso,
     grid_rows_remaining,
     pls_harvest_in_progress,
     pls_judgment_counts,
@@ -73,80 +76,111 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
     return outcomes
 
 
+async def evaluate_pls_stall(db, source: ScraperSource, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Compute the stalled alarm from the corpus itself and notify once per episode.
+
+    stalled == no PakistanLawSite judgment promoted for PLS_STALL_NO_PROMOTION_HOURS. Cursor movement is
+    deliberately ignored: the citation grid advanced every window for 31 hours (2026-09-28 15:26 UTC
+    to 2026-09-30) while nothing was promoted, and the old cursor-signature watchdog never fired."""
+    now = now or datetime.now(timezone.utc)
+    cfg = dict(source.config_json or {})
+    last_at = await pls_last_judgment_at(db)
+    saturation = grid_saturation_view(cfg, now=now)
+    paused = source.state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
+    verdict = compute_stalled(last_promotion_at=last_at, now=now, saturation=saturation, harvest_paused=paused)
+    watch = dict(cfg.get(WATCHDOG_META_KEY) or {})
+    was_stalled = bool(watch.get("stalled"))
+    watch.update({k: verdict[k] for k in ("stalled", "stalled_reason", "hours_since_last_judgment", "threshold_hours")})
+    watch["checked_at"] = now.isoformat()
+    if verdict["stalled"] and not was_stalled:
+        watch["stalled_at"] = now.isoformat()
+        open_alarm = (
+            await db.execute(
+                select(Notification).where(Notification.code == "PLS_NO_NEW_JUDGMENTS", Notification.acknowledged.is_(False)).limit(1)
+            )
+        ).scalars().first()
+        if open_alarm is None:
+            await notify(
+                db,
+                level="warning" if verdict["stalled_reason"] != "harvest_paused" else "info",
+                code="PLS_NO_NEW_JUDGMENTS",
+                message=(
+                    f"PakistanLawSite promoted no new judgment for {verdict['hours_since_last_judgment']} h "
+                    f"(threshold {verdict['threshold_hours']} h; reason: {verdict['stalled_reason']})"
+                ),
+                source_name=SOURCE_NAME,
+                details={**verdict, "saturation": saturation},
+            )
+    if not verdict["stalled"] and was_stalled:
+        watch.pop("stalled_at", None)
+        watch["recovered_at"] = now.isoformat()
+        for n in (
+            await db.execute(select(Notification).where(Notification.code == "PLS_NO_NEW_JUDGMENTS", Notification.acknowledged.is_(False)))
+        ).scalars().all():
+            n.acknowledged = True
+    await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
+    return verdict
+
+
 async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
-    if not settings.login_scraping_effective:
-        return {"skipped": "login_scraping_disabled"}
     now = datetime.now(timezone.utc)
     async with SessionLocal() as db:
         source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
         if source is None:
             return {"skipped": "no source"}
+        verdict = await evaluate_pls_stall(db, source, now=now)
+        await db.commit()
+        result: Dict[str, Any] = dict(verdict)
+        if not settings.login_scraping_effective:
+            result["recovery"] = "login_scraping_disabled"
+            return result
         cfg = dict(source.config_json or {})
-        if not grid_harvest_incomplete(cfg):
-            await merge_source_config(db, source, {WATCHDOG_META_KEY: {"stalled": False, "checked_at": now.isoformat()}})
-            await db.commit()
-            return {"stalled": False, "reason": "grid complete"}
+        if not grid_harvest_incomplete(cfg) or verdict["stalled_reason"] != "no_output_while_harvesting":
+            # paused, saturated or complete: nothing to un-wedge (a saturated grid is not a fault)
+            return result
         total_j, _ = await pls_judgment_counts(db)
         sig = stall_signature(cfg, total_j)
         watch = dict(cfg.get(WATCHDOG_META_KEY) or {})
         prev_sig = watch.get("signature")
-        prev_at = watch.get("checked_at")
-        stalled = False
-        if prev_sig is not None and signatures_equal(prev_sig, sig):
-            try:
-                prev_dt = datetime.fromisoformat(str(prev_at))
-                if prev_dt.tzinfo is None:
-                    prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                prev_dt = now - STALL_AFTER
-            if now - prev_dt >= STALL_AFTER:
-                stalled = True
-        else:
-            watch = {"signature": sig, "checked_at": now.isoformat(), "stalled": False}
-        if stalled:
-            logger.warning(
-                "PLS STALL WATCHDOG: citation grid has %s rows remaining but cursor/judgments unchanged for %s hours",
-                grid_rows_remaining(cfg),
-                int(STALL_AFTER.total_seconds() // 3600),
-            )
-            manager = SessionManager(db, source)
-            for slot in await manager.slots():
-                if slot.state == "ACTIVE":
-                    lock = SessionLock(source.source_name)
-                    try:
-                        await lock.acquire()
-                    except SessionLockHeld:
-                        watch.setdefault("recovery", []).append(
-                            {"slot": slot.slot_number, "skipped": "login_session_lock_held"}
-                        )
-                        continue
-                    try:
-                        check = await verify_stored_session(manager, slot, playwright_browser_factory)
-                    finally:
-                        await lock.release()
-                    if not check.get("alive"):
-                        await manager.mark_needs_human_login(slot.slot_number, "stall watchdog probe failed")
-                rec = await recover_slot(db, manager, slot)
-                watch.setdefault("recovery", []).append(rec)
-            from scraper.tasks.celery_app import app
+        prev_dt = parse_iso(watch.get("signature_at"))
+        if prev_sig is None or not signatures_equal(prev_sig, sig):
+            watch["signature"], watch["signature_at"] = sig, now.isoformat()
+            await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
+            await db.commit()
+            return result
+        if prev_dt is None or now - prev_dt < STALL_AFTER:
+            return result
+        # Real hang: harvest "running" with cursors AND judgments frozen. Probe the slots and requeue.
+        logger.warning(
+            "PLS STALL WATCHDOG: %s grid rows remaining but cursors and judgments unchanged for %s hours",
+            grid_rows_remaining(cfg),
+            int(STALL_AFTER.total_seconds() // 3600),
+        )
+        manager = SessionManager(db, source)
+        recovery: list = []
+        for slot in await manager.slots():
+            if slot.state == "ACTIVE":
+                lock = SessionLock(source.source_name)
+                try:
+                    await lock.acquire()
+                except SessionLockHeld:
+                    recovery.append({"slot": slot.slot_number, "skipped": "login_session_lock_held"})
+                    continue
+                try:
+                    check = await verify_stored_session(manager, slot, playwright_browser_factory)
+                finally:
+                    await lock.release()
+                if not check.get("alive"):
+                    await manager.mark_needs_human_login(slot.slot_number, "stall watchdog probe failed")
+            recovery.append(await recover_slot(db, manager, slot))
+        from scraper.tasks.celery_app import app
 
-            app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
-            await notify(
-                db,
-                level="warning",
-                code="PLS_HARVEST_STALLED",
-                message=f"PakistanLawSite citation grid stalled with {grid_rows_remaining(cfg)} rows remaining; slots probed and harvest requeued",
-                source_name=SOURCE_NAME,
-            )
-            watch["stalled"] = True
-            watch["stalled_at"] = now.isoformat()
-        else:
-            watch["signature"] = sig
-            watch["checked_at"] = now.isoformat()
-            watch["stalled"] = False
+        app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
+        watch["recovery"], watch["signature_at"] = recovery, now.isoformat()
         await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
         await db.commit()
-        return {"stalled": stalled, "rows_remaining": grid_rows_remaining(cfg), "judgments": total_j}
+        result["recovery"] = recovery
+        return result
 
 
 async def reset_retired_pls_search_map_frontier_db(db) -> int:
@@ -160,6 +194,21 @@ async def reset_retired_pls_search_map_frontier_db(db) -> int:
         )
         .values(status="pending", last_error=None)
     )
+    return int(result.rowcount or 0)
+
+
+async def reset_retired_pls_frontier_without_reason_db(db, *, dry_run: bool = False) -> int:
+    """Retired rows that were never run (last_run_at null) and carry no last_error were not retired by the crawler.
+    Put them back to pending; the model guard makes sure this can no longer be produced by the ORM."""
+    cond = (
+        CrawlFrontier.source_name == SOURCE_NAME,
+        CrawlFrontier.status == "retired",
+        or_(CrawlFrontier.last_error.is_(None), CrawlFrontier.last_error == "", CrawlFrontier.last_error == RETIRED_WITHOUT_REASON),
+        CrawlFrontier.last_run_at.is_(None),
+    )
+    if dry_run:
+        return int((await db.execute(select(func.count()).select_from(CrawlFrontier).where(*cond))).scalar() or 0)
+    result = await db.execute(update(CrawlFrontier).where(*cond).values(status="pending", last_error=None, attempts=0))
     return int(result.rowcount or 0)
 
 

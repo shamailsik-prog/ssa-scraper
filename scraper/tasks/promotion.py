@@ -54,6 +54,7 @@ from scraper.models import (
     StatutesStaging,
 )
 from scraper.parsers.bench_parser import normalise_judge_name
+from scraper.parsers.case_metadata import parse_case_metadata
 from scraper.parsers.citation_extractor import canonicalise_statute_name, extract_citations, normalise_citation
 from scraper.parsers.statute_parser import is_short_title_clause, looks_like_fragment_name
 
@@ -199,6 +200,12 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     if not cits:
         await _quarantine(db, st, "no citation supported by source", "judgment")
         return "quarantined"
+    if st.source_name == "PakistanLawSite":
+        # A PLS judgment page carries exactly one reporter citation: the one its grid row names, which
+        # the extractor puts first. Any other citation found in the top of the page is a case cited in
+        # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
+        # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
+        cits = cits[:1]
     full_text = strip_leading_judgment_chrome(st.raw_text or "")
     if full_text != (st.raw_text or ""):
         st.raw_text = full_text
@@ -216,7 +223,9 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     # dedupe by identity and by content
     existing = (await db.execute(select(Judgment).where((Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)))).scalars().first()
     if existing is None:
-        alt = (await db.execute(select(Citation).where(Citation.citation_string.in_(cits)))).scalars().first()
+        # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
+        # just means that string is not ours to attach: drop it and promote under the canonical one.
+        alt = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
         if alt is not None:
             existing = (await db.execute(select(Judgment).where(Judgment.id == alt.judgment_id))).scalars().first()
             if existing is not None and existing.full_text_hash != text_hash and existing.canonical_citation != canonical:
@@ -327,7 +336,11 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                     db.add(Citation(judgment_id=existing.id, citation_string=c, raw_string=c, reporter=parts["reporter"], year=parts["year"], page=parts["page"], is_primary=False, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
         await db.flush()
         return "duplicate"
+    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     j = Judgment(
+        docket_number=meta.docket_number if meta else None,
+        petitioner=meta.petitioner if meta else None,
+        respondent=meta.respondent if meta else None,
         canonical_citation=canonical,
         case_title=(data.get("case_title") or None),
         court_id=court.id if court else None,
@@ -341,7 +354,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         page_number=parts["page"],
         full_text=full_text,
         full_text_hash=text_hash,
-        headnotes=data.get("headnotes"),
+        headnotes=(data.get("headnotes") or (meta.headnotes if meta else None)),
         statutes_cited=data.get("statutes_cited") or [],
         citations_cited=data.get("citations_cited") or [],
         access_method=st.access_method,
@@ -374,7 +387,40 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     st.promoted_to_id = j.id
     db.add(EmbeddingQueue(record_id=j.id, table_name="judgment", access_method=st.access_method, embedding_model=settings.EMBEDDING_MODEL, embedding_dimensions=settings.EMBEDDING_DIM))
     await db.flush()
+    await _supersede_quarantine(db, st, j)
     return "promoted"
+
+
+async def _supersede_quarantine(db: AsyncSession, st: ScraperStaging, judgment: Judgment) -> int:
+    """A judgment was promoted from `st`: earlier quarantined captures of the same citation (a stub,
+    an error page, a headnote-only page fetched before the full page) are superseded. Close their
+    review-queue entries so the queue only holds work that still needs a person."""
+    cit = st.extracted_citation or judgment.canonical_citation
+    others = (
+        await db.execute(
+            select(ScraperStaging).where(
+                ScraperStaging.source_name == st.source_name,
+                ScraperStaging.extracted_citation == cit,
+                ScraperStaging.status == "quarantined",
+                ScraperStaging.id != st.id,
+            )
+        )
+    ).scalars().all()
+    closed = 0
+    for old in others:
+        old.status = "duplicate"
+        old.promoted_to_id = judgment.id
+        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == old.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+        for item in items:
+            item.reviewed = True
+            item.reviewed_by = "system"
+            item.reviewed_at = datetime.now(timezone.utc)
+            item.resolution = "promoted"
+            item.resolution_notes = f"superseded: {cit} was promoted from a later capture"
+            closed += 1
+    if others:
+        await db.flush()
+    return closed
 
 
 # --------------------------------------------------------------------------- statutes / instruments

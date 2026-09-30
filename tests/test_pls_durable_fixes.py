@@ -1,0 +1,277 @@
+"""Regression tests for the 2026-09-30 audit: promotion stall (saturation, stalled alarm, canonical citation),
+metadata, mirror backlog/determinism/lag, embedding health and the frontier retire guard."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import select
+
+from scraper.models import (
+    RETIRED_WITHOUT_REASON,
+    ArchiveObject,
+    ArchiveTarget,
+    CrawlFrontier,
+    EmbeddingQueue,
+    Judgment,
+    Notification,
+    ScraperSource,
+)
+from scraper.parsers.bench_parser import parse_bench
+from scraper.parsers.case_metadata import parse_case_metadata
+from scraper.pls_grid_health import (
+    compute_stalled,
+    dispatch_saturated,
+    grid_rows_remaining,
+    grid_saturation_view,
+    lap_update,
+)
+
+NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+
+HEADER = """1990 C L C 1205
+[Peshawar]
+Before Muhammad Bashir Khan Jehangiri, J
+Mst. KAUSAR BIBI\u2011\u2011\u2011Petitioner
+versus
+MUHAMMAD MUSHTAQ and 6 others\u2011\u2011\u2011Respondents
+Civil Revision No.329 of 1989, decided on 22nd November, 1989.
+(a) Civil Procedure Code (V of 1908)\u2011\u2011\u2011S. 12(2)\u2011\u2011\u2011Fraud.
+
+JUDGMENT
+The facts are these.
+"""
+
+
+# ------------------------------------------------------------------ stalled alarm
+def test_stalled_true_after_threshold_without_new_judgment():
+    v = compute_stalled(last_promotion_at=NOW - timedelta(hours=31), now=NOW, threshold_hours=6)
+    assert v["stalled"] is True and v["stalled_reason"] == "no_output_while_harvesting"
+    assert v["hours_since_last_judgment"] == 31.0
+
+
+def test_stalled_false_when_recent():
+    assert compute_stalled(last_promotion_at=NOW - timedelta(hours=1), now=NOW, threshold_hours=6)["stalled"] is False
+
+
+def test_stalled_reason_saturated_and_paused():
+    old = NOW - timedelta(hours=40)
+    assert compute_stalled(last_promotion_at=old, now=NOW, threshold_hours=6, saturation={"all_saturated": True})["stalled_reason"] == "grid_saturated"
+    assert compute_stalled(last_promotion_at=old, now=NOW, threshold_hours=6, harvest_paused=True)["stalled_reason"] == "harvest_paused"
+
+
+def test_stalled_when_never_promoted():
+    assert compute_stalled(last_promotion_at=None, now=NOW, threshold_hours=6)["stalled"] is True
+
+
+# ------------------------------------------------------------------ saturation
+def _window(**kw):
+    base = {"rows": 0, "in_shard": 0, "fetched": 0, "staged": 0, "known": 0, "staged_skips": 0, "url_less": 0, "grid_duplicates": 0}
+    base.update(kw)
+    return base
+
+
+def test_full_lap_without_staging_marks_saturated_and_new_staging_clears():
+    cur = {}
+    lap_update(cur, total_rows=100, window=_window(rows=60, known=60), now=NOW)
+    assert "saturated_at" not in cur
+    lap_update(cur, total_rows=100, window=_window(rows=40, known=40), now=NOW)
+    assert cur["saturated_at"] and "full lap of 100 rows staged 0 new" in cur["saturated_reason"]
+    lap_update(cur, total_rows=100, window=_window(rows=10, staged=1), now=NOW)
+    assert "saturated_at" not in cur
+
+
+def test_lap_with_staging_is_not_saturated():
+    cur = {}
+    lap_update(cur, total_rows=50, window=_window(rows=50, staged=2), now=NOW)
+    assert "saturated_at" not in cur
+
+
+def test_saturated_shard_is_not_dispatched_until_recheck_due():
+    cfg = {"citation_grid_cursor_shard_1": {"saturated_at": (NOW - timedelta(hours=1)).isoformat(), "row_offset": 5, "last_total_rows": 100}}
+    assert dispatch_saturated(cfg, 1, now=NOW) is True
+    assert dispatch_saturated(cfg, 1, now=NOW + timedelta(hours=20)) is False
+    assert dispatch_saturated(cfg, 0, now=NOW) is False
+
+
+def test_grid_rows_remaining_is_not_summed_across_shards():
+    cfg = {
+        "citation_grid_cursor_shard_0": {"row_offset": 8000, "last_total_rows": 20568},
+        "citation_grid_cursor_shard_1": {"row_offset": 100, "last_total_rows": 20568},
+    }
+    assert grid_rows_remaining(cfg, now=NOW) == 20468  # was 32,336 (sum) on the droplet
+    cfg["citation_grid_cursor_shard_1"]["saturated_at"] = NOW.isoformat()
+    assert grid_rows_remaining(cfg, now=NOW) == 12568
+    assert grid_saturation_view(cfg, now=NOW)["all_saturated"] is False
+
+
+# ------------------------------------------------------------------ metadata
+def test_case_metadata_from_real_header():
+    m = parse_case_metadata(HEADER)
+    assert m.petitioner == "Mst. KAUSAR BIBI"
+    assert m.respondent == "MUHAMMAD MUSHTAQ and 6 others"
+    assert m.docket_number == "Civil Revision No.329 of 1989"
+    assert m.headnotes and "Civil Procedure Code" in m.headnotes
+
+
+def test_case_metadata_absent_values_stay_none():
+    m = parse_case_metadata("JUDGMENT\nnothing structured here")
+    assert m.petitioner is None and m.respondent is None and m.docket_number is None
+
+
+def test_ocr_judge_name_digit_is_repaired():
+    from scraper.parsers.bench_parser import _split_names
+
+    assert "Ilyas Khan" in _split_names("1lyas Khan, J")[0] or "Ilyas Khan" in " ".join(_split_names("1lyas Khan, J"))
+
+
+# ------------------------------------------------------------------ frontier guard
+async def test_retired_frontier_row_always_records_a_reason(db):
+    fr = CrawlFrontier(source_name="PakistanLawSite", tier=2, query_key="k1", query_json={}, status="pending")
+    db.add(fr)
+    await db.commit()
+    fr.status = "retired"
+    await db.commit()
+    await db.refresh(fr)
+    assert fr.last_error == RETIRED_WITHOUT_REASON
+    fr.last_error = "search map cannot express this query"
+    await db.commit()
+    await db.refresh(fr)
+    assert fr.last_error.startswith("search map")
+
+
+async def test_reset_retired_without_reason_only_touches_never_run_rows(db):
+    from scraper.tasks.pls_self_healing import reset_retired_pls_frontier_without_reason_db
+
+    never = CrawlFrontier(source_name="PakistanLawSite", tier=2, query_key="never", query_json={}, status="retired", last_error=RETIRED_WITHOUT_REASON)
+    ran = CrawlFrontier(source_name="PakistanLawSite", tier=2, query_key="ran", query_json={}, status="retired", last_error="zero yield", last_run_at=NOW)
+    ran_no_err = CrawlFrontier(source_name="PakistanLawSite", tier=2, query_key="ran2", query_json={}, status="retired", last_error=RETIRED_WITHOUT_REASON, last_run_at=NOW)
+    db.add_all([never, ran, ran_no_err])
+    await db.commit()
+    assert await reset_retired_pls_frontier_without_reason_db(db, dry_run=True) == 1
+    assert await reset_retired_pls_frontier_without_reason_db(db) == 1
+    await db.commit()
+    await db.refresh(never)
+    await db.refresh(ran)
+    assert never.status == "pending" and never.last_error is None and ran.status == "retired"
+
+
+# ------------------------------------------------------------------ evaluate_pls_stall
+async def test_evaluate_pls_stall_alarms_once_and_recovers(db):
+    from scraper.tasks.pls_self_healing import evaluate_pls_stall
+
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    src.state = "ACTIVE"
+    db.add(Judgment(canonical_citation="2020 CLC 1", full_text="x" * 10, full_text_hash="h1", source_name="PakistanLawSite", promoted_at=NOW - timedelta(hours=30)))
+    await db.commit()
+    v = await evaluate_pls_stall(db, src, now=NOW)
+    await db.commit()
+    assert v["stalled"] is True
+    v2 = await evaluate_pls_stall(db, src, now=NOW + timedelta(minutes=10))
+    await db.commit()
+    alarms = (await db.execute(select(Notification).where(Notification.code == "PLS_NO_NEW_JUDGMENTS"))).scalars().all()
+    assert len(alarms) == 1 and v2["stalled"] is True
+    db.add(Judgment(canonical_citation="2020 CLC 2", full_text="y" * 10, full_text_hash="h2", source_name="PakistanLawSite", promoted_at=NOW + timedelta(minutes=11)))
+    await db.commit()
+    v3 = await evaluate_pls_stall(db, src, now=NOW + timedelta(minutes=12))
+    await db.commit()
+    assert v3["stalled"] is False
+    await db.refresh(alarms[0])
+    assert alarms[0].acknowledged is True
+
+
+# ------------------------------------------------------------------ mirror
+async def _mk_judgments(db, n):
+    js = []
+    for i in range(n):
+        j = Judgment(
+            canonical_citation=f"2021 CLC {1000 + i}",
+            full_text=f"JUDGMENT body {i}\n" * 50,
+            full_text_hash=f"hash{i}",
+            source_name="PakistanLawSite",
+            access_method="public",
+            promoted_at=NOW - timedelta(hours=n - i),
+            case_title=f"A v B {i}",
+        )
+        db.add(j)
+        js.append(j)
+    await db.commit()
+    return js
+
+
+async def test_mirror_backlog_pass_reaches_old_judgments(db, tmp_path, monkeypatch):
+    from scraper.storage.archive import ArchiveMirror
+
+    js = await _mk_judgments(db, 8)
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a")))
+    await db.commit()
+    # newest window is 2 rows, backlog takes 3 more per run: 8 rows need 2 runs, none is left behind
+    await ArchiveMirror(db).mirror_pending(limit=2, backlog_limit=3)
+    await db.commit()
+    first = len({o.judgment_id for o in (await db.execute(select(ArchiveObject).where(ArchiveObject.judgment_id.isnot(None)))).scalars().all()})
+    assert first == 5
+    await ArchiveMirror(db).mirror_pending(limit=2, backlog_limit=3)
+    await db.commit()
+    done = {o.judgment_id for o in (await db.execute(select(ArchiveObject).where(ArchiveObject.judgment_id.isnot(None)))).scalars().all()}
+    assert done == {j.id for j in js}
+    lag = await ArchiveMirror(db).lag((await db.execute(select(ArchiveTarget))).scalars().first())
+    assert lag["judgments_unmirrored"] == 0
+
+
+async def test_rendered_copy_is_byte_stable_across_runs(db):
+    from scraper.storage.archive import ArchiveMirror
+
+    (j,) = await _mk_judgments(db, 1)
+    m = ArchiveMirror(db)
+    a = [o for o in await m.judgment_objects(j) if o["kind"] == "rendered_copy"][0]["data"]
+    b = [o for o in await m.judgment_objects(j) if o["kind"] == "rendered_copy"][0]["data"]
+    assert a == b
+
+
+async def test_mirror_lag_alert_raised_once_then_cleared(db, tmp_path, monkeypatch):
+    from scraper.config import settings
+    from scraper.storage.archive import ArchiveMirror
+
+    monkeypatch.setattr(settings, "MIRROR_LAG_ALERT_HOURS", 3)
+    await _mk_judgments(db, 2)
+    t = ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a"))
+    db.add(t)
+    await db.commit()
+    assert await ArchiveMirror(db).alert_on_lag() == ["ARCHIVE_MIRROR_LAG:local"]
+    assert await ArchiveMirror(db).alert_on_lag() == []
+    await ArchiveMirror(db).mirror_pending(limit=10, backlog_limit=10)
+    await db.commit()
+    await ArchiveMirror(db).alert_on_lag()
+    await db.commit()
+    open_ = (await db.execute(select(Notification).where(Notification.code == "ARCHIVE_MIRROR_LAG", Notification.acknowledged.is_(False)))).scalars().all()
+    assert open_ == []
+
+
+# ------------------------------------------------------------------ embeddings
+async def test_embedding_health_reports_blocker_and_stall(db, monkeypatch):
+    from scraper.config import settings
+    from scraper.tasks.embedding_health import embedding_health
+
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(settings, "EMBED_QUEUE_ALERT_HOURS", 6)
+    (j,) = await _mk_judgments(db, 1)
+    q = EmbeddingQueue(record_id=j.id, table_name="judgments", access_method="login_session", status="pending")
+    db.add(q)
+    await db.commit()
+    q.created_at = NOW - timedelta(hours=20)
+    await db.commit()
+    h = await embedding_health(db, now=NOW)
+    assert h["pending"] == 1 and h["stalled"] is True
+    assert any("OPENAI_API_KEY" in b for b in h["blockers"])
+
+
+# ------------------------------------------------------------------ /status
+def test_status_exposes_stalled_fields(client):
+    r = client.get("/status.json")
+    assert r.status_code == 200
+    body = r.json()
+    assert "stalled" in body and "stalled_reason" in body
+    assert "stalled" in body["pakistanlawsite"] and "grid_saturation" in body["pakistanlawsite"]
+    assert "embeddings" in body

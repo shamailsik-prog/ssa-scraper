@@ -21,12 +21,69 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--dry-run", action="store_true")
     gap = sub.add_parser("search-harvest-gap-report", help="JSON gap report (site total vs rows_known)")
     gap.add_argument("--limit", type=int, default=200)
+    ext = sub.add_parser("search-harvest-plan-extended", help="Seed court/judge/statute/keyword/party x year queries")
+    ext.add_argument("--dry-run", action="store_true")
+    ext.add_argument("--keyword", action="append", default=[])
+    ext.add_argument("--party", action="append", default=[])
+    snow = sub.add_parser("search-harvest-snowball", help="Queue citations found inside downloaded judgments that are not yet in the corpus")
+    snow.add_argument("--dry-run", action="store_true")
+    snow.add_argument("--limit", type=int, default=2000)
+    sub.add_parser("search-harvest-completeness", help="Completeness proof: queue state, capped jobs, page-continuity holes, known-citation test")
     run = sub.add_parser("search-harvest-run", help="Run one search harvest query (login session lock)")
     run.add_argument("--query-key", default="")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--max-pages", type=int, default=0)
     run.add_argument("--priority-gaps", action="store_true")
+    sub.add_parser("reset-retired-frontier-no-reason", help="Reset never-run frontier rows that were retired with no last_error").add_argument("--dry-run", action="store_true")
+    meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
+    meta.add_argument("--dry-run", action="store_true")
+    meta.add_argument("--limit", type=int, default=None)
+    req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
+    req.add_argument("--dry-run", action="store_true")
+    req.add_argument("--limit", type=int, default=2000)
+    sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
     args = parser.parse_args(argv)
+    if args.command == "reset-retired-frontier-no-reason":
+        from scraper.database import SessionLocal
+        from scraper.tasks.pls_self_healing import reset_retired_pls_frontier_without_reason_db
+
+        async def go():
+            async with SessionLocal() as db:
+                n = await reset_retired_pls_frontier_without_reason_db(db, dry_run=args.dry_run)
+                if not args.dry_run:
+                    await db.commit()
+                return n
+
+        print({"would_reset" if args.dry_run else "reset": run_async(go())})
+        return 0
+    if args.command == "backfill-metadata":
+        from scraper.tasks.pls_backfill import run_backfill_metadata
+
+        print(run_async(run_backfill_metadata(dry_run=args.dry_run, limit=args.limit)))
+        return 0
+    if args.command == "requalify-quarantine":
+        from scraper.tasks.pls_backfill import run_requalify
+
+        print(run_async(run_requalify(dry_run=args.dry_run, limit=args.limit)))
+        return 0
+    if args.command == "grid-report":
+        import json
+
+        from sqlalchemy import select as sa_select
+
+        from scraper.database import SessionLocal
+        from scraper.models import ScraperSource
+        from scraper.pls_accounting import grid_accounting
+
+        async def report():
+            async with SessionLocal() as db:
+                src = (await db.execute(sa_select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+                cfg = (src.config_json or {}) if src else {}
+                total = max([int((cfg.get(k) or {}).get("last_total_rows") or 0) for k in ("citation_grid_cursor", "citation_grid_cursor_shard_0", "citation_grid_cursor_shard_1")] or [0])
+                return await grid_accounting(db, total_rows=total)
+
+        print(json.dumps(run_async(report()), indent=2))
+        return 0
     if args.command == "reset-retired-frontier":
         if args.dry_run:
             from sqlalchemy import func, select
@@ -54,6 +111,18 @@ def main(argv: list[str] | None = None) -> int:
         result = run_async(reset_retired_pls_search_map_frontier())
         print(result)
         return 0
+    if args.command == "search-harvest-plan-extended":
+        from scraper.tasks.pls_search_harvest import cli_extended_plan
+
+        return cli_extended_plan((["--dry-run"] if args.dry_run else []) + [x for k in args.keyword for x in ("--keyword", k)] + [x for p_ in args.party for x in ("--party", p_)])
+    if args.command == "search-harvest-snowball":
+        from scraper.tasks.pls_search_harvest import cli_snowball
+
+        return cli_snowball((["--dry-run"] if args.dry_run else []) + ["--limit", str(args.limit)])
+    if args.command == "search-harvest-completeness":
+        from scraper.tasks.pls_search_harvest import cli_completeness
+
+        return cli_completeness([])
     if args.command == "search-harvest-plan":
         from scraper.tasks.pls_search_harvest import cli_plan
 
