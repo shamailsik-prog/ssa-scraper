@@ -85,7 +85,7 @@ for _reporter in KNOWN_REPORTERS:
 
 
 QUARANTINE_REFETCH_MAX = 3
-PLS_STUB_PAGE_MAX_CHARS = 3000  # a capture shorter than this is an error, stub or empty page
+PLS_STUB_PAGE_MAX_BYTES = 3000  # a capture smaller than this (octet_length) is an error, stub or empty page
 # quarantined on the merits (a real citation conflict or a human decision): never fetched again
 _FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|reviewed|rejected")
 _RETRYABLE_QUARANTINE = re.compile(
@@ -106,7 +106,7 @@ def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int]
     if _RETRYABLE_QUARANTINE.search(reason or ""):
         return True
     # no recognised reason: a short capture is an error/empty page, a long one was judged on its merits
-    return (text_len or 0) < PLS_STUB_PAGE_MAX_CHARS
+    return (text_len or 0) < PLS_STUB_PAGE_MAX_BYTES
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -1036,7 +1036,7 @@ class PakistanLawSitePipeline:
                 "absolute_row_index": snapshot_start_row + row_idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
-            refetch_ids = refetch_staging_ids.get(citation_norm) or refetch_staging_ids.get(citation_key) or []
+            refetch_ids = list({*refetch_staging_ids.get(citation_norm, []), *refetch_staging_ids.get(citation_key, [])})
             if refetch_ids:
                 # Count the attempt before fetching, whatever comes back: a page whose bytes change on every
                 # fetch creates a new staging row each time and would otherwise be refetched on every lap.
@@ -1045,7 +1045,7 @@ class PakistanLawSitePipeline:
                     old_route = dict(old_st.route_json or {})
                     old_route["refetch_count"] = int(old_route.get("refetch_count") or 0) + 1
                     old_st.route_json = old_route
-                await self.db.flush()
+                await self.db.commit()  # committed now: a fetch that raises must still use up an attempt
             detail = await self.fetch_detail(detail_url)
             detail_attempts += 1
             result_kind = await self.preserve_and_extract(detail, route, row)
