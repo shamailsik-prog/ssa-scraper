@@ -17,6 +17,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Ordered assemble (avoid glob picking junk like part_00 / SHA256S)
+          cat patches/b64_00 patches/b64_01 \
+              patches/b64_02a patches/b64_02b \
+              patches/b64_03a patches/b64_03b \
+              patches/b64_04a patches/b64_04b \
+              patches/b64_05a patches/b64_05b \
+              patches/b64_06a patches/b64_06b \
+              patches/b64_07a patches/b64_07b \
+            | base64 -d > patches/00-dashboard-form.patch
           cd patches && sha256sum -c SHA256S && cd ..
           git fetch origin main
           git checkout -B work origin/main
