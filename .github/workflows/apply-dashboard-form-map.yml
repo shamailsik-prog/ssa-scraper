@@ -1,0 +1,32 @@
+name: apply-dashboard-form-map
+on:
+  push:
+    branches: ["apply/pls-dashboard-form-map"]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: verify patch, apply onto main, force-push fix branch, open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd patches && sha256sum -c SHA256S && cd ..
+          git fetch origin main
+          git checkout -B work origin/main
+          git apply --index patches/00-dashboard-form.patch
+          git config user.name "grok-bot"
+          git config user.email "shamailsik@gmail.com"
+          git commit -m "fix(pls): map dashboard Citation Search panel for journals×years harvest"
+          git push -f origin HEAD:refs/heads/fix/pls-dashboard-citation-form-map
+          if gh pr view fix/pls-dashboard-citation-form-map --repo shamailsik-prog/ssa-scraper >/dev/null 2>&1; then
+            gh pr view fix/pls-dashboard-citation-form-map --repo shamailsik-prog/ssa-scraper --json url -q .url
+          else
+            gh pr create --repo shamailsik-prog/ssa-scraper --base main --head fix/pls-dashboard-citation-form-map --title "fix(pls): map dashboard Citation Search panel for journals×years harvest" --body "## Summary\n- Map live /Login/Check formless Citation Search controls as query_form with reporter×year.\n- Keep #archivedpatientGrid row_selector so citation-grid harvest remains default.\n- Search harvest opens dashboard panel, submits, waits for AJAX results.\n- Preserve dashboard fields across grid remaps; pls_admin remap-search-form.\n\n## Test plan\n- [x] unit tests/test_dashboard_citation_form_map.py\n- [x] live droplet map v203 query_form; dry-run harvest SCMR|2026"
+          fi
