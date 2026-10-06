@@ -1252,8 +1252,8 @@ class PlaywrightBrowser:
                 await self._wrap(
                     self._page.wait_for_function(
                         """() => {
-                          if (document.querySelector('#archivedpatientGrid')) return true;
-                          const rm = document.querySelector('#rightmenu');
+                          if (document.getElementById('archivedpatientGrid')) return true;
+                          const rm = document.getElementById('rightmenu');
                           if (!rm) return false;
                           const text = (rm.innerText || '').trim();
                           if (/no more result found/i.test(text)) return true;
