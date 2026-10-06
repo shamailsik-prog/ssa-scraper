@@ -37,6 +37,7 @@ from scraper.config import settings
 from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
 from scraper.security import (
+    DNSUnavailable,
     ExplicitBlock,
     URLPolicyError,
     VerificationRequired,
@@ -1149,6 +1150,8 @@ class PlaywrightBrowser:
         referer = (kwargs.get("referer") or "").strip() or None
         try:
             url = self._assert_url_policy(url)
+        except DNSUnavailable as exc:
+            raise BrowserDisconnected(str(exc)) from exc
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         goto_kwargs: Dict[str, Any] = {
@@ -1160,6 +1163,8 @@ class PlaywrightBrowser:
         resp = await self._wrap(self._page.goto(url, **goto_kwargs))
         try:
             self._assert_url_policy(self._page.url)
+        except DNSUnavailable as exc:
+            raise BrowserDisconnected(str(exc)) from exc
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         try:
@@ -1273,11 +1278,15 @@ class PlaywrightBrowser:
     async def download(self, url: str) -> bytes:
         try:
             url = self._assert_url_policy(url)
+        except DNSUnavailable as exc:
+            raise BrowserDisconnected(str(exc)) from exc
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         resp = await self._wrap(self._context.request.get(url))
         try:
             self._assert_url_policy(resp.url)
+        except DNSUnavailable as exc:
+            raise BrowserDisconnected(str(exc)) from exc
         except URLPolicyError as exc:
             raise ExplicitBlock("url_policy", str(exc)) from exc
         if resp.status >= 400:

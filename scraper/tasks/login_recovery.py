@@ -20,7 +20,11 @@ login or only throttled the account is not known at that moment. This Beat task 
    human and the next automatic attempt is two hours away. Without saved credentials the attempt
    backs off (15, 30, 60 minutes, then hourly) and a human login from the dashboard restores it.
 
-An explicit block (HTTP 403/429/451 or a block page) halts the source as it always has. Attempts
+An explicit block (HTTP 403/429/451 or a block page) halts the source as it always has. One halt is
+released here: before 6 October 2026 a failed DNS lookup of the site's own host was reported as the
+host "resolving to a private address" and halted the slot for good (slot 1 on 30 September). Such a
+slot is moved back to NEEDS_HUMAN_LOGIN once the host resolves to public addresses again; a host that
+really resolves to a private address keeps the slot halted. Attempts
 are recorded in the source's config_json under `slot_recovery_<n>` (never credentials or cookie
 values); credentials are never logged or returned by any API.
 """
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
@@ -50,6 +55,8 @@ from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
 
 logger = logging.getLogger(__name__)
+
+_DNS_HALT_RE = re.compile(r"^url_policy: host (\S+) resolves to a private, loopback, link-local or metadata address")
 
 BACKOFF_MINUTES = (15, 30, 60)
 SOURCE_RESUME_COOLDOWN_MINUTES = 15
@@ -253,6 +260,33 @@ async def _wait_for_human(db, source, slot, key, record, attempts, now, what: st
     return {**(outcome or {"attempt": attempts}), "verification": True, "next_attempt_at": _iso(next_attempt)}
 
 
+async def release_dns_halt(db, manager: SessionManager, slot: BrowserSessionSlot, *, resolver=None) -> Optional[bool]:
+    """None when the slot is not halted by the url_policy address guard; else whether it was released.
+
+    The guard's message did not tell a failed lookup from a private address, so the halt is released
+    only after the host is looked up again and every address is public."""
+    from scraper.security import resolve_is_safe
+
+    m = _DNS_HALT_RE.match(slot.state_reason or "") if slot.state == "HALTED" else None
+    if m is None:
+        return None
+    host = m.group(1)
+    if not resolve_is_safe(host, resolver=resolver):
+        return False
+    slot.state = "NEEDS_HUMAN_LOGIN"
+    slot.halted_at = None
+    slot.state_reason = f"released from url_policy halt: {host} resolves to public addresses again (the halt was most likely a failed DNS lookup)"
+    await db.flush()
+    await notify(
+        db,
+        level="info",
+        code="SLOT_RELEASED",
+        message=f"slot {slot.slot_number}: {slot.state_reason}",
+        source_name=manager.source.source_name,
+    )
+    return True
+
+
 async def recover_slot(
     db,
     manager: SessionManager,
@@ -271,6 +305,9 @@ async def recover_slot(
         if record:
             await merge_source_config(db, source, {key: {}})
         return {"skipped": "ACTIVE"}
+    released = await release_dns_halt(db, manager, slot)
+    if released is False:
+        return {"skipped": "HALTED: host still does not resolve to public addresses"}
     if slot.state not in ("NEEDS_HUMAN_LOGIN", "EMPTY"):
         return {"skipped": slot.state}
     if not settings.LOGIN_AUTO_RECOVER:
