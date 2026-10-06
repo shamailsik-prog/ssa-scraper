@@ -134,7 +134,9 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
         if reason:
             return reason
     elif (search_map.get("surface") or (search_map.get("limits") or {}).get("surface")) == "grid_surface_no_query_form":
-        return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
+        fields = search_map.get("fields") or {}
+        if not any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no")):
+            return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     fields = search_map.get("fields") or {}
     if query_json.get("court") and "court" not in fields:
         return "search map cannot express court filter; missing role: court"
