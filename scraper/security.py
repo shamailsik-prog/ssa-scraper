@@ -35,6 +35,11 @@ class URLPolicyError(ValueError):
     """Raised when a URL may not be followed."""
 
 
+class DNSUnavailable(URLPolicyError):
+    """The host's name could not be looked up at all. Unlike a host that resolves to a private address,
+    this is a passing network fault: callers retry instead of treating it as a block."""
+
+
 class ExplicitBlock(RuntimeError):
     """Raised when the source has explicitly blocked access. Caller must HALT, never evade."""
 
@@ -145,7 +150,7 @@ def is_private_address(ip: str) -> bool:
     )
 
 
-def resolve_is_safe(host: str, resolver=None) -> bool:
+def resolve_is_safe(host: str, resolver=None, *, raise_on_dns_failure: bool = False) -> bool:
     if not host or host in METADATA_HOSTS:
         return False
     try:
@@ -160,8 +165,12 @@ def resolve_is_safe(host: str, resolver=None) -> bool:
         addresses = resolver(host)
     except Exception as exc:
         logger.warning("DNS resolution failed for %s: %s", host, exc)
+        if raise_on_dns_failure:
+            raise DNSUnavailable(f"DNS lookup for {host} failed: {exc}") from exc
         return False
     if not addresses:
+        if raise_on_dns_failure:
+            raise DNSUnavailable(f"DNS lookup for {host} returned no address")
         return False
     return all(not is_private_address(ip) for ip in addresses)
 
@@ -193,7 +202,7 @@ def check_url_policy(
         raise URLPolicyError(f"metadata service destination refused: {host}")
     if not (host_in_allow_list(host, allow_list) or host_in_allow_list(host, document_cdn_hosts)):
         raise URLPolicyError(f"host {host} is outside the source allow-list")
-    if not allow_private_for_tests and not resolve_is_safe(host, resolver=resolver):
+    if not allow_private_for_tests and not resolve_is_safe(host, resolver=resolver, raise_on_dns_failure=True):
         raise URLPolicyError(f"host {host} resolves to a private, loopback, link-local or metadata address")
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, ""))
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlsplit
@@ -96,6 +97,62 @@ def discover_citation_search_entrypoints(html: str, base_url: str) -> List[Dict[
             if "statue" in low or "citation" in low or "search" in low:
                 add("ajax", path, path)
     return found
+
+
+ROUTE_CENSUS_EVERY_SECONDS = 3600.0
+ROUTE_CENSUS_MAX = 120
+_route_census_logged_at = 0.0
+
+
+def dashboard_route_census(html: str, base_url: str) -> Dict[str, List[str]]:
+    """Every same-site path the authenticated dashboard links to, posts a form to or names in a script,
+    plus each form's field names. Paths only: query strings and fragments are dropped and no field
+    value is read, so a session token in a link or hidden field never reaches the log."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    host = urlsplit(base_url).netloc.lower()
+    paths: set = set()
+
+    def add(href: str) -> None:
+        href = (href or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return
+        parts = urlsplit(urljoin(base_url, href))
+        if parts.scheme in ("http", "https") and parts.netloc.lower() == host and parts.path:
+            paths.add(parts.path)
+
+    for tag in soup.find_all(["a", "area"], href=True):
+        add(str(tag.get("href") or ""))
+    forms: List[str] = []
+    for form in soup.find_all("form"):
+        action = str(form.get("action") or "")
+        add(action)
+        names = sorted({str(f.get("name")) for f in form.find_all(["input", "select", "textarea"]) if f.get("name")})
+        forms.append(f"{form.get('method') or 'get'} {urlsplit(urljoin(base_url, action)).path or '(this page)'} fields={','.join(names)}")
+    for script in soup.find_all("script"):
+        body = script.string or script.get_text() or ""
+        for match in re.finditer(r"""['"](/[A-Za-z][A-Za-z0-9_/.-]*)['"]""", body):
+            add(match.group(1))
+        for match in re.finditer(r"""url\s*:\s*['"]([^'"]+)['"]""", body, flags=re.IGNORECASE):
+            add(match.group(1))
+    return {"paths": sorted(paths)[:ROUTE_CENSUS_MAX], "forms": forms[:20]}
+
+
+def log_dashboard_route_census(html: str, base_url: str, *, now: Optional[float] = None) -> Optional[Dict[str, List[str]]]:
+    """Log the dashboard's route census at most once an hour per worker process (the per-journal
+    and search harvests need a surface other than the exhausted citation table; this shows which)."""
+    global _route_census_logged_at
+    now = time.monotonic() if now is None else now
+    if _route_census_logged_at and now - _route_census_logged_at < ROUTE_CENSUS_EVERY_SECONDS:
+        return None
+    _route_census_logged_at = now
+    census = dashboard_route_census(html, base_url)
+    logger.info(
+        "PakistanLawSite dashboard route census: %s path(s): %s; forms: %s",
+        len(census["paths"]),
+        " ".join(census["paths"]) or "(none)",
+        " | ".join(census["forms"]) or "(none)",
+    )
+    return census
 
 
 def check_page_login_required_reason(html: str, url: str = "") -> Optional[str]:
@@ -354,6 +411,10 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
 
     base = f"{urlsplit(check_page.url or check_url).scheme}://{urlsplit(check_page.url or check_url).netloc}"
     discovery = discover_citation_search_entrypoints(check_page.html or "", base)
+    try:
+        log_dashboard_route_census(check_page.html or "", base)
+    except Exception as exc:  # a diagnostic must never stop the harvest
+        logger.debug("dashboard route census failed: %s", exc)
     nav_meta: Dict[str, Any] = {
         "check_url": check_url,
         "discovered": discovery,
