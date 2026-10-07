@@ -274,7 +274,9 @@ def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict
 
 def unmapped_query_reason(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
     surface = search_map.get("surface") or (search_map.get("limits") or {}).get("surface")
-    if surface == "grid_surface_no_query_form":
+    fields = search_map.get("fields") or {}
+    has_queryable = any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no"))
+    if surface == "grid_surface_no_query_form" and not has_queryable:
         return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     values = build_values(search_map, query, cursor)
     fields = search_map.get("fields") or {}
@@ -481,10 +483,18 @@ class PakistanLawSitePipeline:
 
     @classmethod
     def _is_citation_grid_map(cls, search_map: Dict[str, Any]) -> bool:
+        """Grid walk wins when the map names #archivedpatientGrid — even if dashboard
+        Citation Search fields are also stored for the search-harvest path."""
         row_sel = str(((search_map.get("result_layout") or {}).get("row_selector") or "")).lower()
-        if "archivedpatientgrid" not in row_sel:
-            return False
-        return not cls._has_queryable_search_fields(search_map)
+        return "archivedpatientgrid" in row_sel
+
+    @classmethod
+    def _is_dashboard_citation_fields(cls, search_map: Dict[str, Any]) -> bool:
+        fields = search_map.get("fields") or {}
+        reporter = fields.get("reporter") or {}
+        year = fields.get("year") or {}
+        sel = f"{reporter.get('selector') or ''} {year.get('selector') or ''}"
+        return "Citation_Category_Search_dropdown" in sel or "Citation_Year_Search_input" in sel
 
     @staticmethod
     def _with_compact_citation_grid_columns(search_map: Dict[str, Any]) -> Dict[str, Any]:
@@ -567,6 +577,10 @@ class PakistanLawSitePipeline:
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
                 return cached
+        prior = await active_map(self.db, SOURCE_NAME)
+        prior_dashboard_fields = None
+        if prior is not None and self._is_dashboard_citation_fields(map_as_dict(prior)):
+            prior_dashboard_fields = prior.fields
         m = await map_search_form(self.db, self.source, page.html, local_engine=self.local_engine, page_url=page.url)
         if not m.stale:
             await self.db.execute(
@@ -576,17 +590,41 @@ class PakistanLawSitePipeline:
             )
         await self.db.flush()
         mapped = map_as_dict(m)
-        if grid_surface and self._has_queryable_search_fields(mapped):
+        if grid_surface and self._has_queryable_search_fields(mapped) and not self._is_dashboard_citation_fields(mapped):
             # The full CitationSearch DOM (a failed compact snapshot returns it) carries the filter
-            # form beside the grid; mapping those inputs would flip the connector into form mode
-            # and every later job would type into fields that mean nothing (23 Sep 2026, map v28).
-            m.fields = {}
+            # form beside the grid; mapping those DataTables inputs would flip the connector into
+            # form mode and every later job would type into fields that mean nothing (23 Sep 2026, map v28).
+            m.fields = prior_dashboard_fields or {}
             layout = dict(m.result_layout or {})
             layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
             m.result_layout = layout
+            if prior_dashboard_fields:
+                limits = dict(m.limits or {})
+                limits["surface"] = "query_form"
+                limits["dashboard_citation_fields"] = True
+                m.limits = limits
+                m.stale = False
+                logger.info(
+                    "PakistanLawSite map v%s grid remap kept dashboard Citation Search fields",
+                    m.map_version,
+                )
+            else:
+                logger.info("PakistanLawSite map v%s reduced to the citation grid: the surface is the grid, not a form", m.map_version)
             await self.db.flush()
-            logger.info("PakistanLawSite map v%s reduced to the citation grid: the surface is the grid, not a form", m.map_version)
             mapped = map_as_dict(m)
+        elif grid_surface and prior_dashboard_fields and not self._has_queryable_search_fields(mapped):
+            m.fields = prior_dashboard_fields
+            layout = dict(m.result_layout or {})
+            layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
+            m.result_layout = layout
+            limits = dict(m.limits or {})
+            limits["surface"] = "query_form"
+            limits["dashboard_citation_fields"] = True
+            m.limits = limits
+            m.stale = False
+            await self.db.flush()
+            mapped = map_as_dict(m)
+            logger.info("PakistanLawSite map v%s restored dashboard Citation Search fields onto grid layout", m.map_version)
         return mapped
 
     def _citation_grid_limits(self) -> Dict[str, int]:
@@ -1305,8 +1343,32 @@ class PakistanLawSitePipeline:
 
     async def fetch_results(self, search_map: Dict[str, Any], values: Dict[str, str]) -> PageResult:
         async def op(browser: Browser) -> PageResult:
-            await open_citation_search_for_harvest(browser)
-            page = await browser.submit_search(search_map, values)
+            if self._is_dashboard_citation_fields(search_map):
+                from scraper.pls_navigation import pls_check_url
+
+                check = await browser.goto(pls_check_url())
+                raise_for_verdict(check)
+                # Reveal the Citation Search panel (hidden while Caselaw Search is selected).
+                try:
+                    await browser._wrap(
+                        browser._page.click('input.searchButton[searchtype="citation"]', timeout=10_000)
+                    )
+                except Exception:
+                    try:
+                        await browser._wrap(
+                            browser._page.evaluate(
+                                """() => {
+                                  const btn = document.querySelector('input.searchButton[searchtype="citation"]');
+                                  if (btn) btn.click();
+                                }"""
+                            )
+                        )
+                    except Exception:
+                        pass
+                page = await browser.submit_search(search_map, values, wait_for_ajax_results=True)
+            else:
+                await open_citation_search_for_harvest(browser)
+                page = await browser.submit_search(search_map, values)
             raise_for_verdict(page)
             return page
 

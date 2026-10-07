@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--max-pages", type=int, default=0)
     run.add_argument("--priority-gaps", action="store_true")
     sub.add_parser("reset-retired-frontier-no-reason", help="Reset never-run frontier rows that were retired with no last_error").add_argument("--dry-run", action="store_true")
+    remap = sub.add_parser(
+        "remap-search-form",
+        help="Remap PakistanLawSite search form from /Login/Check Citation Search panel (ACTIVE slot)",
+    )
+    remap.add_argument("--dry-run", action="store_true")
     meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
     meta.add_argument("--dry-run", action="store_true")
     meta.add_argument("--limit", type=int, default=None)
@@ -55,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
                 return n
 
         print({"would_reset" if args.dry_run else "reset": run_async(go())})
+        return 0
+    if args.command == "remap-search-form":
+        from scraper.tasks.pls_remap_search_form import run_remap_search_form
+        print(run_async(run_remap_search_form(dry_run=args.dry_run)))
         return 0
     if args.command == "backfill-metadata":
         from scraper.tasks.pls_backfill import run_backfill_metadata

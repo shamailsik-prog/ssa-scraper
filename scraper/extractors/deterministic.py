@@ -519,6 +519,61 @@ def _form_controls(form):
     return controls
 
 
+# Live /Login/Check dashboard Citation Search panel (formless AJAX controls).
+# layoutScript.js POSTs these to /Login/CitationSearch — they are not inside a <form>.
+_DASHBOARD_CITATION_ROLES = {
+    "Citation_Category_Search_dropdown": "reporter",
+    "Citation_Year_Search_input": "year",
+    "Citation_Court_Search_input": "court",
+    "Citation_Code_Or_Page_Search_input": "page",
+    "Citation_Judge_Search_input": "judge",
+    "Citation_Party_Search_input": "keyword",
+}
+
+
+def _dashboard_citation_controls(soup: BeautifulSoup):
+    """Map the authenticated dashboard Citation Search panel into field descriptors."""
+    fields = []
+    for control_id, role in _DASHBOARD_CITATION_ROLES.items():
+        el = soup.find(id=control_id)
+        if el is None:
+            continue
+        kind = _field_kind(el)
+        if kind is None:
+            continue
+        option_els = el.find_all("option") if el.name == "select" else []
+        options = [o.get("value") or o.get_text(strip=True) for o in option_els]
+        option_labels = [
+            [str(o.get("value") if o.get("value") is not None else o.get_text(strip=True)), o.get_text(" ", strip=True)]
+            for o in option_els
+        ][:200]
+        fields.append(
+            {
+                "name": control_id,
+                "selector": f"#{control_id}",
+                "kind": kind,
+                "options": [str(o) for o in options][:200],
+                "option_labels": option_labels,
+                "role": role,
+            }
+        )
+    if not fields:
+        return []
+    submit = soup.select_one("button.Citation_Search_btn") or soup.select_one(".Citation_Search_btn")
+    if submit is not None:
+        fields.append(
+            {
+                "name": submit.get("name") or "Citation_Search_btn",
+                "selector": "button.Citation_Search_btn, .Citation_Search_btn",
+                "kind": "submit",
+                "options": [],
+                "option_labels": [],
+                "role": "submit",
+            }
+        )
+    return fields
+
+
 def _search_form(soup: BeautifulSoup):
     """Return the actual CitationSearch query form, never generic grid/filter chrome."""
     candidates = []
@@ -564,6 +619,8 @@ def _has_logout_link(soup: BeautifulSoup) -> bool:
 def _surface_classification(soup: BeautifulSoup, form) -> str:
     if form is not None:
         return "query_form"
+    if soup.find(id="Citation_Category_Search_dropdown") is not None and soup.find(id="Citation_Year_Search_input") is not None:
+        return "query_form"
     if _has_archived_patient_grid(soup):
         return "grid_surface_no_query_form"
     controls = soup.find_all(["input", "select", "textarea", "button"])
@@ -607,6 +664,12 @@ def introspect_search_form(html: str) -> Dict[str, Any]:
             role = "submit"
         selector = _css_selector(el)
         fields.append({"name": name, "selector": selector, "kind": kind, "options": [str(o) for o in options][:200], "option_labels": option_labels, "role": role})
+    # Authenticated /Login/Check dashboard: Citation Search is a formless AJAX panel.
+    if not fields:
+        dash = _dashboard_citation_controls(soup)
+        if dash:
+            fields = dash
+            surface = "query_form"
     tables = soup.find_all("table")
     def table_score(table) -> int:
         headers = " ".join(th.get_text(" ", strip=True).lower() for th in table.find_all("th"))

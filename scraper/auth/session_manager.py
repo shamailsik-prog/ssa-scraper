@@ -1221,6 +1221,7 @@ class PlaywrightBrowser:
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs: Any) -> PageResult:
         archived_grid_start_row = int(kwargs.get("archived_grid_start_row", 0) or 0)
+        wait_for_ajax_results = bool(kwargs.get("wait_for_ajax_results"))
         fields = search_map.get("fields") or {}
         for role, value in values.items():
             f = fields.get(role)
@@ -1245,6 +1246,24 @@ class PlaywrightBrowser:
             await self._wait_for_post_submit_navigation(
                 lambda: self._page.keyboard.press("Enter")
             )
+        if wait_for_ajax_results:
+            # Dashboard Citation Search POSTs via XHR into #rightmenu; wait for the grid or a clear result shell.
+            try:
+                await self._wrap(
+                    self._page.wait_for_function(
+                        """() => {
+                          if (document.getElementById('archivedpatientGrid')) return true;
+                          const rm = document.getElementById('rightmenu');
+                          if (!rm) return false;
+                          const text = (rm.innerText || '').trim();
+                          if (/no more result found/i.test(text)) return true;
+                          return !!(rm.querySelector('table') || rm.querySelector('a[href]'));
+                        }""",
+                        timeout=min(45_000, int(settings.PLAYWRIGHT_TIMEOUT_MS)),
+                    )
+                )
+            except Exception as exc:
+                logger.warning("submit_search ajax results wait timed out slot=%s: %s", self.slot_number, exc)
         html_text, metadata = await self._capture_html(resp=None, archived_grid_start_row=archived_grid_start_row)
         return PageResult(url=self._page.url, html=html_text, status=200, metadata=metadata)
 
