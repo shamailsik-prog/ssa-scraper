@@ -12,6 +12,7 @@ from scraper.config import settings
 from scraper.models import Judgment, ScraperJob, ScraperSource
 
 SOURCE_NAME = "PakistanLawSite"
+PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -200,6 +201,14 @@ def cursor_saturated(cur: Any, *, now: Optional[datetime] = None) -> bool:
 
 def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
     return f"citation_grid_cursor_shard_{reporter_shard}" if reporter_shard in (0, 1) else "citation_grid_cursor"
+
+
+def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any]) -> bool:
+    """When promotion is stalled but search-harvest gaps exist, yield the login queue to gap queries."""
+    if not getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
+        return False
+    watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
+    return bool(watch.get("stalled")) and watch.get("stalled_reason") == "no_output_while_harvesting"
 
 
 def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:

@@ -617,6 +617,8 @@ class PakistanLawSitePipeline:
             # The full CitationSearch DOM (a failed compact snapshot returns it) carries the filter
             # form beside the grid; mapping those DataTables inputs would flip the connector into
             # form mode and every later job would type into fields that mean nothing (23 Sep 2026, map v28).
+            from scraper.extractors.deterministic import enrich_dashboard_result_layout
+
             m.fields = prior_dashboard_fields or {}
             layout = dict(m.result_layout or {})
             layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
@@ -625,6 +627,7 @@ class PakistanLawSitePipeline:
                 limits = dict(m.limits or {})
                 limits["surface"] = "query_form"
                 limits["dashboard_citation_fields"] = True
+                m.result_layout = enrich_dashboard_result_layout(layout, limits)
                 m.limits = limits
                 m.stale = False
                 logger.info(
@@ -636,13 +639,15 @@ class PakistanLawSitePipeline:
             await self.db.flush()
             mapped = map_as_dict(m)
         elif grid_surface and prior_dashboard_fields and not self._has_queryable_search_fields(mapped):
+            from scraper.extractors.deterministic import enrich_dashboard_result_layout
+
             m.fields = prior_dashboard_fields
             layout = dict(m.result_layout or {})
             layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
-            m.result_layout = layout
             limits = dict(m.limits or {})
             limits["surface"] = "query_form"
             limits["dashboard_citation_fields"] = True
+            m.result_layout = enrich_dashboard_result_layout(layout, limits)
             m.limits = limits
             m.stale = False
             await self.db.flush()

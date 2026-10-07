@@ -1,4 +1,4 @@
-from scraper.pls_grid_health import grid_rows_remaining, pls_zero_query_grid_failure
+from scraper.pls_grid_health import defer_pls_grid_for_search_harvest, grid_rows_remaining, pls_zero_query_grid_failure
 
 
 def test_cursor_resume_never_treated_as_complete_at_offset():
@@ -15,6 +15,20 @@ def test_zero_query_grid_failure_when_rows_remain():
     cfg = {"citation_grid_cursor": {"row_offset": 100, "last_total_rows": 500}}
     msg = pls_zero_query_grid_failure(stats, cfg)
     assert msg and "zero citation-grid progress" in msg
+
+
+def test_defer_pls_grid_when_stalled_for_search_harvest():
+    cfg = {"pls_stall_watchdog": {"stalled": True, "stalled_reason": "no_output_while_harvesting"}}
+    from scraper.config import settings
+
+    old = settings.PLS_SEARCH_HARVEST_ENABLED
+    try:
+        settings.PLS_SEARCH_HARVEST_ENABLED = True
+        assert defer_pls_grid_for_search_harvest(cfg) is True
+        assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": False}}) is False
+        assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": True, "stalled_reason": "grid_saturated"}}) is False
+    finally:
+        settings.PLS_SEARCH_HARVEST_ENABLED = old
 
 
 def test_zero_query_not_failure_when_progress():
