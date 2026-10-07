@@ -14,7 +14,7 @@ def test_status_json_has_health_speed_progress(client):
     assert {"Database", "Redis (task queue)", "Scheduler (Celery Beat) and dispatch", "Housekeeping worker"} <= names
     assert set(body["speed"]) >= {"15m", "1h", "24h", "by_source_last_hour"}
     assert "pages_per_hour" in body["speed"]["1h"]
-    assert set(body["progress"]) == {"pakistanlawsite_journals", "public_sources", "archive"}
+    assert set(body["progress"]) == {"pakistanlawsite_journals", "public_sources", "archive", "caseid_walk"}
     assert body["sources_summary"]["total"] >= 1
 
 
