@@ -1,0 +1,342 @@
+THE ASAAN KAROBAR ACT, 2025
+1. Short title, extent and commencement
+2. Definitions
+3. Application of the Act
+4. Certain provisions not to apply
+5. Asaan Karobar Technical Unit
+6. Functions and powers of the Asaan Karobar Technical Unit
+7. Establishment of Pakistan Regulatory Registry
+8. Parameters for review of laws and RLCOs
+9. Entering laws and RLCOs on the Registry
+10. Public comments
+11. Review by Government Agencies
+12. Review by the Asaan Karobar Technical Unit
+13. Decision by Cabinet
+14. Repeal and amendment of laws and RLCOs
+15. Phases of Regulatory Reform
+16. Pakistan Business Portal
+17. Source of funds
+18. Budget and accounts
+19. Assistance
+20. Prohibition of publication or disclosure of information to unauthorized persons
+21. Schedule
+Page 1 of 11
+22. Indemnity
+23. Power to make rules
+24. Power to make regulations
+25. Removal of difficulties
+SCHEDULE
+Page 2 of 11
+THE ASAAN KAROBAR ACT, 2025
+ACT NO. XXXVIII OF 2025
+[25th November, 2025]
+An Act to provide for reforms of the regulatory regime applicable to business, trade and investment
+by removing cumbersome and complex regulatory requirements and to establish the Pakistan
+Regulatory Registry and the Pakistan Business Portal.
+WHEREAS, it is expedient to provide for a legal framework for a modern, simple and
+transparent regulatory regime and eliminate cumbersome procedures and requirements;
+AND WHEREAS, it is expedient to comply with international obligations in respect of
+regulatory reforms;
+AND WHEREAS, it is expedient to establish the Pakistan Regulatory Registry and the Pakistan
+Business Portal and to provide for matters connected therewith and incidental thereto;
+It is hereby enacted as follows:__
+1. Short title, extent and commencement.__(1) This Act shall be called the Asaan Karobar
+Act, 2025.
+(2) It shall extend to the whole of Pakistan.
+(3) It shall come into force at once,
+2. Definitions.__ In this Act, unless there is anything repugnant in the subject or context, __
+(a) “BOI” means the Board of Investment established under the Board of Investment
+Ordinance, 2001 (XV of 2001);
+(b) “burden” means any or all of the following:__
+(i) financial costs, including compliance, time, and administrative costs; or
+(ii) requirements, processes and procedures determined through the final decision
+of the Cabinet under section 13, as causing administrative inconvenience,
+uncertainty, delays and adversely affecting consumer choice, efficiency,
+productivity and profitability.
+(c) “business” includes any lawful enterprise, trade, whether or not incorporated or
+registered;
+(d) “Cabinet Committee” means the Cabinet Committee on Regulatory Reforms
+(CCoRR) constituted by the Prime Minister through Notification No. F.5/24/2024-
+Com. dated the 18th September, 2024 or any other cabinet committee designated by the
+Prime Minister to perform functions under this Act;
+Page 3 of 11
+(e) “electronic document” includes documents, records, information. communication,
+payments, or transactions in electronic form;
+(f) “Government Agency” means__
+(i) a ministry, division, department, or sub-ordinate office of the Federal
+Government:
+(ii) an authority, agency, undertaking, business, or other entity or body established
+by or under a Federal statute or controlled directly or indirectly by the Federal
+Government; and
+(iii) an authority, agency, undertaking, business or other entity or body that is subject
+to Federal law or operates in Federal territory;
+that is or may be charged with the function of administering or enforcing any laws, or
+issuing, administering or enforcing RLCO.
+(g) “Portal” means the Pakistan Business Portal established under section16;
+(h) “prescribed” means prescribed by rules or regulations, as the case may be, made under
+this Act;
+(i) “Registry” means the Pakistan Regulatory Registry established under section 7;
+(j) “Regulatory Impact Assessment (RIA) Tool and Guidelines” or “RIA” means the
+evidence-based approach approved by the BOI to critically assess policy options and
+the consequences of Government Agency’s actions to support policy decisions;
+(k) “Regulatory Management System” or “RMS” means the set of policies, procedures,
+processes, IT systems, and tools employed to pursue and maintain good quality
+regulatory and other policy functions of Government Agencies;
+(1) “RLCO” means any rules, licenses, circulars, orders, regulations, SROs, by-laws,
+notifications, certificates, office memoranda, permits, instructions, forms,
+authorizations, directives, resolution or other instruments made, issued or enforced by
+a Government Agency with regulatory effect and functions, and includes such other
+instruments as may be notified by the Federal Government;
+(m) “Schedule” means Schedule to this Act;
+(n) “Secretary” means the Secretary of the Board of Investment;
+(o) “System” means an electronic system for creating, generating, sending, receiving,
+storing, reproducing, displaying, recording or processing information; and
+(p) “Unit” means the Asaan Karobar Technical Unit established under section 5.
+Page 4 of 11
+3. Application of the Act.__Notwithstanding anything contained in any other law, the
+provisions of this Act shall apply in relation to the matters contained herein, including, but not limited
+to, the powers and functions of the BOI, Government Agencies, and the Cabinet Committee.
+4. Certain provisions not to apply.__The provisions of this Act relating to regulatory reform
+shall not apply to__
+(a) offices, bodies, or institutions, created or existing by or under the Constitution of the
+Islamic Republic of Pakistan 1973;
+(b) the Supreme Court of Pakistan, the High Courts, the Federal Shariat Court and all other
+courts created by the Constitution or the law;
+(c) criminal law, criminal procedure, the police and other law enforcement agencies, not
+including procedural and regulatory matters relating thereto;
+(d) imposition and collection of taxes not including procedural and regulatory matters
+relating thereto;
+(e) foreign relations and foreign policy, not including procedural matters or matters relating
+to the regulation of trade;
+(f) national security, strategic installations and matters pertaining to the armed forces, and
+the defence of Pakistan; and
+(g) any other entity or subject included in the Schedule.
+5. Asaan Karobar Technical Unit.__(1) Not later than thirty days from the coming into force
+of this Act, the Secretary shall establish the Asaan Karobar Technical Unit.
+(2) Head of the Unit to be appointed by the Government shall be a grade-20 officer of the
+Federal Government or a person from private sector having relevant qualifications as may be
+prescribed under the rules.
+(3) For the performance of the functions of the Unit, Head of the Unit may with the approval
+of the Federal Government, appoint such persons including technical experts as may be required from
+amongst the officers of Federal Government or Private Sector on such terms and conditions as may be
+prescribed.
+6. Functions and powers of the Asaan Karobar Technical Unit.__(1) Subject to sub-section
+(2), the Unit shall__
+(a) oversee and monitor the process of regulatory reform under this Act;
+(b) establish and maintain an online Registry to catalogue, describe, and map relevant laws
+and RLCOs;
+Page 5 of 11
+(c) review proposals for legislation relating to regulation of matters affecting business,
+trade and investment and to propose changes thereto prior to their being placed before
+the Cabinet;
+(d) review proposals for issuance of or amendments to RLCOs and propose changes
+thereto;
+(e) co-ordinate with Government Agencies and Provincial Governments for uniformity and
+harmonization of laws and policies having impact on matters affecting business, trade
+and investment throughout Pakistan;
+(f) require Government Agencies, to enter on the Registry, all laws and RLCOs pertaining
+to them that are in force, with such description as may be consistent with guidelines
+issued by it in this regard, and within such period as it may stipulate;
+(g) require Government Agencies to review existing laws and RLCOs and to propose
+retention, amendment or repeal thereof in order that they may be consistent with the
+parameters stated in section 8;
+(h) review proposals received from Government Agencies and the general public, as the
+case may be, for retention, amendment or repeal of laws and RLCOs;
+(i) prescribe codes, principles, guidelines and standards for strengthening regulatory
+governance to be adhered to by Government Agencies during the process of regulatory
+reform under this Act;
+(j) prescribe the manner in which new laws and RLCOs may be entered on the Registry;
+(k) conduct or commission studies, inter alia, for identification of investment constraints
+for small and medium enterprises and women entrepreneurs and to take such steps as
+are necessary to eliminate such identified constraints through the process of regulatory
+reform under this Act;
+(1) issue clarifications, notifications, instructions, guidelines. SOPs and other instruments
+for carrying out the objects of this Act;
+(m) undertake awareness campaigns, market regulatory reforms initiatives, and collaborate
+with stakeholders, Government Agencies, civil society, academia experts, donor
+agencies, development partners, at both national and international level for
+identification and implementation of regulatory reform process;
+(n) conduct training and capacity building exercises for Government Agencies for the
+purposes of their functions under this Act; and
+(o) perform any other functions assigned to it by the Cabinet Committee or the Federal
+Government and to take such steps as are necessary or ancillary to the performance of
+functions under this Act.
+Page 6 of 11
+(2) The functions and powers of the Unit shall be performed and exercised by the Head of the
+Unit who may, subject to such conditions and limitations as he may determine, delegate the same to
+persons appointed under sub-section (3) of section 5 and may also constitute committees from amongst
+such persons for the said purpose.
+7. Establishment of Pakistan Regulatory Registry.__(1) The Unit shall establish and maintain
+an electronic registry to be known as the Pakistan Regulatory Registry for cataloguing and mapping
+of laws and RLCOs.
+(2) The Unit may procure requisite software, hardware, systems, codes, data, infrastructure or
+other material to effectively manage and operate the Registry and for its future expansion and such
+software, hardware, systems, codes, data, infrastructure or other material shall, at all times, be
+accessible to and remain the property of the Unit.
+8. Parameters for review of laws and RLCOs.__(1) The review of laws and RLCOs shall be
+carried out in order to determine:__
+(a) whether the laws and RLCOs are necessary and consistent with the objects of this Act
+as well as regulators’ codes, internationally recognized regulatory quality principles,
+RIA, RMS, smart regulations, risk-based regulations, Pakistan regulators principles and
+code of practice and guidelines issued by the Unit;
+(b) the expected burdens on businesses for compliance with the laws and RLCOs;
+(c) whether a law or RLCO is to be retained with or without amendment or repealed.
+(2) The Unit may issue a checklist or other instructions to be followed for the purpose of the
+review of laws and RLCOs in terms of sub-section (1).
+9. Entering laws and RLCOs on the Registry.__(1) The Unit shall direct Government
+Agencies to make available on the Registry, all laws and RLCO applicable to or being administered
+by them as well as any other information specified by the Unit within such time as it may determine.
+(2) Every Government Agency shall nominate a representative to co-ordinate with the Unit for
+the purpose of ensuring compliance with sub-section (1) and with other provisions of this Act.
+(3) The head of each Government Agency, by whatever name called, shall transmit to the Unit
+a certificate on the schedule set by the Unit to the effect that sub-section (1) stands complied with.
+(4) Upon the transmission of the certificate referred to in sub-section (3), the RLCOs entered
+on the Registry by a Government Agency shall he deemed to be the only RLCOs in force and all other
+RLCOs pertaining to such Government Agency shall cease to be effective.
+10. Public comments.__The laws and RLCOs entered on the Registry shall be made accessible
+to the public for a period of not less than thirty days, inviting comments in the manner specified on the
+Registry, and public awareness in this regard shall be ensured by publicity through electronic, digital
+and print media.
+Page 7 of 11
+11. Review by Government Agencies.__On expiry of the period referred to in section 10, and
+within such time as the Unit may determine, each Government Agency shall review the laws and
+RLCOs relating to it in terms of the parameters stated in section 8 and submit to the Unit, proposals
+regarding retention, with or without amendment, or repeal of such laws and RLCOs.
+12. Review by the Asaan Karobar Technical Unit.__(1) The Unit shall review the laws,
+RLCOs, and proposals entered or submitted under sections 9, 10 and 11 and make a determination as
+to retention of a law or RLCO without change, amendment or repeal.
+(2) The laws and RLCOs approved by the Unit to be retained shall continue to be in force.
+(3) The laws and RLCOs approved by the Unit for amendment or repeal shall be transmitted
+by the Head of the Unit to the Secretary for submission to the Cabinet Committee.
+13. Decision by Cabinet.__(1) The proposals relating to laws and RLCOs shall be considered
+by the Cabinet Committee.
+(2) A Minister-in-charge in respect of whose ministry or division reform has been proposed by
+the Unit and who holds a position opposed to such reform or any part thereof shall be invited to justify
+his position before the Cabinet Committee.
+(3) The Cabinet Committee shall consider the proposed reform and the opposition by a
+Minister-in-charge, if any, and proceed to take a decision in such terms as it may deem fit and transmit
+the same to the Cabinet for ratification.
+14. Repeal and amendment of laws and RLCOs.__(1) The proposals for amendment to or
+repeal of laws ratified by the Cabinet under sub-section (3) of section 13 shall be transmitted to the
+Majlis-e-Shoora (Parliament) for legislation.
+(2) Notwithstanding anything contained in any other law, amendments to or repeal of RLCOs
+as ratified by the Cabinet under sub-section (3) of section 13 shall he notified in the official Gazette
+and shall come into force upon such notification.
+15. Phases of Regulatory Reform.__(1) The process of regulatory reform under sections 9, 10,
+11, 12, 13 and 14 may be carried out in phases, and proposals for amendment or repeal made by the
+Unit under sub-section (3) of section 12 may be submitted to the Cabinet Committee separately or in
+the form of a single summary.
+(2) The Unit shall ensure that all laws and RLCOs in force appear on the Registry and that the
+Registry is kept updated and accessible to the general public until such time that its control is
+transferred under sub-section (3).
+(3) The control and management of the Registry shall be transferred to such Ministry or
+Division of the Federal Government as and when the Unit may specify, whereafter such Ministry or
+Division shall ensure that, within such time as may be specified by the Federal Government, the
+Registry becomes a complete and updated code of all laws and RLCOs in force in Pakistan.
+(4) The Federal Government may determine the date, after which, a Government Agency shall
+submit to the Unit in continuum, proposals for amendment to or promulgation of a new law or RLCO
+Page 8 of 11
+for its review in terms of the parameters stated in section 8 before being submitted to the Cabinet or to
+the authority competent to issue, amend or rescind the same.
+16. Pakistan Business Portal.__(1) Not later than two years from the coming into force of this
+Act, the Federal Government shall, by notification in the Official Gazette, establish an online portal to
+be known as the Pakistan Business Portal to be operated and maintained by the BOI.
+(2) The Portal shall provide a one window facility for access to information regarding
+regulatory requirements and shall also facilitate compliance with the said requirements and matters
+ancillary thereto.
+(3) Without prejudice to the generality of the preceding sub-section, the Portal shall:__
+(a) provide necessary facilities to enable submission and processing of applications or
+documents for registrations, licenses, certificates, permits, approvals and permissions;
+(b) provide mechanisms for online payment of fees, duties, levies, taxes and other charges
+and issuance of receipts thereof;
+(c) issue online registrations, licenses, certificates, permits, approvals and permissions; and
+(d) provide any other service ancillary to the above or that may be prescribed.
+(4) The Portal shall be the country’s only one window facility and all other such facilities,
+however established, shall be integrated with the Portal within a period to be notified by the Federal
+Government:
+Provided that a one window created by a Province may be integrated with the Portal subject to
+the concurrence of the concerned Provincial Government.
+(5) Any electronic exchange of information, declaration, document or record, transaction,
+accounts, offer or acceptance of an offer, notice, order, payment, authentication, authorization or
+information required, delivered or provided, by any person, or by an authorized officer of a
+Government Agency, organization or department shall be deemed to have been required, delivered or
+provided, in accordance with law when communicated electronically through the Portal or its allied
+systems and shall be admissible as evidence in any court, tribunal, judicial or quasi-judicial body or
+commission of inquiry.
+(6) The Federal Government may prescribe the mode and manner in which a Government
+Agency may require documents, records or transmissions from the Portal for any purpose including
+audit, and be allowed access to its premises, computer system or any other systems where data may be
+stored, recorded or retained.
+(7) Any law requiring documents to be created, retained, notarized, duplicated, submitted,
+delivered, authenticated, authorized, transmitted, received, stored, processed, approved or evidenced
+shall be deemed to have been complied with if such documents are available and retrievable in
+electronic form from the Portal.
+Page 9 of 11
+(8) The provisions of the Electronic Transactions Ordinance, 2002 (LI of 2002) and the
+Prevention of Electronic Crimes Act, 2016 (XL of 2016), to the extent not inconsistent with the
+provisions of this Act, shall, mutatis mutandis, apply to electronic submission of documents, data
+retention or storage, copyrights, legal recognition and presumption, certification, notarization,
+registration, offences and other matters, in as much as they relate to the object of, and operations under
+this Act.
+(9) An authorization or approval required to be given or issued under any law in respect to any
+matter to which this Act relates, when issued electronically through the Portal, shall be deemed to have
+been lawfully issued.
+(10) All Government Agencies shall work in aid of the BOI for the purposes of establishing
+the Portal and its functioning.
+(11) The BOI shall prescribe fees and charges for services provided through the Portal.
+17. Source of funds.__(1) The Federal Government shall provide financial resources and funds
+for carrying out the purposes of this Act including the establishment, functioning, and expansion of
+the Unit, Registry and the Portal.
+(2) The BOI and the Unit may also apply for and arrange funds for carrying out the purposes
+of this Act through the following sources:
+(a) grants and borrowing of money;
+(b) sums or property which may become payable to or vest in them in respect of any matter
+incidental to the exercise of their powers and the performance of their functions;
+(c) income generated from levy of fees and service charges under this Act;
+(d) income generated from investments, sale of products and services; and
+(e) any other source, approved by the Federal Government.
+18. Budget and accounts.__(1) In respect of each financial year, by such date as may be
+specified by the Finance Division, the BOI and the Unit shall submit, through the said Division, for
+approval of the Federal Government, a statement showing their estimated receipts and expenditure,
+respectively, and the sums that are likely to be required from the Federal Government during the next
+financial year, and the accounts of the BOI and the Unit shall be kept in such form and in accordance
+with such principles and methods as may be determined by the Auditor-General of Pakistan.
+(2) Subject to the Public Finance Management Act, 2019, the BOI and the Unit may open
+accounts with the State Bank of Pakistan or with any scheduled bank in Pakistan for carrying out the
+purposes of this Act.
+(3) Audit of all accounts under this Act shall be conducted at the close of each financial year
+by the Auditor-General of Pakistan.
+Page 10 of 11
+19. Assistance.__ All Government Agencies shall provide aid and assistance to the BOI and the
+Unit for achieving the objects of this Act.
+20. Prohibition of publication or disclosure of information to unauthorized persons.__(1)
+No person shall, without the consent of the Secretary or other than in the course of their duties under
+this Act, publish or disclose to an unauthorized person, the contents of any document or
+communication or any other information that relates to any matter under this Act whether or not the
+same has come to that person’s knowledge in the course of his duties under this Act.
+(2) Any person who contravenes the provisions of sub-section (1) shall be liable to pay fine,
+not exceeding three hundred thousand Rupees and such other penalties as may be prescribed, including
+termination of appointment.
+21. Schedule.__(1) There shall be a schedule to this Act containing a list of Government
+Agencies, other entities and subjects exempted from the provisions of this Act relating to regulatory
+reform under section 4.
+(2) The Federal Government may, by notification in the Official Gazette, amend the Schedule
+by adding, omitting, amending or substituting entries thereof.
+22. Indemnity.__No suit, prosecution or other legal proceedings shall lie against any person for
+anything done or intended to be done in his official capacity and in good faith under this Act or the
+rules, notifications, instructions or directions made or issued thereunder.
+23. Power to make rules.__The Federal Government may, by notification in the official
+Gazette, make rules for carrying out the purposes of this Act.
+24. Power to make regulations.__Subject to the provisions of this Act and the Rules made
+hereunder, the Secretary may, by notification in the Official Gazette, make regulations for performance
+of functions by the Unit under this Act.
+25. Removal of difficulties.__If a difficulty arises in giving effect to a provision of this Act,
+the Federal Government may, within two years of the commencement of this Act, make such order as
+is not inconsistent with the provisions of this Act and as it considers necessary for removal of the
+difficulty.
+SCHEDULE
+[see sections 4(g) and 21(1&2)]
+EXEMPTIONS
+_______
+RGN Date: 12-12-2025
+Page 11 of 11

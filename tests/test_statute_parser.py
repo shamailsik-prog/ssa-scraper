@@ -129,4 +129,5 @@ def test_extract_statute_flags_listed_title_absent_on_shared_junk_pdf():
         },
     )
     assert extracted["statute_name"] == "Defense Forces of Pakistan Act, 2026"
-    assert (extracted.get("field_evidence") or {}).get("listed_title_absent")
+    # The junk page cannot pass the contents check, so promotion will hold it for review.
+    assert (extracted.get("field_evidence") or {}).get("contents_check", "").startswith("failed")

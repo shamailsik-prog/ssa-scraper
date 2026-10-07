@@ -45,6 +45,7 @@ from scraper.models import (
     SpotCheck,
     Statute,
     StatuteSection,
+    StatuteSectionVersion,
 )
 
 router = APIRouter(tags=["status"])
@@ -264,6 +265,14 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
             "citations": await _count(db, select(func.count()).select_from(Citation)),
             "statutes": await _count(db, select(func.count()).select_from(Statute)),
             "statute_sections": await _count(db, select(func.count()).select_from(StatuteSection)),
+            # A statute "has text" when at least one of its sections holds a real body (40+ characters).
+            "statutes_with_text": await _count(
+                db,
+                select(func.count(func.distinct(StatuteSection.statute_id)))
+                .select_from(StatuteSection)
+                .join(StatuteSectionVersion, StatuteSectionVersion.section_id == StatuteSection.id)
+                .where(func.length(func.trim(StatuteSectionVersion.section_text)) >= 40),
+            ),
             "instruments": await _count(db, select(func.count()).select_from(Instrument)),
             "review_queue_open": await _count(db, select(func.count()).select_from(QuarantineQueue).where(QuarantineQueue.reviewed.is_(False))),
         },

@@ -83,7 +83,7 @@ async function load(){
   $('tiles').innerHTML=tile('Websites / sources',ss.total,(ss.active||0)+' running, '+(ss.paused||0)+' paused'+(ss.halted?', '+ss.halted+' halted':''))
     +tile('Judgments',t.judgments,'+'+num(m.judgments_promoted_today)+' today','/dashboard#browse')
     +tile('Citations',t.citations,null,'/dashboard#browse')
-    +tile('Statutes / acts',t.statutes,null,'/dashboard#browse')
+    +tile('Statutes / acts',t.statutes,num(t.statutes_with_text||0)+' with section text, '+num(Math.max(0,(t.statutes||0)-(t.statutes_with_text||0)))+' without','/dashboard#browse',(t.statutes||0)>(t.statutes_with_text||0)?'warn':'')
     +tile('Statute sections',t.statute_sections)
     +tile('Other instruments',t.instruments,'rules, notifications, ordinances')
     +tile('Last 7 days',m.judgments_promoted_last_7_days,'judgments added')

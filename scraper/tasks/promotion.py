@@ -1639,6 +1639,19 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     sections = data.get("sections") or []
     evidence = data.get("field_evidence") or {}
     if st.source_name == "PakistanCode":
+        # Every PakistanCode statute is read against its own table of contents (statute_contents.py);
+        # only a statute whose title matched and whose listed sections were all found with real text
+        # enters the corpus. Anything else waits in the review queue with the reason.
+        verdict = str(evidence.get("contents_check") or "")
+        if not verdict.startswith("verified"):
+            await _quarantine(
+                db,
+                st,
+                f"pakistancode_contents_check: {verdict or 'statute was not read against its contents list'}"[:1000],
+                "statute",
+                {"reason_code": "pakistancode_contents_check", "statute_name": name[:280], "contents_check": verdict[:500]},
+            )
+            return "quarantined"
         if name and is_short_title_clause(name):
             await _quarantine(
                 db,
@@ -1679,7 +1692,10 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
-        thin_sections = _collect_pakistancode_thin_sections(sections)
+        # The 80-character floor caught heading-only sections from the old parser; a verified statute
+        # has already had every section's text checked, and a short section ("This Act shall come
+        # into force at once.") is real.
+        thin_sections = [] if verdict.startswith("verified") else _collect_pakistancode_thin_sections(sections)
         if thin_sections:
             await _quarantine(
                 db,

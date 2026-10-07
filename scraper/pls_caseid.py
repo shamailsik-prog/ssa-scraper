@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from scraper.extractors.judgment_guards import _has_case_content
 from scraper.parsers.citation_extractor import extract_citations
 
 CASE_ID_RE = re.compile(r"CaseName=(\d{4})([A-Za-z]{1,3})(\d{1,6})(?![0-9A-Za-z])")
@@ -105,16 +106,18 @@ def record(state: Dict, serial: int, hit: bool, known: Set[int], *, miss_streak:
     state["streak"] = int(state.get("streak") or 0) + 1
     nxt = serial + 1
     if state["streak"] >= miss_streak:
-        block_start = (serial // BLOCK + 1) * BLOCK + 1
+        block_start = ((serial - 1) // BLOCK + 1) * BLOCK + 1
         held_above = [k for k in known if k > serial]
         nxt = min([block_start] + ([min(held_above)] if held_above else []))
     state["next"] = nxt
 
 
-def looks_like_case_page(text: str, year: int) -> bool:
+def looks_like_case_page(text: str, year: int, *, raw_html: Optional[str] = None) -> bool:
     """A judgment page carries real text and a citation of its own year near the top; the site's
     answer for a serial it does not hold has neither."""
     body = (text or "").strip()
     if len(body) < MIN_CASE_PAGE_CHARS:
+        return False
+    if not _has_case_content(raw_text=body, raw_html=raw_html):
         return False
     return any(c.get("year") == year for c in extract_citations(body[:4000]))

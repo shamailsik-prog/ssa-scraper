@@ -100,6 +100,12 @@ SELECT source_name, slot_number, state, left(coalesce(state_reason, ''), 110) AS
  (login_username_encrypted IS NOT NULL) AS has_saved_credentials FROM browser_session_slots ORDER BY 1, 2;
 \\echo == frontier by source and status
 SELECT source_name, status, count(*) FROM crawl_frontier GROUP BY 1, 2 ORDER BY 1, 2;
+\\echo == statutes with and without section text, by source
+SELECT s.source_name, count(*) AS statutes,
+ count(*) FILTER (WHERE EXISTS (SELECT 1 FROM statute_section ss JOIN statute_section_version v ON v.section_id = ss.id
+   WHERE ss.statute_id = s.id AND length(trim(v.section_text)) >= 40)) AS with_text,
+ count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM statute_section ss WHERE ss.statute_id = s.id)) AS no_sections
+ FROM statute s GROUP BY 1 ORDER BY 2 DESC;
 \\echo == staging backlog
 SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging GROUP BY 1, 2, 3
  UNION ALL SELECT 'statutes', source_name, status, count(*) FROM statutes_staging GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
