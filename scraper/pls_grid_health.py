@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
@@ -214,6 +214,39 @@ def pls_search_harvest_may_run(cfg: Dict[str, Any], *, pending_gaps: int) -> boo
     if getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
         return True
     return pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg)
+
+
+PLS_PREEMPT_GRID_JOB_FOR_SEARCH_HARVEST_AFTER = timedelta(
+    minutes=int(getattr(settings, "PLS_PREEMPT_GRID_JOB_MINUTES", 10) or 10)
+)
+
+
+def pls_preempt_running_job_for_search_harvest(
+    job: ScraperJob,
+    cfg: Dict[str, Any],
+    *,
+    pending_gaps: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True when a running citation-grid job blocks search-harvest gap recovery during a promotion stall."""
+    if pending_gaps <= 0 or not defer_pls_grid_for_search_harvest(cfg):
+        return False
+    if job.status != "running" or job.job_type != "scrape":
+        return False
+    summary = dict(job.result_summary or {})
+    if summary.get("search_harvest") or summary.get("query_key"):
+        return False
+    pages = int(job.pages_scraped or summary.get("pages_charged") or summary.get("pages") or 0)
+    staged = int(job.records_extracted or summary.get("staged") or 0)
+    if pages > 0 or staged > 0:
+        return False
+    started = job.started_at or job.created_at
+    if started is None:
+        return True
+    now = now or datetime.now(timezone.utc)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (now - started) >= PLS_PREEMPT_GRID_JOB_FOR_SEARCH_HARVEST_AFTER
 
 
 def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:
