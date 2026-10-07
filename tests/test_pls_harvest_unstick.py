@@ -100,7 +100,7 @@ def _plan(**kw):
     base = dict(
         source_state="ACTIVE", pages=0, judgments=0, slot_states={1: "ACTIVE", 2: "ACTIVE"}, lock_keys=[], running_jobs=0,
         stale_running_jobs=0, pending_queries=250, transient_failed=0, search_ran_recently=False, map_ok=True,
-        recent_errors=[], idle_checks=1, last_recreate_at=None, now=NOW,
+        recent_errors=[], idle_checks=1, last_recreate_at=None, now=NOW, search_harvest_active=False,
     )
     base.update(kw)
     return plan_remediation(**base)
@@ -131,6 +131,9 @@ def test_watchdog_recovers_slots_and_releases_stale_lock():
     assert "recover_slots" in plan["actions"] and "release_stale_lock" in plan["actions"]
     # a live job with a fresh heartbeat keeps its lock
     assert "release_stale_lock" not in _plan(lock_keys=["k"], running_jobs=1, stale_running_jobs=0)["actions"]
+    assert "release_stale_lock" not in _plan(
+        lock_keys=["corpus:login_session_lock:PakistanLawSite"], running_jobs=0, search_harvest_active=True
+    )["actions"]
 
 
 def test_watchdog_recreates_worker_on_crashes_with_cooldown():

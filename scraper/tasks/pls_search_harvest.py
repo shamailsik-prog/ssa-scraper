@@ -777,6 +777,18 @@ async def release_tick_keys(keys: List[str]) -> None:
         await r.aclose()
 
 
+async def pls_search_tick_running() -> bool:
+    """True while a search-harvest tick holds corpus:pls_search_run:* (no ScraperJob row)."""
+    r = await _redis()
+    try:
+        for shard in (0, 1):
+            if await r.exists(TICK_RUN_KEY.format(shard=shard)):
+                return True
+        return False
+    finally:
+        await r.aclose()
+
+
 async def claim_tick_enqueue(shard: Optional[int], *, ttl: int = 3600) -> bool:
     """Dispatcher guard: True (and a marker is set) when no tick for this shard is queued or running."""
     r = await _redis()

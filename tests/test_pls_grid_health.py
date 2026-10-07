@@ -6,6 +6,7 @@ from scraper.models import ScraperJob
 from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
     grid_rows_remaining,
+    pls_job_is_grid_reconcile,
     pls_preempt_running_job_for_search_harvest,
     pls_zero_query_grid_failure,
 )
@@ -83,6 +84,23 @@ def test_preempt_citation_grid_job_with_pages_but_zero_staged():
         result_summary={"surface_mode": "citation_grid", "pages_charged": 42, "staged": 0},
     )
     assert pls_preempt_running_job_for_search_harvest(grid_job, cfg, pending_gaps=5, now=now) is True
+
+
+def test_pls_job_is_grid_reconcile_ignores_lock_skip_and_counts_real_grid():
+    skip = ScraperJob(
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        pages_scraped=0,
+        result_summary={"skipped": "login_session_lock_held", "pages": 0, "staged": 0},
+    )
+    grid = ScraperJob(
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        pages_scraped=12,
+        result_summary={"surface_mode": "citation_grid", "pages_charged": 12},
+    )
+    assert not pls_job_is_grid_reconcile(skip)
+    assert pls_job_is_grid_reconcile(grid)
 
 
 def test_zero_query_not_failure_when_progress():

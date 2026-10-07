@@ -72,6 +72,7 @@ def plan_remediation(
     pending_queries: int,
     transient_failed: int,
     search_ran_recently: bool,
+    search_harvest_active: bool,
     map_ok: bool,
     recent_errors: List[str],
     idle_checks: int,
@@ -97,8 +98,11 @@ def plan_remediation(
         actions.append("recover_slots")
     if not any(st == "ACTIVE" for st in slot_states.values()):
         unresolved.append("no ACTIVE login slot; recovery with saved credentials enqueued")
-    if lock_keys and (running_jobs == 0 or stale_running_jobs > 0):
+    if lock_keys and stale_running_jobs > 0:
         diagnosis.append(f"session lock held ({len(lock_keys)} key(s)) with {running_jobs} running / {stale_running_jobs} stale job(s)")
+        actions.append("release_stale_lock")
+    elif lock_keys and running_jobs == 0 and not search_harvest_active:
+        diagnosis.append(f"session lock held ({len(lock_keys)} key(s)) with no running scraper job")
         actions.append("release_stale_lock")
     elif stale_running_jobs > 0:
         diagnosis.append(f"{stale_running_jobs} job(s) recorded running without a heartbeat")
@@ -193,6 +197,19 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
         stale_cut = now - timedelta(minutes=int(wsettings.PLS_WATCHDOG_STALE_JOB_MINUTES or 75))
         stale = [j for j in running if (j.updated_at or j.started_at or j.created_at) and (j.updated_at or j.started_at or j.created_at) < stale_cut]
         pending = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status.in_(("pending", "in_progress"))))).scalar() or 0)
+        harvest_in_progress = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(PlsSearchHarvestQuery)
+                    .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "in_progress")
+                )
+            ).scalar()
+            or 0
+        )
+        from scraper.tasks.pls_search_harvest import pls_search_tick_running
+
+        search_harvest_active = harvest_in_progress > 0 or await pls_search_tick_running()
         failed_rows = (await db.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed"))).scalars().all()
         transient = [q for q in failed_rows if not _PERMANENT_ERRORS.search(q.last_error or "") and (q.last_run_at is None or q.last_run_at < now - timedelta(hours=6))]
         last_query = (await db.execute(select(func.max(PlsSearchHarvestQuery.last_run_at)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).scalar()
@@ -213,6 +230,7 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
             pending_queries=pending,
             transient_failed=len(transient),
             search_ran_recently=bool(last_query and last_query >= since),
+            search_harvest_active=search_harvest_active,
             map_ok=bool(m is not None and not m.stale and "reporter" in (m.fields or {})),
             recent_errors=errors,
             idle_checks=idle_checks + (1 if source.state == "ACTIVE" and judgments == 0 and (pages == 0 or pending > 0) else 0),
@@ -231,7 +249,11 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
                         job.finished_at = now
                         job.error_message = "throughput watchdog: no heartbeat; interrupted so the next job can run"
                     # Only drop the locks when no live job could still own them.
-                    n = await _release_locks(lock_keys) if len(stale) == len(running) else 0
+                    n = (
+                        await _release_locks(lock_keys)
+                        if len(stale) == len(running) and not search_harvest_active
+                        else 0
+                    )
                     done.append(f"released {n} stale lock key(s), interrupted {len(stale)} dead job(s)")
                 elif action == "recreate_worker":
                     _write_request("recreate_worker_scraper", "; ".join(plan["diagnosis"]), now)

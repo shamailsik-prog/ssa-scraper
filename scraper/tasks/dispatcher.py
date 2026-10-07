@@ -33,6 +33,7 @@ from scraper.pls_grid_health import (
     SOURCE_NAME as PLS_SOURCE_NAME,
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
+    pls_last_grid_reconcile_at,
     pls_preempt_running_job_for_search_harvest,
 )
 
@@ -523,18 +524,27 @@ async def _dispatch_pls_search_ticks(db, s: ScraperSource, *, running_jobs, conc
     to end, runs only as a reconciliation pass every PLS_GRID_RECONCILE_HOURS. Returns True when this
     dispatch round is handled (the grid path must not run); False lets a due grid reconciliation through."""
     from scraper.tasks.celery_app import app
-    from scraper.tasks.pls_search_harvest import claim_tick_enqueue, search_is_main_path
+    from scraper.tasks.pls_search_harvest import claim_tick_enqueue, pls_search_tick_running, search_is_main_path
     from scraper.watchdog_settings import wsettings
 
     if not search_is_main_path():
         return False
-    last_grid = (
-        await db.execute(select(func.max(ScraperJob.created_at)).where(ScraperJob.source_name == s.source_name))
-    ).scalar()
-    if last_grid is not None and last_grid.tzinfo is None:
-        last_grid = last_grid.replace(tzinfo=timezone.utc)
+    last_grid = await pls_last_grid_reconcile_at(db)
     grid_due = last_grid is None or (now - last_grid) >= timedelta(hours=float(wsettings.PLS_GRID_RECONCILE_HOURS or 24))
-    if grid_due and not running_jobs:
+    harvest_in_progress = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(PlsSearchHarvestQuery)
+                .where(
+                    PlsSearchHarvestQuery.source_name == s.source_name,
+                    PlsSearchHarvestQuery.status == "in_progress",
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    if grid_due and not running_jobs and harvest_in_progress == 0 and not await pls_search_tick_running():
         return False
     active_slots = await _active_slot_numbers(db, s.source_name)
     shards = [0, 1] if (concurrency >= 2 and len(active_slots) >= 2) else [None]

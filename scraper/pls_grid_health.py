@@ -221,6 +221,38 @@ PLS_PREEMPT_GRID_JOB_FOR_SEARCH_HARVEST_AFTER = timedelta(
 )
 
 
+def pls_job_is_grid_reconcile(job: ScraperJob) -> bool:
+    """True for citation-grid reconciliation jobs; lock-held skips and search-harvest rows do not count."""
+    if job.source_name != SOURCE_NAME or job.job_type != "scrape":
+        return False
+    summary = dict(job.result_summary or {})
+    if summary.get("skipped") == "login_session_lock_held":
+        return False
+    if summary.get("search_harvest") or summary.get("query_key"):
+        return False
+    if summary.get("surface_mode") == "citation_grid":
+        return True
+    return int(job.pages_scraped or summary.get("pages_charged") or summary.get("pages") or 0) > 0
+
+
+async def pls_last_grid_reconcile_at(db: AsyncSession) -> Optional[datetime]:
+    """When the citation grid last ran a real reconcile pass (not a lock-held skip)."""
+    rows = (
+        await db.execute(
+            select(ScraperJob)
+            .where(ScraperJob.source_name == SOURCE_NAME, ScraperJob.job_type == "scrape")
+            .order_by(func.coalesce(ScraperJob.finished_at, ScraperJob.created_at).desc())
+            .limit(40)
+        )
+    ).scalars().all()
+    for job in rows:
+        if pls_job_is_grid_reconcile(job):
+            at = job.finished_at or job.created_at
+            if at is not None:
+                return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    return None
+
+
 def pls_preempt_running_job_for_search_harvest(
     job: ScraperJob,
     cfg: Dict[str, Any],
