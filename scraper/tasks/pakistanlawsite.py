@@ -508,6 +508,27 @@ class PakistanLawSitePipeline:
         normalized["result_layout"] = layout
         return normalized
 
+    @classmethod
+    def _dual_map_grid_layout(cls, search_map: Dict[str, Any]) -> Dict[str, Any]:
+        """Dashboard Citation Search maps must still name #archivedpatientGrid so grid harvest runs.
+
+        After #154 a query_form-only map (no row_selector) made _is_citation_grid_map false, so jobs
+        walked an empty frontier and charged zero pages while the corpus still had grid rows left."""
+        normalized = dict(search_map or {})
+        layout = dict(normalized.get("result_layout") or {})
+        row_sel = str(layout.get("row_selector") or "").lower()
+        if "archivedpatientgrid" in row_sel:
+            return normalized
+        if not cls._is_dashboard_citation_fields(normalized):
+            return normalized
+        layout["row_selector"] = "#archivedpatientGrid tbody tr"
+        normalized["result_layout"] = layout
+        limits = dict(normalized.get("limits") or {})
+        limits.setdefault("surface", "query_form")
+        limits["dashboard_citation_fields"] = True
+        normalized["limits"] = limits
+        return normalized
+
     @staticmethod
     def _is_reference_case_surface(page: PageResult) -> bool:
         candidates = [
@@ -555,7 +576,7 @@ class PakistanLawSitePipeline:
             )
             m = await active_map(self.db, SOURCE_NAME)
             if m is not None:
-                return map_as_dict(m)
+                return self._dual_map_grid_layout(map_as_dict(m))
             raise LoginRequired(str(exc)) from exc
         self._surface_page = page
         self._surface_page_start_row = start_row
@@ -576,6 +597,8 @@ class PakistanLawSitePipeline:
                     return cached
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
+                if self._is_dashboard_citation_fields(cached):
+                    return self._dual_map_grid_layout(cached)
                 return cached
         prior = await active_map(self.db, SOURCE_NAME)
         prior_dashboard_fields = None
@@ -625,7 +648,7 @@ class PakistanLawSitePipeline:
             await self.db.flush()
             mapped = map_as_dict(m)
             logger.info("PakistanLawSite map v%s restored dashboard Citation Search fields onto grid layout", m.map_version)
-        return mapped
+        return self._dual_map_grid_layout(mapped)
 
     def _citation_grid_limits(self) -> Dict[str, int]:
         """Per-window caps and the per-job time budget for the current harvest mode."""
@@ -1733,7 +1756,9 @@ class PakistanLawSitePipeline:
             self._slot_lock = slot_lock
             self.stats["slot"] = slot.slot_number
             grid_start_row = self._citation_grid_cursor()[2]
-            search_map = await self.ensure_search_map(archived_grid_start_row=grid_start_row)
+            search_map = self._dual_map_grid_layout(
+                await self.ensure_search_map(archived_grid_start_row=grid_start_row)
+            )
             if self._is_citation_grid_map(search_map):
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",

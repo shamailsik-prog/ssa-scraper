@@ -37,3 +37,21 @@ def test_grid_only_still_grid_surface():
     probe = introspect_search_form(html)
     assert probe["surface"] == "grid_surface_no_query_form"
     assert probe["fields"] == []
+
+
+def test_dashboard_map_without_row_selector_is_dual_grid_map():
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+
+    dashboard_only = {
+        "fields": {
+            "reporter": {"selector": "#Citation_Category_Search_dropdown", "options": ["PLD"]},
+            "year": {"selector": "#Citation_Year_Search_input"},
+        },
+        "result_layout": {},
+        "limits": {"surface": "query_form"},
+    }
+    assert PakistanLawSitePipeline._is_citation_grid_map(dashboard_only) is False
+    dual = PakistanLawSitePipeline._dual_map_grid_layout(dashboard_only)
+    assert PakistanLawSitePipeline._is_citation_grid_map(dual) is True
+    assert "archivedpatientgrid" in str(dual["result_layout"]["row_selector"]).lower()
+    assert dual["limits"].get("dashboard_citation_fields") is True
