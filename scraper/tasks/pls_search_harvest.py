@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -22,6 +22,7 @@ from scraper.auth.session_manager import (
     release_page_result,
 )
 from scraper.config import settings
+from scraper.watchdog_settings import wsettings
 from scraper.database import SessionLocal, run_async
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -36,14 +37,18 @@ from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemo
 from scraper.pls_search_harvest_core import (
     build_harvest_form_values,
     citation_keys_for_row,
+    citation_lookup_query,
     compute_gap_size,
+    extra_offered_reporters,
     gap_report_sort_key,
     iter_base_plan_queries,
     make_query_key,
     normalize_query_json,
     parse_total_results_from_html,
     partition_rows_by_known,
+    record_query_failure,
     reporters_for_plan,
+    shard_reporters,
     cited_citations_in_text,
     is_capped,
     iter_extended_plan_queries,
@@ -60,6 +65,8 @@ from scraper.tasks.pakistanlawsite import (
 from scraper.tasks.search_map import active_map, map_as_dict
 
 logger = logging.getLogger(__name__)
+
+COMMIT_EVERY_ROWS = 10
 
 
 async def _source_row(db: AsyncSession) -> ScraperSource:
@@ -114,6 +121,35 @@ def _reporter_options_from_map(search_map: Dict[str, Any]) -> List[str]:
     return [str(o).strip() for o in (reporter.get("options") or []) if str(o).strip()]
 
 
+def plan_earliest_year(current_year: int) -> int:
+    """First year of the journal x year plan: the earlier of PLS_EARLIEST_YEAR and
+    PLS_SEARCH_HARVEST_EARLIEST_YEAR (1947 by default: the reporters go back to Partition)."""
+    years = [int(y) for y in (settings.PLS_EARLIEST_YEAR, wsettings.PLS_SEARCH_HARVEST_EARLIEST_YEAR) if int(y or 0) > 0]
+    return min(years) if years else current_year
+
+
+def plan_priority(query_json: Dict[str, Any], *, current_year: Optional[int] = None) -> int:
+    """Newest years first; subscribed journals before the other journals the form offers."""
+    current_year = current_year or datetime.now(timezone.utc).year
+    try:
+        age = max(0, current_year - int(query_json.get("year") or current_year))
+    except (TypeError, ValueError):
+        age = 0
+    subscribed = {str(r).lower() for r in settings.subscribed_reporters}
+    base = 100 if str(query_json.get("reporter") or "").lower() in subscribed or not settings.subscribed_reporters else 400
+    return base + age
+
+
+async def planned_reporters(db: AsyncSession) -> List[str]:
+    """Every journal of the plan, in priority order (subscribed first, then the other offered journals)."""
+    m = await active_map(db, SOURCE_NAME)
+    smap = map_as_dict(m) if m else {}
+    reporters = reporters_for_plan(subscribed=settings.subscribed_reporters, map_reporters=_reporter_options_from_map(smap))
+    if bool(wsettings.PLS_SEARCH_HARVEST_ALL_OFFERED_REPORTERS):
+        reporters = list(reporters) + extra_offered_reporters(reporters, _reporter_options_from_map(smap))
+    return list(reporters)
+
+
 async def seed_search_harvest_plan(
     db: AsyncSession,
     *,
@@ -123,7 +159,7 @@ async def seed_search_harvest_plan(
     """Idempotently insert base (reporter × year) queries."""
     now = datetime.now(timezone.utc)
     current_year = now.year
-    earliest = int(settings.PLS_EARLIEST_YEAR or 0) or current_year
+    earliest = plan_earliest_year(current_year)
     smap = search_map
     if smap is None:
         m = await active_map(db, SOURCE_NAME)
@@ -132,32 +168,37 @@ async def seed_search_harvest_plan(
         subscribed=settings.subscribed_reporters,
         map_reporters=_reporter_options_from_map(smap),
     )
+    extra_reporters: List[str] = []
+    if bool(wsettings.PLS_SEARCH_HARVEST_ALL_OFFERED_REPORTERS):
+        # Every journal the form offers is harvested too, after the subscribed ones (lower priority).
+        extra_reporters = extra_offered_reporters(reporters, _reporter_options_from_map(smap))
     years = years_for_plan(earliest, current_year)
     existing = {
         r.query_key
         for r in (await db.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).scalars().all()
     }
     to_add: List[PlsSearchHarvestQuery] = []
-    for query_json in iter_base_plan_queries(reporters, years):
-        key = make_query_key(query_json)
-        if key in existing:
-            continue
-        to_add.append(
-            PlsSearchHarvestQuery(
-                source_name=SOURCE_NAME,
-                query_key=key,
-                query_json=query_json,
-                status="pending",
-                priority=100 + (current_year - int(query_json["year"])),
+    for base_priority, group in ((100, reporters), (400, extra_reporters)):
+        for query_json in iter_base_plan_queries(group, years):
+            key = make_query_key(query_json)
+            if key in existing:
+                continue
+            to_add.append(
+                PlsSearchHarvestQuery(
+                    source_name=SOURCE_NAME,
+                    query_key=key,
+                    query_json=query_json,
+                    status="pending",
+                    priority=base_priority + (current_year - int(query_json["year"])),
+                )
             )
-        )
-        existing.add(key)
+            existing.add(key)
     if dry_run:
-        return {"would_insert": len(to_add), "reporters": len(reporters), "years": len(years)}
+        return {"would_insert": len(to_add), "reporters": len(reporters) + len(extra_reporters), "years": len(years)}
     for row in to_add:
         db.add(row)
     await db.flush()
-    return {"inserted": len(to_add), "reporters": len(reporters), "years": len(years)}
+    return {"inserted": len(to_add), "reporters": len(reporters) + len(extra_reporters), "years": len(years)}
 
 
 async def seed_extended_plan(
@@ -220,7 +261,7 @@ async def seed_snowball(db: AsyncSession, *, limit: int = 2000, dry_run: bool = 
     existing = {r for (r,) in (await db.execute(select(PlsSearchHarvestQuery.query_key).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).all()}
     added = 0
     for cit in fresh:
-        q = normalize_query_json({"citation": cit})
+        q = citation_lookup_query(cit) or normalize_query_json({"citation": cit})
         key = make_query_key(q)
         if key in existing:
             continue
@@ -301,6 +342,8 @@ async def pick_next_query(
     *,
     query_key: Optional[str] = None,
     priority_gaps: bool = False,
+    reporters: Optional[List[str]] = None,
+    include_unreported: bool = True,
 ) -> Optional[PlsSearchHarvestQuery]:
     if query_key:
         return (
@@ -315,6 +358,13 @@ async def pick_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
+    if reporters is not None:
+        # A login slot works only its own journals, so two slots never take the same query.
+        rep = PlsSearchHarvestQuery.query_json["reporter"].astext
+        cond = rep.in_(list(reporters) or [""])
+        if include_unreported:
+            cond = or_(cond, rep.is_(None))
+        stmt = stmt.where(cond)
     if priority_gaps:
         stmt = stmt.order_by(PlsSearchHarvestQuery.gap_size.desc(), PlsSearchHarvestQuery.priority.asc())
     else:
@@ -435,6 +485,11 @@ class SearchHarvestRunner:
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
                     query_row.cursor_json = cursor
+                    if (idx + 1) % COMMIT_EVERY_ROWS == 0:
+                        # Keep what is staged: a crash late in a long reporter x year list must not roll back
+                        # every judgment opened so far (it resumes from row_index).
+                        query_row.rows_new = rows_new
+                        await self.db.commit()
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
             else:
@@ -533,7 +588,7 @@ class SearchHarvestRunner:
                     query_json=child_json,
                     parent_id=parent.id,
                     status="pending",
-                    priority=500 + int(site_total / max(cap, 1)),
+                    priority=plan_priority(child_json),
                     split_reason=f"parent {parent.query_key} site_total={site_total}",
                 )
             )
@@ -549,13 +604,18 @@ async def run_search_harvest(
     priority_gaps: bool = False,
     redis_client=None,
     job_id=None,
+    reporter_shard: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not settings.login_scraping_effective:
         return {"skipped": True, "reason": "login scraping not permitted in this environment"}
     source = await _source_row(db)
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": True, "reason": f"source state {source.state}"}
-    query_row = await pick_next_query(db, query_key=query_key, priority_gaps=priority_gaps)
+    shard = reporter_shard if reporter_shard in (0, 1) else None
+    reporters = shard_reporters(await planned_reporters(db), shard) if shard is not None else None
+    query_row = await pick_next_query(
+        db, query_key=query_key, priority_gaps=priority_gaps, reporters=reporters, include_unreported=shard in (None, 0)
+    )
     if query_row is None:
         return {"skipped": True, "reason": "no pending search harvest query"}
     m = await active_map(db, SOURCE_NAME)
@@ -581,6 +641,27 @@ async def run_search_harvest(
     except SessionLockHeld:
         query_row.status = "pending"
         return {"skipped": True, "reason": "login session lock held"}
+    slot_lock = None
+    if shard is not None:
+        # One browser per login: this shard runs on its own slot only, under that slot's exclusive lock.
+        slot_no = shard + 1
+        try:
+            slot = await runner.pipeline.manager.slot(slot_no)
+        except Exception:
+            slot = None
+        if slot is None or slot.state != "ACTIVE":
+            query_row.status = "pending"
+            await lock.release()
+            return {"skipped": True, "reason": f"slot {slot_no} not ACTIVE"}
+        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{slot_no}", redis_client, max_holders=1)
+        try:
+            await slot_lock.acquire()
+        except SessionLockHeld:
+            query_row.status = "pending"
+            await lock.release()
+            return {"skipped": True, "reason": f"slot {slot_no} in use"}
+        runner.pipeline.runner.preferred_slot_number = slot_no
+        runner.pipeline.runner.exclusive_slot = True
     try:
         runner.pipeline._session_lock = lock
         runner.pipeline._assert_permitted()
@@ -601,12 +682,111 @@ async def run_search_harvest(
         query_row.last_error = str(exc)[:1000]
         await db.commit()
         return {"paused": True, "reason": str(exc), "query_key": query_row.query_key}
+    except Exception as exc:  # guard: one broken query must never stall the whole queue
+        permanent = "not offered" in str(exc) or "not an option" in str(exc)
+        status = await _book_query_failure(db, query_row, exc, permanent=permanent)
+        logger.warning("PLS search harvest query %s failed (%s): %s", query_row.query_key, status, exc)
+        return {"failed": True, "status": status, "reason": f"{type(exc).__name__}: {exc}"[:500], "query_key": query_row.query_key}
     finally:
         try:
             await runner.pipeline.runner.close()
         except Exception:
             pass
+        if slot_lock is not None:
+            await slot_lock.release()
         await lock.release()
+
+
+async def _book_query_failure(db: AsyncSession, query_row: PlsSearchHarvestQuery, exc: BaseException, *, permanent: bool) -> str:
+    """Roll back the failed attempt's half-written state, then persist the failure on the query row."""
+    row_id = query_row.id
+    error = f"{type(exc).__name__}: {exc}"
+    try:
+        await db.rollback()
+    except Exception:
+        pass
+    row = await db.get(PlsSearchHarvestQuery, row_id)
+    if row is None:
+        return "missing"
+    status = record_query_failure(
+        row,
+        error,
+        max_attempts=int(wsettings.PLS_SEARCH_HARVEST_MAX_ATTEMPTS or 3),
+        permanent=permanent,
+    )
+    row.last_run_at = datetime.now(timezone.utc)
+    await db.commit()
+    return status
+
+
+def tick_should_continue(result: Dict[str, Any], *, elapsed_seconds: float, budget_seconds: float, queries_run: int, max_queries: int) -> bool:
+    """A tick keeps taking queries while time is left, the last one really ran (done/split/failed), and the
+    per-tick cap is not reached. Skips and pauses (lock held, login, pacing, empty queue) end the tick."""
+    if result.get("skipped") or result.get("paused"):
+        return False
+    if max_queries > 0 and queries_run >= max_queries:
+        return False
+    return elapsed_seconds < budget_seconds
+
+
+TICK_RUN_KEY = "corpus:pls_search_run:{shard}"
+TICK_QUEUED_KEY = "corpus:pls_search_tick_queued:{shard}"
+
+
+def search_is_main_path() -> bool:
+    """Shamail's design of 2026-10-08: journal x year search is the main PakistanLawSite path; the citation
+    grid (already read end to end) is only a rare reconciliation pass."""
+    return str(wsettings.PLS_HARVEST_STRATEGY or "search").lower() == "search"
+
+
+def tick_lock_keys(shard: Optional[int]) -> List[str]:
+    """A sharded tick holds its own shard's run key; an unsharded tick (beat, watchdog) must hold both, so it
+    can never run beside a slot's tick and take the same query."""
+    return [TICK_RUN_KEY.format(shard=s) for s in ((shard,) if shard in (0, 1) else (0, 1))]
+
+
+async def _redis():
+    import redis.asyncio as aioredis
+
+    return aioredis.from_url(settings.REDIS_URL)
+
+
+async def acquire_tick_run_locks(shard: Optional[int], *, ttl: int) -> Optional[List[str]]:
+    r = await _redis()
+    got: List[str] = []
+    try:
+        for key in tick_lock_keys(shard):
+            if await r.set(key, datetime.now(timezone.utc).isoformat(), nx=True, ex=max(60, ttl)):
+                got.append(key)
+            else:
+                if got:
+                    await r.delete(*got)
+                return None
+        return got
+    finally:
+        await r.aclose()
+
+
+async def release_tick_keys(keys: List[str]) -> None:
+    if not keys:
+        return
+    r = await _redis()
+    try:
+        await r.delete(*keys)
+    finally:
+        await r.aclose()
+
+
+async def claim_tick_enqueue(shard: Optional[int], *, ttl: int = 3600) -> bool:
+    """Dispatcher guard: True (and a marker is set) when no tick for this shard is queued or running."""
+    r = await _redis()
+    try:
+        for key in tick_lock_keys(shard):
+            if await r.exists(key):
+                return False
+        return bool(await r.set(TICK_QUEUED_KEY.format(shard=shard if shard in (0, 1) else "all"), "1", nx=True, ex=ttl))
+    finally:
+        await r.aclose()
 
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
@@ -633,9 +813,42 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
                 ).scalar()
                 or 0
             )
-            if not pls_search_harvest_may_run(cfg, pending_gaps=pending):
+            if not (search_is_main_path() and pending > 0) and not pls_search_harvest_may_run(cfg, pending_gaps=pending):
                 return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
-            return await run_search_harvest(db, **kwargs)
+        shard = kwargs.get("reporter_shard") if kwargs.get("reporter_shard") in (0, 1) else None
+        held = await acquire_tick_run_locks(shard, ttl=int(wsettings.PLS_SEARCH_HARVEST_TICK_BUDGET_SECONDS or 0) + 1800)
+        if held is None:
+            await release_tick_keys([TICK_QUEUED_KEY.format(shard=shard if shard is not None else "all")])
+            return {"skipped": True, "reason": f"another search-harvest tick is running for shard {shard if shard is not None else 'all'}"}
+        try:
+            return await _run_tick_loop(kwargs)
+        finally:
+            await release_tick_keys(held + [TICK_QUEUED_KEY.format(shard=shard if shard is not None else "all")])
+
+    async def _run_tick_loop(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        import time as _time
+
+        budget = float(wsettings.PLS_SEARCH_HARVEST_TICK_BUDGET_SECONDS or 0)
+        max_queries = int(wsettings.PLS_SEARCH_HARVEST_MAX_QUERIES_PER_TICK or 0)
+        started = _time.monotonic()
+        results: List[Dict[str, Any]] = []
+        while True:
+            async with SessionLocal() as db:
+                result = await run_search_harvest(db, **kwargs)
+            results.append(result)
+            if kwargs.get("query_key") or not tick_should_continue(
+                result,
+                elapsed_seconds=_time.monotonic() - started,
+                budget_seconds=budget,
+                queries_run=len(results),
+                max_queries=max_queries,
+            ):
+                break
+        summary = dict(results[-1])
+        summary["queries_this_tick"] = len([r for r in results if not r.get("skipped") and not r.get("paused")])
+        summary["rows_new_this_tick"] = sum(int(r.get("rows_new") or 0) for r in results if r.get("status") == "done")
+        summary["failed_this_tick"] = len([r for r in results if r.get("failed")])
+        return summary
 
     return run_async(_inner())
 
@@ -649,7 +862,10 @@ def cli_plan(argv: Optional[List[str]] = None) -> int:
 
     async def _run():
         async with SessionLocal() as db:
-            return await seed_search_harvest_plan(db, dry_run=args.dry_run)
+            out = await seed_search_harvest_plan(db, dry_run=args.dry_run)
+            if not args.dry_run:
+                await db.commit()
+            return out
 
     print(json.dumps(run_async(_run()), indent=2))
     return 0
