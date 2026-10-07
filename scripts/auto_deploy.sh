@@ -179,14 +179,19 @@ main() {
     exit 0
   fi
 
-  if [ "$old_sha" = "$new_sha" ] && [ -z "$deployed_sha" ]; then
-    log "checkout already at $new_sha; recording tip_sha without rollout"
+  local pre_merge_sha="$old_sha"
+  local merged=0
+  if [ "$pre_merge_sha" != "$new_sha" ]; then
+    log "fast-forward merge $pre_merge_sha -> $new_sha before waiting for PLS idle (same cron run picks up deploy script fixes)"
     if [ "$DRY_RUN" = 1 ]; then
-      log "dry-run: would record tip_sha=$new_sha"
+      log "dry-run: would git merge --ff-only $REMOTE/$BRANCH"
+    elif ! git merge --ff-only "$REMOTE/$BRANCH"; then
+      die "fast-forward merge failed; manual intervention required"
     else
-      printf '%s\n' "$new_sha" >"$TIP_FILE"
+      merged=1
+      # shellcheck source=scripts/pls_host_lib.sh
+      source "$(dirname "${BASH_SOURCE[0]}")/pls_host_lib.sh"
     fi
-    exit 0
   fi
 
   local beat_was_running=0
@@ -203,15 +208,17 @@ main() {
     log "celery-beat is not running; deploy will not start beat"
   fi
 
-  log "deploying $old_sha -> $new_sha"
-  if [ "$DRY_RUN" = 1 ]; then
-    log "dry-run: would git merge --ff-only $REMOTE/$BRANCH"
-  elif ! git merge --ff-only "$REMOTE/$BRANCH"; then
-    die "fast-forward merge failed; manual intervention required"
+  log "deploying $pre_merge_sha -> $new_sha"
+  if [ "$merged" = 0 ] && [ "$pre_merge_sha" != "$new_sha" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      log "dry-run: would git merge --ff-only $REMOTE/$BRANCH"
+    elif ! git merge --ff-only "$REMOTE/$BRANCH"; then
+      die "fast-forward merge failed; manual intervention required"
+    fi
   fi
 
   local services_line services=()
-  services_line="$(services_for_diff "$old_sha" "$new_sha" || true)"
+  services_line="$(services_for_diff "$pre_merge_sha" "$new_sha" || true)"
   if [ -z "$services_line" ]; then
     log "no service-impacting files changed; recording tip_sha only"
     if [ "$DRY_RUN" = 1 ]; then
