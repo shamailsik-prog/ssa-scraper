@@ -55,6 +55,15 @@ wait_for_pls_idle() {
   local waited=0
   while pls_host_harvest_busy; do
     if [ "$waited" -ge "$WAIT_MAX_SECONDS" ]; then
+      if pls_host_promotion_stalled; then
+        log "PLS busy but /status reports no_output_while_harvesting; releasing lock for pending deploy"
+        if [ "$DRY_RUN" = 1 ]; then
+          log "dry-run: would force-release stalled PLS harvest and continue deploy"
+        else
+          pls_host_force_release_stalled_harvest
+        fi
+        return 0
+      fi
       log "PLS still busy after ${waited}s (lock or running job); deferring deploy to next cron tick"
       exit 0
     fi
