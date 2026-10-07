@@ -78,6 +78,10 @@ from scraper.tasks.search_map import active_map, map_as_dict, map_search_form, m
 
 logger = logging.getLogger(__name__)
 
+
+class ScraperJobPreempted(RuntimeError):
+    """Dispatcher marked this job failed so search-harvest can take the login session."""
+
 SOURCE_NAME = "PakistanLawSite"
 TIER3_RETIRE_AFTER = 3
 TIER4_HIGH_YIELD_TERMS = 10
@@ -407,6 +411,10 @@ class PakistanLawSitePipeline:
                 records_extracted=int(self.stats.get("staged", 0) or 0),
             )
         )
+        job = (await self.db.execute(select(ScraperJob).where(ScraperJob.id == self.job_id))).scalars().first()
+        if job is None or job.status != "running":
+            detail = (job.error_message if job is not None else None) or "scraper job no longer running"
+            raise ScraperJobPreempted(detail)
 
     async def _persist_live_session(self) -> None:
         """Store the browser's current cookies back into its slot (same human login, renewed by the
@@ -1792,6 +1800,15 @@ class PakistanLawSitePipeline:
                         self.stats["pacing_paused"] = True
                         self.stats["stop_reason"] = f"pacing: {exc}"
                         logger.info("PakistanLawSite pacing budget reached: %s; resuming on the next scheduled run", exc)
+                        break
+                    except ScraperJobPreempted as exc:
+                        stopped_clean = True
+                        self.stats["preempted"] = True
+                        self.stats["stop_reason"] = str(exc)
+                        logger.info(
+                            "PakistanLawSite citation-grid job stopped: %s (yielding session for search-harvest)",
+                            exc,
+                        )
                         break
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 if stopped_clean:

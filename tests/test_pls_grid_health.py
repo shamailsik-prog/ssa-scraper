@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from scraper.models import ScraperJob
 from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
@@ -72,3 +74,23 @@ def test_zero_query_not_failure_when_progress():
     stats = {"surface_mode": "citation_grid", "queries": 0, "citation_grid_windows": 1, "pages_charged": 2}
     cfg = {"citation_grid_cursor": {"row_offset": 100, "last_total_rows": 500}}
     assert pls_zero_query_grid_failure(stats, cfg) is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_job_raises_when_dispatcher_preempted(db, login_source):
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, ScraperJobPreempted
+
+    job = ScraperJob(
+        source_id=login_source.id,
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        status="failed",
+        error_message="preempted for search-harvest gap recovery while promotion stalled (zero-output grid job)",
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(job)
+    await db.flush()
+    pipeline = PakistanLawSitePipeline(db, login_source, job_id=job.id)
+    pipeline.stats = {"pages_charged": 0, "staged": 0}
+    with pytest.raises(ScraperJobPreempted, match="preempted"):
+        await pipeline._heartbeat_job()

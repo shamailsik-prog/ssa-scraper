@@ -273,7 +273,11 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
                 from scraper.pls_grid_health import pls_zero_query_grid_failure
 
                 zero_fail = pls_zero_query_grid_failure(stats if isinstance(stats, dict) else {}, dict(source.config_json or {}))
-            if zero_fail:
+            if isinstance(stats, dict) and stats.get("preempted"):
+                job.status = "failed"
+                job.error_message = (stats.get("stop_reason") or "preempted for search-harvest")[:4000]
+                job.result_summary = stats
+            elif zero_fail:
                 job.status = "failed"
                 job.error_message = zero_fail
                 source.last_error = zero_fail[:2000]
