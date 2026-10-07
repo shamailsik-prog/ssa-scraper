@@ -60,14 +60,16 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
                 }
             m = await map_search_form(db, source, page.html or "", page_url=page.url or "")
             # Keep grid walk available: dual map (dashboard fields + archivedpatientGrid layout).
+            from scraper.extractors.deterministic import enrich_dashboard_result_layout
+
             layout = dict(m.result_layout or {})
             layout["row_selector"] = layout.get("row_selector") or "#archivedpatientGrid tbody tr"
             if "archivedpatientgrid" not in str(layout.get("row_selector") or "").lower():
                 layout["row_selector"] = "#archivedpatientGrid tbody tr"
-            m.result_layout = layout
             limits = dict(m.limits or {})
             limits["surface"] = "query_form"
             limits["dashboard_citation_fields"] = True
+            m.result_layout = enrich_dashboard_result_layout(layout, limits)
             m.limits = limits
             m.stale = False
             await db.commit()

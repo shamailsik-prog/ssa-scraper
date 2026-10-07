@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
@@ -27,9 +27,9 @@ from scraper.harvest_mode import (
     source_backfill_priority,
     source_selected_for_mode,
 )
-from scraper.models import BrowserSessionSlot, ScraperJob, ScraperSource
+from scraper.models import BrowserSessionSlot, PlsSearchHarvestQuery, ScraperJob, ScraperSource
 from scraper.notify import notify
-from scraper.pls_grid_health import dispatch_saturated
+from scraper.pls_grid_health import SOURCE_NAME as PLS_SOURCE_NAME, defer_pls_grid_for_search_harvest, dispatch_saturated
 
 logger = logging.getLogger(__name__)
 RUNNING_JOB_STALE_AFTER = timedelta(hours=3)
@@ -394,6 +394,32 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 )
                 continue
             if s.access_method == "login_session":
+                cfg = dict(s.config_json or {})
+                if (
+                    s.source_name == PLS_SOURCE_NAME
+                    and defer_pls_grid_for_search_harvest(cfg)
+                    and int(
+                        (
+                            await db.execute(
+                                select(func.count())
+                                .select_from(PlsSearchHarvestQuery)
+                                .where(
+                                    PlsSearchHarvestQuery.source_name == PLS_SOURCE_NAME,
+                                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                                )
+                            )
+                        ).scalar()
+                        or 0
+                    )
+                    > 0
+                ):
+                    logger.info(
+                        "%s: promotion stalled with search-harvest gaps pending; deferring citation-grid enqueue",
+                        s.source_name,
+                    )
+                    skipped_saturated.append(f"{s.source_name}:search_harvest_priority")
+                    s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                    continue
                 active_slots = await _active_slot_numbers(db, s.source_name)
                 running_shards = _running_reporter_shards(running_jobs)
                 if running_jobs and any(shard not in (0, 1) for shard in running_shards):

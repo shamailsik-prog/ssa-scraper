@@ -383,14 +383,51 @@ def extract_instrument_deterministic(*, html: Optional[str], text: Optional[str]
     return data.model_dump(mode="json")
 
 
+DASHBOARD_AJAX_ROW_SELECTOR = "#rightmenu table tr"
+
+
+def enrich_dashboard_result_layout(result_layout: Dict[str, Any], limits: Dict[str, Any]) -> Dict[str, Any]:
+    """Dashboard Citation Search POSTs results into #rightmenu; grid walk still uses #archivedpatientGrid."""
+    layout = dict(result_layout or {})
+    if (limits or {}).get("dashboard_citation_fields"):
+        layout.setdefault("dashboard_row_selector", DASHBOARD_AJAX_ROW_SELECTOR)
+    return layout
+
+
+def _effective_result_row_selector(soup: BeautifulSoup, search_map: Dict[str, Any]) -> tuple[str, Dict[str, int]]:
+    """Pick a row selector that matches rendered rows (dashboard AJAX vs full CitationSearch grid)."""
+    layout = search_map.get("result_layout") or {}
+    limits = search_map.get("limits") or {}
+    cols = dict(layout.get("columns") or {})
+    primary = layout.get("row_selector") or "table tr"
+    candidates: List[str] = [primary]
+    if limits.get("dashboard_citation_fields"):
+        candidates.append(str(layout.get("dashboard_row_selector") or DASHBOARD_AJAX_ROW_SELECTOR))
+        candidates.append(DASHBOARD_AJAX_ROW_SELECTOR)
+    seen: set[str] = set()
+    for sel in candidates:
+        if not sel or sel in seen:
+            continue
+        seen.add(sel)
+        try:
+            hits = soup.select(sel)
+        except Exception:
+            continue
+        data_rows = [tr for tr in hits if tr.find("td")]
+        if data_rows:
+            return sel, cols
+    if soup.select("#rightmenu table tr td"):
+        return DASHBOARD_AJAX_ROW_SELECTOR, {}
+    return primary, cols
+
+
 def extract_result_rows_deterministic(*, html: str, search_map: Optional[Dict[str, Any]] = None, base_url: str = "") -> Dict[str, Any]:
     """Parse a result table using the stored search map (selectors and column indexes), or fall back to
     generic table introspection. Every row needs at least a citation or a detail/PDF link."""
     soup = BeautifulSoup(html or "", "html.parser")
     search_map = search_map or {}
     layout = search_map.get("result_layout") or {}
-    row_sel = layout.get("row_selector") or "table tr"
-    cols = layout.get("columns") or {}
+    row_sel, cols = _effective_result_row_selector(soup, search_map)
     link_sel = layout.get("detail_link_selector")
     rows_out = []
     for tr in soup.select(row_sel):
