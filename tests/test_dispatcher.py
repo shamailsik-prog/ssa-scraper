@@ -388,6 +388,49 @@ async def test_dispatch_starts_only_the_missing_shard_when_one_shard_is_running(
     assert result["queued"] == ["PakistanLawSite:shard1"] and queued == [1]
 
 
+async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monkeypatch):
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+
+    target = await _prepare_pls_due(db, (1, 2))
+    target.config_json = {
+        **dict(target.config_json or {}),
+        "pls_stall_watchdog": {"stalled": True, "stalled_reason": "no_output_while_harvesting"},
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLD|year=2026",
+            query_json={"reporter": "PLD", "year": "2026"},
+            status="pending",
+            priority=100,
+            gap_size=9,
+        )
+    )
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="stall recovery")
+    await db.commit()
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None: sent.append((name, kwargs or {}, queue)),
+    )
+    result = await dispatch_due_sources()
+    assert "PakistanLawSite:search_harvest_tick" in result["queued"]
+    assert sent == [
+        (
+            "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+            {"priority_gaps": True},
+            "login_session",
+        )
+    ]
+    assert "PakistanLawSite:search_harvest_priority" in result["skipped_saturated"]
+
+
 async def test_dispatch_starts_nothing_beside_a_running_unsharded_job(db, monkeypatch):
     """An unsharded job may fail over to any ACTIVE slot, so no shard is started while it runs,
     even after the second slot comes back."""

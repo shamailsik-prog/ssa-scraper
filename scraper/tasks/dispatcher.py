@@ -29,7 +29,11 @@ from scraper.harvest_mode import (
 )
 from scraper.models import BrowserSessionSlot, PlsSearchHarvestQuery, ScraperJob, ScraperSource
 from scraper.notify import notify
-from scraper.pls_grid_health import SOURCE_NAME as PLS_SOURCE_NAME, defer_pls_grid_for_search_harvest, dispatch_saturated
+from scraper.pls_grid_health import (
+    SOURCE_NAME as PLS_SOURCE_NAME,
+    defer_pls_grid_for_search_harvest,
+    dispatch_saturated,
+)
 
 logger = logging.getLogger(__name__)
 RUNNING_JOB_STALE_AFTER = timedelta(hours=3)
@@ -395,10 +399,9 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             if s.access_method == "login_session":
                 cfg = dict(s.config_json or {})
-                if (
-                    s.source_name == PLS_SOURCE_NAME
-                    and defer_pls_grid_for_search_harvest(cfg)
-                    and int(
+                pending_search_gaps = 0
+                if s.source_name == PLS_SOURCE_NAME:
+                    pending_search_gaps = int(
                         (
                             await db.execute(
                                 select(func.count())
@@ -411,13 +414,22 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         ).scalar()
                         or 0
                     )
-                    > 0
+                if (
+                    s.source_name == PLS_SOURCE_NAME
+                    and defer_pls_grid_for_search_harvest(cfg)
+                    and pending_search_gaps > 0
                 ):
                     logger.info(
                         "%s: promotion stalled with search-harvest gaps pending; deferring citation-grid enqueue",
                         s.source_name,
                     )
                     skipped_saturated.append(f"{s.source_name}:search_harvest_priority")
+                    app.send_task(
+                        "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+                        kwargs={"priority_gaps": True},
+                        queue="login_session",
+                    )
+                    queued.append(f"{s.source_name}:search_harvest_tick")
                     s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
                     continue
                 active_slots = await _active_slot_numbers(db, s.source_name)

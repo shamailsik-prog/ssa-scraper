@@ -609,11 +609,30 @@ async def run_search_harvest(
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
 def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
-    if not getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
-        return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set"}
-
     async def _inner() -> Dict[str, Any]:
+        from sqlalchemy import func, select
+
+        from scraper.pls_grid_health import SOURCE_NAME, pls_search_harvest_may_run
+        from scraper.models import PlsSearchHarvestQuery, ScraperSource
+
         async with SessionLocal() as db:
+            source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
+            cfg = dict(source.config_json or {}) if source else {}
+            pending = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(PlsSearchHarvestQuery)
+                        .where(
+                            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            if not pls_search_harvest_may_run(cfg, pending_gaps=pending):
+                return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
             return await run_search_harvest(db, **kwargs)
 
     return run_async(_inner())
