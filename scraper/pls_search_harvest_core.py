@@ -10,7 +10,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from scraper.config import KNOWN_REPORTERS
 from scraper.parsers.citation_extractor import normalise_citation
 
-_QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
+_QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page", "page_from", "page_to")
+
+# Courts typed into the dashboard's free-text court box when a capped reporter x year list must be narrowed
+# (the box has no option list to read them from). Order: apex courts, High Courts, then tribunals.
+FALLBACK_COURT_SPLITS = (
+    "Supreme Court",
+    "Federal Shariat Court",
+    "Lahore High Court",
+    "Sindh High Court",
+    "Peshawar High Court",
+    "Balochistan High Court",
+    "Islamabad High Court",
+    "Supreme Appellate Court",
+    "Chief Court",
+    "Tribunal",
+)
 
 _ALPHA_KEYWORD_SPLITS = [chr(c) for c in range(ord("a"), ord("z") + 1)]
 
@@ -23,7 +38,7 @@ def normalize_query_json(query: Dict[str, Any]) -> Dict[str, Any]:
         text = str(value).strip()
         if not text:
             continue
-        if key in ("year", "month", "page_from", "page_to"):
+        if key in ("year", "month", "page", "page_from", "page_to"):
             out[key] = int(text)
         else:
             out[key] = text
@@ -50,6 +65,19 @@ def reporters_for_plan(
     if map_reporters:
         return list(map_reporters)
     return list(fallback)
+
+
+def extra_offered_reporters(planned: Sequence[str], offered: Sequence[str]) -> List[str]:
+    """Journals the search form offers that the plan does not already hold (compared case/punctuation-free,
+    so "PCRLJ" is not added again beside "PCrLJ")."""
+    have = {re.sub(r"[^a-z0-9]", "", str(r).lower()) for r in planned}
+    out: List[str] = []
+    for name in offered:
+        key = re.sub(r"[^a-z0-9]", "", str(name).lower())
+        if key and key not in have:
+            have.add(key)
+            out.append(str(name).strip())
+    return out
 
 
 def years_for_plan(earliest_year: int, current_year: int) -> List[int]:
@@ -95,10 +123,19 @@ def build_harvest_form_values(
 
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
     tier_cursor = dict(cursor)
-    if "page" in cursor and "page_no" not in cursor:
+    dashboard = is_dashboard_citation_map(search_map)
+    if "page" in cursor and "page_no" not in cursor and not dashboard:
         tier_cursor["page_no"] = cursor["page"]
+    if dashboard:
+        # On the dashboard Citation Search panel the "page" box is the CITATION page (2019 SCMR <page>), not
+        # the result-list page. Filling it with the pagination cursor ("1") silently turned every
+        # reporter x year search into "citations printed at page 1" (1-9 rows instead of the whole year).
+        tier_cursor.pop("page_no", None)
     values = build_values(search_map, tier_query, tier_cursor)
     fields = search_map.get("fields") or {}
+    canonical = canonical_reporter_option(search_map, values.get("reporter"))
+    if canonical:
+        values["reporter"] = canonical
     for role in ("court", "category"):
         if role in fields and query_json.get(role):
             values[role] = str(query_json[role])
@@ -116,10 +153,96 @@ def build_harvest_form_values(
             values["keyword"] = str(query_json[role])
         elif query_json.get(role) and role in fields:
             values[role] = str(query_json[role])
-    if "page" in fields:
+    if dashboard:
+        values.pop("page", None)
+        if "page" in fields and query_json.get("page") is not None:
+            values["page"] = str(query_json["page"])
+    elif "page" in fields:
         page = cursor.get("page") or cursor.get("page_no") or 1
         values["page"] = str(page)
     return values
+
+
+def is_dashboard_citation_map(search_map: Dict[str, Any]) -> bool:
+    """The authenticated dashboard's Citation Search panel (reporter dropdown + year/page/court boxes)."""
+    if (search_map.get("limits") or {}).get("dashboard_citation_fields"):
+        return True
+    fields = search_map.get("fields") or {}
+    sel = f"{(fields.get('reporter') or {}).get('selector') or ''} {(fields.get('year') or {}).get('selector') or ''}"
+    return "Citation_Category_Search_dropdown" in sel or "Citation_Year_Search_input" in sel
+
+
+def citation_lookup_query(citation: str) -> Optional[Dict[str, Any]]:
+    """A cited citation ("2019 SCMR 123", "PLD 2019 SC 1") as a direct reporter + year + page lookup on the
+    citation form; None when it does not parse into those three parts."""
+    from scraper.parsers.citation_extractor import extract_citations
+
+    for hit in extract_citations(citation or ""):
+        rep, year, page = hit.get("reporter"), hit.get("year"), hit.get("page")
+        if rep and year and page:
+            return normalize_query_json({"reporter": rep, "year": int(year), "page": int(page)})
+    return None
+
+
+def shard_reporters(reporters: Sequence[str], shard: Optional[int]) -> Optional[List[str]]:
+    """Disjoint share of the journals for login slot shard 0 or 1 (alternating down the priority-ordered list,
+    so each slot gets a mix of big and small journals). None means every journal (unsharded)."""
+    if shard not in (0, 1):
+        return None
+    return [r for i, r in enumerate(reporters) if i % 2 == shard]
+
+
+def _norm_opt(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def canonical_reporter_option(search_map: Dict[str, Any], reporter: Optional[str]) -> Optional[str]:
+    """The reporter dropdown's own option value for `reporter` ("PCrLJ" -> "PCRLJ", "PLCN" -> "PLC N"), or
+    None when the field is not a select or nothing matches (the caller keeps the configured spelling)."""
+    if not reporter:
+        return None
+    field = (search_map.get("fields") or {}).get("reporter") or {}
+    if field.get("kind") != "select":
+        return None
+    pairs = [list(p) for p in (field.get("option_labels") or []) if p] or [[o, o] for o in (field.get("options") or [])]
+    for pair in pairs:
+        if str(pair[0]) == str(reporter):
+            return str(pair[0])
+    want = _norm_opt(reporter)
+    for pair in pairs:
+        if _norm_opt(pair[0]) == want or (len(pair) > 1 and _norm_opt(pair[1]) == want):
+            return str(pair[0])
+    return None
+
+
+def reporter_not_offered_reason(search_map: Dict[str, Any], query_json: Dict[str, Any]) -> Optional[str]:
+    """A reporter query whose journal the mapped select does not offer can never run: say so up front."""
+    reporter = query_json.get("reporter")
+    field = (search_map.get("fields") or {}).get("reporter") or {}
+    if not reporter or field.get("kind") != "select" or not (field.get("options") or field.get("option_labels")):
+        return None
+    if canonical_reporter_option(search_map, reporter) is None:
+        return f"reporter {reporter!r} is not offered by the search form's journal dropdown"
+    return None
+
+
+def record_query_failure(query_row: Any, error: str, *, max_attempts: int, permanent: bool = False, demote_by: int = 100) -> str:
+    """Book one failed attempt on a harvest query so a broken query can never block the queue head.
+
+    The attempt count lives in cursor_json["failures"]. Below `max_attempts` the query goes back to
+    pending with its priority pushed behind the others; at the limit (or for a permanent error) it is
+    marked failed with the reason. Returns the new status."""
+    cursor = dict(getattr(query_row, "cursor_json", None) or {})
+    failures = int(cursor.get("failures") or 0) + 1
+    cursor["failures"] = failures
+    query_row.cursor_json = cursor
+    query_row.last_error = str(error or "")[:1000]
+    if permanent or failures >= max(1, int(max_attempts)):
+        query_row.status = "failed"
+    else:
+        query_row.status = "pending"
+        query_row.priority = int(getattr(query_row, "priority", 0) or 0) + int(demote_by)
+    return query_row.status
 
 
 def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
@@ -138,6 +261,9 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
         if not any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no")):
             return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
     fields = search_map.get("fields") or {}
+    not_offered = reporter_not_offered_reason(search_map, query_json)
+    if not_offered:
+        return not_offered
     if query_json.get("court") and "court" not in fields:
         return "search map cannot express court filter; missing role: court"
     if query_json.get("category") and "category" not in fields:
@@ -230,8 +356,9 @@ def split_oversized_query(
             continue
         if dim == "month":
             return [normalize_query_json({**normalized, "month": m}) for m in _MONTHS]
-        if dim == "court" and court_options:
-            return [normalize_query_json({**normalized, "court": c}) for c in court_options if c]
+        if dim == "court" and (court_options or "court" in roles):
+            courts = list(court_options) or list(FALLBACK_COURT_SPLITS)
+            return [normalize_query_json({**normalized, "court": c}) for c in courts if c]
         if dim == "bench" and "bench" in roles and bench_options:
             return [normalize_query_json({**normalized, "bench": b}) for b in bench_options if b]
         if dim == "party_initial" and "party_initial" in roles:
