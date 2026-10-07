@@ -1376,23 +1376,6 @@ class PakistanLawSitePipeline:
 
                 check = await browser.goto(pls_check_url())
                 raise_for_verdict(check)
-                # Reveal the Citation Search panel (hidden while Caselaw Search is selected).
-                try:
-                    await browser._wrap(
-                        browser._page.click('input.searchButton[searchtype="citation"]', timeout=10_000)
-                    )
-                except Exception:
-                    try:
-                        await browser._wrap(
-                            browser._page.evaluate(
-                                """() => {
-                                  const btn = document.querySelector('input.searchButton[searchtype="citation"]');
-                                  if (btn) btn.click();
-                                }"""
-                            )
-                        )
-                    except Exception:
-                        pass
                 page = await browser.submit_search(search_map, values, wait_for_ajax_results=True)
             else:
                 await open_citation_search_for_harvest(browser)

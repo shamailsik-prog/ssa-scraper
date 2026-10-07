@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from scraper.config import settings
+from scraper.extractors.deterministic import search_map_uses_dashboard_citation_panel
 from scraper.models import BrowserSessionSlot, ScraperSource
 from scraper.notify import notify
 from scraper.security import (
@@ -1219,9 +1220,60 @@ class PlaywrightBrowser:
             # Some search surfaces update in-place without a full document navigation.
             return
 
+    async def ensure_dashboard_citation_search_panel_visible(self) -> None:
+        """Select the Citation Search tab on /Login/Check so #Citation_* controls are visible."""
+        if self._page is None:
+            return
+        url = (self._page.url or "").lower()
+        if "/login/check" not in url:
+            return
+        dropdown = self._page.locator("#Citation_Category_Search_dropdown").first
+        try:
+            if await dropdown.is_visible():
+                return
+        except Exception:
+            pass
+        activation_js = """() => {
+          const tab = document.querySelector('input.searchButton[searchtype="citation"]');
+          if (tab) {
+            try { tab.click(); } catch (_e) {
+              tab.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+          }
+          document.querySelectorAll('.citationSearchDiv').forEach((el) => {
+            el.style.display = '';
+            el.style.visibility = 'visible';
+            el.hidden = false;
+            el.classList.remove('hidden');
+          });
+        }"""
+        try:
+            await self._wrap(
+                self._page.click('input.searchButton[searchtype="citation"]', timeout=10_000)
+            )
+        except Exception:
+            try:
+                await self._wrap(self._page.evaluate(activation_js))
+            except Exception:
+                pass
+        try:
+            await self._wrap(
+                self._page.wait_for_selector(
+                    "#Citation_Category_Search_dropdown",
+                    state="visible",
+                    timeout=min(15_000, int(settings.PLAYWRIGHT_TIMEOUT_MS)),
+                )
+            )
+        except Exception as exc:
+            raise BrowserDisconnected(
+                f"Citation Search panel stayed hidden on dashboard (slot {self.slot_number}): {exc}"
+            ) from exc
+
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs: Any) -> PageResult:
         archived_grid_start_row = int(kwargs.get("archived_grid_start_row", 0) or 0)
         wait_for_ajax_results = bool(kwargs.get("wait_for_ajax_results"))
+        if search_map_uses_dashboard_citation_panel(search_map):
+            await self.ensure_dashboard_citation_search_panel_visible()
         fields = search_map.get("fields") or {}
         for role, value in values.items():
             f = fields.get(role)

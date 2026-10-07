@@ -568,6 +568,17 @@ _DASHBOARD_CITATION_ROLES = {
 }
 
 
+def search_map_uses_dashboard_citation_panel(search_map: Dict[str, Any]) -> bool:
+    """True when Playwright must reveal the /Login/Check Citation Search tab before filling controls."""
+    fields = search_map.get("fields") or {}
+    markers = set(_DASHBOARD_CITATION_ROLES.keys())
+    for field in fields.values():
+        sel = str(field.get("selector") or "")
+        if any(marker in sel for marker in markers):
+            return True
+    return False
+
+
 def _dashboard_citation_controls(soup: BeautifulSoup):
     """Map the authenticated dashboard Citation Search panel into field descriptors."""
     fields = []
