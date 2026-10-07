@@ -384,12 +384,31 @@ def test_dispatch_saturation_waits_for_every_journal(monkeypatch):
 
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,CLC")
     monkeypatch.setattr(settings, "PLS_GRID_JOURNALS", "")
-    sat = {"saturated_at": (NOW - timedelta(hours=1)).isoformat()}
-    # the default (CLC) grid is saturated, but PLD has not been walked: not saturated
+    sat = {
+        "saturated_at": (NOW - timedelta(hours=1)).isoformat(),
+        "saturated_total_rows": 100,
+        "last_total_rows": 100,
+    }
+    # the default grid is saturated; PLD has never started: inherits idle (no pointless journal job)
     cfg = {"citation_grid_cursor": dict(sat), "citation_grid_cursor_journal_CLC": dict(sat)}
+    assert dispatch_saturated(cfg, None, now=NOW) is True
+    # once PLD's walk has started, dispatch may resume until that journal is saturated or set aside
+    cfg["citation_grid_cursor_journal_PLD"] = {"row_offset": 50, "lap": {"rows": 10}}
     assert dispatch_saturated(cfg, None, now=NOW) is False
     cfg["citation_grid_cursor_journal_PLD"] = {"unsupported_at": (NOW - timedelta(hours=1)).isoformat()}
     assert dispatch_saturated(cfg, None, now=NOW) is True
     # rotation found no dropdown: the default grid's own saturation decides again
     cfg2 = {"citation_grid_cursor": dict(sat), "citation_grid_journal_rotation_off": {"at": (NOW - timedelta(hours=1)).isoformat()}}
     assert dispatch_saturated(cfg2, None, now=NOW) is True
+
+
+def test_unstarted_journal_cursors_inherit_main_grid_saturation():
+    sat = {
+        "saturated_at": (NOW - timedelta(hours=1)).isoformat(),
+        "saturated_total_rows": 20568,
+        "last_total_rows": 20568,
+    }
+    cfg = {"citation_grid_cursor": dict(sat)}
+    view = grid_saturation_view(cfg, now=NOW)
+    assert view["all_saturated"] is True
+    assert dispatch_saturated(cfg, None, now=NOW) is True

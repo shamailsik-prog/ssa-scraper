@@ -33,7 +33,9 @@ from scraper.pls_grid_health import (
     SOURCE_NAME as PLS_SOURCE_NAME,
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
+    pls_last_judgment_at,
     pls_preempt_running_job_for_search_harvest,
+    pls_stall_verdict_for_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -411,10 +413,20 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     ).scalar()
                     or 0
                 )
+                pls_stall_reason = None
+                if pending_search_gaps > 0:
+                    last_j = await pls_last_judgment_at(db)
+                    pls_stall_reason = pls_stall_verdict_for_config(
+                        cfg, last_promotion_at=last_j, source_state=s.state, now=now
+                    ).get("stalled_reason")
                 preempted = False
                 for job in list(running_jobs):
                     if not pls_preempt_running_job_for_search_harvest(
-                        job, cfg, pending_gaps=pending_search_gaps, now=now
+                        job,
+                        cfg,
+                        pending_gaps=pending_search_gaps,
+                        stall_reason=pls_stall_reason,
+                        now=now,
                     ):
                         continue
                     job.status = "failed"
@@ -444,8 +456,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 cfg = dict(s.config_json or {})
                 if (
                     s.source_name == PLS_SOURCE_NAME
-                    and defer_pls_grid_for_search_harvest(cfg)
                     and pending_search_gaps > 0
+                    and defer_pls_grid_for_search_harvest(cfg, stall_reason=pls_stall_reason)
                 ):
                     logger.info(
                         "%s: promotion stalled with search-harvest gaps pending; deferring citation-grid enqueue",
