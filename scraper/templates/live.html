@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#7a1f1f">
+<title>SIKANDER AI — Corpus live</title>
+<style>
+:root{--bg:#f6f4ef;--panel:#fff;--ink:#1c1a17;--muted:#6b665e;--line:#dcd7cc;--accent:#7a1f1f;--ok:#1f6f43;--warn:#a86b00;--bad:#a12626;--todo:#e9e5dc}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+header{padding:12px 16px;background:var(--panel);border-bottom:2px solid var(--accent);display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:baseline}
+header h1{margin:0;font-size:18px}.muted{color:var(--muted);font-size:12px}
+main{max-width:1200px;margin:0 auto;padding:12px}
+.banner{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-weight:600;color:#fff}.banner.ok{background:var(--ok)}.banner.warn{background:var(--warn)}.banner.bad{background:var(--bad)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.tile,section{background:var(--panel);border:1px solid var(--line);border-radius:6px}.tile{padding:10px 12px}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.value{font-size:22px;font-weight:700}
+section{padding:12px 14px;margin-bottom:12px}section h2{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:5px 7px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:8px;background:var(--todo);border-radius:4px;min-width:80px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--ok)}
+.grid td.c{width:34px;min-width:34px;text-align:center;font-size:11px;padding:3px 2px;border:1px solid #fff}
+.c.done{background:#cfe8d8}.c.split{background:#cfe0e8}.c.pending{background:var(--todo);color:var(--muted)}.c.in_progress{background:#f6e2b3}.c.failed{background:#f2c9c9}
+.legend span{display:inline-block;padding:1px 6px;margin-right:6px;border-radius:3px;font-size:11px}
+ul{margin:4px 0;padding-left:18px}li{margin:2px 0}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:800px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><h1>SIKANDER AI — Corpus live</h1><span class="muted" id="stamp">loading…</span></header>
+<main>
+  <div id="banner" class="banner warn">Loading…</div>
+  <div class="tiles" id="tiles"></div>
+  <div class="two">
+    <section><h2>Self-healing watchdog</h2><div id="watchdog"></div></section>
+    <section><h2>Sessions and sources</h2><div id="sources"></div></section>
+  </div>
+  <section><h2>Journals: citations discovered vs collected</h2><div class="scroll" id="journals"></div></section>
+  <section><h2>Search harvest: journal × year</h2>
+    <div class="legend muted"><span class="c done">done</span><span class="c in_progress">running</span><span class="c pending">pending</span><span class="c failed">failed</span> cell = judgments in corpus for that journal-year</div>
+    <div class="scroll" id="grid"></div></section>
+  <section><h2>Watchdog history</h2><div id="history"></div></section>
+  <p class="muted">Read-only status. Admin actions stay in the <a href="/dashboard">admin console</a> behind the admin key. Detailed health: <a href="/status">/status</a>. Refreshes every 30 s. Times are Pakistan time (PKT).</p>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const n=v=>v==null?'—':Number(v).toLocaleString('en-US');
+const pkt=v=>{if(!v)return '—';try{return new Date(v).toLocaleString('en-GB',{timeZone:'Asia/Karachi',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})+' PKT'}catch(e){return v}};
+const ago=v=>{if(!v)return 'never';const m=Math.round((Date.now()-new Date(v))/60000);return m<60?m+' min ago':(m<2880?Math.round(m/60)+' h ago':Math.round(m/1440)+' d ago')};
+function tile(l,v,sub){return `<div class="tile"><div class="label">${esc(l)}</div><div class="value">${v}</div>${sub?`<div class="muted">${sub}</div>`:''}</div>`}
+async function load(){
+  let d;try{const r=await fetch('/live.json',{cache:'no-store'});d=await r.json();}catch(e){$('banner').className='banner bad';$('banner').textContent='Corpus service not answering';return;}
+  $('stamp').textContent='updated '+pkt(d.generated_at);
+  const t=d.totals||{},r=d.rate||{},w=d.watchdog||{},e=d.embeddings||{};
+  const moving=(r.judgments_1h||0)>0;
+  let cls='ok',msg=`Harvesting — ${n(r.judgments_1h)} new judgments and ${n(r.pls_pages_1h)} pages in the last hour`;
+  if(d.source_state!=='ACTIVE'){cls='warn';msg='PakistanLawSite is '+d.source_state;}
+  else if(!moving){cls=w.state==='idle'?'bad':'warn';msg='No new judgment in the last hour ('+n(r.pls_pages_1h)+' pages)'+(w.diagnosis&&w.diagnosis.length?' — '+w.diagnosis.slice(1).join('; '):'')+(w.last_action?' — watchdog: '+w.last_action:'');}
+  $('banner').className='banner '+cls;$('banner').textContent=msg;
+  const drive=(d.drive||[]).reduce((a,x)=>a+(x.judgments_mirrored||0),0);
+  $('tiles').innerHTML=[
+    tile('Judgments in corpus',n(t.judgments_in_corpus)),
+    tile('Citations discovered',n(t.citations_discovered),'collected '+n(t.citations_collected)),
+    tile('Coverage',t.coverage_pct==null?'—':t.coverage_pct+'%',n(t.remaining)+' to go'),
+    tile('Judgments last 24 h',n(r.judgments_24h),'last hour: '+n(r.judgments_1h)+' · 7 days: '+n(r.judgments_7d)),
+    tile('Rate per day',n(r.judgments_per_day),'ETA '+(r.eta_days==null?'unknown (no rate yet)':r.eta_days+' days')),
+    tile('PLS pages',n(r.pls_pages_1h)+' /h','24 h: '+n(r.pls_pages_24h)),
+    tile('Google Drive copies',n(drive),'judgments mirrored'),
+    tile('Embeddings',n(e.embedded),n(e.pending)+' pending'),
+  ].join('');
+  const h=d.watchdog_host||{};
+  $('watchdog').innerHTML=`<div>State: <b class="${w.state==='ok'?'ok':(w.state==='idle'?'bad':'warn')}">${esc(w.state||'not run yet')}</b> · checked ${esc(ago(w.checked_at))} · window ${esc(w.window_minutes||30)} min</div>
+   <div>Last action: ${w.last_action?esc(w.last_action)+' <span class="muted">('+pkt(w.last_action_at)+')</span>':'<span class="muted">none needed</span>'}</div>
+   ${(w.diagnosis||[]).length?'<div class="muted">Diagnosis</div><ul>'+w.diagnosis.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':''}
+   ${(w.unresolved||[]).length?'<div class="bad">Unresolved</div><ul>'+w.unresolved.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':''}
+   <div class="muted">Host watchdog: ${h.last_action?esc(h.last_action)+' ('+pkt(h.at)+')':'no action needed'}${h.checked_at?' · checked '+esc(ago(h.checked_at)):''}</div>`;
+  const pc=d.pakistancode_transition||{};
+  $('sources').innerHTML=`<div>Login slots: ${(d.slots||[]).map(s=>`slot ${s.slot} <b class="${s.state==='ACTIVE'?'ok':'bad'}">${esc(s.state)}</b>`).join(' · ')||'—'}</div>
+   <div>Search queue: ${Object.entries(d.search_queue||{}).map(([k,v])=>esc(k)+' '+n(v)).join(' · ')||'—'} · last query ${esc(ago(d.search_last_query_at))}</div>
+   <div>${['PakistanLawSite','PakistanCode','NasirLawSite','BalochistanHighCourt'].map(k=>esc(k)+': <b>'+esc((d.sources||{})[k]||'—')+'</b>').join('<br>')}</div>
+   <div class="muted">PakistanCode auto-switch: ${pc.enabled?'on':'off'} · coverage ${pc.coverage==null?'—':(100*pc.coverage).toFixed(1)+'%'} of ${pc.threshold?(100*pc.threshold).toFixed(0)+'%':'—'} needed${(pc.journals_without_discovery||[]).length?' · not yet discovered: '+esc(pc.journals_without_discovery.join(', ')):''}${pc.done?' · switched '+pkt(pc.done):''}</div>`;
+  $('journals').innerHTML='<table><tr><th>Journal</th><th>Collected</th><th>Discovered</th><th>Coverage</th><th>Years done</th><th>Pending</th><th>Failed</th></tr>'+(d.journals||[]).map(j=>`<tr><td><b>${esc(j.journal)}</b></td><td class="num">${n(j.collected)}</td><td class="num">${n(j.discovered)}</td><td><div class="bar"><i style="width:${j.coverage_pct||0}%"></i></div><span class="muted">${j.coverage_pct==null?'not discovered yet':j.coverage_pct+'%'}</span></td><td class="num">${n(j.years_done)}</td><td class="num">${n(j.years_pending)}</td><td class="num">${n(j.years_failed)}</td></tr>`).join('')+'</table>'+(t.default_grid_rows?`<div class="muted">Default citation grid: ${n(t.default_grid_rows)} rows walked.</div>`:'');
+  const cells=d.grid||[];const years=[...new Set(cells.map(c=>c.year))].sort((a,b)=>b-a);const reps=[...new Set(cells.map(c=>c.reporter))];
+  const by={};cells.forEach(c=>by[c.reporter+'|'+c.year]=c);
+  $('grid').innerHTML=cells.length?'<table class="grid"><tr><th>Journal</th>'+years.map(y=>`<th style="font-size:10px">${y}</th>`).join('')+'</tr>'+reps.map(rp=>'<tr><td><b>'+esc(rp)+'</b></td>'+years.map(y=>{const c=by[rp+'|'+y];if(!c)return '<td class="c"></td>';const tip=`${rp} ${y}: ${c.status}; discovered ${c.discovered}, new ${c.rows_new}, in corpus ${c.collected}${c.error?'; '+c.error:''}`;return `<td class="c ${esc(c.status)}" title="${esc(tip)}">${c.collected||''}</td>`}).join('')+'</tr>').join('')+'</table>':'<span class="muted">No search queries yet.</span>';
+  $('history').innerHTML=(w.history||[]).slice(0,12).map(x=>`<div><b>${pkt(x.at)}</b> <span class="${x.state==='ok'?'ok':'bad'}">${esc(x.state)}</span> — ${esc((x.actions||[]).join('; ')||'no action')}${(x.unresolved||[]).length?' <span class="bad">unresolved: '+esc(x.unresolved.join('; '))+'</span>':''}</div>`).join('')||'<span class="muted">Nothing recorded yet.</span>';
+}
+load();setInterval(load,30000);
+</script>
+</body>
+</html>
