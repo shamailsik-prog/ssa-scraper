@@ -24,7 +24,7 @@ pls_host_redis_lock_busy() {
 }
 
 pls_host_running_jobs() {
-  docker compose exec -T postgres psql -U "${POSTGRES_USER:-corpus}" -d "${POSTGRES_DB:-corpus}" -tAc \
+  docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -tAc \
     "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null \
     | tr -d ' \r\n' || echo "0"
 }

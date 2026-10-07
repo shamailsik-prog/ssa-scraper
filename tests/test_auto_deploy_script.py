@@ -35,3 +35,18 @@ def test_auto_deploy_unblocks_stalled_zero_output_harvest():
     assert "pls_host_force_release_stalled_harvest" in host
     assert "no_output_while_harvesting" in deploy
     assert "pls_host_force_release_stalled_harvest" in deploy
+
+
+def test_auto_deploy_merges_before_pls_idle_wait():
+    deploy = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    merge_marker = "before waiting for PLS idle"
+    assert merge_marker in deploy
+    main_body = deploy.split("main() {", 1)[1]
+    assert main_body.index(merge_marker) < main_body.index("wait_for_pls_idle")
+
+
+def test_pls_host_running_jobs_uses_compose_postgres_defaults():
+    text = Path("scripts/pls_host_lib.sh").read_text(encoding="utf-8")
+    assert "POSTGRES_USER:-legal" in text
+    assert "POSTGRES_DB:-legal_scraper" in text
+    assert "POSTGRES_USER:-corpus" not in text
