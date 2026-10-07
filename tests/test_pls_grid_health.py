@@ -70,6 +70,21 @@ def test_preempt_zero_output_grid_job_when_stalled_with_gaps():
     assert pls_preempt_running_job_for_search_harvest(old_job, cfg, pending_gaps=0, now=now) is False
 
 
+def test_preempt_citation_grid_job_with_pages_but_zero_staged():
+    now = datetime.now(timezone.utc)
+    cfg = {"pls_stall_watchdog": {"stalled": True, "stalled_reason": "no_output_while_harvesting"}}
+    grid_job = ScraperJob(
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        status="running",
+        started_at=now - timedelta(minutes=15),
+        pages_scraped=42,
+        records_extracted=0,
+        result_summary={"surface_mode": "citation_grid", "pages_charged": 42, "staged": 0},
+    )
+    assert pls_preempt_running_job_for_search_harvest(grid_job, cfg, pending_gaps=5, now=now) is True
+
+
 def test_zero_query_not_failure_when_progress():
     stats = {"surface_mode": "citation_grid", "queries": 0, "citation_grid_windows": 1, "pages_charged": 2}
     cfg = {"citation_grid_cursor": {"row_offset": 100, "last_total_rows": 500}}
