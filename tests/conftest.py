@@ -72,6 +72,20 @@ def _initialised_database():
     yield
 
 
+def _clear_pls_search_tick_markers() -> None:
+    """PLS search-tick queued/run markers live in Redis with a TTL; clear them so tests stay independent."""
+    try:
+        import redis
+
+        r = redis.Redis.from_url(settings.REDIS_URL)
+        keys = list(r.scan_iter("corpus:pls_search_*"))
+        if keys:
+            r.delete(*keys)
+        r.close()
+    except Exception:
+        pass
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
     """Truncate every table except schema_migrations, then re-seed. Dispose the pool so asyncpg
@@ -87,6 +101,7 @@ async def clean_db():
     MANAGED_BREAKER.reset()
     LOCAL_BREAKER.reset()
     reset_robots_cache()
+    _clear_pls_search_tick_markers()
     yield
     await engine.dispose()
 
