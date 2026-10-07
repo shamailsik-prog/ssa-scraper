@@ -425,7 +425,7 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     running_jobs.remove(job)
                     preempted = True
                     logger.warning(
-                        "%s: preempted running job %s with no pages/staged so search-harvest gaps can run",
+                        "%s: preempted running job %s with no staged output so search-harvest gaps can run",
                         s.source_name,
                         job.id,
                     )

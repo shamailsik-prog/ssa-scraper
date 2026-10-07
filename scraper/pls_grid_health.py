@@ -236,10 +236,16 @@ def pls_preempt_running_job_for_search_harvest(
     summary = dict(job.result_summary or {})
     if summary.get("search_harvest") or summary.get("query_key"):
         return False
-    pages = int(job.pages_scraped or summary.get("pages_charged") or summary.get("pages") or 0)
     staged = int(job.records_extracted or summary.get("staged") or 0)
-    if pages > 0 or staged > 0:
+    if staged > 0:
         return False
+    # Citation-grid laps charge pages while staging nothing; they still monopolize the login lock.
+    if summary.get("surface_mode") == "citation_grid":
+        pass
+    else:
+        pages = int(job.pages_scraped or summary.get("pages_charged") or summary.get("pages") or 0)
+        if pages > 0:
+            return False
     started = job.started_at or job.created_at
     if started is None:
         return True
