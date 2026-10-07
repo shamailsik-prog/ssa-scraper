@@ -1,4 +1,12 @@
-from scraper.pls_grid_health import defer_pls_grid_for_search_harvest, grid_rows_remaining, pls_zero_query_grid_failure
+from datetime import datetime, timedelta, timezone
+
+from scraper.models import ScraperJob
+from scraper.pls_grid_health import (
+    defer_pls_grid_for_search_harvest,
+    grid_rows_remaining,
+    pls_preempt_running_job_for_search_harvest,
+    pls_zero_query_grid_failure,
+)
 
 
 def test_cursor_resume_never_treated_as_complete_at_offset():
@@ -34,6 +42,30 @@ def test_defer_pls_grid_when_stalled_for_search_harvest():
         assert pls_search_harvest_may_run({}, pending_gaps=0) is True
     finally:
         settings.PLS_SEARCH_HARVEST_ENABLED = old
+
+
+def test_preempt_zero_output_grid_job_when_stalled_with_gaps():
+    now = datetime.now(timezone.utc)
+    cfg = {"pls_stall_watchdog": {"stalled": True, "stalled_reason": "no_output_while_harvesting"}}
+    old_job = ScraperJob(
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        status="running",
+        started_at=now - timedelta(minutes=11),
+        pages_scraped=0,
+        records_extracted=0,
+    )
+    young_job = ScraperJob(
+        source_name="PakistanLawSite",
+        job_type="scrape",
+        status="running",
+        started_at=now - timedelta(minutes=3),
+        pages_scraped=0,
+        records_extracted=0,
+    )
+    assert pls_preempt_running_job_for_search_harvest(old_job, cfg, pending_gaps=5, now=now) is True
+    assert pls_preempt_running_job_for_search_harvest(young_job, cfg, pending_gaps=5, now=now) is False
+    assert pls_preempt_running_job_for_search_harvest(old_job, cfg, pending_gaps=0, now=now) is False
 
 
 def test_zero_query_not_failure_when_progress():

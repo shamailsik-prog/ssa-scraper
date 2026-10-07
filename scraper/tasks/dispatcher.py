@@ -33,6 +33,7 @@ from scraper.pls_grid_health import (
     SOURCE_NAME as PLS_SOURCE_NAME,
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
+    pls_preempt_running_job_for_search_harvest,
 )
 
 logger = logging.getLogger(__name__)
@@ -389,7 +390,45 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             concurrency = 1
             if s.access_method == "login_session":
                 concurrency = await _login_session_max_active(db, s.source_name)
-            running_jobs, _ = await _active_running_jobs(db, s.source_name, now=now, max_active=concurrency)
+            running_jobs, recovered_stale = await _active_running_jobs(db, s.source_name, now=now, max_active=concurrency)
+            pending_search_gaps = 0
+            if s.access_method == "login_session" and s.source_name == PLS_SOURCE_NAME:
+                cfg = dict(s.config_json or {})
+                pending_search_gaps = int(
+                    (
+                        await db.execute(
+                            select(func.count())
+                            .select_from(PlsSearchHarvestQuery)
+                            .where(
+                                PlsSearchHarvestQuery.source_name == PLS_SOURCE_NAME,
+                                PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                            )
+                        )
+                    ).scalar()
+                    or 0
+                )
+                preempted = False
+                for job in list(running_jobs):
+                    if not pls_preempt_running_job_for_search_harvest(
+                        job, cfg, pending_gaps=pending_search_gaps, now=now
+                    ):
+                        continue
+                    job.status = "failed"
+                    job.finished_at = now
+                    job.error_message = (
+                        "preempted for search-harvest gap recovery while promotion stalled (zero-output grid job)"
+                    )
+                    running_jobs.remove(job)
+                    preempted = True
+                    logger.warning(
+                        "%s: preempted running job %s with no pages/staged so search-harvest gaps can run",
+                        s.source_name,
+                        job.id,
+                    )
+                if preempted:
+                    recovered_stale = True
+            if recovered_stale:
+                await db.flush()
             if len(running_jobs) >= concurrency:
                 logger.info(
                     "skip enqueue %s: %s login-session scrape job(s) already running",
@@ -399,21 +438,6 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             if s.access_method == "login_session":
                 cfg = dict(s.config_json or {})
-                pending_search_gaps = 0
-                if s.source_name == PLS_SOURCE_NAME:
-                    pending_search_gaps = int(
-                        (
-                            await db.execute(
-                                select(func.count())
-                                .select_from(PlsSearchHarvestQuery)
-                                .where(
-                                    PlsSearchHarvestQuery.source_name == PLS_SOURCE_NAME,
-                                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-                                )
-                            )
-                        ).scalar()
-                        or 0
-                    )
                 if (
                     s.source_name == PLS_SOURCE_NAME
                     and defer_pls_grid_for_search_harvest(cfg)

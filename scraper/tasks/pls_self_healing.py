@@ -12,11 +12,19 @@ from sqlalchemy import func, or_, select, update
 from scraper.auth.session_manager import SessionLock, SessionLockHeld, SessionManager, merge_source_config
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.models import RETIRED_WITHOUT_REASON, BrowserSessionSlot, CrawlFrontier, Notification, ScraperSource
+from scraper.models import (
+    RETIRED_WITHOUT_REASON,
+    BrowserSessionSlot,
+    CrawlFrontier,
+    Notification,
+    PlsSearchHarvestQuery,
+    ScraperSource,
+)
 from scraper.notify import notify
 from scraper.pls_grid_health import (
     SOURCE_NAME,
     compute_stalled,
+    defer_pls_grid_for_search_harvest,
     grid_harvest_incomplete,
     grid_saturation_view,
     parse_iso,
@@ -176,7 +184,27 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
             recovery.append(await recover_slot(db, manager, slot))
         from scraper.tasks.celery_app import app
 
-        app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
+        pending_gaps = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(PlsSearchHarvestQuery)
+                    .where(
+                        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+        if defer_pls_grid_for_search_harvest(cfg) and pending_gaps > 0:
+            app.send_task(
+                "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+                kwargs={"priority_gaps": True},
+                queue="login_session",
+            )
+        else:
+            app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
         watch["recovery"], watch["signature_at"] = recovery, now.isoformat()
         await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
         await db.commit()
