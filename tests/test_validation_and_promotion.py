@@ -1144,6 +1144,7 @@ async def test_pakistancode_statute_promotion_quarantines_clause_as_name(db):
         "statute_name": "This Act shall be called the Sample Act, 2026",
         "jurisdiction": "Federal",
         "statute_type": "act",
+        "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
         "sections": [
             {
                 "section_number": "1",
@@ -1202,7 +1203,8 @@ async def test_pakistancode_statute_promotion_quarantines_thin_section_bodies(db
         await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
     ).scalars().first()
     assert q is not None
-    assert (q.reason or "").startswith("pakistancode_thin_section_body:")
+    # no contents check recorded: the gate holds it before any other rule runs
+    assert (q.reason or "").startswith("pakistancode_contents_check:")
     assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
 
 
@@ -1236,6 +1238,7 @@ async def test_pakistancode_statute_promotion_accepts_real_name_and_operative_te
         "statute_name": "Pakistan Penal Code, 1860",
         "jurisdiction": "Federal",
         "statute_type": "act",
+        "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
         "sections": [
             {
                 "section_number": "1",
@@ -1281,6 +1284,7 @@ async def test_pakistancode_statute_promotion_quarantines_fragment_name(db):
         "statute_name": "Administrator Act 2026",
         "jurisdiction": "Federal",
         "statute_type": "act",
+        "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
         "sections": [
             {
                 "section_number": "1",
@@ -1325,7 +1329,7 @@ async def test_pakistancode_statute_promotion_quarantines_listed_title_absent(db
         "statute_name": "Defense Forces of Pakistan Act, 2026",
         "jurisdiction": "Federal",
         "statute_type": "act",
-        "field_evidence": {"listed_title_absent": "Defense Forces of Pakistan Act, 2026"},
+        "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document", "listed_title_absent": "Defense Forces of Pakistan Act, 2026"},
         "sections": [
             {
                 "section_number": "1",
@@ -1370,6 +1374,7 @@ async def test_pakistancode_statute_promotion_quarantines_empty_section_bodies(d
         "statute_name": "Sample Empty Sections Act, 2026",
         "jurisdiction": "Federal",
         "statute_type": "act",
+        "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
         "sections": [
             {
                 "section_number": "",

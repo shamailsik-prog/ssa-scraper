@@ -249,6 +249,9 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     source_meta = source_meta or {}
     body = html or text or ""
     raw_text = text or (clean_html(html) if html else "")
+    listed_title = source_meta.get("act_title") or source_meta.get("detail_title")
+    if source_meta.get("source_name") == "PakistanCode" and listed_title and raw_text:
+        return _extract_statute_by_contents(raw_text, listed_title, source_meta)
     detected_name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
     official_title = source_meta.get("act_title") or source_meta.get("detail_title")
     name = prefer_official_statute_title(detected_name, official_title)
@@ -300,6 +303,64 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         sections=sec_models,
         field_evidence=evidence,
         extractor_confidence=conf,
+    )
+    return data.model_dump(mode="json")
+
+
+def _extract_statute_by_contents(raw_text: str, listed_title: str, source_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """PakistanCode: read the statute against its own table of contents (scraper/parsers/statute_contents.py).
+    The name is the official listing title; the verdict of the contents check travels in
+    field_evidence["contents_check"] and promotion admits only a "verified" statute."""
+    from scraper.parsers.statute_contents import read_statute
+
+    result = read_statute(raw_text, listed_title)
+    report = result["verification"]
+    name = result["statute_name"]
+    year = None
+    m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", name or "")
+    if m:
+        year = int(m.group(1))
+    mt = re.search(r"(?i)\b(act|ordinance|constitution|rules|regulations|order)\b", name or "")
+    jurisdiction = source_meta.get("jurisdiction") or "Federal"
+    sections = []
+    for sec in result["sections"]:
+        if sec.get("omitted"):
+            continue
+        txt = sec.get("section_text") or ""
+        sections.append(
+            {
+                "statute_name": name,
+                "short_name": None,
+                "section_number": sec["section_number"],
+                "section_title": sec.get("section_title") or None,
+                "section_text": txt,
+                "chapter": None,
+                "year_enacted": year,
+                "effective_from": None,
+                "effective_to": None,
+                "amending_instrument": _amending_footnote(txt),
+                "jurisdiction": jurisdiction,
+                "field_evidence": {"section_number": txt[:120]} if txt else {},
+                "extractor_confidence": 0.95 if report["verified"] else 0.3,
+            }
+        )
+    expected = report["listed"] - report["omitted"] if report["method"] == "contents" else report["found"]
+    if report["verified"]:
+        verdict = f"verified ({report['method']}): {report['found']} of {expected} sections, title matches the document"
+    else:
+        verdict = f"failed ({report['method']}): {report.get('reason') or 'unverified'}"
+    evidence = {"statute_name": (raw_text or "")[:160], "contents_check": verdict[:500]}
+    if report.get("status"):
+        evidence["listing_status"] = report["status"]
+    data = StatuteExtraction(
+        statute_name=name,
+        short_name=None,
+        jurisdiction=jurisdiction,
+        year_enacted=year,
+        statute_type=mt.group(1).lower() if mt else None,
+        sections=sections,
+        field_evidence=evidence,
+        extractor_confidence=0.95 if report["verified"] else 0.2,
     )
     return data.model_dump(mode="json")
 
