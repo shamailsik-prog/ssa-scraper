@@ -27,7 +27,7 @@ from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.parsers.text_cleaner import clean_html
-from scraper.pls_caseid import case_url, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, split_group_key
+from scraper.pls_caseid import case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, split_group_key
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ class CaseIdWalker:
         for serial in samples:
             page = await self.pipeline.fetch_detail(case_url(settings.PLS_BASE_URL, densest, serial))
             text = page_text(page)
-            ok = looks_like_case_page(text, year)
+            ok = looks_like_case_page(text, year, raw_html=page.html)
             results.append({"case": f"{densest}{serial}", "ok": ok, "chars": len(text)})
             release_page_result(page)
             await self._pace()
@@ -128,10 +128,16 @@ class CaseIdWalker:
             if self.stats["probes"] >= probes:
                 break
             g = groups.get(key) or new_state()
-            if g.get("done"):
-                continue
             year, _ = split_group_key(key)
             held = known.setdefault(key, set())
+            if g.get("done"):
+                probe = max(1, int(g.get("next") or 1))
+                while probe in held:
+                    probe += 1
+                if probe <= ceiling(g, held, floor=floor, pad=pad):
+                    g["done"] = False
+                else:
+                    continue
             state["current"] = key
             first_serial = None
             while self.stats["probes"] < probes:
@@ -144,7 +150,7 @@ class CaseIdWalker:
                 page = await self.pipeline.fetch_detail(url)
                 self.stats["probes"] += 1
                 text = page_text(page)
-                hit = looks_like_case_page(text, year)
+                hit = looks_like_case_page(text, year, raw_html=page.html)
                 if hit:
                     route = {"harvest": "caseid_walk", "case_id": f"{key}{serial}"}
                     outcome = await self.pipeline.preserve_and_extract(page, route, {"citation": None, "title": None, "court": None, "detail_url": url, "pdf_url": None})
@@ -166,7 +172,6 @@ class CaseIdWalker:
                 state["groups"] = groups
                 state["last_probe_at"] = _now().isoformat()
                 await self._save(state)
-                await self._pace()
             groups[key] = g
             state["groups"] = groups
             await self._save(state)
