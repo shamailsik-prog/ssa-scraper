@@ -275,7 +275,13 @@ async def _submit_warmup_citation_query_form(
     if not search_map.get("fields"):
         return None
     values = _warmup_search_values(probe)
-    page = await browser.submit_search(search_map, values)
+    from scraper.extractors.deterministic import search_map_uses_dashboard_citation_panel
+
+    page = await browser.submit_search(
+        search_map,
+        values,
+        wait_for_ajax_results=search_map_uses_dashboard_citation_panel(search_map),
+    )
     page.metadata = {
         **(page.metadata or {}),
         "pls_citation_search_nav": {"via": via, "warmup_values": values},

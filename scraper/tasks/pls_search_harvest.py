@@ -563,6 +563,7 @@ async def run_search_harvest(
         query_row.last_error = "no active search form map"
         return {"skipped": True, "reason": "no active search form map"}
     search_map = map_as_dict(m)
+    dashboard_harvest = PakistanLawSitePipeline._is_dashboard_citation_fields(search_map)
     query_row.status = "in_progress"
     await db.flush()
 
@@ -583,9 +584,10 @@ async def run_search_harvest(
     try:
         runner.pipeline._session_lock = lock
         runner.pipeline._assert_permitted()
-        await runner.pipeline.ensure_search_map()
-        m = await active_map(db, SOURCE_NAME)
-        search_map = map_as_dict(m) if m else search_map
+        if not dashboard_harvest:
+            await runner.pipeline.ensure_search_map()
+            m = await active_map(db, SOURCE_NAME)
+            search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
         return result

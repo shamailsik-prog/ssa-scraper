@@ -61,6 +61,19 @@ def test_parse_total_results_from_fixture_html():
     assert parse_total_results_from_html(html) == 1234
 
 
+def test_dashboard_search_map_detected_for_harvest_skip():
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+
+    dashboard = {
+        "fields": {
+            "reporter": {"selector": "#Citation_Category_Search_dropdown"},
+            "year": {"selector": "#Citation_Year_Search_input"},
+        }
+    }
+    assert PakistanLawSitePipeline._is_dashboard_citation_fields(dashboard)
+    assert not PakistanLawSitePipeline._is_dashboard_citation_fields({"fields": {"page": {"selector": "#x"}}})
+
+
 def test_build_harvest_form_values_from_introspected_map():
     html = citation_search_hybrid_html()
     proposal = verify_selectors(html, introspect_search_form(html))
