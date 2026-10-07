@@ -295,3 +295,51 @@ def test_recheck_years_are_recent():
     from scraper.tasks.pls_throughput_watchdog import recheck_years
 
     assert recheck_years(NOW) == [2026, 2025]
+
+
+def test_collected_judgments_are_not_discovery_evidence():
+    """Legacy corpus rows alone must not satisfy the PakistanCode coverage gate (review on #166)."""
+    rows = build_journal_rows(journals=["PLD", "SCMR"], collected={"pld": 50, "scmr": 40}, grid_totals={}, search_cells=[])
+    assert all(r["discovery_evidence"] == 0 for r in rows)
+    t = pakistancode_transition(rows, required=["PLD", "SCMR"], threshold=0.95)
+    assert not t["ready"] and sorted(t["journals_without_discovery"]) == ["PLD", "SCMR"]
+
+
+async def test_tick_run_key_marks_search_harvest_running():
+    from scraper.tasks.pls_search_harvest import acquire_tick_run_locks, pls_search_tick_running, release_tick_keys
+
+    assert await pls_search_tick_running() is False
+    held = await acquire_tick_run_locks(1, ttl=120)
+    try:
+        assert await pls_search_tick_running() is True
+    finally:
+        await release_tick_keys(held or [])
+    assert await pls_search_tick_running() is False
+
+
+def test_worker_start_drops_dead_tick_markers():
+    import redis
+
+    from scraper.config import settings
+    from scraper.tasks.celery_app import drop_dead_search_tick_markers
+
+    r = redis.Redis.from_url(settings.REDIS_URL)
+    try:
+        r.set("corpus:pls_search_run:0", "dead", ex=3600)
+        r.set("corpus:pls_search_tick_queued:all", "1", ex=3600)
+        r.set("corpus:pls_search_keep", "1", ex=60)
+        assert drop_dead_search_tick_markers() == 2
+        assert r.exists("corpus:pls_search_run:0", "corpus:pls_search_tick_queued:all") == 0
+        assert r.exists("corpus:pls_search_keep") == 1
+    finally:
+        r.delete("corpus:pls_search_keep")
+        r.close()
+
+
+def test_live_tick_walking_known_ground_is_not_killed():
+    """No promotion for a while is normal on years already collected: a live tick without crashes keeps running."""
+    assert _plan(queries_completed=2)["state"] == "ok"
+    walking = _plan(idle_checks=5, search_harvest_active=True)
+    assert walking["state"] == "idle" and "recreate_worker" not in walking["actions"]
+    crashed = _plan(idle_checks=5, search_harvest_active=True, recent_errors=["Page.goto: Page crashed"] * 2)
+    assert "recreate_worker" in crashed["actions"]
