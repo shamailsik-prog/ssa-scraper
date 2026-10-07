@@ -433,6 +433,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     recovered_stale = True
             if recovered_stale:
                 await db.flush()
+            if s.access_method == "login_session" and s.source_name == PLS_SOURCE_NAME and pending_search_gaps > 0:
+                sent_search = await _dispatch_pls_search_ticks(db, s, running_jobs=running_jobs, concurrency=concurrency, now=now, queued=queued)
+                if sent_search:
+                    continue
             if len(running_jobs) >= concurrency:
                 logger.info(
                     "skip enqueue %s: %s login-session scrape job(s) already running",
@@ -511,6 +515,42 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
         await db.commit()
     return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}
+
+
+async def _dispatch_pls_search_ticks(db, s: ScraperSource, *, running_jobs, concurrency: int, now: datetime, queued: list) -> bool:
+    """Search strategy (Shamail, 2026-10-08): journal x year searches are the main PakistanLawSite path, one
+    tick per login slot, each on its own disjoint share of the journals. The citation grid, already read end
+    to end, runs only as a reconciliation pass every PLS_GRID_RECONCILE_HOURS. Returns True when this
+    dispatch round is handled (the grid path must not run); False lets a due grid reconciliation through."""
+    from scraper.tasks.celery_app import app
+    from scraper.tasks.pls_search_harvest import claim_tick_enqueue, search_is_main_path
+    from scraper.watchdog_settings import wsettings
+
+    if not search_is_main_path():
+        return False
+    last_grid = (
+        await db.execute(select(func.max(ScraperJob.created_at)).where(ScraperJob.source_name == s.source_name))
+    ).scalar()
+    if last_grid is not None and last_grid.tzinfo is None:
+        last_grid = last_grid.replace(tzinfo=timezone.utc)
+    grid_due = last_grid is None or (now - last_grid) >= timedelta(hours=float(wsettings.PLS_GRID_RECONCILE_HOURS or 24))
+    if grid_due and not running_jobs:
+        return False
+    active_slots = await _active_slot_numbers(db, s.source_name)
+    shards = [0, 1] if (concurrency >= 2 and len(active_slots) >= 2) else [None]
+    for shard in shards:
+        if shard is not None and (shard + 1) not in active_slots:
+            continue
+        if await claim_tick_enqueue(shard):
+            app.send_task(
+                "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+                kwargs={"priority_gaps": True, **({} if shard is None else {"reporter_shard": shard})},
+                queue="login_session",
+            )
+            queued.append(f"{s.source_name}:search_harvest_tick" + ("" if shard is None else f"_shard{shard}"))
+    # stay due: the claim markers (not the cadence) keep ticks from piling up
+    s.next_scrape_at = now + timedelta(minutes=1)
+    return True
 
 
 @shared_task(name="scraper.tasks.dispatcher.dispatch_due_sources")
