@@ -1226,7 +1226,11 @@ class PlaywrightBrowser:
             return
         url = (self._page.url or "").lower()
         if "/login/check" not in url:
-            return
+            # The panel lives only on the dashboard. Jobs reach submit_search from CitationSearch or a
+            # judgment page; returning here left select_option waiting 90 s for a control that is not
+            # on the page, and every job and search tick failed that way (7 October 2026).
+            check_url = (getattr(settings, "PLS_CHECK_URL", None) or "").strip() or f"{settings.PLS_BASE_URL.rstrip('/')}/Login/Check"
+            await self.goto(check_url)
         dropdown = self._page.locator("#Citation_Category_Search_dropdown").first
         try:
             if await dropdown.is_visible():
