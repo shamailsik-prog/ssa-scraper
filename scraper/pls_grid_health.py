@@ -204,11 +204,16 @@ def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
 
 
 def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any]) -> bool:
-    """When promotion is stalled but search-harvest gaps exist, yield the login queue to gap queries."""
-    if not getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
-        return False
+    """When promotion is stalled, yield the login queue to search-harvest gap queries."""
     watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
     return bool(watch.get("stalled")) and watch.get("stalled_reason") == "no_output_while_harvesting"
+
+
+def pls_search_harvest_may_run(cfg: Dict[str, Any], *, pending_gaps: int) -> bool:
+    """Beat may schedule ticks when enabled; during a promotion stall, one gap query may run anyway."""
+    if getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
+        return True
+    return pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg)
 
 
 def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None) -> bool:
