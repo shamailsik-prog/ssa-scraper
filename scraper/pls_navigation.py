@@ -116,7 +116,10 @@ def dashboard_route_census(html: str, base_url: str) -> Dict[str, List[str]]:
         href = (href or "").strip()
         if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
             return
-        parts = urlsplit(urljoin(base_url, href))
+        try:
+            parts = urlsplit(urljoin(base_url, href))
+        except ValueError:  # a malformed link (e.g. "http://[") must not cost the whole census
+            return
         if parts.scheme in ("http", "https") and parts.netloc.lower() == host and parts.path:
             paths.add(parts.path)
 
@@ -127,7 +130,11 @@ def dashboard_route_census(html: str, base_url: str) -> Dict[str, List[str]]:
         action = str(form.get("action") or "")
         add(action)
         names = sorted({str(f.get("name")) for f in form.find_all(["input", "select", "textarea"]) if f.get("name")})
-        forms.append(f"{form.get('method') or 'get'} {urlsplit(urljoin(base_url, action)).path or '(this page)'} fields={','.join(names)}")
+        try:
+            form_path = urlsplit(urljoin(base_url, action)).path or "(this page)"
+        except ValueError:
+            form_path = "(unparsable action)"
+        forms.append(f"{form.get('method') or 'get'} {form_path} fields={','.join(names)}")
     for script in soup.find_all("script"):
         body = script.string or script.get_text() or ""
         for match in re.finditer(r"""['"](/[A-Za-z][A-Za-z0-9_/.-]*)['"]""", body):
@@ -414,7 +421,7 @@ async def open_citation_search(browser: Browser, *, archived_grid_start_row: int
     try:
         log_dashboard_route_census(check_page.html or "", base)
     except Exception as exc:  # a diagnostic must never stop the harvest
-        logger.debug("dashboard route census failed: %s", exc)
+        logger.warning("PakistanLawSite dashboard route census failed: %s: %s", type(exc).__name__, exc)
     nav_meta: Dict[str, Any] = {
         "check_url": check_url,
         "discovered": discovery,
