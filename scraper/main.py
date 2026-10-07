@@ -18,7 +18,7 @@ from sqlalchemy import func, select, text
 
 from scraper.config import settings
 from scraper.database import SessionLocal, embedding_identity_matches, engine, init_db
-from scraper.routers import archive, corpus, coverage, export, jobs, review, scrapegraph, search, sessions, sources, status
+from scraper.routers import archive, corpus, coverage, export, jobs, live, review, scrapegraph, search, sessions, sources, status
 from scraper.routers.auth import _ok
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.PROJECT_NAME, version="D-15", lifespan=lifespan, docs_url="/docs" if settings.DEBUG else None, redoc_url=None)
-for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search, status):
+for r in (sources, coverage, corpus, review, export, sessions, archive, scrapegraph, jobs, search, status, live):
     app.include_router(r.router)
 app.include_router(archive.oauth_router)
 

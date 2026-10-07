@@ -15,6 +15,7 @@ from celery import Celery
 from celery.signals import worker_ready
 
 from scraper.config import settings
+from scraper.watchdog_settings import wsettings
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ app = Celery(
         "scraper.tasks.spot_check",
         "scraper.tasks.pls_self_healing",
         "scraper.tasks.pls_search_harvest",
+        "scraper.tasks.pls_throughput_watchdog",
     ],
 )
 app.conf.update(
@@ -60,6 +62,7 @@ app.conf.update(
         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
+        "scraper.tasks.pls_throughput_watchdog.pls_throughput_watchdog": {"queue": "maintenance"},
     },
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
@@ -70,6 +73,10 @@ app.conf.update(
         "pls-keepalive": {
             "task": "scraper.tasks.pls_self_healing.pls_keepalive_hourly",
             "schedule": settings.PLS_KEEPALIVE_SCHEDULE_SECONDS,
+        },
+        "pls-throughput-watchdog": {
+            "task": "scraper.tasks.pls_throughput_watchdog.pls_throughput_watchdog",
+            "schedule": wsettings.PLS_THROUGHPUT_WATCHDOG_SECONDS,
         },
         "pls-stall-watchdog": {
             "task": "scraper.tasks.pls_self_healing.pls_stall_watchdog",
