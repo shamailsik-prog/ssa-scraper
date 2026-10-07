@@ -5,16 +5,25 @@ set -euo pipefail
 
 DIR="${SSA_SCRAPER_DIR:-/opt/ssa-scraper}"
 BRANCH="${SSA_SCRAPER_BRANCH:-main}"
-REMOTE="origin"
+# Deploy from GitHub directly when the checkout has a "github" remote: a local mirror remote (origin ->
+# /root/ssa-src) that nobody updates silently froze deploys at an old SHA while ten PRs waited on main.
+if [ -n "${SSA_SCRAPER_REMOTE:-}" ]; then
+  REMOTE="$SSA_SCRAPER_REMOTE"
+elif git -C "$DIR" remote get-url github >/dev/null 2>&1; then
+  REMOTE="github"
+else
+  REMOTE="origin"
+fi
 LOG_FILE="state/auto_deploy.log"
 TIP_FILE="state/tip_sha.txt"
 ROLLOUT_FILE="state/rollout_sha.txt"
 RESET_MARKER="state/reset_retired_frontier_sha.txt"
 CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 
-# PLS stack (shared corpus-service image). Beat is never started unless it was already running.
-DEFAULT_APP_SERVICES=(api worker-scraper worker-public)
-ALL_APP_SERVICES=(api worker-scraper worker-public worker-embed celery-beat celery-flower)
+# PLS stack (shared corpus-service image). Beat is never started unless it was already running. worker-maintenance
+# runs the dispatcher and the watchdogs, so it must move with worker-public (old code there dispatched old jobs).
+DEFAULT_APP_SERVICES=(api worker-scraper worker-public worker-maintenance)
+ALL_APP_SERVICES=(api worker-scraper worker-public worker-maintenance worker-embed celery-beat celery-flower)
 
 WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-600}"  # bounded wait before deploy when beat was running
 WAIT_POLL_SECONDS="${AUTO_DEPLOY_WAIT_POLL_SECONDS:-30}"
@@ -50,6 +59,21 @@ install_cron() {
   fi
   log "Installing host auto-deploy cron (every 15 minutes)"
   { printf '%s\n' "$cron_now"; printf '%s\n' "$CRON_MARK"; printf '%s\n' "$cron_line"; } | crontab -
+}
+
+install_watchdog_cron() {
+  # Host half of the PLS self-healing watchdog (scripts/pls_watchdog_host.sh): recreates a stuck
+  # worker-scraper on request, restarts a beat left down, and keeps state/Caddyfile rendered from the repo.
+  local mark="# ssa-scraper PLS host watchdog (every 10 minutes)"
+  local line="*/10 * * * * cd $DIR && /bin/bash scripts/pls_watchdog_host.sh >> state/pls_watchdog_host.log 2>&1"
+  local cron_now
+  cron_now="$(crontab -l 2>/dev/null || true)"
+  if printf '%s\n' "$cron_now" | grep -Fq "$mark"; then
+    return 0
+  fi
+  [ -f "$DIR/scripts/pls_watchdog_host.sh" ] || return 0
+  log "Installing host PLS watchdog cron (every 10 minutes)"
+  { printf '%s\n' "$cron_now"; printf '%s\n' "$mark"; printf '%s\n' "$line"; } | crontab -
 }
 
 wait_for_pls_idle() {
@@ -154,6 +178,9 @@ main() {
   cd "$DIR"
   mkdir -p state
   install_cron
+  if [ "$DRY_RUN" = 0 ]; then
+    install_watchdog_cron
+  fi
 
   # Load compose env for postgres user/db names when present.
   if [ -f .env ]; then
