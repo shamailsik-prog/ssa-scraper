@@ -50,3 +50,11 @@ def test_pls_host_running_jobs_uses_compose_postgres_defaults():
     assert "POSTGRES_USER:-legal" in text
     assert "POSTGRES_DB:-legal_scraper" in text
     assert "POSTGRES_USER:-corpus" not in text
+
+
+def test_auto_deploy_tracks_rollout_sha_separately_from_tip_sha():
+    deploy = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    assert "state/rollout_sha.txt" in deploy
+    assert "rollout_sha" in deploy
+    assert "rollout_sha match" in deploy or "rollout_sha matches" in deploy
+    assert deploy.index("rollout_sha") < deploy.index(">\"$TIP_FILE\"")

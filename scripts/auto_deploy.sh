@@ -8,6 +8,7 @@ BRANCH="${SSA_SCRAPER_BRANCH:-main}"
 REMOTE="origin"
 LOG_FILE="state/auto_deploy.log"
 TIP_FILE="state/tip_sha.txt"
+ROLLOUT_FILE="state/rollout_sha.txt"
 RESET_MARKER="state/reset_retired_frontier_sha.txt"
 CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 
@@ -169,14 +170,21 @@ main() {
     git fetch "$REMOTE" "$BRANCH"
   fi
 
-  local new_sha old_sha deployed_sha
+  local new_sha old_sha deployed_sha rollout_sha
   new_sha="$(git rev-parse "$REMOTE/$BRANCH")"
   deployed_sha="$(cat "$TIP_FILE" 2>/dev/null || true)"
+  rollout_sha="$(cat "$ROLLOUT_FILE" 2>/dev/null || true)"
   old_sha="$(git rev-parse HEAD)"
 
-  if [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ]; then
-    log "origin/$BRANCH still at $new_sha (matches $TIP_FILE); nothing to do"
-    exit 0
+  if [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ] && [ "$rollout_sha" = "$new_sha" ]; then
+    if pls_host_promotion_stalled; then
+      log "origin/$BRANCH at $new_sha (tip_sha and rollout_sha match) but /status reports no_output_while_harvesting; retrying compose rollout"
+    else
+      log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
+      exit 0
+    fi
+  elif [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ] && [ "$rollout_sha" != "$new_sha" ]; then
+    log "tip_sha=$new_sha but rollout_sha=${rollout_sha:-missing}; docker rollout still required"
   fi
 
   local pre_merge_sha="$old_sha"
@@ -206,6 +214,9 @@ main() {
     wait_for_pls_idle
   else
     log "celery-beat is not running; deploy will not start beat"
+    if pls_host_promotion_stalled && pls_host_harvest_busy; then
+      wait_for_pls_idle
+    fi
   fi
 
   log "deploying $pre_merge_sha -> $new_sha"
@@ -264,6 +275,7 @@ main() {
   else
     run_reset_frontier_once "$new_sha"
     printf '%s\n' "$new_sha" >"$TIP_FILE"
+    printf '%s\n' "$new_sha" >"$ROLLOUT_FILE"
   fi
   if [ "$beat_was_running" = 1 ]; then
     if [ "$DRY_RUN" = 1 ]; then
