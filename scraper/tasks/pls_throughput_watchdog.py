@@ -79,13 +79,15 @@ def plan_remediation(
     last_recreate_at: Optional[datetime],
     now: datetime,
     recreate_cooldown: timedelta = timedelta(hours=2),
+    queries_completed: int = 0,
 ) -> Dict[str, Any]:
     """Pure decision table: what is wrong and what to do about it (no I/O)."""
     if source_state != "ACTIVE":
         return {"state": "skipped", "diagnosis": [f"source state {source_state}"], "actions": [], "unresolved": []}
     # Judgments are the signal, not pages: on Oct 7 every job fetched one page and staged nothing for 17 hours
     # while both slots looked ACTIVE. Pages alone count as progress only when the ledger has nothing left to do.
-    if judgments > 0 or (pages > 0 and pending_queries == 0):
+    # A finished ledger query is progress too: walking years whose judgments are all held already opens nothing.
+    if judgments > 0 or (pages > 0 and pending_queries == 0) or queries_completed > 0:
         return {"state": "ok", "diagnosis": [f"{pages} pages, {judgments} judgments in window"], "actions": [], "unresolved": []}
     diagnosis: List[str] = [
         f"{pages} PLS page(s) fetched but no judgment promoted in the window" if pages else "no PLS page fetched and no judgment promoted in the window"
@@ -115,7 +117,8 @@ def plan_remediation(
         if "recover_slots" not in actions:
             actions.append("recover_slots")
     cooled = last_recreate_at is None or now - last_recreate_at >= recreate_cooldown
-    if (kinds["browser_crash"] >= 2 or idle_checks >= 3) and cooled:
+    # A live tick with no crash is walking known ground: idleness alone must not kill it (crashes still do).
+    if (kinds["browser_crash"] >= 2 or (idle_checks >= 3 and not search_harvest_active)) and cooled:
         actions.append("recreate_worker")
     if not map_ok:
         diagnosis.append("search form map missing or stale")
@@ -197,22 +200,15 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
         stale_cut = now - timedelta(minutes=int(wsettings.PLS_WATCHDOG_STALE_JOB_MINUTES or 75))
         stale = [j for j in running if (j.updated_at or j.started_at or j.created_at) and (j.updated_at or j.started_at or j.created_at) < stale_cut]
         pending = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status.in_(("pending", "in_progress"))))).scalar() or 0)
-        harvest_in_progress = int(
-            (
-                await db.execute(
-                    select(func.count())
-                    .select_from(PlsSearchHarvestQuery)
-                    .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "in_progress")
-                )
-            ).scalar()
-            or 0
-        )
         from scraper.tasks.pls_search_harvest import pls_search_tick_running
 
-        search_harvest_active = harvest_in_progress > 0 or await pls_search_tick_running()
+        # Liveness is the tick's run key (held for the life of the tick, TTL = budget + 30 min). A query row left in_progress by a killed
+        # worker must not count, or stale locks would never be released again.
+        search_harvest_active = await pls_search_tick_running()
         failed_rows = (await db.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed"))).scalars().all()
         transient = [q for q in failed_rows if not _PERMANENT_ERRORS.search(q.last_error or "") and (q.last_run_at is None or q.last_run_at < now - timedelta(hours=6))]
         last_query = (await db.execute(select(func.max(PlsSearchHarvestQuery.last_run_at)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME))).scalar()
+        completed = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status.in_(("done", "split")), PlsSearchHarvestQuery.last_run_at >= since))).scalar() or 0)
         m = (await db.execute(select(SearchFormMap).where(SearchFormMap.source_name == SOURCE_NAME, SearchFormMap.is_active.is_(True)).order_by(SearchFormMap.created_at.desc()).limit(1))).scalars().first()
         recent_jobs = (await db.execute(select(ScraperJob).where(ScraperJob.source_name == SOURCE_NAME, ScraperJob.created_at >= now - timedelta(hours=2)).order_by(ScraperJob.created_at.desc()).limit(8))).scalars().all()
         errors = [str((j.result_summary or {}).get("stop_reason") or j.error_message or "")[:300] for j in recent_jobs]
@@ -233,9 +229,10 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
             search_harvest_active=search_harvest_active,
             map_ok=bool(m is not None and not m.stale and "reporter" in (m.fields or {})),
             recent_errors=errors,
-            idle_checks=idle_checks + (1 if source.state == "ACTIVE" and judgments == 0 and (pages == 0 or pending > 0) else 0),
+            idle_checks=idle_checks + (1 if source.state == "ACTIVE" and judgments == 0 and completed == 0 and (pages == 0 or pending > 0) else 0),
             last_recreate_at=parse_iso(watch.get("last_recreate_requested_at")),
             now=now,
+            queries_completed=completed,
         )
         done: List[str] = []
         for action in plan["actions"]:
@@ -297,7 +294,8 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
             transition = dict(cov.get("pakistancode_transition") or {})
             if transition.get("ready") and transition.get("enabled") and not cfg.get("pakistancode_auto_unpaused_at"):
                 pc = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))).scalars().first()
-                if pc is not None and pc.state == "PAUSED":
+                # an administrator's explicit pause is never overridden
+                if pc is not None and pc.state == "PAUSED" and not (pc.config_json or {}).get("paused_by_admin"):
                     pc.state = "ACTIVE"
                     pc.state_reason = f"auto-unpaused by PLS watchdog: citation coverage {transition['coverage']:.1%} >= {transition['threshold']:.0%}"
                     await merge_source_config(db, source, {"pakistancode_auto_unpaused_at": now.isoformat()})
@@ -312,6 +310,7 @@ async def run_throughput_watchdog(*, now: Optional[datetime] = None) -> Dict[str
                 "window_minutes": int(window.total_seconds() // 60),
                 "pages_in_window": pages,
                 "judgments_in_window": judgments,
+                "queries_completed_in_window": completed,
                 "consecutive_idle_checks": (idle_checks + 1) if idle else 0,
                 "diagnosis": plan["diagnosis"],
                 "actions": done,
@@ -365,6 +364,9 @@ async def ledger_upkeep(db, *, now: datetime) -> List[str]:
             q.pages_enumerated = 0
             q.rows_seen = 0
             q.rows_known = 0
+            # the site total of a recent year grows: re-read it (run_query only parses a total when none is cached)
+            q.site_total_results = None
+            q.gap_size = 0
             n += 1
     if n:
         notes.append(f"re-check: {n} recent done cells queued again")
