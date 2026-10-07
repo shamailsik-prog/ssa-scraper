@@ -72,15 +72,37 @@ def journals_for_shard(reporter_shard: Optional[int]) -> List[str]:
     return [j for j in journals if _re.sub(r"[^a-z0-9]", "", j.lower()) in allowed]
 
 
+def _journal_cursor_started(cur: Any) -> bool:
+    if not isinstance(cur, dict):
+        return False
+    if cur.get("lap") or cur.get("last_lap"):
+        return True
+    return _to_int(cur.get("row_offset")) not in (None, 0)
+
+
+def journal_grid_idle(cfg: Dict[str, Any], journal: str, *, now: Optional[datetime] = None) -> bool:
+    """True when this journal's grid walk is finished, unsupported, or need not run yet.
+
+    A journal with no cursor progress inherits saturation from the default citation_grid_cursor when
+    that walk already finished a full lap with nothing new (production had empty journal cursors
+    while the main grid was saturated, which blocked dispatch_saturated and kept enqueueing journal
+    jobs that failed on the hidden dashboard Citation Search panel)."""
+    cur = cfg.get(journal_cursor_key(journal))
+    if isinstance(cur, dict) and (cursor_saturated(cur, now=now) or journal_unsupported(cur, now=now)):
+        return True
+    main = cfg.get("citation_grid_cursor")
+    if isinstance(main, dict) and cursor_saturated(main, now=now):
+        total = _to_int(main.get("saturated_total_rows")) or _to_int(main.get("last_total_rows")) or 0
+        if total > 0 and not _journal_cursor_started(cur):
+            return True
+    return False
+
+
 def journals_all_done(cfg: Dict[str, Any], journals: List[str], *, now: Optional[datetime] = None) -> bool:
     """Every configured journal has a cursor and each is saturated or unsupported (nothing left to walk)."""
     if not journals:
         return False
-    for journal in journals:
-        cur = cfg.get(journal_cursor_key(journal))
-        if not isinstance(cur, dict) or not (cursor_saturated(cur, now=now) or journal_unsupported(cur, now=now)):
-            return False
-    return True
+    return all(journal_grid_idle(cfg, journal, now=now) for journal in journals)
 
 
 def citation_grid_cursor_keys(cfg: Dict[str, Any]) -> List[str]:
@@ -203,17 +225,24 @@ def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
     return f"citation_grid_cursor_shard_{reporter_shard}" if reporter_shard in (0, 1) else "citation_grid_cursor"
 
 
-def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any]) -> bool:
-    """When promotion is stalled, yield the login queue to search-harvest gap queries."""
+SEARCH_HARVEST_PRIORITY_STALL_REASONS = frozenset({"no_output_while_harvesting", "grid_saturated"})
+
+
+def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any], *, stall_reason: Optional[str] = None) -> bool:
+    """When promotion is stalled or the grid is saturated, yield the login queue to search-harvest gaps."""
+    if stall_reason is not None:
+        return stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS
     watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
-    return bool(watch.get("stalled")) and watch.get("stalled_reason") == "no_output_while_harvesting"
+    return bool(watch.get("stalled")) and watch.get("stalled_reason") in SEARCH_HARVEST_PRIORITY_STALL_REASONS
 
 
-def pls_search_harvest_may_run(cfg: Dict[str, Any], *, pending_gaps: int) -> bool:
+def pls_search_harvest_may_run(
+    cfg: Dict[str, Any], *, pending_gaps: int, stall_reason: Optional[str] = None
+) -> bool:
     """Beat may schedule ticks when enabled; during a promotion stall, one gap query may run anyway."""
     if getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
         return True
-    return pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg)
+    return pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason)
 
 
 PLS_PREEMPT_GRID_JOB_FOR_SEARCH_HARVEST_AFTER = timedelta(
@@ -226,10 +255,11 @@ def pls_preempt_running_job_for_search_harvest(
     cfg: Dict[str, Any],
     *,
     pending_gaps: int,
+    stall_reason: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> bool:
     """True when a running citation-grid job blocks search-harvest gap recovery during a promotion stall."""
-    if pending_gaps <= 0 or not defer_pls_grid_for_search_harvest(cfg):
+    if pending_gaps <= 0 or not defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
         return False
     if job.status != "running" or job.job_type != "scrape":
         return False
@@ -395,6 +425,25 @@ def pls_zero_query_grid_failure(stats: Dict[str, Any], cfg: Dict[str, Any]) -> O
     if remaining <= 0:
         return None
     return f"zero citation-grid progress with {remaining} grid rows remaining"
+
+
+def pls_stall_verdict_for_config(
+    cfg: Dict[str, Any],
+    *,
+    last_promotion_at: Optional[datetime],
+    source_state: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Live promotion stall verdict from corpus + grid saturation (not the cached pls_stall_watchdog blob)."""
+    now = now or datetime.now(timezone.utc)
+    saturation = grid_saturation_view(cfg, now=now)
+    paused = source_state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
+    return compute_stalled(
+        last_promotion_at=last_promotion_at,
+        now=now,
+        saturation=saturation,
+        harvest_paused=paused,
+    )
 
 
 async def pls_judgment_counts(db: AsyncSession) -> Tuple[int, Dict[str, int]]:

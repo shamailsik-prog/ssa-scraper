@@ -614,7 +614,12 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
     async def _inner() -> Dict[str, Any]:
         from sqlalchemy import func, select
 
-        from scraper.pls_grid_health import SOURCE_NAME, pls_search_harvest_may_run
+        from scraper.pls_grid_health import (
+            SOURCE_NAME,
+            pls_last_judgment_at,
+            pls_search_harvest_may_run,
+            pls_stall_verdict_for_config,
+        )
         from scraper.models import PlsSearchHarvestQuery, ScraperSource
 
         async with SessionLocal() as db:
@@ -633,7 +638,13 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
                 ).scalar()
                 or 0
             )
-            if not pls_search_harvest_may_run(cfg, pending_gaps=pending):
+            stall_reason = None
+            if pending > 0 and source is not None:
+                last_j = await pls_last_judgment_at(db)
+                stall_reason = pls_stall_verdict_for_config(
+                    cfg, last_promotion_at=last_j, source_state=source.state
+                ).get("stalled_reason")
+            if not pls_search_harvest_may_run(cfg, pending_gaps=pending, stall_reason=stall_reason):
                 return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
             return await run_search_harvest(db, **kwargs)
 

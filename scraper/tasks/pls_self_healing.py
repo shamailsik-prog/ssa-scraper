@@ -143,8 +143,11 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
             result["recovery"] = "login_scraping_disabled"
             return result
         cfg = dict(source.config_json or {})
-        if not grid_harvest_incomplete(cfg) or verdict["stalled_reason"] != "no_output_while_harvesting":
-            # paused, saturated or complete: nothing to un-wedge (a saturated grid is not a fault)
+        if verdict["stalled_reason"] == "harvest_paused":
+            return result
+        if verdict["stalled_reason"] not in ("no_output_while_harvesting", "grid_saturated"):
+            return result
+        if verdict["stalled_reason"] == "no_output_while_harvesting" and not grid_harvest_incomplete(cfg):
             return result
         total_j, _ = await pls_judgment_counts(db)
         sig = stall_signature(cfg, total_j)
@@ -197,13 +200,13 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
             ).scalar()
             or 0
         )
-        if defer_pls_grid_for_search_harvest(cfg) and pending_gaps > 0:
+        if pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg, stall_reason=verdict.get("stalled_reason")):
             app.send_task(
                 "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
                 kwargs={"priority_gaps": True},
                 queue="login_session",
             )
-        else:
+        elif verdict["stalled_reason"] == "no_output_while_harvesting" and grid_harvest_incomplete(cfg):
             app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")
         watch["recovery"], watch["signature_at"] = recovery, now.isoformat()
         await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})

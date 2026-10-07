@@ -39,7 +39,9 @@ def test_defer_pls_grid_when_stalled_for_search_harvest():
         assert pls_search_harvest_may_run(cfg, pending_gaps=3) is True
         assert pls_search_harvest_may_run(cfg, pending_gaps=0) is False
         assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": False}}) is False
-        assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": True, "stalled_reason": "grid_saturated"}}) is False
+        assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": True, "stalled_reason": "grid_saturated"}}) is True
+        assert defer_pls_grid_for_search_harvest({}, stall_reason="grid_saturated") is True
+        assert pls_search_harvest_may_run({}, pending_gaps=2, stall_reason="grid_saturated") is True
         settings.PLS_SEARCH_HARVEST_ENABLED = True
         assert pls_search_harvest_may_run({}, pending_gaps=0) is True
     finally:
