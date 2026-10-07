@@ -597,7 +597,9 @@ class PakistanLawSitePipeline:
                     return cached
                 logger.info("PakistanLawSite surface changed to archivedpatientGrid; remapping search surface")
             elif self._has_queryable_search_fields(cached):
-                return self._dual_map_grid_layout(cached)
+                if self._is_dashboard_citation_fields(cached):
+                    return self._dual_map_grid_layout(cached)
+                return cached
         prior = await active_map(self.db, SOURCE_NAME)
         prior_dashboard_fields = None
         if prior is not None and self._is_dashboard_citation_fields(map_as_dict(prior)):
