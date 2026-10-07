@@ -34,6 +34,8 @@ STEPS = (
     " JOIN statute s ON s.id = ss.statute_id WHERE s.source_name = 'PakistanCode'",
     "CREATE TABLE IF NOT EXISTS backup_20261007_statute_section_version AS SELECT v.* FROM statute_section_version v"
     " JOIN statute_section ss ON ss.id = v.section_id JOIN statute s ON s.id = ss.statute_id WHERE s.source_name = 'PakistanCode'",
+    "DELETE FROM instrument_relation ir USING statute s WHERE s.source_name = 'PakistanCode'"
+    " AND ir.target_statute_id = s.id AND ir.target_instrument_id IS NULL",
     "DELETE FROM statute WHERE source_name = 'PakistanCode'",
     "DELETE FROM statutes_staging WHERE source_name = 'PakistanCode' AND kind = 'statute'",
     "UPDATE crawl_frontier SET status = 'pending', attempts = 0, last_error = NULL WHERE source_name = 'PakistanCode'",
