@@ -23,6 +23,7 @@ HEARTBEAT_LIMITS_SECONDS = {
     "embeddings": 20 * 60,
     "login_session": 3 * 3600,
     "public": 12 * 3600,
+    "caseid_walk": 30 * 60,
 }
 HEARTBEAT_LABELS = {
     "dispatch": "Scheduler (Celery Beat) and dispatch",
@@ -31,6 +32,7 @@ HEARTBEAT_LABELS = {
     "embeddings": "Embeddings",
     "login_session": "PakistanLawSite scraper jobs",
     "public": "Public-source scraper jobs",
+    "caseid_walk": "PakistanLawSite case-number walk",
 }
 EXPECTED_WORKERS = {
     "scraper-login": "PakistanLawSite worker",
@@ -118,7 +120,7 @@ async def health_section(*, sources: List[Dict[str, Any]], targets: List[Dict[st
     for name, label in HEARTBEAT_LABELS.items():
         at = _parse(beats.get(name))
         limit = HEARTBEAT_LIMITS_SECONDS[name]
-        idle_ok = (name == "public" and not (active - {"PakistanLawSite"})) or (name == "login_session" and "PakistanLawSite" not in active)
+        idle_ok = (name == "public" and not (active - {"PakistanLawSite"})) or (name in ("login_session", "caseid_walk") and "PakistanLawSite" not in active)
         if at is None:
             state, detail = ("ok" if idle_ok else "warn"), ("idle (no active source)" if idle_ok else "no run recorded yet")
         else:
@@ -271,4 +273,16 @@ async def progress_section(db: AsyncSession, *, pls_cfg: Dict[str, Any], by_repo
                 "eta_hours": round(remaining / per_hour, 1) if per_hour > 0 and remaining else (0 if not remaining else None),
             }
         )
-    return {"pakistanlawsite_journals": journals, "public_sources": public, "archive": archive}
+    walk = pls_cfg.get("caseid_walk") or {}
+    walk_groups = walk.get("groups") or {}
+    caseid_walk = {
+        "calibrated": bool(walk.get("calibrated_at")),
+        "calibration": walk.get("calibration"),
+        "current_group": walk.get("current"),
+        "groups_started": len(walk_groups),
+        "groups_done": sum(1 for g in walk_groups.values() if g.get("done")),
+        "found": sum(int(g.get("hits") or 0) for g in walk_groups.values()),
+        "misses": sum(int(g.get("misses") or 0) for g in walk_groups.values()),
+        "last_probe_at": walk.get("last_probe_at"),
+    }
+    return {"pakistanlawsite_journals": journals, "public_sources": public, "archive": archive, "caseid_walk": caseid_walk}

@@ -32,6 +32,7 @@ app = Celery(
         "scraper.tasks.spot_check",
         "scraper.tasks.pls_self_healing",
         "scraper.tasks.pls_search_harvest",
+        "scraper.tasks.pls_caseid_walk",
     ],
 )
 app.conf.update(
@@ -58,6 +59,7 @@ app.conf.update(
         "scraper.tasks.pls_self_healing.pls_keepalive_hourly": {"queue": "login_session"},
         "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
+        "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
@@ -102,6 +104,13 @@ if settings.PLS_SEARCH_HARVEST_ENABLED:
         "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
         "schedule": settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS,
         "kwargs": {"priority_gaps": True},
+    }
+if settings.PLS_CASEID_WALK_ENABLED:
+    app.conf.beat_schedule["pls-caseid-walk"] = {
+        "task": "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
+        "schedule": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS,
+        # a tick that waited behind a long job is dropped, not stacked: the next one carries on
+        "options": {"expires": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS},
     }
 if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
     app.conf.beat_schedule["reconcile-judgment-citation-relations"] = {

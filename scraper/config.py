@@ -243,6 +243,16 @@ class Settings(BaseSettings):
         default=3600,
         description="Beat interval for pls_search_harvest_tick when PLS_SEARCH_HARVEST_ENABLED=1.",
     )
+    PLS_CASEID_WALK_ENABLED: bool = Field(
+        default=True,
+        description="Walk PakistanLawSite judgments by the site's own case serial (year + court letter + serial, e.g. 2026S701); see scraper/pls_caseid.py.",
+    )
+    PLS_CASEID_WALK_SCHEDULE_SECONDS: int = Field(default=600, description="Beat interval for pls_caseid_walk_tick.")
+    PLS_CASEID_WALK_PROBES_PER_TICK: int = Field(default=60, description="Case serials asked for per tick, at the login pacing.")
+    PLS_CASEID_WALK_MISS_STREAK: int = Field(default=40, description="Misses in a row after which each further miss jumps to the next block start (x01).")
+    PLS_CASEID_WALK_CEILING: int = Field(default=6000, description="Lowest serial ceiling of a (year, court) group; a group ends past max(this, highest held serial + PAD).")
+    PLS_CASEID_WALK_CEILING_PAD: int = Field(default=1000, description="How far past the highest held or found serial a group keeps probing block starts.")
+    PLS_CASEID_WALK_RECHECK_HOURS: float = Field(default=12.0, description="After a failed calibration on held judgments, wait this long before trying again.")
     PLS_SEARCH_RESULT_CAP: int = Field(
         default=500,
         description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
