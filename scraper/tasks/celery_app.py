@@ -139,3 +139,31 @@ def _retire_orphaned_login_jobs_at_start(sender=None, **_kwargs) -> None:
         logger.info("login-session worker start: retired %s orphaned running job(s)", retired)
     except Exception as exc:  # never keep the worker from starting
         logger.warning("could not retire orphaned login-session jobs at start: %s", exc)
+    dropped = drop_dead_search_tick_markers()
+    if dropped:
+        logger.info("login-session worker start: dropped %s search-harvest tick marker(s) of the previous process", dropped)
+
+
+PLS_SEARCH_TICK_MARKERS = (
+    "corpus:pls_search_run:0",
+    "corpus:pls_search_run:1",
+    "corpus:pls_search_tick_queued:0",
+    "corpus:pls_search_tick_queued:1",
+    "corpus:pls_search_tick_queued:all",
+)
+
+
+def drop_dead_search_tick_markers() -> int:
+    """Search-harvest ticks run only on the login-session worker, so at its start every tick run/queued marker
+    belongs to the previous process; left alone they would block new ticks until their TTL (up to ~55 min)."""
+    try:
+        import redis
+
+        r = redis.Redis.from_url(settings.REDIS_URL)
+        try:
+            return int(r.delete(*PLS_SEARCH_TICK_MARKERS) or 0)
+        finally:
+            r.close()
+    except Exception as exc:
+        logger.warning("could not drop search-harvest tick markers at start: %s", exc)
+        return 0

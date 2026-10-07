@@ -85,12 +85,14 @@ def build_journal_rows(
         have = int(collected.get(key, 0))
         agg = by_journal.get(key, {})
         grid = int(grid_totals.get(key, 0))
-        discovered = max(grid, int(agg.get("discovered", 0)), have)
+        evidence = max(grid, int(agg.get("discovered", 0)))  # citations actually seen on the site
+        discovered = max(evidence, have)
         rows.append(
             {
                 "journal": journal,
                 "collected": have,
                 "discovered": discovered,
+                "discovery_evidence": evidence,
                 "grid_rows": grid or None,
                 "coverage_pct": round(100.0 * have / discovered, 1) if discovered else None,
                 "years_done": int(agg.get("done", 0)),
@@ -122,7 +124,11 @@ def pakistancode_transition(
     Every required journal must have something discovered (an undiscovered journal is not "covered"), and
     collected / discovered over those journals must reach `threshold`."""
     by_key = {norm_reporter(r["journal"]): r for r in journal_rows}
-    missing = [j for j in required if int((by_key.get(norm_reporter(j)) or {}).get("discovered") or 0) <= 0]
+    # discovery must come from the site (grid or finished searches), never from the collected count alone
+    missing = [
+        j for j in required
+        if int((by_key.get(norm_reporter(j)) or {}).get("discovery_evidence", (by_key.get(norm_reporter(j)) or {}).get("discovered")) or 0) <= 0
+    ]
     disc = sum(int((by_key.get(norm_reporter(j)) or {}).get("discovered") or 0) for j in required)
     have = sum(int((by_key.get(norm_reporter(j)) or {}).get("collected") or 0) for j in required)
     coverage = (have / disc) if disc else 0.0
