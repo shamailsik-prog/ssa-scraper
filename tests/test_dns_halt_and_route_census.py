@@ -122,3 +122,10 @@ def test_route_census_is_logged_at_most_hourly(monkeypatch, caplog):
     assert log_dashboard_route_census(DASHBOARD, f"https://{PLS}", now=1000.0 + 3601) is not None
     lines = [r.getMessage() for r in caplog.records if "route census" in r.getMessage()]
     assert len(lines) == 2 and "SECRET" not in lines[0] and "/Login/AdvanceSearch" in lines[0]
+
+
+def test_route_census_survives_a_malformed_link():
+    html = '<a href="http://[broken">x</a><a href="/Login/Search">s</a><form action="http://[x"><input name="q"></form>'
+    census = dashboard_route_census(html, f"https://{PLS}")
+    assert census["paths"] == ["/Login/Search"]
+    assert census["forms"] == ["get (unparsable action) fields=q"]
