@@ -18,9 +18,10 @@ import pkgutil
 from datetime import datetime, timezone
 from typing import AsyncIterator, List
 
-from sqlalchemy import text
+from sqlalchemy import String, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
 
@@ -40,6 +41,18 @@ engine = create_async_engine(
     pool_pre_ping=True,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+class PgSafeString(TypeDecorator):
+    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup."""
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if isinstance(value, str) and "\x00" in value:
+            return value.replace("\x00", "")
+        return value
 
 
 def _strip_nul(value):
