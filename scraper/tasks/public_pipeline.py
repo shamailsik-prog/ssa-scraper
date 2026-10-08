@@ -26,7 +26,18 @@ from scraper.config import settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
-from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute, statute_staging_identity_url
+from scraper.fetchers import (
+    FetchResult,
+    HttpFetcher,
+    _pg_sanitize_json,
+    _pg_text,
+    has_pdf_signature,
+    pdf_text_with_ocr,
+    record_provenance,
+    stage_judgment,
+    stage_statute,
+    statute_staging_identity_url,
+)
 from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -46,7 +57,7 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     for k in ("full_text_candidate", "full_text"):
         if isinstance(out.get(k), str) and len(out[k]) > 2000:
             out[k] = out[k][:2000] + f"…[{len(d[k])} chars in raw_text]"
-    return out
+    return _pg_sanitize_json(out)
 
 
 def _url_looks_like_pdf(url: Optional[str]) -> bool:
@@ -257,12 +268,13 @@ class PublicPipeline:
         if res.is_pdf:
             pdf_prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind="pdf", route=route, http_status=res.status_code, is_original_document=True, document_kind="original_pdf")
             text, ocr = pdf_text_with_ocr(res.content)
+            text = _pg_text(text) or ""
             prov = pdf_prov
             html = None
         else:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
-            html = res.text
-            text = clean_html(html)
+            html = _pg_text(res.text)
+            text = clean_html(html or "")
             pdf_prov = None
             ocr = False
             # an HTML judgment page may link to its original PDF: preserve the original bytes too
@@ -272,6 +284,7 @@ class PublicPipeline:
                     if pdf_res.is_pdf:
                         pdf_prov = await record_provenance(self.db, source=self.source, url=pdf_res.final_url, content=pdf_res.content, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=prov)
                         pdf_text, ocr = pdf_text_with_ocr(pdf_res.content)
+                        pdf_text = _pg_text(pdf_text) or ""
                         if len(pdf_text) > len(text):
                             text = pdf_text
                 except ExplicitBlock:
@@ -312,11 +325,12 @@ class PublicPipeline:
         if res.is_pdf:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind="pdf", route=route, http_status=res.status_code, is_original_document=True, document_kind="original_pdf")
             text, _ = pdf_text_with_ocr(res.content)
+            text = _pg_text(text) or ""
             html = None
         else:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
-            html = res.text
-            text = clean_html(html)
+            html = _pg_text(res.text)
+            text = clean_html(html or "")
         staging = await stage_statute(
             self.db,
             source=self.source,
@@ -340,7 +354,7 @@ class PublicPipeline:
             outcome = await extractor.extract_statute(html=html, text=text, source_meta=meta, content_hash=prov.content_hash)
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
-        staging.reconciled_json = outcome.data if kind == "statute" else _slim(outcome.data)
+        staging.reconciled_json = _pg_sanitize_json(outcome.data if kind == "statute" else _slim(outcome.data))
         staging.extraction_engine = outcome.engine
         staging.confidence_score = outcome.confidence
         staging.validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]

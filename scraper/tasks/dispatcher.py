@@ -565,8 +565,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
                     queued.append(s.source_name)
             elif mark_source_queued(s.source_name):
-                app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
-                queued.append(s.source_name)
+                try:
+                    app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
+                    queued.append(s.source_name)
+                except Exception as exc:
+                    logger.warning("failed to enqueue %s: %s", s.source_name, exc)
+                    clear_source_queued(s.source_name)
             else:
                 logger.info("%s: a job queued earlier has not started yet; not queuing another", s.source_name)
                 skipped_saturated.append(f"{s.source_name}:already_queued")

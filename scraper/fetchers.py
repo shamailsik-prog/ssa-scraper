@@ -301,6 +301,17 @@ def _pg_text(value: Optional[str]) -> Optional[str]:
     return value.replace("\x00", "")
 
 
+def _pg_sanitize_json(value: Any) -> Any:
+    """JSONB rejects \\u0000 in strings; strip NULs recursively from extraction payloads."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _pg_sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_pg_sanitize_json(v) for v in value]
+    return value
+
+
 async def stage_judgment(
     db: AsyncSession,
     *,
@@ -320,6 +331,7 @@ async def stage_judgment(
     ).scalars().first()
     if existing is not None:
         return existing
+    stored_text = _pg_text(raw_text) or ""
     row = ScraperStaging(
         source_id=source.id,
         source_name=source.source_name,
@@ -330,8 +342,8 @@ async def stage_judgment(
         content_hash=prov.content_hash,
         raw_ref=prov.raw_ref,
         raw_html=_pg_text(raw_html),
-        raw_text=_pg_text(raw_text),
-        raw_text_hash=canonical_text_hash(raw_text),
+        raw_text=stored_text,
+        raw_text_hash=canonical_text_hash(stored_text),
         pdf_provenance_id=pdf_prov.id if pdf_prov is not None else None,
         ocr_applied=ocr_applied,
         route_json=route or {},
