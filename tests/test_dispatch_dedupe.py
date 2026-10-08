@@ -76,3 +76,41 @@ def test_nul_bytes_are_removed_before_staging():
 
     assert _pg_text("PK\x03\x04\x00\x00ok") == "PK\x03\x04ok"
     assert _pg_text(None) is None
+
+
+async def test_queued_duplicates_are_skipped_once_their_source_has_run(db, monkeypatch):
+    """The 440 leftover tasks: one that waited while its source ran again is skipped without a job."""
+    from scraper.tasks.dispatcher import run_queued_source, superseded_by_later_job
+
+    monkeypatch.setattr(settings, "DISPATCH_DEDUPE_ENABLED", True)
+    ran = []
+
+    async def fake_run_source(name, **kw):
+        ran.append(name)
+        return {"ran": name}
+
+    monkeypatch.setattr(dispatcher, "run_source", fake_run_source)
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "GBAssembly"))).scalars().first()
+    now = datetime.now(timezone.utc)
+    queued_at = now - timedelta(minutes=30)
+    db.add(ScraperJob(source_id=src.id, source_name="GBAssembly", job_type="scrape", status="done", started_at=now - timedelta(minutes=5)))
+    await db.commit()
+
+    assert await superseded_by_later_job(db, "GBAssembly", queued_at) is True
+    assert await superseded_by_later_job(db, "GBAssembly", now) is False
+    assert (await run_queued_source("GBAssembly", queued_at=queued_at.isoformat()))["skipped"] == "superseded"
+    assert (await run_queued_source("GBAssembly", queued_at=None))["skipped"] == "superseded"  # legacy task, ran 5 min ago
+    assert ran == []
+    assert (await run_queued_source("GBAssembly", queued_at=now.isoformat()))["ran"] == "GBAssembly"
+    assert (await run_queued_source("GBAssembly", manual=True))["ran"] == "GBAssembly"  # "run now" always runs
+
+
+async def test_a_source_that_has_not_run_for_hours_runs_its_legacy_task(db, monkeypatch):
+    from scraper.tasks.dispatcher import superseded_by_later_job
+
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanCode"))).scalars().first()
+    db.add(ScraperJob(source_id=src.id, source_name="PakistanCode", job_type="scrape", status="done", started_at=datetime.now(timezone.utc) - timedelta(hours=6)))
+    await db.commit()
+    # judged an hour from now, so jobs other tests started a moment ago cannot count as recent
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert await superseded_by_later_job(db, "PakistanCode", None, now=later) is False
