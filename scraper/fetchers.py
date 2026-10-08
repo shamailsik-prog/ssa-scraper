@@ -293,6 +293,14 @@ async def record_provenance(
     return prov
 
 
+def _pg_text(value: Optional[str]) -> Optional[str]:
+    """PostgreSQL text cannot hold NUL. A binary file read as text (a .docx linked from an assembly site on
+    8 October 2026) carried \x00 bytes and the INSERT failed, killing the whole job."""
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
 async def stage_judgment(
     db: AsyncSession,
     *,
@@ -321,8 +329,8 @@ async def stage_judgment(
         job_id=job_id,
         content_hash=prov.content_hash,
         raw_ref=prov.raw_ref,
-        raw_html=raw_html,
-        raw_text=raw_text,
+        raw_html=_pg_text(raw_html),
+        raw_text=_pg_text(raw_text),
         raw_text_hash=canonical_text_hash(raw_text),
         pdf_provenance_id=pdf_prov.id if pdf_prov is not None else None,
         ocr_applied=ocr_applied,
@@ -377,8 +385,8 @@ async def stage_statute(
         job_id=job_id,
         content_hash=prov.content_hash,
         raw_ref=prov.raw_ref,
-        raw_html=raw_html,
-        raw_text=raw_text,
+        raw_html=_pg_text(raw_html),
+        raw_text=_pg_text(raw_text),
         kind=kind,
         status="pending",
     )

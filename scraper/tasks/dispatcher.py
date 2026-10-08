@@ -218,8 +218,42 @@ async def _connector_for(source: ScraperSource):
     raise LookupError(f"no connector for source {name}")
 
 
+def _queued_key(source_name: str) -> str:
+    return f"dispatch_queued:{source_name}"
+
+
+def mark_source_queued(source_name: str) -> bool:
+    """True when the source may be queued now (and is marked as queued); False when a job queued for it
+    earlier has not started yet. During the OCR stall of 8 October 2026 the dispatcher queued every public
+    source again every cadence; once the workers recovered they spent hours on near-empty duplicate runs
+    and PakistanCode's job sat at the back of that queue. A Redis error never blocks dispatch."""
+    if not settings.DISPATCH_DEDUPE_ENABLED:
+        return True
+    try:
+        from scraper.tasks.chain import _redis
+
+        ttl = max(60, int(settings.DISPATCH_QUEUED_TTL_SECONDS or 0))
+        return bool(_redis().set(_queued_key(source_name), datetime.now(timezone.utc).isoformat(), nx=True, ex=ttl))
+    except Exception as exc:
+        logger.warning("dispatch dedupe unavailable for %s: %s", source_name, exc)
+        return True
+
+
+def clear_source_queued(source_name: str) -> None:
+    if not settings.DISPATCH_DEDUPE_ENABLED:
+        return
+    try:
+        from scraper.tasks.chain import _redis
+
+        _redis().delete(_queued_key(source_name))
+    except Exception as exc:
+        logger.warning("dispatch dedupe mark not cleared for %s: %s", source_name, exc)
+
+
 async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
     from scraper.heartbeat import beat
+
+    clear_source_queued(source_name)
 
     await beat("login_session" if source_name == "PakistanLawSite" else "public")
     async with SessionLocal() as db:
@@ -299,10 +333,16 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
             job.result_summary = stats
             logger.info("%s already has an active login-session worker; skipped duplicate job", source_name)
         except Exception as exc:
+            logger.exception("source job failed: %s", source_name)
+            # A failed flush leaves the session needing a rollback; without it recording the failure raised
+            # PendingRollbackError and the job stayed 'running', blocking its source for 30 minutes.
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             job.status = "failed"
             job.error_message = str(exc)[:4000]
             source.last_error = str(exc)[:2000]
-            logger.exception("source job failed: %s", source_name)
             stats = {"error": str(exc)}
         job.finished_at = datetime.now(timezone.utc)
         await db.commit()
@@ -524,9 +564,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         logger.info("%s: only one ACTIVE slot; running a single unsharded login-session job", s.source_name)
                     app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
                     queued.append(s.source_name)
-            else:
+            elif mark_source_queued(s.source_name):
                 app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
                 queued.append(s.source_name)
+            else:
+                logger.info("%s: a job queued earlier has not started yet; not queuing another", s.source_name)
+                skipped_saturated.append(f"{s.source_name}:already_queued")
             s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
         await db.commit()
     return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}

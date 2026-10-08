@@ -125,6 +125,9 @@ SELECT l.pid, l.objid AS lock_key, l.granted, now() - a.xact_start AS in_transac
 ROLLBACK;"
   REMOTE="cd /opt/ssa-scraper && docker compose exec -T postgres sh -c 'psql -X -P pager=off -v ON_ERROR_STOP=1 -U \"\${POSTGRES_USER:-legal}\" -d \"\${POSTGRES_DB:-legal_scraper}\"'"
   printf '%s\n' "$SQL" | ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
+  # Celery queue lengths: tasks waiting in Redis that no worker has taken yet (a long scraper queue means
+  # sources wait behind duplicates; see DISPATCH_DEDUPE_ENABLED).
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo && echo "== celery queues (tasks waiting)" && for q in scraper login_session maintenance embeddings; do printf "%-14s %s\n" "$q" "$(docker compose exec -T redis redis-cli LLEN "$q" 2>/dev/null | tr -d "\r")"; done' 2>&1
   # Host memory and killed processes: a worker child that disappears with SIGKILL is usually the
   # kernel's out-of-memory killer, which only the host log shows.
   ssh "${SSH_OPTS[@]}" "root@$IP" 'echo; echo "== host memory"; free -m; echo; echo "== container memory"; docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"; echo; echo "== out-of-memory kills (kernel log, last 24 h)"; journalctl -k --since "24 hours ago" --no-pager 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -15' 2>&1
