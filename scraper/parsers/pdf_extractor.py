@@ -224,6 +224,8 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
                         if len(txt.strip()) < 50:
                             txt = ocr(pil_image, TESSERACT_CONFIG)
                     except Exception as e:
+                        if page_timeout > 0 and isinstance(e, RuntimeError) and "timeout" in str(e).lower():
+                            raise
                         # Tesseract might not have urd, fallback
                         logger.debug("tesseract urd fallback triggered: %s", e)
                         txt = ocr(pil_image, TESSERACT_CONFIG)
