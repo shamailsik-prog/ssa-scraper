@@ -74,6 +74,7 @@ from scraper.pls_grid_health import (
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, VerificationRequired
+from scraper.tasks.chain import request_promotion_after_commit
 from scraper.tasks.search_map import active_map, map_as_dict, map_search_form, mark_map_stale, record_parse_result
 
 logger = logging.getLogger(__name__)
@@ -1513,6 +1514,9 @@ class PakistanLawSitePipeline:
         staging.status = "quarantined" if outcome.quarantine else "extracted"
         staging.quarantine_reason = outcome.quarantine_reason
         await self.db.flush()
+        if staging.status == "extracted":
+            # Save it into the corpus as soon as the batch commits, not on the next Beat promote pass.
+            request_promotion_after_commit(self.db, self.source.source_name)
         self.stats["staged"] += 1
         return "staged"
 

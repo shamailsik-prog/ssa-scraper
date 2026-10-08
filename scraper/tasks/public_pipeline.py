@@ -31,6 +31,7 @@ from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
+from scraper.tasks.chain import request_promotion_after_commit
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +297,8 @@ class PublicPipeline:
             self.stats["quarantined"] += 1
         self.stats["staged"] += 1
         await self.db.flush()
+        if staging.status == "extracted":
+            request_promotion_after_commit(self.db, self.source.source_name)
         return "staged"
 
     async def ingest_statute(self, res: FetchResult, *, route: Dict[str, Any], kind: str = "statute", meta: Optional[Dict[str, Any]] = None) -> str:
@@ -344,6 +347,8 @@ class PublicPipeline:
             self.stats["quarantined"] += 1
         self.stats["staged"] += 1
         await self.db.flush()
+        if staging.status == "extracted":
+            request_promotion_after_commit(self.db, self.source.source_name)
         return "staged"
 
     # ------------------------------------------------------------------ frontier drain
