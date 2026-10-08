@@ -24,6 +24,11 @@ async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
         # on the first run's archive_targets row lock. The run is one transaction, so an xact lock covers it.
         got = (await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": MIRROR_LOCK_KEY})).scalar()
         if not got:
+            # The running pass may have chosen its batch before the latest promotion: ask the chain
+            # for a follow-up run rather than leave the new records to the next Beat pass.
+            from scraper.tasks.chain import request_mirror
+
+            request_mirror()
             return {"skipped": "mirror_run_in_progress"}
         mirror = ArchiveMirror(db)
         result = await mirror.mirror_pending(limit)

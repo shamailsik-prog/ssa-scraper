@@ -21,10 +21,11 @@ from uuid import UUID
 
 from celery import shared_task
 from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
-from scraper.database import SessionLocal, run_async
+from scraper.database import SessionLocal, engine, run_async
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
@@ -59,6 +60,8 @@ from scraper.parsers.citation_extractor import canonicalise_statute_name, extrac
 from scraper.parsers.statute_parser import is_short_title_clause, looks_like_fragment_name
 
 logger = logging.getLogger(__name__)
+
+PROMOTION_LOCK_KEY = 0x55A_9701  # pg advisory lock: one promote_staging_records run at a time
 
 
 def _parse_citation_parts(c: str) -> Dict[str, Any]:
@@ -1923,7 +1926,33 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
                     await db.commit()
                     counts["statutes_quarantined"] += 1
         await db.commit()
+    if counts["promoted"] or counts["statutes_promoted"]:
+        # Chain: copy what was just saved to the archive (Google Drive) without waiting for Beat.
+        from scraper.tasks.chain import request_mirror
+
+        request_mirror()
     return counts
+
+
+async def promote_staging_records_exclusive(limit: int = 200, *, source_name: Optional[str] = None) -> Dict[str, Any]:
+    """One promotion run at a time. Beat and the fetch chain both enqueue promote_staging_records,
+    and two runs over the same extracted rows would race: the loser's unique-constraint error
+    quarantines a row the winner has already promoted. A run that finds another in progress asks
+    the chain for a follow-up run, so rows committed after the running pass selected its batch are
+    still picked up soon. Session-level advisory lock on its own AUTOCOMMIT connection, because
+    the promotion session commits after every row."""
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        got = (await conn.execute(sql_text("SELECT pg_try_advisory_lock(:k)"), {"k": PROMOTION_LOCK_KEY})).scalar()
+        if not got:
+            from scraper.tasks.chain import request_promotion
+
+            request_promotion(source_name)
+            return {"skipped": "promotion_run_in_progress"}
+        try:
+            return await promote_staging_records(limit, source_name=source_name)
+        finally:
+            await conn.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": PROMOTION_LOCK_KEY})
 
 
 async def resolve_quarantine(db: AsyncSession, item: QuarantineQueue, *, reviewer: str, resolution: str, notes: Optional[str] = None, corrected: Optional[Dict[str, Any]] = None) -> str:
@@ -1980,7 +2009,7 @@ async def resolve_quarantine(db: AsyncSession, item: QuarantineQueue, *, reviewe
 
 @shared_task(name="scraper.tasks.promotion.promote_staging_records")
 def promote_staging_records_task(limit: int = 200, source_name: Optional[str] = None):
-    return run_async(promote_staging_records(limit, source_name=source_name))
+    return run_async(promote_staging_records_exclusive(limit, source_name=source_name))
 
 
 @shared_task(name="scraper.tasks.promotion.reconcile_instrument_relations")

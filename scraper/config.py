@@ -232,6 +232,10 @@ class Settings(BaseSettings):
         default=0.5,
         description="Fraction of each promote batch reserved for PROMOTE_PREFERRED_SOURCE when that source has pending rows.",
     )
+    CORPUS_CHAIN_ENABLED: bool = Field(
+        default=True,
+        description="Event-driven chain: a committed fetch batch enqueues promotion, and a promotion that saved something enqueues the archive mirror (debounced). Beat stays the safety net.",
+    )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
