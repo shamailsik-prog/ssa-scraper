@@ -26,6 +26,8 @@ case "$1" in
   up) svc="${@: -1}"; grep -qx "$svc" "$FAKE/running" || echo "$svc" >> "$FAKE/running"; echo "up $svc" >> "$FAKE/calls" ;;
   exec)
     case "$*" in
+      *redis-cli\ SET\ deploy_hold_login*) [ -f "$FAKE/redis_down" ] && exit 1; touch "$FAKE/hold"; echo "hold" >> "$FAKE/calls" ;;
+      *redis-cli\ DEL\ deploy_hold_login*) rm -f "$FAKE/hold"; echo "unhold" >> "$FAKE/calls" ;;
       *redis-cli\ EXISTS*) [ -f "$FAKE/busy" ] && echo 1 || echo 0 ;;
       *redis-cli\ DEL*) rm -f "$FAKE/busy"; echo "release" >> "$FAKE/calls" ;;
       *psql*UPDATE*) echo "release-job" >> "$FAKE/calls" ;;
@@ -96,19 +98,45 @@ def host(tmp_path: Path):
     return h
 
 
-def test_deferred_deploy_keeps_beat_paused_then_starts_it_after_the_deploy(host):
+def test_deferred_deploy_holds_pls_work_keeps_beat_running_then_clears_the_hold(host):
+    """8 October 2026: stopping beat for every deferred deploy left nothing scheduled for up to 45 minutes
+    per push. The deploy now holds only new PakistanLawSite work (Redis deploy_hold_login)."""
     host.push_change()
     (host.fake / "busy").touch()
     r = host.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert "deferring deploy" in r.stdout
-    assert "celery-beat" not in host.running() and host.marker.exists()  # paused while the PLS job drains
+    assert "celery-beat" in host.running() and host.marker.exists()  # beat keeps scheduling everything else
+    assert (host.fake / "hold").exists()  # only new PakistanLawSite work waits
 
     (host.fake / "busy").unlink()  # the PLS job finished
     r = host.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(c.startswith("deploy ") for c in host.calls())
     assert "celery-beat" in host.running() and not host.marker.exists()
+    assert not (host.fake / "hold").exists()
+
+
+def test_beat_is_stopped_as_before_when_the_hold_cannot_be_set(host):
+    host.push_change()
+    (host.fake / "busy").touch()
+    (host.fake / "redis_down").touch()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "stopping celery-beat instead" in r.stdout
+    assert "celery-beat" not in host.running() and host.marker.exists()
+
+    (host.fake / "busy").unlink()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "celery-beat" in host.running() and not host.marker.exists()
+
+
+def test_a_hold_left_by_a_dead_deploy_is_cleared_when_nothing_is_pending(host):
+    (host.fake / "hold").touch()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to do" in r.stdout and not (host.fake / "hold").exists()
 
 
 def test_beat_left_stopped_by_an_old_deploy_is_started_again(host):

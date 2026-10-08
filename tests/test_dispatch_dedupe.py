@@ -141,3 +141,18 @@ async def test_nul_in_any_text_or_json_column_never_reaches_postgres(db):
 
 def test_legacy_queued_tasks_are_skipped_when_their_source_ran_in_the_last_six_hours():
     assert settings.DISPATCH_LEGACY_SKIP_SECONDS >= 6 * 3600
+
+
+async def test_nul_inside_a_tuple_is_stripped_and_unchanged_stored_values_are_not_rescanned(db):
+    from scraper.models import CrawlFrontier
+
+    fr = CrawlFrontier(source_name="SindhAssembly", tier=0, query_key="listing:tuple-test", query_json={"items": ("a\x00b",)}, cursor_json={}, priority=40)
+    db.add(fr)
+    await db.flush()
+    await db.refresh(fr)
+    assert fr.query_json == {"items": ["ab"]}
+    # a stored row whose only change is its status: the listener must not rewrite its other columns
+    fr.status = "done"
+    await db.flush()
+    assert fr.query_json == {"items": ["ab"]}
+    await db.rollback()

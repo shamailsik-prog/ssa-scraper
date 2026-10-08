@@ -47,6 +47,19 @@ pls_host_beat_running() {
   docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx celery-beat
 }
 
+# A deploy waiting for the PakistanLawSite job to finish sets this Redis key instead of stopping celery-beat:
+# the scraper then starts no new PakistanLawSite work (scraper/tasks/deploy_hold.py) while every other
+# source, promotion and the Drive mirror keep running. The key expires on its own if a deploy dies.
+PLS_HOST_LOGIN_HOLD_KEY="deploy_hold_login"
+
+pls_host_set_login_hold() {
+  pls_host_redis_cli SET "$PLS_HOST_LOGIN_HOLD_KEY" "$(date +%s)" EX "${1:-3300}" >/dev/null 2>&1
+}
+
+pls_host_clear_login_hold() {
+  pls_host_redis_cli DEL "$PLS_HOST_LOGIN_HOLD_KEY" >/dev/null 2>&1 || true
+}
+
 pls_host_stop_beat() {
   if pls_host_beat_running; then
     docker compose stop celery-beat

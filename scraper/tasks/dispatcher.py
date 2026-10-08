@@ -15,6 +15,7 @@ from celery import shared_task
 from sqlalchemy import func, select
 
 from scraper.config import search_harvest_tick_expiry, settings
+from scraper.tasks.deploy_hold import login_work_held
 from scraper.database import SessionLocal, run_async
 from scraper.auth.session_manager import SessionLockHeld
 from scraper.harvest_mode import (
@@ -250,7 +251,13 @@ def clear_source_queued(source_name: str) -> None:
         logger.warning("dispatch dedupe mark not cleared for %s: %s", source_name, exc)
 
 
-async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
+async def run_source(
+    source_name: str,
+    *,
+    check_superseded: bool = False,
+    queued_at: Optional[datetime] = None,
+    **connector_kwargs,
+) -> Dict[str, Any]:
     from scraper.heartbeat import beat
 
     clear_source_queued(source_name)
@@ -264,10 +271,18 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
         ).scalars().first()
         if source is None:
             return {"error": f"source {source_name} not found"}
+        if check_superseded and await superseded_by_later_job(db, source_name, queued_at):
+            # checked again under the source row lock: two duplicates taken at the same moment both pass the
+            # unlocked check in run_queued_source, and the second must see the first one's job here
+            logger.info("%s: a job already ran after this task was queued; skipping the duplicate", source_name)
+            return {"skipped": "superseded"}
         if not source.is_active or source.state in ("HALTED", "DISABLED"):
             logger.info("%s is %s; not dispatched (%s)", source_name, source.state, source.state_reason)
             return {"skipped": source.state, "reason": source.state_reason}
         if source.access_method == "login_session":
+            if login_work_held():
+                logger.info("%s: a deploy is waiting for the PakistanLawSite job to finish; queued job not started", source_name)
+                return {"skipped": "deploy_hold"}
             if not settings.login_scraping_effective:
                 await notify(db, level="warning", code="LOGIN_SCRAPING_DISABLED", message="ALLOW_LOGIN_SCRAPING is false or ENVIRONMENT != chambers; PakistanLawSite not run", source_name=source_name)
                 await db.commit()
@@ -379,6 +394,7 @@ async def run_queued_source(source_name: str, *, queued_at: Optional[str] = None
             if await superseded_by_later_job(db, source_name, when):
                 logger.info("%s: a job already ran after this task was queued; skipping the duplicate", source_name)
                 return {"skipped": "superseded"}
+        return await run_source(source_name, check_superseded=True, queued_at=when)
     return await run_source(source_name)
 
 
@@ -469,6 +485,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now
             if not due:
+                continue
+            if s.access_method == "login_session" and login_work_held():
+                logger.info("%s: a deploy is waiting for the PakistanLawSite job to finish; not starting new login work", s.source_name)
+                skipped_saturated.append(f"{s.source_name}:deploy_hold")
                 continue
             concurrency = 1
             if s.access_method == "login_session":

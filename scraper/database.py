@@ -18,9 +18,10 @@ import pkgutil
 from datetime import datetime, timezone
 from typing import AsyncIterator, List
 
-from sqlalchemy import text
+from sqlalchemy import String, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
 
@@ -42,13 +43,25 @@ engine = create_async_engine(
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+class PgSafeString(TypeDecorator):
+    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup."""
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if isinstance(value, str) and "\x00" in value:
+            return value.replace("\x00", "")
+        return value
+
+
 def _strip_nul(value):
     """PostgreSQL text and JSONB cannot hold NUL (\x00 / \u0000)."""
     if isinstance(value, str):
         return value.replace("\x00", "") if "\x00" in value else value
     if isinstance(value, dict):
         return {_strip_nul(k): _strip_nul(v) for k, v in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_strip_nul(v) for v in value]
     return value
 
@@ -58,7 +71,7 @@ def _has_nul(value) -> bool:
         return "\x00" in value
     if isinstance(value, dict):
         return any(_has_nul(k) or _has_nul(v) for k, v in value.items())
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return any(_has_nul(v) for v in value)
     return False
 
@@ -71,15 +84,22 @@ def _strip_nul_before_flush(session, flush_context, instances) -> None:
     INSERT failed and killed the whole job. Fixing call sites one by one kept missing the next one."""
     from sqlalchemy import inspect as sa_inspect
 
-    for obj in list(session.new) + list(session.dirty):
+    new = set(session.new)
+    for obj in list(new) + list(session.dirty):
         try:
             state = sa_inspect(obj)
             keys = {attr.key for attr in state.mapper.column_attrs}
         except Exception:
             continue
-        # only values already loaded: reading an expired attribute here would query the database
+        # only values already loaded (reading an expired attribute here would query the database), and for
+        # rows already stored only the attributes changed now: a stored value cannot hold NUL, and promotion
+        # changes only status fields on rows that carry whole judgments.
         for key, value in list(state.dict.items()):
-            if key in keys and _has_nul(value):
+            if key not in keys:
+                continue
+            if obj not in new and not state.attrs[key].history.added:
+                continue
+            if _has_nul(value):
                 setattr(obj, key, _strip_nul(value))
 
 

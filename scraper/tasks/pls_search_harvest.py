@@ -639,6 +639,11 @@ async def run_search_harvest(
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
 def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": True, "reason": "deploy_hold"}
+
     async def _inner() -> Dict[str, Any]:
         from sqlalchemy import func, select
 
