@@ -380,9 +380,13 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 )
                 mode = "updates"
                 auto_switched = True
+        # SKIP LOCKED: a source row another transaction holds (a running job updating its config) is
+        # left for the next pass instead of blocking this one, and with it every other source.
         rows = (
             await db.execute(
-                select(ScraperSource).where(ScraperSource.is_active.is_(True), ScraperSource.state == "ACTIVE")
+                select(ScraperSource)
+                .where(ScraperSource.is_active.is_(True), ScraperSource.state == "ACTIVE")
+                .with_for_update(skip_locked=True)
             )
         ).scalars().all()
         if mode == "backfill":

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from scraper.auth.session_manager import LoginRequired, SessionLock, SessionLockHeld, merge_source_config, release_page_result
 from scraper.config import settings
@@ -27,7 +27,7 @@ from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.parsers.text_cleaner import clean_html
-from scraper.pls_caseid import case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
+from scraper.pls_caseid import case_name, case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
 
 logger = logging.getLogger(__name__)
@@ -85,11 +85,17 @@ class CaseIdWalker:
         await self.db.commit()
 
     async def _held_text(self, key: str, serial: int) -> str:
-        url_like = f"%CaseName={key}{serial}%"
-        row = (await self.db.execute(select(Judgment.full_text).where(Judgment.source_name == SOURCE_NAME, Judgment.source_url.like(url_like)).limit(1))).first()
+        # Match parse_case_id: serial must not be a prefix of a longer serial (1 vs 10); the case
+        # name ends at "&" or at the end of the link.
+        name = case_name(key, serial)
+
+        def url_match(col):
+            return or_(col.like(f"%CaseName={name}&%"), col.like(f"%CaseName={name}"))
+
+        row = (await self.db.execute(select(Judgment.full_text).where(Judgment.source_name == SOURCE_NAME, url_match(Judgment.source_url)).limit(1))).first()
         if row and row[0]:
             return row[0]
-        row = (await self.db.execute(select(ScraperStaging.raw_text).where(ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.source_url.like(url_like)).limit(1))).first()
+        row = (await self.db.execute(select(ScraperStaging.raw_text).where(ScraperStaging.source_name == SOURCE_NAME, url_match(ScraperStaging.source_url)).limit(1))).first()
         return (row[0] if row else None) or ""
 
     async def calibrate(self, state: Dict[str, Any], known: Dict[str, Set[int]]) -> bool:

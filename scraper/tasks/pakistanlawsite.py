@@ -389,7 +389,10 @@ class PakistanLawSitePipeline:
         await merge_source_config(self.db, self.source, {key: pacing})
         self.stats["pages_charged"] += 1
         await self._heartbeat_job()
-        await self.db.flush()
+        # Commit now: the counter update locks the PakistanLawSite source row, and a job that only
+        # flushed held that lock for its whole run (an hour on 8 October 2026). Every Beat dispatch
+        # waited on it, four of them at once, and the workers they tied up starved the public sources.
+        await self.db.commit()
         pages_per_day = int(self.pacing_profile["pages_per_day"])
         pages_per_hour = int(self.pacing_profile["pages_per_hour"])
         if pacing["day_pages"] > pages_per_day:

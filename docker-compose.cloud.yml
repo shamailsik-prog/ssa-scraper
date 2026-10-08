@@ -17,6 +17,12 @@ services:
     environment:
       FORWARDED_ALLOW_IPS: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
 
+  # A public-source child reading large PDFs reached 2 GB and was killed by the out-of-memory killer
+  # under a 2.5 GB container limit (8 October 2026, three times). The limit is set here, not by hand,
+  # and a child that grows past CELERY_PUBLIC_MAX_MEMORY_KB is replaced after its task.
+  worker-public:
+    mem_limit: ${WORKER_PUBLIC_MEM_LIMIT:-4g}
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
