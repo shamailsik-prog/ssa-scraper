@@ -50,7 +50,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO
+    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO --max-memory-per-child=${CELERY_PUBLIC_MAX_MEMORY_KB:-1258291}
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-public@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s

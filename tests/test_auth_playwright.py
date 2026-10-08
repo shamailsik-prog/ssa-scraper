@@ -2586,3 +2586,25 @@ async def test_journal_missing_from_the_dropdown_is_set_aside_alone(db, login_so
     second = await _run_pls(db, login_source, sc)
     assert second["citation_grid_journals_walked"] == ["PLD"]
     assert _case_gotos(sc) == [pld[0][3]]
+
+
+async def test_charge_page_commits_so_the_source_row_is_not_held(db, login_source):
+    """The pacing counter update locks the source row; committing it at once lets the dispatcher and
+    other writers through (a job that only flushed held the row for an hour on 8 October 2026)."""
+    import asyncio
+
+    from sqlalchemy import text, update
+
+    from scraper.database import SessionLocal
+    from scraper.models import ScraperSource
+
+    await _activate(db, login_source)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    await pipeline._charge_page()
+    async with SessionLocal() as other:
+        await other.execute(text("SET LOCAL lock_timeout = '2s'"))
+        await asyncio.wait_for(
+            other.execute(update(ScraperSource).where(ScraperSource.id == login_source.id).values(updated_at=ScraperSource.updated_at)),
+            timeout=5,
+        )
+        await other.rollback()

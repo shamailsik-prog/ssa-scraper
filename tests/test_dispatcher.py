@@ -535,3 +535,31 @@ async def test_worker_start_retires_orphaned_login_session_jobs(db):
         rows = {j.source_name: j for j in (await fresh.execute(select(ScraperJob))).scalars().all()}
         assert rows["PakistanLawSite"].status == "interrupted" and "worker started" in rows["PakistanLawSite"].error_message
         assert rows["PakistanCode"].status == "running"
+
+
+async def test_dispatch_skips_a_source_row_another_transaction_holds(db, monkeypatch):
+    """8 October 2026: a PakistanLawSite job held its source row (an uncommitted pacing-counter
+    update) for an hour; every dispatch pass waited on it and no other source was dispatched."""
+    import asyncio
+
+    from scraper.database import SessionLocal
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    sources = (await db.execute(select(ScraperSource))).scalars().all()
+    for source in sources:
+        source.next_scrape_at = now + timedelta(hours=1)
+    due = {s.source_name: s for s in sources if s.source_name in ("PakistanCode", "PakistanLawSite")}
+    for s in due.values():
+        s.next_scrape_at, s.state, s.is_active = now - timedelta(minutes=1), "ACTIVE", True
+    await db.commit()
+    queued = []
+    monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append(args))
+
+    async with SessionLocal() as holder:  # a running job's open transaction on the PakistanLawSite row
+        await holder.execute(
+            ScraperSource.__table__.update().where(ScraperSource.source_name == "PakistanLawSite").values(config_json={"held": True})
+        )
+        result = await asyncio.wait_for(dispatch_due_sources(), timeout=20)
+        await holder.rollback()
+    assert "PakistanCode" in result["queued"] and "PakistanLawSite" not in result["queued"]
