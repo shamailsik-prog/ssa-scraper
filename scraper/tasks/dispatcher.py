@@ -282,6 +282,8 @@ async def run_source(
         if source.access_method == "login_session":
             if login_work_held():
                 logger.info("%s: a deploy is waiting for the PakistanLawSite job to finish; queued job not started", source_name)
+                source.next_scrape_at = datetime.now(timezone.utc)
+                await db.commit()
                 return {"skipped": "deploy_hold"}
             if not settings.login_scraping_effective:
                 await notify(db, level="warning", code="LOGIN_SCRAPING_DISABLED", message="ALLOW_LOGIN_SCRAPING is false or ENVIRONMENT != chambers; PakistanLawSite not run", source_name=source_name)

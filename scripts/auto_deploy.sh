@@ -107,9 +107,7 @@ resume_beat() {
     return 0
   fi
   pls_host_clear_login_hold
-  if ! pls_host_beat_running; then
-    pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
-  fi
+  pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
   rm -f "$DIR/$BEAT_PAUSE_MARKER"
 }
 
