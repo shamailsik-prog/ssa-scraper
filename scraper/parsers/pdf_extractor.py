@@ -13,6 +13,7 @@ Tech stack: pdfplumber, pytesseract, Pillow, httpx, pdf2image fallback
 from __future__ import annotations
 
 import io
+import os
 import logging
 import re
 import time
@@ -53,6 +54,19 @@ class PDFDownloadError(RuntimeError):
 
 class PDFExtractionError(RuntimeError):
     """Raised when both pdfplumber and OCR fail to produce usable text."""
+
+
+class OCRBudgetExceeded(RuntimeError):
+    """OCR of one document ran past OCR_DOCUMENT_BUDGET_SECONDS; its text would be incomplete."""
+
+
+def _ocr_limits() -> tuple[int, int]:
+    try:
+        from scraper.config import settings
+
+        return int(settings.OCR_PAGE_TIMEOUT_SECONDS or 0), int(settings.OCR_DOCUMENT_BUDGET_SECONDS or 0)
+    except Exception:
+        return 120, 900
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +170,23 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
         logger.error("OCR dependencies missing: %s", exc)
         return ""
 
+    # One OpenMP thread per tesseract run. With the default (one per core) two workers OCRing side by side
+    # on the 4-CPU server thrashed: on 8 October 2026 pages went from about 2 s to about 3 minutes each.
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    page_timeout, budget = _ocr_limits()
+    deadline = time.monotonic() + budget if budget > 0 else None
+
+    def ocr(image, config):
+        return pytesseract.image_to_string(image, config=config, timeout=page_timeout) if page_timeout > 0 else pytesseract.image_to_string(image, config=config)
+
     ocr_texts: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total = len(pdf.pages)
             for idx, page in enumerate(pdf.pages):
+                if deadline is not None and time.monotonic() >= deadline:
+                    _release_page(page)
+                    raise OCRBudgetExceeded(f"OCR stopped after {budget}s at page {idx + 1} of {total}")
                 try:
                     # Render page to image at 300 DPI for decent OCR
                     # pdfplumber's to_image requires Wand or pdfium optional; handle fallback
@@ -193,13 +220,13 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
 
                     # Try combined eng+urd first, fallback to eng if urdu traineddata missing
                     try:
-                        txt = pytesseract.image_to_string(pil_image, config=TESSERACT_CONFIG_URDU)
+                        txt = ocr(pil_image, TESSERACT_CONFIG_URDU)
                         if len(txt.strip()) < 50:
-                            txt = pytesseract.image_to_string(pil_image, config=TESSERACT_CONFIG)
+                            txt = ocr(pil_image, TESSERACT_CONFIG)
                     except Exception as e:
                         # Tesseract might not have urd, fallback
                         logger.debug("tesseract urd fallback triggered: %s", e)
-                        txt = pytesseract.image_to_string(pil_image, config=TESSERACT_CONFIG)
+                        txt = ocr(pil_image, TESSERACT_CONFIG)
 
                     if txt:
                         ocr_texts.append(txt)
@@ -210,6 +237,8 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
                 finally:
                     pil_image = None
                     _release_page(page)
+    except OCRBudgetExceeded:
+        raise
     except Exception as e:
         logger.warning("OCR pdf open failed: %s", e, exc_info=True)
         return ""
@@ -288,7 +317,13 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     )
 
     try:
-        ocr_raw = _ocr_extract_with_pdfplumber_images(pdf_bytes)
+        try:
+            ocr_raw = _ocr_extract_with_pdfplumber_images(pdf_bytes)
+        except OCRBudgetExceeded as exc:
+            # Partial text of a law or judgment must not pass for the whole: give no OCR text, so the record
+            # is held for review instead of saved incomplete.
+            logger.error("%s; document left without OCR text", exc)
+            return cleaned_primary if len(cleaned_primary.strip()) >= 50 else ""
         ocr_cleaned = _clean_text(ocr_raw)
 
         # Choose best of primary vs OCR

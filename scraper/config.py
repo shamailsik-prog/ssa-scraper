@@ -266,6 +266,10 @@ class Settings(BaseSettings):
         default=500,
         description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
     )
+    PLS_SEARCH_HARVEST_TICK_SECONDS: int = Field(
+        default=1200,
+        description="A search-harvest tick stops after this long (between rows or pages) and resumes from its cursor on the next tick, so one long query cannot hold the single login worker for an hour while case-ID walk ticks expire. 0 = no limit.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
@@ -304,6 +308,11 @@ class Settings(BaseSettings):
     OCR_ENABLED: bool = Field(default=True)
     OCR_LANGUAGE: str = Field(default="eng")
     OCR_DPI: int = Field(default=300)
+    OCR_PAGE_TIMEOUT_SECONDS: int = Field(default=120, description="Tesseract gives up on one page after this long; the page is skipped.")
+    OCR_DOCUMENT_BUDGET_SECONDS: int = Field(
+        default=900,
+        description="OCR of one PDF stops after this long and the document yields no text (held for review), so one long scan cannot hold a public worker for hours. 0 = no limit.",
+    )
 
     # --------------------------------------------------------------- archive
     GOOGLE_DRIVE_ENABLED: bool = Field(default=False)
@@ -693,3 +702,8 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def search_harvest_tick_expiry() -> int:
+    """Seconds a queued search-harvest tick may wait before it is dropped: about one tick's run time."""
+    return max(600, int(settings.PLS_SEARCH_HARVEST_TICK_SECONDS or 0) or 3600)
