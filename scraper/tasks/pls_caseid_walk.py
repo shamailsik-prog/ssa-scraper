@@ -27,7 +27,7 @@ from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.parsers.text_cleaner import clean_html
-from scraper.pls_caseid import case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, split_group_key
+from scraper.pls_caseid import case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,8 @@ def _calibration_due(state: Dict[str, Any], now: datetime) -> bool:
     failed = state.get("calibration_failed_at")
     if not failed:
         return True
+    if any("matched_by" not in r for r in state.get("calibration") or []):
+        return True  # failed under the old citation-only check: try again at once with the held text
     try:
         at = datetime.fromisoformat(str(failed))
     except ValueError:
@@ -82,8 +84,17 @@ class CaseIdWalker:
         await merge_source_config(self.db, self.source, {STATE_KEY: state})
         await self.db.commit()
 
+    async def _held_text(self, key: str, serial: int) -> str:
+        url_like = f"%CaseName={key}{serial}%"
+        row = (await self.db.execute(select(Judgment.full_text).where(Judgment.source_name == SOURCE_NAME, Judgment.source_url.like(url_like)).limit(1))).first()
+        if row and row[0]:
+            return row[0]
+        row = (await self.db.execute(select(ScraperStaging.raw_text).where(ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.source_url.like(url_like)).limit(1))).first()
+        return (row[0] if row else None) or ""
+
     async def calibrate(self, state: Dict[str, Any], known: Dict[str, Set[int]]) -> bool:
-        """Fetch two held judgments; both must read as judgment pages."""
+        """Fetch two held judgments; each must come back as the judgment we hold (its own text), or,
+        where we hold no text for it, read as a judgment page."""
         densest = max(known, key=lambda k: len(known[k]))
         year, _ = split_group_key(densest)
         samples = sorted(known[densest])[:2]
@@ -91,8 +102,12 @@ class CaseIdWalker:
         for serial in samples:
             page = await self.pipeline.fetch_detail(case_url(settings.PLS_BASE_URL, densest, serial))
             text = page_text(page)
-            ok = looks_like_case_page(text, year, raw_html=page.html)
-            results.append({"case": f"{densest}{serial}", "ok": ok, "chars": len(text)})
+            held = await self._held_text(densest, serial)
+            if held:
+                ok, matched = same_judgment(text, held), "held_text"
+            else:
+                ok, matched = looks_like_case_page(text, year, raw_html=page.html), "page_check"
+            results.append({"case": f"{densest}{serial}", "ok": ok, "matched_by": matched, **case_page_diagnostics(text, raw_html=page.html)})
             release_page_result(page)
             await self._pace()
         if all(r["ok"] for r in results):

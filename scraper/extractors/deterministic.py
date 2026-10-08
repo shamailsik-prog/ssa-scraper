@@ -633,8 +633,13 @@ def search_map_uses_dashboard_citation_panel(search_map: Dict[str, Any]) -> bool
     """True when Playwright must reveal the /Login/Check Citation Search tab before filling controls."""
     fields = search_map.get("fields") or {}
     markers = set(_DASHBOARD_CITATION_ROLES.keys())
-    for field in fields.values():
-        sel = str(field.get("selector") or "")
+    # Role entries are dicts; the map record also keeps every field under "_all" as a list of dicts
+    # (scraper/tasks/search_map.build_map_record), which once crashed the search harvest here.
+    entries = []
+    for value in (fields.values() if isinstance(fields, dict) else fields):
+        entries.extend(value if isinstance(value, list) else [value])
+    for field in entries:
+        sel = str(field.get("selector") or "") if isinstance(field, dict) else ""
         if any(marker in sel for marker in markers):
             return True
     return False
