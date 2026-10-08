@@ -12,12 +12,19 @@ ROLLOUT_FILE="state/rollout_sha.txt"
 RESET_MARKER="state/reset_retired_frontier_sha.txt"
 CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 
-# PLS stack (shared corpus-service image). Beat is never started unless it was already running.
+# PLS stack (shared corpus-service image). celery-beat is the scheduler for every scraping, promotion and
+# mirror task: a deploy pauses it while the PakistanLawSite job drains and always starts it again
+# afterwards, unless the operator has switched it off with state/beat_disabled.
 DEFAULT_APP_SERVICES=(api worker-scraper worker-public)
 ALL_APP_SERVICES=(api worker-scraper worker-public worker-embed celery-beat celery-flower)
 
 WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-600}"  # bounded wait before deploy when beat was running
 WAIT_POLL_SECONDS="${AUTO_DEPLOY_WAIT_POLL_SECONDS:-30}"
+# A deferred deploy leaves beat paused (so no new PLS job starts) and records when in this file; once the
+# pause is older than MAX_BEAT_PAUSE_SECONDS the deploy goes ahead and releases the running PLS job.
+BEAT_PAUSE_MARKER="state/beat_paused_by_deploy"
+BEAT_DISABLED_FILE="state/beat_disabled"
+MAX_BEAT_PAUSE_SECONDS="${AUTO_DEPLOY_MAX_BEAT_PAUSE_SECONDS:-2700}"
 DRY_RUN=0
 
 usage() {
@@ -52,10 +59,59 @@ install_cron() {
   { printf '%s\n' "$cron_now"; printf '%s\n' "$CRON_MARK"; printf '%s\n' "$cron_line"; } | crontab -
 }
 
+beat_wanted() {
+  [ ! -f "$DIR/$BEAT_DISABLED_FILE" ]
+}
+
+beat_pause_seconds() {
+  local since
+  since="$(cat "$DIR/$BEAT_PAUSE_MARKER" 2>/dev/null || true)"
+  case "$since" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo $(( $(date +%s) - since )) ;;
+  esac
+}
+
+# Pause beat for this deploy (stop it if running) and remember since when, across cron ticks.
+pause_beat() {
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would stop celery-beat and record $BEAT_PAUSE_MARKER"
+    return 0
+  fi
+  pls_host_stop_beat
+  if [ ! -f "$DIR/$BEAT_PAUSE_MARKER" ]; then
+    date +%s >"$DIR/$BEAT_PAUSE_MARKER"
+  fi
+}
+
+# Start beat again (unless the operator disabled it) and clear the pause marker.
+resume_beat() {
+  if ! beat_wanted; then
+    log "celery-beat left stopped: $BEAT_DISABLED_FILE is present"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    log "dry-run: would start celery-beat and remove $BEAT_PAUSE_MARKER"
+    return 0
+  fi
+  pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
+  rm -f "$DIR/$BEAT_PAUSE_MARKER"
+}
+
 wait_for_pls_idle() {
-  local waited=0
+  local waited=0 paused
   while pls_host_harvest_busy; do
     if [ "$waited" -ge "$WAIT_MAX_SECONDS" ]; then
+      paused="$(beat_pause_seconds)"
+      if [ -f "$DIR/$BEAT_PAUSE_MARKER" ] && [ "$paused" -ge "$MAX_BEAT_PAUSE_SECONDS" ]; then
+        log "celery-beat paused ${paused}s (max ${MAX_BEAT_PAUSE_SECONDS}s) and PLS still busy; releasing the PLS job and deploying"
+        if [ "$DRY_RUN" = 1 ]; then
+          log "dry-run: would release the PLS job and continue deploy"
+        else
+          pls_host_force_release_stalled_harvest
+        fi
+        return 0
+      fi
       if pls_host_promotion_stalled; then
         log "PLS busy but /status reports no_output_while_harvesting; releasing lock for pending deploy"
         if [ "$DRY_RUN" = 1 ]; then
@@ -65,7 +121,7 @@ wait_for_pls_idle() {
         fi
         return 0
       fi
-      log "PLS still busy after ${waited}s (lock or running job); deferring deploy to next cron tick"
+      log "PLS still busy after ${waited}s (lock or running job); deferring deploy to next cron tick (celery-beat paused ${paused}s of ${MAX_BEAT_PAUSE_SECONDS}s)"
       exit 0
     fi
     log "waiting for PLS harvest/login to finish (${waited}s / ${WAIT_MAX_SECONDS}s max)…"
@@ -181,6 +237,10 @@ main() {
       log "origin/$BRANCH at $new_sha (tip_sha and rollout_sha match) but /status reports no_output_while_harvesting; retrying compose rollout"
     else
       log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
+      if beat_wanted && ! pls_host_beat_running; then
+        log "celery-beat is not running and no deploy is pending; starting it"
+        resume_beat || exit 1
+      fi
       exit 0
     fi
   elif [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ] && [ "$rollout_sha" != "$new_sha" ]; then
@@ -203,17 +263,17 @@ main() {
   fi
 
   local beat_was_running=0
-  if pls_host_beat_running; then
+  if beat_wanted; then
     beat_was_running=1
-    log "celery-beat is running; stopping beat before deploy and waiting for PLS idle"
-    if [ "$DRY_RUN" = 1 ]; then
-      log "dry-run: would stop celery-beat"
+    if pls_host_beat_running; then
+      log "celery-beat is running; pausing it before deploy and waiting for PLS idle"
     else
-      pls_host_stop_beat
+      log "celery-beat is not running (paused $(beat_pause_seconds)s); keeping it paused until PLS is idle, then starting it"
     fi
+    pause_beat
     wait_for_pls_idle
   else
-    log "celery-beat is not running; deploy will not start beat"
+    log "celery-beat is switched off ($BEAT_DISABLED_FILE); deploy will not start it"
     if pls_host_promotion_stalled && pls_host_harvest_busy; then
       wait_for_pls_idle
     fi
@@ -239,11 +299,7 @@ main() {
       run_reset_frontier_once "$new_sha"
     fi
     if [ "$beat_was_running" = 1 ]; then
-      if [ "$DRY_RUN" = 1 ]; then
-        log "dry-run: would restart celery-beat"
-      else
-        pls_host_start_beat
-      fi
+      resume_beat || exit 1
     fi
     exit 0
   fi
@@ -265,7 +321,7 @@ main() {
     log "install.sh --deploy-only FAILED — leaving existing containers running"
     git reset --hard "$old_sha" || true
     if [ "$beat_was_running" = 1 ]; then
-      pls_host_start_beat || true
+      resume_beat || true
     fi
     exit 1
   fi
@@ -278,11 +334,7 @@ main() {
     printf '%s\n' "$new_sha" >"$ROLLOUT_FILE"
   fi
   if [ "$beat_was_running" = 1 ]; then
-    if [ "$DRY_RUN" = 1 ]; then
-      log "dry-run: would restart celery-beat"
-    else
-      pls_host_start_beat
-    fi
+    resume_beat || true
   fi
   log "deploy complete; tip_sha=$new_sha beat_restarted=$beat_was_running"
 }
