@@ -45,7 +45,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from scraper.config import settings
-from scraper.database import Base
+from scraper.database import Base, PgSafeString
 
 EMBEDDING_DIM = settings.EMBEDDING_DIM
 
@@ -753,7 +753,7 @@ class CrawlFrontier(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     source_name: Mapped[str] = mapped_column(String(100), nullable=False)
     tier: Mapped[int] = mapped_column(Integer, nullable=False)
-    query_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    query_key: Mapped[str] = mapped_column(PgSafeString(500), nullable=False)
     query_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     cursor_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"), comment="page, row_index, last_citation_no")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"), comment="pending|in_progress|done|retired|stale")
@@ -780,7 +780,7 @@ class PlsSearchHarvestQuery(Base):
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     source_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    query_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    query_key: Mapped[str] = mapped_column(PgSafeString(500), nullable=False)
     query_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     parent_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("pls_search_harvest_query.id", ondelete="SET NULL"))
     status: Mapped[str] = mapped_column(
