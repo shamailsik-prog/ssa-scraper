@@ -12,6 +12,7 @@ Roles (Amendment §0, Cursor command):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import logging
 import pkgutil
@@ -44,14 +45,24 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 
 
 class PgSafeString(TypeDecorator):
-    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup."""
+    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup.
+
+    A value longer than the column (a listing key that embeds a whole judgment URL) is shortened the same way on
+    every bind: its head plus a SHA-256 of the full value. Inserts no longer fail, equality lookups with the raw
+    value still find the row, and keys that share a long prefix stay distinct."""
 
     impl = String
     cache_ok = True
 
     def process_bind_param(self, value, dialect):
-        if isinstance(value, str) and "\x00" in value:
-            return value.replace("\x00", "")
+        if not isinstance(value, str):
+            return value
+        if "\x00" in value:
+            value = value.replace("\x00", "")
+        limit = self.impl.length
+        if limit and len(value) > limit:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            value = f"{value[: limit - len(digest) - 1]}#{digest}"
         return value
 
 
