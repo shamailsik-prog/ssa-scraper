@@ -12,7 +12,7 @@ def test_auto_deploy_script_is_valid_bash():
 
 def test_auto_deploy_default_services_exclude_celery_beat():
     text = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
-    assert "DEFAULT_APP_SERVICES=(api worker-scraper worker-public)" in text
+    assert "DEFAULT_APP_SERVICES=(api worker-scraper worker-public worker-maintenance)" in text
     assert "celery-beat" not in text.split("DEFAULT_APP_SERVICES=")[1].split(")")[0]
 
 

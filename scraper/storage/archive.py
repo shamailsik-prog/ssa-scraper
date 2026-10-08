@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -97,10 +98,26 @@ async def _retry(fn, *args):
 
 
 class ArchiveMirror:
-    def __init__(self, db: AsyncSession, *, adapter_factory=build_adapter):
+    def __init__(self, db: AsyncSession, *, adapter_factory=build_adapter, deadline: Optional[float] = None, commit_progress: bool = False):
         self.db = db
         self.adapter_factory = adapter_factory
         self.summary: Dict[str, Dict[str, int]] = {}
+        # A run with a deadline (time.monotonic()) stops starting new objects once it passes, and one
+        # with commit_progress commits its ledger as it goes: after the statute re-scrape a single
+        # all-or-nothing pass over thousands of objects ran for hours, and a killed worker lost every
+        # ledger row it had written (8 October 2026). The next run carries on where this one stopped.
+        self.deadline = deadline
+        self.commit_progress = commit_progress
+        self.out_of_time = False
+
+    def _time_up(self) -> bool:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.out_of_time = True
+        return self.out_of_time
+
+    async def _checkpoint(self) -> None:
+        if self.commit_progress:
+            await self.db.commit()
 
     async def targets(self) -> List[ArchiveTarget]:
         return list((await self.db.execute(select(ArchiveTarget).where(ArchiveTarget.enabled.is_(True)))).scalars().all())
@@ -302,6 +319,8 @@ class ArchiveMirror:
                 continue
             failures = 0
             for j in judgments:
+                if self._time_up():
+                    break
                 if not self._policy_allows(t, j.access_method):
                     summary["skipped_policy"] += 1
                     continue
@@ -322,6 +341,7 @@ class ArchiveMirror:
                 if failures >= 5:
                     break
                 index_rows.append([j.canonical_citation, j.case_title or "", j.court_name or "", str(j.year or ""), j.decision_date.isoformat() if j.decision_date else "", judgment_prefix(j), "original_pdf" if j.has_original_pdf else "rendered_copy", j.full_text_hash or ""])
+                await self._checkpoint()
             # _index CSV snapshot (write-once: timestamped file name)
             if index_rows:
                 buf = io.StringIO()
@@ -344,6 +364,7 @@ class ArchiveMirror:
                 t.last_error = None
                 t.last_ok_at = datetime.now(timezone.utc)
             await self.db.flush()
+            await self._checkpoint()
             index_rows = []
         return {"targets": len(targets), "summary": self.summary}
 
@@ -369,6 +390,8 @@ class ArchiveMirror:
         ).all()
         out: Dict[str, int] = {}
         for t in targets:
+            if self._time_up():
+                break
             done = await self._written_keys(t, "Statutes/")
             pending = [(r[0], key) for r in key_rows if (key := self._statute_key(r[1], r[2], r[3], r[4])) not in done][:limit]
             if not pending:
@@ -388,13 +411,18 @@ class ArchiveMirror:
                 ).all()
             }
             n = 0
-            for vid, key in pending:
+            for i, (vid, key) in enumerate(pending, 1):
+                if self._time_up():
+                    break
                 text_, prov = bodies.get(vid, ("", None))
                 try:
                     status = await self._write(t, adapter, {"key": key, "data": (text_ or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=prov)
                     n += status == "written"
                 except Exception as exc:
                     logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+                if i % 50 == 0:
+                    await self._checkpoint()
+            await self._checkpoint()
             out[t.name] = n
         return out
 
@@ -411,6 +439,8 @@ class ArchiveMirror:
         ).all()
         out: Dict[str, int] = {}
         for t in targets:
+            if self._time_up():
+                break
             done = await self._written_keys(t, "Instruments/")
             pending = [(r[0], key) for r in key_rows if (key := self._instrument_key(*r)) not in done][:limit]
             if not pending:
@@ -428,13 +458,18 @@ class ArchiveMirror:
                 ).all()
             }
             n = 0
-            for iid, key in pending:
+            for i, (iid, key) in enumerate(pending, 1):
+                if self._time_up():
+                    break
                 text_, prov = bodies.get(iid, ("", None))
                 try:
                     status = await self._write(t, adapter, {"key": key, "data": (text_ or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"}, prov_id=prov)
                     n += status == "written"
                 except Exception as exc:
                     logger.warning("archive %s: %s failed: %s", t.name, key, exc)
+                if i % 50 == 0:
+                    await self._checkpoint()
+            await self._checkpoint()
             out[t.name] = n
         return out
 
