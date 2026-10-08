@@ -271,6 +271,11 @@ def pls_stall_watchdog():
 
 
 def _pls_keepalive_cli() -> int:
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        print({"skipped": "deploy_hold"})
+        return 0
     result = run_async(keepalive_pakistanlawsite_slots())
     print(result)
     return 0
