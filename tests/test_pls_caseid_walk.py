@@ -172,3 +172,19 @@ async def test_walk_calibrates_on_held_text_when_the_citation_is_unreadable(db, 
     assert state.get("calibrated_at"), state.get("calibration")
     assert [(c["ok"], c["matched_by"]) for c in state["calibration"]] == [(True, "held_text"), (True, "held_text")]
     assert all("has_case_content" in c and "citation_years" in c for c in state["calibration"])
+
+
+async def test_held_text_lookup_matches_the_whole_case_name(db, login_source):
+    from scraper.models import Judgment
+
+    db.add_all([
+        Judgment(canonical_citation="1984 CLC 2010", full_text="text of 1984K2010", full_text_hash="ha", source_name="PakistanLawSite",
+                 access_method="login_session", source_url=f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=1984K2010&court=", case_title="X v Y"),
+        Judgment(canonical_citation="1984 CLC 7", full_text="text of 1984K7", full_text_hash="hb", source_name="PakistanLawSite",
+                 access_method="login_session", source_url=f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=1984K7", case_title="P v Q"),
+    ])
+    await db.commit()
+    walker = CaseIdWalker(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    assert await walker._held_text("1984K", 201) == ""  # 1984K2010 is another case
+    assert await walker._held_text("1984K", 2010) == "text of 1984K2010"
+    assert await walker._held_text("1984K", 7) == "text of 1984K7"  # case name at the end of the link
