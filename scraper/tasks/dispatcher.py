@@ -260,8 +260,6 @@ async def run_source(
 ) -> Dict[str, Any]:
     from scraper.heartbeat import beat
 
-    clear_source_queued(source_name)
-
     await beat("login_session" if source_name == "PakistanLawSite" else "public")
     async with SessionLocal() as db:
         source = (
@@ -276,12 +274,17 @@ async def run_source(
             # unlocked check in run_queued_source, and the second must see the first one's job here
             logger.info("%s: a job already ran after this task was queued; skipping the duplicate", source_name)
             return {"skipped": "superseded"}
+        # only now: a stale duplicate skipped above must not clear the mark of a newer queued task
+        clear_source_queued(source_name)
         if not source.is_active or source.state in ("HALTED", "DISABLED"):
             logger.info("%s is %s; not dispatched (%s)", source_name, source.state, source.state_reason)
             return {"skipped": source.state, "reason": source.state_reason}
         if source.access_method == "login_session":
             if login_work_held():
                 logger.info("%s: a deploy is waiting for the PakistanLawSite job to finish; queued job not started", source_name)
+                # due again at once, so it runs on the first dispatch after the hold instead of a cadence later
+                source.next_scrape_at = datetime.now(timezone.utc)
+                await db.commit()
                 return {"skipped": "deploy_hold"}
             if not settings.login_scraping_effective:
                 await notify(db, level="warning", code="LOGIN_SCRAPING_DISABLED", message="ALLOW_LOGIN_SCRAPING is false or ENVIRONMENT != chambers; PakistanLawSite not run", source_name=source_name)

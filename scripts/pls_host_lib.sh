@@ -52,6 +52,13 @@ pls_host_beat_running() {
 # source, promotion and the Drive mirror keep running. The key expires on its own if a deploy dies.
 PLS_HOST_LOGIN_HOLD_KEY="deploy_hold_login"
 
+# True when the running worker image honours the hold in every PakistanLawSite entry point: version 1 (the
+# first hold) still let slot recovery, keepalive, the watchdog and the spot check run, so it does not count.
+PLS_HOST_LOGIN_HOLD_MIN_VERSION=2
+pls_host_workers_know_login_hold() {
+  docker compose exec -T worker-scraper python -c "import sys, scraper.tasks.deploy_hold as h; sys.exit(0 if getattr(h, 'HOLD_GUARDS_VERSION', 1) >= $PLS_HOST_LOGIN_HOLD_MIN_VERSION else 1)" >/dev/null 2>&1
+}
+
 pls_host_set_login_hold() {
   pls_host_redis_cli SET "$PLS_HOST_LOGIN_HOLD_KEY" "$(date +%s)" EX "${1:-3300}" >/dev/null 2>&1
 }
@@ -68,6 +75,11 @@ pls_host_stop_beat() {
 
 pls_host_start_beat() {
   docker compose up -d --no-build celery-beat
+}
+
+# Start the existing celery-beat container as it was (no recreate onto a newer local image).
+pls_host_restore_beat() {
+  docker compose start celery-beat
 }
 
 # True when /status.json reports a promotion stall (zero judgments while harvest is active).

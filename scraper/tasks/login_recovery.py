@@ -457,4 +457,8 @@ async def recover_login_slots_async(
 
 @shared_task(name="scraper.tasks.login_recovery.recover_login_slots")
 def recover_login_slots() -> Dict[str, Any]:
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(recover_login_slots_async())

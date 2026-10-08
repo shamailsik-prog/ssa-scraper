@@ -23,9 +23,11 @@ shift  # compose
 case "$1" in
   ps) cat "$FAKE/running" 2>/dev/null ;;
   stop) grep -vx "$2" "$FAKE/running" > "$FAKE/running.new" || true; mv "$FAKE/running.new" "$FAKE/running"; echo "stop $2" >> "$FAKE/calls" ;;
-  up) svc="${@: -1}"; grep -qx "$svc" "$FAKE/running" || echo "$svc" >> "$FAKE/running"; echo "up $svc" >> "$FAKE/calls" ;;
+  up) svc="${@: -1}"; [ -f "$FAKE/up_fails" ] && exit 1; grep -qx "$svc" "$FAKE/running" || echo "$svc" >> "$FAKE/running"; echo "up $svc" >> "$FAKE/calls" ;;
+  start) grep -qx "$2" "$FAKE/running" || echo "$2" >> "$FAKE/running"; echo "start $2" >> "$FAKE/calls" ;;
   exec)
     case "$*" in
+      *scraper.tasks.deploy_hold*HOLD_GUARDS_VERSION*) [ -f "$FAKE/old_workers" ] && exit 1; exit 0 ;;
       *redis-cli\ SET\ deploy_hold_login*) [ -f "$FAKE/redis_down" ] && exit 1; touch "$FAKE/hold"; echo "hold" >> "$FAKE/calls" ;;
       *redis-cli\ DEL\ deploy_hold_login*) rm -f "$FAKE/hold"; echo "unhold" >> "$FAKE/calls" ;;
       *redis-cli\ EXISTS*) [ -f "$FAKE/busy" ] && echo 1 || echo 0 ;;
@@ -64,7 +66,9 @@ def host(tmp_path: Path):
     _git(seed, "config", "user.email", "t@example.com")
     _git(seed, "config", "user.name", "t")
     (seed / "cloud").mkdir()
-    (seed / "cloud" / "install.sh").write_text('#!/usr/bin/env bash\necho "deploy $AUTO_DEPLOY_SERVICES" >> "$FAKE/calls"\n')
+    (seed / "cloud" / "install.sh").write_text(
+        '#!/usr/bin/env bash\n[ -f "$FAKE/install_fails" ] && exit 1\necho "deploy $AUTO_DEPLOY_SERVICES" >> "$FAKE/calls"\n'
+    )
     (seed / "scraper").mkdir()
     (seed / "scraper" / "a.py").write_text("v = 1\n")
     _git(seed, "add", "-A")
@@ -167,3 +171,63 @@ def test_operator_switch_keeps_beat_off(host):
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(c.startswith("deploy ") for c in host.calls())
     assert "celery-beat" not in host.running()
+
+
+def test_beat_is_recreated_after_every_deploy_so_it_never_keeps_the_old_image(host):
+    host.push_change()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(c.startswith("deploy ") for c in host.calls())
+    assert "up celery-beat" in host.calls()  # beat was running all along and is still brought up on the new image
+
+
+def test_first_rollout_stops_beat_while_the_running_workers_predate_the_hold(host):
+    host.push_change()
+    (host.fake / "busy").touch()
+    (host.fake / "old_workers").touch()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "stopping celery-beat instead" in r.stdout
+    assert "celery-beat" not in host.running() and not (host.fake / "hold").exists()
+
+
+def test_hold_is_cleared_when_the_operator_switched_beat_off_mid_deploy(host):
+    host.push_change()
+    (host.fake / "busy").touch()
+    r = host.run()
+    assert r.returncode == 0 and (host.fake / "hold").exists(), r.stdout + r.stderr
+    (host.app / "state" / "beat_disabled").touch()
+    (host.fake / "busy").unlink()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(c.startswith("deploy ") for c in host.calls())
+    assert not (host.fake / "hold").exists()
+
+
+def test_a_failed_beat_recreate_after_rollout_is_retried_even_while_old_beat_runs(host):
+    """#182 review: when `up celery-beat` fails after a successful rollout, both SHA markers already match and
+    the old beat keeps running; the pause marker left behind must make the next tick recreate it."""
+    host.push_change()
+    (host.fake / "up_fails").touch()
+    r = host.run()
+    assert any(c.startswith("deploy ") for c in host.calls()), r.stdout + r.stderr
+    assert host.marker.exists() and "celery-beat" in host.running()  # old beat still up, retry owed
+
+    (host.fake / "up_fails").unlink()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to do" in r.stdout
+    assert host.calls().count("up celery-beat") == 1 and not host.marker.exists()
+
+
+def test_a_failed_install_restores_the_existing_beat_without_recreating_it(host):
+    """#182 review: after a failed install the local image may already be the failed release, so beat is only
+    started again as the existing container, never recreated."""
+    host.push_change()
+    (host.fake / "old_workers").touch()  # beat is stopped for this deploy
+    (host.fake / "install_fails").touch()
+    r = host.run()
+    assert r.returncode == 1, r.stdout + r.stderr
+    calls = host.calls()
+    assert "up celery-beat" not in calls and "start celery-beat" in calls
+    assert "celery-beat" in host.running() and not host.marker.exists() and not (host.fake / "hold").exists()

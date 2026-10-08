@@ -49,6 +49,12 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
     """Probe ACTIVE slots; re-login only slots that fail the live search probe."""
     if not settings.login_scraping_effective:
         return {"skipped": "login_scraping_disabled"}
+    from scraper.tasks.deploy_hold import login_work_held
+
+    # here rather than only in the Celery task: the host backup cron (scripts/pls_keepalive_cron.sh) calls
+    # this through the module's CLI
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     outcomes: Dict[str, Any] = {"probed": [], "recovered": []}
     async with SessionLocal() as db:
         busy = await pls_harvest_in_progress(db)
@@ -254,15 +260,28 @@ async def reset_retired_pls_search_map_frontier() -> Dict[str, int]:
 
 @shared_task(name="scraper.tasks.pls_self_healing.pls_keepalive_hourly")
 def pls_keepalive_hourly():
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(keepalive_pakistanlawsite_slots())
 
 
 @shared_task(name="scraper.tasks.pls_self_healing.pls_stall_watchdog")
 def pls_stall_watchdog():
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(stall_watchdog_pakistanlawsite())
 
 
 def _pls_keepalive_cli() -> int:
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        print({"skipped": "deploy_hold"})
+        return 0
     result = run_async(keepalive_pakistanlawsite_slots())
     print(result)
     return 0
