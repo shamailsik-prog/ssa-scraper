@@ -84,6 +84,21 @@ def _clean_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _release_page(page) -> None:
+    """Drop a page's cached layout objects and rendered image once it has been read.
+
+    pdfplumber keeps every page's parsed objects until the document is closed, so a long scanned
+    ordinance (300-DPI renders for OCR) grew a public worker past 2 GB and the kernel killed it
+    (law.gok.pk, 8 October 2026). Releasing each page keeps memory at about one page."""
+    try:
+        page.close()
+    except Exception:
+        try:
+            page.flush_cache()
+        except Exception:
+            pass
+
+
 def _pdfplumber_extract(pdf_bytes: bytes) -> tuple[str, int, bool]:
     """
     Attempt pdfplumber extraction.
@@ -118,6 +133,8 @@ def _pdfplumber_extract(pdf_bytes: bytes) -> tuple[str, int, bool]:
                     logger.warning("pdfplumber page %d extraction failed: %s", i, e, exc_info=False)
                     text_parts.append("")
                     scanned_pages += 1
+                finally:
+                    _release_page(page)
         full_text = "\n".join(text_parts)
         is_scanned = scanned_pages > (num_pages * 0.6) if num_pages else False
         return full_text, num_pages, is_scanned
@@ -190,6 +207,9 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
                 except Exception as e:
                     logger.warning("OCR failed on page %d: %s", idx, e, exc_info=False)
                     continue
+                finally:
+                    pil_image = None
+                    _release_page(page)
     except Exception as e:
         logger.warning("OCR pdf open failed: %s", e, exc_info=True)
         return ""
