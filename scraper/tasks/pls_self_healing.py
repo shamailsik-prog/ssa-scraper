@@ -254,11 +254,19 @@ async def reset_retired_pls_search_map_frontier() -> Dict[str, int]:
 
 @shared_task(name="scraper.tasks.pls_self_healing.pls_keepalive_hourly")
 def pls_keepalive_hourly():
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(keepalive_pakistanlawsite_slots())
 
 
 @shared_task(name="scraper.tasks.pls_self_healing.pls_stall_watchdog")
 def pls_stall_watchdog():
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(stall_watchdog_pakistanlawsite())
 
 

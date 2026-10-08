@@ -83,10 +83,12 @@ pause_beat() {
     log "dry-run: would hold new PakistanLawSite work and record $BEAT_PAUSE_MARKER"
     return 0
   fi
-  if pls_host_set_login_hold $((MAX_BEAT_PAUSE_SECONDS + 600)); then
+  # The running workers must know the hold (scraper/tasks/deploy_hold.py); on the deploy that first brings it
+  # they still run the previous image, so beat is stopped as before.
+  if pls_host_workers_know_login_hold && pls_host_set_login_hold $((MAX_BEAT_PAUSE_SECONDS + 600)); then
     log "new PakistanLawSite work held for the deploy; celery-beat keeps running"
   else
-    log "could not set the login hold in Redis; stopping celery-beat instead"
+    log "login hold unavailable (running workers predate it, or Redis refused); stopping celery-beat instead"
     pls_host_stop_beat
   fi
   if [ ! -f "$DIR/$BEAT_PAUSE_MARKER" ]; then
@@ -107,9 +109,9 @@ resume_beat() {
     return 0
   fi
   pls_host_clear_login_hold
-  if ! pls_host_beat_running; then
-    pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
-  fi
+  # always `up`: it is a no-op for a current container and recreates beat when the image was rebuilt, so beat
+  # never keeps running the previous code and schedule
+  pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
   rm -f "$DIR/$BEAT_PAUSE_MARKER"
 }
 
@@ -320,6 +322,7 @@ main() {
     if [ "$beat_was_running" = 1 ]; then
       resume_beat || exit 1
     else
+      [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
       rm -f "$DIR/$BEAT_PAUSE_MARKER"
     fi
     if [ "$PLS_FORCE_RELEASED" = 1 ]; then
@@ -364,6 +367,7 @@ main() {
   if [ "$beat_was_running" = 1 ]; then
     resume_beat || true
   else
+    [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
     rm -f "$DIR/$BEAT_PAUSE_MARKER"
   fi
   log "deploy complete; tip_sha=$new_sha beat_restarted=$beat_was_running"

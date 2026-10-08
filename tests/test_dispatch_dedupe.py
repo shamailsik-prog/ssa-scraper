@@ -151,8 +151,44 @@ async def test_nul_inside_a_tuple_is_stripped_and_unchanged_stored_values_are_no
     await db.flush()
     await db.refresh(fr)
     assert fr.query_json == {"items": ["ab"]}
-    # a stored row whose only change is its status: the listener must not rewrite its other columns
-    fr.status = "done"
-    await db.flush()
-    assert fr.query_json == {"items": ["ab"]}
+    # a stored row whose only change is its status: the listener must not even look at its other columns
+    from scraper import database
+
+    seen = []
+    real = database._has_nul
+    database._has_nul = lambda value: (seen.append(value), real(value))[1]
+    try:
+        fr.status = "done"
+        await db.flush()
+    finally:
+        database._has_nul = real
+    assert seen == ["done"]
     await db.rollback()
+
+
+async def test_frontier_lookup_with_a_nul_key_finds_the_row_stored_without_it(db):
+    """Cursor Agent's PgSafeString: an existence check made with the raw key (NUL included) must match the
+    row whose key was cleaned at flush, or the same link is queued again on every listing pass."""
+    from scraper.models import CrawlFrontier
+
+    raw = "listing:https://example.test/a\x00b"
+    db.add(CrawlFrontier(source_name="SindhAssembly", tier=0, query_key=raw, query_json={}, cursor_json={}, priority=40))
+    await db.flush()
+    found = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == "SindhAssembly", CrawlFrontier.query_key == raw))).scalars().first()
+    assert found is not None and found.query_key == "listing:https://example.test/ab"
+    await db.rollback()
+
+
+async def test_a_superseded_duplicate_leaves_the_newer_tasks_queued_mark(db, monkeypatch):
+    from scraper.tasks.dispatcher import run_source
+
+    monkeypatch.setattr(settings, "DISPATCH_DEDUPE_ENABLED", True)
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "GBAssembly"))).scalars().first()
+    now = datetime.now(timezone.utc)
+    db.add(ScraperJob(source_id=src.id, source_name="GBAssembly", job_type="scrape", status="done", started_at=now - timedelta(minutes=1)))
+    await db.commit()
+    _redis().set(dispatcher._queued_key("GBAssembly"), "newer task", ex=60)
+    result = await run_source("GBAssembly", check_superseded=True, queued_at=now - timedelta(minutes=10))
+    assert result["skipped"] == "superseded"
+    assert _redis().get(dispatcher._queued_key("GBAssembly")) == b"newer task"
+    _redis().delete(dispatcher._queued_key("GBAssembly"))

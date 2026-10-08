@@ -52,6 +52,11 @@ pls_host_beat_running() {
 # source, promotion and the Drive mirror keep running. The key expires on its own if a deploy dies.
 PLS_HOST_LOGIN_HOLD_KEY="deploy_hold_login"
 
+# True when the running worker image has scraper/tasks/deploy_hold.py, i.e. honours the hold.
+pls_host_workers_know_login_hold() {
+  docker compose exec -T worker-scraper python -c "import scraper.tasks.deploy_hold" >/dev/null 2>&1
+}
+
 pls_host_set_login_hold() {
   pls_host_redis_cli SET "$PLS_HOST_LOGIN_HOLD_KEY" "$(date +%s)" EX "${1:-3300}" >/dev/null 2>&1
 }

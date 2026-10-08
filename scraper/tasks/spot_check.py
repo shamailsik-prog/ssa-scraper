@@ -392,6 +392,10 @@ async def spot_check_statutes_async(**kwargs) -> Dict[str, Any]:
 
 @shared_task(name="scraper.tasks.spot_check.spot_check_judgments")
 def spot_check_judgments() -> Dict[str, Any]:
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
     return run_async(spot_check_judgments_async())
 
 

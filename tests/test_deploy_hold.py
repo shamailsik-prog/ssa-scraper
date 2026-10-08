@@ -58,3 +58,25 @@ def test_case_id_walk_and_search_harvest_ticks_wait_during_a_hold(hold):
 
     assert pls_caseid_walk_tick()["skipped"] == "deploy_hold"
     assert pls_search_harvest_tick()["reason"] == "deploy_hold"
+
+
+
+async def test_a_held_pakistanlawsite_job_stays_due_for_the_first_dispatch_after_the_hold(db, hold):
+    from scraper.tasks.dispatcher import run_source
+
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    src.next_scrape_at = datetime.now(timezone.utc) + timedelta(hours=1)  # as the dispatcher left it
+    await db.commit()
+    assert (await run_source("PakistanLawSite"))["skipped"] == "deploy_hold"
+    db.expire_all()
+    src = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    assert src.next_scrape_at <= datetime.now(timezone.utc)
+
+
+def test_periodic_pakistanlawsite_tasks_wait_during_a_hold(hold):
+    from scraper.tasks.login_recovery import recover_login_slots
+    from scraper.tasks.pls_self_healing import pls_keepalive_hourly, pls_stall_watchdog
+    from scraper.tasks.spot_check import spot_check_judgments
+
+    for task in (recover_login_slots, pls_keepalive_hourly, pls_stall_watchdog, spot_check_judgments):
+        assert task()["skipped"] == "deploy_hold", task.name

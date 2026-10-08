@@ -26,6 +26,7 @@ case "$1" in
   up) svc="${@: -1}"; grep -qx "$svc" "$FAKE/running" || echo "$svc" >> "$FAKE/running"; echo "up $svc" >> "$FAKE/calls" ;;
   exec)
     case "$*" in
+      *import\ scraper.tasks.deploy_hold*) [ -f "$FAKE/old_workers" ] && exit 1; exit 0 ;;
       *redis-cli\ SET\ deploy_hold_login*) [ -f "$FAKE/redis_down" ] && exit 1; touch "$FAKE/hold"; echo "hold" >> "$FAKE/calls" ;;
       *redis-cli\ DEL\ deploy_hold_login*) rm -f "$FAKE/hold"; echo "unhold" >> "$FAKE/calls" ;;
       *redis-cli\ EXISTS*) [ -f "$FAKE/busy" ] && echo 1 || echo 0 ;;
@@ -167,3 +168,34 @@ def test_operator_switch_keeps_beat_off(host):
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(c.startswith("deploy ") for c in host.calls())
     assert "celery-beat" not in host.running()
+
+
+def test_beat_is_recreated_after_every_deploy_so_it_never_keeps_the_old_image(host):
+    host.push_change()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(c.startswith("deploy ") for c in host.calls())
+    assert "up celery-beat" in host.calls()  # beat was running all along and is still brought up on the new image
+
+
+def test_first_rollout_stops_beat_while_the_running_workers_predate_the_hold(host):
+    host.push_change()
+    (host.fake / "busy").touch()
+    (host.fake / "old_workers").touch()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "stopping celery-beat instead" in r.stdout
+    assert "celery-beat" not in host.running() and not (host.fake / "hold").exists()
+
+
+def test_hold_is_cleared_when_the_operator_switched_beat_off_mid_deploy(host):
+    host.push_change()
+    (host.fake / "busy").touch()
+    r = host.run()
+    assert r.returncode == 0 and (host.fake / "hold").exists(), r.stdout + r.stderr
+    (host.app / "state" / "beat_disabled").touch()
+    (host.fake / "busy").unlink()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(c.startswith("deploy ") for c in host.calls())
+    assert not (host.fake / "hold").exists()
