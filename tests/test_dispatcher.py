@@ -417,7 +417,7 @@ async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monke
     monkeypatch.setattr(
         app,
         "send_task",
-        lambda name, args=(), kwargs=None, queue=None: sent.append((name, kwargs or {}, queue)),
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {}, queue)),
     )
     result = await dispatch_due_sources()
     assert "PakistanLawSite:search_harvest_tick" in result["queued"]
@@ -472,7 +472,7 @@ async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harves
     monkeypatch.setattr(
         app,
         "send_task",
-        lambda name, args=(), kwargs=None, queue=None: sent.append((name, kwargs or {}, queue)),
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {}, queue)),
     )
     result = await dispatch_due_sources()
     await db.refresh(blocking)

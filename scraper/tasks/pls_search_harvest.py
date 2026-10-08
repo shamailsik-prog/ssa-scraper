@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -384,6 +385,10 @@ class SearchHarvestRunner:
         start_row_index = int(cursor.get("row_index") or 0)
         page_idx = int(cursor.get("page") or 1)
 
+        budget = int(getattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0) or 0)
+        deadline = time.monotonic() + budget if budget > 0 else None
+        out_of_time = False
+
         resume_url = cursor.get("next_url") if pages_done > 0 else None
         if resume_url:
             page = await self.pipeline.fetch_detail(str(resume_url))
@@ -437,8 +442,26 @@ class SearchHarvestRunner:
                     query_row.cursor_json = cursor
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
+                    if deadline is not None and time.monotonic() >= deadline and idx + 1 < len(rows):
+                        out_of_time = True
+                        break
             else:
                 rows_new += len(new_rows)
+
+            if out_of_time:
+                # Stop mid-page and give the login worker back; the cursor (this page, next row) resumes the
+                # query on the next tick, which counts this page's rows again, so they are not counted now.
+                rows_seen -= len(rows)
+                rows_known -= known_on_page
+                release_page_result(page)
+                query_row.rows_seen = rows_seen
+                query_row.rows_known = rows_known
+                query_row.rows_new = rows_new
+                query_row.site_total_results = site_total
+                query_row.last_run_at = datetime.now(timezone.utc)
+                query_row.status = "in_progress"
+                await self.db.flush()
+                break
 
             pages_done += 1
             start_row_index = 0
@@ -494,6 +517,10 @@ class SearchHarvestRunner:
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
             query_row.cursor_json = cursor
+            if deadline is not None and time.monotonic() >= deadline:
+                out_of_time = True
+                query_row.status = "in_progress"
+                break
             await self._pace_sleep()
             page = await self.pipeline.fetch_detail(nxt)
             self.memory.note_window()
@@ -509,6 +536,7 @@ class SearchHarvestRunner:
             "rows_new": rows_new,
             "gap_size": query_row.gap_size,
             "dry_run": self.dry_run,
+            "out_of_time": out_of_time,
         }
 
     async def _enqueue_split_children(

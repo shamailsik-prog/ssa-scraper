@@ -10,7 +10,7 @@ from celery import shared_task
 from sqlalchemy import func, or_, select, update
 
 from scraper.auth.session_manager import SessionLock, SessionLockHeld, SessionManager, merge_source_config
-from scraper.config import settings
+from scraper.config import search_harvest_tick_expiry, settings
 from scraper.database import SessionLocal, run_async
 from scraper.models import (
     RETIRED_WITHOUT_REASON,
@@ -205,6 +205,7 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
                 "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
                 kwargs={"priority_gaps": True},
                 queue="login_session",
+                expires=search_harvest_tick_expiry(),
             )
         elif verdict["stalled_reason"] == "no_output_while_harvesting" and grid_harvest_incomplete(cfg):
             app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(SOURCE_NAME,), queue="login_session")

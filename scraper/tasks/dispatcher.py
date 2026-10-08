@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 from celery import shared_task
 from sqlalchemy import func, select
 
-from scraper.config import settings
+from scraper.config import search_harvest_tick_expiry, settings
 from scraper.database import SessionLocal, run_async
 from scraper.auth.session_manager import SessionLockHeld
 from scraper.harvest_mode import (
@@ -472,6 +472,9 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
                         kwargs={"priority_gaps": True},
                         queue="login_session",
+                        # dropped if it waits longer than a tick runs: unexpiring ticks stacked up behind
+                        # each other and starved the case-ID walk on the single login worker
+                        expires=search_harvest_tick_expiry(),
                     )
                     queued.append(f"{s.source_name}:search_harvest_tick")
                     s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))

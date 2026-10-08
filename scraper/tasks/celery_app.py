@@ -14,7 +14,7 @@ import logging
 from celery import Celery
 from celery.signals import worker_ready
 
-from scraper.config import settings
+from scraper.config import search_harvest_tick_expiry, settings
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,7 @@ if settings.PLS_SEARCH_HARVEST_ENABLED:
         "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
         "schedule": settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS,
         "kwargs": {"priority_gaps": True},
+        "options": {"expires": search_harvest_tick_expiry()},
     }
 if settings.PLS_CASEID_WALK_ENABLED:
     app.conf.beat_schedule["pls-caseid-walk"] = {

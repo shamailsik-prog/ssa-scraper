@@ -266,6 +266,10 @@ class Settings(BaseSettings):
         default=500,
         description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
     )
+    PLS_SEARCH_HARVEST_TICK_SECONDS: int = Field(
+        default=1200,
+        description="A search-harvest tick stops after this long (between rows or pages) and resumes from its cursor on the next tick, so one long query cannot hold the single login worker for an hour while case-ID walk ticks expire. 0 = no limit.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
@@ -693,3 +697,8 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def search_harvest_tick_expiry() -> int:
+    """Seconds a queued search-harvest tick may wait before it is dropped: about one tick's run time."""
+    return max(600, int(settings.PLS_SEARCH_HARVEST_TICK_SECONDS or 0) or 3600)
