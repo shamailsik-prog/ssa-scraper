@@ -27,7 +27,7 @@ from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.parsers.text_cleaner import clean_html
-from scraper.pls_caseid import case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
+from scraper.pls_caseid import case_name, case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,8 @@ class CaseIdWalker:
         await self.db.commit()
 
     async def _held_text(self, key: str, serial: int) -> str:
-        url_like = f"%CaseName={key}{serial}%"
+        # Match parse_case_id: serial must not be a prefix of a longer serial (1 vs 10).
+        url_like = f"%CaseName={case_name(key, serial)}&%"
         row = (await self.db.execute(select(Judgment.full_text).where(Judgment.source_name == SOURCE_NAME, Judgment.source_url.like(url_like)).limit(1))).first()
         if row and row[0]:
             return row[0]

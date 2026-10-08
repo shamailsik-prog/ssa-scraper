@@ -318,9 +318,13 @@ class ArchiveMirror:
                 await self.db.flush()
                 continue
             failures = 0
+            target_timed_out = False
+            touched = False
             for j in judgments:
                 if self._time_up():
+                    target_timed_out = True
                     break
+                touched = True
                 if not self._policy_allows(t, j.access_method):
                     summary["skipped_policy"] += 1
                     continue
@@ -359,6 +363,8 @@ class ArchiveMirror:
                 t.consecutive_failures += 1
                 t.last_error = f"{failures} object write(s) failed"
                 await notify(self.db, level="error", code="ARCHIVE_TARGET_FAILED", message=f"{t.name}: {failures} object write(s) failed", details={"target": t.name})
+            elif target_timed_out and not touched:
+                pass
             else:
                 t.consecutive_failures = 0
                 t.last_error = None
