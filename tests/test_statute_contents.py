@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from scraper.database import engine
 from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute
-from scraper.models import CrawlFrontier, ScraperSource, Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
+from scraper.models import CrawlFrontier, Instrument, InstrumentRelation, ScraperSource, Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
 from scraper.parsers.statute_contents import clean_title, read_statute, title_matches
 
 FIX = Path(__file__).parent / "fixtures_statutes"
@@ -78,6 +78,9 @@ def test_pakistancode_extraction_names_from_the_listing_and_records_the_verdict(
 
 
 migration = importlib.import_module("migrations.013_rescrape_pakistancode_statutes")
+BACKUPS = ", ".join(
+    f"backup_20261007_{t}" for t in ("statute", "statute_section", "statute_section_version", "instrument_relation", "instrument_section_relation")
+)
 
 
 async def test_migration_backs_up_clears_and_requeues_only_pakistancode(db):
@@ -91,6 +94,15 @@ async def test_migration_backs_up_clears_and_requeues_only_pakistancode(db):
     db.add(sec)
     await db.flush()
     db.add(StatuteSectionVersion(section_id=sec.id, version_no=1, section_text="Short title", text_hash="h1"))
+    # an instrument linked only to the PakistanCode statute: the link cannot be left pointing nowhere
+    # (ck_instrument_relation_target_present stopped the first run of 013 on the server, 7 October 2026)
+    inst = Instrument(type="act", title="Laws (Continuance in Force) Order, 1977", source_name="PakistanCode")
+    other = Instrument(type="act", title="Some Order", source_name="GazetteOfPakistan")
+    db.add_all([inst, other])
+    await db.flush()
+    edge = dict(relation_phrase="read with", target_mention_raw="Court fees Act", target_mention_normalized="court fees act", span_start=0, span_end=5, evidence_snippet="read with")
+    db.add(InstrumentRelation(source_instrument_id=inst.id, target_statute_id=old.id, relation_type="read_with", **edge))
+    db.add(InstrumentRelation(source_instrument_id=inst.id, target_instrument_id=other.id, target_statute_id=old.id, relation_type="amended_by", **edge))
     prov = await record_provenance(db, source=pc, url="https://pakistancode.gov.pk/pdffiles/x.pdf", content=b"%PDF-1.4 x", content_kind="pdf")
     await stage_statute(db, source=pc, prov=prov, raw_html=None, raw_text="x", url="https://pakistancode.gov.pk/pdffiles/x.pdf", kind="statute")
     db.add(CrawlFrontier(source_name="PakistanCode", tier=0, query_key="doc:x", query_json={"kind": "document"}, cursor_json={}, status="done", attempts=2, last_error="old"))
@@ -100,7 +112,7 @@ async def test_migration_backs_up_clears_and_requeues_only_pakistancode(db):
 
     async with engine.begin() as conn:
         # the test database ran every migration at start-up; drop its (empty) backups to run 013 afresh
-        await conn.exec_driver_sql("DROP TABLE IF EXISTS backup_20261007_statute, backup_20261007_statute_section, backup_20261007_statute_section_version")
+        await conn.exec_driver_sql(f"DROP TABLE IF EXISTS {BACKUPS}")
         await migration.upgrade(conn)
     db.expire_all()
 
@@ -114,5 +126,9 @@ async def test_migration_backs_up_clears_and_requeues_only_pakistancode(db):
     async with engine.begin() as conn:
         backed = (await conn.exec_driver_sql("SELECT name FROM backup_20261007_statute")).scalars().all()
         backed_text = (await conn.exec_driver_sql("SELECT section_text FROM backup_20261007_statute_section_version")).scalars().all()
-        await conn.exec_driver_sql("DROP TABLE backup_20261007_statute, backup_20261007_statute_section, backup_20261007_statute_section_version")
+        backed_links = (await conn.exec_driver_sql("SELECT relation_type FROM backup_20261007_instrument_relation ORDER BY 1")).scalars().all()
+        await conn.exec_driver_sql(f"DROP TABLE {BACKUPS}")
+    assert backed_links == ["amended_by", "read_with"]
+    links = (await db.execute(select(InstrumentRelation))).scalars().all()
+    assert [(r.relation_type, r.target_statute_id) for r in links] == [("amended_by", None)]  # the link to another instrument stays
     assert backed == ["This Act may be called the Court fees Act 1870"] and backed_text == ["Short title"]
