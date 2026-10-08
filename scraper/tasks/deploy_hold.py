@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 LOGIN_HOLD_KEY = "deploy_hold_login"
 
+# Raised whenever more entry points start honouring the hold. auto_deploy.sh uses the hold only when the
+# running workers report at least the version it needs (scripts/pls_host_lib.sh), so a deploy never relies
+# on a hold that the code still running would partly ignore.
+HOLD_GUARDS_VERSION = 2
+
 
 def login_work_held() -> bool:
     try:

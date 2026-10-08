@@ -26,7 +26,7 @@ case "$1" in
   up) svc="${@: -1}"; grep -qx "$svc" "$FAKE/running" || echo "$svc" >> "$FAKE/running"; echo "up $svc" >> "$FAKE/calls" ;;
   exec)
     case "$*" in
-      *import\ scraper.tasks.deploy_hold*) [ -f "$FAKE/old_workers" ] && exit 1; exit 0 ;;
+      *scraper.tasks.deploy_hold*HOLD_GUARDS_VERSION*) [ -f "$FAKE/old_workers" ] && exit 1; exit 0 ;;
       *redis-cli\ SET\ deploy_hold_login*) [ -f "$FAKE/redis_down" ] && exit 1; touch "$FAKE/hold"; echo "hold" >> "$FAKE/calls" ;;
       *redis-cli\ DEL\ deploy_hold_login*) rm -f "$FAKE/hold"; echo "unhold" >> "$FAKE/calls" ;;
       *redis-cli\ EXISTS*) [ -f "$FAKE/busy" ] && echo 1 || echo 0 ;;
