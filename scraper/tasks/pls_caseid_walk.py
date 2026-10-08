@@ -244,6 +244,10 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
 def pls_caseid_walk_tick(**kwargs) -> Dict[str, Any]:
     if not settings.PLS_CASEID_WALK_ENABLED:
         return {"skipped": "PLS_CASEID_WALK_ENABLED is off"}
+    from scraper.tasks.deploy_hold import login_work_held
+
+    if login_work_held():
+        return {"skipped": "deploy_hold"}
 
     async def _inner() -> Dict[str, Any]:
         from scraper.heartbeat import beat

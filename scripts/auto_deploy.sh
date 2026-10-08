@@ -13,8 +13,9 @@ RESET_MARKER="state/reset_retired_frontier_sha.txt"
 CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 
 # PLS stack (shared corpus-service image). celery-beat is the scheduler for every scraping, promotion and
-# mirror task: a deploy pauses it while the PakistanLawSite job drains and always starts it again
-# afterwards, unless the operator has switched it off with state/beat_disabled.
+# mirror task: a deploy holds new PakistanLawSite work (Redis key deploy_hold_login) while the PLS job
+# drains, keeps beat running, and always clears the hold and makes sure beat runs afterwards, unless the
+# operator has switched beat off with state/beat_disabled.
 DEFAULT_APP_SERVICES=(api worker-scraper worker-public worker-maintenance)
 ALL_APP_SERVICES=(api worker-scraper worker-public worker-maintenance worker-embed celery-beat celery-flower)
 
@@ -73,13 +74,21 @@ beat_pause_seconds() {
   esac
 }
 
-# Pause beat for this deploy (stop it if running) and remember since when, across cron ticks.
+# Hold new PakistanLawSite work for this deploy and remember since when, across cron ticks. celery-beat keeps
+# running, so public sources, promotion and the mirror do not stop while the PLS job drains (8 October 2026:
+# stopping beat for each deferred deploy left nothing scheduled for up to 45 minutes per push). Only when
+# the hold cannot be set is beat stopped, as before.
 pause_beat() {
   if [ "$DRY_RUN" = 1 ]; then
-    log "dry-run: would stop celery-beat and record $BEAT_PAUSE_MARKER"
+    log "dry-run: would hold new PakistanLawSite work and record $BEAT_PAUSE_MARKER"
     return 0
   fi
-  pls_host_stop_beat
+  if pls_host_set_login_hold $((MAX_BEAT_PAUSE_SECONDS + 600)); then
+    log "new PakistanLawSite work held for the deploy; celery-beat keeps running"
+  else
+    log "could not set the login hold in Redis; stopping celery-beat instead"
+    pls_host_stop_beat
+  fi
   if [ ! -f "$DIR/$BEAT_PAUSE_MARKER" ]; then
     date +%s >"$DIR/$BEAT_PAUSE_MARKER"
   fi
@@ -89,6 +98,7 @@ pause_beat() {
 resume_beat() {
   if ! beat_wanted; then
     log "celery-beat left stopped: $BEAT_DISABLED_FILE is present"
+    [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
     rm -f "$DIR/$BEAT_PAUSE_MARKER"
     return 0
   fi
@@ -96,7 +106,10 @@ resume_beat() {
     log "dry-run: would start celery-beat and remove $BEAT_PAUSE_MARKER"
     return 0
   fi
-  pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
+  pls_host_clear_login_hold
+  if ! pls_host_beat_running; then
+    pls_host_start_beat || { log "ERROR: celery-beat did not start; next cron tick retries"; return 1; }
+  fi
   rm -f "$DIR/$BEAT_PAUSE_MARKER"
 }
 
@@ -241,6 +254,8 @@ main() {
       log "origin/$BRANCH at $new_sha (tip_sha and rollout_sha match) but /status reports no_output_while_harvesting; retrying compose rollout"
     else
       log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
+      # nothing is pending, so no PakistanLawSite hold may linger (a deploy that died leaves one behind)
+      [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
       if beat_wanted && ! pls_host_beat_running; then
         log "celery-beat is not running and no deploy is pending; starting it"
         resume_beat || exit 1
