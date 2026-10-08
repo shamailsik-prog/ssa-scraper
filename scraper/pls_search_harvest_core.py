@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from scraper.config import KNOWN_REPORTERS
+from scraper.keys import fit_key
 from scraper.parsers.citation_extractor import normalise_citation
 
 _QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
@@ -36,7 +37,7 @@ def make_query_key(query_json: Dict[str, Any]) -> str:
     if not parts:
         digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:16]
         return f"search:empty:{digest}"
-    return "search:" + "|".join(parts)
+    return fit_key("search:" + "|".join(parts))
 
 
 def reporters_for_plan(

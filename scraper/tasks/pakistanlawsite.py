@@ -44,6 +44,7 @@ from scraper.auth.session_manager import (
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.keys import fit_key
 from scraper.pls_navigation import (
     CitationSearchNavigationFailed,
     JournalNotOffered,
@@ -225,20 +226,20 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
     # Tier 2 from promoted statute sections (bounded per seeding run)
     rows = (await db.execute(select(StatuteSection, Statute).join(Statute, Statute.id == StatuteSection.statute_id).limit(2000))).all()
     for sec, st in rows:
-        key = f"t2:{st.short_name or st.name}:{sec.section_number}"
+        key = fit_key(f"t2:{st.short_name or st.name}:{sec.section_number}")
         if (2, key) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=2, query_key=key, query_json={"statute": st.short_name or st.name, "section": sec.section_number}, cursor_json={"page": 1}, priority=50))
             counts["tier2"] += 1
             existing.add((2, key))
     high_yield = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.tier == 3, CrawlFrontier.yield_count > 0).order_by(CrawlFrontier.yield_count.desc()).limit(TIER4_HIGH_YIELD_TERMS))).scalars().all()
     for hy in high_yield:
-        key = f"t4:vocab:{hy.query_json.get('keyword', '').lower()}"
+        key = fit_key(f"t4:vocab:{hy.query_json.get('keyword', '').lower()}")
         if (4, key) not in existing and hy.query_json.get("keyword"):
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key, query_json={"keyword": hy.query_json["keyword"], "daily": True}, cursor_json={"page": 1}, priority=5, next_run_at=now))
             counts["tier4"] += 1
             existing.add((4, key))
     for term in settings.tier3_vocabulary or DEFAULT_VOCABULARY:
-        key = f"t3:{term.lower()}"
+        key = fit_key(f"t3:{term.lower()}")
         if (3, key) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=3, query_key=key, query_json={"keyword": term}, cursor_json={"page": 1}, priority=80))
             counts["tier3"] += 1

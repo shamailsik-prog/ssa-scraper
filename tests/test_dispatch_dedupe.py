@@ -192,3 +192,41 @@ async def test_a_superseded_duplicate_leaves_the_newer_tasks_queued_mark(db, mon
     assert result["skipped"] == "superseded"
     assert _redis().get(dispatcher._queued_key("GBAssembly")) == b"newer task"
     _redis().delete(dispatcher._queued_key("GBAssembly"))
+
+
+async def test_an_over_long_frontier_key_is_stored_shortened_and_found_again(db):
+    """8 October 2026: IslamabadHighCourt listing keys embed whole judgment URLs; one over 500 characters failed
+    the INSERT (StringDataRightTruncationError) and rolled back every run of the source. Over-long keys are
+    shortened deterministically (prefix + hash), so lookups with the raw key still find the row and two keys that
+    share a long prefix stay distinct."""
+    from scraper.models import CrawlFrontier
+
+    base = "listing:https://mis.ihc.gov.pk/frmRdJgmnt.aspx?cseNo=" + "x" * 600
+    a, b = base + "-A.pdf", base + "-B.pdf"
+    for key in (a, b):
+        db.add(CrawlFrontier(source_name="IslamabadHighCourt", tier=0, query_key=key, query_json={}, cursor_json={}, priority=40))
+    await db.flush()
+    for key in (a, b):
+        rows = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == "IslamabadHighCourt", CrawlFrontier.query_key == key))).scalars().all()
+        assert len(rows) == 1 and len(rows[0].query_key) <= 500 and rows[0].query_key.startswith("listing:https://mis.ihc.gov.pk/")
+    await db.rollback()
+
+
+async def test_seeding_twice_with_an_over_long_statute_name_stays_idempotent(db):
+    """#183 review (Codex): seed_frontier and seed_extended_plan compare stored keys with freshly built ones in
+    Python. A statute name may be 1,000 characters, so a key over 500 is stored shortened; the next seed must
+    build the same shortened key, or it inserts it again and the unique constraint aborts the flush."""
+    from scraper.models import Statute, StatuteSection
+    from scraper.tasks.pakistanlawsite import seed_frontier
+    from scraper.tasks.pls_search_harvest import seed_extended_plan
+
+    st = Statute(name="The " + "Very Long Title " * 40 + "Act", source_name="PakistanCode")
+    db.add(st)
+    await db.flush()
+    db.add(StatuteSection(statute_id=st.id, section_number="1"))
+    await db.flush()
+    for _ in range(2):
+        await seed_frontier(db, None)
+        await seed_extended_plan(db, judge_limit=0)
+        await db.flush()
+    await db.rollback()

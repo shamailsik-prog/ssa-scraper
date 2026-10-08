@@ -24,6 +24,7 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
+from scraper.keys import fit_key
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +45,21 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 
 
 class PgSafeString(TypeDecorator):
-    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup."""
+    """Strip NUL on bind so unique-key lookups match rows written after flush-time cleanup.
+
+    A value longer than the column (a listing key that embeds a whole judgment URL) is shortened the same way on
+    every bind: its head plus a SHA-256 of the full value. Inserts no longer fail, equality lookups with the raw
+    value still find the row, and keys that share a long prefix stay distinct."""
 
     impl = String
     cache_ok = True
 
     def process_bind_param(self, value, dialect):
-        if isinstance(value, str) and "\x00" in value:
-            return value.replace("\x00", "")
-        return value
+        if not isinstance(value, str):
+            return value
+        if "\x00" in value:
+            value = value.replace("\x00", "")
+        return fit_key(value, self.impl.length)
 
 
 def _strip_nul(value):
