@@ -12,7 +12,6 @@ Roles (Amendment §0, Cursor command):
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import logging
 import pkgutil
@@ -25,6 +24,7 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
+from scraper.keys import fit_key
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +59,7 @@ class PgSafeString(TypeDecorator):
             return value
         if "\x00" in value:
             value = value.replace("\x00", "")
-        limit = self.impl.length
-        if limit and len(value) > limit:
-            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-            value = f"{value[: limit - len(digest) - 1]}#{digest}"
-        return value
+        return fit_key(value, self.impl.length)
 
 
 def _strip_nul(value):

@@ -210,3 +210,23 @@ async def test_an_over_long_frontier_key_is_stored_shortened_and_found_again(db)
         rows = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == "IslamabadHighCourt", CrawlFrontier.query_key == key))).scalars().all()
         assert len(rows) == 1 and len(rows[0].query_key) <= 500 and rows[0].query_key.startswith("listing:https://mis.ihc.gov.pk/")
     await db.rollback()
+
+
+async def test_seeding_twice_with_an_over_long_statute_name_stays_idempotent(db):
+    """#183 review (Codex): seed_frontier and seed_extended_plan compare stored keys with freshly built ones in
+    Python. A statute name may be 1,000 characters, so a key over 500 is stored shortened; the next seed must
+    build the same shortened key, or it inserts it again and the unique constraint aborts the flush."""
+    from scraper.models import Statute, StatuteSection
+    from scraper.tasks.pakistanlawsite import seed_frontier
+    from scraper.tasks.pls_search_harvest import seed_extended_plan
+
+    st = Statute(name="The " + "Very Long Title " * 40 + "Act", source_name="PakistanCode")
+    db.add(st)
+    await db.flush()
+    db.add(StatuteSection(statute_id=st.id, section_number="1"))
+    await db.flush()
+    for _ in range(2):
+        await seed_frontier(db, None)
+        await seed_extended_plan(db, judge_limit=0)
+        await db.flush()
+    await db.rollback()
