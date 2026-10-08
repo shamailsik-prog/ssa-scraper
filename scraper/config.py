@@ -246,7 +246,7 @@ class Settings(BaseSettings):
         description="How long a 'job queued, not started' mark lasts; after it expires the source can be queued again even if the job was lost.",
     )
     DISPATCH_LEGACY_SKIP_SECONDS: int = Field(
-        default=900,
+        default=21600,
         description="A queued public job with no queue time (sent before queue times were recorded) is skipped when its source started a job this recently.",
     )
     PUBLIC_BACKLOG_CONTINUE_SECONDS: int = Field(

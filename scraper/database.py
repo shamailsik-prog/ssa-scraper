@@ -42,6 +42,53 @@ engine = create_async_engine(
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+def _strip_nul(value):
+    """PostgreSQL text and JSONB cannot hold NUL (\x00 / \u0000)."""
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
+def _has_nul(value) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_has_nul(k) or _has_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_has_nul(v) for v in value)
+    return False
+
+
+def _strip_nul_before_flush(session, flush_context, instances) -> None:
+    """Every string and JSON value written by any session loses its NUL characters.
+
+    On 8 October 2026 binary files read as text (a .docx on an assembly site) carried NUL into
+    statutes_staging, then into crawl_frontier.query_json through links read from the same file; each
+    INSERT failed and killed the whole job. Fixing call sites one by one kept missing the next one."""
+    from sqlalchemy import inspect as sa_inspect
+
+    for obj in list(session.new) + list(session.dirty):
+        try:
+            state = sa_inspect(obj)
+            keys = {attr.key for attr in state.mapper.column_attrs}
+        except Exception:
+            continue
+        # only values already loaded: reading an expired attribute here would query the database
+        for key, value in list(state.dict.items()):
+            if key in keys and _has_nul(value):
+                setattr(obj, key, _strip_nul(value))
+
+
+from sqlalchemy import event as _sa_event  # noqa: E402
+from sqlalchemy.orm import Session as _SyncSession  # noqa: E402
+
+_sa_event.listen(_SyncSession, "before_flush", _strip_nul_before_flush)
+
+
 def run_async(coro):
     """Run a coroutine to completion in a fresh event loop (Celery / CLI entry points).
 

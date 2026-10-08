@@ -114,3 +114,30 @@ async def test_a_source_that_has_not_run_for_hours_runs_its_legacy_task(db, monk
     # judged an hour from now, so jobs other tests started a moment ago cannot count as recent
     later = datetime.now(timezone.utc) + timedelta(hours=1)
     assert await superseded_by_later_job(db, "PakistanCode", None, now=later) is False
+
+
+async def test_nul_in_any_text_or_json_column_never_reaches_postgres(db):
+    """8 October 2026: a link read out of a .docx put \\x00 into crawl_frontier.query_json and the INSERT
+    ('unsupported Unicode escape sequence') killed the job. Every flush now strips NUL."""
+    from scraper.models import CrawlFrontier
+
+    fr = CrawlFrontier(
+        source_name="SindhAssembly",
+        tier=0,
+        query_key="listing:nul-test\x00",
+        query_json={"kind": "listing", "url": "https://example.test/a\x00b", "list": ["x\x00"]},
+        cursor_json={},
+        priority=40,
+        last_error="bad\x00byte",
+    )
+    db.add(fr)
+    await db.flush()
+    await db.refresh(fr)
+    assert fr.query_key == "listing:nul-test"
+    assert fr.query_json == {"kind": "listing", "url": "https://example.test/ab", "list": ["x"]}
+    assert fr.last_error == "badbyte"
+    await db.rollback()
+
+
+def test_legacy_queued_tasks_are_skipped_when_their_source_ran_in_the_last_six_hours():
+    assert settings.DISPATCH_LEGACY_SKIP_SECONDS >= 6 * 3600
