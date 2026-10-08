@@ -86,6 +86,9 @@ class PublicPipeline:
             "halted": False,
             "blocked_cooldown": False,
             "errors": 0,
+            "completed": 0,
+            "limit_reached": False,
+            "backlog_remaining": False,
         }
         self._persisted_pages = 0
         self._persisted_staged = 0
@@ -360,12 +363,16 @@ class PublicPipeline:
                 return
             for fr in batch:
                 if len(processed) >= limit:
+                    self.stats["limit_reached"] = True
                     return
                 processed.add(fr.id)
                 if await self._drain_one(fr) == "halted":
                     await self._persist_frontier_progress()
                     return
+                if fr.status in ("done", "retired"):
+                    self.stats["completed"] += 1
                 await self._persist_frontier_progress()
+        self.stats["limit_reached"] = True
 
     async def _persist_frontier_progress(self) -> None:
         """Durably persist one frontier step and mirror live counters onto the running job."""
@@ -472,6 +479,33 @@ def _tests_allow_private() -> bool:
     return bool(settings.APP_ENV == "development" and settings.DEBUG)
 
 
+async def _continue_while_backlog(db: AsyncSession, source: ScraperSource, stats: Dict[str, Any]) -> None:
+    """Run again soon, not after the full cadence, while this source's frontier still holds work.
+
+    Only when the run stopped at its page limit and finished at least one row: a run whose rows all
+    came back pending (server errors, robots unavailable) would otherwise rerun every minute."""
+    wait = int(settings.PUBLIC_BACKLOG_CONTINUE_SECONDS or 0)
+    if wait <= 0 or not stats.get("limit_reached") or not stats.get("completed"):
+        return
+    left = (
+        await db.execute(
+            select(CrawlFrontier.id)
+            .where(
+                CrawlFrontier.source_name == source.source_name,
+                CrawlFrontier.tier == 0,
+                CrawlFrontier.status.in_(["pending", "in_progress"]),
+            )
+            .limit(1)
+        )
+    ).first()
+    if left is None:
+        return
+    stats["backlog_remaining"] = True
+    soon = datetime.now(timezone.utc) + timedelta(seconds=wait)
+    if source.next_scrape_at is None or source.next_scrape_at > soon:
+        source.next_scrape_at = soon
+
+
 async def run_public_source(
     db: AsyncSession,
     source: ScraperSource,
@@ -520,6 +554,7 @@ async def run_public_source(
         cfg = dict(source.config_json or {})
         if cfg.pop("block_retry", None) is not None:
             source.config_json = cfg
+        await _continue_while_backlog(db, source, pipeline.stats)
     source.total_pages_scraped += max(0, int(pipeline.stats["fetched"] or 0) - pipeline._persisted_pages)
     source.total_records_extracted += max(0, int(pipeline.stats["staged"] or 0) - pipeline._persisted_staged)
     await db.flush()

@@ -237,6 +237,10 @@ class Settings(BaseSettings):
         default=True,
         description="Event-driven chain: a committed fetch batch enqueues promotion, and a promotion that saved something enqueues the archive mirror (debounced). Beat stays the safety net.",
     )
+    PUBLIC_BACKLOG_CONTINUE_SECONDS: int = Field(
+        default=60,
+        description="A public source whose run stopped at its page limit, completed work and still has frontier rows runs again this soon instead of waiting its cadence. 0 = always wait the cadence.",
+    )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
     PLS_TIER3_VOCABULARY: str = Field(default="", description="Optional comma list seeding the Tier 3 vocabulary sweep.")
