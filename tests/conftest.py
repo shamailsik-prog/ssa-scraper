@@ -44,6 +44,7 @@ os.environ["SCRAPER_RETRY_ATTEMPTS"] = "1"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["RECONNECT_SECONDS"] = "30"
 os.environ["CORPUS_CHAIN_ENABLED"] = "false"  # tests that exercise the chain switch it on
+os.environ["DISPATCH_DEDUPE_ENABLED"] = "false"  # tests that exercise dispatch dedupe switch it on
 for k in ("PLS_USER", "PLS_PASS", "PLS_USER_B", "PLS_PASS_B"):
     os.environ.pop(k, None)
 if not os.environ.get("PLAYWRIGHT_EXECUTABLE_PATH"):

@@ -237,6 +237,14 @@ class Settings(BaseSettings):
         default=True,
         description="Event-driven chain: a committed fetch batch enqueues promotion, and a promotion that saved something enqueues the archive mirror (debounced). Beat stays the safety net.",
     )
+    DISPATCH_DEDUPE_ENABLED: bool = Field(
+        default=True,
+        description="The dispatcher does not queue a public source again while a job it queued for that source has not started yet.",
+    )
+    DISPATCH_QUEUED_TTL_SECONDS: int = Field(
+        default=10800,
+        description="How long a 'job queued, not started' mark lasts; after it expires the source can be queued again even if the job was lost.",
+    )
     PUBLIC_BACKLOG_CONTINUE_SECONDS: int = Field(
         default=60,
         description="A public source whose run stopped at its page limit, completed work and still has frontier rows runs again this soon instead of waiting its cadence. 0 = always wait the cadence.",
