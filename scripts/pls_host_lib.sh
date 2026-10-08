@@ -77,6 +77,11 @@ pls_host_start_beat() {
   docker compose up -d --no-build celery-beat
 }
 
+# Start the existing celery-beat container as it was (no recreate onto a newer local image).
+pls_host_restore_beat() {
+  docker compose start celery-beat
+}
+
 # True when /status.json reports a promotion stall (zero judgments while harvest is active).
 pls_host_promotion_stalled() {
   local api="${PLS_HOST_STATUS_URL:-http://127.0.0.1:8000/status.json}"
