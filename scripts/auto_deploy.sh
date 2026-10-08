@@ -26,6 +26,7 @@ BEAT_PAUSE_MARKER="state/beat_paused_by_deploy"
 BEAT_DISABLED_FILE="state/beat_disabled"
 MAX_BEAT_PAUSE_SECONDS="${AUTO_DEPLOY_MAX_BEAT_PAUSE_SECONDS:-2700}"
 DRY_RUN=0
+PLS_FORCE_RELEASED=0
 
 usage() {
   sed -n '2,8p' "$0"
@@ -88,6 +89,7 @@ pause_beat() {
 resume_beat() {
   if ! beat_wanted; then
     log "celery-beat left stopped: $BEAT_DISABLED_FILE is present"
+    rm -f "$DIR/$BEAT_PAUSE_MARKER"
     return 0
   fi
   if [ "$DRY_RUN" = 1 ]; then
@@ -109,6 +111,7 @@ wait_for_pls_idle() {
           log "dry-run: would release the PLS job and continue deploy"
         else
           pls_host_force_release_stalled_harvest
+          PLS_FORCE_RELEASED=1
         fi
         return 0
       fi
@@ -118,6 +121,7 @@ wait_for_pls_idle() {
           log "dry-run: would force-release stalled PLS harvest and continue deploy"
         else
           pls_host_force_release_stalled_harvest
+          PLS_FORCE_RELEASED=1
         fi
         return 0
       fi
@@ -300,6 +304,15 @@ main() {
     fi
     if [ "$beat_was_running" = 1 ]; then
       resume_beat || exit 1
+    else
+      rm -f "$DIR/$BEAT_PAUSE_MARKER"
+    fi
+    if [ "$PLS_FORCE_RELEASED" = 1 ]; then
+      if [ "$DRY_RUN" = 1 ]; then
+        log "dry-run: would start worker-scraper after force-releasing PLS harvest"
+      else
+        docker compose up -d --no-build worker-scraper || log "ERROR: worker-scraper did not start; next cron tick retries"
+      fi
     fi
     exit 0
   fi
@@ -335,6 +348,8 @@ main() {
   fi
   if [ "$beat_was_running" = 1 ]; then
     resume_beat || true
+  else
+    rm -f "$DIR/$BEAT_PAUSE_MARKER"
   fi
   log "deploy complete; tip_sha=$new_sha beat_restarted=$beat_was_running"
 }
