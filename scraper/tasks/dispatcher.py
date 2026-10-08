@@ -377,7 +377,6 @@ async def run_queued_source(source_name: str, *, queued_at: Optional[str] = None
                 when = None
         async with SessionLocal() as db:
             if await superseded_by_later_job(db, source_name, when):
-                clear_source_queued(source_name)
                 logger.info("%s: a job already ran after this task was queued; skipping the duplicate", source_name)
                 return {"skipped": "superseded"}
     return await run_source(source_name)
