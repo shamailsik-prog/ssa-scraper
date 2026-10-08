@@ -349,9 +349,43 @@ async def run_source(source_name: str, **connector_kwargs) -> Dict[str, Any]:
         return stats
 
 
+async def superseded_by_later_job(db, source_name: str, queued_at: Optional[datetime], *, now: Optional[datetime] = None) -> bool:
+    """True when the source already started a job after this task was queued, so the task's work is done.
+
+    On 8 October 2026 the scraper queue held 440 duplicate tasks left from a two-hour stall; each ran a
+    near-empty 30-second job and PakistanCode waited behind them for hours. A task sent before queue times
+    were recorded (queued_at None) counts as superseded when its source started a job in the last
+    DISPATCH_LEGACY_SKIP_SECONDS."""
+    last = (
+        await db.execute(select(func.max(ScraperJob.started_at)).where(ScraperJob.source_name == source_name))
+    ).scalar()
+    if last is None:
+        return False
+    if queued_at is not None:
+        return last >= queued_at
+    now = now or datetime.now(timezone.utc)
+    return last >= now - timedelta(seconds=max(0, int(settings.DISPATCH_LEGACY_SKIP_SECONDS or 0)))
+
+
+async def run_queued_source(source_name: str, *, queued_at: Optional[str] = None, manual: bool = False) -> Dict[str, Any]:
+    if not manual and settings.DISPATCH_DEDUPE_ENABLED:
+        when = None
+        if queued_at:
+            try:
+                when = datetime.fromisoformat(queued_at)
+            except ValueError:
+                when = None
+        async with SessionLocal() as db:
+            if await superseded_by_later_job(db, source_name, when):
+                clear_source_queued(source_name)
+                logger.info("%s: a job already ran after this task was queued; skipping the duplicate", source_name)
+                return {"skipped": "superseded"}
+    return await run_source(source_name)
+
+
 @shared_task(name="scraper.tasks.dispatcher.run_source_job", bind=True, max_retries=0)
-def run_source_job(self, source_name: str):
-    return run_async(run_source(source_name))
+def run_source_job(self, source_name: str, queued_at: Optional[str] = None, manual: bool = False):
+    return run_async(run_queued_source(source_name, queued_at=queued_at, manual=manual))
 
 
 @shared_task(name="scraper.tasks.dispatcher.run_login_session_job", bind=True, max_retries=0)
@@ -565,7 +599,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(s.source_name,), queue="login_session")
                     queued.append(s.source_name)
             elif mark_source_queued(s.source_name):
-                app.send_task("scraper.tasks.dispatcher.run_source_job", args=(s.source_name,), queue="scraper")
+                app.send_task(
+                    "scraper.tasks.dispatcher.run_source_job",
+                    args=(s.source_name,),
+                    kwargs={"queued_at": now.isoformat()},
+                    queue="scraper",
+                )
                 queued.append(s.source_name)
             else:
                 logger.info("%s: a job queued earlier has not started yet; not queuing another", s.source_name)

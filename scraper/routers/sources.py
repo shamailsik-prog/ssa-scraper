@@ -328,7 +328,7 @@ async def trigger(name: str, db: AsyncSession = Depends(get_db)) -> Dict[str, An
             raise HTTPException(409, "ALLOW_LOGIN_SCRAPING is false or ENVIRONMENT != chambers")
         app.send_task("scraper.tasks.dispatcher.run_login_session_job", args=(name,), queue="login_session")
     else:
-        app.send_task("scraper.tasks.dispatcher.run_source_job", args=(name,), queue="scraper")
+        app.send_task("scraper.tasks.dispatcher.run_source_job", args=(name,), kwargs={"manual": True}, queue="scraper")
     return {"message": f"triggered {name}"}
 
 

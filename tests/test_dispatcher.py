@@ -116,7 +116,7 @@ async def test_dispatch_due_sources_queues_source_after_retiring_stale_running_j
 
     queued = []
 
-    def fake_send_task(name, args=(), queue=None):
+    def fake_send_task(name, args=(), kwargs=None, queue=None):
         queued.append((name, args, queue))
 
     monkeypatch.setattr(app, "send_task", fake_send_task)
