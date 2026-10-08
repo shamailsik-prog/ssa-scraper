@@ -121,3 +121,38 @@ def looks_like_case_page(text: str, year: int, *, raw_html: Optional[str] = None
     if not _has_case_content(raw_text=body, raw_html=raw_html):
         return False
     return any(c.get("year") == year for c in extract_citations(body[:4000]))
+
+
+def _words(text: str) -> List[str]:
+    return re.sub(r"[^0-9a-z]+", " ", (text or "").lower()).split()
+
+
+def same_judgment(page_text: str, held_text: str, *, shingle: int = 12, samples: int = 8) -> bool:
+    """True when a fetched page carries the body of a judgment we already hold: at least half (and at
+    least two) of `samples` runs of `shingle` words, taken evenly from the held text past its first
+    tenth (site chrome), appear in the page. The walk calibrates on this, because a held judgment's
+    own text is a surer test of "the site still serves judgments at this ID" than finding a citation
+    the parser reads: on 8 October 2026 two held 1984 Sindh judgments (16k and 20k characters) failed
+    the citation test and kept the walk switched off."""
+    held = _words(held_text)
+    page = " " + " ".join(_words(page_text)) + " "
+    start = len(held) // 10
+    span = len(held) - start - shingle
+    if span < shingle * 2:
+        return False
+    step = max(1, span // samples)
+    picks = [" " + " ".join(held[i : i + shingle]) + " " for i in range(start, start + span, step)][:samples]
+    found = sum(1 for p in picks if p in page)
+    return found >= 2 and found * 2 >= len(picks)
+
+
+def case_page_diagnostics(text: str, *, raw_html: Optional[str] = None) -> Dict[str, object]:
+    """Why a page did or did not read as a judgment page (recorded with each calibration)."""
+    body = (text or "").strip()
+    return {
+        "chars": len(body),
+        "has_case_content": _has_case_content(raw_text=body, raw_html=raw_html),
+        "citation_years": sorted({c.get("year") for c in extract_citations(body[:4000]) if c.get("year")}),
+        "head": re.sub(r"\s+", " ", body[:160]),
+    }
+

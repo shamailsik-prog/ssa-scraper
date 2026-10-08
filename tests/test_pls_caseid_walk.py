@@ -126,3 +126,49 @@ async def test_walk_stops_when_held_judgments_do_not_read_as_judgments(db, login
     assert len([k for k, _ in sc.log if k[0] == "goto"]) == 2  # only the two checks, no walk
     again = await CaseIdWalker(db, login_source, browser_factory=sc.factory(), sleep=_nosleep).run(probes=20)
     assert "waiting for the recheck" in again["skipped"]
+
+
+def test_same_judgment_matches_the_held_text_and_rejects_another_page():
+    from scraper.pls_caseid import same_judgment
+
+    held = " ".join(f"word{i} of the held judgment body sentence" for i in range(120))
+    assert same_judgment("Menu Home Login\n" + held + "\nfooter", held)
+    other = " ".join(f"word{i} of another judgment entirely different" for i in range(120))
+    assert not same_judgment(other, held)
+    assert not same_judgment("", held) and not same_judgment(held, "too short")
+
+
+async def test_walk_calibrates_on_held_text_when_the_citation_is_unreadable(db, login_source, monkeypatch):
+    """8 October 2026: held 1984 Sindh judgments (1984K201, 1984K202) came back as full pages but their
+    old-style citation is not parsed, so the citation-only check kept the walk off. A stored failure
+    from that check is retried at once, and the held judgment's own text now decides."""
+    from datetime import datetime, timezone
+
+    from scraper.models import Judgment
+
+    await _activate(db, login_source, slots=(1,))
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_CEILING", 0)
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_CEILING_PAD", 0)
+    body = {s: " ".join(f"sentence {i} of judgment {s} in the Sindh High Court reported in 1984" for i in range(150)) for s in (201, 202)}
+    for s in (201, 202):
+        db.add(Judgment(canonical_citation=f"1984 C L C {s}", full_text=body[s], full_text_hash=f"h{s}", source_name="PakistanLawSite",
+                        access_method="login_session", source_url=case_url(BASE, "1984K", s), case_title=f"A v B {s}"))
+    login_source.config_json = {**(login_source.config_json or {}), STATE_KEY: {
+        "calibration_failed_at": datetime.now(timezone.utc).isoformat(),
+        "calibration": [{"ok": False, "case": "1984K201", "chars": 16072}],
+    }}
+    await db.commit()
+
+    async def _known(_db):
+        return {"1984K": {201, 202}}
+
+    monkeypatch.setattr(pls_caseid_walk, "load_known", _known)
+    sc = BrowserScript()
+    for s in (201, 202):
+        sc.page(("goto", case_url(BASE, "1984K", s)), f"<html><body><div>1984 C L C {s}</div><p>{body[s]}</p></body></html>")
+    walker = CaseIdWalker(db, login_source, browser_factory=sc.factory(), sleep=_nosleep)
+    await walker.run(probes=2)
+    state = (login_source.config_json or {})[STATE_KEY]
+    assert state.get("calibrated_at"), state.get("calibration")
+    assert [(c["ok"], c["matched_by"]) for c in state["calibration"]] == [(True, "held_text"), (True, "held_text")]
+    assert all("has_case_content" in c and "citation_years" in c for c in state["calibration"])

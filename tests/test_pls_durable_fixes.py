@@ -412,3 +412,57 @@ def test_unstarted_journal_cursors_inherit_main_grid_saturation():
     view = grid_saturation_view(cfg, now=NOW)
     assert view["all_saturated"] is True
     assert dispatch_saturated(cfg, None, now=NOW) is True
+
+
+async def test_mirror_run_stops_at_its_time_budget_keeps_its_progress_and_queues_the_next_slice(db, tmp_path, monkeypatch):
+    """8 October 2026: after the statute re-scrape one all-or-nothing mirror pass ran for hours and a
+    killed worker lost every ledger row it had written. A run now commits as it goes and stops at
+    MIRROR_RUN_BUDGET_SECONDS; the next run carries on."""
+    import time as _time
+
+    from scraper.config import settings
+    from scraper.models import ArchiveObject
+    from scraper.storage import archive as archive_mod
+    from scraper.tasks import archive_mirror, chain
+
+    await _mk_judgments(db, 3)
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a")))
+    await db.commit()
+    requested = []
+    monkeypatch.setattr(chain, "request_mirror", lambda: requested.append(1) or True)
+    # the clock passes the deadline after the first judgment has been written
+    real_time_up = archive_mod.ArchiveMirror._time_up
+    calls = {"n": 0}
+
+    def time_up_after_first(self):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            self.out_of_time = True
+        return real_time_up(self)
+
+    monkeypatch.setattr(archive_mod.ArchiveMirror, "_time_up", time_up_after_first)
+    result = await archive_mirror.mirror_pending(limit=10)
+    assert result["out_of_time"] is True and requested == [1]
+    async def judgments_written():
+        db.expire_all()
+        rows = (await db.execute(select(ArchiveObject.judgment_id).where(ArchiveObject.status == "written", ArchiveObject.judgment_id.isnot(None)))).scalars().all()
+        return len(set(rows))
+
+    assert await judgments_written() == 1  # committed although the run stopped early
+
+    monkeypatch.setattr(archive_mod.ArchiveMirror, "_time_up", real_time_up)
+    monkeypatch.setattr(settings, "MIRROR_RUN_BUDGET_SECONDS", 3600)
+    result = await archive_mirror.mirror_pending(limit=10)
+    assert result["out_of_time"] is False and requested == [1]
+    assert await judgments_written() == 3
+
+
+async def test_mirror_statutes_stops_when_the_deadline_has_passed(db, tmp_path):
+    import time as _time
+
+    from scraper.storage.archive import ArchiveMirror
+
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(tmp_path / "a")))
+    await db.commit()
+    m = ArchiveMirror(db, deadline=_time.monotonic() - 1, commit_progress=True)
+    assert await m.mirror_statutes() == {} and m.out_of_time is True

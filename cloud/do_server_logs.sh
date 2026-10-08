@@ -116,9 +116,18 @@ SELECT source_name, kind, coalesce(details->>'reason_code', left(reason, 70)) AS
 SELECT source_name, status, count(*), max(started_at) AS latest FROM scraper_jobs WHERE started_at > now() - interval '6 hours' GROUP BY 1, 2 ORDER BY 1, 2;
 \\echo == latest notifications
 SELECT created_at, code, left(message, 160) AS message FROM notifications ORDER BY created_at DESC LIMIT 25;
+\\echo == database sessions busy for over 5 minutes, and who holds run locks (advisory)
+SELECT a.pid, a.application_name, a.state, now() - a.xact_start AS in_transaction_for, a.wait_event_type, left(a.query, 90) AS query
+ FROM pg_stat_activity a WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+ AND a.xact_start < now() - interval '5 minutes' ORDER BY a.xact_start LIMIT 15;
+SELECT l.pid, l.objid AS lock_key, l.granted, now() - a.xact_start AS in_transaction_for, a.state FROM pg_locks l
+ JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' ORDER BY l.objid;
 ROLLBACK;"
   REMOTE="cd /opt/ssa-scraper && docker compose exec -T postgres sh -c 'psql -X -P pager=off -v ON_ERROR_STOP=1 -U \"\${POSTGRES_USER:-legal}\" -d \"\${POSTGRES_DB:-legal_scraper}\"'"
   printf '%s\n' "$SQL" | ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
+  # Host memory and killed processes: a worker child that disappears with SIGKILL is usually the
+  # kernel's out-of-memory killer, which only the host log shows.
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'echo; echo "== host memory"; free -m; echo; echo "== container memory"; docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"; echo; echo "== out-of-memory kills (kernel log, last 24 h)"; journalctl -k --since "24 hours ago" --no-pager 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -15' 2>&1
   exit 0
 fi
 ssh "${SSH_OPTS[@]}" "root@$IP" "cd /opt/ssa-scraper && echo '== docker compose ps' && docker compose ps --format 'table {{.Service}}\t{{.Status}}' && echo && echo '== logs (last $LINES lines of: $SERVICES)' && docker compose logs --no-color --tail=$LINES $SERVICES" 2>&1 \

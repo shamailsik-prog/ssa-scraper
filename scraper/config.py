@@ -166,6 +166,7 @@ class Settings(BaseSettings):
     PLS_GRID_JOURNAL_MIN_MATCH: float = Field(default=0.5, description="Share of a journal grid's rows that must carry the requested journal's citations; below it the journal is marked unsupported (the form did not filter) and skipped until the saturation recheck.")
     PLS_CITATION_GRID_SKIP_FLUSH_EVERY: int = Field(default=50, description="Commit the grid cursor every N rows that are only skipped (known, already staged, other shard); rows that fetch a detail page still commit every PLS_CITATION_GRID_FLUSH_EVERY.")
     MIRROR_BACKLOG_PER_RUN: int = Field(default=300, description="Oldest-first backlog judgments the archive mirror writes per target per run, in addition to the newest ones.")
+    MIRROR_RUN_BUDGET_SECONDS: int = Field(default=900, description="An archive mirror run stops starting new objects after this many seconds, commits, and queues the next run.")
     MIRROR_LAG_ALERT_HOURS: float = Field(default=3.0, description="Alert (ARCHIVE_MIRROR_LAG) when a target has unmirrored judgments and its newest mirrored judgment is older than this.")
     EMBED_QUEUE_ALERT_HOURS: float = Field(default=6.0, description="Alert (EMBED_QUEUE_STALLED) when pending embeddings are older than this and none were embedded in that time.")
     SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Every 30 minutes a few promoted records are re-fetched and compared with the corpus.")

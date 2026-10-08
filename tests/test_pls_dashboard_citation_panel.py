@@ -108,3 +108,20 @@ async def test_ensure_dashboard_citation_panel_opens_the_dashboard_from_another_
     await browser.ensure_dashboard_citation_search_panel_visible()
     assert visited and visited[0].endswith("/Login/Check")
     assert browser._page.activation_calls == 1 and browser._page.visible
+
+
+def test_panel_detection_reads_the_all_field_list_of_a_map_record():
+    """A map record keeps every field under "_all" as a list; that crashed the search harvest with
+    AttributeError("'list' object has no attribute 'get'") on 8 October 2026."""
+    from scraper.extractors.deterministic import search_map_uses_dashboard_citation_panel
+    from scraper.tasks.search_map import build_map_record
+
+    record = build_map_record(
+        {"fields": [{"role": "reporter", "name": "cat", "selector": "#Citation_Category_Search_dropdown", "kind": "select"}]},
+        "<html></html>",
+        "test",
+    )
+    assert isinstance(record["fields"]["_all"], list)
+    assert search_map_uses_dashboard_citation_panel(record) is True
+    plain = build_map_record({"fields": [{"role": "keyword", "name": "q", "selector": "#q", "kind": "text"}]}, "<html></html>", "test")
+    assert search_map_uses_dashboard_citation_panel(plain) is False

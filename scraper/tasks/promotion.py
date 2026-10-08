@@ -1865,6 +1865,7 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
 
     await beat("promotion")
     counts = {"promoted": 0, "duplicate": 0, "quarantined": 0, "statutes_promoted": 0, "statutes_duplicate": 0, "statutes_quarantined": 0}
+    more_extracted_pending = False
     async with SessionLocal() as db:
         unqueued = (
             await db.execute(
@@ -1926,11 +1927,16 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
                     await db.commit()
                     counts["statutes_quarantined"] += 1
         await db.commit()
+        more_extracted_pending = len(rows) >= limit or len(srows) >= limit
     if counts["promoted"] or counts["statutes_promoted"]:
         # Chain: copy what was just saved to the archive (Google Drive) without waiting for Beat.
         from scraper.tasks.chain import request_mirror
 
         request_mirror()
+    if more_extracted_pending:
+        from scraper.tasks.chain import request_promotion
+
+        request_promotion(source_name)
     return counts
 
 

@@ -90,7 +90,7 @@ if [ "$DEPLOY_ONLY" = 1 ]; then
   fi
   install_managed_host_crons
   # shellcheck disable=SC2206
-  services=(${AUTO_DEPLOY_SERVICES:-api worker-scraper worker-public celery-beat})
+  services=(${AUTO_DEPLOY_SERVICES:-api worker-scraper worker-public worker-maintenance celery-beat})
   log "deploy-only: building ${services[*]}"
   if ! docker compose build "${services[@]}"; then
     die "deploy-only: docker compose build failed (existing containers unchanged)"
