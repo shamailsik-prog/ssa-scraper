@@ -67,11 +67,16 @@ PLD_COURT_CANONICAL = {
     "AZAD JAMMU AND KASHMIR": "AJ&K",
     "GILGIT BALTISTAN": "GB",
     "GB": "GB",
-    # AJ&K's own courts restart PLD page numbers, so they must not fold into SC / a High Court
+}
+
+# Matched only exactly, never through the substring fallback below: as substrings they would swallow the bare
+# "AJ&K" (or any name containing "SUPREME COURT"). The AJ&K Supreme Court restarts PLD page numbers, so it is kept
+# apart; the AJ&K High Court gets the key bare "AJ&K" always produced ("Aj&K"), so stored keys still match.
+_EXACT_ONLY_COURTS = {
     "SUPREME COURT (AJ&K)": "SC (AJ&K)",
     "SUPREME COURT (AJK)": "SC (AJ&K)",
-    "HIGH COURT (AJ&K)": "AJ&K",
-    "HIGH COURT (AJK)": "AJ&K",
+    "HIGH COURT (AJ&K)": "Aj&K",
+    "HIGH COURT (AJK)": "Aj&K",
     "FCC": "FCC",
     "FEDERAL CONSTITUTIONAL COURT": "FCC",
 }
@@ -130,19 +135,10 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
     "CLC": _year_first(_letters("CLC")),
     "YLR": _year_first(_letters("YLR")),
     "MLD": _year_first(_letters("MLD")),
-    "PCrLJ": _year_first(r"P\s*Cr\.?\s*L\.?\s*J\.?"),
+    "PCrLJ": _year_first(r"P\.?\s*Cr\.?\s*L\.?\s*J\.?"),
     "PTD": _year_first(_letters("PTD"), court=False, note=False),
-    "PTCL": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        P(?:TCL|TCLR|CLD)
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
+    "PTCL": _year_first(
+        r"(?:" + _letters("PTCL") + r"(?:\s*R\.?)?|" + _letters("PCLD") + r")", court=False, note=False
     ),
     # Pakistan Labour Cases; "(C.S.)" is its Civil Service series, a separate page run
     "PLC": re.compile(
@@ -301,6 +297,8 @@ def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
     key = re.sub(r"\s*\(\s*", " (", key)
     key = re.sub(r"\s*\)", ")", key)
     key = re.sub(r"\s*&\s*", "&", key)
+    if key in _EXACT_ONLY_COURTS:
+        return _EXACT_ONLY_COURTS[key]
     if key in PLD_COURT_CANONICAL:
         return PLD_COURT_CANONICAL[key]
     for k, v in PLD_COURT_CANONICAL.items():
