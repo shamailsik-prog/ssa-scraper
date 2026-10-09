@@ -120,7 +120,15 @@ class ArchiveMirror:
             await self.db.commit()
 
     async def targets(self) -> List[ArchiveTarget]:
-        return list((await self.db.execute(select(ArchiveTarget).where(ArchiveTarget.enabled.is_(True)))).scalars().all())
+        # Least recently completed first: a run walks the targets against one time budget, and in a fixed order the
+        # last target starved whenever there was a backlog ("local" wrote nothing for hours on 9 October 2026). A
+        # target the budget never reached keeps its old last_ok_at and so leads the next run.
+        q = (
+            select(ArchiveTarget)
+            .where(ArchiveTarget.enabled.is_(True))
+            .order_by(ArchiveTarget.last_ok_at.asc().nulls_first(), ArchiveTarget.name)
+        )
+        return list((await self.db.execute(q)).scalars().all())
 
     # ------------------------------------------------------------------ objects for a judgment
     async def judgment_objects(self, j: Judgment) -> List[Dict[str, Any]]:

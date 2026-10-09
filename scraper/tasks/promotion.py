@@ -117,6 +117,27 @@ async def _ensure_judges(db: AsyncSession, names, court: Optional[Court]) -> Non
 
 
 # --------------------------------------------------------------------------- judgments
+_COURTLESS_PLD = re.compile(r"^(?:(?P<y1>\d{4})\s+PLD|PLD\s+(?P<y2>\d{4}))\s+(?P<page>\d+[A-Z]?)$", re.IGNORECASE)
+
+
+def pls_own_citation(grid_citation: Optional[str], page_citations: List[str]) -> Optional[str]:
+    """A PakistanLawSite judgment's own citation: the grid row's, except that the grid prints PLD without its court
+    ("2026 PLD 7") while PLD restarts page numbers per court, so distinct judgments collided on one key and were
+    dropped as duplicates. When the page itself carries the court form for the same year and page
+    ("P L D 2026 Lahore 7"), that is the identity."""
+    own = normalise_citation(grid_citation) if grid_citation else None
+    if not own:
+        return page_citations[0] if page_citations else None
+    m = _COURTLESS_PLD.match(own)
+    if m:
+        year, page = m.group("y1") or m.group("y2"), m.group("page").upper()
+        for c in page_citations:
+            parts = c.split()
+            if len(parts) >= 4 and parts[0] == "PLD" and parts[1] == year and parts[-1].upper() == page:
+                return c
+    return own
+
+
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
@@ -208,8 +229,8 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         # the extractor puts first. Any other citation found in the top of the page is a case cited in
         # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
         # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
-        own = normalise_citation(st.extracted_citation) if st.extracted_citation else None
         # the staging row's citation is the grid row's identity; the page-text order of citations is not
+        own = pls_own_citation(st.extracted_citation, cits)
         cits = [own] if own else cits[:1]
     full_text = strip_leading_judgment_chrome(st.raw_text or "")
     if full_text != (st.raw_text or ""):
