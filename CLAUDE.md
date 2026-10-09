@@ -16,3 +16,11 @@ If gstack is requested but missing, install it:
 git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
 cd ~/.claude/skills/gstack && ./setup --team
 ```
+
+## Behaviour skill (owner's working standards)
+
+Load the `behaviour` skill (`.claude/skills/behaviour/SKILL.md`) before any substantive
+task. It sets the owner's standards for analysis depth, adversarial testing, verification
+of legal authority (never invent citations; mark doubtful ones **[REQUIRES VERIFICATION]**),
+court-ready drafting format, and the mid-chat trigger words (`GODMODE`, `OODA`, `STEELMAN`,
+`DEVIL`, `CRITIQUE`, and the rest).
