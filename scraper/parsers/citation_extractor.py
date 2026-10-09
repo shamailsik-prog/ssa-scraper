@@ -3,7 +3,7 @@
 Pakistani Legal Citation Extractor - Production Module
 Section 15 Compliance - FINAL_SCRAPER_PROMPT_1.md
 
-Implements 8 CITATION_PATTERNS and 4 STATUTE_PATTERNS as compiled regex objects.
+Implements 11 CITATION_PATTERNS and 4 STATUTE_PATTERNS as compiled regex objects.
 Supports dual-credential failover context (handled at caller) - extractor is stateless.
 
 Reporters Covered:
@@ -15,6 +15,12 @@ Reporters Covered:
   PCrLJ - Pakistan Criminal Law Journal
   PTD  - Pakistan Tax Decisions
   PTCL - Pakistan Company Law / Tax Cases (PTCL variant)
+  PLC  - Pakistan Labour Cases (and its Civil Service series, PLC (CS))
+  CLD  - Corporate Law Decisions
+  GBLR - Gilgit-Baltistan Law Reports
+
+Reporters are matched run together ("PLD") or spaced/dotted as PakistanLawSite prints them ("P L D",
+"P.L.D."); a "Note"/"N" series ("2019 YLR Note 120") is kept apart from the main page run.
 
 Statutes Covered:
   SECTION, ARTICLE, ORDER_RULE, ACT_YEAR
@@ -61,21 +67,51 @@ PLD_COURT_CANONICAL = {
     "AZAD JAMMU AND KASHMIR": "AJ&K",
     "GILGIT BALTISTAN": "GB",
     "GB": "GB",
+    # AJ&K's own courts restart PLD page numbers, so they must not fold into SC / a High Court
+    "SUPREME COURT (AJ&K)": "SC (AJ&K)",
+    "SUPREME COURT (AJK)": "SC (AJ&K)",
+    "HIGH COURT (AJ&K)": "AJ&K",
+    "HIGH COURT (AJK)": "AJ&K",
+    "FCC": "FCC",
+    "FEDERAL CONSTITUTIONAL COURT": "FCC",
 }
 
 # PLD: PLD 2023 SC 123, PLD 2020 Lahore 1, PLD 2023 Federal Shariat Court 45
 _PLD_COURT_ALTERNATIVES = (
-    r"SC|Supreme Court(?: of Pakistan)?|FSC|Federal Shariat Court|"
-    r"Lahore(?: High Court)?|Lah\.?|Sindh(?: High Court)?|Karachi|Kar\.?|"
-    r"Peshawar(?: High Court)?|Pesh\.?|Balochistan(?: High Court)?|Quetta|"
-    r"Islamabad(?: High Court)?|IHC|AJ&?K|Azad Jammu and Kashmir|Gilgit Baltistan|GB"
+    r"(?:Supreme\s+Court|High\s+Court)\s*\(\s*AJ\s*&?\s*K\s*\)|"
+    r"SC|Supreme\s+Court(?:\s+of\s+Pakistan)?|FSC|Federal\s+Shariat\s+Court|"
+    r"FCC|Federal\s+Constitutional\s+Court|"
+    r"Lahore(?:\s+High\s+Court)?|Lah\.?|Sindh(?:\s+High\s+Court)?|Karachi|Kar\.?|"
+    r"Peshawar(?:\s+High\s+Court)?|Pesh\.?|Balochistan(?:\s+High\s+Court)?|Quetta|"
+    r"Islamabad(?:\s+High\s+Court)?|IHC|AJ&?K|Azad\s+Jammu\s+and\s+Kashmir|Gilgit\s+Baltistan|GB"
 )
+
+
+def _letters(abbr: str) -> str:
+    """A reporter abbreviation as printed run together ("PLD") or spaced/dotted ("P L D", "P.L.D.")."""
+    return r"\.?\s*".join(re.escape(ch) for ch in abbr) + r"\.?"
+
+
+# Year-first reporters: "2025 SCMR 1967", "2025 S C M R 1967", "2023 CLC (Lahore) 789", "2019 YLR Note 120"
+_COURT_PAREN = r"(?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?"
+_NOTE = r"(?:\s*(?P<note>N(?:ote)?\b\.?))?"
+
+
+def _year_first(token: str, *, court: bool = True, note: bool = True) -> re.Pattern:
+    return re.compile(
+        r"\b(?P<year>19\d{2}|20\d{2})\s+"
+        + token
+        + (r"\s*" + _COURT_PAREN if court else "")
+        + (_NOTE if note else "")
+        + r"\s+(?P<page>\d+[A-Z]?)\b",
+        re.IGNORECASE,
+    )
 
 CITATION_PATTERNS: Dict[str, re.Pattern] = {
     "PLD": re.compile(
         rf"""
-        \bPLD
-        \s+
+        \b{_letters("PLD")}
+        \s*
         (?P<year>19\d{{2}}|20\d{{2}})
         \s+
         (?P<court>{_PLD_COURT_ALTERNATIVES})
@@ -86,85 +122,16 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
         re.IGNORECASE | re.VERBOSE,
     ),
     "SCMR": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        SCMR
-        \s+
-        (?P<page>\d+[A-Z]?)(?:\s*\(\s*(?P<court>SC|Supreme Court)\s*\))?
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
+        r"\b(?P<year>19\d{2}|20\d{2})\s+"
+        + _letters("SCMR")
+        + r"\s+(?P<page>\d+[A-Z]?)(?:\s*\(\s*(?P<court>SC|Supreme Court)\s*\))?\b",
+        re.IGNORECASE,
     ),
-    "CLC": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        CLC
-        \s*
-        (?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    ),
-    "YLR": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        YLR
-        \s*
-        (?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    ),
-    "MLD": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        MLD
-        \s*
-        (?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    ),
-    "PCrLJ": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        P\s*Cr\.?\s*L\.?\s*J\.?
-        \s*
-        (?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    ),
-    "PTD": re.compile(
-        r"""
-        \b
-        (?P<year>19\d{2}|20\d{2})
-        \s+
-        PTD
-        \s+
-        (?P<page>\d+[A-Z]?)
-        \b
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    ),
+    "CLC": _year_first(_letters("CLC")),
+    "YLR": _year_first(_letters("YLR")),
+    "MLD": _year_first(_letters("MLD")),
+    "PCrLJ": _year_first(r"P\s*Cr\.?\s*L\.?\s*J\.?"),
+    "PTD": _year_first(_letters("PTD"), court=False, note=False),
     "PTCL": re.compile(
         r"""
         \b
@@ -177,6 +144,17 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
         """,
         re.IGNORECASE | re.VERBOSE,
     ),
+    # Pakistan Labour Cases; "(C.S.)" is its Civil Service series, a separate page run
+    "PLC": re.compile(
+        r"\b(?P<year>19\d{2}|20\d{2})\s+"
+        + _letters("PLC")
+        + r"\s*(?:\(\s*(?P<series>C\.?\s*S\.?)\s*\)|\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?"
+        + _NOTE
+        + r"\s+(?P<page>\d+[A-Z]?)\b",
+        re.IGNORECASE,
+    ),
+    "CLD": _year_first(_letters("CLD")),
+    "GBLR": _year_first(_letters("GBLR"), court=False),
 }
 
 # ============================================================================
@@ -320,6 +298,9 @@ def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
         return None
     key = re.sub(r"\s+", " ", raw_court.strip()).upper()
     key = re.sub(r"\.", "", key)
+    key = re.sub(r"\s*\(\s*", " (", key)
+    key = re.sub(r"\s*\)", ")", key)
+    key = re.sub(r"\s*&\s*", "&", key)
     if key in PLD_COURT_CANONICAL:
         return PLD_COURT_CANONICAL[key]
     for k, v in PLD_COURT_CANONICAL.items():
@@ -421,6 +402,23 @@ def normalise_instrument_mention(raw: str, mention_type: str) -> str:
 # Core Functions
 # ============================================================================
 
+# normalise_citation tries the year-first reporters in this order (PCrLJ first: its dotted forms are the loosest)
+_YEAR_FIRST_ORDER = ("PCrLJ", "SCMR", "CLC", "YLR", "MLD", "PTD", "PTCL", "PLC", "CLD", "GBLR")
+
+
+def _year_first_normalised(reporter_key: str, m: re.Match) -> str:
+    gd = m.groupdict()
+    rep_out = reporter_key
+    if reporter_key == "PLC" and gd.get("series"):
+        rep_out = "PLC (CS)"
+    out = f"{m.group('year')} {rep_out}"
+    if gd.get("court"):
+        out += f" ({_canonical_court(gd['court'])})"
+    if gd.get("note"):
+        out += " Note"
+    return f"{out} {_clean_page(m.group('page'))}"
+
+
 def normalise_citation(raw: str) -> str:
     """
     Normalise a raw Pakistani legal citation string.
@@ -457,47 +455,10 @@ def normalise_citation(raw: str) -> str:
             court_out = court_canonical
         return f"PLD {year} {court_out} {page}"
 
-    upper_s = s.upper()
-    if re.search(r"P\s*CR\.?\s*L\.?\s*J", upper_s, re.IGNORECASE):
-        m = CITATION_PATTERNS["PCrLJ"].search(s)
+    for reporter_key in _YEAR_FIRST_ORDER:
+        m = CITATION_PATTERNS[reporter_key].search(s)
         if m:
-            year = m.group("year")
-            page = _clean_page(m.group("page"))
-            court = m.group("court")
-            if court:
-                court_norm = _canonical_court(court)
-                return f"{year} PCrLJ ({court_norm}) {page}"
-            return f"{year} PCrLJ {page}"
-        s = re.sub(r"P\s*Cr\.?\s*L\.?\s*J\.?", "PCrLJ", s, flags=re.IGNORECASE)
-
-    if re.search(r"\bPTCLR\b|\bPCLD\b", upper_s):
-        s = re.sub(r"\bPTCLR\b|\bPCLD\b", "PTCL", s, flags=re.IGNORECASE)
-    for rep in ["SCMR", "CLC", "YLR", "MLD", "PTD", "PTCL", "PLD"]:
-        s = re.sub(rf"\b{rep}\b", rep, s, flags=re.IGNORECASE)
-
-    for reporter_key in ["SCMR", "CLC", "YLR", "MLD", "PTD", "PTCL"]:
-        pat = CITATION_PATTERNS[reporter_key]
-        m = pat.search(s)
-        if m:
-            year = m.group("year")
-            page = _clean_page(m.group("page"))
-            rep_out = "PCrLJ" if reporter_key == "PCrLJ" else reporter_key
-            court = m.groupdict().get("court")
-            if court:
-                court_norm = _canonical_court(court)
-                return f"{year} {rep_out} ({court_norm}) {page}"
-            return f"{year} {rep_out} {page}"
-
-    # Check PCrLJ again after clean
-    m = CITATION_PATTERNS["PCrLJ"].search(s)
-    if m:
-        year = m.group("year")
-        page = _clean_page(m.group("page"))
-        court = m.groupdict().get("court")
-        if court:
-            court_norm = _canonical_court(court)
-            return f"{year} PCrLJ ({court_norm}) {page}"
-        return f"{year} PCrLJ {page}"
+            return _year_first_normalised(reporter_key, m)
 
     def _paren_court_repl(match):
         inside = match.group(1)
@@ -570,7 +531,7 @@ def extract_citations(text: str) -> List[Dict[str, Any]]:
 
             entry = {
                 "raw": raw.strip(),
-                "reporter": "PCrLJ" if reporter == "PCrLJ" else reporter,
+                "reporter": "PLC(CS)" if reporter == "PLC" and gd.get("series") else reporter,
                 "year": year,
                 "court": court,
                 "page": page,
