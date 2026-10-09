@@ -233,6 +233,14 @@ main() {
   [ -d "$DIR/.git" ] || die "not a git checkout: $DIR"
   cd "$DIR"
   mkdir -p state
+  # One deployer at a time on the host: two racing runs left worker-scraper and worker-public dead in "Created".
+  if [ "$DRY_RUN" != 1 ] && command -v flock >/dev/null 2>&1; then
+    exec 9>"$DIR/state/auto_deploy.lock"
+    if ! flock -n 9; then
+      log "another auto_deploy run holds state/auto_deploy.lock; exiting"
+      exit 0
+    fi
+  fi
   install_cron
 
   # Load compose env for postgres user/db names when present.
@@ -257,22 +265,20 @@ main() {
   old_sha="$(git rev-parse HEAD)"
 
   if [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ] && [ "$rollout_sha" = "$new_sha" ]; then
-    if pls_host_promotion_stalled; then
-      log "origin/$BRANCH at $new_sha (tip_sha and rollout_sha match) but /status reports no_output_while_harvesting; retrying compose rollout"
-    else
-      log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
-      # nothing is pending, so no PakistanLawSite hold may linger (a deploy that died leaves one behind)
-      [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
-      if beat_wanted && ! pls_host_beat_running; then
-        log "celery-beat is not running and no deploy is pending; starting it"
-        resume_beat || exit 1
-      elif beat_wanted && [ -f "$DIR/$BEAT_PAUSE_MARKER" ]; then
-        # a rollout finished but recreating beat failed: the old scheduler may still be running
-        log "$BEAT_PAUSE_MARKER left by the last deploy; bringing celery-beat up on the current image"
-        resume_beat || exit 1
-      fi
-      exit 0
+    # A /status stall is never a reason to roll out the same commit again: that stopped worker-scraper and failed a
+    # healthy in-flight harvest (PR #169, 9 October 2026). The in-app stall watchdog owns stalls.
+    log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
+    # nothing is pending, so no PakistanLawSite hold may linger (a deploy that died leaves one behind)
+    [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
+    if beat_wanted && ! pls_host_beat_running; then
+      log "celery-beat is not running and no deploy is pending; starting it"
+      resume_beat || exit 1
+    elif beat_wanted && [ -f "$DIR/$BEAT_PAUSE_MARKER" ]; then
+      # a rollout finished but recreating beat failed: the old scheduler may still be running
+      log "$BEAT_PAUSE_MARKER left by the last deploy; bringing celery-beat up on the current image"
+      resume_beat || exit 1
     fi
+    exit 0
   elif [ -n "$deployed_sha" ] && [ "$deployed_sha" = "$new_sha" ] && [ "$rollout_sha" != "$new_sha" ]; then
     log "tip_sha=$new_sha but rollout_sha=${rollout_sha:-missing}; docker rollout still required"
   fi

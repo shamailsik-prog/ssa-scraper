@@ -123,3 +123,65 @@ def test_queued_ticks_expire_after_about_one_tick(monkeypatch):
     assert search_harvest_tick_expiry() == 1200
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
     assert search_harvest_tick_expiry() == 3600
+
+
+async def test_cursor_and_staged_rows_are_saved_after_every_row_and_survive_a_killed_tick(db, monkeypatch):
+    """9 October 2026 (PR #169, stalls #6 and #7): the cursor dict was changed in place and assigned back, so after
+    the first flush SQLAlchemy saw no change and the stored row_index stayed at 1-9 while the tick advanced to 67+;
+    and nothing was committed until the tick ended, so a killed tick lost everything. Each tick restarted near the
+    top and re-fetched ~65 rows. Progress is now written and committed after every row."""
+    from sqlalchemy import delete, select
+
+    from scraper.database import SessionLocal
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
+    clock = [0.0]
+    q = PlsSearchHarvestQuery(source_name="PakistanLawSite", query_key="kill-test", query_json={}, status="in_progress")
+    db.add(q)
+    await db.commit()
+    try:
+        runner = _runner(db, monkeypatch, clock)
+        real = runner.pipeline.preserve_and_extract
+
+        async def killed_on_row_3(detail, route, row):
+            if detail.url.endswith("/3"):
+                raise RuntimeError("worker killed")
+            return await real(detail, route, row)
+
+        runner.pipeline.preserve_and_extract = killed_on_row_3
+        try:
+            await runner.run_query(q, {})
+        except RuntimeError:
+            pass
+        await db.rollback()  # what the dead worker's open transaction amounts to
+        async with SessionLocal() as other:
+            saved = (await other.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.query_key == "kill-test"))).scalars().one()
+            assert saved.cursor_json["row_index"] == 2 and saved.rows_new == 2
+    finally:
+        await db.rollback()
+        await db.execute(delete(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.query_key == "kill-test"))
+        await db.commit()
+
+
+async def test_search_rows_without_a_citation_are_known_by_their_case_name(db):
+    """PR #169 stall #7: search-harvest result rows carry no citation (the grid has no citation column), so
+    citation_keys_for_row gave no key and every row already held was fetched again (~65 per tick). A row's
+    CaseName (its judgment's identity on the site) now marks it known when any staged or promoted capture has it."""
+    import hashlib
+
+    from scraper.models import ScraperStaging, SourceProvenance
+    from scraper.pls_search_harvest_core import citation_keys_for_row
+
+    held = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2025L8&court=&Row=0&bookName=undefined"
+    prov = SourceProvenance(source_name="PakistanLawSite", access_method="login_session", source_url=held, content_hash=hashlib.sha256(held.encode()).hexdigest(), content_kind="html")
+    db.add(prov)
+    await db.flush()
+    db.add(ScraperStaging(source_name="PakistanLawSite", access_method="login_session", source_url=held, provenance_id=prov.id, content_hash="x" * 64, status="quarantined"))
+    await db.flush()
+
+    held_row = {"citation": "", "detail_url": held.replace("Row=0", "Row=5")}
+    new_row = {"detail_url": held.replace("2025L8", "2025L80")}
+    keys = citation_keys_for_row(held_row) | citation_keys_for_row(new_row)
+    assert keys == {"case:2025L8", "case:2025L80"}
+    assert await harvest.load_known_citation_keys(db, keys) == {"case:2025L8"}
+    await db.rollback()
