@@ -42,7 +42,12 @@ exit 0
 """
 
 FAKE_CRONTAB = "#!/usr/bin/env bash\n[ \"$1\" = -l ] && cat \"$FAKE/crontab\" 2>/dev/null; [ \"$1\" = - ] && cat > \"$FAKE/crontab\"; exit 0\n"
-FAKE_CURL = "#!/usr/bin/env bash\nexit 1\n"  # /status.json unreachable: never reports a promotion stall
+# /status.json is unreachable (never a stall) unless $FAKE/stalled exists
+FAKE_CURL = (
+    "#!/usr/bin/env bash\n"
+    "[ -f \"$FAKE/stalled\" ] && { echo '{\"stalled\": true, \"stalled_reason\": \"no_output_while_harvesting\"}'; exit 0; }\n"
+    "exit 1\n"
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -231,3 +236,29 @@ def test_a_failed_install_restores_the_existing_beat_without_recreating_it(host)
     calls = host.calls()
     assert "up celery-beat" not in calls and "start celery-beat" in calls
     assert "celery-beat" in host.running() and not host.marker.exists() and not (host.fake / "hold").exists()
+
+
+def test_a_stall_at_an_unchanged_commit_never_stops_the_running_harvest(host):
+    """PR #169 stall #6: with nothing new to deploy, a /status "stalled" reading still "retried the rollout", which
+    stopped worker-scraper and failed a healthy in-flight harvest. Redeploying the same code fixes no stall; the
+    in-app stall watchdog owns that."""
+    (host.fake / "stalled").touch()
+    (host.fake / "busy").touch()
+    r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to do" in r.stdout
+    assert "stop worker-scraper" not in host.calls() and "release-job" not in host.calls()
+    assert not any(c.startswith("deploy ") for c in host.calls())
+
+
+def test_a_second_deployer_exits_while_one_holds_the_host_lock(host):
+    """PR #169 stall #6: two deployers raced and left worker-scraper and worker-public dead in Created."""
+    import fcntl
+
+    host.push_change()
+    with open(host.app / "state" / "auto_deploy.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = host.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "another auto_deploy run holds" in r.stdout
+    assert not any(c.startswith("deploy ") for c in host.calls())

@@ -156,7 +156,13 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
     return None
 
 
+CASE_KEY_PREFIX = "case:"
+
+
 def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
+    """Keys that identify a result row's judgment: its citation (raw and normalised) and, from its detail link, its
+    CaseName ("case:2025L8"). Search-harvest rows carry no citation column, so without the CaseName every row
+    already held looked new and was fetched again."""
     keys: Set[str] = set()
     raw = str(row.get("citation") or "").strip()
     if raw:
@@ -164,7 +170,18 @@ def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
         normalized = normalise_citation(raw)
         if normalized:
             keys.add(normalized)
+    name = case_name_from_url(row.get("detail_url") or row.get("pdf_url"))
+    if name:
+        keys.add(CASE_KEY_PREFIX + name)
     return keys
+
+
+_CASE_NAME_RE = re.compile(r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])")
+
+
+def case_name_from_url(url: Optional[str]) -> Optional[str]:
+    m = _CASE_NAME_RE.search(url or "")
+    return m.group(1).upper() if m else None
 
 
 def partition_rows_by_known(

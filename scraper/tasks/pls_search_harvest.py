@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -36,6 +36,7 @@ from scraper.models import (
 from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemoryState, check_rss_limits
 from scraper.pls_search_harvest_core import (
     build_harvest_form_values,
+    CASE_KEY_PREFIX,
     citation_keys_for_row,
     compute_gap_size,
     gap_report_sort_key,
@@ -74,7 +75,18 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
     if not keys:
         return set()
     known: Set[str] = set()
-    key_list = list(keys)
+    case_names = {k[len(CASE_KEY_PREFIX):] for k in keys if k.startswith(CASE_KEY_PREFIX)}
+    if case_names:
+        # a judgment page's CaseName in a promoted or staged (any status) capture: already held
+        for model in (Judgment, ScraperStaging):
+            name_col = func.upper(func.substring(model.source_url, r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])"))
+            q = select(name_col).where(model.source_name == SOURCE_NAME, name_col.in_(list(case_names)))
+            for (name,) in (await db.execute(q)).all():
+                if name:
+                    known.add(CASE_KEY_PREFIX + str(name))
+    key_list = [k for k in keys if not k.startswith(CASE_KEY_PREFIX)]
+    if not key_list:
+        return known
     for canonical, in (await db.execute(select(Judgment.canonical_citation).where(Judgment.canonical_citation.in_(key_list)))).all():
         if canonical:
             known.add(str(canonical))
@@ -439,7 +451,12 @@ class SearchHarvestRunner:
                         rows_new += 1
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
-                    query_row.cursor_json = cursor
+                    # A new dict every time: the same dict changed in place and assigned back is not seen as a change
+                    # after the first flush, so the stored row_index stayed at 1-9 while ticks reached row 67+. Commit
+                    # per row so a killed or redeployed tick keeps its place and its staged rows.
+                    query_row.cursor_json = dict(cursor)
+                    query_row.rows_new = rows_new
+                    await self.db.commit()
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
                     if deadline is not None and time.monotonic() >= deadline and idx + 1 < len(rows):
@@ -488,7 +505,7 @@ class SearchHarvestRunner:
 
             if page_limit and pages_done >= page_limit:
                 cursor["page"] = page_idx
-                query_row.cursor_json = cursor
+                query_row.cursor_json = dict(cursor)
                 query_row.status = "in_progress"
                 break
             if not nxt:
@@ -516,7 +533,7 @@ class SearchHarvestRunner:
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
-            query_row.cursor_json = cursor
+            query_row.cursor_json = dict(cursor)
             if deadline is not None and time.monotonic() >= deadline:
                 out_of_time = True
                 query_row.status = "in_progress"
