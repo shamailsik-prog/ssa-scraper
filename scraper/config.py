@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     DATABASE_MAX_OVERFLOW: int = Field(default=20)
     DATABASE_POOL_TIMEOUT: int = Field(default=30)
     DATABASE_ECHO: bool = Field(default=False)
+    # Postgres ends an app session left idle inside a transaction this long (0 disables). A leaked mirror
+    # connection held archive_targets row locks for over an hour on 9 October 2026 and stalled every later
+    # mirror run; 30 minutes matches the dispatcher's heartbeat rule, so no live job idles that long.
+    DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS: int = 1800
     SIKANDER_READER_ROLE: str = Field(default="sikander_reader")
     SIKANDER_READER_PASSWORD: SecretStr = Field(default=SecretStr(""), description="Blank = role not created; dashboard shows NOT CONFIGURED.")
     CORPUS_WRITER_ROLE: str = Field(default="corpus_writer")

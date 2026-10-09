@@ -33,8 +33,18 @@ class Base(DeclarativeBase):
     pass
 
 
+def connect_args() -> dict:
+    """Server settings for every app connection: a session idle inside a transaction for
+    DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS is ended by Postgres, releasing its locks (pool_pre_ping replaces it)."""
+    timeout = int(settings.DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS or 0)
+    if timeout <= 0:
+        return {}
+    return {"server_settings": {"idle_in_transaction_session_timeout": str(timeout * 1000)}}
+
+
 engine = create_async_engine(
     settings.DATABASE_URL,
+    connect_args=connect_args(),
     echo=settings.DATABASE_ECHO,
     pool_size=settings.DATABASE_POOL_SIZE,
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
