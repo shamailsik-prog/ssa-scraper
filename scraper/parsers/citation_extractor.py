@@ -307,6 +307,40 @@ def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
     return raw_court.strip().title()
 
 
+_BRACKET_COURT = re.compile(r"\[\s*([A-Za-z][A-Za-z\s\.\-&,()]{1,78}?)\s*\]")
+_FORUM_WORDS = re.compile(r"(?i)\b(?:court|tribunal|bench|commission|board)\b")
+
+
+def _known_court(raw: str) -> Optional[str]:
+    """The canonical court for a name the court tables know, else None (no title-case guess)."""
+    key = re.sub(r"\s+", " ", raw.strip()).upper()
+    key = re.sub(r"\.", "", key)
+    key = re.sub(r"\s*\(\s*", " (", key)
+    key = re.sub(r"\s*\)", ")", key)
+    key = re.sub(r"\s*&\s*", "&", key)
+    if key in _EXACT_ONLY_COURTS:
+        return _EXACT_ONLY_COURTS[key]
+    return PLD_COURT_CANONICAL.get(key)
+
+
+def court_from_bracket(text: str, start: int, window: int = 160) -> Optional[str]:
+    """The court printed in brackets just after a year-first citation ("1983 P Cr. L J 2056 [Karachi]").
+
+    Only the first bracket within `window` characters of `start` is read, and only a name the court tables
+    know, or one naming a court, tribunal, bench, commission or board, is accepted; footnote markers and
+    editorial brackets are not courts."""
+    m = _BRACKET_COURT.search(text, start, start + window)
+    if not m:
+        return None
+    name = re.sub(r"\s+", " ", m.group(1)).strip(" ,.")
+    known = _known_court(name)
+    if known:
+        return known
+    if _FORUM_WORDS.search(name):
+        return name
+    return None
+
+
 def _clean_page(page: str) -> str:
     if not page:
         return page

@@ -19,6 +19,7 @@ from scraper.extractors.schemas import JudgmentExtraction, StatuteExtraction, In
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import (
     canonicalise_statute_name,
+    court_from_bracket,
     extract_citations,
     extract_instrument_mentions,
     extract_statute_mentions,
@@ -132,15 +133,20 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     evidence: Dict[str, str] = {}
     cits = extract_citations(raw_text)
     own: List[str] = []
+    own_end: Optional[int] = None
+    cit_end: Dict[str, int] = {}
     cited: List[str] = []
     head_limit = max(300, min(800, int(len(raw_text) * 0.15)))
     for c in cits:
         norm = c.get("normalized") or normalise_citation(c["raw"])
+        cit_end.setdefault(norm, c["span"][1])
         # "Muhammad Ahmad Ameen 2006 SCMR 631 ref." in a headnote is a case the judgment cites, never its own
         # citation, however near the top it sits (staging 6404c66e was promoted as 2006 SCMR 631 that way)
         referred = _REFERRED_AFTER.match(raw_text, c["span"][1]) is not None
         if c["span"][0] < head_limit and len(own) < 6 and not referred:
             own.append(norm)
+            if own_end is None:
+                own_end = c["span"][1]
             evidence.setdefault("citations", raw_text[max(0, c["span"][0] - 30) : c["span"][1] + 30].strip())
         else:
             cited.append(norm)
@@ -154,7 +160,10 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
             # the result row names this judgment's own citation: it leads even when a cited case came first
             own.remove(hn)
             own.insert(0, hn)
-    cited = [c for c in dict.fromkeys(cited) if c not in own]
+        if hn in cit_end:
+            # the court bracket follows the judgment's own citation, not whichever citation came first
+            own_end = cit_end[hn]
+    cited =[c for c in dict.fromkeys(cited) if c not in own]
     bench = parse_bench(raw_text)
     if bench.evidence:
         evidence["judge_names"] = bench.evidence
@@ -173,6 +182,11 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
                 court = c["court"]
                 evidence["court"] = c["raw"]
                 break
+    if not court and own_end is not None:
+        # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]"
+        court = court_from_bracket(raw_text, own_end)
+        if court:
+            evidence["court"] = raw_text[own_end : own_end + 80].strip()
     if not court:
         m = re.search(r"(?i)\b(supreme court of pakistan|lahore high court|high court of sindh|sindh high court|peshawar high court|balochistan high court|high court of balochistan|islamabad high court|federal shariat court)\b", raw_text[:5000])
         if m:
