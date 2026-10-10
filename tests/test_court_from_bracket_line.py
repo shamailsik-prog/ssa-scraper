@@ -64,3 +64,10 @@ def test_row_court_still_wins_over_the_bracket():
 def test_pld_court_from_citation_unchanged():
     out = extract_judgment_deterministic(html=None, text="PLD 2025 Lahore 98 [Lahore] Before X, J  A versus B")
     assert out["court"] == "Lahore"
+
+
+def test_bracket_is_read_after_the_citation_the_result_row_names():
+    # a cited case comes first; the result row names the later citation as this judgment's own
+    text = "1999 CLC 1 [Karachi] referred in   2021 CLC 1001 [Lahore] Before X, J  A versus B"
+    out = extract_judgment_deterministic(html=None, text=text, source_meta={"citation": "2021 CLC 1001"})
+    assert out["court"] == "Lahore"

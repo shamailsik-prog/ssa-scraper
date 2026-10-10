@@ -134,10 +134,12 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     cits = extract_citations(raw_text)
     own: List[str] = []
     own_end: Optional[int] = None
+    cit_end: Dict[str, int] = {}
     cited: List[str] = []
     head_limit = max(300, min(800, int(len(raw_text) * 0.15)))
     for c in cits:
         norm = c.get("normalized") or normalise_citation(c["raw"])
+        cit_end.setdefault(norm, c["span"][1])
         # "Muhammad Ahmad Ameen 2006 SCMR 631 ref." in a headnote is a case the judgment cites, never its own
         # citation, however near the top it sits (staging 6404c66e was promoted as 2006 SCMR 631 that way)
         referred = _REFERRED_AFTER.match(raw_text, c["span"][1]) is not None
@@ -158,7 +160,10 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
             # the result row names this judgment's own citation: it leads even when a cited case came first
             own.remove(hn)
             own.insert(0, hn)
-    cited = [c for c in dict.fromkeys(cited) if c not in own]
+        if hn in cit_end:
+            # the court bracket follows the judgment's own citation, not whichever citation came first
+            own_end = cit_end[hn]
+    cited =[c for c in dict.fromkeys(cited) if c not in own]
     bench = parse_bench(raw_text)
     if bench.evidence:
         evidence["judge_names"] = bench.evidence
