@@ -113,11 +113,12 @@ SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging G
 SELECT source_name, kind, coalesce(details->>'reason_code', left(reason, 70)) AS reason, count(*) FROM quarantine_queue
  WHERE NOT reviewed GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 25;
 \\echo == PakistanLawSite judgments held as court unknown: by journal, and the latest openings
-SELECT coalesce(substring(extracted_citation from '[A-Za-z][A-Za-z. ]*[A-Za-z]'), '?') AS journal, count(*),
- count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_24h FROM quarantine_queue
- WHERE NOT reviewed AND source_name = 'PakistanLawSite' AND reason = 'court unknown' GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
+SELECT coalesce(substring(q.extracted_citation from '[A-Za-z][A-Za-z. ]*[A-Za-z]'), '?') AS journal, count(*),
+ count(*) FILTER (WHERE q.created_at > now() - interval '24 hours') AS last_24h
+ FROM quarantine_queue q JOIN scraper_staging s ON s.id = q.staging_id AND s.status = 'quarantined'
+ WHERE NOT q.reviewed AND q.source_name = 'PakistanLawSite' AND q.reason = 'court unknown' GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
 SELECT q.extracted_citation, left(regexp_replace(coalesce(s.raw_text, ''), '[[:space:]]+', ' ', 'g'), 240) AS opening
- FROM quarantine_queue q LEFT JOIN scraper_staging s ON s.id = q.staging_id
+ FROM quarantine_queue q JOIN scraper_staging s ON s.id = q.staging_id AND s.status = 'quarantined'
  WHERE NOT q.reviewed AND q.source_name = 'PakistanLawSite' AND q.reason = 'court unknown' ORDER BY q.created_at DESC LIMIT 12;
 \\echo == jobs in the last 6 hours
 SELECT source_name, status, count(*), max(started_at) AS latest FROM scraper_jobs WHERE started_at > now() - interval '6 hours' GROUP BY 1, 2 ORDER BY 1, 2;
