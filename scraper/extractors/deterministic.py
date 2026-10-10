@@ -19,6 +19,7 @@ from scraper.extractors.schemas import JudgmentExtraction, StatuteExtraction, In
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import (
     canonicalise_statute_name,
+    court_from_bracket,
     extract_citations,
     extract_instrument_mentions,
     extract_statute_mentions,
@@ -132,6 +133,7 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     evidence: Dict[str, str] = {}
     cits = extract_citations(raw_text)
     own: List[str] = []
+    own_end: Optional[int] = None
     cited: List[str] = []
     head_limit = max(300, min(800, int(len(raw_text) * 0.15)))
     for c in cits:
@@ -141,6 +143,8 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
         referred = _REFERRED_AFTER.match(raw_text, c["span"][1]) is not None
         if c["span"][0] < head_limit and len(own) < 6 and not referred:
             own.append(norm)
+            if own_end is None:
+                own_end = c["span"][1]
             evidence.setdefault("citations", raw_text[max(0, c["span"][0] - 30) : c["span"][1] + 30].strip())
         else:
             cited.append(norm)
@@ -173,6 +177,11 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
                 court = c["court"]
                 evidence["court"] = c["raw"]
                 break
+    if not court and own_end is not None:
+        # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]"
+        court = court_from_bracket(raw_text, own_end)
+        if court:
+            evidence["court"] = raw_text[own_end : own_end + 80].strip()
     if not court:
         m = re.search(r"(?i)\b(supreme court of pakistan|lahore high court|high court of sindh|sindh high court|peshawar high court|balochistan high court|high court of balochistan|islamabad high court|federal shariat court)\b", raw_text[:5000])
         if m:
