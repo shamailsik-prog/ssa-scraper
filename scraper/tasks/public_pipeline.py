@@ -518,12 +518,15 @@ async def requalify_held_judgment(db: AsyncSession, source: ScraperSource, *, fr
         st.extracted_citation = (data.get("citations") or [citation])[0]
         st.extracted_court = data.get("court") or st.extracted_court
         st.extracted_year = data.get("year") or st.extracted_year
+        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
         if out.quarantine:
             st.quarantine_reason = out.quarantine_reason
+            for item in items:
+                # the review queue shows why the judgment is held now, not the reason it was first held for
+                item.reason = (out.quarantine_reason or item.reason)[:1000]
             continue
         st.status = "extracted"
         st.quarantine_reason = None
-        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
         for item in items:
             item.reviewed = True
             item.reviewed_by = "system"

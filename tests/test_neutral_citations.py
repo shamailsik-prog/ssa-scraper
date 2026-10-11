@@ -169,3 +169,46 @@ async def test_done_detail_grids_are_read_again_once_to_pick_up_citations(db, fi
         await scrape_sindh_high_court(source, db, fetcher=fetcher, limit=20)
     await db.commit()
     assert fixture_server.hits.count("/caselaw/public/reported-judgements-detail-all/901/-1") == hits_before + 1
+
+
+@pytest.mark.parametrize("text", ["2025 LHC KHI 1", "2025 SHC 1", "1900 LHC 1", "2099 SCP 1"])
+def test_malformed_or_out_of_range_neutral_citations_are_not_read(text):
+    assert [h for h in extract_citations(text) if h["reporter"] in ("SHC", "LHC", "IHC", "PHC", "SCP")] == []
+
+
+def test_own_citation_bracket_court_beats_a_cited_case_court():
+    text = "1983 P Cr. L J 2056 [Karachi] Before X, J  A versus B. Reliance on PLD 1980 Lahore 1."
+    assert extract_judgment_deterministic(html=None, text=text)["court"] == "Karachi"
+
+
+async def test_held_judgment_still_failing_shows_its_new_reason_in_the_review_queue(db):
+    from scraper.models import ScraperSource as Src
+    from scraper.tasks.public_pipeline import requalify_held_judgment
+
+    from scraper.fetchers import record_provenance
+
+    source = (await db.execute(select(Src).where(Src.source_name == "SindhHighCourt"))).scalars().first()
+    prov = await record_provenance(
+        db, source=source, url="https://caselaw.shc.gov.pk/caselaw/view-file/X", content=b"Order. Disposed of.", content_kind="html", route={}
+    )
+    st = ScraperStaging(
+        provenance_id=prov.id,
+        source_id=source.id,
+        source_name="SindhHighCourt",
+        access_method=source.access_method,
+        source_url="https://caselaw.shc.gov.pk/caselaw/view-file/X",
+        content_hash=prov.content_hash,
+        raw_text="Order. Disposed of.",
+        route_json={"frontier": "judgment:https://caselaw.shc.gov.pk/caselaw/view-file/X"},
+        status="quarantined",
+        quarantine_reason="no citation supported by source",
+    )
+    db.add(st)
+    await db.flush()
+    db.add(QuarantineQueue(staging_id=st.id, reason=st.quarantine_reason, source_name="SindhHighCourt"))
+    await db.flush()
+    released = await requalify_held_judgment(db, source, frontier_key=st.route_json["frontier"], citation="2025 SHC KHI 9")
+    assert released == 0
+    item = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().one()
+    assert item.reason == st.quarantine_reason
+    assert item.reason != "no citation supported by source"
