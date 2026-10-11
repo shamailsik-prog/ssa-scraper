@@ -8,7 +8,8 @@
 #   DO_TOKEN         DigitalOcean API token (read/write)
 #   DO_REGION        e.g. fra1 (Frankfurt), lon1, ams3, sgp1, blr1 (Bangalore)   default fra1
 #   DO_SIZE          e.g. s-2vcpu-4gb, s-4vcpu-8gb                                default s-2vcpu-4gb
-#   DROPLET_NAME     default ssa-corpus
+#   DROPLET_NAME     default ssa-corpus (the free-sites server is a second droplet, e.g. ssa-corpus-public)
+#   DEPLOY_ROLE      all | pls | public: what the server harvests (scraper/deploy_role.py); blank = unchanged
 #   DOMAIN           DNS name pointing at the server (optional)
 #   REPORTERS, EARLIEST_YEAR, DEPLOY_REGION_LABEL   firm values passed to the installer
 #   SGAI_API_KEY     optional; written to .env on the server over stdin, never printed
@@ -112,6 +113,7 @@ ARGS=(--repo /root/ssa-src --branch "$BRANCH")
 [ -n "$EARLIEST_YEAR" ] && ARGS+=(--earliest-year "$EARLIEST_YEAR")
 [ -n "$DEPLOY_REGION_LABEL" ] && ARGS+=(--region "$DEPLOY_REGION_LABEL")
 case "${MIRROR_LOGIN_SESSION_ROWS:-keep}" in true|false) ARGS+=(--mirror-login-session-rows "$MIRROR_LOGIN_SESSION_ROWS");; esac
+case "${DEPLOY_ROLE:-}" in all|pls|public) ARGS+=(--role "$DEPLOY_ROLE");; esac
 ssh "${SSH_OPTS[@]}" "root@$IP" "bash /root/ssa-src/cloud/install.sh $(printf '%q ' "${ARGS[@]}") < /dev/null" 2>&1 | sed -E 's/Admin key:  [0-9a-f]{64}/Admin key:  (see the job summary)/'
 
 # ---------------------------------------------------------------- optional secrets, sent over stdin, never echoed

@@ -32,6 +32,7 @@ REPORTERS=""
 EARLIEST=""
 REGION=""
 MIRROR_ROWS=""
+ROLE=""
 SKIP_DOCKER=0
 SKIP_FIREWALL=0
 PREPARE_ONLY=0
@@ -45,6 +46,7 @@ while [ $# -gt 0 ]; do
     --earliest-year) EARLIEST="$2"; shift 2;;
     --region) REGION="$2"; shift 2;;
     --mirror-login-session-rows) MIRROR_ROWS="$2"; shift 2;;
+    --role) ROLE="$2"; shift 2;;
     --dir) DIR="$2"; shift 2;;
     --branch) BRANCH="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
@@ -111,6 +113,7 @@ fi
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 case "$MIRROR_ROWS" in ""|true|false) ;; *) die "--mirror-login-session-rows must be true or false";; esac
+case "$ROLE" in ""|all|pls|public) ;; *) die "--role must be all, pls or public";; esac
 case "$BRANCH$DIR$DOMAIN$REPORTERS$EARLIEST$REGION" in *[\'\"\;\`]*) die "quotes, semicolons and backticks are not allowed in options";; esac
 
 # ---------------------------------------------------------------- packages
@@ -313,6 +316,21 @@ if n == 0:
     s += ("" if s.endswith("\n") else "\n") + line + "\n"
 open(".env", "w").write(s)
 print("  MIRROR_LOGIN_SESSION_ROWS set to", os.environ["MIRROR_ROWS"])
+PY
+fi
+
+# What this server harvests (scraper/deploy_role.py): all, pls (PakistanLawSite only) or public (the
+# free sites only). Set from the deploy-cloud workflow input; left as it is when not given.
+if [ -n "$ROLE" ] && [ -f .env ]; then
+  ROLE="$ROLE" python3 - <<'PY'
+import os, re
+s = open(".env").read()
+line = "DEPLOY_ROLE=" + os.environ["ROLE"]
+s, n = re.subn(r"^DEPLOY_ROLE=.*$", line, s, flags=re.M)
+if n == 0:
+    s += ("" if s.endswith("\n") else "\n") + line + "\n"
+open(".env", "w").write(s)
+print("  DEPLOY_ROLE set to", os.environ["ROLE"])
 PY
 fi
 

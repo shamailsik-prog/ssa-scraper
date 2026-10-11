@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 
 from scraper.config import search_harvest_tick_expiry, settings
 from scraper.tasks.deploy_hold import login_work_held
+from scraper.deploy_role import harvests
 from scraper.database import SessionLocal, run_async
 from scraper.auth.session_manager import SessionLockHeld
 from scraper.harvest_mode import (
@@ -269,6 +270,10 @@ async def run_source(
         ).scalars().first()
         if source is None:
             return {"error": f"source {source_name} not found"}
+        if not harvests(source.access_method):
+            clear_source_queued(source_name)
+            logger.info("%s is not harvested on this server (DEPLOY_ROLE=%s); not run", source_name, settings.DEPLOY_ROLE)
+            return {"skipped": "other_server", "deploy_role": settings.DEPLOY_ROLE}
         if check_superseded and await superseded_by_later_job(db, source_name, queued_at):
             # checked again under the source row lock: two duplicates taken at the same moment both pass the
             # unlocked check in run_queued_source, and the second must see the first one's job here
@@ -484,6 +489,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
         if mode == "backfill":
             rows.sort(key=source_backfill_priority)
         for s in rows:
+            if not harvests(s.access_method):
+                continue  # the other server's source (DEPLOY_ROLE)
             if not source_selected_for_mode(s, mode):
                 continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now
