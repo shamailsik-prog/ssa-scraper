@@ -50,6 +50,25 @@ die() {
 # shellcheck source=scripts/pls_host_lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/pls_host_lib.sh"
 
+# Operator decision of 11 October 2026: PakistanLawSite login 1 and login 2 are separate accounts and run at the same
+# time, one reporter shard each, each login paced at its own 300 pages an hour. Both the updates-mode and the
+# backfill-mode setting say so; the login worker's --concurrency reads LOGIN_SESSION_CONCURRENCY from .env.
+ensure_two_pls_logins() {
+  [ -f .env ] || return 0
+  local kv key
+  for kv in LOGIN_SESSION_CONCURRENCY=2 BACKFILL_LOGIN_SESSION_CONCURRENCY=2; do
+    key="${kv%%=*}"
+    if grep -q "^${key}=" .env; then
+      grep -qx "$kv" .env || { sed -i "s/^${key}=.*/${kv}/" .env; log "set $kv in .env"; }
+    else
+      # a last line without its newline would swallow the new key
+      [ -s .env ] && [ -n "$(tail -c1 .env)" ] && printf '\n' >> .env
+      printf '%s\n' "$kv" >> .env
+      log "added $kv to .env"
+    fi
+  done
+}
+
 install_cron() {
   local cron_line="*/15 * * * * cd $DIR && /bin/bash scripts/auto_deploy.sh >> state/auto_deploy.log 2>&1"
   local cron_now
@@ -242,6 +261,7 @@ main() {
     fi
   fi
   install_cron
+  [ "$DRY_RUN" = 1 ] || ensure_two_pls_logins
 
   # Load compose env for postgres user/db names when present.
   if [ -f .env ]; then

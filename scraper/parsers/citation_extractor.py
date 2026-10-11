@@ -319,6 +319,7 @@ def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
 
 
 _BRACKET_COURT = re.compile(r"\[\s*([A-Za-z][A-Za-z\s\.\-&,()]{1,78}?)\s*\]")
+_BRACKET_GAP = re.compile(r"[\s\(\)\d.,;:\-]*")
 _FORUM_WORDS = re.compile(r"(?i)\b(?:court|tribunal|bench|commission|board)\b")
 
 
@@ -342,6 +343,10 @@ def court_from_bracket(text: str, start: int, window: int = 160) -> Optional[str
     editorial brackets are not courts."""
     m = _BRACKET_COURT.search(text, start, start + window)
     if not m:
+        return None
+    # the bracket belongs to this citation only when nothing but spacing and a "(2)" part number stands
+    # between them; a bracket after words ("relied on 1980 CLC 1 [Lahore]") is a cited case's court
+    if not _BRACKET_GAP.fullmatch(text[start : m.start()]):
         return None
     name = re.sub(r"\s+", " ", m.group(1)).strip(" ,.")
     known = _known_court(name)

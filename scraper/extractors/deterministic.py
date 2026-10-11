@@ -197,11 +197,6 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
                 court = c["court"]
                 evidence["court"] = c["raw"]
                 break
-    if not court and own_end is not None:
-        # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]"
-        court = court_from_bracket(raw_text, own_end)
-        if court:
-            evidence["court"] = raw_text[own_end : own_end + 80].strip()
     if not court:
         m = re.search(r"(?i)\b(supreme court of pakistan|lahore high court|high court of sindh|sindh high court|peshawar high court|balochistan high court|high court of balochistan|islamabad high court|federal shariat court)\b", raw_text[:5000])
         if m:

@@ -239,20 +239,35 @@ class SessionLock:
             self._redis = aioredis.from_url(settings.REDIS_URL)
         return self._redis
 
+    # The shared form keeps one member per holder in a sorted set scored by that holder's own expiry (ms), so a
+    # holder that crashed drops out on its own instead of keeping its place while the other holder refreshes the
+    # key. An older plain set left by a previous release is converted on first sight (its members get a full TTL).
+    _SHARED_PRELUDE = """
+        local t = redis.call('time')
+        local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+        if redis.call('type', KEYS[2]).ok == 'set' then
+            local old = redis.call('smembers', KEYS[2])
+            redis.call('del', KEYS[2])
+            for _, m in ipairs(old) do redis.call('zadd', KEYS[2], now + tonumber(ARGV[3]) * 1000, m) end
+        end
+        redis.call('zremrangebyscore', KEYS[2], '-inf', now)
+    """
+
     async def acquire(self) -> None:
         r = await self._client()
         shared_key = f"{self.exclusive_key}:holders"
         # The exclusive and shared forms protect the same login. Check and acquire both keys in
         # one script so a recovery browser cannot overlap a dual-shard harvest browser.
         ok = await r.eval(
-            """
+            self._SHARED_PRELUDE
+            + """
             if tonumber(ARGV[2]) == 1 then
-                if redis.call('exists', KEYS[1]) == 1 or redis.call('scard', KEYS[2]) > 0 then return 0 end
+                if redis.call('exists', KEYS[1]) == 1 or redis.call('zcard', KEYS[2]) > 0 then return 0 end
                 return redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[3]) and 1 or 0
             end
             if redis.call('exists', KEYS[1]) == 1 then return 0 end
-            if redis.call('scard', KEYS[2]) >= tonumber(ARGV[2]) then return 0 end
-            redis.call('sadd', KEYS[2], ARGV[1])
+            if redis.call('zcard', KEYS[2]) >= tonumber(ARGV[2]) then return 0 end
+            redis.call('zadd', KEYS[2], now + tonumber(ARGV[3]) * 1000, ARGV[1])
             redis.call('expire', KEYS[2], ARGV[3])
             return 1
             """,
@@ -280,10 +295,17 @@ class SessionLock:
                 )
             else:
                 ok = await r.eval(
-                    "if redis.call('sismember', KEYS[1], ARGV[1]) == 1 then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                    1,
+                    self._SHARED_PRELUDE
+                    + """
+                    if redis.call('zscore', KEYS[2], ARGV[1]) == false then return 0 end
+                    redis.call('zadd', KEYS[2], 'XX', now + tonumber(ARGV[3]) * 1000, ARGV[1])
+                    return redis.call('expire', KEYS[2], ARGV[3])
+                    """,
+                    2,
+                    self.exclusive_key,
                     self.key,
                     self._token,
+                    str(self.max_holders),
                     str(LOCK_TTL_SECONDS),
                 )
             if int(ok or 0) != 1:
@@ -306,10 +328,18 @@ class SessionLock:
                 )
             else:
                 await r.eval(
-                    "redis.call('srem', KEYS[1], ARGV[1]); if redis.call('scard', KEYS[1]) == 0 then redis.call('del', KEYS[1]) end; return 1",
-                    1,
+                    self._SHARED_PRELUDE
+                    + """
+                    redis.call('zrem', KEYS[2], ARGV[1])
+                    if redis.call('zcard', KEYS[2]) == 0 then redis.call('del', KEYS[2]) end
+                    return 1
+                    """,
+                    2,
+                    self.exclusive_key,
                     self.key,
                     self._token,
+                    str(self.max_holders),
+                    str(LOCK_TTL_SECONDS),
                 )
             self._held = False
         finally:

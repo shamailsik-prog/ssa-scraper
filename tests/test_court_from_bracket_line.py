@@ -71,3 +71,8 @@ def test_bracket_is_read_after_the_citation_the_result_row_names():
     text = "1999 CLC 1 [Karachi] referred in   2021 CLC 1001 [Lahore] Before X, J  A versus B"
     out = extract_judgment_deterministic(html=None, text=text, source_meta={"citation": "2021 CLC 1001"})
     assert out["court"] == "Lahore"
+
+
+def test_a_cited_cases_bracket_after_words_is_not_this_judgments_court():
+    # review on #192: the first bracket in the window may belong to a case the judgment cites
+    assert court_from_bracket("1983 P Cr. L J 2056 relied on 1980 CLC 1 [Lahore] Before X, J", len("1983 P Cr. L J 2056")) is None

@@ -58,6 +58,8 @@ from scraper.tasks.pakistanlawsite import (
     PacingBudgetExceeded,
     PakistanLawSitePipeline,
     SOURCE_NAME,
+    claim_free_slot,
+    release_claimed_slot,
 )
 from scraper.tasks.search_map import active_map, map_as_dict
 
@@ -621,13 +623,27 @@ async def run_search_harvest(
     active_slot_count = len([s for s in await runner.pipeline.manager.slots() if s.state == "ACTIVE"])
     max_holders = max(1, min(int(runner.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
     lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders)
+    # one search harvest at a time: two would pick the same pending query
+    harvest_lock = SessionLock(f"{SOURCE_NAME}:search_harvest", redis_client, max_holders=1)
+    try:
+        await harvest_lock.acquire()
+    except SessionLockHeld:
+        query_row.status = "pending"
+        return {"skipped": True, "reason": "another search harvest is running"}
     try:
         await lock.acquire()
     except SessionLockHeld:
         query_row.status = "pending"
+        await harvest_lock.release()
         return {"skipped": True, "reason": "login session lock held"}
     try:
         runner.pipeline._session_lock = lock
+        runner.pipeline._run_locks.append(harvest_lock)
+        if await claim_free_slot(runner.pipeline) is None:
+            # both logins are busy with grid shards: never open a second browser on a login in use
+            query_row.status = "pending"
+            await db.commit()
+            return {"skipped": True, "reason": "no free login slot"}
         runner.pipeline._assert_permitted()
         if not dashboard_harvest:
             await runner.pipeline.ensure_search_map()
@@ -651,7 +667,9 @@ async def run_search_harvest(
             await runner.pipeline.runner.close()
         except Exception:
             pass
+        await release_claimed_slot(runner.pipeline)
         await lock.release()
+        await harvest_lock.release()
 
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
