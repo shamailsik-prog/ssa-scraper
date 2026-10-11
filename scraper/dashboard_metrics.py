@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.models import ArchiveObject, ArchiveTarget, CrawlFrontier, Instrument, Judgment, ScraperSource, SourceProvenance, Statute, StatuteSection
+from scraper.tasks.pls_caseid_walk import WALK_PARTITIONS, partition_of, state_key
 
 # How long a heartbeat may be old before its light turns red (the job's own cadence plus slack).
 HEARTBEAT_LIMITS_SECONDS = {
@@ -194,6 +195,46 @@ async def speed_section(db: AsyncSession, *, now: datetime) -> Dict[str, Any]:
     return out
 
 
+def _caseid_walk_progress(pls_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge each partition's cursor (caseid_walk and caseid_walk_p1) for /status."""
+    groups: Dict[str, Dict[str, Any]] = {}
+    calibrated = False
+    calibration = None
+    last_probe_at: Optional[str] = None
+    current_group: Optional[str] = None
+    best_probe: Optional[datetime] = None
+    for p in range(WALK_PARTITIONS):
+        walk = pls_cfg.get(state_key(p)) or {}
+        if walk.get("calibrated_at"):
+            calibrated = True
+        if calibration is None and walk.get("calibration") is not None:
+            calibration = walk.get("calibration")
+        for key, g in (walk.get("groups") or {}).items():
+            if partition_of(key) == p:
+                groups[key] = g
+        lp = walk.get("last_probe_at")
+        if not lp:
+            continue
+        try:
+            at = datetime.fromisoformat(str(lp))
+        except ValueError:
+            continue
+        if best_probe is None or at > best_probe:
+            best_probe = at
+            last_probe_at = lp
+            current_group = walk.get("current")
+    return {
+        "calibrated": calibrated,
+        "calibration": calibration,
+        "current_group": current_group,
+        "groups_started": len(groups),
+        "groups_done": sum(1 for g in groups.values() if g.get("done")),
+        "found": sum(int(g.get("hits") or 0) for g in groups.values()),
+        "misses": sum(int(g.get("misses") or 0) for g in groups.values()),
+        "last_probe_at": last_probe_at,
+    }
+
+
 async def progress_section(db: AsyncSession, *, pls_cfg: Dict[str, Any], by_reporter_year: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
     """How far each walk has come: PakistanLawSite journal grids, public-source queues, the archive copy."""
     from scraper.pls_grid_health import JOURNAL_CURSOR_PREFIX, cursor_saturated, journal_cursor_key, journal_unsupported
@@ -273,16 +314,5 @@ async def progress_section(db: AsyncSession, *, pls_cfg: Dict[str, Any], by_repo
                 "eta_hours": round(remaining / per_hour, 1) if per_hour > 0 and remaining else (0 if not remaining else None),
             }
         )
-    walk = pls_cfg.get("caseid_walk") or {}
-    walk_groups = walk.get("groups") or {}
-    caseid_walk = {
-        "calibrated": bool(walk.get("calibrated_at")),
-        "calibration": walk.get("calibration"),
-        "current_group": walk.get("current"),
-        "groups_started": len(walk_groups),
-        "groups_done": sum(1 for g in walk_groups.values() if g.get("done")),
-        "found": sum(int(g.get("hits") or 0) for g in walk_groups.values()),
-        "misses": sum(int(g.get("misses") or 0) for g in walk_groups.values()),
-        "last_probe_at": walk.get("last_probe_at"),
-    }
+    caseid_walk = _caseid_walk_progress(pls_cfg)
     return {"pakistanlawsite_journals": journals, "public_sources": public, "archive": archive, "caseid_walk": caseid_walk}
