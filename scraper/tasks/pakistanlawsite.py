@@ -580,7 +580,7 @@ class PakistanLawSitePipeline:
             return await open_citation_search_for_harvest(browser, archived_grid_start_row=start_row)
 
         try:
-            page = await self.runner.run(op)
+            page = await self.runner.run(op, timeout=settings.PLS_GRID_OP_TIMEOUT_SECONDS)
         except CitationSearchNavigationFailed as exc:
             logger.error(
                 "PakistanLawSite CitationSearch navigation failed (page_type=%s): %s",
@@ -854,7 +854,7 @@ class PakistanLawSitePipeline:
                 return await open_citation_grid_for_journal(browser, journal, archived_grid_start_row=row_offset)
 
             try:
-                page = await self.runner.run(journal_op)
+                page = await self.runner.run(journal_op, timeout=settings.PLS_GRID_OP_TIMEOUT_SECONDS)
             except JournalNotOffered as exc:
                 await self._mark_journal_unsupported(journal, str(exc))
                 result["journal_done"] = True
@@ -889,7 +889,7 @@ class PakistanLawSitePipeline:
                 return loaded
 
             try:
-                page = await self.runner.run(op)
+                page = await self.runner.run(op, timeout=settings.PLS_GRID_OP_TIMEOUT_SECONDS)
             except CitationSearchNavigationFailed as exc:
                 if exc.page_type == "citation_search_no_results":
                     result["citation_grid_stub_stop"] = True
@@ -1397,7 +1397,7 @@ class PakistanLawSitePipeline:
             return page
 
         await self._charge_page()
-        return await self.runner.run(op)
+        return await self.runner.run(op, timeout=settings.PLS_GRID_OP_TIMEOUT_SECONDS)  # may open the large search page
 
     async def fetch_detail(self, url: str) -> PageResult:
         async def op(browser: Browser) -> PageResult:

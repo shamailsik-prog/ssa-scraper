@@ -1401,6 +1401,9 @@ async def playwright_browser_factory(storage_state: Dict[str, Any], slot_number:
 
 
 # --------------------------------------------------------------------------- continuity runner
+BROWSER_CLOSE_TIMEOUT_SECONDS = 30
+
+
 @dataclass
 class ContinuityRunner:
     """Runs operations against the current slot with the mandated recovery ladder."""
@@ -1447,17 +1450,33 @@ class ContinuityRunner:
     async def close(self) -> None:
         if self.browser is not None:
             try:
-                await self.browser.close()
+                # a frozen browser can hang its own close too: give up on it after a short wait
+                await asyncio.wait_for(self.browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("browser did not close within %ss; abandoning it", BROWSER_CLOSE_TIMEOUT_SECONDS)
             finally:
                 self.browser = None
 
-    async def run(self, op):
+    async def _call(self, op, browser: Browser, timeout: float):
+        """The watchdog: an operation that makes no progress for `timeout` seconds is a frozen
+        browser. It is reported as a disconnect, so the recovery ladder below closes the browser,
+        opens a fresh one on the same slot and re-runs the operation from the same cursor."""
+        if timeout <= 0:
+            return await op(browser)
+        try:
+            return await asyncio.wait_for(op(browser), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise BrowserDisconnected(f"browser operation made no progress for {timeout:.0f}s; restarting the browser") from None
+
+    async def run(self, op, *, timeout: Optional[float] = None):
         """op(browser) -> result. Same cursor is the caller's responsibility: the op is re-invoked
-        unchanged, so whatever cursor it closed over is the cursor it resumes."""
+        unchanged, so whatever cursor it closed over is the cursor it resumes. `timeout` (seconds,
+        default PLS_BROWSER_OP_TIMEOUT_SECONDS) is the watchdog limit for one attempt."""
+        limit = float(settings.PLS_BROWSER_OP_TIMEOUT_SECONDS if timeout is None else timeout)
         browser = await self.ensure_browser()
         slot_no = browser.slot_number
         try:
-            result = await op(browser)
+            result = await self._call(op, browser, limit)
             await self.manager.touch(slot_no)
             return result
         except BrowserDisconnected as exc:
@@ -1469,7 +1488,7 @@ class ContinuityRunner:
                 if slot.state != "ACTIVE":
                     raise BrowserDisconnected(f"slot {slot_no} no longer ACTIVE")
                 browser = await self.open(slot)
-                result = await op(browser)
+                result = await self._call(op, browser, limit)
                 slot.reconnect_count += 1
                 self.reconnects += 1
                 await self.manager.touch(slot_no)
@@ -1485,7 +1504,7 @@ class ContinuityRunner:
                     raise
                 await self.manager.switch_current(alt.slot_number, f"continuity recovery from slot {slot_no}")
                 browser = await self.open(alt)
-                result = await op(browser)
+                result = await self._call(op, browser, limit)
                 self.reconnects += 1
                 await self.manager.touch(alt.slot_number)
                 return result
@@ -1499,7 +1518,7 @@ class ContinuityRunner:
                 raise
             await self.manager.switch_current(alt.slot_number, f"slot {slot_no} needs human login")
             browser = await self.open(alt)
-            result = await op(browser)
+            result = await self._call(op, browser, limit)
             await self.manager.touch(alt.slot_number)
             return result
         except ExplicitBlock as exc:
