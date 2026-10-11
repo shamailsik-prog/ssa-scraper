@@ -116,12 +116,15 @@ if settings.PLS_SEARCH_HARVEST_ENABLED:
         "options": {"expires": search_harvest_tick_expiry()},
     }
 if settings.PLS_CASEID_WALK_ENABLED:
-    app.conf.beat_schedule["pls-caseid-walk"] = {
-        "task": "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
-        "schedule": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS,
-        # a tick that waited behind a long job is dropped, not stacked: the next one carries on
-        "options": {"expires": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS},
-    }
+    # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
+    for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):
+        app.conf.beat_schedule[_name] = {
+            "task": "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
+            "schedule": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS,
+            "kwargs": {"partition": _partition},
+            # a tick that waited behind a long job is dropped, not stacked: the next one carries on
+            "options": {"expires": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS},
+        }
 if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
     app.conf.beat_schedule["reconcile-judgment-citation-relations"] = {
         "task": "scraper.tasks.treatment.reconcile_judgment_citation_relations",

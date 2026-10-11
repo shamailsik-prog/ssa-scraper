@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import random
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -26,6 +27,7 @@ from scraper.database import SessionLocal, run_async
 from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
+from scraper.pls_grid_health import dispatch_saturated
 from scraper.parsers.text_cleaner import clean_html
 from scraper.pls_caseid import case_name, case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME, claim_free_slot, release_claimed_slot
@@ -33,6 +35,18 @@ from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSiteP
 logger = logging.getLogger(__name__)
 
 STATE_KEY = "caseid_walk"
+# Two walks run side by side, one per login (11 Oct 2026): one walk at a time, at the login pacing, read
+# about 300 pages an hour while the second login idled. Each (year, court) group belongs to one partition.
+WALK_PARTITIONS = 2
+
+
+def partition_of(group_key: str) -> int:
+    return zlib.crc32(group_key.encode("utf-8")) % WALK_PARTITIONS
+
+
+def state_key(partition: Optional[int]) -> str:
+    """config_json key of one walk's cursor; partition 0 keeps the key of the single walk before the split."""
+    return STATE_KEY if not partition else f"{STATE_KEY}_p{partition}"
 
 
 def _now() -> datetime:
@@ -69,9 +83,10 @@ def _calibration_due(state: Dict[str, Any], now: datetime) -> bool:
 
 
 class CaseIdWalker:
-    def __init__(self, db, source: ScraperSource, *, redis_client=None, job_id=None, **pipeline_kwargs):
+    def __init__(self, db, source: ScraperSource, *, redis_client=None, job_id=None, partition: Optional[int] = None, **pipeline_kwargs):
         self.db = db
         self.source = source
+        self.partition = partition  # None: walk every group (one walk); 0 or 1: only that partition's groups
         self.pipeline = PakistanLawSitePipeline(db, source, redis_client=redis_client, job_id=job_id, **pipeline_kwargs)
         self.pacing_profile = login_pacing_profile("updates")
         self.stats: Dict[str, Any] = {"probes": 0, "hits": 0, "misses": 0, "staged": 0, "duplicates": 0, "groups": []}
@@ -81,7 +96,7 @@ class CaseIdWalker:
         await self.pipeline.sleep(random.uniform(lo, hi))
 
     async def _save(self, state: Dict[str, Any]) -> None:
-        await merge_source_config(self.db, self.source, {STATE_KEY: state})
+        await merge_source_config(self.db, self.source, {state_key(self.partition): state})
         await self.db.commit()
 
     async def _held_text(self, key: str, serial: int) -> str:
@@ -127,7 +142,13 @@ class CaseIdWalker:
 
     async def run(self, probes: int) -> Dict[str, Any]:
         now = _now()
-        state: Dict[str, Any] = dict((self.source.config_json or {}).get(STATE_KEY) or {})
+        cfg = dict(self.source.config_json or {})
+        state: Dict[str, Any] = dict(cfg.get(state_key(self.partition)) or {})
+        if self.partition and not state:
+            # first run of a split-off walk: carry over the single walk's calibration and its own groups' cursors
+            legacy = dict(cfg.get(STATE_KEY) or {})
+            state = {k: legacy[k] for k in ("calibrated_at", "calibration", "calibration_failed_at") if k in legacy}
+            state["groups"] = {k: v for k, v in dict(legacy.get("groups") or {}).items() if partition_of(k) == self.partition}
         groups: Dict[str, Dict[str, Any]] = dict(state.get("groups") or {})
         known = await load_known(self.db)
         if not known:
@@ -143,6 +164,8 @@ class CaseIdWalker:
         years = [split_group_key(k)[0] for k in known]
         first_year = int(settings.PLS_EARLIEST_YEAR or 0) or min(years)
         order = group_order(known, first_year=min(first_year, min(years)), last_year=now.year)
+        if self.partition is not None:
+            order = [k for k in order if partition_of(k) == self.partition]
         floor, pad, streak = int(settings.PLS_CASEID_WALK_CEILING), int(settings.PLS_CASEID_WALK_CEILING_PAD), int(settings.PLS_CASEID_WALK_MISS_STREAK)
         miss_sampled = False
         for key in order:
@@ -204,7 +227,7 @@ class CaseIdWalker:
         return self.stats
 
 
-async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None, job_id=None) -> Dict[str, Any]:
+async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None, job_id=None, partition: int = 0) -> Dict[str, Any]:
     if not settings.login_scraping_effective:
         return {"skipped": "login scraping not permitted in this environment"}
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
@@ -212,18 +235,22 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
         return {"skipped": "PakistanLawSite source missing"}
     if source.state in ("HALTED", "DISABLED", "PAUSED") or not source.is_active:
         return {"skipped": f"source state {source.state}"}
-    walker = CaseIdWalker(db, source, redis_client=redis_client, job_id=job_id)
+    if partition and not all(dispatch_saturated(dict(source.config_json or {}), shard) for shard in (0, 1)):
+        # the grid shards come first: the second walk takes a login only while both grid laps find nothing new
+        return {"skipped": "the citation grid has work; the second walk leaves this login to it"}
+    walker = CaseIdWalker(db, source, redis_client=redis_client, job_id=job_id, partition=partition)
     mode = await get_harvest_mode(db)
     walker.pacing_profile = login_pacing_profile(mode)
     walker.pipeline.harvest_mode = mode
     walker.pipeline.pacing_profile = walker.pacing_profile
     active = len([s for s in await walker.pipeline.manager.slots() if s.state == "ACTIVE"])
     lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max(1, min(int(walker.pacing_profile.get("login_session_concurrency") or 1), active)))
-    # one walk at a time: its cursor is a single state key in the source config
-    walk_lock = SessionLock(f"{SOURCE_NAME}:caseid_walk", redis_client, max_holders=1)
+    # one walk per partition at a time: each partition's cursor is one state key in the source config
+    walk_lock = SessionLock(f"{SOURCE_NAME}:caseid_walk" if not partition else f"{SOURCE_NAME}:caseid_walk:p{partition}", redis_client, max_holders=1)
     try:
         await walk_lock.acquire()
     except SessionLockHeld:
+        await walk_lock.release()
         return {"skipped": "another case-ID walk is running"}
     try:
         await lock.acquire()
