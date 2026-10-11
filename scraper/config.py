@@ -137,6 +137,14 @@ class Settings(BaseSettings):
     PLAYWRIGHT_ENABLED: bool = Field(default=True)
     PLAYWRIGHT_HEADLESS: bool = Field(default=True)
     PLAYWRIGHT_TIMEOUT_MS: int = Field(default=90000)
+    PLS_BROWSER_OP_TIMEOUT_SECONDS: int = Field(
+        default=180,
+        description="Watchdog: a PakistanLawSite page operation (open a judgment, download a PDF, submit a search) that makes no progress this long is a frozen browser; it is restarted on the same slot and the operation resumes. 0 disables.",
+    )
+    PLS_GRID_OP_TIMEOUT_SECONDS: int = Field(
+        default=600,
+        description="Watchdog limit for opening the citation grid, which loads a 10-16 MB page and seeks to the cursor row. 0 disables.",
+    )
     PLAYWRIGHT_EXECUTABLE_PATH: str = Field(default="", description="Optional Chromium executable; blank = Playwright's bundled browser.")
     PLAYWRIGHT_MAX_HTML_BYTES: int = Field(default=2_000_000, description="Guard: skip full page.content() when HTML responses are larger than this many bytes.")
     PLAYWRIGHT_OVERSIZE_INPUT_THRESHOLD: int = Field(default=5000, description="Guard: skip full page.content() when the DOM input count indicates a huge datatable surface.")

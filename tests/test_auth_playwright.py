@@ -1057,7 +1057,7 @@ async def test_ensure_search_map_normalizes_cached_citation_grid_columns_for_com
     )
     pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory())
 
-    async def fake_run(_op):
+    async def fake_run(_op, **_kwargs):
         return PageResult(
             url=settings.PLS_SEARCH_URL,
             html="<html><body><table id='archivedpatientGrid'></table></body></html>",
@@ -1086,7 +1086,7 @@ async def test_ensure_search_map_keeps_cached_citation_grid_map_when_snapshot_fa
     )
     pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory())
 
-    async def fake_run(_op):
+    async def fake_run(_op, **_kwargs):
         return PageResult(
             url=settings.PLS_SEARCH_URL,
             html="<html><body><div id='oversize_guard'>stub</div></body></html>",
