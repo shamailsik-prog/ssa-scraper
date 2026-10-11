@@ -174,3 +174,33 @@ async def test_run_locks_are_kept_alive_with_every_page(db):
         pass
     await r.aclose()
     assert calls["n"] == 1
+
+
+async def test_claim_free_slot_prefers_the_login_with_more_of_its_hour_left(db):
+    """11 Oct 2026: the case-ID walk and the search harvest always opened login 1 first, so login 1 spent its
+    300 pages an hour and the walk stopped on its budget while login 2 sat unused since 00:44."""
+    from datetime import datetime, timezone
+
+    from scraper.tasks.pakistanlawsite import pacing_key
+
+    pipeline, r = await _pipeline(db, (1, 2))
+    hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    cfg = dict(pipeline.source.config_json or {})
+    cfg[pacing_key(1)] = {"hour": hour, "hour_pages": 290}
+    cfg[pacing_key(2)] = {"hour": hour, "hour_pages": 10}
+    pipeline.source.config_json = cfg
+    await db.flush()
+    try:
+        slot = await claim_free_slot(pipeline)
+        assert slot is not None and slot.slot_number == 2
+        await pipeline._slot_lock.release()
+        cfg[pacing_key(2)] = {"hour": "2000-01-01T00", "hour_pages": 999}  # an old hour counts as unused
+        cfg[pacing_key(1)] = {"hour": hour, "hour_pages": 5}
+        pipeline.source.config_json = dict(cfg)
+        await db.flush()
+        slot = await claim_free_slot(pipeline)
+        assert slot is not None and slot.slot_number == 2
+        await pipeline._slot_lock.release()
+    finally:
+        await r.delete(*SLOT_KEYS)
+        await r.aclose()
