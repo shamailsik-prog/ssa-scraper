@@ -33,6 +33,7 @@ app = Celery(
         "scraper.tasks.pls_self_healing",
         "scraper.tasks.pls_search_harvest",
         "scraper.tasks.pls_caseid_walk",
+        "scraper.tasks.pls_backfill",
     ],
 )
 app.conf.update(
@@ -48,6 +49,7 @@ app.conf.update(
         "scraper.tasks.dispatcher.run_source_job": {"queue": "scraper"},
         "scraper.tasks.embeddings.process_embedding_queue": {"queue": "embeddings"},
         "scraper.tasks.promotion.promote_staging_records": {"queue": "maintenance"},
+        "scraper.tasks.pls_backfill.requalify_quarantined": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
@@ -66,6 +68,13 @@ app.conf.update(
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900, "kwargs": {"limit": 200}},
+        # PakistanLawSite judgments held for a reason a later extractor fix removes ("court unknown") are re-checked
+        # from their stored text; no request goes to the site, and merits holds are left to a person.
+        "pls-requalify-quarantined": {
+            "task": "scraper.tasks.pls_backfill.requalify_quarantined",
+            "schedule": 3600,
+            "kwargs": {"limit": 2000, "skip_final": True},
+        },
         # Operator decision of 24 September 2026: a lost slot is re-verified and, if dead, signed in
         # again with the saved credentials (runs on the single login-session worker, never beside a job).
         "recover-login-slots": {"task": "scraper.tasks.login_recovery.recover_login_slots", "schedule": settings.LOGIN_RECOVERY_SCHEDULE_SECONDS},

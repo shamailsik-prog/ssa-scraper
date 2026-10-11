@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scraper.database import SessionLocal
+from celery import shared_task
+
+from scraper.database import SessionLocal, run_async
 from scraper.extractors import deterministic as det
 from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
@@ -63,7 +65,7 @@ async def backfill_case_metadata(db: AsyncSession, *, batch: int = 500, limit: O
     return counts
 
 
-async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
+async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False, skip_final: bool = False) -> Dict[str, Any]:
     """Re-run the (deterministic, no-AI) extraction + validation on quarantined PLS captures whose citation is still not
     a judgment. Rows that now validate are re-promoted; rows that still fail stay quarantined with their new reason
     (bad pages are re-fetched by the grid walk instead, see quarantined_capture_retryable)."""
@@ -75,7 +77,11 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
     directory = await load_court_directory(db)
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
     min_confidence = float((source.extraction_min_confidence if source else None) or settings.SGAI_DEFAULT_MIN_CONFIDENCE)
-    counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}}
+    counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}, "skipped_final": 0}
+    final = None
+    if skip_final:
+        # the scheduled run leaves a judgment held on the merits (a citation conflict, a human decision) to a person
+        from scraper.tasks.pakistanlawsite import _FINAL_QUARANTINE as final
     ids = (
         await db.execute(
             select(ScraperStaging.id)
@@ -89,6 +95,9 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
     for st_id in ids:
         st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == st_id))).scalars().first()
         if st is None:
+            continue
+        if final is not None and final.search(st.quarantine_reason or ""):
+            counts["skipped_final"] += 1
             continue
         counts["scanned"] += 1
         text = st.raw_text or ""
@@ -148,3 +157,9 @@ async def run_backfill_metadata(**kw) -> Dict[str, int]:
 async def run_requalify(**kw) -> Dict[str, Any]:
     async with SessionLocal() as db:
         return await requalify_quarantined(db, **kw)
+
+
+@shared_task(name="scraper.tasks.pls_backfill.requalify_quarantined")
+def requalify_quarantined_task(limit: int = 2000, skip_final: bool = True):
+    """Scheduled form of `pls_admin requalify-quarantine`: deterministic, stored text only, merits holds left alone."""
+    return run_async(run_requalify(limit=limit, skip_final=skip_final))
