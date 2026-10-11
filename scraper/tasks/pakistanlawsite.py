@@ -1457,10 +1457,14 @@ class PakistanLawSitePipeline:
                 pdf_bytes = await self.download(row["pdf_url"])
                 if pdf_bytes[:4] == b"%PDF":
                     pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=html_prov)
-                    from scraper.fetchers import pdf_text_layer
+                    from scraper.corpus_record import text_is_thin
+                    from scraper.fetchers import pdf_text_layer_info
 
-                    pdf_text = pdf_text_layer(pdf_bytes)  # typed text only: never OCR on the login worker
-                    if len(pdf_text) > len(text):
+                    pdf_text, pdf_scanned = pdf_text_layer_info(pdf_bytes)  # never OCR on the login worker
+                    if pdf_scanned or text_is_thin(pdf_text):
+                        # Keep notes HTML from masking a scanned attachment: thin text → needs_ocr in corpus.
+                        text = pdf_text
+                    elif len(pdf_text) > len(text):
                         text = pdf_text
             except (ExplicitBlock, VerificationRequired, LoginRequired, BrowserDisconnected):
                 raise
