@@ -1906,6 +1906,35 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return out
 
 
+async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
+    """Take the slot lock of an ACTIVE login nobody else holds (the current login first) and bind `pipeline` to it:
+    its browser opens that login only and never fails over onto the other one, which another job may be using.
+    Login 1 and login 2 are separate accounts that run at the same time (operator decision, 11 Oct 2026), but two
+    browsers on ONE login end each other. Returns the slot, or None when every ACTIVE login is in use."""
+    current = await pipeline.manager.current_slot()
+    active = [s for s in await pipeline.manager.slots() if s.state == "ACTIVE"]
+    active.sort(key=lambda s: (current is None or s.slot_number != current.slot_number, s.slot_number))
+    for slot in active:
+        lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", pipeline.redis_client, max_holders=1)
+        try:
+            await lock.acquire()
+        except SessionLockHeld:
+            continue
+        pipeline._slot_lock = lock
+        pipeline.runner.preferred_slot_number = slot.slot_number
+        pipeline.runner.exclusive_slot = True
+        return slot
+    return None
+
+
+async def release_claimed_slot(pipeline: "PakistanLawSitePipeline") -> None:
+    if pipeline._slot_lock is not None:
+        try:
+            await pipeline._slot_lock.release()
+        finally:
+            pipeline._slot_lock = None
+
+
 async def scrape_pakistanlawsite(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
     reporter_shard = kwargs.pop("reporter_shard", None)
     pipeline = PakistanLawSitePipeline(db, source, reporter_shard=reporter_shard, **kwargs)

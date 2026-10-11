@@ -249,15 +249,15 @@ for line in example.splitlines():
         continue
     s += ("" if s.endswith("\n") else "\n") + line + "\n"
     added.append(m.group(1))
-# Values an earlier release wrote that the specification refuses or no longer reads. The settings
-# validator refuses LOGIN_SESSION_CONCURRENCY other than 1 (one login-session worker at a time), so
-# a 2 left in .env would stop every container from starting; keys of removed features (harvest
-# modes, backfill pacing, citation-grid windows, automatic login recovery, block-retry cooldowns)
-# are dropped so the file matches .env.example.
+# Values an earlier release wrote that the specification refuses or no longer reads; keys of removed
+# features (harvest modes, backfill pacing, citation-grid windows, automatic login recovery,
+# block-retry cooldowns) are dropped so the file matches .env.example.
+# Operator decision of 11 October 2026: PakistanLawSite login 1 and login 2 are separate accounts and
+# run at the same time, one reporter shard each (each login keeps its own 300 pages an hour).
 migrated = []
-s, n = re.subn(r"^LOGIN_SESSION_CONCURRENCY=2\s*$", "LOGIN_SESSION_CONCURRENCY=1", s, flags=re.M)
+s, n = re.subn(r"^LOGIN_SESSION_CONCURRENCY=1\s*$", "LOGIN_SESSION_CONCURRENCY=2", s, flags=re.M)
 if n:
-    migrated.append("LOGIN_SESSION_CONCURRENCY 2->1")
+    migrated.append("LOGIN_SESSION_CONCURRENCY 1->2")
 # Specification 3.6 and 11: the login-session pacing numbers are fixed (4.0-9.0 s, 300 pages an
 # hour, 2,500 a day) and "server size never changes these numbers". An earlier release had left
 # PAGES_PER_HOUR=10000 and PAGES_PER_DAY=200000 on the server (seen 24 September 2026), which is

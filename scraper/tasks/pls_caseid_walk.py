@@ -28,7 +28,7 @@ from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.parsers.text_cleaner import clean_html
 from scraper.pls_caseid import case_name, case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
-from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
+from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME, claim_free_slot, release_claimed_slot
 
 logger = logging.getLogger(__name__)
 
@@ -219,13 +219,23 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
     walker.pipeline.pacing_profile = walker.pacing_profile
     active = len([s for s in await walker.pipeline.manager.slots() if s.state == "ACTIVE"])
     lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max(1, min(int(walker.pacing_profile.get("login_session_concurrency") or 1), active)))
+    # one walk at a time: its cursor is a single state key in the source config
+    walk_lock = SessionLock(f"{SOURCE_NAME}:caseid_walk", redis_client, max_holders=1)
+    try:
+        await walk_lock.acquire()
+    except SessionLockHeld:
+        return {"skipped": "another case-ID walk is running"}
     try:
         await lock.acquire()
     except SessionLockHeld:
         await lock.release()
+        await walk_lock.release()
         return {"skipped": "login session lock held"}
     try:
         walker.pipeline._session_lock = lock
+        if await claim_free_slot(walker.pipeline) is None:
+            # both logins are busy with grid shards: never open a second browser on a login in use
+            return {"skipped": "no free login slot"}
         walker.pipeline._assert_permitted()
         return await walker.run(int(probes or settings.PLS_CASEID_WALK_PROBES_PER_TICK))
     except (PacingBudgetExceeded, LoginRequired) as exc:
@@ -237,7 +247,9 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
             await walker.pipeline.runner.close()
         except Exception:
             pass
+        await release_claimed_slot(walker.pipeline)
         await lock.release()
+        await walk_lock.release()
 
 
 @shared_task(name="scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick")
