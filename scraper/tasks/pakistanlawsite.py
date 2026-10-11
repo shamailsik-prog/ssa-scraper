@@ -1923,6 +1923,7 @@ async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
         try:
             await lock.acquire()
         except SessionLockHeld:
+            await lock.release()
             continue
         pipeline._slot_lock = lock
         pipeline.runner.preferred_slot_number = slot.slot_number
