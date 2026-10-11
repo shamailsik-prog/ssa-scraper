@@ -205,6 +205,9 @@ def _caseid_walk_progress(pls_cfg: Dict[str, Any]) -> Dict[str, Any]:
     best_probe: Optional[datetime] = None
     for p in range(WALK_PARTITIONS):
         walk = pls_cfg.get(state_key(p)) or {}
+        if p and not walk:
+            # this partition has not run yet: its groups' progress is still in the single walk's record
+            walk = {"groups": (pls_cfg.get(state_key(0)) or {}).get("groups") or {}}
         if walk.get("calibrated_at"):
             calibrated = True
         if calibration is None and walk.get("calibration") is not None:

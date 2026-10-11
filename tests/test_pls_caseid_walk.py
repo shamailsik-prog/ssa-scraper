@@ -257,3 +257,17 @@ async def test_the_second_walk_steps_aside_while_the_grid_has_work(db, login_sou
     monkeypatch.setattr(pls_caseid_walk, "dispatch_saturated", lambda cfg, shard, now=None: shard == 0)
     out = await run_caseid_walk(db, partition=1)
     assert out == {"skipped": "the citation grid has work; the second walk leaves this login to it"}
+
+
+def test_status_counts_every_group_before_and_after_the_split():
+    from scraper.dashboard_metrics import _caseid_walk_progress
+    from scraper.tasks.pls_caseid_walk import partition_of, state_key
+
+    keys = [f"{y}{c}" for y in (2020, 2021, 2022) for c in ("S", "L")]
+    p1 = [k for k in keys if partition_of(k) == 1]
+    legacy = {"calibrated_at": "x", "groups": {k: {"hits": 2, "misses": 1} for k in keys}}
+    before = _caseid_walk_progress({state_key(0): legacy})  # partition 1 has not run yet
+    assert before["groups_started"] == len(keys) and before["found"] == 2 * len(keys)
+    after = _caseid_walk_progress({state_key(0): legacy, state_key(1): {"groups": {k: {"hits": 5, "misses": 0} for k in p1}}})
+    assert after["groups_started"] == len(keys)
+    assert after["found"] == 2 * (len(keys) - len(p1)) + 5 * len(p1)  # partition 1's own record wins for its groups
