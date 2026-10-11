@@ -347,6 +347,8 @@ class PakistanLawSitePipeline:
         self._other_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
         self._slot_lock: Optional[SessionLock] = None
+        # locks a caller holds for the length of its run (one search harvest, one case-ID walk): kept alive per page
+        self._run_locks: List[SessionLock] = []
         self._surface_page: Optional[PageResult] = None
         self._surface_page_start_row: Optional[int] = None
         self._citation_grid_fast_reload: bool = False
@@ -375,6 +377,8 @@ class PakistanLawSitePipeline:
             await self._session_lock.refresh()
         if self._slot_lock is not None:
             await self._slot_lock.refresh()
+        for lock in self._run_locks:
+            await lock.refresh()
         now = datetime.now(timezone.utc)
         key = pacing_key(await self._pacing_slot_number())
         cfg = dict(self.source.config_json or {})

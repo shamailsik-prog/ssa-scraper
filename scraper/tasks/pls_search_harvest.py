@@ -638,6 +638,7 @@ async def run_search_harvest(
         return {"skipped": True, "reason": "login session lock held"}
     try:
         runner.pipeline._session_lock = lock
+        runner.pipeline._run_locks.append(harvest_lock)
         if await claim_free_slot(runner.pipeline) is None:
             # both logins are busy with grid shards: never open a second browser on a login in use
             query_row.status = "pending"

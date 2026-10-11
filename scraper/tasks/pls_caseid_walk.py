@@ -233,6 +233,7 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
         return {"skipped": "login session lock held"}
     try:
         walker.pipeline._session_lock = lock
+        walker.pipeline._run_locks.append(walk_lock)
         if await claim_free_slot(walker.pipeline) is None:
             # both logins are busy with grid shards: never open a second browser on a login in use
             return {"skipped": "no free login slot"}

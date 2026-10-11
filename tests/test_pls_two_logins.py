@@ -27,7 +27,10 @@ async def _pipeline(db, active_slots):
     await db.flush()
     r = aioredis.from_url(settings.REDIS_URL)
     await r.delete(*SLOT_KEYS)
-    return PakistanLawSitePipeline(db, source, redis_client=r), r
+    async def _nosleep(*_a, **_k):
+        return None
+
+    return PakistanLawSitePipeline(db, source, redis_client=r, sleep=_nosleep), r
 
 
 async def test_claim_free_slot_takes_the_login_nobody_holds(db):
@@ -103,3 +106,71 @@ def test_deploy_step_sets_both_logins_in_env(tmp_path):
     subprocess.run(["bash", "-c", prog, "deploy-test", str(tmp_path)], check=True, capture_output=True, text=True)
     lines = env.read_text(encoding="utf-8").splitlines()
     assert lines == ["FOO=1", "LOGIN_SESSION_CONCURRENCY=2", "BAR=2", "BACKFILL_LOGIN_SESSION_CONCURRENCY=2"]
+
+
+async def test_a_crashed_shared_holder_drops_out_on_its_own(monkeypatch):
+    """Review on #192: one live holder refreshing the shared key kept a crashed holder's place for ever."""
+    import asyncio
+
+    import scraper.auth.session_manager as sm
+    from scraper.auth.session_manager import SessionLockHeld
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    key = "corpus:login_session_lock:PakistanLawSite:holders"
+    await r.delete(key, "corpus:login_session_lock:PakistanLawSite")
+    monkeypatch.setattr(sm, "LOCK_TTL_SECONDS", 1)
+    crashed = SessionLock("PakistanLawSite", r, max_holders=2)
+    alive = SessionLock("PakistanLawSite", r, max_holders=2)
+    try:
+        await crashed.acquire()
+        await alive.acquire()
+        third = SessionLock("PakistanLawSite", r, max_holders=2)
+        try:
+            await third.acquire()
+            raise AssertionError("both places are taken")
+        except SessionLockHeld:
+            pass
+        for _ in range(3):  # the live holder keeps refreshing; the crashed one never does
+            await asyncio.sleep(0.45)
+            await alive.refresh()
+        newcomer = SessionLock("PakistanLawSite", r, max_holders=2)
+        await newcomer.acquire()  # the crashed holder's place is free again
+        await newcomer.release()
+        await alive.release()
+    finally:
+        await r.delete(key)
+        await r.aclose()
+
+
+async def test_shared_lock_reads_the_older_plain_set_format():
+    r = aioredis.from_url(settings.REDIS_URL)
+    key = "corpus:login_session_lock:PakistanLawSite:holders"
+    await r.delete(key, "corpus:login_session_lock:PakistanLawSite")
+    await r.sadd(key, "holder-from-the-previous-release")
+    try:
+        lock = SessionLock("PakistanLawSite", r, max_holders=2)
+        await lock.acquire()  # one place left: the old holder keeps its own
+        assert await r.type(key) in (b"zset", "zset")
+        assert await r.zcard(key) == 2
+        await lock.release()
+        assert await r.zcard(key) == 1
+    finally:
+        await r.delete(key)
+        await r.aclose()
+
+
+async def test_run_locks_are_kept_alive_with_every_page(db):
+    pipeline, r = await _pipeline(db, (1,))
+    calls = {"n": 0}
+
+    class RunLock:
+        async def refresh(self):
+            calls["n"] += 1
+
+    pipeline._run_locks.append(RunLock())
+    try:
+        await pipeline._charge_page()
+    except Exception:
+        pass
+    await r.aclose()
+    assert calls["n"] == 1
