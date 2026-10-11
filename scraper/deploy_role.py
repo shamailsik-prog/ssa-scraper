@@ -19,7 +19,7 @@ from scraper.config import settings
 # Beat entries that only make sense where PakistanLawSite is harvested: they sign in, keep the login
 # alive, watch PakistanLawSite for stalls, walk its search grid, or re-fetch through the login session.
 LOGIN_ONLY_BEAT_ENTRIES = frozenset(
-    {"recover-login-slots", "pls-keepalive", "pls-stall-watchdog", "spot-check-judgments", "pls-search-harvest", "pls-caseid-walk"}
+    {"recover-login-slots", "pls-keepalive", "pls-stall-watchdog", "spot-check-judgments", "pls-search-harvest", "pls-caseid-walk", "pls-caseid-walk-p1"}
 )
 # Beat entries that only make sense where the free sites are harvested (statutes come from them).
 PUBLIC_ONLY_BEAT_ENTRIES = frozenset({"spot-check-statutes", "reconcile-instrument-relations"})

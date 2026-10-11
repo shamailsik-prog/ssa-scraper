@@ -188,3 +188,72 @@ async def test_held_text_lookup_matches_the_whole_case_name(db, login_source):
     assert await walker._held_text("1984K", 201) == ""  # 1984K2010 is another case
     assert await walker._held_text("1984K", 2010) == "text of 1984K2010"
     assert await walker._held_text("1984K", 7) == "text of 1984K7"  # case name at the end of the link
+
+
+async def test_two_walks_split_the_groups_and_keep_their_own_progress(db, login_source, monkeypatch):
+    """11 Oct 2026: one walk at a time, at 6-9 s a page, read about 300 pages an hour while login 2 idled.
+    Two walks run side by side, one per login: each walks only its own groups and records its own cursor."""
+    from scraper.pls_caseid import parse_case_id
+    from scraper.tasks.pls_caseid_walk import partition_of, state_key
+
+    await _activate(db, login_source, slots=(1,))
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_MISS_STREAK", 2)
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_CEILING", 3)
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_CEILING_PAD", 0)
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 2020)
+    known = {f"{y}{c}": {900} for y in (2020, 2021, 2022) for c in ("S", "L")}
+
+    async def _known(_db):
+        return {k: set(v) for k, v in known.items()}
+
+    monkeypatch.setattr(pls_caseid_walk, "load_known", _known)
+    assert {partition_of(k) for k in known} == {0, 1}
+    # the single walk before the split: calibrated, and part-way through a group of partition 1
+    p1_group = next(k for k in sorted(known) if partition_of(k) == 1)
+    login_source.config_json = {**(login_source.config_json or {}), STATE_KEY: {
+        "calibrated_at": "2026-10-10T00:00:00+00:00", "calibration": [{"ok": True, "matched_by": "held_text"}],
+        "groups": {p1_group: {**new_state(), "next": 2}},
+    }}
+    await db.flush()
+
+    sc = BrowserScript()  # nothing is a judgment: every probe is a miss
+    stats = await CaseIdWalker(db, login_source, browser_factory=sc.factory(), sleep=_nosleep, partition=1).run(probes=50)
+    asked = [parse_case_id(k[1]) for k, _ in sc.log if k[0] == "goto"]
+    assert asked and stats["probes"] == len(asked)  # no calibration: it carried over from the single walk
+    assert {partition_of(f"{y}{c}") for y, c, _ in asked} == {1}
+    assert (int(p1_group[:4]), p1_group[4], 1) not in asked  # resumed where the single walk stopped
+    cfg = login_source.config_json or {}
+    walked = set(cfg[state_key(1)]["groups"])
+    assert {k for k in known if partition_of(k) == 1} <= walked and {partition_of(k) for k in walked} == {1}
+    assert state_key(0) == STATE_KEY and set(cfg[STATE_KEY]["groups"]) == {p1_group}  # partition 0's record untouched
+
+    sc0 = BrowserScript()
+    await CaseIdWalker(db, login_source, browser_factory=sc0.factory(), sleep=_nosleep, partition=0).run(probes=50)
+    asked0 = [parse_case_id(k[1]) for k, _ in sc0.log if k[0] == "goto"]
+    assert asked0 and {partition_of(f"{y}{c}") for y, c, _ in asked0} == {0}
+
+
+def test_both_walk_partitions_are_scheduled_and_lock_separately():
+    from pathlib import Path
+
+    from scraper.deploy_role import LOGIN_ONLY_BEAT_ENTRIES
+    from scraper.tasks.celery_app import app
+
+    entries = {k: v for k, v in app.conf.beat_schedule.items() if v["task"] == "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick"}
+    assert sorted((v.get("kwargs") or {}).get("partition", 0) for v in entries.values()) == [0, 1]
+    assert set(entries) <= LOGIN_ONLY_BEAT_ENTRIES
+    assert ':caseid_walk:p{partition}"' in Path("scraper/tasks/pls_caseid_walk.py").read_text(encoding="utf-8")
+
+
+async def test_the_second_walk_steps_aside_while_the_grid_has_work(db, login_source, monkeypatch):
+    """The second walk only uses a login the citation-grid shards do not need: while the grid is not saturated,
+    it skips and leaves that login to the grid, as before the split."""
+    from scraper.tasks.pls_caseid_walk import run_caseid_walk
+
+    await _activate(db, login_source, slots=(1, 2))
+    login_source.state, login_source.is_active = "ACTIVE", True
+    await db.flush()
+    monkeypatch.setattr(type(settings), "login_scraping_effective", property(lambda self: True))
+    monkeypatch.setattr(pls_caseid_walk, "dispatch_saturated", lambda cfg, shard, now=None: shard == 0)
+    out = await run_caseid_walk(db, partition=1)
+    assert out == {"skipped": "the citation grid has work; the second walk leaves this login to it"}
