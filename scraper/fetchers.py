@@ -397,6 +397,7 @@ async def stage_statute(
 
 def pdf_text_with_ocr(pdf_bytes: bytes) -> tuple[str, bool]:
     """Extract text from original PDF bytes; returns (text, ocr_applied)."""
+    from scraper.corpus_record import text_is_thin
     from scraper.parsers.pdf_extractor import _pdfplumber_extract, extract_pdf_text  # type: ignore
 
     try:
@@ -404,5 +405,5 @@ def pdf_text_with_ocr(pdf_bytes: bytes) -> tuple[str, bool]:
     except Exception:
         primary, scanned = "", True
     text = extract_pdf_text(pdf_bytes)
-    ocr_applied = bool(scanned or len((primary or "").strip()) < 200)
+    ocr_applied = bool(scanned or text_is_thin(primary))
     return text, ocr_applied

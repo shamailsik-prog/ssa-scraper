@@ -321,6 +321,10 @@ async def trigger(name: str, db: AsyncSession = Depends(get_db)) -> Dict[str, An
     s = await _source(db, name)
     if s.state in ("HALTED", "DISABLED"):
         raise HTTPException(409, f"source is {s.state}: {s.state_reason}")
+    from scraper.deploy_role import harvests
+
+    if not harvests(s.access_method):
+        raise HTTPException(409, f"{name} is harvested by the other server (this server's DEPLOY_ROLE is {settings.DEPLOY_ROLE})")
     from scraper.tasks.celery_app import app
 
     if s.access_method == "login_session":

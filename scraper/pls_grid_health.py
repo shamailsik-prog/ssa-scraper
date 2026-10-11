@@ -378,6 +378,11 @@ def compute_stalled(
     (a real fault: work is running and yields nothing)."""
     now = now or datetime.now(timezone.utc)
     threshold = float(threshold_hours if threshold_hours is not None else stall_threshold_hours())
+    from scraper.deploy_role import harvests_login_sources
+
+    if not harvests_login_sources():
+        # A free-sites server never harvests PakistanLawSite, so it can never be stalled on it.
+        return {"stalled": False, "stalled_reason": "not_harvested_on_this_server", "hours_since_last_judgment": None, "threshold_hours": threshold, "last_judgment_at": None}
     if last_promotion_at is not None and last_promotion_at.tzinfo is None:
         last_promotion_at = last_promotion_at.replace(tzinfo=timezone.utc)
     idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)

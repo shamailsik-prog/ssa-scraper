@@ -131,7 +131,10 @@ if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
             "batch_size": settings.JUDGMENT_CITATION_RECONCILE_BATCH_SIZE,
         },
     }
-logger.info("Celery configured: queues scraper/login_session/embeddings/maintenance; beat %s", list(app.conf.beat_schedule))
+from scraper.deploy_role import beat_schedule_for_role, deploy_role  # noqa: E402
+
+app.conf.beat_schedule = beat_schedule_for_role(app.conf.beat_schedule)
+logger.info("Celery configured for deploy role %s: queues scraper/login_session/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
 
 
 @worker_ready.connect
