@@ -151,7 +151,18 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
     ),
     "CLD": _year_first(_letters("CLD")),
     "GBLR": _year_first(_letters("GBLR"), court=False),
+    # A court's own neutral citation: "2025 SHC KHI 608" (Sindh High Court, with its bench seat),
+    # "2025 PHC 1", "2012 LHC 869", "2024 IHC 123", "2023 SCP 245". The court issues it, so the
+    # citation names the court and no law report is involved.
+    "NEUTRAL": re.compile(
+        r"\b(?P<year>19\d{2}|20\d{2})\s+(?:(?P<shc>SHC)\s+(?P<seat>KHI|HYD|SUK|LRK|MPK)|(?P<nc>LHC|IHC|PHC|SCP))"
+        r"\s+(?P<page>\d+)\b",
+        re.IGNORECASE,
+    ),
 }
+
+# The court each neutral citation names (keys of PLD_COURT_CANONICAL's values).
+NEUTRAL_CITATION_COURT = {"SHC": "Sindh", "LHC": "Lahore", "IHC": "Islamabad", "PHC": "Peshawar", "SCP": "SC"}
 
 # ============================================================================
 # 4 STATUTE PATTERNS
@@ -451,6 +462,12 @@ def _year_first_normalised(reporter_key: str, m: re.Match) -> str:
     return f"{out} {_clean_page(m.group('page'))}"
 
 
+def _neutral_normalised(m: re.Match) -> str:
+    seat = m.group("seat")
+    court = (m.group("shc") or m.group("nc")).upper()
+    return f"{m.group('year')} {court}{' ' + seat.upper() if seat else ''} {int(m.group('page'))}"
+
+
 def normalise_citation(raw: str) -> str:
     """
     Normalise a raw Pakistani legal citation string.
@@ -476,6 +493,9 @@ def normalise_citation(raw: str) -> str:
         return ""
 
     m_pld = CITATION_PATTERNS["PLD"].search(s)
+    m_nc = CITATION_PATTERNS["NEUTRAL"].search(s)
+    if m_nc and not (m_pld and m_pld.start() <= m_nc.start() < m_pld.end()):
+        return _neutral_normalised(m_nc)
     if m_pld:
         year = m_pld.group("year")
         court_raw = m_pld.group("court")
@@ -538,6 +558,25 @@ def extract_citations(text: str) -> List[Dict[str, Any]]:
         for match in pattern.finditer(text):
             raw = match.group(0)
             gd = match.groupdict()
+            if reporter == "NEUTRAL":
+                # inside a PLD citation found already ("PLD 2023 IHC 5", "P. L. D. 2023 IHC 5"): not neutral
+                if any(r["reporter"] == "PLD" and r["span"][0] <= match.start() < r["span"][1] for r in results):
+                    continue
+                nc = (gd["shc"] or gd["nc"]).upper()
+                if not 1947 <= int(gd["year"]) <= 2030:
+                    continue
+                results.append(
+                    {
+                        "raw": raw.strip(),
+                        "reporter": nc,
+                        "year": int(gd["year"]),
+                        "court": NEUTRAL_CITATION_COURT[nc],
+                        "page": str(int(gd["page"])),
+                        "normalized": _neutral_normalised(match),
+                        "span": (match.start(), match.end()),
+                    }
+                )
+                continue
             year_str = gd.get("year")
             try:
                 year = int(year_str) if year_str else None

@@ -57,7 +57,9 @@ echo; echo "== other checkouts of this project on disk"; find / -maxdepth 4 -typ
 echo; echo "== git state of /opt/ssa-scraper"; git -C /opt/ssa-scraper log --oneline -1; git -C /opt/ssa-scraper status --porcelain --untracked-files=no; git -C /opt/ssa-scraper stash list; git -C /opt/ssa-scraper for-each-ref refs/server-edits
 echo; echo "== hand edits set aside by deploys (diff, first 120 lines)"; git -C /opt/ssa-scraper stash show -p "stash@{0}" 2>/dev/null | head -120
 echo; echo "== .env keys that differ from .env.example (names only)"; diff <(grep -oE "^[A-Z][A-Z0-9_]*=" /opt/ssa-scraper/.env | sort) <(grep -oE "^[A-Z][A-Z0-9_]*=" /opt/ssa-scraper/.env.example | sort) | head -20; echo "LOGIN_SESSION_CONCURRENCY=$(grep -E "^LOGIN_SESSION_CONCURRENCY=" /opt/ssa-scraper/.env | cut -d= -f2)"
-echo; echo "== SSH logins in the last 48 hours"; journalctl -u ssh --since "48 hours ago" --no-pager 2>/dev/null | grep -E "Accepted|session opened" | tail -30; last -n 20 -F 2>/dev/null | head -25
+echo; echo "== SSH logins in the last 72 hours, by key (count, first, last, addresses)"; journalctl -u ssh --since "72 hours ago" --no-pager -o short-iso 2>/dev/null | grep "Accepted publickey" | awk "{ip=\"\"; for(i=1;i<=NF;i++) if(\$i==\"from\") ip=\$(i+1); k=\$NF; n[k]++; if(!(k in f)) f[k]=\$1; l[k]=\$1; if(index(\" \" a[k], \" \" ip \" \")==0 && length(a[k])<120) a[k]=a[k] ip \" \"} END {for(k in n) print k, n[k], f[k], l[k], a[k]}"
+echo; echo "== keys allowed to log in as root (fingerprints only)"; ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null | awk "{print \$2, \$NF}"
+echo; echo "== SSH logins, latest 30"; journalctl -u ssh --since "48 hours ago" --no-pager 2>/dev/null | grep -E "Accepted" | tail -30; last -n 20 -F 2>/dev/null | head -25
 echo; echo "== recent shell history of root (commands only, last 60)"; tail -60 /root/.bash_history 2>/dev/null
 echo; echo "== docker exec / compose invocations seen by the docker daemon (last 200 journal lines)"; journalctl -u docker --since "48 hours ago" --no-pager 2>/dev/null | tail -20'
   ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'

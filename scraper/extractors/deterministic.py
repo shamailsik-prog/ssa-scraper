@@ -174,9 +174,24 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     if title_ev:
         evidence["case_title"] = title_ev
     court = source_meta.get("court")
+    hint_court = None
+    if not court and hint:
+        # the result row's own citation names its court ("2025 SHC KHI 608", "PLD 2025 SC 1"); a case the
+        # judgment cites must not decide it
+        hint_hits = extract_citations(hint)
+        hint_court = hint_hits[0].get("court") if hint_hits else None
     if court:
         evidence["court"] = f"result row: {court}"
-    else:
+    elif hint_court:
+        court = hint_court
+        evidence["court"] = f"result row: {hint}"
+    if not court and own_end is not None:
+        # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]";
+        # that bracket is this judgment's court, ahead of the court of a case it cites further down
+        court = court_from_bracket(raw_text, own_end)
+        if court:
+            evidence["court"] = raw_text[own_end : own_end + 80].strip()
+    if not court:
         for c in cits[:3]:
             if c.get("court"):
                 court = c["court"]
