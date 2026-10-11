@@ -4,16 +4,19 @@ captures with the corrected extractor. Both only ever ADD information; neither d
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scraper.database import SessionLocal
+from celery import shared_task
+
+from scraper.database import SessionLocal, run_async
 from scraper.extractors import deterministic as det
 from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
-from scraper.models import Judgment, ScraperStaging
+from scraper.models import Judgment, QuarantineQueue, ScraperStaging
 from scraper.parsers.case_metadata import parse_case_metadata
 
 logger = logging.getLogger(__name__)
@@ -63,7 +66,7 @@ async def backfill_case_metadata(db: AsyncSession, *, batch: int = 500, limit: O
     return counts
 
 
-async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
+async def requalify_quarantined(db: AsyncSession, *, limit: Optional[int] = 2000, dry_run: bool = False, skip_final: bool = False) -> Dict[str, Any]:
     """Re-run the (deterministic, no-AI) extraction + validation on quarantined PLS captures whose citation is still not
     a judgment. Rows that now validate are re-promoted; rows that still fail stay quarantined with their new reason
     (bad pages are re-fetched by the grid walk instead, see quarantined_capture_retryable)."""
@@ -75,15 +78,21 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
     directory = await load_court_directory(db)
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
     min_confidence = float((source.extraction_min_confidence if source else None) or settings.SGAI_DEFAULT_MIN_CONFIDENCE)
-    counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}}
-    ids = (
-        await db.execute(
-            select(ScraperStaging.id)
-            .where(ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.status == "quarantined", ScraperStaging.promoted_to_id.is_(None))
-            .order_by(ScraperStaging.created_at)
-            .limit(limit)
-        )
-    ).scalars().all()
+    counts: Dict[str, Any] = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0, "still_by_reason": {}, "skipped_final": 0}
+    held = (ScraperStaging.source_name == SOURCE_NAME, ScraperStaging.status == "quarantined", ScraperStaging.promoted_to_id.is_(None))
+    q = select(ScraperStaging.id).where(*held)
+    if skip_final:
+        # the scheduled run leaves a judgment held on the merits (a citation conflict, a human decision) to a person;
+        # filtered in the query, so merits holds never fill the batch ahead of rows that can be released
+        from scraper.tasks.pakistanlawsite import _FINAL_QUARANTINE
+
+        merits = func.coalesce(ScraperStaging.quarantine_reason, "").op("~*")(_FINAL_QUARANTINE.pattern.replace("(?i)", ""))
+        q = q.where(~merits)
+        counts["skipped_final"] = int((await db.execute(select(func.count()).select_from(ScraperStaging).where(*held, merits))).scalar() or 0)
+    q = q.order_by(ScraperStaging.created_at)
+    if limit is not None:
+        q = q.limit(limit)
+    ids = (await db.execute(q)).scalars().all()
     # One row at a time, re-selected after each commit/rollback: a rollback expires every loaded instance,
     # and touching an expired attribute under AsyncSession raises instead of lazy-loading.
     for st_id in ids:
@@ -131,10 +140,18 @@ async def requalify_quarantined(db: AsyncSession, *, limit: int = 2000, dry_run:
             logger.exception("requalify: promotion failed for %s", st_id)
             counts["still_quarantined"] += 1
             continue
-        if result == "promoted":
-            counts["promoted"] += 1
-        elif result == "duplicate":
-            counts["duplicate"] += 1
+        if result in ("promoted", "duplicate"):
+            counts[result] += 1
+            # the judgment no longer needs a person: close its open review item
+            items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st_id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+            for item in items:
+                item.reviewed = True
+                item.reviewed_by = "system"
+                item.reviewed_at = datetime.now(timezone.utc)
+                item.resolution = "requalified"
+                item.resolution_notes = f"re-checked with the corrected extractor: {result}"
+            if items:
+                await db.commit()
         else:
             counts["still_quarantined"] += 1
     return counts
@@ -148,3 +165,9 @@ async def run_backfill_metadata(**kw) -> Dict[str, int]:
 async def run_requalify(**kw) -> Dict[str, Any]:
     async with SessionLocal() as db:
         return await requalify_quarantined(db, **kw)
+
+
+@shared_task(name="scraper.tasks.pls_backfill.requalify_quarantined")
+def requalify_quarantined_task(limit: Optional[int] = None, skip_final: bool = True):
+    """Scheduled form of `pls_admin requalify-quarantine`: deterministic, stored text only, merits holds left alone."""
+    return run_async(run_requalify(limit=limit, skip_final=skip_final))
