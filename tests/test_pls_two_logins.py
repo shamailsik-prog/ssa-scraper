@@ -98,7 +98,7 @@ def test_deploy_step_sets_both_logins_in_env(tmp_path):
     import subprocess
 
     env = tmp_path / ".env"
-    env.write_text("FOO=1\nLOGIN_SESSION_CONCURRENCY=1\nBAR=2\n", encoding="utf-8")
+    env.write_text("FOO=1\nLOGIN_SESSION_CONCURRENCY=1\nBAR=2", encoding="utf-8")  # no final newline
     script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
     start = script.index("ensure_two_pls_logins() {")
     func = script[start : script.index("\n}\n", start) + 3]

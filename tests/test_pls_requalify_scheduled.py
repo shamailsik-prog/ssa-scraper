@@ -80,3 +80,32 @@ def test_requalify_runs_hourly_on_the_maintenance_queue():
     assert entry["task"] == "scraper.tasks.pls_backfill.requalify_quarantined"
     assert entry["kwargs"]["skip_final"] is True
     assert app.conf.task_routes["scraper.tasks.pls_backfill.requalify_quarantined"] == {"queue": "maintenance"}
+
+
+async def test_still_held_row_shows_its_current_reason_in_the_review_queue(db):
+    source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    st = await _held(db, source, reason="court unknown", n=7)
+    st.raw_text = "1983 PCrLJ 2063 short page"  # still fails, for another reason now
+    db.add(QuarantineQueue(staging_id=st.id, reason="court unknown", source_name="PakistanLawSite"))
+    await db.commit()
+    await requalify_quarantined(db, skip_final=True)
+    await db.commit()
+    st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == st.id))).scalars().one()
+    item = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().one()
+    assert st.status == "quarantined"
+    assert item.reason == st.quarantine_reason
+
+
+async def test_overlapping_requalify_runs_do_not_both_run():
+    from sqlalchemy import text as sql_text
+
+    from scraper.database import engine
+    from scraper.tasks.pls_backfill import REQUALIFY_LOCK_KEY, run_requalify
+
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        assert (await conn.execute(sql_text("SELECT pg_try_advisory_lock(:k)"), {"k": REQUALIFY_LOCK_KEY})).scalar()
+        try:
+            assert await run_requalify(skip_final=True) == {"skipped": "requalify_run_in_progress"}
+        finally:
+            await conn.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": REQUALIFY_LOCK_KEY})

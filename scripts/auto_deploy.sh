@@ -61,6 +61,8 @@ ensure_two_pls_logins() {
     if grep -q "^${key}=" .env; then
       grep -qx "$kv" .env || { sed -i "s/^${key}=.*/${kv}/" .env; log "set $kv in .env"; }
     else
+      # a last line without its newline would swallow the new key
+      [ -s .env ] && [ -n "$(tail -c1 .env)" ] && printf '\n' >> .env
       printf '%s\n' "$kv" >> .env
       log "added $kv to .env"
     fi

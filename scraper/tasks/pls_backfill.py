@@ -97,8 +97,8 @@ async def requalify_quarantined(db: AsyncSession, *, limit: Optional[int] = 2000
     # and touching an expired attribute under AsyncSession raises instead of lazy-loading.
     for st_id in ids:
         st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == st_id))).scalars().first()
-        if st is None:
-            continue
+        if st is None or st.status != "quarantined" or st.promoted_to_id is not None:
+            continue  # released meanwhile (by promotion, a reviewer or another run)
         counts["scanned"] += 1
         text = st.raw_text or ""
         meta = {"citation": st.extracted_citation, "title": st.extracted_title, "court": st.extracted_court, "url": st.source_url}
@@ -109,8 +109,13 @@ async def requalify_quarantined(db: AsyncSession, *, limit: Optional[int] = 2000
             key = (out.quarantine_reason or "")[:40]
             counts["still_by_reason"][key] = counts["still_by_reason"].get(key, 0) + 1
             if not dry_run:
-                # keep the ledger truthful: the reason the row is set aside NOW, not the one from before the fixes
+                # keep the ledger truthful: the reason the row is set aside NOW, not the one from before the fixes,
+                # in the staging row and in its open review item alike
                 st.quarantine_reason = out.quarantine_reason
+                for item in (
+                    await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st_id, QuarantineQueue.reviewed.is_(False)))
+                ).scalars().all():
+                    item.reason = (out.quarantine_reason or item.reason)[:1000]
                 st.validation_errors = out.errors
                 st.confidence_score = out.confidence
                 if out.data:
@@ -162,9 +167,23 @@ async def run_backfill_metadata(**kw) -> Dict[str, int]:
         return await backfill_case_metadata(db, **kw)
 
 
+REQUALIFY_LOCK_KEY = 0x55A_9702  # pg advisory lock: one requalify run at a time (scheduled or by hand)
+
+
 async def run_requalify(**kw) -> Dict[str, Any]:
-    async with SessionLocal() as db:
-        return await requalify_quarantined(db, **kw)
+    from sqlalchemy import text as sql_text
+
+    from scraper.database import engine
+
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        if not (await conn.execute(sql_text("SELECT pg_try_advisory_lock(:k)"), {"k": REQUALIFY_LOCK_KEY})).scalar():
+            return {"skipped": "requalify_run_in_progress"}
+        try:
+            async with SessionLocal() as db:
+                return await requalify_quarantined(db, **kw)
+        finally:
+            await conn.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": REQUALIFY_LOCK_KEY})
 
 
 @shared_task(name="scraper.tasks.pls_backfill.requalify_quarantined")
