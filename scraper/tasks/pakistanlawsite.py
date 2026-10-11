@@ -1914,10 +1914,19 @@ async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
     """Take the slot lock of an ACTIVE login nobody else holds (the current login first) and bind `pipeline` to it:
     its browser opens that login only and never fails over onto the other one, which another job may be using.
     Login 1 and login 2 are separate accounts that run at the same time (operator decision, 11 Oct 2026), but two
-    browsers on ONE login end each other. Returns the slot, or None when every ACTIVE login is in use."""
+    browsers on ONE login end each other. Returns the slot, or None when every ACTIVE login is in use.
+    The login with the most of its hourly page budget left goes first: each login has its own budget, and always
+    opening the current one spent login 1's hour while login 2 sat unused (11 Oct 2026)."""
     current = await pipeline.manager.current_slot()
     active = [s for s in await pipeline.manager.slots() if s.state == "ACTIVE"]
-    active.sort(key=lambda s: (current is None or s.slot_number != current.slot_number, s.slot_number))
+    cfg = dict(pipeline.source.config_json or {})
+    hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+
+    def pages_this_hour(slot) -> int:
+        pacing = dict(cfg.get(pacing_key(slot.slot_number)) or {})
+        return int(pacing.get("hour_pages") or 0) if pacing.get("hour") == hour_key else 0
+
+    active.sort(key=lambda s: (pages_this_hour(s), current is None or s.slot_number != current.slot_number, s.slot_number))
     for slot in active:
         lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", pipeline.redis_client, max_holders=1)
         try:
