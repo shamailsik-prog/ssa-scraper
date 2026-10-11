@@ -474,6 +474,69 @@ class PublicPipeline:
                 self.stats["rejected_urls"] += 1
 
 
+NO_CITATION_REASON = "no citation supported by source"
+
+
+async def requalify_held_judgment(db: AsyncSession, source: ScraperSource, *, frontier_key: str, citation: str) -> int:
+    """A judgment held as "no citation supported by source" whose result row is now known to name `citation`
+    (a neutral citation the parser did not read before) is checked again with that citation, deterministically.
+    One that now validates goes back to "extracted" for promotion and its review item is closed; one that still
+    fails keeps its hold with the reason it fails for now. Returns how many were released."""
+    from scraper.extractors import deterministic as det
+    from scraper.extractors.hybrid_extractor import load_court_directory
+    from scraper.extractors.validation import reconcile_judgment
+    from scraper.models import QuarantineQueue, ScraperStaging
+
+    held = (
+        await db.execute(
+            select(ScraperStaging).where(
+                ScraperStaging.source_name == source.source_name,
+                ScraperStaging.status == "quarantined",
+                ScraperStaging.quarantine_reason == NO_CITATION_REASON,
+                ScraperStaging.promoted_to_id.is_(None),
+                ScraperStaging.route_json["frontier"].astext == frontier_key,
+            )
+        )
+    ).scalars().all()
+    if not held:
+        return 0
+    directory = await load_court_directory(db)
+    min_confidence = float(source.extraction_min_confidence or settings.SGAI_DEFAULT_MIN_CONFIDENCE)
+    released = 0
+    for st in held:
+        text = st.raw_text or ""
+        meta = {"citation": citation, "title": st.extracted_title, "url": st.source_url}
+        dj = det.extract_judgment_deterministic(html=st.raw_html, text=text, source_meta=meta)
+        out = reconcile_judgment(
+            deterministic=dj, ai=None, raw_text=text, source_url=st.source_url, raw_html=st.raw_html, court_directory=directory, min_confidence=min_confidence
+        )
+        data = dict(out.data or {})
+        st.deterministic_json = _slim(dj)
+        st.reconciled_json = _slim(data)
+        st.confidence_score = out.confidence
+        st.validation_errors = out.errors + [c.get("reason", "") for c in out.conflicts]
+        st.extracted_citation = (data.get("citations") or [citation])[0]
+        st.extracted_court = data.get("court") or st.extracted_court
+        st.extracted_year = data.get("year") or st.extracted_year
+        if out.quarantine:
+            st.quarantine_reason = out.quarantine_reason
+            continue
+        st.status = "extracted"
+        st.quarantine_reason = None
+        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+        for item in items:
+            item.reviewed = True
+            item.reviewed_by = "system"
+            item.reviewed_at = datetime.now(timezone.utc)
+            item.resolution = "requalified"
+            item.resolution_notes = f"result row names {citation}"
+        released += 1
+    await db.flush()
+    if released:
+        request_promotion_after_commit(db, source.source_name)
+    return released
+
+
 def _tests_allow_private() -> bool:
     """Fixture servers in tests run on loopback; production never allows private hosts."""
     return bool(settings.APP_ENV == "development" and settings.DEBUG)

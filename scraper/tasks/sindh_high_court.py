@@ -22,8 +22,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.models import CrawlFrontier, ScraperSource
+from scraper.parsers.citation_extractor import extract_citations
 from scraper.security import URLPolicyError, check_url_policy
-from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, run_public_source
+from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, requalify_held_judgment, run_public_source
 
 PUBLIC_HOST = "caselaw.shc.gov.pk"
 PUBLIC_HOST_ALIASES = (
@@ -231,6 +232,18 @@ def _file_view_token(url: str) -> Optional[str]:
     return None
 
 
+def _citation_from_download_url(url: str) -> Optional[str]:
+    """The neutral citation the result grid gives a judgment ("download-file.php?doc=...&citation=2025+SHC+KHI+608").
+    "Nil" and anything else that is not a citation is ignored."""
+    parts = urlsplit(url)
+    if not DOWNLOAD_FILE_PATH_RE.search(parts.path or ""):
+        return None
+    values = parse_qs(parts.query or "", keep_blank_values=True).get("citation") or []
+    raw = html.unescape(values[0] or "").strip() if values else ""
+    hits = extract_citations(raw) if raw else []
+    return hits[0]["normalized"] if hits else None
+
+
 class SindhHighCourtPipeline(PublicPipeline):
     """Public pipeline with SHC result-grid and file-view discovery."""
 
@@ -418,6 +431,9 @@ class SindhHighCourtPipeline(PublicPipeline):
 
         kind = _classify_discovered_url(safe, hint_text=hint)
         if kind == "judgment":
+            row_citation = _citation_from_download_url(safe)
+            if row_citation:
+                route_meta = {**route_meta, "citation": row_citation}
             judgment_candidates: List[Tuple[str, str, str]] = []
             derived_view = _view_file_from_download_url(safe, base_url=base_url)
             if derived_view:
@@ -469,6 +485,12 @@ class SindhHighCourtPipeline(PublicPipeline):
                 )
             ).scalars().first()
             if exists is not None:
+                citation = meta.get("citation")
+                if citation and (exists.query_json.get("meta") or {}).get("citation") != citation:
+                    exists.query_json = {**exists.query_json, "meta": {**(exists.query_json.get("meta") or {}), "citation": citation}}
+                    self.stats["requalified"] = self.stats.get("requalified", 0) + await requalify_held_judgment(
+                        self.db, self.source, frontier_key=key, citation=citation
+                    )
                 continue
             route: Dict[str, Any] = {"listing": listing_url}
             for key_name in (
@@ -500,7 +522,42 @@ class SindhHighCourtPipeline(PublicPipeline):
         return added
 
 
+CITATION_BACKFILL_FLAG = "neutral_citation_backfill_2026_10"
+
+
+async def _reopen_detail_grids_once(db: AsyncSession, source: ScraperSource) -> int:
+    """Detail grids read before the row citation was kept are read once more, so the judgments held as
+    "no citation supported by source" get their citation (requalify_held_judgment). A flag in the source's
+    config makes this a one-off."""
+    cfg = dict(source.config_json or {})
+    if cfg.get(CITATION_BACKFILL_FLAG):
+        return 0
+    rows = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == source.source_name,
+                CrawlFrontier.query_key.like("listing:%"),
+                CrawlFrontier.status.in_(("done", "retired")),
+            )
+        )
+    ).scalars().all()
+    reopened = 0
+    for fr in rows:
+        if DETAIL_LISTING_PATH_RE.search(urlsplit(fr.query_json.get("url") or "").path or ""):
+            fr.status = "pending"
+            fr.attempts = 0
+            fr.last_error = None
+            reopened += 1
+    if reopened:
+        cfg[CITATION_BACKFILL_FLAG] = {"reopened": reopened}
+        source.config_json = cfg
+    await db.flush()
+    return reopened
+
+
 async def scrape_sindh_high_court(source: ScraperSource, db: AsyncSession, **kwargs) -> Dict[str, Any]:
+    if source.state not in ("HALTED", "DISABLED", "PAUSED"):
+        await _reopen_detail_grids_once(db, source)
     return await run_public_source(
         db,
         source,
