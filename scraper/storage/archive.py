@@ -7,7 +7,7 @@ Archive mirror and reconcile_storage (Section 9 / 9A; Amendment §12, §19).
       Judgments/<court_code>/<year>/<citation_slug>/original.pdf        (genuine source PDF)
       Judgments/<court_code>/<year>/<citation_slug>/rendered_copy.pdf   (HTML-only judgments, labelled)
       Judgments/<court_code>/<year>/<citation_slug>/judgment.txt
-      Judgments/<court_code>/<year>/<citation_slug>/metadata.json
+      Judgments/<court_code>/<year>/<citation_slug>/metadata.json     (corpus record, scraper/corpus_record.py)
       Statutes/<statute_slug>/<section>/v<n>.txt
       _index/judgments-YYYYMMDD-HHMMSS.csv, _index/statutes-YYYYMMDD-HHMMSS.csv
 * Write-once: an object key is written at most once per target; a different hash at the same
@@ -33,10 +33,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
+from scraper.corpus_record import judgment_record
 from scraper.fetchers import read_raw
 from scraper.models import ArchiveObject, ArchiveTarget, Judgment, SourceProvenance, Statute, StatuteSection, StatuteSectionVersion
 from scraper.notify import notify
-from scraper.parsers.pdf_writer import RENDERED_COPY_LABEL, render_judgment_pdf_bytes
+from scraper.parsers.pdf_writer import render_judgment_pdf_bytes
 from scraper.security import is_login_session
 from scraper.storage.adapters import ArchiveAdapter, ArchiveError, ObjectExists, build_adapter
 
@@ -148,23 +149,7 @@ class ArchiveMirror:
             meta = {"court": j.court_name, "title": j.case_title, "citation": j.canonical_citation, "source_name": j.source_name, "source_url": j.source_url, "content_hash": j.full_text_hash, "rendered_at": (j.promoted_at or j.created_at or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat(), "access_method": j.access_method}
             objs.append({"key": f"{prefix}/rendered_copy.pdf", "data": render_judgment_pdf_bytes(meta, j.full_text or ""), "kind": "rendered_copy", "content_type": "application/pdf"})
         objs.append({"key": f"{prefix}/judgment.txt", "data": (j.full_text or "").encode("utf-8"), "kind": "text", "content_type": "text/plain; charset=utf-8"})
-        metadata = {
-            "canonical_citation": j.canonical_citation,
-            "case_title": j.case_title,
-            "court": j.court_name,
-            "judge_names": j.judge_names,
-            "bench_size": j.bench_size,
-            "bench_type": j.bench_type,
-            "decision_date": j.decision_date.isoformat() if j.decision_date else None,
-            "year": j.year,
-            "source_name": j.source_name,
-            "source_url": j.source_url,
-            "access_method": j.access_method,
-            "full_text_sha256_canonical": j.full_text_hash,
-            "has_original_pdf": bool(original),
-            "document_label": "ORIGINAL SOURCE PDF" if original else RENDERED_COPY_LABEL,
-            "judgment_id": str(j.id),
-        }
+        metadata = judgment_record(j, has_original_pdf=bool(original))
         objs.append({"key": f"{prefix}/metadata.json", "data": json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"), "kind": "text", "content_type": "application/json"})
         return objs
 

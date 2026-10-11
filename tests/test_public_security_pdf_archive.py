@@ -226,6 +226,9 @@ async def test_mirror_write_once_tree_and_index(db, source, tmp_path):
     assert r1["summary"]["local"]["written"] >= 4  # rendered copy, text, metadata, index
     folder = root / judgment_prefix(j)
     assert {p.name for p in folder.iterdir()} == {"rendered_copy.pdf", "judgment.txt", "metadata.json"}
+    from scraper.corpus_record import validate_record
+
+    assert validate_record(json.loads((folder / "metadata.json").read_text())) == []  # the shared corpus record format
     # write-once: a second run writes nothing new for the same judgment and never overwrites
     before = {p: p.stat().st_mtime_ns for p in folder.iterdir()}
     r2 = await ArchiveMirror(db).mirror_pending()
