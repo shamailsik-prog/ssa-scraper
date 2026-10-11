@@ -40,9 +40,16 @@ def test_neutral_citations_are_recognised(text, normalized, reporter, court, yea
     assert normalise_citation(text) == normalized
 
 
-def test_pld_with_a_court_token_is_not_also_read_as_a_neutral_citation():
-    hits = extract_citations("PLD 2023 IHC 5 and P.L.D. 2019 Islamabad 7")
-    assert [h["normalized"] for h in hits] == ["PLD 2023 Islamabad 5", "PLD 2019 Islamabad 7"]
+@pytest.mark.parametrize("text", ["PLD 2023 IHC 5", "P.L.D. 2023 IHC 5", "P. L. D. 2023 IHC 5", "P L D 2023 IHC 5"])
+def test_pld_with_a_court_token_is_not_also_read_as_a_neutral_citation(text):
+    assert [h["normalized"] for h in extract_citations(text)] == ["PLD 2023 Islamabad 5"]
+
+
+def test_row_neutral_citation_decides_the_court_over_a_cited_case():
+    text = "Reliance is placed on PLD 2020 SC 1 and 2019 SCMR 5.\nThe petition is dismissed."
+    out = extract_judgment_deterministic(html=None, text=text, source_meta={"citation": "2025 SHC KHI 608"})
+    assert out["citations"][0] == "2025 SHC KHI 608"
+    assert out["court"] == "Sindh"
 
 
 def test_law_report_citations_unchanged():

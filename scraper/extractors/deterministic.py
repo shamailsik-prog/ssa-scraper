@@ -174,8 +174,17 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     if title_ev:
         evidence["case_title"] = title_ev
     court = source_meta.get("court")
+    hint_court = None
+    if not court and hint:
+        # the result row's own citation names its court ("2025 SHC KHI 608", "PLD 2025 SC 1"); a case the
+        # judgment cites must not decide it
+        hint_hits = extract_citations(hint)
+        hint_court = hint_hits[0].get("court") if hint_hits else None
     if court:
         evidence["court"] = f"result row: {court}"
+    elif hint_court:
+        court = hint_court
+        evidence["court"] = f"result row: {hint}"
     else:
         for c in cits[:3]:
             if c.get("court"):

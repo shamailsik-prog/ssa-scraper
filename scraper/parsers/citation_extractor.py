@@ -163,8 +163,6 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
 
 # The court each neutral citation names (keys of PLD_COURT_CANONICAL's values).
 NEUTRAL_CITATION_COURT = {"SHC": "Sindh", "LHC": "Lahore", "IHC": "Islamabad", "PHC": "Peshawar", "SCP": "SC"}
-# "PLD 2023 IHC 5" is a PLD citation whose court is written IHC, not a neutral citation.
-_PLD_BEFORE = re.compile(r"(?i)P\.?\s*L\.?\s*D\.?\s*$")
 
 # ============================================================================
 # 4 STATUTE PATTERNS
@@ -560,7 +558,8 @@ def extract_citations(text: str) -> List[Dict[str, Any]]:
             raw = match.group(0)
             gd = match.groupdict()
             if reporter == "NEUTRAL":
-                if _PLD_BEFORE.search(text[max(0, match.start() - 8) : match.start()]):
+                # inside a PLD citation found already ("PLD 2023 IHC 5", "P. L. D. 2023 IHC 5"): not neutral
+                if any(r["reporter"] == "PLD" and r["span"][0] <= match.start() < r["span"][1] for r in results):
                     continue
                 nc = gd["nc"].upper()
                 results.append(
