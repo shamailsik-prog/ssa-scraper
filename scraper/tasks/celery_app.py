@@ -73,7 +73,7 @@ app.conf.update(
         "pls-requalify-quarantined": {
             "task": "scraper.tasks.pls_backfill.requalify_quarantined",
             "schedule": 3600,
-            "kwargs": {"limit": 2000, "skip_final": True},
+            "kwargs": {"limit": None, "skip_final": True},
         },
         # Operator decision of 24 September 2026: a lost slot is re-verified and, if dead, signed in
         # again with the saved credentials (runs on the single login-session worker, never beside a job).

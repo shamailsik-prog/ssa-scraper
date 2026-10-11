@@ -8,7 +8,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from scraper.fetchers import record_provenance
-from scraper.models import ScraperSource, ScraperStaging
+from scraper.models import QuarantineQueue, ScraperSource, ScraperStaging
 from scraper.tasks.celery_app import app
 from scraper.tasks.pls_backfill import requalify_quarantined
 
@@ -45,6 +45,7 @@ async def test_scheduled_requalify_releases_court_unknown_but_keeps_merits_holds
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
     court_unknown = await _held(db, source, reason="court unknown", n=0)
     conflict = await _held(db, source, reason="citation conflict between deterministic parser and AI", n=1)
+    db.add(QuarantineQueue(staging_id=court_unknown.id, reason="court unknown", source_name="PakistanLawSite"))
     await db.commit()
 
     counts = await requalify_quarantined(db, skip_final=True)
@@ -56,6 +57,22 @@ async def test_scheduled_requalify_releases_court_unknown_but_keeps_merits_holds
     assert kept.status == "quarantined"
     assert kept.quarantine_reason == "citation conflict between deterministic parser and AI"
     assert counts["skipped_final"] == 1
+    item = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == court_unknown.id))).scalars().one()
+    assert item.reviewed is True and item.resolution == "requalified"
+
+
+async def test_merits_holds_do_not_fill_the_batch_ahead_of_releasable_rows(db):
+    source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    for n in range(1, 4):  # older merits holds, more of them than the batch
+        await _held(db, source, reason="citation conflict between deterministic parser and AI", n=n)
+    await db.commit()
+    releasable = await _held(db, source, reason="court unknown", n=0)
+    await db.commit()
+
+    await requalify_quarantined(db, limit=2, skip_final=True)
+    await db.commit()
+    st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == releasable.id))).scalars().one()
+    assert st.status in ("promoted", "duplicate")
 
 
 def test_requalify_runs_hourly_on_the_maintenance_queue():
