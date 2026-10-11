@@ -395,6 +395,20 @@ async def stage_statute(
     return row
 
 
+def pdf_text_layer(pdf_bytes: bytes) -> str:
+    """The text a PDF already carries, never OCR. PakistanLawSite publishes typed text, so its scraper
+    reads only this and never stops on scanned pages; a thin result reaches the corpus marked
+    needs_ocr (scraper/corpus_record.py) and ingestion does the OCR."""
+    from scraper.parsers.pdf_extractor import _clean_text, _pdfplumber_extract  # type: ignore
+
+    try:
+        raw, _pages, _scanned = _pdfplumber_extract(pdf_bytes)
+    except Exception as exc:
+        logger.warning("PDF text layer unreadable: %s", exc)
+        return ""
+    return _clean_text(raw or "")
+
+
 def pdf_text_with_ocr(pdf_bytes: bytes) -> tuple[str, bool]:
     """Extract text from original PDF bytes; returns (text, ocr_applied)."""
     from scraper.corpus_record import text_is_thin

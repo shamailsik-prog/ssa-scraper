@@ -1452,15 +1452,14 @@ class PakistanLawSitePipeline:
             )
         modal_judges = extract_before_jj_judge_names(modal_text) if modal_text else []
         pdf_prov = None
-        ocr = False
         if row.get("pdf_url"):
             try:
                 pdf_bytes = await self.download(row["pdf_url"])
                 if pdf_bytes[:4] == b"%PDF":
                     pdf_prov = await record_provenance(self.db, source=self.source, url=row["pdf_url"], content=pdf_bytes, content_kind="pdf", route=route, is_original_document=True, document_kind="original_pdf", parent=html_prov)
-                    from scraper.fetchers import pdf_text_with_ocr
+                    from scraper.fetchers import pdf_text_layer
 
-                    pdf_text, ocr = pdf_text_with_ocr(pdf_bytes)
+                    pdf_text = pdf_text_layer(pdf_bytes)  # typed text only: never OCR on the login worker
                     if len(pdf_text) > len(text):
                         text = pdf_text
             except (ExplicitBlock, VerificationRequired, LoginRequired, BrowserDisconnected):
@@ -1468,7 +1467,7 @@ class PakistanLawSitePipeline:
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
         text = strip_leading_judgment_chrome(text)
-        staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=ocr)
+        staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=False)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
             routes = list(staging.route_json.get("routes", [])) if isinstance(staging.route_json, dict) else []
