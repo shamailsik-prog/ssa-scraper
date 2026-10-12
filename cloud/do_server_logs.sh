@@ -79,11 +79,13 @@ SELECT 'judgment' AS table_name, count(*) FROM judgment UNION ALL SELECT 'citati
 \\echo == judgments by source (last 24 h in brackets)
 SELECT coalesce(source_name, '?') AS source_name, count(*) AS total, count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_24h
  FROM judgment GROUP BY 1 ORDER BY 2 DESC;
-\\echo == speed: pages fetched and judgments/statutes added per hour, last 12 hours
+\\echo == speed: pages fetched and judgments/statutes added per hour, last 24 hours
 SELECT date_trunc('hour', fetched_at) AS hour, source_name, count(*) AS pages_fetched FROM source_provenance
- WHERE fetched_at > now() - interval '12 hours' GROUP BY 1, 2 ORDER BY 1 DESC, 2;
-SELECT date_trunc('hour', created_at) AS hour, count(*) AS judgments_added FROM judgment WHERE created_at > now() - interval '12 hours' GROUP BY 1 ORDER BY 1 DESC;
-SELECT date_trunc('hour', created_at) AS hour, count(*) AS statutes_added FROM statute WHERE created_at > now() - interval '12 hours' GROUP BY 1 ORDER BY 1 DESC;
+ WHERE fetched_at > now() - interval '24 hours' GROUP BY 1, 2 ORDER BY 1 DESC, 2;
+SELECT date_trunc('hour', created_at) AS hour, count(*) AS judgments_added,
+ count(*) FILTER (WHERE source_name = 'PakistanLawSite') AS pakistanlawsite
+ FROM judgment WHERE created_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 1 DESC;
+SELECT date_trunc('hour', created_at) AS hour, count(*) AS statutes_added FROM statute WHERE created_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 1 DESC;
 \\echo == archive targets (Google Drive and others; configuration is encrypted and not selected)
 SELECT name, target_type, enabled, mirror_login_session_rows, objects_written, pg_size_pretty(bytes_written) AS written,
  consecutive_failures, last_ok_at, left(coalesce(last_error, ''), 160) AS last_error FROM archive_targets ORDER BY name;
