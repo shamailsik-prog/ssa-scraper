@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func, select
@@ -42,6 +42,12 @@ from scraper.security import is_login_session
 from scraper.storage.adapters import ArchiveAdapter, ArchiveError, ObjectExists, build_adapter
 
 logger = logging.getLogger(__name__)
+
+
+def _aware(d: Optional[datetime]) -> datetime:
+    if d is None:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
 def slug(s: Optional[str], limit: int = 80) -> str:
@@ -103,6 +109,7 @@ class ArchiveMirror:
         self.db = db
         self.adapter_factory = adapter_factory
         self.summary: Dict[str, Dict[str, int]] = {}
+        self._gate: Dict[Any, bool] = {}  # target id -> whether this run writes to it (batch transfer)
         # A run with a deadline (time.monotonic()) stops starting new objects once it passes, and one
         # with commit_progress commits its ledger as it goes: after the statute re-scrape a single
         # all-or-nothing pass over thousands of objects ran for hours, and a killed worker lost every
@@ -234,7 +241,7 @@ class ArchiveMirror:
             return None
         return func.lower(func.coalesce(Judgment.access_method, "")) != "login_session"
 
-    async def backlog_judgments(self, t: ArchiveTarget, limit: int, *, exclude=frozenset()) -> List[Judgment]:
+    async def backlog_judgments(self, t: ArchiveTarget, limit: int, *, exclude=frozenset(), before: Optional[datetime] = None) -> List[Judgment]:
         """Oldest judgments that lack a full set of objects on target `t` and that the target may hold."""
         if limit <= 0:
             return []
@@ -245,6 +252,8 @@ class ArchiveMirror:
             q = q.where(policy)
         if exclude:
             q = q.where(Judgment.id.notin_(list(exclude)))
+        if before is not None:
+            q = q.where(Judgment.promoted_at <= before)
         return list((await self.db.execute(q.order_by(Judgment.promoted_at.asc()).limit(limit))).scalars().all())
 
     async def lag(self, t: ArchiveTarget) -> Dict[str, Any]:
@@ -272,7 +281,8 @@ class ArchiveMirror:
         for t in await self.targets():
             lag = await self.lag(t)
             last = lag.pop("_last_written")
-            stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
+            allowed = float(settings.MIRROR_LAG_ALERT_HOURS) + (float(settings.ARCHIVE_BATCH_MAX_WAIT_HOURS) if self._batched(t) else 0.0)
+            stale = last is None or (now - last) > timedelta(hours=allowed)
             problem = lag["judgments_unmirrored"] > 0 and stale
             code_msg = f"ARCHIVE_MIRROR_LAG:{t.name}"
             open_alert = (
@@ -286,6 +296,86 @@ class ArchiveMirror:
         await self.db.flush()
         return raised
 
+    # ------------------------------------------------------------------ batch transfer
+    # Google Drive receives judgments in batches of about ARCHIVE_BATCH_BYTES instead of file by file. A batch
+    # is a snapshot: it opens with a cut-off time, takes only what was waiting at that moment (newer records
+    # wait for the next batch, or the stream would never end) and closes once the snapshot is on the target.
+    # The cut-off lives in Redis; if it is lost, the target simply waits for the next threshold.
+    def _batched(self, t: ArchiveTarget) -> bool:
+        types = {x.strip() for x in (settings.ARCHIVE_BATCH_TARGET_TYPES or "").split(",") if x.strip()}
+        return int(settings.ARCHIVE_BATCH_BYTES or 0) > 0 and t.target_type in types
+
+    @staticmethod
+    def _cutoff_key(t: ArchiveTarget) -> str:
+        return f"corpus:archive_batch_cutoff:{t.id}"
+
+    def _get_cutoff(self, t: ArchiveTarget) -> Optional[datetime]:
+        try:
+            from scraper.tasks.chain import _redis
+
+            raw = _redis().get(self._cutoff_key(t))
+            return datetime.fromisoformat(raw.decode() if isinstance(raw, bytes) else raw) if raw else None
+        except Exception as exc:
+            logger.warning("archive batch: cut-off for %s unreadable: %s", t.name, exc)
+            return None
+
+    def _set_cutoff(self, t: ArchiveTarget, cutoff: Optional[datetime]) -> None:
+        try:
+            from scraper.tasks.chain import _redis
+
+            if cutoff is None:
+                _redis().delete(self._cutoff_key(t))
+            else:
+                _redis().set(self._cutoff_key(t), cutoff.isoformat(), ex=7 * 86400)
+        except Exception as exc:
+            logger.warning("archive batch: cut-off for %s not stored: %s", t.name, exc)
+
+    async def batch_waiting(self, t: ArchiveTarget, *, before: Optional[datetime] = None) -> Dict[str, Any]:
+        """Judgments the target still lacks: how many, roughly how many bytes, and how long the oldest has waited."""
+        from scraper.models import SourceProvenance as Prov
+
+        have = self._have_subquery(t)
+        size = func.coalesce(Prov.byte_size, 0) + 2 * func.coalesce(func.octet_length(Judgment.full_text), 0)  # PDF (or rendered copy) + text
+        q = (
+            select(func.count(), func.coalesce(func.sum(size), 0), func.min(Judgment.promoted_at))
+            .select_from(Judgment)
+            .outerjoin(have, have.c.jid == Judgment.id)
+            .outerjoin(Prov, Prov.id == Judgment.original_document_id)
+            .where(func.coalesce(have.c.c, 0) < JUDGMENT_OBJECT_COUNT)
+        )
+        policy = self._policy_clause(t)
+        if policy is not None:
+            q = q.where(policy)
+        if before is not None:
+            q = q.where(Judgment.promoted_at <= before)
+        count, nbytes, oldest = (await self.db.execute(q)).one()
+        return {"judgments": int(count or 0), "bytes": int(nbytes or 0), "oldest": oldest}
+
+    async def batch_gate(self, t: ArchiveTarget, *, now: Optional[datetime] = None) -> tuple:
+        """(go, cutoff). go=False: the target waits for its next batch. cutoff: only judgments promoted
+        up to it belong to the open batch (None for a target that is not batched)."""
+        if not self._batched(t):
+            return True, None
+        now = now or datetime.now(timezone.utc)
+        cutoff = self._get_cutoff(t)
+        if cutoff is not None:
+            if (await self.batch_waiting(t, before=cutoff))["judgments"] > 0:
+                return True, cutoff
+            self._set_cutoff(t, None)  # the snapshot is on the target: the batch is closed
+            logger.info("archive batch for %s complete", t.name)
+        waiting = await self.batch_waiting(t)
+        oldest = waiting["oldest"]
+        if oldest is not None and oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        overdue = oldest is not None and now - oldest >= timedelta(hours=float(settings.ARCHIVE_BATCH_MAX_WAIT_HOURS))
+        info = {"judgments": waiting["judgments"], "mb": round(waiting["bytes"] / 1024**2, 1), "threshold_mb": round(int(settings.ARCHIVE_BATCH_BYTES) / 1024**2, 1)}
+        if waiting["judgments"] and (waiting["bytes"] >= int(settings.ARCHIVE_BATCH_BYTES) or overdue):
+            self._set_cutoff(t, now)
+            logger.info("archive batch for %s opened: %s judgments, %s MB%s", t.name, info["judgments"], info["mb"], " (waited the maximum)" if overdue else "")
+            return True, now
+        self.summary.setdefault(t.name, {})["batch_waiting"] = info
+        return False, None
+
     # ------------------------------------------------------------------ mirror run
     async def mirror_pending(self, limit: int = 200, *, backlog_limit: Optional[int] = None) -> Dict[str, Any]:
         targets = await self.targets()
@@ -295,11 +385,15 @@ class ArchiveMirror:
         index_rows: List[List[str]] = []
         for t in targets:
             summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0, "backlog": 0})
+            go, cutoff = await self.batch_gate(t)
+            self._gate[t.id] = go
+            if not go:
+                continue  # this target waits for its next batch
             # The newest `limit` judgments were the only ones ever considered, so once promotion moved on the
             # older ones were never mirrored (13.8k of 19.7k on Drive). Every run now also takes the OLDEST
             # judgments this target still lacks, so the backlog always shrinks.
-            backlog = await self.backlog_judgments(t, settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit, exclude={j.id for j in newest})
-            judgments = list(newest) + backlog
+            backlog = await self.backlog_judgments(t, settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit, exclude={j.id for j in newest}, before=cutoff)
+            judgments = [j for j in newest if cutoff is None or _aware(j.promoted_at) <= cutoff] + backlog
             summary["backlog"] += len(backlog)
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
@@ -391,6 +485,8 @@ class ArchiveMirror:
         for t in targets:
             if self._time_up():
                 break
+            if self._gate.get(t.id) is False:
+                continue  # batched target between batches
             done = await self._written_keys(t, "Statutes/")
             pending = [(r[0], key) for r in key_rows if (key := self._statute_key(r[1], r[2], r[3], r[4])) not in done][:limit]
             if not pending:
@@ -440,6 +536,8 @@ class ArchiveMirror:
         for t in targets:
             if self._time_up():
                 break
+            if self._gate.get(t.id) is False:
+                continue  # batched target between batches
             done = await self._written_keys(t, "Instruments/")
             pending = [(r[0], key) for r in key_rows if (key := self._instrument_key(*r)) not in done][:limit]
             if not pending:
