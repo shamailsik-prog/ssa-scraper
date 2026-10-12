@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Every 30 minutes a few promoted records are re-fetched and compared with the corpus.")
     SPOT_CHECK_JUDGMENTS: int = Field(default=3, description="Promoted PakistanLawSite judgments re-fetched per spot-check run.")
     SPOT_CHECK_STATUTES: int = Field(default=2, description="Current statute sections re-fetched per spot-check run.")
+    RETIRED_SOURCES: str = Field(
+        default="NasirLawSite,BalochistanHighCourt",
+        description="Comma list of sources switched off for good on the owner's instruction (12 Oct 2026): both blocked this service (HTTP 403 / access denied) since mid-September. Kept as DISABLED rows so their records and history stay; never dispatched. Remove a name here to bring it back.",
+    )
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",
