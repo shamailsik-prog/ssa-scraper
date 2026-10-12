@@ -29,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     snow.add_argument("--dry-run", action="store_true")
     snow.add_argument("--limit", type=int, default=2000)
     sub.add_parser("search-harvest-completeness", help="Completeness proof: queue state, capped jobs, page-continuity holes, known-citation test")
+    reopen = sub.add_parser(
+        "search-harvest-reopen-premature-done",
+        help="Re-queue search harvest queries marked done after page 1 with unknown site total",
+    )
+    reopen.add_argument("--dry-run", action="store_true")
     run = sub.add_parser("search-harvest-run", help="Run one search harvest query (login session lock)")
     run.add_argument("--query-key", default="")
     run.add_argument("--dry-run", action="store_true")
@@ -134,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_search_harvest import cli_completeness
 
         return cli_completeness([])
+    if args.command == "search-harvest-reopen-premature-done":
+        from scraper.tasks.pls_search_harvest import cli_reopen_premature_done
+
+        return cli_reopen_premature_done(["--dry-run"] if args.dry_run else [])
     if args.command == "search-harvest-plan":
         from scraper.tasks.pls_search_harvest import cli_plan
 

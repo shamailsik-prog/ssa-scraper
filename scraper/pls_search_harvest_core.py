@@ -268,6 +268,28 @@ def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> boo
     return rows_seen >= result_cap
 
 
+def search_harvest_may_mark_done(
+    *,
+    site_total: Optional[int],
+    rows_seen: int,
+    rows_on_page: int,
+) -> Tuple[bool, str]:
+    """When the extractor reports no next-page link, decide if the query may be marked done.
+
+    Done only for a genuinely empty page, or when the site total is known and every row was seen.
+    """
+    if rows_on_page == 0:
+        return True, ""
+    if site_total is None:
+        return False, "pagination ended without next link and site total unknown"
+    if rows_seen < int(site_total):
+        return (
+            False,
+            f"pagination ended without next link with rows_seen={rows_seen}<site_total={site_total}",
+        )
+    return True, ""
+
+
 def iter_extended_plan_queries(
     *,
     years: Sequence[int],

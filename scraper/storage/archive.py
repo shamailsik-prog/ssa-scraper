@@ -120,14 +120,16 @@ class ArchiveMirror:
         if self.commit_progress:
             await self.db.commit()
 
-    async def targets(self) -> List[ArchiveTarget]:
+    async def targets(self, *, for_reconcile: bool = False) -> List[ArchiveTarget]:
         # Least recently completed first: a run walks the targets against one time budget, and in a fixed order the
         # last target starved whenever there was a backlog ("local" wrote nothing for hours on 9 October 2026). A
-        # target the budget never reached keeps its old last_ok_at and so leads the next run.
+        # target the budget never reached keeps its old last_ok_at and so leads the next run. Reconcile uses
+        # last_reconciled_at for the same fairness: mirror order would leave Drive first every hour.
+        order_col = ArchiveTarget.last_reconciled_at if for_reconcile else ArchiveTarget.last_ok_at
         q = (
             select(ArchiveTarget)
             .where(ArchiveTarget.enabled.is_(True))
-            .order_by(ArchiveTarget.last_ok_at.asc().nulls_first(), ArchiveTarget.name)
+            .order_by(order_col.asc().nulls_first(), ArchiveTarget.name)
         )
         return list((await self.db.execute(q)).scalars().all())
 
@@ -489,7 +491,7 @@ class ArchiveMirror:
         mirror updates, so Drive copies stopped (11 October 2026). With `limit`, a deadline and commit_progress
         a run checks a bounded slice and commits as it goes; the next run carries on from the oldest checks."""
         report: Dict[str, Any] = {}
-        for t in await self.targets():
+        for t in await self.targets(for_reconcile=True):
             rep = {"checked": 0, "ok": 0, "missing": 0, "mismatch": 0, "error": None}
             if self._time_up():
                 report[t.name] = rep
