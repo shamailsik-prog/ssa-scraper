@@ -6,7 +6,8 @@
 # deploy key derived from DO_TOKEN and prints `docker compose ps` plus the last LINES lines of the
 # chosen services. The admin key and any 64-hex token are scrubbed from the output.
 #
-# Environment: DO_TOKEN (required), SERVICES (default "api worker-scraper", or "inspect", or
+# Environment: DO_TOKEN (required), DROPLET_NAME (default ssa-corpus; ssa-corpus-public for the
+# free-sites server), SERVICES (default "api worker-scraper", or "inspect", or
 # "status" for a read-only harvest report), LINES (default 300)
 # =============================================================================
 set -euo pipefail
@@ -27,7 +28,8 @@ KEYDIR="$(mktemp -d)"
 trap 'rm -rf "$KEYDIR"' EXIT
 python3 "$HERE/derive_ssh_key.py" "$KEYDIR" >/dev/null
 
-DROPLET="$(api "/droplets?tag_name=ssa-corpus&per_page=200" | jq -c --arg n "$DROPLET_NAME" '[.droplets[] | select(.name==$n)][0]')"
+# By name across the account (as do_deploy.sh): a droplet made or renamed by hand carries no tag.
+DROPLET="$(api "/droplets?per_page=200" | jq -c --arg n "$DROPLET_NAME" '[.droplets[] | select(.name==$n)][0]')"
 [ -n "$DROPLET" ] && [ "$DROPLET" != "null" ] || die "no droplet named $DROPLET_NAME; run the deploy-cloud workflow first"
 IP="$(echo "$DROPLET" | jq -r '.networks.v4[] | select(.type=="public") | .ip_address' | head -1)"
 [ -n "$IP" ] && [ "$IP" != "null" ] || die "droplet has no public IPv4 address"
