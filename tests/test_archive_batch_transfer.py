@@ -153,3 +153,21 @@ async def test_a_fresh_drive_target_building_its_first_batch_raises_no_lag_alarm
     j.promoted_at = datetime.now(timezone.utc) - timedelta(hours=30)  # the batch should have gone by now
     await db.commit()
     assert await mirror.alert_on_lag() == ["ARCHIVE_MIRROR_LAG:drive"]
+
+
+async def test_an_old_backlog_raises_no_lag_alarm_while_drive_is_actively_receiving(db, source, drive, monkeypatch):
+    """Draining an old backlog (e.g. Drive connected after weeks of collecting) is progress, not lag."""
+    _root, factory = drive
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_BYTES", 1)
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_MAX_WAIT_HOURS", 24.0)
+    await _promote_one(db, source, "PLD 2024 SC 610")
+    t = await _drive_target(db)
+    mirror = ArchiveMirror(db, adapter_factory=factory)
+    await mirror.mirror_pending()
+    await db.commit()
+    assert await _written_judgments(db, t)  # Drive wrote something just now
+
+    old = await _promote_one(db, source, "PLD 2024 SC 611")
+    old.promoted_at = datetime.now(timezone.utc) - timedelta(hours=30)
+    await db.commit()
+    assert await mirror.alert_on_lag() == []

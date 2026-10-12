@@ -287,7 +287,11 @@ class ArchiveMirror:
                 oldest = waiting["oldest"]
                 if oldest is not None and oldest.tzinfo is None:
                     oldest = oldest.replace(tzinfo=timezone.utc)
-                stale = oldest is not None and (now - oldest) > timedelta(hours=allowed)
+                backlog_stale = oldest is not None and (now - oldest) > timedelta(hours=allowed)
+                if last is not None and last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                write_stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
+                stale = backlog_stale and write_stale
             else:
                 stale = last is None or (now - last) > timedelta(hours=allowed)
             problem = lag["judgments_unmirrored"] > 0 and stale
