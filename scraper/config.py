@@ -181,6 +181,12 @@ class Settings(BaseSettings):
     MIRROR_RUN_BUDGET_SECONDS: int = Field(default=900, description="An archive mirror run stops starting new objects after this many seconds, commits, and queues the next run.")
     RECONCILE_RUN_BUDGET_SECONDS: int = Field(default=600, description="A reconcile_storage run stops checking objects after this many seconds; the next run carries on from the least recently verified.")
     RECONCILE_BATCH_SIZE: int = Field(default=2000, description="At most this many stored objects per target are checked in one reconcile_storage run.")
+    ARCHIVE_BATCH_BYTES: int = Field(
+        default=1024**3,
+        description="Batch transfer: a batched archive target (ARCHIVE_BATCH_TARGET_TYPES) receives nothing until about this many bytes of judgments are waiting for it, then takes that whole snapshot in one transfer. 0 = copy every record as it is promoted.",
+    )
+    ARCHIVE_BATCH_MAX_WAIT_HOURS: float = Field(default=24.0, description="A batch also starts when the oldest judgment waiting for a batched target has waited this long, so a slow trickle still reaches it.")
+    ARCHIVE_BATCH_TARGET_TYPES: str = Field(default="google_drive", description="Comma list of archive target types that receive batches (the rest are written record by record).")
     MIRROR_LAG_ALERT_HOURS: float = Field(default=3.0, description="Alert (ARCHIVE_MIRROR_LAG) when a target has unmirrored judgments and its newest mirrored judgment is older than this.")
     EMBED_QUEUE_ALERT_HOURS: float = Field(default=6.0, description="Alert (EMBED_QUEUE_STALLED) when pending embeddings are older than this and none were embedded in that time.")
     SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Every 30 minutes a few promoted records are re-fetched and compared with the corpus.")

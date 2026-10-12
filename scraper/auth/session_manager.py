@@ -1408,17 +1408,22 @@ class PlaywrightBrowser:
         return await self._wrap(self._context.storage_state())
 
     async def close(self) -> None:
-        for closer in (self._context, self._browser):
+        async def _timed_close(coro, timeout: float = 10.0) -> None:
+            if coro is None:
+                return
             try:
-                if closer is not None:
-                    await closer.close()
+                await asyncio.wait_for(coro, timeout=timeout)
             except Exception:
                 pass
-        try:
-            if self._pw is not None:
-                await self._pw.stop()
-        except Exception:
-            pass
+
+        # A hung context must not block browser/playwright teardown (ContinuityRunner abandons after 30s).
+        await _timed_close(self._browser.close() if self._browser else None)
+        await _timed_close(self._context.close() if self._context else None)
+        await _timed_close(self._pw.stop() if self._pw else None)
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._pw = None
 
 
 class BrowserFactory(Protocol):
