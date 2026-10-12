@@ -59,7 +59,9 @@ fi
 
 # ---------------------------------------------------------------- droplet (create or reuse)
 log "Looking for an existing droplet named $DROPLET_NAME"
-DROPLET_ID="$(api GET "/droplets?tag_name=ssa-corpus&per_page=200" | jq -r --arg n "$DROPLET_NAME" '.droplets[] | select(.name==$n) | .id' | head -1)"
+# By name across the account, not only droplets tagged ssa-corpus: a droplet the owner created or
+# renamed by hand carries no tag, and missing it would create a second droplet of the same name.
+DROPLET_ID="$(api GET "/droplets?per_page=200" | jq -r --arg n "$DROPLET_NAME" '.droplets[] | select(.name==$n) | .id' | head -1)"
 if [ -z "$DROPLET_ID" ]; then
   log "Creating droplet $DROPLET_NAME ($DO_SIZE in $DO_REGION, Ubuntu 24.04)"
   BODY="$(jq -nc --arg n "$DROPLET_NAME" --arg r "$DO_REGION" --arg s "$DO_SIZE" --argjson k "$KEY_ID" \

@@ -42,6 +42,11 @@ def harvests(access_method: str) -> bool:
     return harvests_login_sources() if access_method == "login_session" else harvests_public_sources()
 
 
+def retired_sources() -> frozenset:
+    """Sources the owner retired (RETIRED_SOURCES): never dispatched on any server, whatever their row says."""
+    return frozenset(n.strip() for n in (settings.RETIRED_SOURCES or "").split(",") if n.strip())
+
+
 def beat_schedule_for_role(schedule: Dict[str, Any]) -> Dict[str, Any]:
     """The Beat schedule without the entries that belong to the other server."""
     drop = set()

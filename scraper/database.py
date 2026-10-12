@@ -391,6 +391,15 @@ async def seed_data() -> None:
                     state_reason="Awaiting human login" if method == "login_session" else None,
                 )
             )
+        # Sources the owner retired stay as DISABLED rows (their records and history remain) and are
+        # never dispatched; a new database seeds them the same way.
+        from scraper.deploy_role import retired_sources
+
+        retired = retired_sources()
+        for row in list(existing_source_rows.values()) + [o for o in db.new if isinstance(o, ScraperSource)]:
+            if row.source_name in retired and (row.state != "DISABLED" or row.is_active):
+                row.state, row.is_active = "DISABLED", False
+                row.state_reason = "retired on the owner's instruction (12 Oct 2026): the site blocks this service"
         # Keep LHC source aligned with the connector defaults on existing databases.
         lhc = existing_source_rows.get("LahoreHighCourt")
         if lhc is not None:
