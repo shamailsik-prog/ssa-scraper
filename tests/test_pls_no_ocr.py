@@ -47,3 +47,39 @@ async def test_pls_judgment_with_a_scanned_pdf_is_staged_without_ocr(db, login_s
     staging = (await db.execute(select(ScraperStaging))).scalars().one()
     assert staging.pdf_provenance_id is not None  # the original PDF is still preserved byte for byte
     assert staging.ocr_applied is False
+
+
+async def test_typed_judgment_text_is_kept_when_the_attached_pdf_is_scanned(db, login_source, monkeypatch):
+    """The full typed judgment from the case-description modal is never replaced by a scanned (or
+    corrupt) attachment's thin text: that would throw away the judgment to keep an empty PDF read."""
+    from tests.test_auth_playwright import _modal_full_judgment_text
+
+    _forbid_ocr(monkeypatch)
+    await _activate(db, login_source)
+    citation, title = "PLD 2024 SC 903", "Typed modal, scanned attachment"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2006K903"
+    modal_text = _modal_full_judgment_text(citation, title)
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    pdf = scanned_pdf_bytes()
+
+    async def download(_url):
+        return pdf
+
+    monkeypatch.setattr(pipeline, "download", download)
+    row = {"citation": citation, "title": title, "court": "Supreme Court", "detail_url": detail_url, "pdf_url": "https://www.pakistanlawsite.com/files/903.pdf"}
+    page = PageResult(
+        url=detail_url,
+        html=_notes_only_detail_html(citation, title),
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_found": True,
+            "case_description_modal_text": modal_text,
+            "case_description_modal_text_length": len(modal_text),
+        },
+    )
+
+    assert await pipeline.preserve_and_extract(page, {"tier": 4, "row_index": 0}, row) == "staged"
+    staging = (await db.execute(select(ScraperStaging))).scalars().one()
+    assert len(staging.raw_text.strip()) > 200 and citation in staging.raw_text  # the typed judgment survives
