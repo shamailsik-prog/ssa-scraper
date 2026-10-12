@@ -282,7 +282,14 @@ class ArchiveMirror:
             lag = await self.lag(t)
             last = lag.pop("_last_written")
             allowed = float(settings.MIRROR_LAG_ALERT_HOURS) + (float(settings.ARCHIVE_BATCH_MAX_WAIT_HOURS) if self._batched(t) else 0.0)
-            stale = last is None or (now - last) > timedelta(hours=allowed)
+            if self._batched(t):
+                waiting = await self.batch_waiting(t)
+                oldest = waiting["oldest"]
+                if oldest is not None and oldest.tzinfo is None:
+                    oldest = oldest.replace(tzinfo=timezone.utc)
+                stale = oldest is not None and (now - oldest) > timedelta(hours=allowed)
+            else:
+                stale = last is None or (now - last) > timedelta(hours=allowed)
             problem = lag["judgments_unmirrored"] > 0 and stale
             code_msg = f"ARCHIVE_MIRROR_LAG:{t.name}"
             open_alert = (
