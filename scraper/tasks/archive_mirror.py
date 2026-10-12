@@ -55,9 +55,12 @@ async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
 
 
 async def reconcile_storage() -> Dict[str, Any]:
+    """Check one bounded slice of stored objects per target, committing as it goes (see ArchiveMirror.reconcile)."""
     async with SessionLocal() as db:
-        report = await ArchiveMirror(db).reconcile()
+        mirror = ArchiveMirror(db, deadline=time.monotonic() + settings.RECONCILE_RUN_BUDGET_SECONDS, commit_progress=True)
+        report = await mirror.reconcile(limit=settings.RECONCILE_BATCH_SIZE)
         await db.commit()
+        report["out_of_time"] = mirror.out_of_time
         return report
 
 

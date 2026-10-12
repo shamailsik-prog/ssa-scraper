@@ -411,3 +411,45 @@ def test_classify_response_authenticated_case_page_with_password_modal_is_ok():
     body = "<html><body><a href='/logout'>Logout</a><h2>Citation Name: PLD 2024 SC 1</h2><p>JUDGMENT</p>"
     body += "<div id='UpdateSubscriber'><input type='password' name='Password'></div></body></html>"
     assert classify_response(200, body, "https://www.pakistanlawsite.com/Login/Check").kind == "ok"
+
+
+async def test_reconcile_runs_in_committed_slices_least_recently_verified_first(db, source, tmp_path):
+    """The daily reconcile asked Drive about all ~150,000 objects inside one transaction: Postgres ended it
+    at the idle-in-transaction limit before it ever finished, and while it ran it held the target row the
+    mirror updates, so Drive copies stopped for half an hour (11 October 2026, 23:21 and 00:19 UTC). A run
+    now checks a bounded slice, oldest verification first, and commits as it goes."""
+    await _promote_one(db, source, "PLD 2024 SC 502")
+    root = tmp_path / "slices"
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(root)))
+    await db.commit()
+    await ArchiveMirror(db).mirror_pending()
+    await db.commit()
+    total = (await db.execute(select(func.count()).select_from(ArchiveObject))).scalar()
+    assert total >= 4
+
+    rec = await ArchiveMirror(db, commit_progress=True).reconcile(limit=2)
+    assert rec["local"]["checked"] == 2
+    # committed as it went: another session already sees the two verifications
+    async with SessionLocal() as other:
+        seen = (await other.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.verified_at.isnot(None)))).scalar()
+    assert seen == 2
+
+    # the next slice takes the objects never verified, not the same two again
+    rec2 = await ArchiveMirror(db, commit_progress=True).reconcile(limit=total - 2)
+    assert rec2["local"]["checked"] == total - 2
+    unverified = (await db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.verified_at.is_(None)))).scalar()
+    assert unverified == 0
+
+
+async def test_reconcile_stops_at_its_deadline(db, source, tmp_path):
+    import time
+
+    await _promote_one(db, source, "PLD 2024 SC 503")
+    root = tmp_path / "deadline"
+    db.add(ArchiveTarget(name="local", target_type="local_path", root_path=str(root)))
+    await db.commit()
+    await ArchiveMirror(db).mirror_pending()
+    await db.commit()
+    mirror = ArchiveMirror(db, deadline=time.monotonic() - 1, commit_progress=True)
+    rec = await mirror.reconcile()
+    assert rec["local"]["checked"] == 0 and mirror.out_of_time

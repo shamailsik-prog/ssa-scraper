@@ -96,7 +96,8 @@ app.conf.update(
         "classify-treatment-nightly": {"task": "scraper.tasks.treatment.classify_treatment", "schedule": 86400},
         "process-embeddings": {"task": "scraper.tasks.embeddings.process_embedding_queue", "schedule": 300},
         "archive-mirror": {"task": "scraper.tasks.archive_mirror.mirror_pending", "schedule": 1800},
-        "reconcile-storage": {"task": "scraper.tasks.archive_mirror.reconcile_storage", "schedule": 86400},
+        # hourly bounded slices (RECONCILE_BATCH_SIZE objects per target, least recently verified first)
+        "reconcile-storage": {"task": "scraper.tasks.archive_mirror.reconcile_storage", "schedule": 3600},
     },
 )
 if settings.TREATMENT_RECONCILE_ENABLED:
