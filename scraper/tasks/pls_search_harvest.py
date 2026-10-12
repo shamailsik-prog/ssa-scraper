@@ -724,52 +724,6 @@ async def run_search_harvest(
         await harvest_lock.release()
 
 
-# The harvest runs once an hour and shares the two logins with the two case-ID walks. A tick that found both logins
-# busy used to skip its whole hour; it comes back a minute later instead, a bounded number of times (each walk tick
-# ends within its 10-minute schedule, so a login frees well inside the retries). Operator, 12 October 2026.
-LOGIN_BUSY_REASONS = ("no free login slot", "login session lock held")
-LOGIN_BUSY_RETRY_SECONDS = 60
-LOGIN_BUSY_MAX_RETRIES = 15
-
-
-async def _harvest_tick_body(**kwargs) -> Dict[str, Any]:
-    from sqlalchemy import func, select
-
-    from scraper.pls_grid_health import (
-        SOURCE_NAME,
-        pls_last_judgment_at,
-        pls_search_harvest_may_run,
-        pls_stall_verdict_for_config,
-    )
-    from scraper.models import PlsSearchHarvestQuery, ScraperSource
-
-    async with SessionLocal() as db:
-        source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
-        cfg = dict(source.config_json or {}) if source else {}
-        pending = int(
-            (
-                await db.execute(
-                    select(func.count())
-                    .select_from(PlsSearchHarvestQuery)
-                    .where(
-                        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-                        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-        stall_reason = None
-        if pending > 0 and source is not None:
-            last_j = await pls_last_judgment_at(db)
-            stall_reason = pls_stall_verdict_for_config(
-                cfg, last_promotion_at=last_j, source_state=source.state
-            ).get("stalled_reason")
-        if not pls_search_harvest_may_run(cfg, pending_gaps=pending, stall_reason=stall_reason):
-            return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
-        return await run_search_harvest(db, **kwargs)
-
-
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
 def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
     from scraper.tasks.deploy_hold import login_work_held
@@ -777,12 +731,44 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
     if login_work_held():
         return {"skipped": True, "reason": "deploy_hold"}
 
-    retry = int(kwargs.pop("login_busy_retry", 0) or 0)
-    result = run_async(_harvest_tick_body(**kwargs))
-    if isinstance(result, dict) and result.get("skipped") and result.get("reason") in LOGIN_BUSY_REASONS and retry < LOGIN_BUSY_MAX_RETRIES:
-        pls_search_harvest_tick.apply_async(kwargs={**kwargs, "login_busy_retry": retry + 1}, countdown=LOGIN_BUSY_RETRY_SECONDS)
-        result["requeued"] = True
-    return result
+    async def _inner() -> Dict[str, Any]:
+        from sqlalchemy import func, select
+
+        from scraper.pls_grid_health import (
+            SOURCE_NAME,
+            pls_last_judgment_at,
+            pls_search_harvest_may_run,
+            pls_stall_verdict_for_config,
+        )
+        from scraper.models import PlsSearchHarvestQuery, ScraperSource
+
+        async with SessionLocal() as db:
+            source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
+            cfg = dict(source.config_json or {}) if source else {}
+            pending = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(PlsSearchHarvestQuery)
+                        .where(
+                            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            stall_reason = None
+            if pending > 0 and source is not None:
+                last_j = await pls_last_judgment_at(db)
+                stall_reason = pls_stall_verdict_for_config(
+                    cfg, last_promotion_at=last_j, source_state=source.state
+                ).get("stalled_reason")
+            if not pls_search_harvest_may_run(cfg, pending_gaps=pending, stall_reason=stall_reason):
+                return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
+            return await run_search_harvest(db, **kwargs)
+
+    return run_async(_inner())
 
 
 def cli_plan(argv: Optional[List[str]] = None) -> int:
