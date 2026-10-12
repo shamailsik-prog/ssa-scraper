@@ -7,7 +7,7 @@ as **two servers from the same code**, each with its own database, queues, worke
 | Server | `DEPLOY_ROLE` | Harvests |
 |---|---|---|
 | `ssa-corpus` | `pls` | PakistanLawSite only (login, citation grid, search harvest, case-ID walk) |
-| `ssa-corpus-public` | `public` | Every free source: court websites (unreported judgments), PakistanCode, legislatures, gazettes, NasirLawSite |
+| `ssa-corpus-public` | `public` | Every free source: court websites (unreported judgments), PakistanCode, legislatures, gazettes |
 
 `DEPLOY_ROLE=all` (the default) keeps the old single-server behaviour, so nothing changes on a server
 until its role is set.
@@ -26,6 +26,14 @@ until its role is set.
 
 Both servers write documents in the same format (`docs/CORPUS_RECORD_FORMAT.md`), so the ingestion stage
 reads them alike.
+
+## Retired sources
+
+`RETIRED_SOURCES` (default `NasirLawSite,BalochistanHighCourt`) lists sources that are switched off on
+every start-up: their rows are set to DISABLED and never dispatched. Both sites block this service (HTTP
+403 / access denied since September 2026), and the owner asked for them to be removed. Their records
+already collected stay in the database and on Drive. To bring one back, remove it from the setting in
+`/opt/ssa-scraper/.env`, restart, and set the source ACTIVE on the dashboard.
 
 ## Starting the free-sites server
 

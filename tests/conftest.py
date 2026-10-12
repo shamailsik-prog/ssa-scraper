@@ -33,6 +33,8 @@ os.environ["PDF_STORAGE_PATH"] = str(_TMP / "live")
 os.environ["STATE_STORAGE_PATH"] = str(_TMP / "state")
 os.environ["ARCHIVE_LOCAL_PATH"] = ""
 os.environ["SGAI_API_KEY"] = ""
+# Connector tests exercise every source's code, including the two retired in production.
+os.environ["RETIRED_SOURCES"] = ""
 os.environ["SGAI_LOCAL_LLM_BASE_URL"] = ""
 os.environ["SGAI_LOCAL_LLM_MODEL"] = ""
 os.environ["SGAI_DAILY_CREDIT_CAP"] = ""

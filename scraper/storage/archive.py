@@ -266,7 +266,12 @@ class ArchiveMirror:
             total_q, unmirrored_q = total_q.where(policy), unmirrored_q.where(policy)
         total = int((await self.db.execute(total_q)).scalar() or 0)
         unmirrored = int((await self.db.execute(unmirrored_q)).scalar() or 0)
-        last_written = (await self.db.execute(select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written"))).scalar()
+        # progress means judgments reaching the target: index, statute and instrument writes do not count
+        last_written = (
+            await self.db.execute(
+                select(func.max(ArchiveObject.written_at)).where(ArchiveObject.target_id == t.id, ArchiveObject.status == "written", ArchiveObject.judgment_id.is_not(None))
+            )
+        ).scalar()
         return {"judgments_total": total, "judgments_unmirrored": unmirrored, "last_written_at": last_written.isoformat() if last_written else None, "_last_written": last_written}
 
     async def alert_on_lag(self) -> List[str]:
@@ -287,7 +292,11 @@ class ArchiveMirror:
                 oldest = waiting["oldest"]
                 if oldest is not None and oldest.tzinfo is None:
                     oldest = oldest.replace(tzinfo=timezone.utc)
-                stale = oldest is not None and (now - oldest) > timedelta(hours=allowed)
+                backlog_stale = oldest is not None and (now - oldest) > timedelta(hours=allowed)
+                if last is not None and last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                write_stale = last is None or (now - last) > timedelta(hours=float(settings.MIRROR_LAG_ALERT_HOURS))
+                stale = backlog_stale and write_stale
             else:
                 stale = last is None or (now - last) > timedelta(hours=allowed)
             problem = lag["judgments_unmirrored"] > 0 and stale
