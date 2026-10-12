@@ -171,3 +171,17 @@ async def test_an_old_backlog_raises_no_lag_alarm_while_drive_is_actively_receiv
     old.promoted_at = datetime.now(timezone.utc) - timedelta(hours=30)
     await db.commit()
     assert await mirror.alert_on_lag() == []
+
+
+async def test_a_fresh_index_write_does_not_hide_a_stuck_judgment_backlog(db, source, drive, monkeypatch):
+    """Only judgments reaching Drive count as progress: an index rewritten every run must not mute the alarm."""
+    _root, factory = drive
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_BYTES", 10 * 1024**2)
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_MAX_WAIT_HOURS", 24.0)
+    j = await _promote_one(db, source, "PLD 2024 SC 612")
+    j.promoted_at = datetime.now(timezone.utc) - timedelta(hours=30)
+    t = await _drive_target(db)
+    db.add(ArchiveObject(target_id=t.id, object_key="index.csv", content_hash="0" * 64, document_kind="index_csv", status="written", written_at=datetime.now(timezone.utc)))
+    await db.commit()
+
+    assert await ArchiveMirror(db, adapter_factory=factory).alert_on_lag() == ["ARCHIVE_MIRROR_LAG:drive"]
