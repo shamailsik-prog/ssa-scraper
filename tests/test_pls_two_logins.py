@@ -94,15 +94,33 @@ def test_installer_and_deploy_run_both_logins():
     assert "BACKFILL_LOGIN_SESSION_CONCURRENCY=2" in deploy
 
 
+def _deploy_funcs(*names):
+    script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    out = ""
+    for name in names:
+        start = script.index(f"{name}() {{")
+        out += script[start : script.index("\n}\n", start) + 3]
+    return out
+
+
+def test_deploy_step_turns_the_caseid_walk_back_on(tmp_path):
+    """Operator, 12 October 2026: "make it faster". The walk had been switched off by hand in .env."""
+    import subprocess
+
+    env = tmp_path / ".env"
+    env.write_text("FOO=1\nPLS_CASEID_WALK_ENABLED=false\n", encoding="utf-8")
+    prog = 'log() { echo "$*"; }\n' + _deploy_funcs("ensure_env_kv", "ensure_caseid_walk_on") + 'cd "$1" && ensure_caseid_walk_on && ensure_caseid_walk_on\n'
+    subprocess.run(["bash", "-c", prog, "deploy-test", str(tmp_path)], check=True, capture_output=True, text=True)
+    assert env.read_text(encoding="utf-8").splitlines() == ["FOO=1", "PLS_CASEID_WALK_ENABLED=true"]
+    assert '[ "$DRY_RUN" = 1 ] || ensure_caseid_walk_on' in Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+
+
 def test_deploy_step_sets_both_logins_in_env(tmp_path):
     import subprocess
 
     env = tmp_path / ".env"
     env.write_text("FOO=1\nLOGIN_SESSION_CONCURRENCY=1\nBAR=2", encoding="utf-8")  # no final newline
-    script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
-    start = script.index("ensure_two_pls_logins() {")
-    func = script[start : script.index("\n}\n", start) + 3]
-    prog = 'log() { echo "$*"; }\n' + func + 'cd "$1" && ensure_two_pls_logins && ensure_two_pls_logins\n'
+    prog = 'log() { echo "$*"; }\n' + _deploy_funcs("ensure_env_kv", "ensure_two_pls_logins") + 'cd "$1" && ensure_two_pls_logins && ensure_two_pls_logins\n'
     subprocess.run(["bash", "-c", prog, "deploy-test", str(tmp_path)], check=True, capture_output=True, text=True)
     lines = env.read_text(encoding="utf-8").splitlines()
     assert lines == ["FOO=1", "LOGIN_SESSION_CONCURRENCY=2", "BAR=2", "BACKFILL_LOGIN_SESSION_CONCURRENCY=2"]

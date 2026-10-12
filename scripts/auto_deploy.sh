@@ -50,13 +50,11 @@ die() {
 # shellcheck source=scripts/pls_host_lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/pls_host_lib.sh"
 
-# Operator decision of 11 October 2026: PakistanLawSite login 1 and login 2 are separate accounts and run at the same
-# time, one reporter shard each, each login paced at its own 300 pages an hour. Both the updates-mode and the
-# backfill-mode setting say so; the login worker's --concurrency reads LOGIN_SESSION_CONCURRENCY from .env.
-ensure_two_pls_logins() {
+# Set KEY=VALUE pairs in .env, replacing a different value and appending a missing key.
+ensure_env_kv() {
   [ -f .env ] || return 0
   local kv key
-  for kv in LOGIN_SESSION_CONCURRENCY=2 BACKFILL_LOGIN_SESSION_CONCURRENCY=2; do
+  for kv in "$@"; do
     key="${kv%%=*}"
     if grep -q "^${key}=" .env; then
       grep -qx "$kv" .env || { sed -i "s/^${key}=.*/${kv}/" .env; log "set $kv in .env"; }
@@ -67,6 +65,20 @@ ensure_two_pls_logins() {
       log "added $kv to .env"
     fi
   done
+}
+
+# Operator decision of 11 October 2026: PakistanLawSite login 1 and login 2 are separate accounts and run at the same
+# time, one reporter shard each, each login paced at its own 300 pages an hour. Both the updates-mode and the
+# backfill-mode setting say so; the login worker's --concurrency reads LOGIN_SESSION_CONCURRENCY from .env.
+ensure_two_pls_logins() {
+  ensure_env_kv LOGIN_SESSION_CONCURRENCY=2 BACKFILL_LOGIN_SESSION_CONCURRENCY=2
+}
+
+# Operator decision of 12 October 2026 ("make it faster", "unblock"): the case-ID walk runs again. It had been
+# switched off by hand in .env, which left only the hourly search harvest (about 125 judgments an hour); the logins
+# were thrown out on the same schedule with the walk off. The harvest now waits for a free login instead of skipping.
+ensure_caseid_walk_on() {
+  ensure_env_kv PLS_CASEID_WALK_ENABLED=true
 }
 
 install_cron() {
@@ -262,6 +274,7 @@ main() {
   fi
   install_cron
   [ "$DRY_RUN" = 1 ] || ensure_two_pls_logins
+  [ "$DRY_RUN" = 1 ] || ensure_caseid_walk_on
 
   # Load compose env for postgres user/db names when present.
   if [ -f .env ]; then
