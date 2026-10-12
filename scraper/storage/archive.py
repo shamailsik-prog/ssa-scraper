@@ -481,24 +481,47 @@ class ArchiveMirror:
             return {"ok": False, "error": str(exc)[:300]}
 
     # ------------------------------------------------------------------ reconcile
-    async def reconcile(self) -> Dict[str, Any]:
+    async def reconcile(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Check stored objects against each target, least recently verified first.
+
+        One pass over every object asked Drive about ~150,000 files inside a single transaction: Postgres ended
+        it at the idle-in-transaction limit before it finished, and while it ran it held the target row the
+        mirror updates, so Drive copies stopped (11 October 2026). With `limit`, a deadline and commit_progress
+        a run checks a bounded slice and commits as it goes; the next run carries on from the oldest checks."""
         report: Dict[str, Any] = {}
         for t in await self.targets():
             rep = {"checked": 0, "ok": 0, "missing": 0, "mismatch": 0, "error": None}
+            if self._time_up():
+                report[t.name] = rep
+                continue
             try:
                 adapter = await asyncio.to_thread(self.adapter_factory, t.target_type, target_config(t))
             except Exception as exc:
                 rep["error"] = str(exc)[:500]
                 report[t.name] = rep
                 continue
-            objs = (await self.db.execute(select(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "missing", "mismatch"])))).scalars().all()
-            for o in objs:
+            q = (
+                select(ArchiveObject)
+                .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "missing", "mismatch"]))
+                .order_by(ArchiveObject.verified_at.asc().nulls_first(), ArchiveObject.id)
+            )
+            if limit is not None:
+                q = q.limit(limit)
+            objs = (await self.db.execute(q)).scalars().all()
+            for i, o in enumerate(objs, 1):
+                if self._time_up():
+                    break
+                if i % 50 == 0:
+                    await self._checkpoint()
                 rep["checked"] += 1
                 try:
                     size = await asyncio.to_thread(adapter.size, o.object_key)
                 except Exception as exc:
                     rep["error"] = str(exc)[:500]
                     break
+                # verified_at is when the object was last checked, whatever the answer: a missing object keeps its
+                # status but moves to the back of the queue instead of leading every slice.
+                o.verified_at = datetime.now(timezone.utc)
                 if size is None:
                     o.status = "missing"
                     rep["missing"] += 1
@@ -507,13 +530,13 @@ class ArchiveMirror:
                     rep["mismatch"] += 1
                 else:
                     o.status = "written"
-                    o.verified_at = datetime.now(timezone.utc)
                     rep["ok"] += 1
             t.last_reconciled_at = datetime.now(timezone.utc)
             if rep["missing"] or rep["mismatch"]:
                 await notify(self.db, level="warning", code="ARCHIVE_RECONCILE", message=f"{t.name}: {rep['missing']} missing, {rep['mismatch']} mismatched of {rep['checked']}", details=rep)
             report[t.name] = rep
             await self.db.flush()
+            await self._checkpoint()
         return report
 
 
