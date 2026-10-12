@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 
 from scraper.config import search_harvest_tick_expiry, settings
 from scraper.tasks.deploy_hold import login_work_held
-from scraper.deploy_role import harvests
+from scraper.deploy_role import harvests, retired_sources
 from scraper.database import SessionLocal, run_async
 from scraper.auth.session_manager import SessionLockHeld
 from scraper.harvest_mode import (
@@ -270,6 +270,10 @@ async def run_source(
         ).scalars().first()
         if source is None:
             return {"error": f"source {source_name} not found"}
+        if source_name in retired_sources():
+            clear_source_queued(source_name)
+            logger.info("%s is retired (RETIRED_SOURCES); not run", source_name)
+            return {"skipped": "retired"}
         if not harvests(source.access_method):
             clear_source_queued(source_name)
             logger.info("%s is not harvested on this server (DEPLOY_ROLE=%s); not run", source_name, settings.DEPLOY_ROLE)
@@ -491,6 +495,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
         for s in rows:
             if not harvests(s.access_method):
                 continue  # the other server's source (DEPLOY_ROLE)
+            if s.source_name in retired_sources():
+                continue  # retired on the owner's instruction, even if re-enabled on the dashboard
             if not source_selected_for_mode(s, mode):
                 continue
             due = s.next_scrape_at is None or s.next_scrape_at <= now

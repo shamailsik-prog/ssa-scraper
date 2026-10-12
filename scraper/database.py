@@ -393,7 +393,9 @@ async def seed_data() -> None:
             )
         # Sources the owner retired stay as DISABLED rows (their records and history remain) and are
         # never dispatched; a new database seeds them the same way.
-        retired = {n.strip() for n in (settings.RETIRED_SOURCES or "").split(",") if n.strip()}
+        from scraper.deploy_role import retired_sources
+
+        retired = retired_sources()
         for row in list(existing_source_rows.values()) + [o for o in db.new if isinstance(o, ScraperSource)]:
             if row.source_name in retired and (row.state != "DISABLED" or row.is_active):
                 row.state, row.is_active = "DISABLED", False
