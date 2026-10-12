@@ -45,6 +45,7 @@ from scraper.pls_search_harvest_core import (
     normalize_query_json,
     parse_total_results_from_html,
     partition_rows_by_known,
+    search_harvest_may_mark_done,
     reporters_for_plan,
     cited_citations_in_text,
     is_capped,
@@ -280,6 +281,38 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     }
 
 
+async def reopen_premature_done_queries(
+    db: AsyncSession,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Re-queue search harvest jobs marked done after only page 1 with no parsed site total."""
+    reopen_reason = "reopened: marked done without known site total and at most one page enumerated"
+    stmt = select(PlsSearchHarvestQuery).where(
+        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+        PlsSearchHarvestQuery.status == "done",
+        PlsSearchHarvestQuery.site_total_results.is_(None),
+        func.coalesce(PlsSearchHarvestQuery.pages_enumerated, 0) <= 1,
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    if dry_run:
+        return {
+            "would_reopen": len(rows),
+            "query_keys": [row.query_key for row in rows[:100]],
+        }
+    for row in rows:
+        row.status = "in_progress"
+        row.pages_enumerated = 0
+        row.rows_seen = 0
+        row.rows_known = 0
+        row.rows_new = 0
+        row.gap_size = 0
+        row.cursor_json = {"page": 1, "row_index": 0}
+        row.last_error = reopen_reason
+    await db.flush()
+    return {"reopened": len(rows)}
+
+
 async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[str, Any]]:
     rows = (
         await db.execute(
@@ -404,6 +437,11 @@ class SearchHarvestRunner:
         out_of_time = False
 
         resume_url = cursor.get("next_url") if pages_done > 0 else None
+        # The run opens on a page an earlier run already finished: a page that showed no next link and no site
+        # total is read once more to confirm it is the last. Its rows were counted then and are not counted again,
+        # so the confirming read can neither inflate rows_seen into a false cap split nor loop for ever
+        # (12 October 2026: SCMR, CLC and PCrLJ 2017 re-read page 1 every tick).
+        rereading = not resume_url and pages_done > 0 and pages_done >= page_idx
         if resume_url:
             page = await self.pipeline.fetch_detail(str(resume_url))
         else:
@@ -425,8 +463,12 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(rows, known_set)
-            rows_seen += len(rows)
-            rows_known += known_on_page
+            if rereading:
+                rows_counted, known_counted = 0, 0
+            else:
+                rows_counted, known_counted = len(rows), known_on_page
+            rows_seen += rows_counted
+            rows_known += known_counted
 
             if not self.dry_run:
                 route_base = {
@@ -470,8 +512,8 @@ class SearchHarvestRunner:
             if out_of_time:
                 # Stop mid-page and give the login worker back; the cursor (this page, next row) resumes the
                 # query on the next tick, which counts this page's rows again, so they are not counted now.
-                rows_seen -= len(rows)
-                rows_known -= known_on_page
+                rows_seen -= rows_counted
+                rows_known -= known_counted
                 release_page_result(page)
                 query_row.rows_seen = rows_seen
                 query_row.rows_known = rows_known
@@ -482,7 +524,10 @@ class SearchHarvestRunner:
                 await self.db.flush()
                 break
 
-            pages_done += 1
+            confirmed_last = rereading and not outcome.data.get("next_page")
+            if not rereading:
+                pages_done += 1
+            rereading = False
             start_row_index = 0
             cursor["row_index"] = 0
             nxt = outcome.data.get("next_page")
@@ -530,8 +575,25 @@ class SearchHarvestRunner:
                     query_row.status = "failed"
                     query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
                     break
-                query_row.status = "done"
-                query_row.cursor_json = {"page": 1, "row_index": 0}
+                may_done, incomplete_reason = search_harvest_may_mark_done(
+                    site_total=site_total,
+                    rows_seen=rows_seen,
+                    rows_on_page=len(rows),
+                )
+                if not may_done and confirmed_last and site_total is None:
+                    may_done = True
+                if may_done:
+                    query_row.status = "done"
+                    query_row.last_error = None if confirmed_last else query_row.last_error
+                    query_row.cursor_json = {"page": 1, "row_index": 0}
+                else:
+                    query_row.status = "in_progress"
+                    query_row.last_error = incomplete_reason[:1000]
+                    if site_total is not None and rows_seen < int(site_total):
+                        cursor = {"page": page_idx + 1, "row_index": 0}
+                    else:
+                        cursor = {"page": page_idx, "row_index": 0}
+                    query_row.cursor_json = dict(cursor)
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
@@ -541,7 +603,12 @@ class SearchHarvestRunner:
                 query_row.status = "in_progress"
                 break
             await self._pace_sleep()
-            page = await self.pipeline.fetch_detail(nxt)
+            try:
+                page = await self.pipeline.fetch_detail(nxt)
+            except Exception as exc:
+                query_row.status = "in_progress"
+                query_row.last_error = f"pagination interrupted: {exc}"[:1000]
+                break
             self.memory.note_window()
             await self._maybe_recycle_browser()
 
@@ -820,4 +887,22 @@ def cli_completeness(argv: Optional[List[str]] = None) -> int:
             return await completeness_report(db)
 
     print(json.dumps(run_async(_run()), indent=2, default=str))
+    return 0
+
+
+def cli_reopen_premature_done(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    async def _run():
+        async with SessionLocal() as db:
+            out = await reopen_premature_done_queries(db, dry_run=args.dry_run)
+            if not args.dry_run:
+                await db.commit()
+            return out
+
+    print(json.dumps(run_async(_run()), indent=2))
     return 0
