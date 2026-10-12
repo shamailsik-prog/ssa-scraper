@@ -137,3 +137,19 @@ async def test_zero_turns_batching_off(db, source, drive, monkeypatch):
     await db.commit()
     assert await _written_judgments(db, t) == {j.id}
     assert (await db.execute(select(Judgment))).scalars().first() is not None
+
+
+async def test_a_fresh_drive_target_building_its_first_batch_raises_no_lag_alarm(db, source, drive, monkeypatch):
+    """A new server's Drive has written nothing yet while its first batch builds up: that is not lag."""
+    _root, factory = drive
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_BYTES", 10 * 1024**2)
+    monkeypatch.setattr(settings, "ARCHIVE_BATCH_MAX_WAIT_HOURS", 24.0)
+    j = await _promote_one(db, source, "PLD 2024 SC 609")
+    await _drive_target(db)
+    mirror = ArchiveMirror(db, adapter_factory=factory)
+
+    assert await mirror.alert_on_lag() == []  # waiting 0 h of the allowed 24 + 3
+
+    j.promoted_at = datetime.now(timezone.utc) - timedelta(hours=30)  # the batch should have gone by now
+    await db.commit()
+    assert await mirror.alert_on_lag() == ["ARCHIVE_MIRROR_LAG:drive"]
