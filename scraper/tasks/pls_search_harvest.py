@@ -437,6 +437,11 @@ class SearchHarvestRunner:
         out_of_time = False
 
         resume_url = cursor.get("next_url") if pages_done > 0 else None
+        # The run opens on a page an earlier run already finished: a page that showed no next link and no site
+        # total is read once more to confirm it is the last. Its rows were counted then and are not counted again,
+        # so the confirming read can neither inflate rows_seen into a false cap split nor loop for ever
+        # (12 October 2026: SCMR, CLC and PCrLJ 2017 re-read page 1 every tick).
+        rereading = not resume_url and pages_done > 0 and pages_done >= page_idx
         if resume_url:
             page = await self.pipeline.fetch_detail(str(resume_url))
         else:
@@ -458,8 +463,12 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(rows, known_set)
-            rows_seen += len(rows)
-            rows_known += known_on_page
+            if rereading:
+                rows_counted, known_counted = 0, 0
+            else:
+                rows_counted, known_counted = len(rows), known_on_page
+            rows_seen += rows_counted
+            rows_known += known_counted
 
             if not self.dry_run:
                 route_base = {
@@ -503,8 +512,8 @@ class SearchHarvestRunner:
             if out_of_time:
                 # Stop mid-page and give the login worker back; the cursor (this page, next row) resumes the
                 # query on the next tick, which counts this page's rows again, so they are not counted now.
-                rows_seen -= len(rows)
-                rows_known -= known_on_page
+                rows_seen -= rows_counted
+                rows_known -= known_counted
                 release_page_result(page)
                 query_row.rows_seen = rows_seen
                 query_row.rows_known = rows_known
@@ -515,7 +524,10 @@ class SearchHarvestRunner:
                 await self.db.flush()
                 break
 
-            pages_done += 1
+            confirmed_last = rereading and not outcome.data.get("next_page")
+            if not rereading:
+                pages_done += 1
+            rereading = False
             start_row_index = 0
             cursor["row_index"] = 0
             nxt = outcome.data.get("next_page")
@@ -568,8 +580,11 @@ class SearchHarvestRunner:
                     rows_seen=rows_seen,
                     rows_on_page=len(rows),
                 )
+                if not may_done and confirmed_last and site_total is None:
+                    may_done = True
                 if may_done:
                     query_row.status = "done"
+                    query_row.last_error = None if confirmed_last else query_row.last_error
                     query_row.cursor_json = {"page": 1, "row_index": 0}
                 else:
                     query_row.status = "in_progress"

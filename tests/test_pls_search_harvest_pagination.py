@@ -174,3 +174,84 @@ async def test_reopen_premature_done_queries(db):
     assert q.pages_enumerated == 0
     assert q.rows_seen == 0
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_unknown_total_last_page_is_confirmed_by_one_reread_then_done(db, monkeypatch):
+    """12 October 2026, 15:40-16:40 UTC: the harvest re-read page 1 of reopened queries every tick (SCMR 2017,
+    CLC 2017, PCrLJ 2017), counted the same 238 rows again each time and, at 714 "seen", split a finished list
+    as if the site had capped it. A page with no next link read twice in a row is the last page."""
+    pages = {"page1": ([_row(i) for i in range(1, 5)], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=None)
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="pagination-confirm-last",
+        query_json={"reporter": "CLC", "year": 2017},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    first = await runner.run_query(q, {})
+    assert first["status"] == "in_progress" and q.rows_seen == 4
+    second = await runner.run_query(q, {})
+    assert second["status"] == "done" and q.status == "done"
+    # the re-read is not counted again
+    assert q.rows_seen == 4 and q.pages_enumerated == 1
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_rereading_a_large_last_page_never_trips_the_cap_split(db, monkeypatch):
+    pages = {"page1": ([_row(i) for i in range(1, 301)], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=None)
+    monkeypatch.setattr(harvest.settings, "PLS_SEARCH_RESULT_CAP", 500)
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="pagination-no-false-split",
+        query_json={"reporter": "SCMR", "year": 2017},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    for _ in range(3):
+        await runner.run_query(q, {})
+    assert q.status == "done"
+    assert q.rows_seen == 300
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_a_reread_that_finds_a_next_link_carries_on(db, monkeypatch):
+    """The first read missed the next link; the confirming re-read finds it and the query goes on to page 2."""
+    calls = {"n": 0}
+    pages = {
+        "page1": ([_row(1), _row(2)], None),
+        "page1b": ([_row(1), _row(2)], "page2"),
+        "page2": ([_row(3)], None),
+    }
+    runner = _runner_factory(monkeypatch, db, pages, total=None)
+
+    async def fetch_results(search_map, values):
+        calls["n"] += 1
+        html = "page1" if calls["n"] == 1 else "page1b"
+        return SimpleNamespace(html=html, url=html)
+
+    runner.pipeline.fetch_results = fetch_results
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="pagination-reread-next",
+        query_json={"reporter": "PLD", "year": 2017},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    first = await runner.run_query(q, {})
+    assert first["status"] == "in_progress" and q.rows_seen == 2
+    second = await runner.run_query(q, {})
+    # page 1 is not counted twice; page 2 is new and, with no next link and no total, waits for its own re-read
+    assert second["status"] == "in_progress"
+    assert q.rows_seen == 3 and q.pages_enumerated == 2
+    await db.rollback()
