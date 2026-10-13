@@ -135,3 +135,43 @@ async def test_recovery_waits_while_its_own_login_is_in_use(db, login_source, mo
     # the job that held it may hand its own lock over: a harvest whose login dropped recovers it in place
     result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=2), browser_factory=sc.factory(), holds_slot_lock=True)
     assert result.get("recovered") == "verified"
+
+
+def test_the_login_check_has_its_own_worker_so_a_busy_harvest_never_starves_it():
+    """13 October 2026: both login-session processes ran back-to-back harvests, so every minute's login check
+    waited behind them, expired and was thrown away (39 of 39 in 40 minutes; the queue grew past 50). The check
+    now has its own queue and its own one-process worker."""
+    import yaml
+
+    from scraper.tasks.celery_app import app
+
+    assert app.conf.task_routes["scraper.tasks.login_recovery.recover_login_slots"] == {"queue": "login_recovery"}
+    services = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))["services"]
+    command = services["worker-login-recovery"]["command"]
+    assert "-Q login_recovery " in command and "--concurrency=1" in command
+    assert "login_recovery" not in services["worker-scraper"]["command"]  # never behind a harvest again
+    deploy = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    for line in deploy.splitlines():
+        if line.startswith(("DEFAULT_APP_SERVICES=", "ALL_APP_SERVICES=")):
+            assert "worker-login-recovery" in line  # a code change restarts it with the rest
+
+
+def test_auto_deploy_starts_a_newly_added_service_that_has_no_container(tmp_path):
+    """The deploy that pulled worker-login-recovery ran the old script (its service list was read before the
+    pull), so the new worker was never started. Every run now starts an app service that has no container yet,
+    and leaves alone one that exists (stopped or running)."""
+    script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    start = script.index("start_missing_services() {")
+    func = script[start : script.index("\n}\n", start) + 3]
+    calls = tmp_path / "calls"
+    prog = (
+        'log() { echo "$*"; }\n'
+        "DEFAULT_APP_SERVICES=(api worker-scraper worker-login-recovery)\n"
+        f'docker() {{ if [ "$2" = ps ]; then printf "api\\nworker-scraper\\n"; else echo "$*" >>"{calls}"; fi; }}\n'
+        + func
+        + "start_missing_services\n"
+    )
+    subprocess.run(["bash", "-c", prog], check=True, capture_output=True, text=True)
+    assert calls.read_text(encoding="utf-8").splitlines() == ["compose up -d --no-build worker-login-recovery"]
+    main = script[script.index("main() {") :]
+    assert main.count("start_missing_services") >= 2  # on the nothing-to-do path and after a rollout

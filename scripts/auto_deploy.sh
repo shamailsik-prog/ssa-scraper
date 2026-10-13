@@ -16,8 +16,8 @@ CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 # mirror task: a deploy holds new PakistanLawSite work (Redis key deploy_hold_login) while the PLS job
 # drains, keeps beat running, and always clears the hold and makes sure beat runs afterwards, unless the
 # operator has switched beat off with state/beat_disabled.
-DEFAULT_APP_SERVICES=(api worker-scraper worker-public worker-maintenance)
-ALL_APP_SERVICES=(api worker-scraper worker-public worker-maintenance worker-embed celery-beat celery-flower)
+DEFAULT_APP_SERVICES=(api worker-scraper worker-login-recovery worker-public worker-maintenance)
+ALL_APP_SERVICES=(api worker-scraper worker-login-recovery worker-public worker-maintenance worker-embed celery-beat celery-flower)
 
 WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-600}"  # bounded wait before deploy when beat was running
 WAIT_POLL_SECONDS="${AUTO_DEPLOY_WAIT_POLL_SECONDS:-30}"
@@ -229,6 +229,19 @@ services_for_diff() {
   printf '%s\n' "${DEFAULT_APP_SERVICES[*]}"
 }
 
+start_missing_services() {
+  # A service newly added to docker-compose.yml is unknown to the run that pulled it (that run read its service
+  # lists before the pull), so it gets no container; start it here. A service that has a container, stopped or
+  # running, is left alone: stopping and starting those belongs to the rollout.
+  local existing svc
+  existing=" $(docker compose ps -a --services 2>/dev/null | tr '\n' ' ') "
+  for svc in "${DEFAULT_APP_SERVICES[@]}"; do
+    case "$existing" in *" $svc "*) continue ;; esac
+    log "$svc has no container yet; starting it"
+    docker compose up -d --no-build "$svc" || log "ERROR: $svc did not start; next cron tick retries"
+  done
+}
+
 run_reset_frontier_once() {
   local sha="$1"
   local marker="$DIR/$RESET_MARKER"
@@ -301,6 +314,7 @@ main() {
     log "origin/$BRANCH still at $new_sha (tip_sha and rollout_sha match); nothing to do"
     # nothing is pending, so no PakistanLawSite hold may linger (a deploy that died leaves one behind)
     [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
+    [ "$DRY_RUN" = 1 ] || start_missing_services
     if beat_wanted && ! pls_host_beat_running; then
       log "celery-beat is not running and no deploy is pending; starting it"
       resume_beat || exit 1
@@ -416,6 +430,7 @@ main() {
     [ "$DRY_RUN" = 1 ] || pls_host_clear_login_hold
     rm -f "$DIR/$BEAT_PAUSE_MARKER"
   fi
+  [ "$DRY_RUN" = 1 ] || start_missing_services
   log "deploy complete; tip_sha=$new_sha beat_restarted=$beat_was_running"
 }
 
