@@ -527,19 +527,28 @@ async def _next_attempt_no(db: AsyncSession, judgment_id: Any) -> int:
     return int(n or 0) + 1
 
 
-async def _record_failure(db: AsyncSession, j: Judgment, *, attempt_no: int, started_at: datetime, exc: Exception) -> None:
+async def _record_failure(
+    db: AsyncSession,
+    *,
+    judgment_id: Any,
+    judgment_text_hash: Optional[str],
+    attempt_no: int,
+    started_at: datetime,
+    exc: Exception,
+) -> None:
+    """Persist a failed attempt using captured scalar identity, safe even after a transaction rollback expires ORM rows."""
     now = datetime.now(timezone.utc)
     kind = exc.kind if isinstance(exc, ReaderError) else "unknown"
     retry_after = now + _failure_delay(exc)
     db.add(
         JudgmentReadingVersion(
-            judgment_id=j.id,
+            judgment_id=judgment_id,
             status="failed",
             model=model_name(),
             provider=_provider_name((settings.READER_BASE_URL or "https://api.openai.com/v1").rstrip("/")),
             prompt_version=PROMPT_VERSION,
             taxonomy_version=SUBJECT_TAXONOMY_VERSION,
-            judgment_text_hash=j.full_text_hash,
+            judgment_text_hash=judgment_text_hash,
             error=str(exc)[:2000],
             error_kind=kind,
             attempt_no=attempt_no,
@@ -700,38 +709,43 @@ async def read_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> D
         reason = await _circuit_status()
         if reason:
             break
-        lock_key = _judgment_lock_key(j.id)
+        # Capture scalars before any rollback; AsyncSession.rollback() may expire ORM attributes.
+        judgment_id = j.id
+        judgment_text_hash = j.full_text_hash
+        judgment_text = j.full_text or ""
+        citation = j.canonical_citation
+        lock_key = _judgment_lock_key(judgment_id)
         async with engine.connect() as lock_conn:
             lock_conn = await lock_conn.execution_options(isolation_level="AUTOCOMMIT")
             if not (await lock_conn.execute(sql_text("SELECT pg_try_advisory_lock(:k)"), {"k": lock_key})).scalar():
                 locked += 1
                 continue
             try:
-                attempt_no = await _next_attempt_no(db, j.id)
+                attempt_no = await _next_attempt_no(db, judgment_id)
                 started_at = datetime.now(timezone.utc)
                 try:
-                    answer = await read_full_judgment(j.full_text or "")
+                    answer = await read_full_judgment(judgment_text)
                     try:
                         await _publish_success(db, j, attempt_no=attempt_no, started_at=started_at, answer=answer)
                         read += 1
                     except Exception as db_exc:
                         await db.rollback()
                         failed += 1
-                        logger.exception("reading agent: database publish failed for %s", j.canonical_citation)
+                        logger.exception("reading agent: database publish failed for %s", citation)
                         try:
                             wrapped = ReaderError(f"database publish failure: {db_exc}", kind="database")
-                            await _record_failure(db, j, attempt_no=attempt_no, started_at=started_at, exc=wrapped)
+                            await _record_failure(db, judgment_id=judgment_id, judgment_text_hash=judgment_text_hash, attempt_no=attempt_no, started_at=started_at, exc=wrapped)
                         except Exception:
                             await db.rollback()
                 except Exception as exc:
                     await db.rollback()
                     failed += 1
-                    logger.warning("reading agent: %s failed [%s]: %s", j.canonical_citation, getattr(exc, "kind", "unknown"), str(exc)[:300])
+                    logger.warning("reading agent: %s failed [%s]: %s", citation, getattr(exc, "kind", "unknown"), str(exc)[:300])
                     try:
-                        await _record_failure(db, j, attempt_no=attempt_no, started_at=started_at, exc=exc)
+                        await _record_failure(db, judgment_id=judgment_id, judgment_text_hash=judgment_text_hash, attempt_no=attempt_no, started_at=started_at, exc=exc)
                     except Exception:
                         await db.rollback()
-                        logger.exception("reading agent: could not persist failure attempt for %s", j.canonical_citation)
+                        logger.exception("reading agent: could not persist failure attempt for %s", citation)
                     if isinstance(exc, ReaderError) and exc.kind in ("auth", "configuration"):
                         await _open_circuit(str(exc)[:300], int(settings.READER_AUTH_CIRCUIT_SECONDS or 3600))
                     elif isinstance(exc, ReaderError) and exc.kind in ("transient", "provider", "rate_limit"):
