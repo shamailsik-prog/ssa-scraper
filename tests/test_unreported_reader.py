@@ -442,6 +442,28 @@ def test_reader_model_off_stops_even_with_treatment_model(monkeypatch):
     assert unreported_reader.model_name() == "" and not unreported_reader.configured()
 
 
+def test_reader_configuration_requires_credential_for_custom_or_openai_endpoint(monkeypatch):
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "TREATMENT_MODEL", "")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    monkeypatch.setattr(settings, "READER_API_KEY", SecretStr(""))
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", None)
+    assert unreported_reader.configured() is False
+
+    monkeypatch.setattr(settings, "READER_API_KEY", SecretStr("reader-key"))
+    assert unreported_reader.configured() is True
+
+    monkeypatch.setattr(settings, "READER_BASE_URL", "")
+    monkeypatch.setattr(settings, "READER_API_KEY", SecretStr(""))
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", SecretStr(""))
+    assert unreported_reader.configured() is False
+
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", SecretStr("openai-key"))
+    assert unreported_reader.configured() is True
+
+
 async def test_answer_without_a_reading_is_failure(monkeypatch):
     monkeypatch.setattr(settings, "READER_MODEL", "test-model")
     monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
