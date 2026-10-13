@@ -68,6 +68,112 @@ def _record(db, *, kind: str, label: str, url: Optional[str], result: str, detai
 
 
 # --------------------------------------------------------------------------- judgments (login session)
+SPOT_CHECK_TURN_KEY = "corpus:spot_check:judgments:turn"
+
+
+async def claim_spot_check_turn(redis_client=None) -> bool:
+    """The judgments spot check runs once per SPOT_CHECK_SCHEDULE_SECONDS, whoever runs it: the beat task, or a
+    search-harvest tick between two pages on its own login (13 October 2026: the beat task found the login lock
+    held by a harvest at every turn and was skipped). The first to set the key takes the turn."""
+    client = redis_client
+    if client is None:
+        import redis.asyncio as aioredis
+
+        client = aioredis.from_url(settings.REDIS_URL)
+    try:
+        return bool(await client.set(SPOT_CHECK_TURN_KEY, datetime.now(timezone.utc).isoformat(), nx=True, ex=int(settings.SPOT_CHECK_SCHEDULE_SECONDS)))
+    finally:
+        if redis_client is None:
+            await client.aclose()
+
+
+async def _sample_judgments(db, n: int) -> List[Judgment]:
+    from scraper.tasks.pakistanlawsite import SOURCE_NAME
+
+    return list(
+        (
+            await db.execute(
+                select(Judgment)
+                .where(Judgment.source_name == SOURCE_NAME, Judgment.source_url.isnot(None), Judgment.full_text.isnot(None))
+                .order_by(func.random())
+                .limit(n)
+            )
+        ).scalars().all()
+    )
+
+
+async def _check_judgments_on_browser(db, pipeline, browser, slot, rows) -> List[Dict[str, Any]]:
+    """Fetch each judgment again on `browser` (bound to `slot`) under the ordinary page pacing and compare it with
+    the stored text. Shared by the beat task and the between-pages check of a search-harvest tick."""
+    from scraper.auth.session_manager import raise_for_verdict
+    from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
+    from scraper.tasks.pakistanlawsite import PacingBudgetExceeded
+
+    results: List[Dict[str, Any]] = []
+    for j in rows:
+        label = j.canonical_citation
+        try:
+            await pipeline._charge_page()
+            page = await browser.goto(j.source_url, capture_case_description_modal=bool(re.search(r"ReferenceCaseLawSearch", j.source_url or "", flags=re.IGNORECASE)))
+            await pipeline.manager.touch(slot.slot_number)
+            raise_for_verdict(page)
+        except PacingBudgetExceeded as exc:
+            results.append({"label": label, "result": "skipped", "detail": f"pacing: {exc}"})
+            _record(db, kind="judgment", label=label, url=j.source_url, result="skipped", detail=f"pacing budget spent: {exc}", record_id=j.id)
+            break
+        except (LoginRequired, VerificationRequired) as exc:
+            await pipeline.manager.mark_needs_human_login(slot.slot_number, f"{type(exc).__name__}: {exc}")
+            results.append({"label": label, "result": "login_required", "detail": str(exc)[:300]})
+            _record(db, kind="judgment", label=label, url=j.source_url, result="login_required", detail=f"{type(exc).__name__}: {exc}", record_id=j.id)
+            break
+        except (NoActiveSlot, BrowserDisconnected) as exc:
+            results.append({"label": label, "result": "unreachable", "detail": str(exc)[:300]})
+            _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=j.id)
+            break
+        except ExplicitBlock as exc:
+            await pipeline.manager.halt_source(f"explicit block during a spot check: {exc}", slot_number=slot.slot_number)
+            results.append({"label": label, "result": "unreachable", "detail": f"block: {exc}"})
+            _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"block, source halted: {exc}", record_id=j.id)
+            break
+        text = clean_html(page.html)
+        modal_text = strip_leading_judgment_chrome((page.metadata or {}).get("case_description_modal_text"))
+        if modal_text:
+            text = modal_text
+        text = strip_leading_judgment_chrome(text)
+        live_hash = canonical_text_hash(text)
+        stored_hash = j.full_text_hash or canonical_text_hash(j.full_text or "")
+        citation_seen = _norm(j.canonical_citation).lower() in _norm(page.html).lower() or _norm(j.canonical_citation).lower() in _norm(text).lower()
+        if live_hash == stored_hash and citation_seen:
+            result, detail, sim = "match", "stored full text is exactly what the site shows and the citation is on the page", 1.0
+        elif live_hash == stored_hash:
+            result, detail, sim = "differs", "the text matches but the stored citation is not on the page (the URL may now serve another document)", 1.0
+        else:
+            sim = _similarity(_norm(text), _norm(j.full_text or ""))
+            result = "differs"
+            detail = f"live text differs from the stored text (similarity {sim:.3f}; live {len(_norm(text))} chars, stored {len(_norm(j.full_text or ''))} chars)" + ("" if citation_seen else "; citation string not seen on the page")
+        _record(db, kind="judgment", label=label, url=j.source_url, result=result, detail=detail, similarity=sim, record_id=j.id)
+        results.append({"label": label, "result": result, "similarity": sim})
+    return results
+
+
+async def check_judgments_between_pages(db, pipeline, *, sample: Optional[int] = None) -> List[Dict[str, Any]]:
+    """The spot check run by a search-harvest tick between two pages, on the login the tick already holds (its
+    slot lock and pacing), with the browser it already has open. Nothing else is opened or locked."""
+    n = int(sample if sample is not None else settings.SPOT_CHECK_JUDGMENTS)
+    if n <= 0:
+        return [{"skipped": "SPOT_CHECK_JUDGMENTS=0"}]
+    browser = pipeline.runner.browser
+    if browser is None:
+        return [{"skipped": "the harvest has no open browser"}]
+    rows = await _sample_judgments(db, n)
+    if not rows:
+        return [{"skipped": "no promoted PakistanLawSite judgment with a source URL"}]
+    slot = await pipeline.manager.slot(int(browser.slot_number))
+    results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
+    await db.flush()
+    return results
+
+
 async def check_judgments(
     db,
     *,
@@ -75,10 +181,9 @@ async def check_judgments(
     browser_factory: Callable = playwright_browser_factory,
     redis_client=None,
     sleep=None,
+    claim_turn: bool = False,
 ) -> List[Dict[str, Any]]:
-    from scraper.auth.session_manager import raise_for_verdict
-    from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
-    from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline, SOURCE_NAME
 
     n = int(sample if sample is not None else settings.SPOT_CHECK_JUDGMENTS)
     if n <= 0 or not settings.login_scraping_effective:
@@ -86,14 +191,7 @@ async def check_judgments(
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
     if source is None or source.state != "ACTIVE":
         return [{"skipped": f"{SOURCE_NAME} is {source.state if source else 'missing'}"}]
-    rows = (
-        await db.execute(
-            select(Judgment)
-            .where(Judgment.source_name == SOURCE_NAME, Judgment.source_url.isnot(None), Judgment.full_text.isnot(None))
-            .order_by(func.random())
-            .limit(n)
-        )
-    ).scalars().all()
+    rows = await _sample_judgments(db, n)
     if not rows:
         return [{"skipped": "no promoted PakistanLawSite judgment with a source URL"}]
     kwargs = {"browser_factory": browser_factory, "redis_client": redis_client}
@@ -112,6 +210,8 @@ async def check_judgments(
     results: List[Dict[str, Any]] = []
     try:
         pipeline._session_lock = lock
+        if claim_turn and not await claim_spot_check_turn(redis_client):
+            return [{"skipped": "checked between search-harvest pages within the last spot-check interval"}]
         slot = await pipeline.manager.current_slot()
         if slot is None:
             return [{"skipped": "no ACTIVE slot"}]
@@ -119,49 +219,7 @@ async def check_judgments(
         # ladder (no reconnect on the alternate slot, no switch of the current slot), so a bounce
         # here costs one slot its state exactly as a harvest would, and nothing more.
         browser = await pipeline.runner.open(slot)
-        for j in rows:
-            label = j.canonical_citation
-            try:
-                await pipeline._charge_page()
-                page = await browser.goto(j.source_url, capture_case_description_modal=bool(re.search(r"ReferenceCaseLawSearch", j.source_url or "", flags=re.IGNORECASE)))
-                await pipeline.manager.touch(slot.slot_number)
-                raise_for_verdict(page)
-            except PacingBudgetExceeded as exc:
-                results.append({"label": label, "result": "skipped", "detail": f"pacing: {exc}"})
-                _record(db, kind="judgment", label=label, url=j.source_url, result="skipped", detail=f"pacing budget spent: {exc}", record_id=j.id)
-                break
-            except (LoginRequired, VerificationRequired) as exc:
-                await pipeline.manager.mark_needs_human_login(slot.slot_number, f"{type(exc).__name__}: {exc}")
-                results.append({"label": label, "result": "login_required", "detail": str(exc)[:300]})
-                _record(db, kind="judgment", label=label, url=j.source_url, result="login_required", detail=f"{type(exc).__name__}: {exc}", record_id=j.id)
-                break
-            except (NoActiveSlot, BrowserDisconnected) as exc:
-                results.append({"label": label, "result": "unreachable", "detail": str(exc)[:300]})
-                _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"{type(exc).__name__}: {str(exc)[:300]}", record_id=j.id)
-                break
-            except ExplicitBlock as exc:
-                await pipeline.manager.halt_source(f"explicit block during a spot check: {exc}", slot_number=slot.slot_number)
-                results.append({"label": label, "result": "unreachable", "detail": f"block: {exc}"})
-                _record(db, kind="judgment", label=label, url=j.source_url, result="unreachable", detail=f"block, source halted: {exc}", record_id=j.id)
-                break
-            text = clean_html(page.html)
-            modal_text = strip_leading_judgment_chrome((page.metadata or {}).get("case_description_modal_text"))
-            if modal_text:
-                text = modal_text
-            text = strip_leading_judgment_chrome(text)
-            live_hash = canonical_text_hash(text)
-            stored_hash = j.full_text_hash or canonical_text_hash(j.full_text or "")
-            citation_seen = _norm(j.canonical_citation).lower() in _norm(page.html).lower() or _norm(j.canonical_citation).lower() in _norm(text).lower()
-            if live_hash == stored_hash and citation_seen:
-                result, detail, sim = "match", "stored full text is exactly what the site shows and the citation is on the page", 1.0
-            elif live_hash == stored_hash:
-                result, detail, sim = "differs", "the text matches but the stored citation is not on the page (the URL may now serve another document)", 1.0
-            else:
-                sim = _similarity(_norm(text), _norm(j.full_text or ""))
-                result = "differs"
-                detail = f"live text differs from the stored text (similarity {sim:.3f}; live {len(_norm(text))} chars, stored {len(_norm(j.full_text or ''))} chars)" + ("" if citation_seen else "; citation string not seen on the page")
-            _record(db, kind="judgment", label=label, url=j.source_url, result=result, detail=detail, similarity=sim, record_id=j.id)
-            results.append({"label": label, "result": result, "similarity": sim})
+        results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
         await db.flush()
         return results
     finally:
@@ -396,7 +454,7 @@ def spot_check_judgments() -> Dict[str, Any]:
 
     if login_work_held():
         return {"skipped": "deploy_hold"}
-    return run_async(spot_check_judgments_async())
+    return run_async(spot_check_judgments_async(claim_turn=True))
 
 
 @shared_task(name="scraper.tasks.spot_check.spot_check_statutes")

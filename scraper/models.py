@@ -34,6 +34,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     TIMESTAMP,
@@ -780,6 +781,7 @@ class PlsSearchHarvestQuery(Base):
         UniqueConstraint("source_name", "query_key", name="uq_pls_search_harvest_query"),
         Index("ix_pls_search_harvest_status_prio", "source_name", "status", "priority"),
         Index("ix_pls_search_harvest_gap", "source_name", "gap_size"),
+        Index("ix_pls_search_harvest_pick", "source_name", "status", "priority", "last_run_at"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     source_name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -801,6 +803,7 @@ class PlsSearchHarvestQuery(Base):
     rows_new: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     gap_size: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     cursor_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    slot: Mapped[Optional[int]] = mapped_column(SmallInteger, comment="login slot (1 or 2) whose harvest tick last took this row")
     split_reason: Mapped[Optional[str]] = mapped_column(String(500))
     last_error: Mapped[Optional[str]] = mapped_column(String(1000))
     last_run_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))

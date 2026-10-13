@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from scraper.config import KNOWN_REPORTERS
 from scraper.keys import fit_key
@@ -29,6 +29,25 @@ def normalize_query_json(query: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[key] = text
     return out
+
+
+SEARCH_HARVEST_SLOTS = (1, 2)
+
+
+def normalise_reporter(reporter: Any) -> str:
+    """A reporter name compared without case, spaces or dots: "P.Cr.L.J." and "PCrLJ" are one reporter."""
+    return re.sub(r"[\s.]", "", str(reporter or "")).upper()
+
+
+def slot1_reporter_share(csv: Optional[str]) -> FrozenSet[str]:
+    """Login slot 1's reporters (PLS_SEARCH_HARVEST_SLOT1_REPORTERS), normalised. Slot 2 has everything else."""
+    return frozenset(n for n in (normalise_reporter(p) for p in str(csv or "").split(",")) if n)
+
+
+def search_harvest_slot_for(query_json: Dict[str, Any], slot1_share: FrozenSet[str]) -> int:
+    """The login slot whose share holds a ledger row: slot 1 for its listed reporters, slot 2 for every other
+    reporter and for rows with no reporter, so each row belongs to exactly one slot (handbook R3.1)."""
+    return 1 if normalise_reporter((query_json or {}).get("reporter")) in slot1_share else 2
 
 
 def make_query_key(query_json: Dict[str, Any]) -> str:

@@ -14,7 +14,7 @@ import logging
 from celery import Celery
 from celery.signals import worker_ready
 
-from scraper.config import search_harvest_tick_expiry, settings
+from scraper.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -109,13 +109,28 @@ if settings.TREATMENT_RECONCILE_ENABLED:
             "batch_size": settings.TREATMENT_RECONCILE_BATCH_SIZE,
         },
     }
-if settings.PLS_SEARCH_HARVEST_ENABLED:
-    app.conf.beat_schedule["pls-search-harvest"] = {
-        "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
-        "schedule": settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS,
-        "kwargs": {"priority_gaps": True},
-        "options": {"expires": search_harvest_tick_expiry()},
+
+
+def search_harvest_beat_entries() -> dict:
+    """One search-harvest tick per login slot, each on its own reporter share (handbook R3.1; owner's decision of
+    13 October 2026). No expiry (R3.7): a tick whose slot's harvest is already running exits at once, and an
+    expiring tick queued behind a long job was revoked before it ran. A tick that worked queues its slot's next
+    one itself (PLS_SEARCH_HARVEST_CONTINUE); the beat is the fallback that restarts a slot whose tick was skipped
+    (its login briefly busy with another job), so it fires at least once per tick budget."""
+    budget = int(settings.PLS_SEARCH_HARVEST_TICK_SECONDS or 0)
+    schedule = min(settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS, budget) if budget > 0 else settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS
+    return {
+        name: {
+            "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
+            "schedule": schedule,
+            "kwargs": {"slot": slot},
+        }
+        for name, slot in (("pls-search-harvest", 1), ("pls-search-harvest-s2", 2))
     }
+
+
+if settings.PLS_SEARCH_HARVEST_ENABLED:
+    app.conf.beat_schedule.update(search_harvest_beat_entries())
 if settings.PLS_CASEID_WALK_ENABLED:
     # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
     for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):

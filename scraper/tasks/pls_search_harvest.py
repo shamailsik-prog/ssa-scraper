@@ -9,11 +9,11 @@ import json
 import logging
 import random
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import func, select
+from sqlalchemy import false, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -27,6 +27,7 @@ from scraper.database import SessionLocal, run_async
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import (
+    BrowserSessionSlot,
     Citation,
     Judgment,
     PlsSearchHarvestQuery,
@@ -35,6 +36,7 @@ from scraper.models import (
 )
 from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemoryState, check_rss_limits
 from scraper.pls_search_harvest_core import (
+    SEARCH_HARVEST_SLOTS,
     build_harvest_form_values,
     CASE_KEY_PREFIX,
     citation_keys_for_row,
@@ -47,6 +49,7 @@ from scraper.pls_search_harvest_core import (
     partition_rows_by_known,
     search_harvest_may_mark_done,
     reporters_for_plan,
+    slot1_reporter_share,
     cited_citations_in_text,
     is_capped,
     iter_extended_plan_queries,
@@ -59,8 +62,6 @@ from scraper.tasks.pakistanlawsite import (
     PacingBudgetExceeded,
     PakistanLawSitePipeline,
     SOURCE_NAME,
-    claim_free_slot,
-    release_claimed_slot,
 )
 from scraper.tasks.search_map import active_map, map_as_dict
 
@@ -344,12 +345,38 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
     return out
 
 
+def _pick_order(stmt):
+    # Priority first (lower is sooner), then the row that has waited longest since its last run: a row whose site
+    # total is unknown keeps its planned priority instead of sinking to the back (13 October 2026).
+    return stmt.order_by(
+        PlsSearchHarvestQuery.priority.asc(),
+        PlsSearchHarvestQuery.last_run_at.asc().nulls_first(),
+        PlsSearchHarvestQuery.created_at.asc(),
+    )
+
+
+def _reporter_sql():
+    return func.upper(func.regexp_replace(func.coalesce(PlsSearchHarvestQuery.query_json["reporter"].astext, ""), r"[\s.]", "", "g"))
+
+
+def _share_filter(slot: int):
+    share = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_SLOT1_REPORTERS))
+    if slot == 1:
+        return _reporter_sql().in_(share) if share else false()
+    return _reporter_sql().notin_(share) if share else true()
+
+
 async def pick_next_query(
     db: AsyncSession,
     *,
     query_key: Optional[str] = None,
     priority_gaps: bool = False,
+    slot: Optional[int] = None,
+    take_over: bool = False,
 ) -> Optional[PlsSearchHarvestQuery]:
+    """The next ledger row to work, without taking it (see claim_next_query). `priority_gaps` is accepted from
+    ticks queued before 13 October 2026 and no longer changes the order: gap-first put every row with an unknown
+    site total (gap 0) last."""
     if query_key:
         return (
             await db.execute(
@@ -363,11 +390,74 @@ async def pick_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if priority_gaps:
-        stmt = stmt.order_by(PlsSearchHarvestQuery.gap_size.desc(), PlsSearchHarvestQuery.priority.asc())
-    else:
-        stmt = stmt.order_by(PlsSearchHarvestQuery.priority.asc(), PlsSearchHarvestQuery.created_at.asc())
-    return (await db.execute(stmt.limit(1))).scalars().first()
+    if slot in SEARCH_HARVEST_SLOTS and not take_over:
+        stmt = stmt.where(_share_filter(slot))
+    return (await db.execute(_pick_order(stmt).limit(1))).scalars().first()
+
+
+def _query_lock(row_id, redis_client) -> SessionLock:
+    return SessionLock(f"{SOURCE_NAME}:search_harvest:query:{row_id}", redis_client, max_holders=1)
+
+
+async def claim_next_query(
+    db: AsyncSession,
+    slot: int,
+    *,
+    redis_client=None,
+    take_over: bool = False,
+    candidates: int = 25,
+) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
+    """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
+    tick. The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
+    never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
+    after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None)."""
+    stmt = select(PlsSearchHarvestQuery).where(
+        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+    )
+    if not take_over:
+        stmt = stmt.where(_share_filter(slot))
+    rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
+    for row in rows:
+        lock = _query_lock(row.id, redis_client)
+        try:
+            await lock.acquire()
+        except SessionLockHeld:
+            await lock.release()
+            continue
+        row.status = "in_progress"
+        row.slot = slot
+        # stamped at once, so a row that ends its run early (an interrupted page) goes behind its equals
+        row.last_run_at = datetime.now(timezone.utc)
+        await db.commit()
+        return row, lock
+    await db.commit()  # ends the transaction that held the candidates' row locks
+    return None, None
+
+
+def _slot_known_good_at(slot_row: BrowserSessionSlot) -> Optional[datetime]:
+    seen = [t for t in (slot_row.last_used_at, slot_row.last_verified_at, slot_row.logged_in_at) if t is not None]
+    return max(seen) if seen else slot_row.updated_at
+
+
+async def slot_takeover_due(db: AsyncSession, slot: int, *, now: Optional[datetime] = None) -> bool:
+    """True when the other login has been logged out (not ACTIVE) for PLS_SEARCH_HARVEST_TAKEOVER_MINUTES, counted
+    from the last time it was known to work, so `slot` may also work the other slot's share."""
+    other = 2 if slot == 1 else 1
+    row = (
+        await db.execute(
+            select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == SOURCE_NAME, BrowserSessionSlot.slot_number == other)
+        )
+    ).scalars().first()
+    if row is None:
+        return True  # there is no other login at all: its share is nobody's but this one's
+    if row.state == "ACTIVE":
+        return False
+    since = _slot_known_good_at(row)
+    if since is None:
+        return True
+    now = now or datetime.now(timezone.utc)
+    return now - since >= timedelta(minutes=int(settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES))
 
 
 class SearchHarvestRunner:
@@ -387,6 +477,8 @@ class SearchHarvestRunner:
         self.memory = PlsBrowserMemoryState()
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
+        # the 30-minute spot check of three promoted judgments runs between this run's pages, on its login
+        self.spot_check_between_pages = True
 
     async def _pace_sleep(self) -> None:
         lo = float(self.pacing_profile["login_delay_min"])
@@ -405,6 +497,24 @@ class SearchHarvestRunner:
             self.pipeline.runner.browser = None
             self.memory.reset_recycle_counter()
             logger.info("PLS search harvest recycled browser after memory/window guard")
+
+    async def _maybe_spot_check(self) -> None:
+        """Between two pages: when the 30-minute spot-check turn is free, check three promoted judgments on this
+        run's own login. The beat task found the login lock held by a harvest at every turn and never ran."""
+        if self.dry_run or not getattr(self, "spot_check_between_pages", False):
+            return
+        from scraper.tasks.spot_check import check_judgments_between_pages, claim_spot_check_turn
+
+        try:
+            if not await claim_spot_check_turn(getattr(self.pipeline, "redis_client", None)):
+                return
+            results = await check_judgments_between_pages(self.db, self.pipeline)
+            await self.db.commit()
+            logger.info("PLS search harvest: spot check between pages: %s", results)
+        except (LoginRequired, PacingBudgetExceeded):
+            raise
+        except Exception as exc:  # a spot check never ends the harvest
+            logger.warning("PLS search harvest: spot check between pages failed: %s", exc)
 
     async def run_query(
         self,
@@ -436,6 +546,11 @@ class SearchHarvestRunner:
         deadline = time.monotonic() + budget if budget > 0 else None
         out_of_time = False
 
+        # Judgments already met on an earlier page of this run: the site has served page 1's rows again as page 2,
+        # and a repeated row is neither opened nor counted a second time.
+        seen_keys: Set[str] = set()
+        repeat_pages = 0
+
         resume_url = cursor.get("next_url") if pages_done > 0 else None
         # The run opens on a page an earlier run already finished: a page that showed no next link and no site
         # total is read once more to confirm it is the last. Its rows were counted then and are not counted again,
@@ -456,17 +571,31 @@ class SearchHarvestRunner:
             extractor = HybridExtractor(self.db, self.source, local=self.pipeline.local_engine)
             outcome = await extractor.extract_result_rows(html=page.html, search_map=search_map, base_url=page.url)
             rows = outcome.data.get("result_rows") or []
+            repeated = 0
+            fresh_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                keys = citation_keys_for_row(row)
+                if keys and keys & seen_keys:
+                    repeated += 1
+                    continue
+                seen_keys.update(keys)
+                fresh_rows.append(row)
+            fresh_ids = {id(row) for row in fresh_rows}
+            if repeated:
+                logger.info("PLS search harvest %s page %s: %s row(s) repeat an earlier page and are skipped", query_row.query_key, page_idx, repeated)
+            # Every row of a non-empty page already met: the site is serving an earlier page again.
+            repeat_pages = repeat_pages + 1 if rows and not fresh_rows else 0
             if site_total is None:
                 site_total = outcome.data.get("total_results_if_shown") or parse_total_results_from_html(page.html)
             lookup_keys: Set[str] = set()
-            for row in rows:
+            for row in fresh_rows:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
-            known_on_page, new_rows = partition_rows_by_known(rows, known_set)
+            known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
             if rereading:
                 rows_counted, known_counted = 0, 0
             else:
-                rows_counted, known_counted = len(rows), known_on_page
+                rows_counted, known_counted = len(fresh_rows), known_on_page
             rows_seen += rows_counted
             rows_known += known_counted
 
@@ -484,6 +613,8 @@ class SearchHarvestRunner:
                         continue
                     keys = citation_keys_for_row(row)
                     if keys & known_set:
+                        continue
+                    if id(row) not in fresh_ids:
                         continue
                     detail = await self.pipeline.fetch_detail(detail_url)
                     result = await self.pipeline.preserve_and_extract(
@@ -546,7 +677,11 @@ class SearchHarvestRunner:
             query_row.rows_known = rows_known
             query_row.rows_new = rows_new
             query_row.gap_size = gap
-            query_row.priority = max(1, 1000 - gap)
+            if site_total is not None:
+                # Only a known site total measures the gap. With the total unknown the gap reads 0, and 1000 - 0
+                # sent the row to the back of the ledger, behind every row that had one (13 October 2026); it keeps
+                # its planned priority instead.
+                query_row.priority = max(1, 1000 - gap)
             query_row.last_run_at = datetime.now(timezone.utc)
             await self.db.flush()
 
@@ -598,10 +733,18 @@ class SearchHarvestRunner:
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
             query_row.cursor_json = dict(cursor)
+            if repeat_pages >= 2:
+                # Two pages in a row brought nothing new: the next link leads back over pages already read. Stop
+                # here, keep the place, and say why, instead of walking the same rows until the time runs out.
+                query_row.status = "in_progress"
+                query_row.last_error = f"pages {page_idx - 2} and {page_idx - 1} repeated rows of earlier pages; pagination stopped for this run"[:1000]
+                break
             if deadline is not None and time.monotonic() >= deadline:
                 out_of_time = True
                 query_row.status = "in_progress"
                 break
+            await self.db.commit()
+            await self._maybe_spot_check()
             await self._pace_sleep()
             try:
                 page = await self.pipeline.fetch_detail(nxt)
@@ -654,9 +797,19 @@ class SearchHarvestRunner:
             existing.add(key)
 
 
+async def _slot_state(db: AsyncSession, slot: int) -> Optional[str]:
+    row = (
+        await db.execute(
+            select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == SOURCE_NAME, BrowserSessionSlot.slot_number == slot)
+        )
+    ).scalars().first()
+    return row.state if row is not None else None
+
+
 async def run_search_harvest(
     db: AsyncSession,
     *,
+    slot: Optional[int] = None,
     query_key: Optional[str] = None,
     dry_run: bool = False,
     max_pages: int = 0,
@@ -664,53 +817,101 @@ async def run_search_harvest(
     redis_client=None,
     job_id=None,
 ) -> Dict[str, Any]:
+    """One search-harvest tick on one login. Login 1 and login 2 harvest at the same time (owner's decision of
+    13 October 2026, handbook R3.1): each tick holds its own slot's singleton lock, works only ledger rows of its own
+    reporter share, and opens only its own login. A slot that has been logged out for
+    PLS_SEARCH_HARVEST_TAKEOVER_MINUTES has its share taken over by the other. A tick queued with no slot (the CLI,
+    or one queued before this change) takes the first ACTIVE slot whose harvest is free."""
     if not settings.login_scraping_effective:
         return {"skipped": True, "reason": "login scraping not permitted in this environment"}
     source = await _source_row(db)
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": True, "reason": f"source state {source.state}"}
-    query_row = await pick_next_query(db, query_key=query_key, priority_gaps=priority_gaps)
-    if query_row is None:
-        return {"skipped": True, "reason": "no pending search harvest query"}
-    m = await active_map(db, SOURCE_NAME)
-    if m is None:
-        query_row.last_error = "no active search form map"
-        return {"skipped": True, "reason": "no active search form map"}
-    search_map = map_as_dict(m)
-    dashboard_harvest = PakistanLawSitePipeline._is_dashboard_citation_fields(search_map)
-    query_row.status = "in_progress"
-    await db.flush()
+    slots = [int(slot)] if slot in SEARCH_HARVEST_SLOTS else list(SEARCH_HARVEST_SLOTS)
 
-    runner = SearchHarvestRunner(db, source, redis_client=redis_client, job_id=job_id, dry_run=dry_run)
-    runner.harvest_mode = await get_harvest_mode(db)
-    runner.pacing_profile = login_pacing_profile(runner.harvest_mode)
-    runner.pipeline.harvest_mode = runner.harvest_mode
-    runner.pipeline.pacing_profile = runner.pacing_profile
+    harvest_lock: Optional[SessionLock] = None
+    chosen: Optional[int] = None
+    reasons: List[str] = []
+    for n in slots:
+        state = await _slot_state(db, n)
+        if state != "ACTIVE":
+            reasons.append(f"slot {n} is {state or 'missing'}; the other slot takes over its share after {settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES} minutes")
+            continue
+        # one harvest per slot (R3.7): a second tick for the same slot exits at once
+        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1)
+        try:
+            await candidate.acquire()
+        except SessionLockHeld:
+            await candidate.release()
+            reasons.append(f"a search harvest is already running on slot {n}")
+            continue
+        harvest_lock, chosen = candidate, n
+        break
+    if harvest_lock is None or chosen is None:
+        await db.commit()
+        return {"skipped": True, "slot": slot, "reason": "; ".join(reasons) or "no login slot"}
 
-    active_slot_count = len([s for s in await runner.pipeline.manager.slots() if s.state == "ACTIVE"])
-    max_holders = max(1, min(int(runner.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
-    lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders)
-    # one search harvest at a time: two would pick the same pending query
-    harvest_lock = SessionLock(f"{SOURCE_NAME}:search_harvest", redis_client, max_holders=1)
+    query_lock: Optional[SessionLock] = None
+    lock: Optional[SessionLock] = None
+    slot_lock: Optional[SessionLock] = None
+    runner: Optional[SearchHarvestRunner] = None
+    query_row: Optional[PlsSearchHarvestQuery] = None
+    took_over = False
     try:
-        await harvest_lock.acquire()
-    except SessionLockHeld:
-        query_row.status = "pending"
-        return {"skipped": True, "reason": "another search harvest is running"}
-    try:
-        await lock.acquire()
-    except SessionLockHeld:
-        query_row.status = "pending"
-        await harvest_lock.release()
-        return {"skipped": True, "reason": "login session lock held"}
-    try:
-        runner.pipeline._session_lock = lock
-        runner.pipeline._run_locks.append(harvest_lock)
-        if await claim_free_slot(runner.pipeline) is None:
-            # both logins are busy with grid shards: never open a second browser on a login in use
+        if query_key:
+            query_row = await pick_next_query(db, query_key=query_key)
+            if query_row is not None:
+                query_lock = _query_lock(query_row.id, redis_client)
+                try:
+                    await query_lock.acquire()
+                except SessionLockHeld:
+                    return {"skipped": True, "slot": chosen, "reason": f"query {query_key} is being run by another tick"}
+                query_row.status, query_row.slot = "in_progress", chosen
+                await db.commit()
+        else:
+            query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
+            if query_row is None and await slot_takeover_due(db, chosen):
+                took_over = True
+                query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+        if query_row is None:
+            return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
+        m = await active_map(db, SOURCE_NAME)
+        if m is None:
+            query_row.status = "pending"
+            query_row.last_error = "no active search form map"
+            await db.commit()
+            return {"skipped": True, "slot": chosen, "reason": "no active search form map"}
+        search_map = map_as_dict(m)
+        dashboard_harvest = PakistanLawSitePipeline._is_dashboard_citation_fields(search_map)
+
+        runner = SearchHarvestRunner(db, source, redis_client=redis_client, job_id=job_id, dry_run=dry_run)
+        runner.harvest_mode = await get_harvest_mode(db)
+        runner.pacing_profile = login_pacing_profile(runner.harvest_mode)
+        runner.pipeline.harvest_mode = runner.harvest_mode
+        runner.pipeline.pacing_profile = runner.pacing_profile
+
+        active_slot_count = len([s for s in await runner.pipeline.manager.slots() if s.state == "ACTIVE"])
+        max_holders = max(1, min(int(runner.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
+        lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders)
+        try:
+            await lock.acquire()
+        except SessionLockHeld:
             query_row.status = "pending"
             await db.commit()
-            return {"skipped": True, "reason": "no free login slot"}
+            return {"skipped": True, "slot": chosen, "reason": "login session lock held"}
+        # This tick's own login only, never the other (two browsers on one login end each other, R3.5).
+        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1)
+        try:
+            await slot_lock.acquire()
+        except SessionLockHeld:
+            query_row.status = "pending"
+            await db.commit()
+            return {"skipped": True, "slot": chosen, "reason": f"login slot {chosen} is in use by another job"}
+        runner.pipeline._session_lock = lock
+        runner.pipeline._slot_lock = slot_lock
+        runner.pipeline.runner.preferred_slot_number = chosen
+        runner.pipeline.runner.exclusive_slot = True
+        runner.pipeline._run_locks.extend([harvest_lock, query_lock])
         runner.pipeline._assert_permitted()
         if not dashboard_harvest:
             await runner.pipeline.ensure_search_map()
@@ -718,25 +919,44 @@ async def run_search_harvest(
             search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
-        return result
-    except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit) as exc:
-        query_row.status = "pending"
-        query_row.last_error = str(exc)[:1000]
+        return {**result, "slot": chosen, "took_over": took_over}
+    except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit, LoginRequired) as exc:
+        if query_row is not None:
+            query_row.status = "pending"
+            query_row.last_error = str(exc)[:1000]
         await db.commit()
-        return {"paused": True, "reason": str(exc), "query_key": query_row.query_key}
-    except LoginRequired as exc:
-        query_row.status = "pending"
-        query_row.last_error = str(exc)[:1000]
-        await db.commit()
-        return {"paused": True, "reason": str(exc), "query_key": query_row.query_key}
+        return {"paused": True, "slot": chosen, "reason": str(exc), "query_key": query_row.query_key if query_row else None}
     finally:
-        try:
-            await runner.pipeline.runner.close()
-        except Exception:
-            pass
-        await release_claimed_slot(runner.pipeline)
-        await lock.release()
-        await harvest_lock.release()
+        if runner is not None:
+            try:
+                await runner.pipeline.runner.close()
+            except Exception:
+                pass
+            runner.pipeline._slot_lock = None
+        for held in (slot_lock, lock, query_lock, harvest_lock):
+            if held is not None:
+                await held.release()
+
+
+def _continue_slot(result: Dict[str, Any]) -> Optional[int]:
+    """The slot whose next tick is queued at once: a tick that worked a row and was not paused (a spent page
+    budget, a lost login, the memory guard) or skipped. Anything else waits for the beat."""
+    if not settings.PLS_SEARCH_HARVEST_CONTINUE:
+        return None
+    if result.get("skipped") or result.get("paused") or not result.get("query_key"):
+        return None
+    slot = result.get("slot")
+    return int(slot) if slot in SEARCH_HARVEST_SLOTS else None
+
+
+def queue_search_harvest_ticks(app, *, slots=SEARCH_HARVEST_SLOTS) -> List[int]:
+    """Queue one search-harvest tick per login slot on the login queue. Harvest ticks never expire (R3.7): a tick
+    that finds its slot's harvest already running exits at once, so queued ticks cannot pile up into work."""
+    queued: List[int] = []
+    for n in slots:
+        app.send_task("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", kwargs={"slot": int(n)}, queue="login_session")
+        queued.append(int(n))
+    return queued
 
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
@@ -783,7 +1003,14 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
                 return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
             return await run_search_harvest(db, **kwargs)
 
-    return run_async(_inner())
+    result = run_async(_inner())
+    next_slot = _continue_slot(result)
+    if next_slot is not None:
+        from scraper.tasks.celery_app import app
+
+        queue_search_harvest_ticks(app, slots=(next_slot,))
+        result["queued_next_tick"] = next_slot
+    return result
 
 
 def cli_plan(argv: Optional[List[str]] = None) -> int:

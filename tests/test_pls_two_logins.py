@@ -78,12 +78,14 @@ async def test_claim_free_slot_ignores_a_login_that_is_not_active(db):
 
 
 def test_search_harvest_and_caseid_walk_hold_a_login_and_run_one_at_a_time():
-    for path in ("scraper/tasks/pls_search_harvest.py", "scraper/tasks/pls_caseid_walk.py"):
-        text = Path(path).read_text(encoding="utf-8")
-        assert "claim_free_slot(" in text, path
-        assert "no free login slot" in text, path
-    assert 'SessionLock(f"{SOURCE_NAME}:search_harvest"' in Path("scraper/tasks/pls_search_harvest.py").read_text(encoding="utf-8")
-    assert 'SessionLock(f"{SOURCE_NAME}:caseid_walk"' in Path("scraper/tasks/pls_caseid_walk.py").read_text(encoding="utf-8")
+    walk = Path("scraper/tasks/pls_caseid_walk.py").read_text(encoding="utf-8")
+    assert "claim_free_slot(" in walk and "no free login slot" in walk
+    assert 'SessionLock(f"{SOURCE_NAME}:caseid_walk"' in walk
+    # Owner's decision of 13 October 2026: one search harvest per login, each holding its own login's slot lock
+    # (behaviour covered in tests/test_pls_search_harvest_slots.py).
+    harvest = Path("scraper/tasks/pls_search_harvest.py").read_text(encoding="utf-8")
+    assert 'SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}"' in harvest
+    assert 'SessionLock(f"{SOURCE_NAME}:slot{chosen}"' in harvest
 
 
 def test_installer_and_deploy_run_both_logins():
