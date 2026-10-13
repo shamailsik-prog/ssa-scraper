@@ -18,7 +18,7 @@ login or only throttled the account is not known at that moment. This Beat task 
    (23 September 2026) so the harvest runs around the clock on the firm's two logins.
 4. A verification page (CAPTCHA, OTP, "verify you are human") is never solved: the slot waits for a
    human and the next automatic attempt is two hours away. Without saved credentials the attempt
-   backs off (15, 30, 60 minutes, then hourly) and a human login from the dashboard restores it.
+   backs off (3, 3, 15, 30, 60 minutes, then hourly) and a human login from the dashboard restores it.
 
 An explicit block (HTTP 403/429/451 or a block page) halts the source as it always has. One halt is
 released here: before 6 October 2026 a failed DNS lookup of the site's own host was reported as the
@@ -58,7 +58,10 @@ logger = logging.getLogger(__name__)
 
 _DNS_HALT_RE = re.compile(r"^url_policy: host (\S+) resolves to a private, loopback, link-local or metadata address")
 
-BACKOFF_MINUTES = (15, 30, 60)
+# A failed sign-in is tried again 3 minutes later, twice (owner's rule of 13 October 2026: after a logout, wait 3
+# minutes, then log back in; the site answers "account already in use" while it still holds the old session), then
+# backs off so a login that keeps failing is not signed in every few minutes.
+BACKOFF_MINUTES = (3, 3, 15, 30, 60)
 SOURCE_RESUME_COOLDOWN_MINUTES = 15
 
 

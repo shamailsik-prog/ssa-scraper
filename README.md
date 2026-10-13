@@ -87,7 +87,8 @@ username and password into it, ticks **I Agree with the Terms and Conditions** a
 On the operator's instruction of 24 September 2026 the tab also offers **Saved sign-in**: the
 username and password of each login are stored encrypted (never shown or logged again), and when
 the site ends a session the `recover-login-slots` task waits `LOGIN_RECOVERY_COOLDOWN_MINUTES`
-(15), re-opens the stored session, and if it is dead fills the form, ticks the box below the
+(3: the owner's rule of 13 October 2026, wait 3 minutes after a logout, then log back in; a failed sign-in is
+tried again 3 minutes later, twice, then backs off), re-opens the stored session, and if it is dead fills the form, ticks the box below the
 password and presses Sign in. A verification page is never solved: the slot then waits for a
 person (`NEEDS_HUMAN_LOGIN`). The site allows one live login per account: logging in to it
 yourself with the same account ends the scraper's session.

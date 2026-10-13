@@ -77,19 +77,24 @@ async def test_bounced_slot_without_saved_credentials_backs_off(db, login_source
     assert result["verify"]["landed"] == "https://www.pakistanlawsite.com/Login/MainPage"  # query string never recorded
     record = (login_source.config_json or {})[recovery_key(1)]
     assert record["attempts"] == 1
-    assert datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
+    assert datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=3)
     assert (await _slot(db, 1)).state == "NEEDS_HUMAN_LOGIN"
     # Only a goto of the search page with the stored session; no login page, no form submission.
     assert [k for k, _ in sc.log] == [("goto", pls_check_url())]
     notes = (await db.execute(select(Notification).where(Notification.code == "SLOT_RECOVERY_FAILED"))).scalars().all()
     assert len(notes) == 1 and "no saved credentials" in notes[0].message and "human login" in notes[0].message
 
-    # Second failure backs off 30 minutes and does not notify again.
+    # The second failure is tried again 3 minutes later too, the third backs off 15; no second notice.
     later = datetime.fromisoformat(record["next_attempt_at"]) + timedelta(seconds=1)
     result2 = await recover_slot(db, mgr, await _slot(db, 1), now=later, browser_factory=sc.factory())
     await db.commit()
     record2 = (login_source.config_json or {})[recovery_key(1)]
-    assert record2["attempts"] == 2 and datetime.fromisoformat(record2["next_attempt_at"]) == later + timedelta(minutes=30)
+    assert record2["attempts"] == 2 and datetime.fromisoformat(record2["next_attempt_at"]) == later + timedelta(minutes=3)
+    third = datetime.fromisoformat(record2["next_attempt_at"]) + timedelta(seconds=1)
+    await recover_slot(db, mgr, await _slot(db, 1), now=third, browser_factory=sc.factory())
+    await db.commit()
+    record3 = (login_source.config_json or {})[recovery_key(1)]
+    assert record3["attempts"] == 3 and datetime.fromisoformat(record3["next_attempt_at"]) == third + timedelta(minutes=15)
     notes = (await db.execute(select(Notification).where(Notification.code == "SLOT_RECOVERY_FAILED"))).scalars().all()
     assert len(notes) == 1
 
@@ -364,7 +369,7 @@ async def test_sign_in_failure_counts_as_an_attempt_and_backs_off(db, login_sour
     await db.commit()
     assert "failed" in result and result["sign_in"]["verdict"] == "error"
     record = (login_source.config_json or {})[recovery_key(1)]
-    assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=15)
+    assert record["attempts"] == 1 and datetime.fromisoformat(record["next_attempt_at"]) == t0 + timedelta(seconds=1) + timedelta(minutes=3)
 
 
 async def test_sign_in_refused_when_agree_checkbox_not_ticked(db, login_source, monkeypatch):

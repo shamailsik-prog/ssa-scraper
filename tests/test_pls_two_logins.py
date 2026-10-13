@@ -102,8 +102,10 @@ def test_deploy_step_sets_both_logins_in_env(tmp_path):
     env = tmp_path / ".env"
     env.write_text("FOO=1\nLOGIN_SESSION_CONCURRENCY=1\nBAR=2", encoding="utf-8")  # no final newline
     script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
-    start = script.index("ensure_two_pls_logins() {")
-    func = script[start : script.index("\n}\n", start) + 3]
+    func = ""
+    for name in ("pin_env() {", "ensure_two_pls_logins() {"):
+        start = script.index(name)
+        func += script[start : script.index("\n}\n", start) + 3]
     prog = 'log() { echo "$*"; }\n' + func + 'cd "$1" && ensure_two_pls_logins && ensure_two_pls_logins\n'
     subprocess.run(["bash", "-c", prog, "deploy-test", str(tmp_path)], check=True, capture_output=True, text=True)
     lines = env.read_text(encoding="utf-8").splitlines()

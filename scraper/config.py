@@ -166,8 +166,8 @@ class Settings(BaseSettings):
         "with the credentials the operator saved for the slot and store the new session. Verification/CAPTCHA pages are "
         "never solved: the slot then waits for a human.",
     )
-    LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=15, description="Minutes after a lost login before the first automatic recovery attempt.")
-    LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=300, description="Celery Beat cadence of the login-slot recovery task.")
+    LOGIN_RECOVERY_COOLDOWN_MINUTES: int = Field(default=3, description="Minutes after a lost login before the first automatic recovery attempt (owner's rule of 13 October 2026: after a logout, wait 3 minutes, then log back in).")
+    LOGIN_RECOVERY_SCHEDULE_SECONDS: int = Field(default=60, description="Celery Beat cadence of the login-slot recovery task; every minute, so the 3-minute wait signs in at 3-4 minutes.")
     LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
     PLS_KEEPALIVE_SCHEDULE_SECONDS: int = Field(default=3600, description="Celery Beat cadence for PLS slot keepalive (probe ACTIVE slots; recover unhealthy only).")
     PLS_STALL_WATCHDOG_SECONDS: int = Field(default=1800, description="Celery Beat cadence for citation-grid stall watchdog.")
