@@ -491,7 +491,9 @@ def test_genuine_passage_paired_with_invented_law_is_dropped():
     }
     kept, dropped = keep_only_evidenced(answer, TEXT)
     assert [law["statute"] for law in kept["laws"]] == ["Pakistan Penal Code", "Code of Criminal Procedure"]
-    assert dropped[0]["why"] == "its quote does not name this law"
+    assert kept["laws"][1]["sections"] == ["497(2)"]  # unsupported 498 must not ride along with a genuine quote
+    assert any(d["kind"] == "law_section" and d["item"]["section"] == "498" for d in dropped)
+    assert any(d["kind"] == "law" and "does not name any listed section" in d["why"] for d in dropped)
 
 
 def test_viewer_shows_grounded_reading_and_audit_metadata(client, admin_headers):
