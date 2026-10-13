@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import get_db
@@ -302,11 +302,13 @@ async def unreported_sections(db: AsyncSession = Depends(get_db)) -> Dict[str, A
         by_court[court or "unknown"] = by_court.get(court or "unknown", 0) + int(n)
     from scraper.models import JudgmentReading
 
-    read = int((await db.execute(select(func.count()).select_from(JudgmentReading).where(JudgmentReading.status == "read"))).scalar() or 0)
+    # only judgments still in the section: one that later gained a reporter citation keeps its reading but leaves the section
+    current = and_(JudgmentReading.status == "read", Judgment.unreported.is_(True))
+    read = int((await db.execute(select(func.count()).select_from(JudgmentReading).join(Judgment, Judgment.id == JudgmentReading.judgment_id).where(current))).scalar() or 0)
     subj = func.unnest(JudgmentReading.subjects).label("subject")
     subject_rows = (
         await db.execute(
-            select(subj, func.count()).select_from(JudgmentReading).where(JudgmentReading.status == "read").group_by(subj).order_by(func.count().desc(), subj).limit(60)
+            select(subj, func.count()).select_from(JudgmentReading).join(Judgment, Judgment.id == JudgmentReading.judgment_id).where(current).group_by(subj).order_by(func.count().desc(), subj).limit(60)
         )
     ).all()
     return {

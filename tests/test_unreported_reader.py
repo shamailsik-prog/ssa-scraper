@@ -180,3 +180,30 @@ async def test_a_second_reading_run_skips_while_one_is_in_progress(db, monkeypat
             assert await unreported_reader._run(10) == {"skipped": "reading_run_in_progress"}
         finally:
             await holder.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": unreported_reader.READER_LOCK_KEY})
+
+
+def test_a_genuine_passage_paired_with_an_invented_law_is_dropped():
+    answer = {"laws": [
+        {"statute": "Contract Act 1872", "sections": ["73"], "quote": "The application is allowed and the applicant is admitted to bail."},
+        {"statute": "Pakistan Penal Code", "sections": [], "quote": "a case under section 489-F of the Pakistan Penal Code"},
+        {"statute": "Code of Criminal Procedure", "sections": ["497(2)", "498"], "quote": "within the meaning of section 497(2) Cr.P.C."},
+    ], "points": []}
+    kept, dropped = keep_only_evidenced(answer, TEXT)
+    assert [law["statute"] for law in kept["laws"]] == ["Pakistan Penal Code", "Code of Criminal Procedure"]
+    assert dropped == [{"kind": "law", "item": {"statute": "Contract Act 1872", "quote": "The application is allowed and the applicant is admitted to bail."}, "why": "its quote does not name this law"}]
+
+
+def test_the_section_summary_counts_only_judgments_still_unreported(client, admin_headers):
+    from scraper.database import SessionLocal, run_async
+
+    async def seed():
+        async with SessionLocal() as db:
+            (j,) = await _unreported(db)
+            db.add(JudgmentReading(judgment_id=j.id, status="read", model="m", prompt_version="v", laws=[], points=[], subjects=["Bail"], dropped=[]))
+            await db.commit()
+            j.unreported = False  # it later gained a reporter citation
+            await db.commit()
+
+    run_async(seed())
+    s = client.get("/admin/corpus/unreported", headers=admin_headers).json()
+    assert s["read"] == 0 and s["subjects"] == []
