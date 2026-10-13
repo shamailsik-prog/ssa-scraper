@@ -1925,6 +1925,7 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
     still cannot enter (no court, too little text) is held again with that reason, so it is never retried
     in a loop."""
     if not settings.UNREPORTED_JUDGMENTS:
+        logger.info("unreported release: switched off (UNREPORTED_JUDGMENTS=false)")
         return 0
     held = (
         await db.execute(
@@ -1972,6 +1973,7 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
             item.resolution = "released_unreported"
             item.resolution_notes = "no law report cites it: promoted as an unreported judgment"
     await db.flush()
+    logger.info("unreported release: %d held without a citation looked at, %d released for promotion, %d kept held", len(held), released, len(held) - released)
     return released
 
 
