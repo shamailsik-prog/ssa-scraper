@@ -208,8 +208,13 @@ class Settings(BaseSettings):
     READER_API_KEY: SecretStr = Field(default=SecretStr(""), description="Key for READER_BASE_URL. Blank = OPENAI_API_KEY.")
     READER_BATCH: int = Field(default=20, description="Unreported judgments the reading agent reads per run.")
     READER_SCHEDULE_SECONDS: int = Field(default=600, description="How often the reading agent runs.")
-    READER_MAX_CHARS: int = Field(default=24000, description="Judgment text sent to the model: the opening and the closing part when longer.")
-    READER_RETRY_HOURS: float = Field(default=24.0, description="A failed reading is tried again after this long.")
+    READER_MAX_CHARS: int = Field(default=24000, description="Maximum characters per reader-model chunk; long judgments are read in overlapping chunks, never head/tail truncated.")
+    READER_CHUNK_OVERLAP_CHARS: int = Field(default=1200, description="Overlap between adjacent reader chunks so propositions crossing a boundary are not lost.")
+    READER_RETRY_HOURS: float = Field(default=24.0, description="Base delay before retrying a failed judgment after transient/validation failures.")
+    READER_HTTP_RETRIES: int = Field(default=2, description="Immediate retries for transient reader-provider HTTP/network failures before recording a failed attempt.")
+    READER_AUTH_CIRCUIT_SECONDS: int = Field(default=3600, description="Circuit-breaker period after reader-provider authentication/authorization failures.")
+    READER_TRANSIENT_CIRCUIT_SECONDS: int = Field(default=120, description="Circuit-breaker period after repeated provider/network failures.")
+    READER_FRESH_SHARE: float = Field(default=0.2, ge=0.0, le=1.0, description="Share of each reader batch reserved for newest eligible judgments; the rest drains historical backlog.")
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",
