@@ -97,7 +97,7 @@ SELECT t.name, o.document_kind, o.status, count(*), count(*) FILTER (WHERE o.wri
 \\echo == mirror backlog: judgments with no archived copy on any target
 SELECT access_method, count(*) FROM judgment j WHERE NOT EXISTS (SELECT 1 FROM archive_objects o WHERE o.judgment_id = j.id AND o.status = 'written') GROUP BY 1;
 \\echo == latest archive errors
-SELECT t.name, o.created_at, left(o.error, 160) FROM archive_objects o JOIN archive_targets t ON t.id = o.target_id WHERE o.status <> 'written' ORDER BY o.created_at DESC LIMIT 10;
+SELECT t.name, o.created_at, left(o.error, 160) FROM archive_objects o JOIN archive_targets t ON t.id = o.target_id WHERE o.status NOT IN ('written', 'superseded') ORDER BY o.created_at DESC LIMIT 10;
 \\echo == sources
 SELECT source_name, state, left(coalesce(state_reason, ''), 90) AS reason, is_active, last_success_at, next_scrape_at,
  total_pages_scraped AS pages, total_records_extracted AS records, left(coalesce(last_error, ''), 90) AS last_error
