@@ -1937,16 +1937,26 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
         )
     ).scalars().all()
     now = datetime.now(timezone.utc)
+    released = 0
     for st in held:
+        data = st.reconciled_json or {}
+        why = _unreported_hold_reason(strip_leading_judgment_chrome(st.raw_text or ""), None, data)
+        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+        if why:
+            # not a judgment that can stand as unreported: it stays held, says why, and is not picked again
+            st.quarantine_reason = f"no citation supported by source (not taken as unreported: {why})"
+            for item in items:
+                item.reason = st.quarantine_reason
+            continue
         st.status = "extracted"
         st.quarantine_reason = None
-        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+        released += 1
         for item in items:
             item.reviewed, item.reviewed_by, item.reviewed_at = True, "system", now
             item.resolution = "released_unreported"
             item.resolution_notes = "no law report cites it: promoted as an unreported judgment"
     await db.flush()
-    return len(held)
+    return released
 
 
 async def promote_staging_records(limit: int = 200, *, source_name: Optional[str] = None) -> Dict[str, int]:

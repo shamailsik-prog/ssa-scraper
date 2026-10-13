@@ -87,10 +87,19 @@ async def test_the_same_judgment_captured_twice_is_a_duplicate(db, source):
 
 async def test_a_capture_too_short_to_be_a_judgment_stays_held_with_its_reason(db, source):
     st = await _held(db, source, body="Adjourned.")
-    await release_unreported(db)
+    assert await release_unreported(db) == 0
+    assert st.status == "quarantined"
+    assert st.quarantine_reason == "no citation supported by source (not taken as unreported: text too short for a judgment)"
+    item = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().one()
+    assert item.reviewed is False and item.reason == st.quarantine_reason  # still waits for a person, and says why
+    assert await release_unreported(db) == 0  # never picked again
+
+
+async def test_promotion_itself_still_refuses_a_short_capture(db, source):
+    st = await _held(db, source, body="Adjourned.")
+    st.status = "extracted"
     assert await promote_judgment_staging(db, st) == "quarantined"
     assert st.quarantine_reason == "unreported judgment held: text too short for a judgment"
-    assert await release_unreported(db) == 0  # never retried in a loop
 
 
 async def test_pakistanlawsite_without_a_citation_is_still_held(db, source):
