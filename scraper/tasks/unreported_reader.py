@@ -338,12 +338,29 @@ def keep_only_evidenced(answer: Dict[str, Any], text: str) -> Tuple[Dict[str, An
             if not isinstance(item, dict):
                 continue
             quote = _norm(item.get("quote") or "")
-            if kind == "law" and len(quote) >= MIN_QUOTE_CHARS and quote in body and not _law_supported(item, quote):
-                dropped.append({"kind": kind, "item": {k: _short(v, 300) for k, v in item.items() if not isinstance(v, (list, dict))}, "why": "its quote does not name this law"})
-                continue
             if len(quote) >= MIN_QUOTE_CHARS and quote in body:
                 if kind == "law":
-                    kept[key].append({"statute": _short(item.get("statute"), 300), "sections": [_short(s, 40) for s in (item.get("sections") or []) if _short(s, 40)][:20], "quote": _short(item.get("quote"), 400)})
+                    raw_sections = [_short(s, 40) for s in (item.get("sections") or []) if _short(s, 40)][:20]
+                    supported_sections: List[str] = []
+                    for section in raw_sections:
+                        sec = _norm(section or "")
+                        if sec and re.search(rf"(?<![\\w-]){re.escape(sec)}(?![\\w-])", quote):
+                            supported_sections.append(section)
+                        else:
+                            dropped.append(
+                                {
+                                    "kind": "law_section",
+                                    "item": {"statute": _short(item.get("statute"), 300), "section": section, "quote": _short(item.get("quote"), 300)},
+                                    "why": "this section is not named in the law's supporting quotation",
+                                }
+                            )
+                    if raw_sections and not supported_sections:
+                        dropped.append({"kind": kind, "item": {"statute": _short(item.get("statute"), 300), "quote": _short(item.get("quote"), 300)}, "why": "its quote does not name any listed section"})
+                        continue
+                    if not raw_sections and not _law_supported(item, quote):
+                        dropped.append({"kind": kind, "item": {k: _short(v, 300) for k, v in item.items() if not isinstance(v, (list, dict))}, "why": "its quote does not name this law"})
+                        continue
+                    kept[key].append({"statute": _short(item.get("statute"), 300), "sections": supported_sections, "quote": _short(item.get("quote"), 400)})
                 else:
                     kept[key].append({"point": _short(item.get("point"), 500), "decision": _short(item.get("decision"), 500), "quote": _short(item.get("quote"), 400)})
             else:
