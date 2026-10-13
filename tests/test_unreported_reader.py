@@ -145,3 +145,65 @@ async def test_the_model_call_sends_the_judgment_as_data_and_reads_the_json_back
     assert seen["url"] == "http://reader.test/v1/chat/completions"
     assert seen["body"]["model"] == "test-model" and seen["body"]["response_format"] == {"type": "json_object"}
     assert "DATA" in seen["body"]["messages"][0]["content"] and "489-F" in seen["body"]["messages"][1]["content"]
+
+
+def test_reader_model_off_stops_the_agent_even_with_a_treatment_model(monkeypatch):
+    monkeypatch.setattr(settings, "READER_MODEL", "off")
+    monkeypatch.setattr(settings, "TREATMENT_MODEL", "some-model")
+    assert unreported_reader.model_name() == "" and not unreported_reader.configured()
+
+
+async def test_an_answer_without_a_reading_is_a_failure_not_an_empty_reading(monkeypatch):
+    import httpx
+    import pytest
+
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    real = httpx.AsyncClient
+    for content in ("", "I cannot help with that.", '{"note": "nothing"}'):
+        handler = lambda request, c=content: httpx.Response(200, json={"choices": [{"message": {"content": c}}]})
+        monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+        with pytest.raises(ValueError):
+            await unreported_reader.call_reader_model(TEXT)
+
+
+async def test_a_second_reading_run_skips_while_one_is_in_progress(db, monkeypatch):
+    from sqlalchemy import text as sql_text
+
+    from scraper.database import engine
+
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    async with engine.connect() as holder:
+        holder = await holder.execution_options(isolation_level="AUTOCOMMIT")
+        await holder.execute(sql_text("SELECT pg_advisory_lock(:k)"), {"k": unreported_reader.READER_LOCK_KEY})
+        try:
+            assert await unreported_reader._run(10) == {"skipped": "reading_run_in_progress"}
+        finally:
+            await holder.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": unreported_reader.READER_LOCK_KEY})
+
+
+def test_a_genuine_passage_paired_with_an_invented_law_is_dropped():
+    answer = {"laws": [
+        {"statute": "Contract Act 1872", "sections": ["73"], "quote": "The application is allowed and the applicant is admitted to bail."},
+        {"statute": "Pakistan Penal Code", "sections": [], "quote": "a case under section 489-F of the Pakistan Penal Code"},
+        {"statute": "Code of Criminal Procedure", "sections": ["497(2)", "498"], "quote": "within the meaning of section 497(2) Cr.P.C."},
+    ], "points": []}
+    kept, dropped = keep_only_evidenced(answer, TEXT)
+    assert [law["statute"] for law in kept["laws"]] == ["Pakistan Penal Code", "Code of Criminal Procedure"]
+    assert dropped == [{"kind": "law", "item": {"statute": "Contract Act 1872", "quote": "The application is allowed and the applicant is admitted to bail."}, "why": "its quote does not name this law"}]
+
+
+def test_the_section_summary_counts_only_judgments_still_unreported(client, admin_headers):
+    from scraper.database import SessionLocal, run_async
+
+    async def seed():
+        async with SessionLocal() as db:
+            (j,) = await _unreported(db)
+            db.add(JudgmentReading(judgment_id=j.id, status="read", model="m", prompt_version="v", laws=[], points=[], subjects=["Bail"], dropped=[]))
+            await db.commit()
+            j.unreported = False  # it later gained a reporter citation
+            await db.commit()
+
+    run_async(seed())
+    s = client.get("/admin/corpus/unreported", headers=admin_headers).json()
+    assert s["read"] == 0 and s["subjects"] == []

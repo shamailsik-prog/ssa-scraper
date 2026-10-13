@@ -127,7 +127,7 @@ fi
 
 case "${READER_MODEL_CHOICE:-keep}" in
   keep|"") ;;
-  off) log "Turning the reading agent off"; printf '' | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py READER_MODEL >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1';;
+  off) log "Turning the reading agent off"; printf 'off' | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py READER_MODEL >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1';;
   *) [[ "$READER_MODEL_CHOICE" =~ ^[A-Za-z0-9._:-]+$ ]] || die "reader model name not recognised: $READER_MODEL_CHOICE"
      log "Setting the reading agent's model to $READER_MODEL_CHOICE"
      printf '%s' "$READER_MODEL_CHOICE" | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py READER_MODEL >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1';;

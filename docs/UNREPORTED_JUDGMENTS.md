@@ -52,7 +52,8 @@ never a substitute for reading the judgment.
 **Switching it on.** Set `READER_MODEL` (or `TREATMENT_MODEL`) and an API key (`OPENAI_API_KEY`, or
 `READER_BASE_URL` + `READER_API_KEY` for any OpenAI-compatible endpoint) in `/opt/ssa-scraper/.env`, then
 restart, or run the deploy-cloud workflow with `reader_model` set (it writes `READER_MODEL` and restarts; `off`
-stops it). Without them the agent does nothing and the dashboard lists `READER_MODEL` under "Not configured".
+stops it, even where TREATMENT_MODEL is set). One reading run at a time (advisory lock); an answer without a
+reading counts as a failure and is retried after `READER_RETRY_HOURS`. Without them the agent does nothing and the dashboard lists `READER_MODEL` under "Not configured".
 Only public judgments are sent (the unreported section is court websites); PakistanLawSite text never is.
 
 **Cost.** Up to `READER_MAX_CHARS` (24,000) characters of each judgment are sent (the opening and the
