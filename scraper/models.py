@@ -286,6 +286,7 @@ class JudgmentReadingVersion(Base):
         Index("ix_judgment_reading_version_judgment", "judgment_id", "attempt_no"),
         Index("ix_judgment_reading_version_status", "status", "completed_at"),
         Index("ix_judgment_reading_version_current", "judgment_id", "is_current"),
+        UniqueConstraint("judgment_id", "attempt_no", name="uq_judgment_reading_version_attempt"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     judgment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False)
@@ -316,6 +317,7 @@ class JudgmentReadingVersion(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     started_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     completed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    retry_after_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 
 
 class Treatment(Base):
