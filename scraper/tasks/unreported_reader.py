@@ -41,7 +41,6 @@ SUBJECT_TAXONOMY_VERSION = "legal-subjects-1"
 CIRCUIT_KEY = "ssa:reader:circuit"
 OUTCOMES = ("allowed", "dismissed", "partly allowed", "disposed of", "remanded", "withdrawn", "converted", "other")
 MIN_QUOTE_CHARS = 12
-READER_LOCK_KEY = 0x55A_B3D1  # pg advisory lock: one reading run at a time
 ANSWER_FIELDS = ("laws", "points", "interpretation", "turns_on", "subjects", "outcome")
 
 # The fixed subject headings (owner's decision, 13 October 2026): the agent files each judgment under one to three of
