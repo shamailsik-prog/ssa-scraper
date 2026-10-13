@@ -170,6 +170,50 @@ async def test_failed_first_read_is_versioned_and_not_hot_looped(db, monkeypatch
     assert await read_unreported(db, limit=10) == {"read": 0, "failed": 0, "locked": 0}
 
 
+async def test_database_publish_failure_rolls_back_and_records_attempt_without_corrupting_current(db, monkeypatch):
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    (j,) = await _unreported(db)
+    old = JudgmentReading(
+        judgment_id=j.id,
+        status="read",
+        model="old-model",
+        prompt_version="unreported-reader-1",
+        laws=[],
+        points=[],
+        subjects=["Bail"],
+        dropped=[],
+    )
+    db.add(old)
+    await db.commit()
+
+    async def fake_model(_text):
+        return _model_answer()
+
+    async def broken_publish(*_args, **_kwargs):
+        raise RuntimeError("database commit failed")
+
+    monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
+    monkeypatch.setattr(unreported_reader, "_publish_success", broken_publish)
+
+    assert await read_unreported(db, limit=10) == {"read": 0, "failed": 1, "locked": 0}
+    # Rollback must leave the previous serving snapshot untouched.
+    current = await db.get(JudgmentReading, j.id)
+    assert current is not None and current.status == "read"
+    assert current.model == "old-model" and current.prompt_version == "unreported-reader-1"
+    failure = (
+        await db.execute(
+            select(JudgmentReadingVersion).where(
+                JudgmentReadingVersion.judgment_id == j.id,
+                JudgmentReadingVersion.status == "failed",
+            )
+        )
+    ).scalars().one()
+    assert failure.error_kind == "database"
+    assert "database commit failed" in failure.error
+    assert failure.is_current is False
+
+
 async def test_failed_upgrade_preserves_last_good_reading(db, monkeypatch):
     """Regression: v2/v3 reclassification failure must never hide or overwrite the prior valid legal reading."""
     monkeypatch.setattr(settings, "READER_MODEL", "test-model")
