@@ -10,7 +10,8 @@ CONTRACT TABLES (Layer 17 Annex A; the only tables `sikander_reader` may SELECT)
 INTERNAL TABLES (never granted to the reader role):
     scraper_sources, scraper_jobs, scraper_staging, statutes_staging, quarantine_queue,
     embedding_queue, browser_session_slots, search_form_map, crawl_frontier, crawl_coverage,
-    pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation, archive_targets, archive_objects, sgai_usage_daily,
+    pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation,
+    judgment_reading, judgment_reading_version, archive_targets, archive_objects, sgai_usage_daily,
     notifications, schema_migrations
 
 The vector dimension is read from EMBEDDING_DIM (Annex B-6); the model/dimension pair is
