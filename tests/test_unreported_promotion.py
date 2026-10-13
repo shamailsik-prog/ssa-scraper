@@ -226,3 +226,30 @@ async def test_migration_015_refiles_earlier_unreported_judgments_under_their_we
     rows = {j.canonical_citation: j.court_name for j in (await db.execute(select(Judgment))).scalars().all()}
     assert rows["UNREPORTED SHC C.P. No. D-1 of 2024 (2024-01-02)"] == "High Court of Sindh"
     assert rows["PLD 2020 SC 9"] == "Supreme Court of Pakistan"  # a reported judgment is never touched
+
+
+async def test_migration_017_supersedes_archive_copies_left_under_the_old_court(db):
+    import importlib
+
+    from scraper.database import engine
+    from scraper.models import ArchiveObject, ArchiveTarget
+    from scraper.storage.archive import judgment_prefix
+
+    t = ArchiveTarget(name="local", target_type="local_path", root_path="/tmp/x")
+    moved = Judgment(canonical_citation="UNREPORTED SHC C.P. No. D-2 of 2024 (2024-01-02)", full_text_hash="5" * 64, full_text=BODY, court_name="High Court of Sindh", source_name="SindhHighCourt", unreported=True, proceeding_type="constitutional_petition", year=2024)
+    kept = Judgment(canonical_citation="UNREPORTED SHC C.P. No. D-3 of 2024 (2024-01-02)", full_text_hash="4" * 64, full_text=BODY, court_name="High Court of Sindh", source_name="SindhHighCourt", unreported=True, proceeding_type="constitutional_petition", year=2024)
+    db.add_all([t, moved, kept])
+    await db.flush()
+    old = judgment_prefix(moved).replace("High_Court_of_Sindh", "Supreme_Court_of_Pakistan")
+    assert old != judgment_prefix(moved)
+    db.add(ArchiveObject(target_id=t.id, object_key=f"{old}/text.txt", content_hash="a" * 64, document_kind="text", judgment_id=moved.id, status="written"))
+    db.add(ArchiveObject(target_id=t.id, object_key=f"{judgment_prefix(kept)}/text.txt", content_hash="b" * 64, document_kind="text", judgment_id=kept.id, status="written"))
+    moved_id, kept_id = moved.id, kept.id
+    await db.commit()
+    mig = importlib.import_module("migrations.017_unreported_refile_archive")
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    db.expire_all()
+    status = {o.judgment_id: o.status for o in (await db.execute(select(ArchiveObject))).scalars().all()}
+    assert status[moved_id] == "superseded"  # the mirror writes it again under the corrected court
+    assert status[kept_id] == "written"  # already in the right folder: untouched

@@ -940,7 +940,7 @@ class ArchiveObject(Base):
     judgment_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     source_provenance_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     access_method: Mapped[str] = mapped_column(String(30), nullable=False, default="public", server_default=text("'public'"))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="written", server_default=text("'written'"), comment="written|failed|missing|mismatch")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="written", server_default=text("'written'"), comment="written|failed|missing|mismatch|superseded")
     error: Mapped[Optional[str]] = mapped_column(String(2000))
     written_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))

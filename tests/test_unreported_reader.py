@@ -145,3 +145,38 @@ async def test_the_model_call_sends_the_judgment_as_data_and_reads_the_json_back
     assert seen["url"] == "http://reader.test/v1/chat/completions"
     assert seen["body"]["model"] == "test-model" and seen["body"]["response_format"] == {"type": "json_object"}
     assert "DATA" in seen["body"]["messages"][0]["content"] and "489-F" in seen["body"]["messages"][1]["content"]
+
+
+def test_reader_model_off_stops_the_agent_even_with_a_treatment_model(monkeypatch):
+    monkeypatch.setattr(settings, "READER_MODEL", "off")
+    monkeypatch.setattr(settings, "TREATMENT_MODEL", "some-model")
+    assert unreported_reader.model_name() == "" and not unreported_reader.configured()
+
+
+async def test_an_answer_without_a_reading_is_a_failure_not_an_empty_reading(monkeypatch):
+    import httpx
+    import pytest
+
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    real = httpx.AsyncClient
+    for content in ("", "I cannot help with that.", '{"note": "nothing"}'):
+        handler = lambda request, c=content: httpx.Response(200, json={"choices": [{"message": {"content": c}}]})
+        monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+        with pytest.raises(ValueError):
+            await unreported_reader.call_reader_model(TEXT)
+
+
+async def test_a_second_reading_run_skips_while_one_is_in_progress(db, monkeypatch):
+    from sqlalchemy import text as sql_text
+
+    from scraper.database import engine
+
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    async with engine.connect() as holder:
+        holder = await holder.execution_options(isolation_level="AUTOCOMMIT")
+        await holder.execute(sql_text("SELECT pg_advisory_lock(:k)"), {"k": unreported_reader.READER_LOCK_KEY})
+        try:
+            assert await unreported_reader._run(10) == {"skipped": "reading_run_in_progress"}
+        finally:
+            await holder.execute(sql_text("SELECT pg_advisory_unlock(:k)"), {"k": unreported_reader.READER_LOCK_KEY})
