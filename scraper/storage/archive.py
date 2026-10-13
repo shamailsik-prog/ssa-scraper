@@ -96,6 +96,7 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
 
 RETRY_DELAYS = (1.0, 3.0)
 JUDGMENT_OBJECT_COUNT = 3  # document (original or rendered copy) + judgment.txt + metadata.json
+OBJECTS_CACHE_MAX = 600  # judgments whose built objects one run keeps for the next target (a slice is 500)
 
 
 async def _retry(fn, *args):
@@ -124,6 +125,11 @@ class ArchiveMirror:
         self.deadline = deadline
         self.commit_progress = commit_progress
         self.out_of_time = False
+        # Set when a target took a full backlog slice: more is owed, so the caller queues the next run at once
+        # instead of waiting for Beat (13 October 2026: 11,000 released judgments, one 500-row slice per 30 minutes).
+        self.more_pending = False
+        # Each judgment's objects (the rendered PDF above all) are built once per run and reused for every target.
+        self._objects_cache: Dict[Any, List[Dict[str, Any]]] = {}
 
     def _time_up(self) -> bool:
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -145,10 +151,27 @@ class ArchiveMirror:
             .where(ArchiveTarget.enabled.is_(True))
             .order_by(order_col.asc().nulls_first(), ArchiveTarget.name)
         )
-        return list((await self.db.execute(q)).scalars().all())
+        rows = list((await self.db.execute(q)).scalars().all())
+        if for_reconcile:
+            return rows
+        # Local disks first: they take a full slice in a minute or two. Google Drive uploads took the whole
+        # 15-minute budget when it led (13 October 2026: 424 Drive objects, 0 local, in one run), so the local
+        # copies wrote nothing on every other run. The sort is stable, so least recently completed still leads
+        # within each group.
+        return sorted(rows, key=lambda t: t.target_type != "local_path")
 
     # ------------------------------------------------------------------ objects for a judgment
     async def judgment_objects(self, j: Judgment) -> List[Dict[str, Any]]:
+        cached = self._objects_cache.get(j.id)
+        if cached is not None:
+            return cached
+        objs = await self._build_judgment_objects(j)
+        if len(self._objects_cache) >= OBJECTS_CACHE_MAX:
+            self._objects_cache.pop(next(iter(self._objects_cache)))
+        self._objects_cache[j.id] = objs
+        return objs
+
+    async def _build_judgment_objects(self, j: Judgment) -> List[Dict[str, Any]]:
         prefix = judgment_prefix(j)
         objs: List[Dict[str, Any]] = []
         original: Optional[bytes] = None
@@ -417,7 +440,12 @@ class ArchiveMirror:
             # The newest `limit` judgments were the only ones ever considered, so once promotion moved on the
             # older ones were never mirrored (13.8k of 19.7k on Drive). Every run now also takes the OLDEST
             # judgments this target still lacks, so the backlog always shrinks.
-            backlog = await self.backlog_judgments(t, settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit, exclude={j.id for j in newest}, before=cutoff)
+            # One row past the slice says whether more is owed after this run, without a second count query.
+            backlog_quota = int(settings.MIRROR_BACKLOG_PER_RUN if backlog_limit is None else backlog_limit)
+            backlog = await self.backlog_judgments(t, backlog_quota + 1 if backlog_quota > 0 else 0, exclude={j.id for j in newest}, before=cutoff)
+            if len(backlog) > backlog_quota:
+                self.more_pending = True
+                backlog = backlog[:backlog_quota]
             judgments = [j for j in newest if cutoff is None or _aware(j.promoted_at) <= cutoff] + backlog
             summary["backlog"] += len(backlog)
             try:
