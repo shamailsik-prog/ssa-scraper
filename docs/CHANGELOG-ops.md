@@ -3,6 +3,26 @@
 Changes to rate limits, slot shares, confidence thresholds or the definition of done, each with the owner's
 written approval and the reason (handbook R9.6, `docs/PLS_HARVEST_HANDBOOK.md`).
 
+## 13 October 2026 — unreported section for court-website judgments; reading agent on the mini model
+
+**Approved by:** Shamail Sikander, in chat on 12–13 October 2026 ("If any of the citations downloaded from the free
+sources don't have a citation reported, they can be put into the unreported judgement section … the other agent will
+be employed, which may be reading them simultaneously in the background"), and "Mini" for the reading agent's model.
+
+**What changed**
+
+- **Promotion rule (R5.6).** A court-website judgment held only for "no citation supported by source" is promoted into
+  the unreported section instead of staying held. Its identity is court + case number + decision date
+  (`UNREPORTED <court> <case no> (<date>)`), as R5.6 prescribes. Its court is the court whose website published it,
+  never a court named in its text. The confidence cutoff (0.85) is unchanged: rows held for low confidence stay held.
+- **Length floor.** An unreported judgment needs at least `UNREPORTED_MIN_TEXT_CHARS` (400) characters; shorter ones
+  stay held as "not taken as unreported: text too short". This is below R5.7's 1,000-character `short_text` mark,
+  because single-page court orders (bail, adjournment) are often 400–1,000 characters. **Awaiting the owner's
+  ruling** on whether to raise it to 1,000.
+- **Reading agent.** `READER_MODEL=gpt-4o-mini` on both servers (20 judgments every 10 minutes, on the maintenance
+  queue, never on a login queue). It records laws, points, interpretation and subjects, and drops any law or point
+  whose quoted words are not in the judgment.
+
 ## 13 October 2026 — search harvest on both logins at once, with fixed reporter shares
 
 **Approved by:** Shamail Sikander, in chat on 13 October 2026 ("make the PakistanLawSite search harvest run on BOTH

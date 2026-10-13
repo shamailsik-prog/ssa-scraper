@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import get_db
@@ -224,6 +224,7 @@ async def list_judgments(
     empty_body: Optional[bool] = None,
     section: Optional[str] = Query(default=None, pattern="^(reported|unreported)$"),
     proceeding_type: Optional[str] = Query(default=None, max_length=40),
+    subject: Optional[str] = Query(default=None, max_length=120),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -236,6 +237,14 @@ async def list_judgments(
         filters.append(Judgment.unreported.is_(section == "unreported"))
     if proceeding_type:
         filters.append(Judgment.proceeding_type == proceeding_type)
+    if subject:
+        from scraper.models import JudgmentReading
+
+        filters.append(
+            select(JudgmentReading.judgment_id)
+            .where(JudgmentReading.judgment_id == Judgment.id, JudgmentReading.status == "read", JudgmentReading.subjects.any(subject))
+            .exists()
+        )
     if source:
         filters.append(Judgment.source_name == source)
     if empty_body is True:
@@ -291,8 +300,21 @@ async def unreported_sections(db: AsyncSession = Depends(get_db)) -> Dict[str, A
     for court, ptype, n in rows:
         by_type[ptype or "other"] = by_type.get(ptype or "other", 0) + int(n)
         by_court[court or "unknown"] = by_court.get(court or "unknown", 0) + int(n)
+    from scraper.models import JudgmentReading
+
+    # only judgments still in the section: one that later gained a reporter citation keeps its reading but leaves the section
+    current = and_(JudgmentReading.status == "read", Judgment.unreported.is_(True))
+    read = int((await db.execute(select(func.count()).select_from(JudgmentReading).join(Judgment, Judgment.id == JudgmentReading.judgment_id).where(current))).scalar() or 0)
+    subj = func.unnest(JudgmentReading.subjects).label("subject")
+    subject_rows = (
+        await db.execute(
+            select(subj, func.count()).select_from(JudgmentReading).join(Judgment, Judgment.id == JudgmentReading.judgment_id).where(current).group_by(subj).order_by(func.count().desc(), subj).limit(60)
+        )
+    ).all()
     return {
         "total": sum(by_type.values()),
+        "read": read,
+        "subjects": [{"subject": s_, "count": int(n)} for s_, n in subject_rows],
         "proceeding_types": [{"key": k, "label": PROCEEDING_LABELS.get(k, k), "count": by_type.get(k, 0)} for k in PROCEEDING_LABELS],
         "courts": [{"court": c, "count": n} for c, n in sorted(by_court.items(), key=lambda x: -x[1])],
     }
@@ -306,7 +328,24 @@ async def get_judgment(judgment_id: UUID, db: AsyncSession = Depends(get_db)) ->
     cites = (
         await db.execute(select(Citation).where(Citation.judgment_id == judgment_id).order_by(Citation.is_primary.desc()))
     ).scalars().all()
+    from scraper.models import JudgmentReading
+
+    rd = await db.get(JudgmentReading, judgment_id)
+    reading = None
+    if rd is not None and rd.status == "read":
+        reading = {
+            "machine_reading": True,  # the reading agent's tags, not a headnote: always read with the judgment
+            "laws": rd.laws or [],
+            "points": rd.points or [],
+            "interpretation": rd.interpretation,
+            "turns_on": rd.turns_on,
+            "subjects": rd.subjects or [],
+            "outcome": rd.outcome,
+            "model": rd.model,
+            "read_at": rd.read_at.isoformat() if rd.read_at else None,
+        }
     return {
+        "reading": reading,
         "id": str(j.id),
         "citation": j.canonical_citation,
         "title": j.case_title,
