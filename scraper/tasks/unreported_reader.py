@@ -558,6 +558,19 @@ async def _record_failure(
             is_current=False,
         )
     )
+    if kind in ("auth", "configuration"):
+        # Permanent for the immediate provider call: surface it to the existing operator notification system
+        # instead of silently cycling through judgments with bad credentials/provider configuration.
+        from scraper.notify import notify
+
+        await notify(
+            db,
+            level="error",
+            code="READER_PROVIDER_CONFIGURATION",
+            message=str(exc)[:1000],
+            source_name="UnreportedReader",
+            details={"error_kind": kind, "model": model_name(), "prompt_version": PROMPT_VERSION},
+        )
     await db.commit()
 
 
