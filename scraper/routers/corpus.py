@@ -222,6 +222,8 @@ async def list_judgments(
     q: Optional[str] = Query(default=None, min_length=1),
     source: Optional[str] = None,
     empty_body: Optional[bool] = None,
+    section: Optional[str] = Query(default=None, pattern="^(reported|unreported)$"),
+    proceeding_type: Optional[str] = Query(default=None, max_length=40),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -229,7 +231,11 @@ async def list_judgments(
     filters = []
     if q:
         pat = f"%{q}%"
-        filters.append(or_(Judgment.canonical_citation.ilike(pat), Judgment.case_title.ilike(pat)))
+        filters.append(or_(Judgment.canonical_citation.ilike(pat), Judgment.case_title.ilike(pat), Judgment.docket_number.ilike(pat)))
+    if section:
+        filters.append(Judgment.unreported.is_(section == "unreported"))
+    if proceeding_type:
+        filters.append(Judgment.proceeding_type == proceeding_type)
     if source:
         filters.append(Judgment.source_name == source)
     if empty_body is True:
@@ -255,6 +261,10 @@ async def list_judgments(
             "source_name": j.source_name,
             "source_url": j.source_url,
             "access_method": j.access_method,
+            "unreported": j.unreported,
+            "proceeding_type": j.proceeding_type,
+            "case_number": j.docket_number,
+            "decision_date": j.decision_date.isoformat() if j.decision_date else None,
             "has_body": _has_body(j.full_text),
             "body_length": len(j.full_text) if j.full_text else 0,
             "promoted_at": j.promoted_at.isoformat() if j.promoted_at else None,
@@ -262,6 +272,30 @@ async def list_judgments(
         for j in rows
     ]
     return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+
+@router.get("/unreported")
+async def unreported_sections(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    """The unreported section at a glance: how many judgments of each kind of proceeding, by court."""
+    from scraper.unreported import PROCEEDING_LABELS
+
+    rows = (
+        await db.execute(
+            select(Judgment.court_name, Judgment.proceeding_type, func.count())
+            .where(Judgment.unreported.is_(True))
+            .group_by(Judgment.court_name, Judgment.proceeding_type)
+        )
+    ).all()
+    by_type: Dict[str, int] = {}
+    by_court: Dict[str, int] = {}
+    for court, ptype, n in rows:
+        by_type[ptype or "other"] = by_type.get(ptype or "other", 0) + int(n)
+        by_court[court or "unknown"] = by_court.get(court or "unknown", 0) + int(n)
+    return {
+        "total": sum(by_type.values()),
+        "proceeding_types": [{"key": k, "label": PROCEEDING_LABELS.get(k, k), "count": by_type.get(k, 0)} for k in PROCEEDING_LABELS],
+        "courts": [{"court": c, "count": n} for c, n in sorted(by_court.items(), key=lambda x: -x[1])],
+    }
 
 
 @router.get("/judgments/{judgment_id}")
@@ -279,6 +313,9 @@ async def get_judgment(judgment_id: UUID, db: AsyncSession = Depends(get_db)) ->
         "court": j.court_name,
         "year": j.year,
         "decision_date": j.decision_date.isoformat() if j.decision_date else None,
+        "unreported": j.unreported,
+        "proceeding_type": j.proceeding_type,
+        "case_number": j.docket_number,
         "judges": j.judge_names,
         "source_name": j.source_name,
         "source_url": j.source_url,

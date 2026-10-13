@@ -56,10 +56,17 @@ def slug(s: Optional[str], limit: int = 80) -> str:
 
 
 def judgment_prefix(j: Judgment) -> str:
-    """Citations/<reporter>/<year>/<citation> for reported judgments; Unreported/<court>/<year>/<citation> otherwise."""
+    """Citations/<reporter>/<year>/<citation> for reported judgments; Unreported/<court>/<proceeding>/<year>/<identity> for
+    judgments marked unreported; Unreported/<court>/<year>/<citation> for the court-website judgments promoted before that."""
     if j.reporter and j.year:
         return f"Citations/{slug(j.reporter, 20)}/{j.year}/{slug(j.canonical_citation)}"
     court = slug(j.court_name or "Unknown_Court", 40)
+    if getattr(j, "unreported", False):
+        # the unreported section, sorted by the kind of proceeding (bail, constitutional petition, suit ...)
+        from scraper.unreported import PROCEEDING_LABELS
+
+        kind = slug(PROCEEDING_LABELS.get(j.proceeding_type or "other", "Other"), 40)
+        return f"Unreported/{court}/{kind}/{j.year or 'unknown'}/{slug(j.canonical_citation, 200)}"  # whole identity: a same-day order differs only in its tail
     return f"Unreported/{court}/{j.year or 'unknown'}/{slug(j.canonical_citation)}"
 
 
