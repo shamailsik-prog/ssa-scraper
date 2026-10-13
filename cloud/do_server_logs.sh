@@ -118,6 +118,11 @@ SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging G
  UNION ALL SELECT 'statutes', source_name, status, count(*) FROM statutes_staging GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 \\echo == unreported section: judgments by court and kind of proceeding
 SELECT court_name, coalesce(proceeding_type, '?') AS proceeding, count(*) FROM judgment WHERE unreported GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30;
+\\echo == reading agent: unreported judgments read (machine readings), by status and model
+SELECT status, model, count(*), max(read_at) AS latest FROM judgment_reading GROUP BY 1, 2 ORDER BY 3 DESC;
+SELECT count(*) AS unreported_not_yet_read FROM judgment j WHERE j.unreported AND NOT EXISTS (SELECT 1 FROM judgment_reading r WHERE r.judgment_id = j.id);
+SELECT left(s, 60) AS subject, count(*) FROM judgment_reading, unnest(subjects) s WHERE status = 'read' GROUP BY 1 ORDER BY 2 DESC LIMIT 15;
+SELECT left(error, 120) AS latest_errors, count(*) FROM judgment_reading WHERE status = 'failed' GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
 \\echo == court-website judgments still held without a citation (reason on the staging row)
 SELECT source_name, left(coalesce(quarantine_reason, '(none on the staging row)'), 70) AS reason, count(*) FROM scraper_staging
  WHERE status = 'quarantined' AND source_name <> 'PakistanLawSite' AND promoted_to_id IS NULL GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 15;
@@ -147,7 +152,7 @@ ROLLBACK;"
   printf '%s\n' "$SQL" | ssh "${SSH_OPTS[@]}" "root@$IP" "$REMOTE" 2>&1 | sed -E 's/[0-9a-f]{64}/<redacted-64-hex>/g'
   # Celery queue lengths: tasks waiting in Redis that no worker has taken yet (a long scraper queue means
   # sources wait behind duplicates; see DISPATCH_DEDUPE_ENABLED).
-  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo && echo "== celery queues (tasks waiting)" && for q in scraper login_session maintenance embeddings; do printf "%-14s %s\n" "$q" "$(docker compose exec -T redis redis-cli LLEN "$q" 2>/dev/null | tr -d "\r")"; done' 2>&1
+  ssh "${SSH_OPTS[@]}" "root@$IP" 'cd /opt/ssa-scraper && echo && echo "== celery queues (tasks waiting)" && for q in scraper login_session maintenance embeddings; do printf "%-14s %s\n" "$q" "$(docker compose exec -T redis redis-cli LLEN "$q" 2>/dev/null | tr -d "\r")"; done && echo && echo "== reading agent (model setting and last hour of its log)" && echo "READER_MODEL=$(grep -E "^READER_MODEL=" .env | tail -1 | cut -d= -f2 | cut -c1-40)" && docker compose logs --no-color --since 1h worker-maintenance 2>/dev/null | grep -E "reading agent|read_unreported" | tail -8' 2>&1
   # Host memory and killed processes: a worker child that disappears with SIGKILL is usually the
   # kernel's out-of-memory killer, which only the host log shows.
   ssh "${SSH_OPTS[@]}" "root@$IP" 'echo; echo "== host memory"; free -m; echo; echo "== container memory"; docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"; echo; echo "== out-of-memory kills (kernel log, last 24 h)"; journalctl -k --since "24 hours ago" --no-pager 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -15' 2>&1
