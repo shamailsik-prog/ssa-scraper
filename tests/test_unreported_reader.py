@@ -29,7 +29,7 @@ MODEL_ANSWER = {
     ],
     "interpretation": "Section 497(2) applies where the material leaves room for further inquiry.",
     "turns_on": "Offence outside the prohibitory clause; further inquiry.",
-    "subjects": ["Bail", "Dishonoured cheque (489-F PPC)"],
+    "subjects": ["Bail", "dishonoured cheques (489-F PPC)", "Cheque bouncing law"],
     "outcome": "allowed",
 }
 
@@ -75,8 +75,9 @@ async def test_the_agent_reads_unreported_judgments_once_and_keeps_only_evidence
     r = (await db.execute(select(JudgmentReading).where(JudgmentReading.judgment_id == j.id))).scalars().one()
     assert r.status == "read" and r.model == "test-model" and r.outcome == "allowed"
     assert [law["statute"] for law in r.laws] == ["Pakistan Penal Code", "Code of Criminal Procedure"]
-    assert len(r.points) == 1 and len(r.dropped) == 2
-    assert r.subjects == ["Bail", "Dishonoured cheque (489-F PPC)"]
+    assert len(r.points) == 1 and len(r.dropped) == 3
+    assert r.subjects == ["Bail", "Dishonoured cheques (489-F PPC)"]  # the list's own spelling; an unlisted heading is dropped
+    assert {"kind": "subject", "item": {"subject": "Cheque bouncing law"}, "why": "not one of the fixed subject headings"} in r.dropped
 
     assert await read_unreported(db, limit=10) == {"read": 0, "failed": 0}  # never read twice
     assert len(calls) == 1
@@ -207,3 +208,32 @@ def test_the_section_summary_counts_only_judgments_still_unreported(client, admi
     run_async(seed())
     s = client.get("/admin/corpus/unreported", headers=admin_headers).json()
     assert s["read"] == 0 and s["subjects"] == []
+
+
+def test_subjects_come_only_from_the_fixed_list():
+    subjects, dropped = unreported_reader.fixed_subjects(["  service LAW ", "Bail", "Bail", "Something new", 7])
+    assert subjects == ["Service law", "Bail"]
+    assert [d["item"]["subject"] for d in dropped] == ["Something new", "7"]
+    assert unreported_reader.fixed_subjects([])[0] == ["Other"]
+    assert unreported_reader.fixed_subjects(["Invented heading"])[0] == ["Other"]
+    assert len(unreported_reader.SUBJECTS) == len(set(unreported_reader.SUBJECTS)) and "Other" in unreported_reader.SUBJECTS
+    assert all(h in unreported_reader.SYSTEM for h in unreported_reader.SUBJECTS)  # the model is shown every heading
+
+
+async def test_readings_from_the_earlier_prompt_are_read_again_once(db, monkeypatch):
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    calls = []
+
+    async def fake_model(text):
+        calls.append(text)
+        return MODEL_ANSWER
+
+    monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
+    (j,) = await _unreported(db)
+    db.add(JudgmentReading(judgment_id=j.id, status="read", model="m", prompt_version="unreported-reader-1", laws=[], points=[], subjects=["Free-form heading"], dropped=[]))
+    await db.commit()
+    assert await read_unreported(db, limit=10) == {"read": 1, "failed": 0}
+    r = (await db.execute(select(JudgmentReading).where(JudgmentReading.judgment_id == j.id))).scalars().one()
+    assert r.prompt_version == unreported_reader.PROMPT_VERSION and r.subjects == ["Bail", "Dishonoured cheques (489-F PPC)"]
+    assert await read_unreported(db, limit=10) == {"read": 0, "failed": 0} and len(calls) == 1

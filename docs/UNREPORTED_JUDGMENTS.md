@@ -42,7 +42,10 @@ A background task (`scraper/tasks/unreported_reader.py`, every `READER_SCHEDULE_
 - **Points**: each point decided and how, with the words of the judgment that show it.
 - **Interpretation**: the reading of the law the court adopts, in a sentence or two.
 - **Turns on**: what the decision rests on.
-- **Subjects**: two to five subject headings (e.g. "Bail - further inquiry"), and the **outcome**.
+- **Subjects**: one to three headings taken only from the fixed list `SUBJECTS` in
+  `scraper/tasks/unreported_reader.py` (owner's decision, 13 October 2026), so one topic never splits across
+  near-identical headings. Any other heading is dropped and recorded; a judgment with none is filed under Other. To add
+  a heading, add it to the list. And the **outcome**.
 
 Guard against invention: a law or point whose quoted words are not found in the judgment is dropped
 (kept aside in `dropped`, never shown as a finding). Interpretation and "turns on" are one-line summaries.
