@@ -174,8 +174,9 @@ async def test_database_publish_failure_rolls_back_and_records_attempt_without_c
     monkeypatch.setattr(settings, "READER_MODEL", "test-model")
     monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
     (j,) = await _unreported(db)
+    jid = j.id
     old = JudgmentReading(
-        judgment_id=j.id,
+        judgment_id=jid,
         status="read",
         model="old-model",
         prompt_version="unreported-reader-1",
@@ -198,13 +199,13 @@ async def test_database_publish_failure_rolls_back_and_records_attempt_without_c
 
     assert await read_unreported(db, limit=10) == {"read": 0, "failed": 1, "locked": 0}
     # Rollback must leave the previous serving snapshot untouched.
-    current = await db.get(JudgmentReading, j.id)
+    current = await db.get(JudgmentReading, jid)
     assert current is not None and current.status == "read"
     assert current.model == "old-model" and current.prompt_version == "unreported-reader-1"
     failure = (
         await db.execute(
             select(JudgmentReadingVersion).where(
-                JudgmentReadingVersion.judgment_id == j.id,
+                JudgmentReadingVersion.judgment_id == jid,
                 JudgmentReadingVersion.status == "failed",
             )
         )
