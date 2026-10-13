@@ -26,6 +26,7 @@ app = Celery(
         "scraper.tasks.dispatcher",
         "scraper.tasks.promotion",
         "scraper.tasks.treatment",
+        "scraper.tasks.unreported_reader",
         "scraper.tasks.embeddings",
         "scraper.tasks.archive_mirror",
         "scraper.tasks.login_recovery",
@@ -52,6 +53,7 @@ app.conf.update(
         "scraper.tasks.pls_backfill.requalify_quarantined": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
+        "scraper.tasks.unreported_reader.read_unreported_batch": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_judgment_citation_relations": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
@@ -100,6 +102,7 @@ app.conf.update(
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,
         },
         "classify-treatment-nightly": {"task": "scraper.tasks.treatment.classify_treatment", "schedule": 86400},
+        "read-unreported": {"task": "scraper.tasks.unreported_reader.read_unreported_batch", "schedule": settings.READER_SCHEDULE_SECONDS},
         "process-embeddings": {"task": "scraper.tasks.embeddings.process_embedding_queue", "schedule": 300},
         "archive-mirror": {"task": "scraper.tasks.archive_mirror.mirror_pending", "schedule": 1800},
         # hourly bounded slices (RECONCILE_BATCH_SIZE objects per target, least recently verified first)

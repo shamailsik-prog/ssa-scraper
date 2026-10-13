@@ -249,6 +249,28 @@ class Citation(Base):
     judgment: Mapped["Judgment"] = relationship("Judgment", back_populates="citations")
 
 
+class JudgmentReading(Base):
+    """The reading agent's reading of one unreported judgment: the law applied, the points decided (each
+    tied to words copied from the judgment), the interpretation, what it turns on, subject tags and outcome.
+    A machine reading, shown as such beside the text; never a headnote."""
+
+    __tablename__ = "judgment_reading"
+    __table_args__ = (Index("ix_judgment_reading_status", "status"),)
+    judgment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, comment="read|failed")
+    model: Mapped[Optional[str]] = mapped_column(String(100))
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(40))
+    laws: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{statute, sections[], quote}]")
+    points: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{point, decision, quote}]")
+    interpretation: Mapped[Optional[str]] = mapped_column(Text)
+    turns_on: Mapped[Optional[str]] = mapped_column(Text)
+    subjects: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text))
+    outcome: Mapped[Optional[str]] = mapped_column(String(40))
+    dropped: Mapped[Optional[list]] = mapped_column(JSONB, comment="tags the model gave whose words are not in the judgment")
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    read_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
 class Treatment(Base):
     __tablename__ = "treatment"
     __table_args__ = (
@@ -918,7 +940,7 @@ class ArchiveObject(Base):
     judgment_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     source_provenance_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     access_method: Mapped[str] = mapped_column(String(30), nullable=False, default="public", server_default=text("'public'"))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="written", server_default=text("'written'"), comment="written|failed|missing|mismatch")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="written", server_default=text("'written'"), comment="written|failed|missing|mismatch|superseded")
     error: Mapped[Optional[str]] = mapped_column(String(2000))
     written_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     verified_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))

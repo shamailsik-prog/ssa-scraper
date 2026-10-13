@@ -48,6 +48,12 @@ on:
         type: choice
         options: [keep, "true", "false"]
         required: false
+      reader_model:
+        description: "Model for the reading agent over unreported judgments (uses the server's OpenAI key). keep = leave .env as it is; off = stop it"
+        default: keep
+        type: choice
+        options: [keep, gpt-4o-mini, gpt-4o, "off"]
+        required: false
 
 concurrency:
   group: deploy-cloud
@@ -85,6 +91,7 @@ jobs:
           MIRROR_LOGIN_SESSION_ROWS: ${{ inputs.mirror_login_session_rows }}
           DROPLET_NAME: ${{ inputs.droplet_name }}
           DEPLOY_ROLE: ${{ inputs.deploy_role }}
+          READER_MODEL_CHOICE: ${{ inputs.reader_model }}
           SUMMARY_FILE: ${{ github.step_summary }}
         run: |
           test -n "$DO_TOKEN" || { echo "::error::Repository secret DO_TOKEN is not set (Settings → Secrets and variables → Actions)"; exit 1; }
