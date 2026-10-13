@@ -16,8 +16,8 @@ CRON_MARK="# ssa-scraper auto-deploy from origin/main (every 15 minutes)"
 # mirror task: a deploy holds new PakistanLawSite work (Redis key deploy_hold_login) while the PLS job
 # drains, keeps beat running, and always clears the hold and makes sure beat runs afterwards, unless the
 # operator has switched beat off with state/beat_disabled.
-DEFAULT_APP_SERVICES=(api worker-scraper worker-public worker-maintenance)
-ALL_APP_SERVICES=(api worker-scraper worker-public worker-maintenance worker-embed celery-beat celery-flower)
+DEFAULT_APP_SERVICES=(api worker-scraper worker-login-recovery worker-public worker-maintenance)
+ALL_APP_SERVICES=(api worker-scraper worker-login-recovery worker-public worker-maintenance worker-embed celery-beat celery-flower)
 
 WAIT_MAX_SECONDS="${AUTO_DEPLOY_WAIT_MAX_SECONDS:-600}"  # bounded wait before deploy when beat was running
 WAIT_POLL_SECONDS="${AUTO_DEPLOY_WAIT_POLL_SECONDS:-30}"
