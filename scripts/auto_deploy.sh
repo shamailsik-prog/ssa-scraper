@@ -53,10 +53,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/pls_host_lib.sh"
 # Operator decision of 11 October 2026: PakistanLawSite login 1 and login 2 are separate accounts and run at the same
 # time, one reporter shard each, each login paced at its own 300 pages an hour. Both the updates-mode and the
 # backfill-mode setting say so; the login worker's --concurrency reads LOGIN_SESSION_CONCURRENCY from .env.
-ensure_two_pls_logins() {
+pin_env() {
   [ -f .env ] || return 0
   local kv key
-  for kv in LOGIN_SESSION_CONCURRENCY=2 BACKFILL_LOGIN_SESSION_CONCURRENCY=2; do
+  for kv in "$@"; do
     key="${kv%%=*}"
     if grep -q "^${key}=" .env; then
       grep -qx "$kv" .env || { sed -i "s/^${key}=.*/${kv}/" .env; log "set $kv in .env"; }
@@ -67,6 +67,16 @@ ensure_two_pls_logins() {
       log "added $kv to .env"
     fi
   done
+}
+
+ensure_two_pls_logins() {
+  pin_env LOGIN_SESSION_CONCURRENCY=2 BACKFILL_LOGIN_SESSION_CONCURRENCY=2
+}
+
+# Owner's rule of 13 October 2026: after a logout, wait 3 minutes, then log back in. install.sh copied
+# .env.example's old 15 minutes (checked every 5) into .env, which outranks the code default.
+ensure_relogin_wait() {
+  pin_env LOGIN_RECOVERY_COOLDOWN_MINUTES=3 LOGIN_RECOVERY_SCHEDULE_SECONDS=60
 }
 
 install_cron() {
@@ -262,6 +272,7 @@ main() {
   fi
   install_cron
   [ "$DRY_RUN" = 1 ] || ensure_two_pls_logins
+  [ "$DRY_RUN" = 1 ] || ensure_relogin_wait
 
   # Load compose env for postgres user/db names when present.
   if [ -f .env ]; then
