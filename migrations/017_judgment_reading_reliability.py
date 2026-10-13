@@ -53,7 +53,9 @@ async def upgrade(conn) -> None:
                 parse_repair_used BOOLEAN NOT NULL DEFAULT false,
                 is_current BOOLEAN NOT NULL DEFAULT false,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                retry_after_at TIMESTAMPTZ,
+                CONSTRAINT uq_judgment_reading_version_attempt UNIQUE (judgment_id, attempt_no)
             )
             """
         )
