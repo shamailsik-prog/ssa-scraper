@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from scraper.config import settings
-from scraper.models import Judgment, JudgmentReading, JudgmentReadingVersion
+from scraper.models import Judgment, JudgmentReading, JudgmentReadingVersion, Notification
 from scraper.tasks import unreported_reader
 from scraper.tasks.unreported_reader import keep_only_evidenced, read_unreported
 
@@ -404,6 +404,25 @@ async def test_model_call_sends_data_reads_json_and_tracks_usage(monkeypatch):
     assert seen["body"]["model"] == "test-model"
     assert seen["body"]["response_format"] == {"type": "json_object"}
     assert "DATA" in seen["body"]["messages"][0]["content"] and "489-F" in seen["body"]["messages"][1]["content"]
+
+
+async def test_auth_failure_records_operator_notification(db, monkeypatch):
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    (j,) = await _unreported(db)
+    await unreported_reader._record_failure(
+        db,
+        judgment_id=j.id,
+        judgment_text_hash=j.full_text_hash,
+        attempt_no=1,
+        started_at=datetime.now(timezone.utc),
+        exc=unreported_reader.ReaderError("bad reader key", kind="auth", permanent=True),
+    )
+    note = (
+        await db.execute(select(Notification).where(Notification.code == "READER_PROVIDER_CONFIGURATION"))
+    ).scalars().one()
+    assert note.level == "error"
+    assert note.source_name == "UnreportedReader"
+    assert note.details["error_kind"] == "auth"
 
 
 def test_reader_http_failure_classification():
