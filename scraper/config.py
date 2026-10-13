@@ -196,6 +196,12 @@ class Settings(BaseSettings):
         default="NasirLawSite,BalochistanHighCourt",
         description="Comma list of sources switched off for good on the owner's instruction (12 Oct 2026): both blocked this service (HTTP 403 / access denied) since mid-September. Kept as DISABLED rows so their records and history stay; never dispatched. Remove a name here to bring it back.",
     )
+    UNREPORTED_JUDGMENTS: bool = Field(
+        default=True,
+        description="A judgment from a court's own website that no law report cites enters the corpus marked unreported (identity: court, case number, decision date) instead of being held for review. PakistanLawSite is never affected.",
+    )
+    UNREPORTED_MIN_TEXT_CHARS: int = Field(default=400, description="An unreported judgment needs at least this much text; shorter captures (cause lists, stubs) stay held.")
+    UNREPORTED_RELEASE_BATCH: int = Field(default=500, description="Held 'no citation' judgments released for promotion as unreported per promotion run.")
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",

@@ -169,6 +169,7 @@ class Judgment(Base):
         Index("ix_judgment_year", "year"),
         Index("ix_judgment_reporter", "reporter"),
         Index("ix_judgment_decision_date", "decision_date"),
+        Index("ix_judgment_unreported_proceeding", "unreported", "proceeding_type"),
         Index("ix_judgment_access_method", "access_method"),
         Index("ix_judgment_source_promoted", "source_name", "promoted_at"),
         Index("ix_judgment_title_trgm", "case_title", postgresql_using="gin", postgresql_ops={"case_title": "gin_trgm_ops"}),
@@ -198,6 +199,8 @@ class Judgment(Base):
     volume: Mapped[Optional[str]] = mapped_column(String(50))
     page_number: Mapped[Optional[int]] = mapped_column(Integer)
     docket_number: Mapped[Optional[str]] = mapped_column(String(300))
+    unreported: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False, comment="From a court's own website and cited by no law report; identity is court + case number + date")
+    proceeding_type: Mapped[Optional[str]] = mapped_column(String(40), comment="bail|constitutional_petition|civil_suit|civil_appeal|... (scraper/unreported.py)")
     petitioner: Mapped[Optional[str]] = mapped_column(String(1000))
     respondent: Mapped[Optional[str]] = mapped_column(String(1000))
     full_text: Mapped[Optional[str]] = mapped_column(Text)

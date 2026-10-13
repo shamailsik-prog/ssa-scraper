@@ -48,6 +48,8 @@
         <label>Kind <select id="kind"><option value="citations">citations</option><option value="judgments">judgments</option><option value="statutes">statutes</option></select></label>
         <label>Search <input id="query" placeholder="citation, title, or statute"></label>
         <label>Source <input id="source" placeholder="PakistanLawSite"></label>
+        <label>Section <select id="section" onchange="loadList(0)"><option value="">all judgments</option><option value="reported">reported</option><option value="unreported">unreported</option></select></label>
+        <label>Proceeding <select id="ptype" onchange="loadList(0)"><option value="">any</option></select></label>
         <button class="primary" onclick="loadList(0)">Search</button>
         <span id="meta" class="note"></span>
       </div>
@@ -154,7 +156,7 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 function tile(label,value,cls){return '<div class="tile"><div class="label">'+esc(label)+'</div><div class="value '+(cls||'')+'">'+esc(value)+'</div></div>'}
 function show(tab){
   TABS.forEach(name=>{const el=$(name); if(el) el.hidden=name!==tab});
-  if(tab==='corpus') loadList(0);
+  if(tab==='corpus'){loadPtypes();loadList(0)}
   if(tab==='sources') loadSources();
   if(tab==='login') loadLogin();
   if(tab==='review') loadReview();
@@ -177,6 +179,12 @@ async function summary(){
   $('progress').textContent=JSON.stringify({frontier_remaining:c.frontier_remaining,pakistan_law_site:c.pakistan_law_site,pakistan_code:c.pakistan_code},null,2);
 }
 function cell(v){return '<td>'+esc(v)+'</td>'}
+let PTYPES={};
+async function loadPtypes(){
+  try{const d=await get('/admin/corpus/unreported');PTYPES={};let o='<option value="">any</option>';
+    for(const p of d.proceeding_types||[]){PTYPES[p.key]=p.label;o+='<option value="'+esc(p.key)+'">'+esc(p.label)+' ('+p.count+')</option>'}
+    const cur=$('ptype').value;$('ptype').innerHTML=o;$('ptype').value=cur}catch(e){}
+}
 async function loadList(n){
   offset=typeof n==='number'?n:offset;
   const k=$('kind').value,q=$('query').value.trim(),src=$('source').value.trim();
@@ -184,14 +192,15 @@ async function loadList(n){
   if(q)u+='&q='+encodeURIComponent(q);
   if(src&&k!=='citations')u+='&source='+encodeURIComponent(src);
   if(k==='statutes')u+='&with_sections_only=false';
+  if(k==='judgments'){const sec=$('section').value,pt=$('ptype').value;if(sec)u+='&section='+sec;if(pt)u+='&proceeding_type='+encodeURIComponent(pt)}
   try{
     const d=await get(u);
     $('meta').textContent='showing '+(d.items||[]).length+' of '+d.total+' (offset '+d.offset+')';
     const rows=d.items||[];
-    let html='<table><tr>'+(k==='citations'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':k==='judgments'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':'<th>name</th><th>source</th><th>sections</th><th>with text</th>')+'<th></th></tr>';
+    let html='<table><tr>'+(k==='citations'?'<th>citation</th><th>title</th><th>source</th><th>body</th>':k==='judgments'?'<th>citation / case no.</th><th>title</th><th>source</th><th>proceeding</th><th>body</th>':'<th>name</th><th>source</th><th>sections</th><th>with text</th>')+'<th></th></tr>';
     for(const r of rows){
       const body=k==='statutes'?(r.has_body?'<span class="ok">yes</span>':'<span class="bad">no sections</span>'):(r.has_body?'<span class="ok">yes ('+esc(r.body_length)+')</span>':'<span class="bad">empty</span>');
-      html+='<tr>'+(k==='citations'?cell(r.citation_string)+cell(r.title)+cell(r.source_name):k==='judgments'?cell(r.citation)+cell(r.title)+cell(r.source_name):cell(r.name)+cell(r.source_name)+cell(r.section_count)+cell(r.sections_with_text))+'<td>'+body+'</td><td><button class="primary" data-kind="'+esc(k)+'" data-id="'+esc(r.id)+'" onclick="openDetail(this.dataset.kind,this.dataset.id)">Open</button></td></tr>';
+      html+='<tr>'+(k==='citations'?cell(r.citation_string)+cell(r.title)+cell(r.source_name):k==='judgments'?cell(r.unreported?('Unreported · '+(r.case_number||r.citation)+(r.decision_date?' · '+r.decision_date:'')):r.citation)+cell(r.title)+cell(r.source_name)+cell(PTYPES[r.proceeding_type]||''):cell(r.name)+cell(r.source_name)+cell(r.section_count)+cell(r.sections_with_text))+'<td>'+body+'</td><td><button class="primary" data-kind="'+esc(k)+'" data-id="'+esc(r.id)+'" onclick="openDetail(this.dataset.kind,this.dataset.id)">Open</button></td></tr>';
     }
     html+='</table>';
     if(!rows.length)html='<p class="note">No records.</p>';
@@ -204,7 +213,7 @@ async function openDetail(k,id){
   try{
     const d=await get('/admin/corpus/'+encodeURIComponent(k)+'/'+encodeURIComponent(id));
     if(k==='citations'){$('detailMeta').textContent=d.citation_string+' · judgment '+(d.judgment?.citation||'')+' · '+(d.judgment?.body_length||0)+' chars';$('detail').textContent=d.judgment?.full_text||'(no full_text saved)'}
-    else if(k==='judgments'){$('detailMeta').textContent=(d.citation||'')+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=d.full_text||'(no full_text saved)'}
+    else if(k==='judgments'){$('detailMeta').textContent=(d.unreported?'UNREPORTED · '+(d.case_number||d.citation)+(d.decision_date?' · decided '+d.decision_date:'')+(d.proceeding_type?' · '+(PTYPES[d.proceeding_type]||d.proceeding_type):''):(d.citation||''))+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=d.full_text||'(no full_text saved)'}
     else{$('detailMeta').textContent=(d.name||'')+' · '+d.section_count+' sections ('+d.sections_with_text+' with text)';$('detail').textContent=(d.sections||[]).map(s=>'§ '+s.section_number+' '+(s.section_title||'')+' ['+s.body_length+' chars]\n'+(s.section_text||'(empty)')).join('\n\n---\n\n')||'(no sections)'}
   }catch(e){$('detailMeta').textContent='error: '+e.message}
 }
