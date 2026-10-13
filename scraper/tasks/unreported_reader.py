@@ -161,16 +161,25 @@ def configured() -> bool:
 
 
 class ReaderError(RuntimeError):
-    def __init__(self, message: str, *, kind: str = "provider", retry_after_seconds: Optional[float] = None, permanent: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "provider",
+        retry_after_seconds: Optional[float] = None,
+        permanent: bool = False,
+        reader_meta: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.kind = kind
         self.retry_after_seconds = retry_after_seconds
         self.permanent = permanent
+        self.reader_meta = reader_meta or {}
 
 
 class ReaderValidationError(ReaderError):
-    def __init__(self, message: str):
-        super().__init__(message, kind="validation")
+    def __init__(self, message: str, *, reader_meta: Optional[Dict[str, Any]] = None):
+        super().__init__(message, kind="validation", reader_meta=reader_meta)
 
 
 def judgment_chunks(text: str) -> List[str]:
@@ -273,19 +282,29 @@ async def call_reader_model(text: str) -> Dict[str, Any]:
                         "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": wrap_as_data(text)}],
                     },
                 )
+            provider = _provider_name(base)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
             if r.status_code >= 400:
-                raise _reader_http_error(r)
+                err = _reader_http_error(r)
+                err.reader_meta = {"provider": provider, "input_tokens": 0, "output_tokens": 0, "latency_ms": elapsed_ms, "parse_repair_used": False}
+                raise err
             payload = r.json()
             content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            answer, repaired = _parse_answer(content)
             usage = payload.get("usage") or {}
-            answer["_reader_meta"] = {
-                "provider": _provider_name(base),
+            meta = {
+                "provider": provider,
                 "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
-                "latency_ms": int((time.perf_counter() - started) * 1000),
-                "parse_repair_used": repaired,
+                "latency_ms": elapsed_ms,
+                "parse_repair_used": False,
             }
+            try:
+                answer, repaired = _parse_answer(content)
+            except ReaderValidationError as exc:
+                exc.reader_meta = meta
+                raise
+            meta["parse_repair_used"] = repaired
+            answer["_reader_meta"] = meta
             return answer
         except ReaderError as exc:
             last = exc
@@ -557,6 +576,7 @@ async def _record_failure(
     now = datetime.now(timezone.utc)
     kind = exc.kind if isinstance(exc, ReaderError) else "unknown"
     retry_after = now + _failure_delay(exc)
+    meta = exc.reader_meta if isinstance(exc, ReaderError) else {}
     db.add(
         JudgmentReadingVersion(
             judgment_id=judgment_id,
@@ -569,6 +589,10 @@ async def _record_failure(
             error=str(exc)[:2000],
             error_kind=kind,
             attempt_no=attempt_no,
+            input_tokens=int(meta.get("input_tokens") or 0),
+            output_tokens=int(meta.get("output_tokens") or 0),
+            latency_ms=int(meta.get("latency_ms") or 0),
+            parse_repair_used=bool(meta.get("parse_repair_used")),
             started_at=started_at,
             completed_at=now,
             retry_after_at=retry_after,
