@@ -738,7 +738,9 @@ async def read_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> D
                         except Exception:
                             await db.rollback()
                 except Exception as exc:
-                    await db.rollback()
+                    # Model/provider/validation failures have not mutated the DB; do not rollback the caller's
+                    # selection transaction merely to record an attempt. A rollback here expires ORM rows and can
+                    # trigger async implicit I/O (MissingGreenlet) in callers.
                     failed += 1
                     logger.warning("reading agent: %s failed [%s]: %s", citation, getattr(exc, "kind", "unknown"), str(exc)[:300])
                     try:
