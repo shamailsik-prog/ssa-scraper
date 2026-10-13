@@ -50,6 +50,7 @@
         <label>Source <input id="source" placeholder="PakistanLawSite"></label>
         <label>Section <select id="section" onchange="loadList(0)"><option value="">all judgments</option><option value="reported">reported</option><option value="unreported">unreported</option></select></label>
         <label>Proceeding <select id="ptype" onchange="loadList(0)"><option value="">any</option></select></label>
+        <label>Subject <select id="subject" onchange="loadList(0)"><option value="">any</option></select></label>
         <button class="primary" onclick="loadList(0)">Search</button>
         <span id="meta" class="note"></span>
       </div>
@@ -183,7 +184,9 @@ let PTYPES={};
 async function loadPtypes(){
   try{const d=await get('/admin/corpus/unreported');PTYPES={};let o='<option value="">any</option>';
     for(const p of d.proceeding_types||[]){PTYPES[p.key]=p.label;o+='<option value="'+esc(p.key)+'">'+esc(p.label)+' ('+p.count+')</option>'}
-    const cur=$('ptype').value;$('ptype').innerHTML=o;$('ptype').value=cur}catch(e){}
+    const cur=$('ptype').value;$('ptype').innerHTML=o;$('ptype').value=cur;
+    let so='<option value="">any</option>';for(const x of d.subjects||[])so+='<option value="'+esc(x.subject)+'">'+esc(x.subject)+' ('+x.count+')</option>';
+    const cs=$('subject').value;$('subject').innerHTML=so;$('subject').value=cs}catch(e){}
 }
 async function loadList(n){
   offset=typeof n==='number'?n:offset;
@@ -192,7 +195,7 @@ async function loadList(n){
   if(q)u+='&q='+encodeURIComponent(q);
   if(src&&k!=='citations')u+='&source='+encodeURIComponent(src);
   if(k==='statutes')u+='&with_sections_only=false';
-  if(k==='judgments'){const sec=$('section').value,pt=$('ptype').value;if(sec)u+='&section='+sec;if(pt)u+='&proceeding_type='+encodeURIComponent(pt)}
+  if(k==='judgments'){const sec=$('section').value,pt=$('ptype').value;if(sec)u+='&section='+sec;if(pt)u+='&proceeding_type='+encodeURIComponent(pt);const sj=$('subject').value;if(sj)u+='&subject='+encodeURIComponent(sj)}
   try{
     const d=await get(u);
     $('meta').textContent='showing '+(d.items||[]).length+' of '+d.total+' (offset '+d.offset+')';
@@ -209,11 +212,22 @@ async function loadList(n){
     $('list').innerHTML=html;
   }catch(e){$('meta').textContent='error: '+e.message}
 }
+function readingText(r){
+  if(!r)return '';
+  const L=[];L.push('MACHINE READING (reading agent, '+(r.model||'')+'): not a headnote. Check every point against the judgment below.');
+  if(r.subjects&&r.subjects.length)L.push('Subjects: '+r.subjects.join('; '));
+  if(r.outcome)L.push('Outcome: '+r.outcome);
+  for(const l of r.laws||[])L.push('Law: '+(l.statute||'')+((l.sections||[]).length?' s. '+l.sections.join(', '):'')+'  ["'+(l.quote||'')+'"]');
+  for(const p of r.points||[])L.push('Point: '+(p.point||'')+' -> '+(p.decision||'')+'  ["'+(p.quote||'')+'"]');
+  if(r.interpretation)L.push('Interpretation: '+r.interpretation);
+  if(r.turns_on)L.push('Turns on: '+r.turns_on);
+  return L.join('\n')+'\n\n----- JUDGMENT -----\n\n';
+}
 async function openDetail(k,id){
   try{
     const d=await get('/admin/corpus/'+encodeURIComponent(k)+'/'+encodeURIComponent(id));
     if(k==='citations'){$('detailMeta').textContent=d.citation_string+' · judgment '+(d.judgment?.citation||'')+' · '+(d.judgment?.body_length||0)+' chars';$('detail').textContent=d.judgment?.full_text||'(no full_text saved)'}
-    else if(k==='judgments'){$('detailMeta').textContent=(d.unreported?'UNREPORTED · '+(d.case_number||d.citation)+(d.decision_date?' · decided '+d.decision_date:'')+(d.proceeding_type?' · '+(PTYPES[d.proceeding_type]||d.proceeding_type):''):(d.citation||''))+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=d.full_text||'(no full_text saved)'}
+    else if(k==='judgments'){const rd=readingText(d.reading);$('detailMeta').textContent=(d.unreported?'UNREPORTED · '+(d.case_number||d.citation)+(d.decision_date?' · decided '+d.decision_date:'')+(d.proceeding_type?' · '+(PTYPES[d.proceeding_type]||d.proceeding_type):''):(d.citation||''))+' · '+(d.title||'')+' · '+(d.body_length||0)+' chars';$('detail').textContent=rd+(d.full_text||'(no full_text saved)')}
     else{$('detailMeta').textContent=(d.name||'')+' · '+d.section_count+' sections ('+d.sections_with_text+' with text)';$('detail').textContent=(d.sections||[]).map(s=>'§ '+s.section_number+' '+(s.section_title||'')+' ['+s.body_length+' chars]\n'+(s.section_text||'(empty)')).join('\n\n---\n\n')||'(no sections)'}
   }catch(e){$('detailMeta').textContent='error: '+e.message}
 }
