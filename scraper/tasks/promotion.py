@@ -1991,7 +1991,9 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
             await _quarantine(db, st, st.quarantine_reason or "below threshold", "judgment")
             counts["quarantined"] += 1
         await db.commit()
-        counts["released_unreported"] = await release_unreported(db)
+        released = await release_unreported(db)
+        if released:
+            counts["released_unreported"] = released
         await db.commit()
         rows = await _pending_judgment_staging(db, limit=limit, source_name=source_name)
         for st in rows:
