@@ -157,7 +157,11 @@ def model_name() -> str:
 def configured() -> bool:
     if not model_name():
         return False
-    return bool(settings.READER_BASE_URL or settings.READER_API_KEY.get_secret_value() or settings.OPENAI_API_KEY)
+    reader_key = settings.READER_API_KEY.get_secret_value()
+    openai_key = settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else ""
+    if settings.READER_BASE_URL:
+        return bool(reader_key)
+    return bool(reader_key or openai_key)
 
 
 class ReaderError(RuntimeError):
