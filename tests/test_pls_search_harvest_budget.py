@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from scraper.config import search_harvest_tick_expiry, settings
+from scraper.config import settings
 from scraper.models import PlsSearchHarvestQuery
 from scraper.tasks import pls_search_harvest as harvest
 
@@ -118,11 +118,20 @@ async def test_tick_stopped_mid_page_resumes_at_the_next_row_without_double_coun
     await db.rollback()
 
 
-def test_queued_ticks_expire_after_about_one_tick(monkeypatch):
+def test_harvest_ticks_never_expire_and_run_one_per_slot(monkeypatch):
+    """Handbook R3.7 (13 October 2026): an expiring harvest tick queued behind a long job was revoked before it
+    ran. Each slot has its own beat entry, with no expiry; the per-slot lock drops a duplicate tick instead."""
+    from scraper.tasks.celery_app import search_harvest_beat_entries
+
+    entries = search_harvest_beat_entries()
+    assert {name: e["kwargs"] for name, e in entries.items()} == {"pls-search-harvest": {"slot": 1}, "pls-search-harvest-s2": {"slot": 2}}
+    assert all("expires" not in (e.get("options") or {}) for e in entries.values())
+    # the beat restarts a skipped slot at least once per tick budget
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_SCHEDULE_SECONDS", 3600)
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 1200)
-    assert search_harvest_tick_expiry() == 1200
+    assert {e["schedule"] for e in search_harvest_beat_entries().values()} == {1200}
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
-    assert search_harvest_tick_expiry() == 3600
+    assert {e["schedule"] for e in search_harvest_beat_entries().values()} == {3600}
 
 
 async def test_cursor_and_staged_rows_are_saved_after_every_row_and_survive_a_killed_tick(db, monkeypatch):
