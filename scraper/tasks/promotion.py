@@ -1916,19 +1916,36 @@ def _pending_statute_staging_query(*, limit: int, source_name: Optional[str] = N
     return query.limit(max(1, int(limit)))
 
 
+NO_CITATION = "no citation supported by source"
+
+
 async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> int:
     """Judgments held as "no citation supported by source" from a court's own website go back to
     `extracted`, so this run promotes them as unreported judgments; their review items are closed. One that
     still cannot enter (no court, too little text) is held again with that reason, so it is never retried
     in a loop."""
     if not settings.UNREPORTED_JUDGMENTS:
+        logger.info("unreported release: switched off (UNREPORTED_JUDGMENTS=false)")
         return 0
     held = (
         await db.execute(
             select(ScraperStaging)
             .where(
                 ScraperStaging.status == "quarantined",
-                ScraperStaging.quarantine_reason == "no citation supported by source",
+                # older rows carry the reason only on their review item, not on the staging row itself
+                or_(
+                    ScraperStaging.quarantine_reason == NO_CITATION,
+                    and_(
+                        ScraperStaging.quarantine_reason.is_(None),
+                        exists(
+                            select(QuarantineQueue.id).where(
+                                QuarantineQueue.staging_id == ScraperStaging.id,
+                                QuarantineQueue.reviewed.is_(False),
+                                QuarantineQueue.reason == NO_CITATION,
+                            )
+                        ),
+                    ),
+                ),
                 ScraperStaging.promoted_to_id.is_(None),
                 ScraperStaging.source_name != "PakistanLawSite",
             )
@@ -1956,6 +1973,7 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
             item.resolution = "released_unreported"
             item.resolution_notes = "no law report cites it: promoted as an unreported judgment"
     await db.flush()
+    logger.info("unreported release: %d held without a citation looked at, %d released for promotion, %d kept held", len(held), released, len(held) - released)
     return released
 
 

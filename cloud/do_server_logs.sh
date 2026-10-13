@@ -116,6 +116,11 @@ SELECT s.source_name, count(*) AS statutes,
 \\echo == staging backlog
 SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging GROUP BY 1, 2, 3
  UNION ALL SELECT 'statutes', source_name, status, count(*) FROM statutes_staging GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+\\echo == unreported section: judgments by court and kind of proceeding
+SELECT court_name, coalesce(proceeding_type, '?') AS proceeding, count(*) FROM judgment WHERE unreported GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30;
+\\echo == court-website judgments still held without a citation (reason on the staging row)
+SELECT source_name, left(coalesce(quarantine_reason, '(none on the staging row)'), 70) AS reason, count(*) FROM scraper_staging
+ WHERE status = 'quarantined' AND source_name <> 'PakistanLawSite' AND promoted_to_id IS NULL GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 15;
 \\echo == why records are held for review (unreviewed, top reasons per source)
 SELECT source_name, kind, coalesce(details->>'reason_code', left(reason, 70)) AS reason, count(*) FROM quarantine_queue
  WHERE NOT reviewed GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 25;

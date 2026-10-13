@@ -174,3 +174,12 @@ async def test_an_unreported_judgment_that_later_gets_its_citation_takes_it(db, 
     assert j.canonical_citation == "2024 SCMR 77" and j.unreported is False and j.reporter == "SCMR"
     aliases = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == j.id))).scalars().all()}
     assert old_identity in aliases and "2024 SCMR 77" in aliases
+
+
+async def test_an_older_hold_recorded_only_on_its_review_item_is_released(db, source):
+    """Rows held before the reason was copied onto the staging row carry it only on the review item."""
+    st = await _held(db, source)
+    st.quarantine_reason = None
+    await db.commit()
+    assert await release_unreported(db) == 1
+    assert await promote_judgment_staging(db, st) == "promoted"
