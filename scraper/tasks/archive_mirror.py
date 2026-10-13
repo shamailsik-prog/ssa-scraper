@@ -47,10 +47,11 @@ async def mirror_pending(limit: int = 200) -> Dict[str, Any]:
                 result["statutes"] = statutes
                 result["instruments"] = instruments
                 result["out_of_time"] = mirror.out_of_time
+                result["more_pending"] = mirror.more_pending
         finally:
             await lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": MIRROR_LOCK_KEY})
-    if result["out_of_time"]:
-        request_mirror()  # more is pending: carry on in the next slice
+    if result["out_of_time"] or result["more_pending"]:
+        request_mirror()  # more is pending: carry on in the next slice now, not at the next Beat pass
     return result
 
 
