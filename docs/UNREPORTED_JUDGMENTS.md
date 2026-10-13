@@ -54,7 +54,7 @@ A failed re-read therefore never destroys or hides the last good reading. All of
 the viewer labels it so and it is never a substitute for reading the judgment.
 
 **Switching it on.** Set `READER_MODEL` (or `TREATMENT_MODEL`) and an API key (`OPENAI_API_KEY`, or
-`READER_BASE_URL` + `READER_API_KEY` for any OpenAI-compatible endpoint) in `/opt/ssa-scraper/.env`, then
+`READER_BASE_URL` + `READER_API_KEY` for an OpenAI Chat-Completions-compatible endpoint that supports JSON-object response mode) in `/opt/ssa-scraper/.env`, then
 restart, or run the deploy-cloud workflow with `reader_model` set (it writes `READER_MODEL` and restarts; `off`
 stops it, even where TREATMENT_MODEL is set). Concurrent workers are safe: each judgment is protected by its own
 PostgreSQL advisory lock, so different judgments can be read in parallel without duplicate model spend. Failures are
