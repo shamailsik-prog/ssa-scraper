@@ -183,3 +183,46 @@ async def test_an_older_hold_recorded_only_on_its_review_item_is_released(db, so
     await db.commit()
     assert await release_unreported(db) == 1
     assert await promote_judgment_staging(db, st) == "promoted"
+
+
+async def test_the_court_is_the_websites_not_a_court_the_text_names(db, source):
+    """A Sindh High Court order that discusses a Supreme Court precedent is still a Sindh High Court order."""
+    st = await _held(db, source)
+    st.source_name = "SindhHighCourt"
+    st.reconciled_json = {**(st.reconciled_json or {}), "court": "Supreme Court of Pakistan", "court_canonical": "Supreme Court of Pakistan"}
+    await db.commit()
+    assert await release_unreported(db) == 1
+    assert await promote_judgment_staging(db, st) == "promoted"
+    j = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().one()
+    assert j.court_name == "High Court of Sindh" and j.canonical_citation.startswith("UNREPORTED SHC ")
+
+
+async def test_a_judgment_held_for_an_unknown_court_is_released_when_its_website_names_the_court(db, source):
+    st = await _held(db, source)
+    st.source_name = "SupremeAppellateCourtGB"
+    st.quarantine_reason = "no citation supported by source (not taken as unreported: court unknown)"
+    st.reconciled_json = {k: v for k, v in (st.reconciled_json or {}).items() if k not in ("court", "court_canonical")}
+    await db.commit()
+    assert await release_unreported(db) == 1
+    assert await promote_judgment_staging(db, st) == "promoted"
+    j = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().one()
+    assert j.court_name == "Supreme Appellate Court Gilgit-Baltistan"
+
+
+async def test_migration_015_refiles_earlier_unreported_judgments_under_their_websites_court(db):
+    import importlib
+
+    from scraper.database import engine
+    from scraper.models import Court
+
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    db.add(Judgment(canonical_citation="UNREPORTED SHC C.P. No. D-1 of 2024 (2024-01-02)", full_text_hash="7" * 64, full_text=BODY, court_id=sc.id, court_name=sc.name, source_name="SindhHighCourt", unreported=True))
+    db.add(Judgment(canonical_citation="PLD 2020 SC 9", full_text_hash="6" * 64, full_text=BODY, court_id=sc.id, court_name=sc.name, source_name="SindhHighCourt", reporter="PLD"))
+    await db.commit()
+    mig = importlib.import_module("migrations.015_unreported_court_from_source")
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    db.expire_all()
+    rows = {j.canonical_citation: j.court_name for j in (await db.execute(select(Judgment))).scalars().all()}
+    assert rows["UNREPORTED SHC C.P. No. D-1 of 2024 (2024-01-02)"] == "High Court of Sindh"
+    assert rows["PLD 2020 SC 9"] == "Supreme Court of Pakistan"  # a reported judgment is never touched
