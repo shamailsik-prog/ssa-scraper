@@ -10,6 +10,7 @@
 #   DO_SIZE          e.g. s-2vcpu-4gb, s-4vcpu-8gb                                default s-2vcpu-4gb
 #   DROPLET_NAME     default ssa-corpus (the free-sites server is a second droplet, e.g. ssa-corpus-public)
 #   DEPLOY_ROLE      all | pls | public: what the server harvests (scraper/deploy_role.py); blank = unchanged
+#   READER_MODEL_CHOICE  model for the reading agent over unreported judgments; off = stop it; blank/keep = unchanged
 #   DOMAIN           DNS name pointing at the server (optional)
 #   REPORTERS, EARLIEST_YEAR, DEPLOY_REGION_LABEL   firm values passed to the installer
 #   SGAI_API_KEY     optional; written to .env on the server over stdin, never printed
@@ -123,6 +124,14 @@ if [ -n "${SGAI_API_KEY:-}" ]; then
   log "Storing the ScrapeGraph key in the server's .env"
   printf '%s' "$SGAI_API_KEY" | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py SGAI_API_KEY >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1'
 fi
+
+case "${READER_MODEL_CHOICE:-keep}" in
+  keep|"") ;;
+  off) log "Turning the reading agent off"; printf '' | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py READER_MODEL >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1';;
+  *) [[ "$READER_MODEL_CHOICE" =~ ^[A-Za-z0-9._:-]+$ ]] || die "reader model name not recognised: $READER_MODEL_CHOICE"
+     log "Setting the reading agent's model to $READER_MODEL_CHOICE"
+     printf '%s' "$READER_MODEL_CHOICE" | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py READER_MODEL >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1';;
+esac
 
 # ---------------------------------------------------------------- result
 ADMIN_KEY="$(ssh "${SSH_OPTS[@]}" "root@$IP" "grep '^ADMIN_API_KEY=' /opt/ssa-scraper/.env | cut -d= -f2-")"

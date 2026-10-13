@@ -33,9 +33,32 @@ own section.
 - **Drive.** `Unreported/<court>/<proceeding>/<year>/<identity>/`.
 - **Record format.** `unreported` and `proceeding_type` (docs/CORPUS_RECORD_FORMAT.md).
 
-## Next: the reading agent (planned)
+## The reading agent
 
-A background agent reads each unreported judgment and records, with the paragraph it relies on:
-the law and sections applied, the legal point decided, the interpretation adopted, and the ground
-the decision turns on. Its tags are machine readings, marked as such in the viewer and always shown
-beside the judgment text; they are never a substitute for reading the judgment.
+A background task (`scraper/tasks/unreported_reader.py`, every `READER_SCHEDULE_SECONDS`, 600 s, up to
+`READER_BATCH`, 20, judgments a run) reads each unreported judgment once and records:
+
+- **Laws**: each statute and section the court applies or interprets, with the words of the judgment that show it.
+- **Points**: each point decided and how, with the words of the judgment that show it.
+- **Interpretation**: the reading of the law the court adopts, in a sentence or two.
+- **Turns on**: what the decision rests on.
+- **Subjects**: two to five subject headings (e.g. "Bail - further inquiry"), and the **outcome**.
+
+Guard against invention: a law or point whose quoted words are not found in the judgment is dropped
+(kept aside in `dropped`, never shown as a finding). Interpretation and "turns on" are one-line summaries.
+All of it is a **machine reading**: the viewer labels it so, shows it above the full judgment, and it is
+never a substitute for reading the judgment.
+
+**Switching it on.** Set `READER_MODEL` (or `TREATMENT_MODEL`) and an API key (`OPENAI_API_KEY`, or
+`READER_BASE_URL` + `READER_API_KEY` for any OpenAI-compatible endpoint) in `/opt/ssa-scraper/.env`, then
+restart, or run the deploy-cloud workflow with `reader_model` set (it writes `READER_MODEL` and restarts; `off`
+stops it). Without them the agent does nothing and the dashboard lists `READER_MODEL` under "Not configured".
+Only public judgments are sent (the unreported section is court websites); PakistanLawSite text never is.
+
+**Cost.** Up to `READER_MAX_CHARS` (24,000) characters of each judgment are sent (the opening and the
+closing part of a long one), about 6,000 tokens. Twelve thousand judgments are roughly 75 million input
+tokens; the price depends on the model chosen. At 20 a run every 10 minutes the agent reads about 2,900
+judgments a day.
+
+**Viewer.** Corpus viewer → judgments → Section *unreported*: the **Subject** filter lists the headings the
+agent has assigned, with counts; opening a judgment shows the reading above the text.

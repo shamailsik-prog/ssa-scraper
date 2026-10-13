@@ -31,6 +31,22 @@ COURT_ABBR = {
     "GBChiefCourt": "GBCC",
 }
 
+# The court a court's own website publishes, by source name (short codes of the court directory). The
+# court of an unreported judgment comes from here, never from its text: a Sindh High Court order that
+# discusses a Supreme Court precedent is still a Sindh High Court order.
+SOURCE_COURT_CODE = {
+    "SupremeCourt": "SC",
+    "FederalShariatCourt": "FSC",
+    "IslamabadHighCourt": "IHC",
+    "LahoreHighCourt": "LHC",
+    "SindhHighCourt": "SHC",
+    "PeshawarHighCourt": "PHC",
+    "BalochistanHighCourt": "BHC",
+    "AJKSupremeCourt": "AJK-SC",
+    "AJKHighCourt": "AJK-HC",
+    "SupremeAppellateCourtGB": "SAC-GB",
+}
+
 PROCEEDING_LABELS = {
     "bail": "Bail",
     "habeas_corpus": "Habeas corpus",

@@ -52,6 +52,7 @@ SECRET_FIELD_NAMES = (
     "ARCHIVE_DROPBOX_TOKEN",
     "ARCHIVE_ONEDRIVE_TOKEN",
     "LOCAL_TREATMENT_API_KEY",
+    "READER_API_KEY",
 )
 
 
@@ -202,6 +203,13 @@ class Settings(BaseSettings):
     )
     UNREPORTED_MIN_TEXT_CHARS: int = Field(default=400, description="An unreported judgment needs at least this much text; shorter captures (cause lists, stubs) stay held.")
     UNREPORTED_RELEASE_BATCH: int = Field(default=500, description="Held 'no citation' judgments released for promotion as unreported per promotion run.")
+    READER_MODEL: str = Field(default="", description="Model the reading agent uses on unreported judgments (OpenAI-compatible chat API). Blank = TREATMENT_MODEL; both blank = the agent does nothing.")
+    READER_BASE_URL: str = Field(default="", description="OpenAI-compatible endpoint for the reading agent. Blank = https://api.openai.com/v1 with OPENAI_API_KEY.")
+    READER_API_KEY: SecretStr = Field(default=SecretStr(""), description="Key for READER_BASE_URL. Blank = OPENAI_API_KEY.")
+    READER_BATCH: int = Field(default=20, description="Unreported judgments the reading agent reads per run.")
+    READER_SCHEDULE_SECONDS: int = Field(default=600, description="How often the reading agent runs.")
+    READER_MAX_CHARS: int = Field(default=24000, description="Judgment text sent to the model: the opening and the closing part when longer.")
+    READER_RETRY_HOURS: float = Field(default=24.0, description="A failed reading is tried again after this long.")
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",
@@ -726,6 +734,8 @@ class Settings(BaseSettings):
             missing.append("SGAI_PUBLIC_TEST_URL")
         if not self.OPENAI_API_KEY:
             missing.append("OPENAI_API_KEY")
+        if not (self.READER_MODEL or self.TREATMENT_MODEL):
+            missing.append("READER_MODEL (the reading agent for unreported judgments)")
         return missing
 
     def model_dump_safe(self) -> Dict[str, Any]:
