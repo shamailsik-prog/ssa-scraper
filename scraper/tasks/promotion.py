@@ -1916,6 +1916,9 @@ def _pending_statute_staging_query(*, limit: int, source_name: Optional[str] = N
     return query.limit(max(1, int(limit)))
 
 
+NO_CITATION = "no citation supported by source"
+
+
 async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> int:
     """Judgments held as "no citation supported by source" from a court's own website go back to
     `extracted`, so this run promotes them as unreported judgments; their review items are closed. One that
@@ -1928,7 +1931,20 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
             select(ScraperStaging)
             .where(
                 ScraperStaging.status == "quarantined",
-                ScraperStaging.quarantine_reason == "no citation supported by source",
+                # older rows carry the reason only on their review item, not on the staging row itself
+                or_(
+                    ScraperStaging.quarantine_reason == NO_CITATION,
+                    and_(
+                        ScraperStaging.quarantine_reason.is_(None),
+                        exists(
+                            select(QuarantineQueue.id).where(
+                                QuarantineQueue.staging_id == ScraperStaging.id,
+                                QuarantineQueue.reviewed.is_(False),
+                                QuarantineQueue.reason == NO_CITATION,
+                            )
+                        ),
+                    ),
+                ),
                 ScraperStaging.promoted_to_id.is_(None),
                 ScraperStaging.source_name != "PakistanLawSite",
             )
