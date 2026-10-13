@@ -58,6 +58,7 @@ from scraper.parsers.bench_parser import normalise_judge_name
 from scraper.parsers.case_metadata import parse_case_metadata
 from scraper.parsers.citation_extractor import canonicalise_statute_name, extract_citations, normalise_citation
 from scraper.parsers.statute_parser import is_short_title_clause, looks_like_fragment_name
+from scraper.unreported import find_case_number, proceeding_type, unreported_identity
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,15 @@ def pls_own_citation(grid_citation: Optional[str], page_citations: List[str]) ->
             if len(parts) >= 4 and parts[0] == "PLD" and parts[1] == year and parts[-1].upper() == page:
                 return c
     return own
+
+
+def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[str, Any]) -> Optional[str]:
+    """Why a judgment without a citation cannot enter as unreported (None when it can)."""
+    if court is None and not (data.get("court_canonical") or data.get("court")):
+        return "court unknown"
+    if len((full_text or "").strip()) < int(settings.UNREPORTED_MIN_TEXT_CHARS or 0):
+        return "text too short for a judgment"
+    return None
 
 
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
@@ -221,7 +231,11 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         return "quarantined"
     cits = [normalise_citation(c) for c in (data.get("citations") or []) if c]
     cits = [c for c in dict.fromkeys(cits) if c]
-    if not cits:
+    # A judgment from a court's own website that no law report cites is an unreported judgment: it enters
+    # the corpus identified by court, case number and date (scraper/unreported.py). PakistanLawSite only
+    # publishes reported judgments, so one without a citation there is still a bad capture.
+    unreported = not cits and bool(settings.UNREPORTED_JUDGMENTS) and st.source_name != "PakistanLawSite"
+    if not cits and not unreported:
         await _quarantine(db, st, "no citation supported by source", "judgment")
         return "quarantined"
     if st.source_name == "PakistanLawSite":
@@ -240,12 +254,27 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     if st.raw_text_hash and text_hash != st.raw_text_hash:
         await _quarantine(db, st, "full_text hash changed between staging and promotion", "judgment")
         return "quarantined"
-    canonical = cits[0]
     prov = (await db.execute(select(SourceProvenance).where(SourceProvenance.id == st.provenance_id))).scalars().first()
     court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
     dd = data.get("decision_date")
     decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
-    parts = _parse_citation_parts(canonical)
+    case_number = proceeding = None
+    if unreported:
+        held = _unreported_hold_reason(full_text, court, data)
+        if held:
+            await _quarantine(db, st, f"unreported judgment held: {held}", "judgment")
+            return "quarantined"
+        case_number = find_case_number(full_text, st.route_json)
+        proceeding = proceeding_type(case_number, full_text)
+        canonical = unreported_identity(st.source_name, case_number, decision_date, text_hash)
+        clash = (await db.execute(select(Judgment).where(Judgment.canonical_citation == canonical))).scalars().first()
+        if clash is not None and clash.full_text_hash != text_hash:
+            # another order in the same case on the same day: a different judgment, so its own identity
+            canonical = f"{canonical[:186]} #{text_hash[:12]}"
+        parts = {"reporter": None, "year": None, "page": None, "court": None}
+    else:
+        canonical = cits[0]
+        parts = _parse_citation_parts(canonical)
     # dedupe by identity and by content
     existing = (await db.execute(select(Judgment).where((Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)))).scalars().first()
     if existing is None:
@@ -353,6 +382,19 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             if st.route_json and st.route_json not in routes:
                 routes.append(st.route_json)
                 prov.routes = routes
+        if getattr(existing, "unreported", False) and cits and existing.full_text_hash == text_hash:
+            # the same judgment, entered as unreported, now arrives with a citation of its own: it takes that
+            # citation as its identity; the unreported identity stays as an alias, so earlier links still resolve
+            taken = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
+            if taken is None and (await db.execute(select(Judgment.id).where(Judgment.canonical_citation == canonical))).first() is None:
+                db.add(Citation(judgment_id=existing.id, citation_string=existing.canonical_citation[:200], raw_string=existing.canonical_citation, is_primary=False, source_evidence="unreported identity before a citation was known"))
+                cparts = _parse_citation_parts(canonical)
+                existing.canonical_citation = canonical
+                existing.unreported = False
+                existing.reporter, existing.page_number = cparts["reporter"], cparts["page"]
+                existing.year = existing.year or cparts["year"]
+                db.add(Citation(judgment_id=existing.id, citation_string=canonical, raw_string=canonical, reporter=cparts["reporter"], year=cparts["year"], page=cparts["page"], is_primary=True, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
+                await db.flush()
         # alternate citations learned from another route
         known = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == existing.id))).scalars().all()}
         for c in cits:
@@ -366,7 +408,9 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         return "duplicate"
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     j = Judgment(
-        docket_number=meta.docket_number if meta else None,
+        docket_number=meta.docket_number if meta else case_number,
+        unreported=unreported,
+        proceeding_type=proceeding,
         petitioner=meta.petitioner if meta else None,
         respondent=meta.respondent if meta else None,
         canonical_citation=canonical,
@@ -377,7 +421,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         bench_size=data.get("bench_size"),
         bench_type=data.get("bench_type"),
         decision_date=decision_date,
-        year=data.get("year") or parts["year"],
+        year=data.get("year") or parts["year"] or (decision_date.year if decision_date else None),
         reporter=parts["reporter"],
         page_number=parts["page"],
         full_text=full_text,
@@ -1872,6 +1916,49 @@ def _pending_statute_staging_query(*, limit: int, source_name: Optional[str] = N
     return query.limit(max(1, int(limit)))
 
 
+async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> int:
+    """Judgments held as "no citation supported by source" from a court's own website go back to
+    `extracted`, so this run promotes them as unreported judgments; their review items are closed. One that
+    still cannot enter (no court, too little text) is held again with that reason, so it is never retried
+    in a loop."""
+    if not settings.UNREPORTED_JUDGMENTS:
+        return 0
+    held = (
+        await db.execute(
+            select(ScraperStaging)
+            .where(
+                ScraperStaging.status == "quarantined",
+                ScraperStaging.quarantine_reason == "no citation supported by source",
+                ScraperStaging.promoted_to_id.is_(None),
+                ScraperStaging.source_name != "PakistanLawSite",
+            )
+            .order_by(ScraperStaging.created_at)
+            .limit(int(limit or settings.UNREPORTED_RELEASE_BATCH))
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    released = 0
+    for st in held:
+        data = st.reconciled_json or {}
+        why = _unreported_hold_reason(strip_leading_judgment_chrome(st.raw_text or ""), None, data)
+        items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
+        if why:
+            # not a judgment that can stand as unreported: it stays held, says why, and is not picked again
+            st.quarantine_reason = f"no citation supported by source (not taken as unreported: {why})"
+            for item in items:
+                item.reason = st.quarantine_reason
+            continue
+        st.status = "extracted"
+        st.quarantine_reason = None
+        released += 1
+        for item in items:
+            item.reviewed, item.reviewed_by, item.reviewed_at = True, "system", now
+            item.resolution = "released_unreported"
+            item.resolution_notes = "no law report cites it: promoted as an unreported judgment"
+    await db.flush()
+    return released
+
+
 async def promote_staging_records(limit: int = 200, *, source_name: Optional[str] = None) -> Dict[str, int]:
     """Promote every `extracted` staging row (bounded per pass) and make sure every `quarantined` row
     has a review-queue entry.
@@ -1903,6 +1990,10 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
         for st in unqueued:
             await _quarantine(db, st, st.quarantine_reason or "below threshold", "judgment")
             counts["quarantined"] += 1
+        await db.commit()
+        released = await release_unreported(db)
+        if released:
+            counts["released_unreported"] = released
         await db.commit()
         rows = await _pending_judgment_staging(db, limit=limit, source_name=source_name)
         for st in rows:

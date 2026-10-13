@@ -10,7 +10,8 @@ The code that builds and checks the format is `scraper/corpus_record.py`.
 
 ```
 Citations/<reporter>/<year>/<citation>/       reported judgments (PLD, SCMR, YLR ...)
-Unreported/<court>/<year>/<citation>/         unreported judgments from court websites
+Unreported/<court>/<proceeding>/<year>/<id>/  unreported judgments, by kind of proceeding
+Unreported/<court>/<year>/<citation>/         court-website judgments written before that
 
     original.pdf        the genuine PDF from the source, byte for byte
       or
@@ -34,6 +35,7 @@ Exactly one of `original.pdf` / `rendered_copy.pdf` is present. The record's `fi
 | `decision_date`, `year` | Date of decision (`YYYY-MM-DD`) and year (1947–2100) |
 | `reported`, `reporter`, `volume`, `page_number` | Whether it is a reported judgment, and where it is reported |
 | `docket_number` | Case number, e.g. `C.P. 1/2024` |
+| `unreported`, `proceeding_type` | `true` for a judgment from a court's website that no law report cites (its `canonical_citation` is then `UNREPORTED <court> <case no> (<date>)`), and the kind of proceeding: `bail`, `constitutional_petition`, `civil_suit`, `civil_appeal`, `criminal_appeal`, ... (`scraper/unreported.py`). Optional: older files lack them. |
 | `language` | `en` or `ur` |
 | `source_name`, `source_url`, `access_method` | Where it came from; `public` or `login_session` |
 | `full_text_sha256_canonical` | Fingerprint of the text, so duplicates and changes are detectable |

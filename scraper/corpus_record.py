@@ -102,6 +102,9 @@ def judgment_record(j: Any, *, has_original_pdf: bool) -> Dict[str, Any]:
         "language": j.language,
         "needs_ocr": text_is_thin(j.full_text),
         "collected_at": _iso(j.promoted_at),
+        # added in version 1 without breaking it (optional keys): the unreported section
+        "unreported": bool(getattr(j, "unreported", False)),
+        "proceeding_type": getattr(j, "proceeding_type", None),
         "files": {
             "document": "original.pdf" if has_original_pdf else "rendered_copy.pdf",
             "text": "judgment.txt",
