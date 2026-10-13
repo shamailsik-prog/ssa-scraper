@@ -80,3 +80,58 @@ def test_auto_deploy_pins_the_three_minute_wait_in_env(tmp_path):
         "LOGIN_RECOVERY_COOLDOWN_MINUTES=3",
         "LOGIN_RECOVERY_SCHEDULE_SECONDS=60",
     ]
+
+
+async def _hold(lock_name, max_holders=1):
+    import redis.asyncio as aioredis
+
+    from scraper.auth.session_manager import SessionLock
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    lock = SessionLock(lock_name, r, max_holders=max_holders)
+    await lock.acquire()
+    return lock
+
+
+async def test_a_logged_out_login_signs_in_while_the_other_login_is_harvesting(db, login_source, monkeypatch):
+    """13 October 2026: slot 1 logged out at 09:13 and its 3-minute re-login was skipped 21 times in a row
+    ("login_session_lock_held"): login 2's back-to-back harvest kept the PakistanLawSite lock taken. Recovery now
+    waits only for its own login's lock."""
+    from tests.test_auth_playwright import _activate
+
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    await mgr.mark_needs_human_login(1, "LoginRequired: login surface URL")
+    await db.commit()
+    shared = await _hold("PakistanLawSite", max_holders=2)  # login 2's harvest
+    other_slot = await _hold("PakistanLawSite:slot2")
+    try:
+        sc = BrowserScript()
+        sc.page(("goto", pls_check_url()), GRID_HTML)
+        t0 = datetime.now(timezone.utc)
+        await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
+        done = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
+        await db.commit()
+        assert done.get("recovered") == "verified"
+        assert (await _slot(db, 1)).state == "ACTIVE"
+    finally:
+        for lock in (shared, other_slot):
+            await lock.release()
+
+
+async def test_recovery_waits_while_its_own_login_is_in_use(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", pls_check_url()), GRID_HTML)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
+    own = await _hold("PakistanLawSite:slot1")
+    try:
+        result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
+        assert result == {"skipped": "slot_lock_held"} and sc.log == []  # never a second browser on one login
+    finally:
+        await own.release()
+    # the job that held it may hand its own lock over: a harvest whose login dropped recovers it in place
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=2), browser_factory=sc.factory(), holds_slot_lock=True)
+    assert result.get("recovered") == "verified"

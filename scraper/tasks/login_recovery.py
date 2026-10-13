@@ -299,6 +299,7 @@ async def recover_slot(
     browser_factory: Callable = playwright_browser_factory,
     registry_factory: Callable[[], LoginSessionRegistry] = LoginSessionRegistry,
     redis_client=None,
+    holds_slot_lock: bool = False,
 ) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     source = manager.source
@@ -329,14 +330,17 @@ async def recover_slot(
     if next_at is not None and now < next_at:
         return {"waiting_until": record.get("next_attempt_at")}
 
-    # The recovery task runs on the single login-session worker, so it never runs beside a harvest
-    # job; the source lock is still taken so a stale lock or a second worker is respected.
-    source_lock = SessionLock(source.source_name, redis_client)
-    try:
-        await source_lock.acquire()
-    except SessionLockHeld:
-        await source_lock.release()  # closes the client the lock opened for itself
-        return {"skipped": "login_session_lock_held"}
+    # Only this login's own lock: two browsers on one login end each other, but the other login's work is no
+    # obstacle. Waiting for the whole PakistanLawSite lock skipped slot 1's re-login 21 times in a row on 13 October
+    # 2026 while login 2's back-to-back harvest held it. A job whose own login dropped already holds this lock
+    # (holds_slot_lock) and recovers it in place.
+    slot_lock = None if holds_slot_lock else SessionLock(f"{source.source_name}:slot{slot.slot_number}", redis_client)
+    if slot_lock is not None:
+        try:
+            await slot_lock.acquire()
+        except SessionLockHeld:
+            await slot_lock.release()  # closes the client the lock opened for itself
+            return {"skipped": "slot_lock_held"}
     try:
         attempts = int(record.get("attempts", 0) or 0) + 1
         outcome: Dict[str, Any] = {"attempt": attempts}
@@ -410,7 +414,8 @@ async def recover_slot(
             )
         return {**outcome, "failed": reason, "next_attempt_at": _iso(next_attempt)}
     finally:
-        await source_lock.release()
+        if slot_lock is not None:
+            await slot_lock.release()
 
 
 async def recover_login_slots_async(
