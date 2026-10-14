@@ -80,3 +80,98 @@ def test_auto_deploy_pins_the_three_minute_wait_in_env(tmp_path):
         "LOGIN_RECOVERY_COOLDOWN_MINUTES=3",
         "LOGIN_RECOVERY_SCHEDULE_SECONDS=60",
     ]
+
+
+async def _hold(lock_name, max_holders=1):
+    import redis.asyncio as aioredis
+
+    from scraper.auth.session_manager import SessionLock
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    lock = SessionLock(lock_name, r, max_holders=max_holders)
+    await lock.acquire()
+    return lock
+
+
+async def test_a_logged_out_login_signs_in_while_the_other_login_is_harvesting(db, login_source, monkeypatch):
+    """13 October 2026: slot 1 logged out at 09:13 and its 3-minute re-login was skipped 21 times in a row
+    ("login_session_lock_held"): login 2's back-to-back harvest kept the PakistanLawSite lock taken. Recovery now
+    waits only for its own login's lock."""
+    from tests.test_auth_playwright import _activate
+
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _activate(db, login_source, slots=(1, 2))
+    await mgr.mark_needs_human_login(1, "LoginRequired: login surface URL")
+    await db.commit()
+    shared = await _hold("PakistanLawSite", max_holders=2)  # login 2's harvest
+    other_slot = await _hold("PakistanLawSite:slot2")
+    try:
+        sc = BrowserScript()
+        sc.page(("goto", pls_check_url()), GRID_HTML)
+        t0 = datetime.now(timezone.utc)
+        await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
+        done = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
+        await db.commit()
+        assert done.get("recovered") == "verified"
+        assert (await _slot(db, 1)).state == "ACTIVE"
+    finally:
+        for lock in (shared, other_slot):
+            await lock.release()
+
+
+async def test_recovery_waits_while_its_own_login_is_in_use(db, login_source, monkeypatch):
+    monkeypatch.setattr(settings, "LOGIN_RECOVERY_COOLDOWN_MINUTES", 0)
+    mgr = await _bounce_slot(db, login_source)
+    t0 = datetime.now(timezone.utc)
+    sc = BrowserScript()
+    sc.page(("goto", pls_check_url()), GRID_HTML)
+    await recover_slot(db, mgr, await _slot(db, 1), now=t0, browser_factory=sc.factory())
+    own = await _hold("PakistanLawSite:slot1")
+    try:
+        result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=1), browser_factory=sc.factory())
+        assert result == {"skipped": "slot_lock_held"} and sc.log == []  # never a second browser on one login
+    finally:
+        await own.release()
+    # the job that held it may hand its own lock over: a harvest whose login dropped recovers it in place
+    result = await recover_slot(db, mgr, await _slot(db, 1), now=t0 + timedelta(seconds=2), browser_factory=sc.factory(), holds_slot_lock=True)
+    assert result.get("recovered") == "verified"
+
+
+def test_the_login_check_has_its_own_worker_so_a_busy_harvest_never_starves_it():
+    """13 October 2026: both login-session processes ran back-to-back harvests, so every minute's login check
+    waited behind them, expired and was thrown away (39 of 39 in 40 minutes; the queue grew past 50). The check
+    now has its own queue and its own one-process worker."""
+    import yaml
+
+    from scraper.tasks.celery_app import app
+
+    assert app.conf.task_routes["scraper.tasks.login_recovery.recover_login_slots"] == {"queue": "login_recovery"}
+    services = yaml.safe_load(Path("docker-compose.yml").read_text(encoding="utf-8"))["services"]
+    command = services["worker-login-recovery"]["command"]
+    assert "-Q login_recovery " in command and "--concurrency=1" in command
+    assert "login_recovery" not in services["worker-scraper"]["command"]  # never behind a harvest again
+    deploy = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    for line in deploy.splitlines():
+        if line.startswith(("DEFAULT_APP_SERVICES=", "ALL_APP_SERVICES=")):
+            assert "worker-login-recovery" in line  # a code change restarts it with the rest
+
+
+def test_auto_deploy_starts_a_newly_added_service_that_has_no_container(tmp_path):
+    """The deploy that pulled worker-login-recovery ran the old script (its service list was read before the
+    pull), so the new worker was never started. Every run now starts an app service that has no container yet,
+    and leaves alone one that exists (stopped or running)."""
+    script = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    start = script.index("start_missing_services() {")
+    func = script[start : script.index("\n}\n", start) + 3]
+    calls = tmp_path / "calls"
+    prog = (
+        'log() { echo "$*"; }\n'
+        "DEFAULT_APP_SERVICES=(api worker-scraper worker-login-recovery)\n"
+        f'docker() {{ if [ "$2" = ps ]; then printf "api\\nworker-scraper\\n"; else echo "$*" >>"{calls}"; fi; }}\n'
+        + func
+        + "start_missing_services\n"
+    )
+    subprocess.run(["bash", "-c", prog], check=True, capture_output=True, text=True)
+    assert calls.read_text(encoding="utf-8").splitlines() == ["compose up -d --no-build worker-login-recovery"]
+    main = script[script.index("main() {") :]
+    assert main.count("start_missing_services") >= 2  # on the nothing-to-do path and after a rollout
