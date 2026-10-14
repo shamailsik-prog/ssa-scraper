@@ -1685,7 +1685,7 @@ class PakistanLawSitePipeline:
             pass
         self.runner.browser = None
         slot = await self.manager.slot(slot_no)
-        outcome = await recover_slot(self.db, self.manager, slot)
+        outcome = await recover_slot(self.db, self.manager, slot, holds_slot_lock=self._slot_lock is not None)
         self.stats.setdefault("login_recovery", []).append({"slot": slot_no, **outcome})
         await self.db.flush()
         if outcome.get("recovered"):
