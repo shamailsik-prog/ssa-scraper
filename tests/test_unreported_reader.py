@@ -53,6 +53,12 @@ def _model_answer():
     return copy.deepcopy(MODEL_ANSWER)
 
 
+def _configure_custom_reader(monkeypatch):
+    """Configure a usable custom OpenAI-compatible reader for tests that exercise read_unreported."""
+    _configure_custom_reader(monkeypatch)
+    monkeypatch.setattr(settings, "READER_API_KEY", SecretStr("test-reader-key"))
+
+
 def test_tags_without_their_words_in_the_judgment_are_dropped():
     kept, dropped = keep_only_evidenced(MODEL_ANSWER, TEXT)
     assert [law["statute"] for law in kept["laws"]] == ["Pakistan Penal Code", "Code of Criminal Procedure"]
@@ -137,8 +143,7 @@ async def test_migration_018_repairs_schema_when_017_was_already_applied(db):
 
 
 async def test_agent_reads_once_and_persists_grounded_current_and_version(db, monkeypatch):
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     calls = []
 
     async def fake_model(text):
@@ -192,8 +197,7 @@ async def test_without_a_model_agent_does_nothing(db, monkeypatch):
 
 
 async def test_failed_first_read_is_versioned_and_not_hot_looped(db, monkeypatch):
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
 
     async def broken(_text):
         raise RuntimeError("model unavailable")
@@ -210,8 +214,7 @@ async def test_failed_first_read_is_versioned_and_not_hot_looped(db, monkeypatch
 
 
 async def test_database_publish_failure_rolls_back_and_records_attempt_without_corrupting_current(db, monkeypatch):
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     (j,) = await _unreported(db)
     jid = j.id
     old = JudgmentReading(
@@ -256,8 +259,7 @@ async def test_database_publish_failure_rolls_back_and_records_attempt_without_c
 
 async def test_failed_upgrade_preserves_last_good_reading(db, monkeypatch):
     """Regression: v2/v3 reclassification failure must never hide or overwrite the prior valid legal reading."""
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     (j,) = await _unreported(db)
     old = JudgmentReading(
         judgment_id=j.id,
@@ -305,8 +307,7 @@ async def test_failed_upgrade_preserves_last_good_reading(db, monkeypatch):
 
 
 async def test_successful_upgrade_keeps_immutable_history_and_switches_current(db, monkeypatch):
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     (j,) = await _unreported(db)
     old = JudgmentReading(
         judgment_id=j.id,
@@ -417,8 +418,7 @@ async def test_ungrounded_interpretation_turns_on_and_outcome_are_refused(monkey
 async def test_model_call_sends_data_reads_json_and_tracks_usage(monkeypatch):
     import json as _json
 
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     monkeypatch.setattr(settings, "READER_HTTP_RETRIES", 0)
     seen = {}
 
@@ -482,8 +482,6 @@ def test_reader_model_off_stops_even_with_treatment_model(monkeypatch):
 
 
 def test_reader_configuration_requires_credential_for_custom_or_openai_endpoint(monkeypatch):
-    from pydantic import SecretStr
-
     monkeypatch.setattr(settings, "READER_MODEL", "test-model")
     monkeypatch.setattr(settings, "TREATMENT_MODEL", "")
     monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
@@ -504,8 +502,7 @@ def test_reader_configuration_requires_credential_for_custom_or_openai_endpoint(
 
 
 async def test_answer_without_a_reading_is_failure(monkeypatch):
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     monkeypatch.setattr(settings, "READER_HTTP_RETRIES", 0)
     real = httpx.AsyncClient
     for response_content in ("", "I cannot help with that.", '{"note": "nothing"}'):
@@ -520,8 +517,7 @@ async def test_per_judgment_lock_allows_parallel_workers_without_duplicate_spend
 
     from scraper.database import engine
 
-    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
-    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
+    _configure_custom_reader(monkeypatch)
     (j,) = await _unreported(db)
     calls = []
 
