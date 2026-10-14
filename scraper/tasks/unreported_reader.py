@@ -435,6 +435,40 @@ def _dedupe_dicts(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> List[Dic
     return out
 
 
+def _consolidate_subjects(answers: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Choose up to three subjects from the whole judgment, not merely the first three chunk outputs.
+
+    Each chunk gets one vote per recognised heading. Headings are ranked by chunk coverage, then by
+    their latest occurrence so a dominant subject appearing throughout/later in a long judgment is
+    not crowded out by an incidental early label. Invalid headings and valid overflow are auditable.
+    """
+    scores: Dict[str, Tuple[int, int]] = {}
+    dropped: List[Dict[str, Any]] = []
+    for chunk_index, answer in enumerate(answers):
+        seen_here = set()
+        raw = answer.get("subjects") or []
+        for item in raw if isinstance(raw, list) else []:
+            heading = _SUBJECT_KEY.get(re.sub(r"[^a-z0-9]", "", str(item).lower()))
+            if heading is None:
+                dropped.append({"kind": "subject", "item": {"subject": _short(item, 120)}, "why": "not one of the fixed subject headings"})
+                continue
+            if heading in seen_here:
+                continue
+            seen_here.add(heading)
+            count, _latest = scores.get(heading, (0, -1))
+            scores[heading] = (count + 1, chunk_index)
+
+    specific = {k: v for k, v in scores.items() if k != "Other"}
+    ranked_source = specific or scores
+    ranked = sorted(ranked_source, key=lambda s: (-ranked_source[s][0], -ranked_source[s][1], SUBJECTS.index(s)))
+    kept = ranked[:3]
+    for heading in ranked[3:]:
+        dropped.append({"kind": "subject", "item": {"subject": heading}, "why": "maximum three subjects exceeded after whole-judgment ranking"})
+    if specific and "Other" in scores:
+        dropped.append({"kind": "subject", "item": {"subject": "Other"}, "why": "more specific fixed subject headings were available"})
+    return kept, dropped
+
+
 async def read_full_judgment(text: str) -> Dict[str, Any]:
     """Read every chunk, deterministically validate evidence against the full judgment, then consolidate."""
     chunks = judgment_chunks(text)
@@ -469,19 +503,19 @@ async def read_full_judgment(text: str) -> Dict[str, Any]:
     turns_on_evidence, d2 = _claim_supported(raw_turns_on, text, kind="turns_on")
     dropped.extend(d1)
     dropped.extend(d2)
-    subjects, subject_dropped = fixed_subjects(raw_subjects)
+    subjects, subject_dropped = _consolidate_subjects(answers)
     dropped.extend(subject_dropped)
     if not subjects:
         raise ReaderValidationError("model subject classification contained no valid fixed heading; Other must be selected explicitly when appropriate")
 
+    # The ultimate disposition should come from the judgment's final chunk only. Earlier chunks may quote
+    # procedural history ("the trial court allowed...") and are evidence-valid but not the present case outcome.
     outcome_evidence = None
-    for answer in reversed(answers):
-        candidate, rejected = _outcome_supported(answer.get("outcome"), text)
+    if answers:
+        candidate, rejected = _outcome_supported(answers[-1].get("outcome"), chunks[-1])
         if rejected:
             dropped.append(rejected)
-        if candidate is not None:
-            outcome_evidence = candidate
-            break
+        outcome_evidence = candidate
 
     interpretation_evidence = _dedupe_dicts(interpretation_evidence, ("statement", "quote"))
     turns_on_evidence = _dedupe_dicts(turns_on_evidence, ("statement", "quote"))
