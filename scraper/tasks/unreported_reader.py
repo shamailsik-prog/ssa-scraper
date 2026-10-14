@@ -508,14 +508,21 @@ async def read_full_judgment(text: str) -> Dict[str, Any]:
     if not subjects:
         raise ReaderValidationError("model subject classification contained no valid fixed heading; Other must be selected explicitly when appropriate")
 
-    # The ultimate disposition should come from the judgment's final chunk only. Earlier chunks may quote
-    # procedural history ("the trial court allowed...") and are evidence-valid but not the present case outcome.
+    # The ultimate disposition must be evidenced near the end of the judgment. Restricting it to the
+    # literal final chunk is too strict because chunk boundaries can leave the dispositive sentence in the
+    # penultimate chunk followed by signatures/annexures. A bounded two-chunk tail excludes early procedural
+    # history while still covering the court's concluding order.
     outcome_evidence = None
     if answers:
-        candidate, rejected = _outcome_supported(answers[-1].get("outcome"), chunks[-1])
-        if rejected:
-            dropped.append(rejected)
-        outcome_evidence = candidate
+        tail_chars = max(2000, int(settings.READER_MAX_CHARS or 24000)) * 2
+        outcome_tail = text[-tail_chars:]
+        for answer in reversed(answers):
+            candidate, rejected = _outcome_supported(answer.get("outcome"), outcome_tail)
+            if rejected:
+                dropped.append(rejected)
+            if candidate is not None:
+                outcome_evidence = candidate
+                break
 
     interpretation_evidence = _dedupe_dicts(interpretation_evidence, ("statement", "quote"))
     turns_on_evidence = _dedupe_dicts(turns_on_evidence, ("statement", "quote"))
