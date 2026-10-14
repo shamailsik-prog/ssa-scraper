@@ -18,18 +18,19 @@ async def upgrade(conn) -> None:
     # Fresh databases already have the uq_judgment_reading_version_attempt constraint from 017.
     # Older databases may have applied the earlier 017 without it. Avoid creating a duplicate unique
     # index on fresh installs while repairing only the missing case.
-    await conn.execute(
-        text(
-            """
-            DO $
-            BEGIN
-                IF to_regclass('public.uq_judgment_reading_version_attempt') IS NULL
-                   AND to_regclass('public.uq_judgment_reading_version_attempt_idx') IS NULL THEN
-                    CREATE UNIQUE INDEX uq_judgment_reading_version_attempt_idx
-                    ON judgment_reading_version (judgment_id, attempt_no);
-                END IF;
-            END
-            $;
-            """
+    existing_unique = (
+        await conn.execute(
+            text(
+                "SELECT to_regclass('public.uq_judgment_reading_version_attempt') IS NOT NULL "
+                "OR to_regclass('public.uq_judgment_reading_version_attempt_idx') IS NOT NULL"
+            )
         )
-    )
+    ).scalar()
+    if not existing_unique:
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_judgment_reading_version_attempt_idx "
+                "ON judgment_reading_version (judgment_id, attempt_no)"
+            )
+        )
+
