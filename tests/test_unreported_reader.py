@@ -401,6 +401,61 @@ async def test_long_judgment_reads_the_middle_instead_of_head_tail_truncation(mo
     assert result["_reader_meta"]["chunk_count"] == len(seen)
 
 
+async def test_subjects_are_ranked_across_chunks_not_first_three_seen(monkeypatch):
+    monkeypatch.setattr(settings, "READER_MAX_CHARS", 2000)
+    monkeypatch.setattr(settings, "READER_CHUNK_OVERLAP_CHARS", 0)
+    text = ("A" * 2200) + ("B" * 2200) + ("C" * 2200)
+    answers = iter(
+        [
+            {"laws": [], "points": [], "interpretation": [], "turns_on": [], "subjects": ["Bail", "Arbitration"], "outcome": None},
+            {"laws": [], "points": [], "interpretation": [], "turns_on": [], "subjects": ["Service law", "Arbitration"], "outcome": None},
+            {"laws": [], "points": [], "interpretation": [], "turns_on": [], "subjects": ["Service law", "Arbitration"], "outcome": None},
+            {"laws": [], "points": [], "interpretation": [], "turns_on": [], "subjects": ["Service law"], "outcome": None},
+        ]
+    )
+
+    async def fake_model(_chunk):
+        return next(answers)
+
+    monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
+    result = await unreported_reader.read_full_judgment(text)
+    assert result["subjects"][0] == "Service law"
+    assert result["subjects"][1] == "Arbitration"
+    assert "Bail" in result["subjects"]
+
+
+async def test_outcome_is_taken_only_from_final_chunk(monkeypatch):
+    monkeypatch.setattr(settings, "READER_MAX_CHARS", 2000)
+    monkeypatch.setattr(settings, "READER_CHUNK_OVERLAP_CHARS", 0)
+    first = "The trial court allowed the application. " + ("A" * 2100)
+    last = "For these reasons, the present appeal is dismissed. " + ("Z" * 2100)
+    long_text = first + last
+    calls = 0
+
+    async def fake_model(chunk):
+        nonlocal calls
+        calls += 1
+        if "trial court allowed" in chunk:
+            return {
+                "laws": [], "points": [], "interpretation": [], "turns_on": [],
+                "subjects": ["Civil procedure"],
+                "outcome": {"value": "allowed", "quote": "The trial court allowed the application."},
+            }
+        if "present appeal is dismissed" in chunk:
+            return {
+                "laws": [], "points": [], "interpretation": [], "turns_on": [],
+                "subjects": ["Civil procedure"],
+                "outcome": {"value": "dismissed", "quote": "the present appeal is dismissed"},
+            }
+        return {"laws": [], "points": [], "interpretation": [], "turns_on": [], "subjects": ["Civil procedure"], "outcome": None}
+
+    monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
+    result = await unreported_reader.read_full_judgment(long_text)
+    assert calls >= 2
+    assert result["outcome"] == "dismissed"
+    assert result["outcome_evidence"]["value"] == "dismissed"
+
+
 async def test_ungrounded_interpretation_turns_on_and_outcome_are_refused(monkeypatch):
     async def fake_model(_text):
         ans = _model_answer()
