@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import select
 
 from scraper.config import settings
@@ -55,7 +56,8 @@ def _model_answer():
 
 def _configure_custom_reader(monkeypatch):
     """Configure a usable custom OpenAI-compatible reader for tests that exercise read_unreported."""
-    _configure_custom_reader(monkeypatch)
+    monkeypatch.setattr(settings, "READER_MODEL", "test-model")
+    monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
     monkeypatch.setattr(settings, "READER_API_KEY", SecretStr("test-reader-key"))
 
 
