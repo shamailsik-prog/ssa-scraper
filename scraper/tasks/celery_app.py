@@ -59,7 +59,8 @@ app.conf.update(
         "scraper.tasks.archive_mirror.mirror_pending": {"queue": "maintenance"},
         "scraper.tasks.archive_mirror.reconcile_storage": {"queue": "maintenance"},
         "scraper.tasks.dispatcher.dispatch_due_sources": {"queue": "maintenance"},
-        "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_session"},
+        # its own queue and worker: behind two back-to-back harvests every check expired unread (13 October 2026)
+        "scraper.tasks.login_recovery.recover_login_slots": {"queue": "login_recovery"},
         "scraper.tasks.pls_self_healing.pls_keepalive_hourly": {"queue": "login_session"},
         "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
@@ -78,7 +79,8 @@ app.conf.update(
             "kwargs": {"limit": None, "skip_final": True},
         },
         # Operator decision of 24 September 2026: a lost slot is re-verified and, if dead, signed in
-        # again with the saved credentials (runs on the single login-session worker, never beside a job).
+        # again with the saved credentials. Runs on worker-login-recovery; it waits only for its own login's
+        # lock, so it never opens a second browser on a login that a job is using.
         # Every minute (owner's 3-minute re-login rule, 13 October 2026); a check still queued behind a running
         # harvest when the next one is due is dropped, so a busy worker never meets a pile of stale ones.
         "recover-login-slots": {
