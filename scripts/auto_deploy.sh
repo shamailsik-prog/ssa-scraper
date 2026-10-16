@@ -287,13 +287,13 @@ main() {
   [ "$DRY_RUN" = 1 ] || ensure_two_pls_logins
   [ "$DRY_RUN" = 1 ] || ensure_relogin_wait
 
-  # Load compose env for postgres user/db names when present.
-  if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-  fi
+  # The PakistanLawSite checks need the postgres user and database names. They are read from .env as data
+  # (scripts/env_file.sh) and not exported: sourcing .env as shell stopped every run on the free-sites server here,
+  # before the fetch (12-16 October 2026), and docker compose must keep reading its own .env.
+  # shellcheck source=scripts/env_file.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/env_file.sh"
+  POSTGRES_USER="${POSTGRES_USER:-$(env_file_value .env POSTGRES_USER)}"
+  POSTGRES_DB="${POSTGRES_DB:-$(env_file_value .env POSTGRES_DB)}"
 
   log "auto_deploy: fetch $REMOTE $BRANCH"
   if [ "$DRY_RUN" = 1 ]; then

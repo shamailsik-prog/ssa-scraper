@@ -84,12 +84,8 @@ if [ "$DEPLOY_ONLY" = 1 ]; then
   [ -d "$DIR/.git" ] || die "deploy-only: not a git checkout at $DIR"
   cd "$DIR"
   mkdir -p state
-  if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-  fi
+  # Nothing here needs .env: docker compose reads it itself, and the services come in AUTO_DEPLOY_SERVICES.
+  # (It used to be sourced as shell, which a compose-style value can make exit.)
   install_managed_host_crons
   # shellcheck disable=SC2206
   services=(${AUTO_DEPLOY_SERVICES:-api worker-scraper worker-login-recovery worker-public worker-maintenance celery-beat})
