@@ -48,8 +48,9 @@ from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
 from scraper.models import Judgment, PlsSearchHarvestQuery, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
 from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.pls_search_harvest_core import build_harvest_form_values, citation_keys_for_row, unmapped_harvest_reason
+from scraper.pls_search_harvest_core import CASE_KEY_PREFIX, build_harvest_form_values, citation_keys_for_row, unmapped_harvest_reason
 from scraper.notify import notify
+from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.parsers.text_cleaner import clean_html
 from scraper.tasks.search_map import active_map, map_as_dict
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
@@ -176,6 +177,137 @@ async def check_judgments_between_pages(db, pipeline, *, sample: Optional[int] =
     results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
     await db.flush()
     return results
+
+
+
+_CASE_NAME_IN_GRID = re.compile(r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])", re.IGNORECASE)
+
+
+def _independent_grid_keys(html: str) -> set[str]:
+    """A deliberately separate verifier parser.
+
+    The harvester uses result-row extraction. The verifier does not: it independently inspects
+    detail-link CaseName identifiers and citation-like strings visible in the rendered HTML.
+    """
+    keys: set[str] = {
+        CASE_KEY_PREFIX + match.group(1).upper()
+        for match in _CASE_NAME_IN_GRID.finditer(html or "")
+    }
+    for hit in extract_citations(clean_html(html or "")):
+        raw = str(hit.get("raw") or "").strip()
+        normalized = normalise_citation(raw) if raw else None
+        if raw:
+            keys.add(raw)
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Blind Account-2 challenge of searches already declared complete.
+
+    A miss is not merely logged: the affected query is reopened so Account 1 must reconcile it.
+    """
+    from scraper.tasks.pakistanlawsite import SOURCE_NAME
+    from scraper.tasks.pls_search_harvest import load_known_citation_keys
+
+    n = int(settings.PLS_COVERAGE_CHALLENGES if count is None else count)
+    if n <= 0:
+        return []
+    map_row = await active_map(db, SOURCE_NAME)
+    if map_row is None:
+        return [{"skipped": "no active PakistanLawSite search map for coverage challenge"}]
+    search_map = map_as_dict(map_row)
+    queries = (
+        await db.execute(
+            select(PlsSearchHarvestQuery)
+            .where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.status == "done",
+            )
+            .order_by(func.random())
+            .limit(n)
+        )
+    ).scalars().all()
+    if not queries:
+        return [{"skipped": "no completed search query available for coverage challenge"}]
+
+    out: List[Dict[str, Any]] = []
+    for query_row in queries:
+        cursor = {"page": 1, "page_no": 1}
+        reason = unmapped_harvest_reason(search_map, dict(query_row.query_json or {}), cursor)
+        if reason:
+            _record(
+                db,
+                kind="coverage",
+                label=query_row.query_key,
+                url=settings.PLS_SEARCH_URL,
+                result="skipped",
+                detail=f"independent verifier cannot express query: {reason}",
+            )
+            out.append({"query": query_row.query_key, "result": "skipped"})
+            continue
+        landing = await browser.goto(settings.PLS_SEARCH_URL)
+        verdict = landing.classify()
+        if verdict.kind == "block":
+            raise ExplicitBlock(verdict.kind, verdict.detail)
+        if verdict.kind == "verification":
+            raise VerificationRequired(verdict.kind, verdict.detail)
+        if verdict.kind == "login":
+            raise LoginRequired(verdict.detail)
+        values = build_harvest_form_values(search_map, dict(query_row.query_json or {}), cursor)
+        page = await browser.submit_search(search_map, values)
+        try:
+            verdict = page.classify()
+            if verdict.kind == "block":
+                raise ExplicitBlock(verdict.kind, verdict.detail)
+            if verdict.kind == "verification":
+                raise VerificationRequired(verdict.kind, verdict.detail)
+            if verdict.kind == "login":
+                raise LoginRequired(verdict.detail)
+            live_keys = _independent_grid_keys(page.html)
+            if not live_keys:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="unreachable",
+                    detail="independent verifier found no citation or CaseName keys; no completeness verdict recorded",
+                )
+                out.append({"query": query_row.query_key, "result": "unreachable"})
+                continue
+            known = await load_known_citation_keys(db, live_keys)
+            missing = sorted(live_keys - known)
+            if missing:
+                query_row.status = "pending"
+                query_row.last_error = (
+                    "independent verifier coverage miss: " + ", ".join(missing[:8])
+                )[:1000]
+                query_row.updated_at = datetime.now(timezone.utc)
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="differs",
+                    detail=f"Account-2 verifier found {len(missing)} live key(s) absent from corpus/staging; query reopened",
+                )
+                out.append({"query": query_row.query_key, "result": "coverage_miss", "missing": missing[:8]})
+            else:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="match",
+                    detail=f"Account-2 verifier independently found {len(live_keys)} key(s); all resolve in corpus/staging",
+                )
+                out.append({"query": query_row.query_key, "result": "match", "keys": len(live_keys)})
+        finally:
+            release_page_result(page)
+    await db.flush()
+    return out
 
 
 async def check_judgments(
