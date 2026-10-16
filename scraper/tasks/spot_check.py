@@ -47,8 +47,7 @@ from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
 from scraper.models import Judgment, PlsSearchHarvestQuery, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
-from scraper.extractors.hybrid_extractor import HybridExtractor
-from scraper.pls_search_harvest_core import CASE_KEY_PREFIX, build_harvest_form_values, citation_keys_for_row, unmapped_harvest_reason
+from scraper.pls_search_harvest_core import CASE_KEY_PREFIX, build_harvest_form_values, unmapped_harvest_reason
 from scraper.notify import notify
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.parsers.text_cleaner import clean_html
@@ -193,6 +192,11 @@ def _independent_grid_keys(html: str) -> set[str]:
         CASE_KEY_PREFIX + match.group(1).upper()
         for match in _CASE_NAME_IN_GRID.finditer(html or "")
     }
+    # CaseName detail identifiers are the cleanest independent result identities. Only fall back
+    # to citation text when the result surface does not expose CaseName links; otherwise citations
+    # inside snippets/headnotes could be mistaken for additional result rows.
+    if keys:
+        return keys
     for hit in extract_citations(clean_html(html or "")):
         raw = str(hit.get("raw") or "").strip()
         normalized = normalise_citation(raw) if raw else None
