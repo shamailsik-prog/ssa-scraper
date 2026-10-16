@@ -14,6 +14,7 @@ hash, version_confidence 0.5 unless an effective date is evidenced). Instruments
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -21,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from celery import shared_task
-from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,6 +49,7 @@ from scraper.models import (
     Judge,
     Judgment,
     JudgmentCitationRelation,
+    Treatment,
     QuarantineQueue,
     ScraperStaging,
     SourceProvenance,
@@ -226,6 +228,214 @@ async def _supersede_old_archive_layout(db: AsyncSession, judgment_id) -> None:
     for row in rows:
         row.status = "superseded"
         row.error = "unreported judgment later reported; archive under reported citation"
+
+
+
+async def _merge_reported_duplicate_into_unreported(
+    db: AsyncSession,
+    *,
+    unreported_row: Judgment,
+    reported_row: Judgment,
+) -> Judgment:
+    """Collapse an already-existing reported/unreported pair into one reported judgment row.
+
+    The earlier unreported row is retained so links to it remain stable. Derived outgoing relation
+    rows from that row are discarded in favour of the reported row's versions; incoming links are
+    repointed. Archive copies are superseded so the mirror rewrites under the reported citation.
+    """
+    if not unreported_row.unreported or reported_row.unreported:
+        raise ValueError("reconciliation requires unreported winner and reported loser")
+    old_identity = unreported_row.canonical_citation
+    reported_citation = reported_row.canonical_citation
+
+    # Free the two unique judgment keys before assigning the reported identity/text to the winner.
+    reported_row.canonical_citation = f"MERGING-{reported_row.id}"
+    reported_row.full_text_hash = hashlib.sha256(f"merging:{reported_row.id}".encode()).hexdigest()
+    await db.flush()
+
+    existing_alias = (
+        await db.execute(select(Citation).where(Citation.citation_string == old_identity))
+    ).scalars().first()
+    if existing_alias is None:
+        db.add(
+            Citation(
+                judgment_id=unreported_row.id,
+                citation_string=old_identity[:200],
+                raw_string=old_identity,
+                is_primary=False,
+                source_evidence="unreported identity before later reporter reconciliation",
+            )
+        )
+
+    # Citations on the reported row are authoritative and become citations of the retained row.
+    for citation in (
+        await db.execute(select(Citation).where(Citation.judgment_id == reported_row.id))
+    ).scalars().all():
+        citation.judgment_id = unreported_row.id
+
+    # Keep the reported row's derived outgoing legal relations, not stale unreported derivations.
+    await db.execute(delete(Treatment).where(Treatment.citing_judgment_id == unreported_row.id))
+    await db.execute(
+        update(Treatment)
+        .where(Treatment.citing_judgment_id == reported_row.id)
+        .values(citing_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        update(Treatment)
+        .where(Treatment.cited_judgment_id == reported_row.id)
+        .values(cited_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        delete(JudgmentCitationRelation).where(
+            JudgmentCitationRelation.source_judgment_id == unreported_row.id
+        )
+    )
+    await db.execute(
+        update(JudgmentCitationRelation)
+        .where(JudgmentCitationRelation.source_judgment_id == reported_row.id)
+        .values(source_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        update(JudgmentCitationRelation)
+        .where(JudgmentCitationRelation.target_judgment_id == reported_row.id)
+        .values(target_judgment_id=unreported_row.id)
+    )
+
+    # Generic pointers are not foreign keys but must still follow the retained row.
+    await db.execute(
+        update(SourceProvenance)
+        .where(
+            SourceProvenance.promoted_table == "judgment",
+            SourceProvenance.promoted_id == reported_row.id,
+        )
+        .values(promoted_id=unreported_row.id)
+    )
+    await db.execute(
+        update(ScraperStaging)
+        .where(ScraperStaging.promoted_to_id == reported_row.id)
+        .values(promoted_to_id=unreported_row.id)
+    )
+
+    for obj in (
+        await db.execute(
+            select(ArchiveObject).where(
+                ArchiveObject.judgment_id.in_([unreported_row.id, reported_row.id])
+            )
+        )
+    ).scalars().all():
+        obj.judgment_id = unreported_row.id
+        obj.status = "superseded"
+        obj.error = "reported/unreported reconciliation; rewrite under reported citation"
+
+    await db.execute(
+        delete(EmbeddingQueue).where(
+            EmbeddingQueue.table_name == "judgment",
+            EmbeddingQueue.record_id.in_([unreported_row.id, reported_row.id]),
+        )
+    )
+
+    # Promote the retained row to the reported representation.
+    unreported_row.canonical_citation = reported_citation
+    unreported_row.unreported = False
+    unreported_row.proceeding_type = None
+    unreported_row.case_title = reported_row.case_title or unreported_row.case_title
+    unreported_row.court_id = reported_row.court_id or unreported_row.court_id
+    unreported_row.court_name = reported_row.court_name or unreported_row.court_name
+    unreported_row.judge_names = reported_row.judge_names or unreported_row.judge_names
+    unreported_row.bench_size = reported_row.bench_size
+    unreported_row.bench_type = reported_row.bench_type
+    unreported_row.decision_date = reported_row.decision_date or unreported_row.decision_date
+    unreported_row.year = reported_row.year or unreported_row.year
+    unreported_row.reporter = reported_row.reporter
+    unreported_row.volume = reported_row.volume
+    unreported_row.page_number = reported_row.page_number
+    unreported_row.docket_number = reported_row.docket_number or unreported_row.docket_number
+    unreported_row.petitioner = reported_row.petitioner or unreported_row.petitioner
+    unreported_row.respondent = reported_row.respondent or unreported_row.respondent
+    unreported_row.full_text = reported_row.full_text
+    unreported_row.full_text_hash = canonical_text_hash(reported_row.full_text or "")
+    unreported_row.headnotes = reported_row.headnotes
+    unreported_row.statutes_cited = reported_row.statutes_cited
+    unreported_row.citations_cited = reported_row.citations_cited
+    unreported_row.access_method = reported_row.access_method
+    unreported_row.source_name = reported_row.source_name
+    unreported_row.source_url = reported_row.source_url
+    unreported_row.source_provenance_id = reported_row.source_provenance_id
+    unreported_row.original_document_id = reported_row.original_document_id
+    unreported_row.has_original_pdf = reported_row.has_original_pdf
+    unreported_row.confidence_score = reported_row.confidence_score
+    unreported_row.extraction_engine = reported_row.extraction_engine
+
+    db.add(
+        EmbeddingQueue(
+            record_id=unreported_row.id,
+            table_name="judgment",
+            access_method=unreported_row.access_method or "public",
+            embedding_model=settings.EMBEDDING_MODEL,
+            embedding_dimensions=settings.EMBEDDING_DIM,
+        )
+    )
+    await db.delete(reported_row)
+    await db.flush()
+    return unreported_row
+
+
+async def reconcile_reported_unreported_once(db: AsyncSession, *, limit: int = 100) -> Dict[str, int]:
+    """Nightly deterministic sweep for older duplicate pairs created before promotion-time reconciliation."""
+    reported_rows = (
+        await db.execute(
+            select(Judgment)
+            .where(
+                Judgment.unreported.is_(False),
+                Judgment.docket_number.isnot(None),
+                Judgment.full_text.isnot(None),
+            )
+            .order_by(Judgment.promoted_at.desc())
+            .limit(max(1, int(limit)))
+        )
+    ).scalars().all()
+    matched = merged = ambiguous = 0
+    for reported in reported_rows:
+        court = await db.get(Court, reported.court_id) if reported.court_id else None
+        candidate = await _find_unreported_version_of_reported(
+            db,
+            docket_number=reported.docket_number,
+            decision_date=reported.decision_date,
+            court=court,
+            full_text=reported.full_text or "",
+        )
+        if candidate is None:
+            continue
+        matched += 1
+        # _find_unreported_version_of_reported already refuses near-equal ambiguous candidates.
+        try:
+            await _merge_reported_duplicate_into_unreported(
+                db,
+                unreported_row=candidate,
+                reported_row=reported,
+            )
+            merged += 1
+        except Exception:
+            logger.exception(
+                "reported/unreported reconciliation failed: reported=%s unreported=%s",
+                reported.canonical_citation,
+                candidate.canonical_citation,
+            )
+            ambiguous += 1
+            await db.rollback()
+            break
+    return {"reported_scanned": len(reported_rows), "matched": matched, "merged": merged, "ambiguous_or_failed": ambiguous}
+
+
+@shared_task(name="scraper.tasks.promotion.reconcile_reported_unreported")
+def reconcile_reported_unreported(limit: int = 100):
+    async def _run():
+        async with SessionLocal() as db:
+            result = await reconcile_reported_unreported_once(db, limit=limit)
+            await db.commit()
+            return result
+
+    return run_async(_run())
 
 
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
