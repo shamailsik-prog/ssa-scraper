@@ -2,6 +2,7 @@ name: corpus-service-ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 concurrency:
