@@ -36,7 +36,6 @@ from scraper.models import (
 )
 from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemoryState, check_rss_limits
 from scraper.pls_search_harvest_core import (
-    SEARCH_HARVEST_SLOTS,
     build_harvest_form_values,
     CASE_KEY_PREFIX,
     citation_keys_for_row,
@@ -49,7 +48,6 @@ from scraper.pls_search_harvest_core import (
     partition_rows_by_known,
     search_harvest_may_mark_done,
     reporters_for_plan,
-    slot1_reporter_share,
     cited_citations_in_text,
     is_capped,
     iter_extended_plan_queries,
@@ -438,7 +436,6 @@ async def pick_next_query(
     query_key: Optional[str] = None,
     priority_gaps: bool = False,
     slot: Optional[int] = None,
-    take_over: bool = False,
 ) -> Optional[PlsSearchHarvestQuery]:
     """The next ledger row to work, without taking it (see claim_next_query). `priority_gaps` is accepted from
     ticks queued before 13 October 2026 and no longer changes the order: gap-first put every row with an unknown
@@ -456,7 +453,7 @@ async def pick_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if slot in SEARCH_HARVEST_SLOTS and not take_over:
+    if slot is not None:
         stmt = stmt.where(_share_filter(slot))
     return (await db.execute(_pick_order(stmt).limit(1))).scalars().first()
 
@@ -473,16 +470,15 @@ async def claim_next_query(
     take_over: bool = False,
     candidates: int = 25,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
-    """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
-    tick. The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
+    """Take the next ledger row owned by the requested acquisition slot. Account 2 owns no acquisition rows.
+    The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
     after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None)."""
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if not take_over:
-        stmt = stmt.where(_share_filter(slot))
+    stmt = stmt.where(_share_filter(slot))
     rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
         lock = _query_lock(row.id, redis_client)
