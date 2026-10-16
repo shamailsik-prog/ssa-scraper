@@ -817,17 +817,20 @@ async def run_search_harvest(
     redis_client=None,
     job_id=None,
 ) -> Dict[str, Any]:
-    """One search-harvest tick on one login. Login 1 and login 2 harvest at the same time (owner's decision of
-    13 October 2026, handbook R3.1): each tick holds its own slot's singleton lock, works only ledger rows of its own
-    reporter share, and opens only its own login. A slot that has been logged out for
-    PLS_SEARCH_HARVEST_TAKEOVER_MINUTES has its share taken over by the other. A tick queued with no slot (the CLI,
-    or one queued before this change) takes the first ACTIVE slot whose harvest is free."""
+    """One search-harvest tick on Account 1.
+
+    Owner ruling 16 October 2026: slot 1 is acquisition; slot 2 is an independent verifier.
+    No takeover or manual fallback may turn the verifier account into an acquisition account.
+    """
     if not settings.login_scraping_effective:
         return {"skipped": True, "reason": "login scraping not permitted in this environment"}
     source = await _source_row(db)
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": True, "reason": f"source state {source.state}"}
-    slots = [int(slot)] if slot in SEARCH_HARVEST_SLOTS else list(SEARCH_HARVEST_SLOTS)
+    harvest_slot = 1
+    if slot is not None and int(slot) != harvest_slot:
+        return {"skipped": True, "reason": f"slot {slot} is reserved for independent verification", "slot": int(slot)}
+    slots = [harvest_slot]
 
     harvest_lock: Optional[SessionLock] = None
     chosen: Optional[int] = None
@@ -835,7 +838,7 @@ async def run_search_harvest(
     for n in slots:
         state = await _slot_state(db, n)
         if state != "ACTIVE":
-            reasons.append(f"slot {n} is {state or 'missing'}; the other slot takes over its share after {settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES} minutes")
+            reasons.append(f"harvester slot {n} is {state or 'missing'}; verifier slot is never used for acquisition")
             continue
         # one harvest per slot (R3.7): a second tick for the same slot exits at once
         candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1)
@@ -946,16 +949,17 @@ def _continue_slot(result: Dict[str, Any]) -> Optional[int]:
     if result.get("skipped") or result.get("paused") or not result.get("query_key"):
         return None
     slot = result.get("slot")
-    return int(slot) if slot in SEARCH_HARVEST_SLOTS else None
+    return 1 if slot == 1 else None
 
 
-def queue_search_harvest_ticks(app, *, slots=SEARCH_HARVEST_SLOTS) -> List[int]:
-    """Queue one search-harvest tick per login slot on the login queue. Harvest ticks never expire (R3.7): a tick
-    that finds its slot's harvest already running exits at once, so queued ticks cannot pile up into work."""
+def queue_search_harvest_ticks(app, *, slots=(1,)) -> List[int]:
+    """Queue acquisition only on Account 1. Account 2 is reserved for independent verification."""
     queued: List[int] = []
     for n in slots:
-        app.send_task("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", kwargs={"slot": int(n)}, queue="login_session")
-        queued.append(int(n))
+        if int(n) != 1:
+            continue
+        app.send_task("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", kwargs={"slot": 1}, queue="login_session")
+        queued.append(1)
     return queued
 
 
