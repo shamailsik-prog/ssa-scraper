@@ -32,7 +32,7 @@ async def _judgment(db, citation: str, url: str, full_text: str) -> Judgment:
 
 
 async def test_judgment_spot_check_matches_and_flags_a_changed_page(db, login_source):
-    await _activate(db, login_source)
+    await _activate(db, login_source, slots=(1, 2))
     same_url = "https://www.pakistanlawsite.com/case/9001"
     changed_url = "https://www.pakistanlawsite.com/case/9002"
     same_html = judgment_html("PLD 2024 SC 9001", title="Same Text Case")
@@ -53,11 +53,11 @@ async def test_judgment_spot_check_matches_and_flags_a_changed_page(db, login_so
     assert by_label["PLD 2024 SC 9002"]["result"] == "differs" and 0 < by_label["PLD 2024 SC 9002"]["similarity"] < 1
     rows = (await db.execute(select(SpotCheck).where(SpotCheck.kind == "judgment"))).scalars().all()
     assert {r.label: r.result for r in rows} == {"PLD 2024 SC 9001": "match", "PLD 2024 SC 9002": "differs"}
-    assert (login_source.config_json or {}).get("pacing_slot_1", {}).get("day_pages") == 2  # charged like any other page
+    assert (login_source.config_json or {}).get("pacing_slot_2", {}).get("day_pages") == 2  # charged like any other page
 
 
 async def test_judgment_spot_check_login_page_ends_the_run_and_marks_the_slot(db, login_source):
-    await _activate(db, login_source)
+    await _activate(db, login_source, slots=(1, 2))
     url = "https://www.pakistanlawsite.com/case/9003"
     await _judgment(db, "PLD 2024 SC 9003", url, "some stored text")
     await db.commit()
@@ -69,7 +69,7 @@ async def test_judgment_spot_check_login_page_ends_the_run_and_marks_the_slot(db
     await db.commit()
     await r.aclose()
     assert results and results[0]["result"] == "login_required"
-    slot = (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.slot_number == 1))).scalars().first()
+    slot = (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.slot_number == 2))).scalars().first()
     assert slot.state == "NEEDS_HUMAN_LOGIN"
     row = (await db.execute(select(SpotCheck))).scalars().first()
     assert row.result == "login_required" and "LoginRequired" in row.detail
@@ -166,14 +166,14 @@ async def test_judgment_spot_check_never_switches_to_the_alternate_slot(db, logi
     await r.aclose()
     assert [x["result"] for x in results] == ["login_required"]
     slots = {s.slot_number: s.state for s in (await db.execute(select(BrowserSessionSlot))).scalars().all()}
-    assert slots == {1: "NEEDS_HUMAN_LOGIN", 2: "ACTIVE"}
-    assert all(entry[1] == 1 for entry in sc.log)  # every page was asked of slot 1 only
-    assert (login_source.config_json or {}).get("current_slot") == 1  # not switched
+    assert slots == {1: "ACTIVE", 2: "NEEDS_HUMAN_LOGIN"}
+    assert all(entry[1] == 2 for entry in sc.log)  # every verifier page was asked of Account 2 only
+    assert (login_source.config_json or {}).get("current_slot") == 1  # harvester slot was not switched
     assert login_source.state == "ACTIVE"
 
 
 async def test_judgment_match_requires_the_citation_on_the_page(db, login_source):
-    await _activate(db, login_source)
+    await _activate(db, login_source, slots=(1, 2))
     url = "https://www.pakistanlawsite.com/case/9006"
     html = judgment_html("PLD 2024 SC 9006", title="Identity Case")
     j = await _judgment(db, "PLD 2024 SC 9006", url, _stored_text_for(html))
