@@ -60,17 +60,20 @@ validators and tests.
 3. **Tier 1** — citation enumeration per subscribed reporter × year; `VOLUME_END_GAP` (40) consecutive
    misses close the volume. **Tier 2** — one query per promoted statute section. **Tier 3** —
    vocabulary sweep ranked by yield and retired after repeated zero yield. **Tier 4** — current-year
-   daily wave. `crawl_frontier` / `crawl_coverage` are the truth for progress.
-4. **Continuity.** Disconnect → wait exactly `RECONNECT_SECONDS` (30) → reconnect the **same** slot →
-   resume the **same** cursor; only if that fails may the alternate slot continue the same cursor.
-   Never from page one; no automatic recovery to the primary. Verification/login expiry → slot
-   `NEEDS_HUMAN_LOGIN`, notify, pause if no valid slot. HTTP 403 / "account suspended" / "automated
-   access" / CAPTCHA → source **HALTED**, notify, no slot switch, no proxy, no stealth, admin review.
-5. **One login-session worker at a time.** `LOGIN_SESSION_CONCURRENCY` is 1 and the settings
-   validator refuses any other value; a Redis lock (`corpus:login_session_lock:PakistanLawSite`,
-   TTL 3600 s, refreshed on every page) refuses a second worker. The two slots are continuity
-   slots: the alternate ACTIVE slot continues the same cursor when the primary is lost, never two
-   browsers at once.
+   daily wave with reserved scheduler precedence over backfill. Tier 2 is seeded exhaustively from
+   every promoted statute section; there is no fixed-row ceiling. `crawl_frontier`,
+   `pls_search_harvest_query` and the consolidated completeness report are the progress evidence.
+4. **Two-account separation.** Account/slot 1 is the **harvester**. Account/slot 2 is the
+   **independent verifier**. Acquisition never fails over to slot 2 and verifier work never falls
+   back to slot 1. A dead harvester pauses acquisition; a dead verifier makes completeness
+   **unverified**, not complete. Both sessions retain their own encrypted state and recovery flow.
+   HTTP 403 / "account suspended" / "automated access" / CAPTCHA → source **HALTED**, notify,
+   no proxy, no stealth and no technical-control bypass.
+5. **Independent verification and freshness.** Every scheduled verifier run re-opens random stored
+   judgments on Account 2 and independently challenges completed search windows. A live result
+   missing from corpus/staging reopens that query automatically. Tier 4 is the reserved current-year
+   lane and is selected ahead of historical backfill. Corpus completeness is false unless recent
+   Account-2 coverage checks exist with zero misses and every promoted statute section has a Tier-2 frontier.
 6. **Pacing.** Before every result-page submission and detail fetch the lock is refreshed and the
    page is counted in `source.config_json.pacing`; past `PAGES_PER_HOUR` (300) or `PAGES_PER_DAY`
    (2500) the run ends with `pacing: ...`, the source stays ACTIVE and Beat resumes it later;
