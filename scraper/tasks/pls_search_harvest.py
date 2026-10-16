@@ -255,7 +255,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     and year, the site-total comparison, and a random known-citation test against the corpus."""
     from sqlalchemy import func
 
-    from scraper.models import Citation, Judgment
+    from scraper.models import Citation, CrawlFrontier, Judgment, SpotCheck, StatuteSection
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
@@ -270,6 +270,51 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     holes = {k: v for k, v in holes.items() if v}
     sample = (await db.execute(select(Judgment.canonical_citation).where(Judgment.source_name == SOURCE_NAME).order_by(func.random()).limit(known_sample))).scalars().all()
     known = await load_known_citation_keys(db, set(sample)) if sample else set()
+
+    statute_sections = int(
+        (await db.execute(select(func.count()).select_from(StatuteSection))).scalar() or 0
+    )
+    tier2_seeded = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(CrawlFrontier)
+                .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.tier == 2)
+            )
+        ).scalar()
+        or 0
+    )
+    tier2_missing = max(0, statute_sections - tier2_seeded)
+    now = datetime.now(timezone.utc)
+    fresh_due = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(CrawlFrontier)
+                .where(
+                    CrawlFrontier.source_name == SOURCE_NAME,
+                    CrawlFrontier.tier == 4,
+                    CrawlFrontier.status.in_(("pending", "in_progress")),
+                    (CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    verifier_rows = (
+        await db.execute(
+            select(SpotCheck.result, func.count())
+            .where(
+                SpotCheck.kind == "coverage",
+                SpotCheck.created_at >= now - timedelta(hours=24),
+            )
+            .group_by(SpotCheck.result)
+        )
+    ).all()
+    verifier = {result: int(count) for result, count in verifier_rows}
+    verifier_checks = sum(verifier.values())
+    verifier_misses = int(verifier.get("differs", 0))
+
     return {
         "queue": status_counts,
         "done_but_capped": capped_open,
@@ -278,7 +323,30 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         "rows_known_done_queries": int(totals[1]),
         "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
         "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
-        "complete": bool(status_counts.get("pending", 0) + status_counts.get("in_progress", 0) + status_counts.get("failed", 0) + capped_open == 0 and not holes),
+        "tier2_provision_coverage": {
+            "statute_sections": statute_sections,
+            "frontiers_seeded": tier2_seeded,
+            "missing": tier2_missing,
+        },
+        "fresh_lane": {"due_now": fresh_due},
+        "account2_coverage_verifier": {
+            "last_24h_checks": verifier_checks,
+            "matches": int(verifier.get("match", 0)),
+            "misses": verifier_misses,
+            "demonstrated": verifier_checks > 0,
+        },
+        "complete": bool(
+            status_counts.get("pending", 0)
+            + status_counts.get("in_progress", 0)
+            + status_counts.get("failed", 0)
+            + capped_open
+            == 0
+            and not holes
+            and tier2_missing == 0
+            and fresh_due == 0
+            and verifier_checks > 0
+            and verifier_misses == 0
+        ),
     }
 
 
