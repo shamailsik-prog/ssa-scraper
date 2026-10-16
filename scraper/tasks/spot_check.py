@@ -373,7 +373,50 @@ async def check_judgments(
         pipeline.runner.exclusive_slot = True
         browser = await pipeline.runner.open(slot)
         results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
-        results.extend(await _coverage_challenges_on_browser(db, pipeline, browser))
+        try:
+            results.extend(await _coverage_challenges_on_browser(db, pipeline, browser))
+        except Exception as exc:
+            from scraper.tasks.pakistanlawsite import PacingBudgetExceeded
+
+            if isinstance(exc, PacingBudgetExceeded):
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="skipped",
+                    detail=f"pacing budget spent: {exc}",
+                )
+                results.append({"result": "skipped", "detail": f"coverage pacing: {exc}"})
+            elif isinstance(exc, (LoginRequired, VerificationRequired)):
+                await pipeline.manager.mark_needs_human_login(
+                    verifier_slot_no, f"{type(exc).__name__}: {exc}"
+                )
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="login_required",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+                results.append({"result": "login_required", "detail": str(exc)[:300]})
+            elif isinstance(exc, ExplicitBlock):
+                await pipeline.manager.halt_source(
+                    f"explicit block during Account-2 coverage challenge: {exc}",
+                    slot_number=verifier_slot_no,
+                )
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="unreachable",
+                    detail=f"block, source halted: {exc}",
+                )
+                results.append({"result": "unreachable", "detail": f"block: {exc}"})
+            else:
+                raise
         await db.flush()
         return results
     finally:
