@@ -191,12 +191,22 @@ async def _find_unreported_version_of_reported(
     docket_key = _identity_text(docket_number)
     if not docket_key:
         return None
-    stmt = select(Judgment).where(Judgment.unreported.is_(True), Judgment.docket_number.isnot(None))
+    # Filter by docket in PostgreSQL BEFORE ordering/reading candidates. Previously the
+    # newest 250 unreported rows were fetched across *all* dockets, so an older
+    # exact match was invisible once 250 unrelated court judgments had arrived.
+    # Match _identity_text() exactly; do not apply a global pre-match LIMIT.
+    stmt = select(Judgment).where(
+        Judgment.unreported.is_(True),
+        Judgment.docket_number.isnot(None),
+        func.regexp_replace(
+            func.lower(Judgment.docket_number), r"[^a-z0-9]+", "", "g"
+        ) == docket_key,
+    )
     if decision_date is not None:
         stmt = stmt.where(or_(Judgment.decision_date == decision_date, Judgment.decision_date.is_(None)))
     if court is not None:
         stmt = stmt.where(or_(Judgment.court_id == court.id, Judgment.court_id.is_(None)))
-    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()).limit(250))).scalars().all()
+    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()))).scalars().all()
     strong = []
     for candidate in candidates:
         if _identity_text(candidate.docket_number) != docket_key:
