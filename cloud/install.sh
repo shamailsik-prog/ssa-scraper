@@ -184,6 +184,8 @@ else
   log "Cloning $REPO ($BRANCH) into $DIR"
   "${GIT[@]}" clone -q -b "$BRANCH" "$REPO" "$DIR" || die "clone failed. If the repository is private, export GH_TOKEN (see the header of this script) and re-run."
 fi
+# Installed from a local copy (deploy-cloud's uploaded bundle): the auto-deploy cron must still fetch GitHub.
+if [ -f "$DIR/cloud/follow_github.sh" ]; then bash "$DIR/cloud/follow_github.sh" "$DIR" "$REPO"; fi
 unset GH_TOKEN
 cd "$DIR"
 mkdir -p live raw state

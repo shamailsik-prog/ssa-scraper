@@ -117,7 +117,7 @@ ARGS=(--repo /root/ssa-src --branch "$BRANCH")
 [ -n "$DEPLOY_REGION_LABEL" ] && ARGS+=(--region "$DEPLOY_REGION_LABEL")
 case "${MIRROR_LOGIN_SESSION_ROWS:-keep}" in true|false) ARGS+=(--mirror-login-session-rows "$MIRROR_LOGIN_SESSION_ROWS");; esac
 case "${DEPLOY_ROLE:-}" in all|pls|public) ARGS+=(--role "$DEPLOY_ROLE");; esac
-ssh "${SSH_OPTS[@]}" "root@$IP" "bash /root/ssa-src/cloud/install.sh $(printf '%q ' "${ARGS[@]}") < /dev/null" 2>&1 | sed -E 's/Admin key:  [0-9a-f]{64}/Admin key:  (see the job summary)/'
+ssh "${SSH_OPTS[@]}" "root@$IP" "bash /root/ssa-src/cloud/install.sh $(printf '%q ' "${ARGS[@]}") < /dev/null" 2>&1 | sed -E 's/Admin key:  [0-9a-f]{64}/Admin key:  (not printed: this repository is public; it is ADMIN_API_KEY in \/opt\/ssa-scraper\/.env)/'
 
 # ---------------------------------------------------------------- optional secrets, sent over stdin, never echoed
 if [ -n "${SGAI_API_KEY:-}" ]; then
@@ -134,7 +134,8 @@ case "${READER_MODEL_CHOICE:-keep}" in
 esac
 
 # ---------------------------------------------------------------- result
-ADMIN_KEY="$(ssh "${SSH_OPTS[@]}" "root@$IP" "grep '^ADMIN_API_KEY=' /opt/ssa-scraper/.env | cut -d= -f2-")"
+# The admin key is never written to the job summary or the log: this repository is public, so both are readable by
+# anyone (16 October 2026). It stays in /opt/ssa-scraper/.env on the server.
 if [ -n "$DOMAIN" ]; then URL="https://$DOMAIN/dashboard"; NOTE=""; else URL="https://$IP/dashboard"; NOTE=" (self-signed certificate: accept the browser warning once)"; fi
 HEALTH="$(ssh "${SSH_OPTS[@]}" "root@$IP" "curl -fsS http://127.0.0.1:8000/health" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status"), "· db", d.get("db_connected"), "· redis", d.get("redis_connected"), "· login scraping", d.get("login_scraping_permitted"))' 2>/dev/null || echo unknown)"
 
@@ -146,7 +147,7 @@ if [ -n "${SUMMARY_FILE:-}" ]; then
     echo "| | |"
     echo "|---|---|"
     echo "| Dashboard | $URL$NOTE |"
-    echo "| Admin key | \`$ADMIN_KEY\` |"
+    echo "| Admin key | not printed (this repository is public): ADMIN_API_KEY in /opt/ssa-scraper/.env on the server, unchanged by a redeploy |"
     echo "| Server | droplet $DROPLET_ID, $IP, $DO_SIZE in $DO_REGION$( [ "$NEW_DROPLET" = 1 ] && echo ", created now" || echo ", reused") |"
     echo "| Health | $HEALTH |"
     echo
