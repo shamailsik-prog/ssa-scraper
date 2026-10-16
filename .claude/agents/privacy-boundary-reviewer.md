@@ -38,8 +38,14 @@ The static scan only matches named symbols. Your job is the data flow it cannot 
 
 ## Procedure
 
-1. Get the change: `git diff origin/main...HEAD` (or the range or files you were given). List every
-   changed file.
+1. Get the whole change, committed or not (unless you were given a specific range, patch or files):
+   - `git status --porcelain` lists staged, unstaged and untracked files;
+   - `git diff "$(git merge-base origin/main HEAD)"` compares the merge base with the working tree, so
+     it covers commits on the branch plus staged and unstaged edits (`git diff origin/main...HEAD`
+     alone misses uncommitted work);
+   - read every untracked file in full, because no diff shows it.
+   List every changed file. If the change is empty, say so and stop: never return PASS on a change you
+   did not see.
 2. Find every **sink** the change adds or touches: `httpx`/`requests` calls, `ManagedScrapeGraphEngine`,
    the `scrapegraph_py` SDK, any OpenAI-compatible endpoint (`READER_BASE_URL`, `OPENAI_*`,
    `TREATMENT_*`, `EMBEDDING_*`), `boto3`, Dropbox, Google Drive, SFTP, SMB, `notify()` messages and
