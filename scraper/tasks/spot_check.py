@@ -41,13 +41,17 @@ from scraper.auth.session_manager import (
     PlaywrightBrowser,
     SessionLockHeld,
     playwright_browser_factory,
+    release_page_result,
 )
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
-from scraper.models import Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import Judgment, PlsSearchHarvestQuery, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.extractors.hybrid_extractor import HybridExtractor
+from scraper.pls_search_harvest_core import build_harvest_form_values, citation_keys_for_row, unmapped_harvest_reason
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
+from scraper.tasks.search_map import active_map, map_as_dict
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
 
 logger = logging.getLogger(__name__)
