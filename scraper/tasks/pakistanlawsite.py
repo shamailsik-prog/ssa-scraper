@@ -255,6 +255,16 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
     return counts
 
 
+def frontier_ordering():
+    """SQL ordering for runnable frontier rows: fresh current-year work before historical backfill."""
+    return (
+        case((CrawlFrontier.tier == 4, 0), else_=1).asc(),
+        CrawlFrontier.priority.asc(),
+        CrawlFrontier.tier.asc(),
+        CrawlFrontier.created_at.asc(),
+    )
+
+
 # --------------------------------------------------------------------------- query building
 def build_values(search_map: Dict[str, Any], query: Dict[str, Any], cursor: Dict[str, Any]) -> Dict[str, str]:
     """Map a frontier query onto the form roles found in the search map."""
@@ -1842,12 +1852,7 @@ class PakistanLawSitePipeline:
                 .where((CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now))
                 # Fresh current-year work is a reserved lane: historical backfill must never sit
                 # ahead of a due Tier-4 wave merely because its numeric tier is smaller.
-                .order_by(
-                    case((CrawlFrontier.tier == 4, 0), else_=1).asc(),
-                    CrawlFrontier.priority.asc(),
-                    CrawlFrontier.tier.asc(),
-                    CrawlFrontier.created_at.asc(),
-                )
+                .order_by(*frontier_ordering())
                 .limit(max_queries)
             )
             frontier_rows = (await self.db.execute(q)).scalars().all()
