@@ -1,10 +1,6 @@
-"""Owner's decision of 13 October 2026 (handbook R3.1, R3.7): the PakistanLawSite search harvest runs on login 1 and
-login 2 at the same time, each on its own fixed share of the reporters, with no overlap. Each slot has its own
-singleton lock instead of one global "another search harvest is running" lock; ledger rows are taken with
-SELECT ... FOR UPDATE SKIP LOCKED and held by a per-row lock, so two ticks never work the same row; a slot logged out
-for 30 minutes has its share taken over by the other. A row whose site total is unknown keeps its priority (it used
-to sink to 1000), rows a later page repeats are neither opened nor counted again, and the 30-minute spot check runs
-between harvest pages instead of being skipped on the login lock."""
+"""Owner decision 16 October 2026: Account 1 owns all PakistanLawSite acquisition and Account 2 is
+reserved for independent verification. Search-harvest rows remain lock-safe and resumable, but are no longer
+partitioned across accounts and acquisition never takes over the verifier account."""
 
 from __future__ import annotations
 
@@ -115,96 +111,34 @@ async def _tick(slot, r):
         return await harvest.run_search_harvest(s, slot=slot, redis_client=r)
 
 
-def test_the_two_shares_never_overlap_and_cover_every_reporter():
-    share = slot1_reporter_share(SLOT1)
-    assert share == {"PLD", "SCMR", "CLC", "YLR", "CLD", "GBLR"}
-    for rep in ("PLD", "SCMR", "CLC", "YLR", "CLD", "GBLR", "P.L.D.", "scmr"):
-        assert search_harvest_slot_for({"reporter": rep}, share) == 1, rep
-    for rep in ("PLC", "PLC(CS)", "PCrLJ", "P.Cr.L.J", "MLD", "PTD", "PLJ", "NLR"):
-        assert search_harvest_slot_for({"reporter": rep}, share) == 2, rep
-    assert search_harvest_slot_for({"keyword": "bail"}, share) == 2  # no reporter: slot 2 takes it
-    # every reporter of the dropdown is in exactly one share
-    assert {search_harvest_slot_for({"reporter": rep}, share) for rep in KNOWN_REPORTERS} <= {1, 2}
-
-
-async def test_each_slot_claims_only_rows_of_its_own_share(db, r):
+async def test_account1_claims_the_complete_search_ledger_and_account2_claims_none(db, r):
     await _seed(db, ["PLD", "SCMR", "PLC", "PCrLJ", "MLD"])
-    taken = {1: [], 2: []}
+    claimed = []
     locks = []
-    for slot in (1, 2):
-        while True:
-            row, lock = await harvest.claim_next_query(db, slot, redis_client=r)
-            if row is None:
-                break
-            assert row.status == "in_progress" and row.slot == slot
-            taken[slot].append(row.query_json["reporter"])
-            locks.append(lock)
-    assert sorted(taken[1]) == ["PLD", "SCMR"]
-    assert sorted(taken[2]) == ["MLD", "PCrLJ", "PLC"]
+    while True:
+        row, lock = await harvest.claim_next_query(db, 1, redis_client=r)
+        if row is None:
+            break
+        claimed.append(row.query_json["reporter"])
+        locks.append(lock)
+    assert sorted(claimed) == ["MLD", "PCrLJ", "PLC", "PLD", "SCMR"]
+    row2, lock2 = await harvest.claim_next_query(db, 2, redis_client=r)
+    assert row2 is None and lock2 is None
     for lock in locks:
         await lock.release()
 
 
-async def test_two_ticks_picking_at_the_same_moment_never_take_the_same_row(db, r):
-    """Both pickers compete for one pool (as when one slot has taken over the other's share)."""
-    await _seed(db, [f"R{n}" for n in range(12)])
-    claimed = {1: [], 2: []}
-    locks = []
-
-    async def picker(slot):
-        async with SessionLocal() as s:
-            while True:
-                row, lock = await harvest.claim_next_query(s, slot, redis_client=r, take_over=True)
-                if row is None:
-                    return
-                claimed[slot].append(row.id)
-                locks.append(lock)
-                await asyncio.sleep(0)
-
-    await asyncio.gather(picker(1), picker(2))
-    every = claimed[1] + claimed[2]
-    assert len(every) == 12 and len(set(every)) == 12  # each row taken once, none twice
-    for lock in locks:
-        await lock.release()
-
-
-async def test_a_row_held_by_a_running_tick_is_not_taken_after_that_tick_commits(db, r):
-    """The run commits after every judgment, which ends the SELECT ... FOR UPDATE row lock; the per-row lock keeps
-    the row out of the other slot's reach until the run ends."""
-    await _seed(db, ["PLD"])
-    row, lock = await harvest.claim_next_query(db, 1, redis_client=r, take_over=True)
-    assert row is not None
-    await db.commit()
-    async with SessionLocal() as other:
-        again, _ = await harvest.claim_next_query(other, 2, redis_client=r, take_over=True)
-        assert again is None
-    await lock.release()
-    async with SessionLocal() as other:
-        again, lock2 = await harvest.claim_next_query(other, 2, redis_client=r, take_over=True)
-        assert again is not None and again.id == row.id
-        await lock2.release()
-
-
-async def test_both_slots_harvest_at_the_same_time_each_on_its_own_share(db, r, monkeypatch):
+async def test_account2_search_harvest_is_refused_even_when_active(db, r, monkeypatch):
     await _slots(db)
-    await _seed(db, ["PLD", "PLC"])
-    spans = _fake_tick(monkeypatch, hold=0.5)
-
-    first, second = await asyncio.gather(_tick(1, r), _tick(2, r))
-
-    assert first["slot"] == 1 and second["slot"] == 2, (first, second)
-    assert not first.get("skipped") and not second.get("skipped")
-    by_slot = {s["slot"]: s for s in spans}
-    assert by_slot[1]["reporter"] == "PLD" and by_slot[2]["reporter"] == "PLC"
-    assert by_slot[1]["exclusive"] and by_slot[2]["exclusive"]  # each bound to its own login only
-    # the two runs overlapped in time
-    assert max(s["start"] for s in spans) < min(s["end"] for s in spans)
-    rows = (await db.execute(select(PlsSearchHarvestQuery).order_by(PlsSearchHarvestQuery.query_key))).scalars().all()
-    await db.refresh(rows[0]), await db.refresh(rows[1])
-    assert {(q.query_json["reporter"], q.slot, q.status) for q in rows} == {("PLD", 1, "done"), ("PLC", 2, "done")}
+    await _seed(db, ["PLD"])
+    spans = _fake_tick(monkeypatch)
+    result = await _tick(2, r)
+    assert result["skipped"] is True
+    assert "reserved for independent verification" in result["reason"]
+    assert spans == []
 
 
-async def test_a_second_tick_on_the_same_slot_exits_at_once(db, r, monkeypatch):
+async def test_account1_tick_remains_singleton(db, r, monkeypatch):
     await _slots(db)
     await _seed(db, ["PLD"])
     spans = _fake_tick(monkeypatch)
@@ -216,27 +150,17 @@ async def test_a_second_tick_on_the_same_slot_exits_at_once(db, r, monkeypatch):
         await running.release()
     assert result["skipped"] is True and "already running on slot 1" in result["reason"]
     assert spans == []
-    # slot 2 is not held up by slot 1's lock (the old global lock stopped it)
-    assert (await _tick(2, r)).get("skipped") is True  # nothing in slot 2's share, but it did not wait on slot 1
 
 
-async def test_a_logged_out_slot_hands_its_share_over_after_30_minutes(db, r, monkeypatch):
-    await _slots(db, down=2, down_for=timedelta(minutes=10))
-    await _seed(db, ["PLD", "PLC"])
+async def test_account1_unavailable_never_borrows_verifier_account(db, r, monkeypatch):
+    await _slots(db, down=1, down_for=timedelta(minutes=60))
+    await _seed(db, ["PLC"])
     spans = _fake_tick(monkeypatch)
-
-    down = await _tick(2, r)
-    assert down["skipped"] is True and "slot 2 is NEEDS_HUMAN_LOGIN" in down["reason"]
-
-    own = await _tick(1, r)
-    assert own["slot"] == 1 and own["took_over"] is False and spans[-1]["reporter"] == "PLD"
-    early = await _tick(1, r)
-    assert early["skipped"] is True and "slot 1's share" in early["reason"]  # PLC waits: slot 2 down only 10 min
-
-    await _slots(db, down=2, down_for=timedelta(minutes=31))
-    late = await _tick(1, r)
-    assert late["slot"] == 1 and late["took_over"] is True
-    assert spans[-1] == {**spans[-1], "slot": 1, "reporter": "PLC"}
+    result = await _tick(1, r)
+    assert result["skipped"] is True
+    assert "harvester slot 1" in result["reason"]
+    assert "verifier slot is never used" in result["reason"]
+    assert spans == []
 
 
 async def test_rows_are_picked_by_priority_then_by_the_oldest_last_run(db):
@@ -353,26 +277,23 @@ async def test_a_row_with_an_unknown_site_total_keeps_its_priority(db, monkeypat
     assert q2.site_total_results == 9 and q2.priority == 1000 - q2.gap_size  # a measured gap still orders the row
 
 
-async def test_the_spot_check_runs_between_pages_once_per_interval(db, monkeypatch, r):
-    pages = {"page1": ([_row(1)], "page2"), "page2": ([_row(2)], "page3"), "page3": ([_row(3)], None)}
+async def test_search_harvest_never_substitutes_for_account2_verification(db, monkeypatch, r):
+    pages = {"page1": ([_row(1)], "page2"), "page2": ([_row(2)], None)}
     calls = []
 
-    async def between_pages(db_, pipeline, *, sample=None):
-        calls.append(pipeline)
-        return [{"label": "PLD 2020 SC 1", "result": "match"}]
+    async def forbidden(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("harvester must not perform verifier work")
 
-    monkeypatch.setattr(spot_check, "check_judgments_between_pages", between_pages)
+    monkeypatch.setattr(spot_check, "check_judgments_between_pages", forbidden)
     q = await _query(db)
     runner = _runner(db, monkeypatch, pages)
-    runner.spot_check_between_pages = True
+    runner.spot_check_between_pages = False
     runner.pipeline.redis_client = r
     await runner.run_query(q, {})
-    assert len(calls) == 1 and calls[0] is runner.pipeline  # two page breaks, one 30-minute turn, on this login
-
-    # the beat task finds the turn taken and does not open a second browser for it
-    assert await spot_check.claim_spot_check_turn(r) is False
-    await r.delete(spot_check.SPOT_CHECK_TURN_KEY)
+    assert calls == []
     assert await spot_check.claim_spot_check_turn(r) is True
+
 
 
 def test_a_tick_that_worked_queues_the_next_tick_for_its_own_slot(monkeypatch):
@@ -385,8 +306,8 @@ def test_a_tick_that_worked_queues_the_next_tick_for_its_own_slot(monkeypatch):
 
     sent = []
     app = SimpleNamespace(send_task=lambda name, kwargs=None, queue=None, **extra: sent.append((name, kwargs, queue, extra)))
-    assert harvest.queue_search_harvest_ticks(app) == [1, 2]
+    assert harvest.queue_search_harvest_ticks(app) == [1]
     assert sent == [
         ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 1}, "login_session", {}),
-        ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 2}, "login_session", {}),
-    ]  # no expires (R3.7)
+    ]
+    assert harvest.queue_search_harvest_ticks(app, slots=(2,)) == []
