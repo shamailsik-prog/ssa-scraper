@@ -66,7 +66,7 @@ app.conf.update(
         "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
         "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick": {"queue": "login_session"},
-        "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
+        "scraper.tasks.spot_check.spot_check_judgments": {"queue": "pls_verify"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
     beat_schedule={
@@ -168,7 +168,7 @@ if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
 from scraper.deploy_role import beat_schedule_for_role, deploy_role  # noqa: E402
 
 app.conf.beat_schedule = beat_schedule_for_role(app.conf.beat_schedule)
-logger.info("Celery configured for deploy role %s: queues scraper/login_session/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
+logger.info("Celery configured for deploy role %s: queues scraper/login_session/pls_verify/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
 
 
 @worker_ready.connect
