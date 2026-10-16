@@ -223,8 +223,16 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
         if (4, key4) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key4, query_json={"reporter": rep, "year": current_year, "daily": True}, cursor_json={"page": 1}, priority=1, next_run_at=now))
             counts["tier4"] += 1
-    # Tier 2 from promoted statute sections (bounded per seeding run)
-    rows = (await db.execute(select(StatuteSection, Statute).join(Statute, Statute.id == StatuteSection.statute_id).limit(2000))).all()
+    # Tier 2 from every promoted statute section. Completeness is more important than keeping
+    # this one seeding SELECT artificially small: a hard LIMIT silently left later provisions
+    # undiscoverable once the statute corpus grew beyond that slice.
+    rows = (
+        await db.execute(
+            select(StatuteSection, Statute)
+            .join(Statute, Statute.id == StatuteSection.statute_id)
+            .order_by(Statute.id, StatuteSection.id)
+        )
+    ).all()
     for sec, st in rows:
         key = fit_key(f"t2:{st.short_name or st.name}:{sec.section_number}")
         if (2, key) not in existing:
