@@ -188,6 +188,8 @@ async def _login_session_max_active(db, source_name: Optional[str] = None) -> in
     """How many login-session jobs may run at once for a source: the pacing profile's target,
     capped by the number of ACTIVE slots. Each concurrent browser needs its own human login; two
     browsers on one login share one server-side session and the site ends one of them."""
+    if source_name == PLS_SOURCE_NAME:
+        return 1
     mode = await get_harvest_mode(db)
     target = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
     if source_name is None or target <= 1:
