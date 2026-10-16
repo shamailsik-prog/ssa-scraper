@@ -101,7 +101,8 @@ yourself with the same account ends the scraper's session.
 | service | role |
 |---|---|
 | `api` | FastAPI: `/health`, `/status` (key-free numbers page; "Add to Home Screen" makes it an app), `/dashboard`, `/admin/*`, `/export/*`, `/api/*` |
-| `worker-scraper` | Celery, queue `login_session`, concurrency 1 (PakistanLawSite only) |
+| `worker-scraper` | Celery, queue `login_session`: Account-1 PakistanLawSite acquisition only |
+| `worker-pls-verifier` | Celery, queue `pls_verify`, concurrency 1: Account-2 judgment + coverage verification |
 | `worker-public` | Celery, queues `scraper` and `maintenance`, concurrency 2 (public sources, promotion, treatment, archive, dispatch) |
 | `worker-embed` | Celery, queue `embeddings` |
 | `celery-beat` | schedules (see `scraper/tasks/celery_app.py`) |
