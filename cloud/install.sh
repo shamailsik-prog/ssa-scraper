@@ -184,6 +184,8 @@ else
   log "Cloning $REPO ($BRANCH) into $DIR"
   "${GIT[@]}" clone -q -b "$BRANCH" "$REPO" "$DIR" || die "clone failed. If the repository is private, export GH_TOKEN (see the header of this script) and re-run."
 fi
+# Installed from a local copy (deploy-cloud's uploaded bundle): the auto-deploy cron must still fetch GitHub.
+if [ -f "$DIR/cloud/follow_github.sh" ]; then bash "$DIR/cloud/follow_github.sh" "$DIR" "$REPO"; fi
 unset GH_TOKEN
 cd "$DIR"
 mkdir -p live raw state
@@ -430,13 +432,16 @@ docker compose ps --format '{{.Service}} {{.Health}}' | grep -q '^api healthy' |
 install_managed_host_crons
 
 ADMIN_KEY="$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2-)"
+# Shown only on an operator's terminal: deploy-cloud runs this over ssh with the output piped into the workflow log,
+# and the repository is public (16 October 2026).
+if [ -t 1 ]; then ADMIN_KEY_SHOWN="$ADMIN_KEY"; else ADMIN_KEY_SHOWN="(not shown: the output is not a terminal)"; fi
 cat <<EOF
 
 ============================================================================
  SIKANDER AI corpus service is running.
 
  Dashboard:  $ACCESS_URL
- Admin key:  $ADMIN_KEY
+ Admin key:  $ADMIN_KEY_SHOWN
              (also in $DIR/.env — keep it private; it is the only login to the console)
 
  Next, in the dashboard:

@@ -3,7 +3,8 @@ name: deploy-cloud
 # Creates (or updates) the corpus server on DigitalOcean and installs the service on it.
 # Required repository secret: DO_TOKEN (DigitalOcean API token, read/write).
 # Optional repository secret: SGAI_API_KEY (ScrapeGraph key; written to the server's .env, never printed).
-# Run it from the Actions tab ("Run workflow"). The dashboard address and admin key appear in the job summary.
+# Run it from the Actions tab ("Run workflow"). The dashboard address appears in the job summary; the admin key is never
+# printed (this repository is public) and stays in /opt/ssa-scraper/.env on the server.
 
 on:
   workflow_dispatch:
