@@ -17,7 +17,6 @@ from scraper.auth.session_manager import SessionLock
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.database import SessionLocal
 from scraper.models import BrowserSessionSlot, PlsSearchHarvestQuery, ScraperSource
-from scraper.pls_search_harvest_core import search_harvest_slot_for, slot1_reporter_share
 from scraper.tasks import pls_search_harvest as harvest
 from scraper.tasks import spot_check
 
