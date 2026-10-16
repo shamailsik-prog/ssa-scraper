@@ -27,7 +27,6 @@ SLOT1 = "PLD,SCMR,CLC,YLR,CLD,GBLR"
 @pytest_asyncio.fixture
 async def r(monkeypatch):
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_SLOT1_REPORTERS", SLOT1)
-    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TAKEOVER_MINUTES", 30)
     client = aioredis.from_url(settings.REDIS_URL)
 
     async def clear():
