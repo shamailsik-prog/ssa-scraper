@@ -287,13 +287,11 @@ main() {
   [ "$DRY_RUN" = 1 ] || ensure_two_pls_logins
   [ "$DRY_RUN" = 1 ] || ensure_relogin_wait
 
-  # Load compose env for postgres user/db names when present.
-  if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-  fi
+  # Load compose env for postgres user/db names when present, as data (scripts/env_file.sh): sourcing it as shell
+  # stopped every run on the free-sites server here, before the fetch (12-16 October 2026).
+  # shellcheck source=scripts/env_file.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/env_file.sh"
+  load_env_file .env
 
   log "auto_deploy: fetch $REMOTE $BRANCH"
   if [ "$DRY_RUN" = 1 ]; then
