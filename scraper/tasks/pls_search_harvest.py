@@ -306,7 +306,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
             select(SpotCheck.result, func.count())
             .where(
                 SpotCheck.kind == "coverage",
-                SpotCheck.created_at >= now - timedelta(hours=24),
+                SpotCheck.checked_at >= now - timedelta(hours=24),
             )
             .group_by(SpotCheck.result)
         )
