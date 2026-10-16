@@ -105,14 +105,14 @@ async def _unreported(db, n=1):
     return rows
 
 
-async def test_migration_018_repairs_schema_when_017_was_already_applied(db):
+async def test_migration_019_repairs_schema_when_018_was_already_applied(db):
     import importlib
 
     from sqlalchemy import text as sql_text
 
     from scraper.database import engine
 
-    # PostgreSQL DDL is transactional: emulate the earlier applied-017 shape inside one transaction,
+    # PostgreSQL DDL is transactional: emulate the earlier applied-018 shape inside one transaction,
     # run the forward repair, assert convergence, then roll the whole schema experiment back.
     await db.commit()
     async with engine.connect() as conn:
@@ -121,7 +121,7 @@ async def test_migration_018_repairs_schema_when_017_was_already_applied(db):
             await conn.execute(sql_text("ALTER TABLE judgment_reading_version DROP COLUMN IF EXISTS retry_after_at"))
             await conn.execute(sql_text("ALTER TABLE judgment_reading_version DROP CONSTRAINT IF EXISTS uq_judgment_reading_version_attempt"))
             await conn.execute(sql_text("DROP INDEX IF EXISTS uq_judgment_reading_version_attempt_idx"))
-            mig = importlib.import_module("migrations.018_judgment_reading_retry_repair")
+            mig = importlib.import_module("migrations.019_judgment_reading_retry_repair")
             await mig.upgrade(conn)
             has_column = (
                 await conn.execute(
