@@ -268,6 +268,8 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     holes = {k: v for k, v in holes.items() if v}
     sample = (await db.execute(select(Judgment.canonical_citation).where(Judgment.source_name == SOURCE_NAME).order_by(func.random()).limit(known_sample))).scalars().all()
     known = await load_known_citation_keys(db, set(sample)) if sample else set()
+    known_sample_found = len(known & set(sample))
+    known_sample_ok = bool(sample) and known_sample_found == len(sample)
 
     statute_sections = int(
         (await db.execute(select(func.count()).select_from(StatuteSection))).scalar() or 0
@@ -324,7 +326,11 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         "site_total_done_queries": int(totals[0]),
         "rows_known_done_queries": int(totals[1]),
         "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
-        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
+        "known_citation_test": {
+            "sampled": len(sample),
+            "found": known_sample_found,
+            "passed": known_sample_ok,
+        },
         "tier2_provision_coverage": {
             "statute_sections": statute_sections,
             "frontiers_seeded": tier2_seeded,
@@ -345,6 +351,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
             + capped_open
             == 0
             and not holes
+            and known_sample_ok
             and tier2_missing == 0
             and fresh_due == 0
             and verifier_matches > 0
