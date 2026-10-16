@@ -203,13 +203,18 @@ class Settings(BaseSettings):
     )
     UNREPORTED_MIN_TEXT_CHARS: int = Field(default=400, description="An unreported judgment needs at least this much text; shorter captures (cause lists, stubs) stay held.")
     UNREPORTED_RELEASE_BATCH: int = Field(default=500, description="Held 'no citation' judgments released for promotion as unreported per promotion run.")
-    READER_MODEL: str = Field(default="", description="Model the reading agent uses on unreported judgments (OpenAI-compatible chat API). Blank = TREATMENT_MODEL; both blank, or off, = the agent does nothing.")
-    READER_BASE_URL: str = Field(default="", description="OpenAI-compatible endpoint for the reading agent. Blank = https://api.openai.com/v1 with OPENAI_API_KEY.")
+    READER_MODEL: str = Field(default="", description="Model the reading agent uses on unreported judgments (OpenAI Chat-Completions-compatible API with JSON-object response mode). Blank = TREATMENT_MODEL; both blank, or off, = the agent does nothing.")
+    READER_BASE_URL: str = Field(default="", description="OpenAI Chat-Completions-compatible endpoint supporting response_format=json_object. Blank = https://api.openai.com/v1 with OPENAI_API_KEY.")
     READER_API_KEY: SecretStr = Field(default=SecretStr(""), description="Key for READER_BASE_URL. Blank = OPENAI_API_KEY.")
     READER_BATCH: int = Field(default=20, description="Unreported judgments the reading agent reads per run.")
     READER_SCHEDULE_SECONDS: int = Field(default=600, description="How often the reading agent runs.")
-    READER_MAX_CHARS: int = Field(default=24000, description="Judgment text sent to the model: the opening and the closing part when longer.")
-    READER_RETRY_HOURS: float = Field(default=24.0, description="A failed reading is tried again after this long.")
+    READER_MAX_CHARS: int = Field(default=24000, description="Maximum characters per reader-model chunk; long judgments are read in overlapping chunks, never head/tail truncated.")
+    READER_CHUNK_OVERLAP_CHARS: int = Field(default=1200, description="Overlap between adjacent reader chunks so propositions crossing a boundary are not lost.")
+    READER_RETRY_HOURS: float = Field(default=24.0, description="Base delay before retrying a failed judgment after transient/validation failures.")
+    READER_HTTP_RETRIES: int = Field(default=2, description="Immediate retries for transient reader-provider HTTP/network failures before recording a failed attempt.")
+    READER_AUTH_CIRCUIT_SECONDS: int = Field(default=3600, description="Circuit-breaker period after reader-provider authentication/authorization failures.")
+    READER_TRANSIENT_CIRCUIT_SECONDS: int = Field(default=120, description="Circuit-breaker period after repeated provider/network failures.")
+    READER_FRESH_SHARE: float = Field(default=0.2, ge=0.0, le=1.0, description="Share of each reader batch reserved for newest eligible judgments; the rest drains historical backlog.")
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",
