@@ -13,6 +13,8 @@ hash, version_confidence 0.5 unless an effective date is evidenced). Instruments
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -20,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from celery import shared_task
-from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +38,7 @@ from scraper.extractors.judgment_guards import (
 from scraper.extractors.login_surface_stub import is_login_surface_stub
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
+    ArchiveObject,
     Citation,
     CorpusMetadata,
     Court,
@@ -46,6 +49,9 @@ from scraper.models import (
     Judge,
     Judgment,
     JudgmentCitationRelation,
+    JudgmentReading,
+    JudgmentReadingVersion,
+    Treatment,
     QuarantineQueue,
     ScraperStaging,
     SourceProvenance,
@@ -146,6 +152,309 @@ def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[s
     if len((full_text or "").strip()) < int(settings.UNREPORTED_MIN_TEXT_CHARS or 0):
         return "text too short for a judgment"
     return None
+
+
+
+def _identity_text(value: Optional[str]) -> str:
+    """Conservative identity normaliser for court case numbers; it never guesses a missing number."""
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _substantive_text(value: Optional[str]) -> str:
+    """Normalise formatting noise while retaining the words used by the court."""
+    return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip().lower()
+
+
+def _reported_unreported_similarity(a: Optional[str], b: Optional[str]) -> float:
+    left, right = _substantive_text(a), _substantive_text(b)
+    if not left or not right:
+        return 0.0
+    # SequenceMatcher is deterministic. A high threshold is deliberate: an uncertain pair must remain
+    # separate for human review rather than collapsing two orders in the same case.
+    return difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
+
+
+async def _find_unreported_version_of_reported(
+    db: AsyncSession,
+    *,
+    docket_number: Optional[str],
+    decision_date: Optional[date],
+    court: Optional[Court],
+    full_text: str,
+) -> Optional[Judgment]:
+    """Find the earlier court-site copy of a newly reported judgment.
+
+    Automatic reconciliation is intentionally strict: same normalised case number, same decision date
+    when both sides have one, same court when both sides have one, and >= 0.92 substantive-text
+    similarity. This catches reporter formatting/headings without merging distinct orders in one case.
+    """
+    docket_key = _identity_text(docket_number)
+    if not docket_key:
+        return None
+    stmt = select(Judgment).where(Judgment.unreported.is_(True), Judgment.docket_number.isnot(None))
+    if decision_date is not None:
+        stmt = stmt.where(or_(Judgment.decision_date == decision_date, Judgment.decision_date.is_(None)))
+    if court is not None:
+        stmt = stmt.where(or_(Judgment.court_id == court.id, Judgment.court_id.is_(None)))
+    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()).limit(250))).scalars().all()
+    strong = []
+    for candidate in candidates:
+        if _identity_text(candidate.docket_number) != docket_key:
+            continue
+        if candidate.decision_date and decision_date and candidate.decision_date != decision_date:
+            continue
+        if candidate.court_id and court and candidate.court_id != court.id:
+            continue
+        similarity = _reported_unreported_similarity(candidate.full_text, full_text)
+        if similarity >= 0.92:
+            strong.append((similarity, candidate))
+    if not strong:
+        return None
+    strong.sort(key=lambda item: item[0], reverse=True)
+    # Two near-equal candidates can be two orders in the same case. Refuse an automatic merge.
+    if len(strong) > 1 and abs(strong[0][0] - strong[1][0]) < 0.01:
+        return None
+    return strong[0][1]
+
+
+async def _retire_unreported_reading(db: AsyncSession, judgment_id) -> None:
+    """Stop serving a machine reading when an unreported judgment becomes reported.
+
+    Immutable attempt history remains for audit, but no historical attempt is current after the
+    canonical text/identity changes to the reported version.
+    """
+    await db.execute(
+        update(JudgmentReadingVersion)
+        .where(
+            JudgmentReadingVersion.judgment_id == judgment_id,
+            JudgmentReadingVersion.is_current.is_(True),
+        )
+        .values(is_current=False)
+    )
+    await db.execute(delete(JudgmentReading).where(JudgmentReading.judgment_id == judgment_id))
+
+
+async def _supersede_old_archive_layout(db: AsyncSession, judgment_id) -> None:
+    """A reclassified unreported judgment must be mirrored again under its reported citation."""
+    rows = (
+        await db.execute(
+            select(ArchiveObject).where(
+                ArchiveObject.judgment_id == judgment_id,
+                ArchiveObject.status.in_(("written", "mismatch", "missing")),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        row.status = "superseded"
+        row.error = "unreported judgment later reported; archive under reported citation"
+
+
+
+async def _merge_reported_duplicate_into_unreported(
+    db: AsyncSession,
+    *,
+    unreported_row: Judgment,
+    reported_row: Judgment,
+) -> Judgment:
+    """Collapse an already-existing reported/unreported pair into one reported judgment row.
+
+    The earlier unreported row is retained so links to it remain stable. Derived outgoing relation
+    rows from that row are discarded in favour of the reported row's versions; incoming links are
+    repointed. Archive copies are superseded so the mirror rewrites under the reported citation.
+    """
+    if not unreported_row.unreported or reported_row.unreported:
+        raise ValueError("reconciliation requires unreported winner and reported loser")
+    old_identity = unreported_row.canonical_citation
+    reported_citation = reported_row.canonical_citation
+    await _retire_unreported_reading(db, unreported_row.id)
+
+    # Free the two unique judgment keys before assigning the reported identity/text to the winner.
+    reported_row.canonical_citation = f"MERGING-{reported_row.id}"
+    reported_row.full_text_hash = hashlib.sha256(f"merging:{reported_row.id}".encode()).hexdigest()
+    await db.flush()
+
+    existing_alias = (
+        await db.execute(select(Citation).where(Citation.citation_string == old_identity))
+    ).scalars().first()
+    if existing_alias is None:
+        db.add(
+            Citation(
+                judgment_id=unreported_row.id,
+                citation_string=old_identity[:200],
+                raw_string=old_identity,
+                is_primary=False,
+                source_evidence="unreported identity before later reporter reconciliation",
+            )
+        )
+
+    # Citations on the reported row are authoritative and become citations of the retained row.
+    for citation in (
+        await db.execute(select(Citation).where(Citation.judgment_id == reported_row.id))
+    ).scalars().all():
+        citation.judgment_id = unreported_row.id
+
+    # Keep the reported row's derived outgoing legal relations, not stale unreported derivations.
+    await db.execute(delete(Treatment).where(Treatment.citing_judgment_id == unreported_row.id))
+    await db.execute(
+        update(Treatment)
+        .where(Treatment.citing_judgment_id == reported_row.id)
+        .values(citing_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        update(Treatment)
+        .where(Treatment.cited_judgment_id == reported_row.id)
+        .values(cited_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        delete(JudgmentCitationRelation).where(
+            JudgmentCitationRelation.source_judgment_id == unreported_row.id
+        )
+    )
+    await db.execute(
+        update(JudgmentCitationRelation)
+        .where(JudgmentCitationRelation.source_judgment_id == reported_row.id)
+        .values(source_judgment_id=unreported_row.id)
+    )
+    await db.execute(
+        update(JudgmentCitationRelation)
+        .where(JudgmentCitationRelation.target_judgment_id == reported_row.id)
+        .values(target_judgment_id=unreported_row.id)
+    )
+
+    # Generic pointers are not foreign keys but must still follow the retained row.
+    await db.execute(
+        update(SourceProvenance)
+        .where(
+            SourceProvenance.promoted_table == "judgment",
+            SourceProvenance.promoted_id == reported_row.id,
+        )
+        .values(promoted_id=unreported_row.id)
+    )
+    await db.execute(
+        update(ScraperStaging)
+        .where(ScraperStaging.promoted_to_id == reported_row.id)
+        .values(promoted_to_id=unreported_row.id)
+    )
+
+    for obj in (
+        await db.execute(
+            select(ArchiveObject).where(
+                ArchiveObject.judgment_id.in_([unreported_row.id, reported_row.id])
+            )
+        )
+    ).scalars().all():
+        obj.judgment_id = unreported_row.id
+        obj.status = "superseded"
+        obj.error = "reported/unreported reconciliation; rewrite under reported citation"
+
+    await db.execute(
+        delete(EmbeddingQueue).where(
+            EmbeddingQueue.table_name == "judgment",
+            EmbeddingQueue.record_id.in_([unreported_row.id, reported_row.id]),
+        )
+    )
+
+    # Promote the retained row to the reported representation.
+    unreported_row.canonical_citation = reported_citation
+    unreported_row.unreported = False
+    unreported_row.proceeding_type = None
+    unreported_row.case_title = reported_row.case_title or unreported_row.case_title
+    unreported_row.court_id = reported_row.court_id or unreported_row.court_id
+    unreported_row.court_name = reported_row.court_name or unreported_row.court_name
+    unreported_row.judge_names = reported_row.judge_names or unreported_row.judge_names
+    unreported_row.bench_size = reported_row.bench_size
+    unreported_row.bench_type = reported_row.bench_type
+    unreported_row.decision_date = reported_row.decision_date or unreported_row.decision_date
+    unreported_row.year = reported_row.year or unreported_row.year
+    unreported_row.reporter = reported_row.reporter
+    unreported_row.volume = reported_row.volume
+    unreported_row.page_number = reported_row.page_number
+    unreported_row.docket_number = reported_row.docket_number or unreported_row.docket_number
+    unreported_row.petitioner = reported_row.petitioner or unreported_row.petitioner
+    unreported_row.respondent = reported_row.respondent or unreported_row.respondent
+    unreported_row.full_text = reported_row.full_text
+    unreported_row.full_text_hash = canonical_text_hash(reported_row.full_text or "")
+    unreported_row.headnotes = reported_row.headnotes
+    unreported_row.statutes_cited = reported_row.statutes_cited
+    unreported_row.citations_cited = reported_row.citations_cited
+    unreported_row.access_method = reported_row.access_method
+    unreported_row.source_name = reported_row.source_name
+    unreported_row.source_url = reported_row.source_url
+    unreported_row.source_provenance_id = reported_row.source_provenance_id
+    unreported_row.original_document_id = reported_row.original_document_id
+    unreported_row.has_original_pdf = reported_row.has_original_pdf
+    unreported_row.confidence_score = reported_row.confidence_score
+    unreported_row.extraction_engine = reported_row.extraction_engine
+
+    db.add(
+        EmbeddingQueue(
+            record_id=unreported_row.id,
+            table_name="judgment",
+            access_method=unreported_row.access_method or "public",
+            embedding_model=settings.EMBEDDING_MODEL,
+            embedding_dimensions=settings.EMBEDDING_DIM,
+        )
+    )
+    await db.delete(reported_row)
+    await db.flush()
+    return unreported_row
+
+
+async def reconcile_reported_unreported_once(db: AsyncSession, *, limit: int = 100) -> Dict[str, int]:
+    """Nightly deterministic sweep for older duplicate pairs created before promotion-time reconciliation."""
+    reported_rows = (
+        await db.execute(
+            select(Judgment)
+            .where(
+                Judgment.unreported.is_(False),
+                Judgment.docket_number.isnot(None),
+                Judgment.full_text.isnot(None),
+            )
+            .order_by(Judgment.promoted_at.desc())
+            .limit(max(1, int(limit)))
+        )
+    ).scalars().all()
+    matched = merged = ambiguous = 0
+    for reported in reported_rows:
+        court = await db.get(Court, reported.court_id) if reported.court_id else None
+        candidate = await _find_unreported_version_of_reported(
+            db,
+            docket_number=reported.docket_number,
+            decision_date=reported.decision_date,
+            court=court,
+            full_text=reported.full_text or "",
+        )
+        if candidate is None:
+            continue
+        matched += 1
+        # _find_unreported_version_of_reported already refuses near-equal ambiguous candidates.
+        try:
+            async with db.begin_nested():
+                await _merge_reported_duplicate_into_unreported(
+                    db,
+                    unreported_row=candidate,
+                    reported_row=reported,
+                )
+            merged += 1
+        except Exception:
+            logger.exception(
+                "reported/unreported reconciliation failed: reported=%s unreported=%s",
+                reported.canonical_citation,
+                candidate.canonical_citation,
+            )
+            ambiguous += 1
+    return {"reported_scanned": len(reported_rows), "matched": matched, "merged": merged, "ambiguous_or_failed": ambiguous}
+
+
+@shared_task(name="scraper.tasks.promotion.reconcile_reported_unreported")
+def reconcile_reported_unreported(limit: int = 100):
+    async def _run():
+        async with SessionLocal() as db:
+            result = await reconcile_reported_unreported_once(db, limit=limit)
+            await db.commit()
+            return result
+
+    return run_async(_run())
 
 
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
@@ -258,6 +567,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
     dd = data.get("decision_date")
     decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
+    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     case_number = proceeding = None
     if unreported:
         if st.source_name in SOURCE_COURT_CODE:
@@ -278,8 +588,25 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     else:
         canonical = cits[0]
         parts = _parse_citation_parts(canonical)
-    # dedupe by identity and by content
-    existing = (await db.execute(select(Judgment).where((Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)))).scalars().first()
+    # Dedupe by identity/content first. A reported judgment may also be the same court-site
+    # judgment previously stored as unreported even where reporter formatting changed the text hash.
+    existing = (
+        await db.execute(
+            select(Judgment).where(
+                (Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)
+            )
+        )
+    ).scalars().first()
+    reconciled_unreported = False
+    if existing is None and not unreported and cits and meta is not None:
+        existing = await _find_unreported_version_of_reported(
+            db,
+            docket_number=meta.docket_number,
+            decision_date=decision_date,
+            court=court,
+            full_text=full_text,
+        )
+        reconciled_unreported = existing is not None
     if existing is None:
         # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
         # just means that string is not ours to attach: drop it and promote under the canonical one.
@@ -385,18 +712,62 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             if st.route_json and st.route_json not in routes:
                 routes.append(st.route_json)
                 prov.routes = routes
-        if getattr(existing, "unreported", False) and cits and existing.full_text_hash == text_hash:
-            # the same judgment, entered as unreported, now arrives with a citation of its own: it takes that
-            # citation as its identity; the unreported identity stays as an alias, so earlier links still resolve
+        if getattr(existing, "unreported", False) and cits and (
+            existing.full_text_hash == text_hash or reconciled_unreported
+        ):
+            # The same judgment, entered from the court site as unreported, now has its reporter citation.
+            # Keep one judgment row: preserve the old unreported identity as an alias, then reclassify this
+            # row under the reported citation and refresh it from the reported source.
             taken = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
             if taken is None and (await db.execute(select(Judgment.id).where(Judgment.canonical_citation == canonical))).first() is None:
-                db.add(Citation(judgment_id=existing.id, citation_string=existing.canonical_citation[:200], raw_string=existing.canonical_citation, is_primary=False, source_evidence="unreported identity before a citation was known"))
+                old_identity = existing.canonical_citation
+                db.add(
+                    Citation(
+                        judgment_id=existing.id,
+                        citation_string=old_identity[:200],
+                        raw_string=old_identity,
+                        is_primary=False,
+                        source_evidence="unreported identity before a citation was known",
+                    )
+                )
                 cparts = _parse_citation_parts(canonical)
                 existing.canonical_citation = canonical
                 existing.unreported = False
                 existing.reporter, existing.page_number = cparts["reporter"], cparts["page"]
-                existing.year = existing.year or cparts["year"]
-                db.add(Citation(judgment_id=existing.id, citation_string=canonical, raw_string=canonical, reporter=cparts["reporter"], year=cparts["year"], page=cparts["page"], is_primary=True, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
+                existing.year = cparts["year"] or existing.year
+                existing.case_title = data.get("case_title") or existing.case_title
+                existing.court_id = court.id if court else existing.court_id
+                existing.court_name = court.name if court else (data.get("court") or existing.court_name)
+                existing.judge_names = data.get("judge_names") or existing.judge_names
+                existing.decision_date = decision_date or existing.decision_date
+                existing.docket_number = (meta.docket_number if meta else None) or existing.docket_number
+                existing.full_text = full_text
+                existing.full_text_hash = text_hash
+                existing.headnotes = data.get("headnotes") or existing.headnotes
+                existing.statutes_cited = data.get("statutes_cited") or existing.statutes_cited
+                existing.citations_cited = data.get("citations_cited") or existing.citations_cited
+                existing.access_method = st.access_method
+                existing.source_name = st.source_name
+                existing.source_url = st.source_url
+                existing.source_provenance_id = st.provenance_id
+                existing.original_document_id = st.pdf_provenance_id
+                existing.has_original_pdf = st.pdf_provenance_id is not None
+                existing.confidence_score = st.confidence_score or existing.confidence_score
+                existing.extraction_engine = st.extraction_engine
+                db.add(
+                    Citation(
+                        judgment_id=existing.id,
+                        citation_string=canonical,
+                        raw_string=canonical,
+                        reporter=cparts["reporter"],
+                        year=cparts["year"],
+                        page=cparts["page"],
+                        is_primary=True,
+                        source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500],
+                    )
+                )
+                await _retire_unreported_reading(db, existing.id)
+                await _supersede_old_archive_layout(db, existing.id)
                 await db.flush()
         # alternate citations learned from another route
         known = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == existing.id))).scalars().all()}
@@ -409,7 +780,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await db.flush()
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
-    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     j = Judgment(
         docket_number=meta.docket_number if meta else case_number,
         unreported=unreported,

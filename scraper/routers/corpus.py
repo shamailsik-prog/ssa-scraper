@@ -328,21 +328,44 @@ async def get_judgment(judgment_id: UUID, db: AsyncSession = Depends(get_db)) ->
     cites = (
         await db.execute(select(Citation).where(Citation.judgment_id == judgment_id).order_by(Citation.is_primary.desc()))
     ).scalars().all()
-    from scraper.models import JudgmentReading
+    from scraper.models import JudgmentReading, JudgmentReadingVersion
 
     rd = await db.get(JudgmentReading, judgment_id)
+    rv = (
+        await db.execute(
+            select(JudgmentReadingVersion)
+            .where(JudgmentReadingVersion.judgment_id == judgment_id, JudgmentReadingVersion.is_current.is_(True))
+            .order_by(JudgmentReadingVersion.attempt_no.desc())
+            .limit(1)
+        )
+    ).scalars().first()
     reading = None
     if rd is not None and rd.status == "read":
         reading = {
-            "machine_reading": True,  # the reading agent's tags, not a headnote: always read with the judgment
+            "machine_reading": True,  # machine analysis, never a substitute for the judgment itself
             "laws": rd.laws or [],
             "points": rd.points or [],
             "interpretation": rd.interpretation,
+            "interpretation_evidence": rd.interpretation_evidence or [],
             "turns_on": rd.turns_on,
+            "turns_on_evidence": rd.turns_on_evidence or [],
             "subjects": rd.subjects or [],
             "outcome": rd.outcome,
+            "outcome_evidence": rd.outcome_evidence,
             "model": rd.model,
+            "prompt_version": rd.prompt_version,
+            "taxonomy_version": rd.taxonomy_version,
+            "judgment_text_hash": rd.judgment_text_hash,
             "read_at": rd.read_at.isoformat() if rd.read_at else None,
+            "audit": {
+                "attempt_no": rv.attempt_no if rv else None,
+                "provider": rv.provider if rv else None,
+                "input_tokens": rv.input_tokens if rv else 0,
+                "output_tokens": rv.output_tokens if rv else 0,
+                "latency_ms": rv.latency_ms if rv else 0,
+                "chunk_count": rv.chunk_count if rv else 1,
+                "parse_repair_used": bool(rv.parse_repair_used) if rv else False,
+            },
         }
     return {
         "reading": reading,

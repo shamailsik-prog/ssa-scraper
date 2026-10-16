@@ -36,7 +36,6 @@ from scraper.models import (
 )
 from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemoryState, check_rss_limits
 from scraper.pls_search_harvest_core import (
-    SEARCH_HARVEST_SLOTS,
     build_harvest_form_values,
     CASE_KEY_PREFIX,
     citation_keys_for_row,
@@ -49,7 +48,6 @@ from scraper.pls_search_harvest_core import (
     partition_rows_by_known,
     search_harvest_may_mark_done,
     reporters_for_plan,
-    slot1_reporter_share,
     cited_citations_in_text,
     is_capped,
     iter_extended_plan_queries,
@@ -255,7 +253,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     and year, the site-total comparison, and a random known-citation test against the corpus."""
     from sqlalchemy import func
 
-    from scraper.models import Citation, Judgment
+    from scraper.models import Citation, CrawlFrontier, Judgment, SpotCheck, Statute, StatuteSection
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
@@ -270,6 +268,67 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     holes = {k: v for k, v in holes.items() if v}
     sample = (await db.execute(select(Judgment.canonical_citation).where(Judgment.source_name == SOURCE_NAME).order_by(func.random()).limit(known_sample))).scalars().all()
     known = await load_known_citation_keys(db, set(sample)) if sample else set()
+    known_sample_found = len(known & set(sample))
+    known_sample_ok = bool(sample) and known_sample_found == len(sample)
+
+    provision_rows = (
+        await db.execute(
+            select(StatuteSection.section_number, Statute.short_name, Statute.name)
+            .join(Statute, Statute.id == StatuteSection.statute_id)
+        )
+    ).all()
+    expected_tier2_keys = {
+        fit_key(f"t2:{short_name or statute_name}:{section_number}")
+        for section_number, short_name, statute_name in provision_rows
+    }
+    actual_tier2_keys = set(
+        (
+            await db.execute(
+                select(CrawlFrontier.query_key).where(
+                    CrawlFrontier.source_name == SOURCE_NAME,
+                    CrawlFrontier.tier == 2,
+                )
+            )
+        ).scalars().all()
+    )
+    missing_tier2_keys = sorted(expected_tier2_keys - actual_tier2_keys)
+    statute_sections = len(expected_tier2_keys)
+    tier2_seeded = len(actual_tier2_keys & expected_tier2_keys)
+    tier2_missing = len(missing_tier2_keys)
+    now = datetime.now(timezone.utc)
+    fresh_due = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(CrawlFrontier)
+                .where(
+                    CrawlFrontier.source_name == SOURCE_NAME,
+                    CrawlFrontier.tier == 4,
+                    CrawlFrontier.status.in_(("pending", "in_progress")),
+                    (CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    verifier_rows = (
+        await db.execute(
+            select(SpotCheck.result, func.count())
+            .where(
+                SpotCheck.kind == "coverage",
+                SpotCheck.checked_at >= now - timedelta(hours=24),
+            )
+            .group_by(SpotCheck.result)
+        )
+    ).all()
+    verifier = {result: int(count) for result, count in verifier_rows}
+    verifier_matches = int(verifier.get("match", 0))
+    verifier_misses = int(verifier.get("differs", 0))
+    verifier_no_verdict = sum(
+        int(verifier.get(status, 0))
+        for status in ("skipped", "unreachable", "login_required")
+    )
+
     return {
         "queue": status_counts,
         "done_but_capped": capped_open,
@@ -277,8 +336,39 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         "site_total_done_queries": int(totals[0]),
         "rows_known_done_queries": int(totals[1]),
         "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
-        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
-        "complete": bool(status_counts.get("pending", 0) + status_counts.get("in_progress", 0) + status_counts.get("failed", 0) + capped_open == 0 and not holes),
+        "known_citation_test": {
+            "sampled": len(sample),
+            "found": known_sample_found,
+            "passed": known_sample_ok,
+        },
+        "tier2_provision_coverage": {
+            "statute_sections": statute_sections,
+            "frontiers_seeded": tier2_seeded,
+            "missing": tier2_missing,
+            "missing_examples": missing_tier2_keys[:20],
+        },
+        "fresh_lane": {"due_now": fresh_due},
+        "account2_coverage_verifier": {
+            "last_24h_attempts": sum(verifier.values()),
+            "matches": verifier_matches,
+            "misses": verifier_misses,
+            "no_verdict": verifier_no_verdict,
+            "demonstrated": verifier_matches > 0 and verifier_misses == 0 and verifier_no_verdict == 0,
+        },
+        "complete": bool(
+            status_counts.get("pending", 0)
+            + status_counts.get("in_progress", 0)
+            + status_counts.get("failed", 0)
+            + capped_open
+            == 0
+            and not holes
+            and known_sample_ok
+            and tier2_missing == 0
+            and fresh_due == 0
+            and verifier_matches > 0
+            and verifier_misses == 0
+            and verifier_no_verdict == 0
+        ),
     }
 
 
@@ -360,10 +450,8 @@ def _reporter_sql():
 
 
 def _share_filter(slot: int):
-    share = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_SLOT1_REPORTERS))
-    if slot == 1:
-        return _reporter_sql().in_(share) if share else false()
-    return _reporter_sql().notin_(share) if share else true()
+    """Owner ruling 16 Oct 2026: Account 1 owns the complete acquisition ledger; Account 2 owns none."""
+    return true() if int(slot) == 1 else false()
 
 
 async def pick_next_query(
@@ -372,7 +460,6 @@ async def pick_next_query(
     query_key: Optional[str] = None,
     priority_gaps: bool = False,
     slot: Optional[int] = None,
-    take_over: bool = False,
 ) -> Optional[PlsSearchHarvestQuery]:
     """The next ledger row to work, without taking it (see claim_next_query). `priority_gaps` is accepted from
     ticks queued before 13 October 2026 and no longer changes the order: gap-first put every row with an unknown
@@ -390,7 +477,7 @@ async def pick_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if slot in SEARCH_HARVEST_SLOTS and not take_over:
+    if slot is not None:
         stmt = stmt.where(_share_filter(slot))
     return (await db.execute(_pick_order(stmt).limit(1))).scalars().first()
 
@@ -404,19 +491,17 @@ async def claim_next_query(
     slot: int,
     *,
     redis_client=None,
-    take_over: bool = False,
     candidates: int = 25,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
-    """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
-    tick. The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
+    """Take the next ledger row owned by the requested acquisition slot. Account 2 owns no acquisition rows.
+    The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
     after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None)."""
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if not take_over:
-        stmt = stmt.where(_share_filter(slot))
+    stmt = stmt.where(_share_filter(slot))
     rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
         lock = _query_lock(row.id, redis_client)
@@ -433,31 +518,6 @@ async def claim_next_query(
         return row, lock
     await db.commit()  # ends the transaction that held the candidates' row locks
     return None, None
-
-
-def _slot_known_good_at(slot_row: BrowserSessionSlot) -> Optional[datetime]:
-    seen = [t for t in (slot_row.last_used_at, slot_row.last_verified_at, slot_row.logged_in_at) if t is not None]
-    return max(seen) if seen else slot_row.updated_at
-
-
-async def slot_takeover_due(db: AsyncSession, slot: int, *, now: Optional[datetime] = None) -> bool:
-    """True when the other login has been logged out (not ACTIVE) for PLS_SEARCH_HARVEST_TAKEOVER_MINUTES, counted
-    from the last time it was known to work, so `slot` may also work the other slot's share."""
-    other = 2 if slot == 1 else 1
-    row = (
-        await db.execute(
-            select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == SOURCE_NAME, BrowserSessionSlot.slot_number == other)
-        )
-    ).scalars().first()
-    if row is None:
-        return True  # there is no other login at all: its share is nobody's but this one's
-    if row.state == "ACTIVE":
-        return False
-    since = _slot_known_good_at(row)
-    if since is None:
-        return True
-    now = now or datetime.now(timezone.utc)
-    return now - since >= timedelta(minutes=int(settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES))
 
 
 class SearchHarvestRunner:
@@ -477,8 +537,8 @@ class SearchHarvestRunner:
         self.memory = PlsBrowserMemoryState()
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
-        # the 30-minute spot check of three promoted judgments runs between this run's pages, on its login
-        self.spot_check_between_pages = True
+        # Verification is Account-2-only. Acquisition never substitutes its own session for the verifier.
+        self.spot_check_between_pages = False
 
     async def _pace_sleep(self) -> None:
         lo = float(self.pacing_profile["login_delay_min"])
@@ -499,22 +559,9 @@ class SearchHarvestRunner:
             logger.info("PLS search harvest recycled browser after memory/window guard")
 
     async def _maybe_spot_check(self) -> None:
-        """Between two pages: when the 30-minute spot-check turn is free, check three promoted judgments on this
-        run's own login. The beat task found the login lock held by a harvest at every turn and never ran."""
-        if self.dry_run or not getattr(self, "spot_check_between_pages", False):
-            return
-        from scraper.tasks.spot_check import check_judgments_between_pages, claim_spot_check_turn
+        """Verification is a separate Account-2 task; harvester pages never claim its verification turn."""
+        return
 
-        try:
-            if not await claim_spot_check_turn(getattr(self.pipeline, "redis_client", None)):
-                return
-            results = await check_judgments_between_pages(self.db, self.pipeline)
-            await self.db.commit()
-            logger.info("PLS search harvest: spot check between pages: %s", results)
-        except (LoginRequired, PacingBudgetExceeded):
-            raise
-        except Exception as exc:  # a spot check never ends the harvest
-            logger.warning("PLS search harvest: spot check between pages failed: %s", exc)
 
     async def run_query(
         self,
@@ -817,17 +864,20 @@ async def run_search_harvest(
     redis_client=None,
     job_id=None,
 ) -> Dict[str, Any]:
-    """One search-harvest tick on one login. Login 1 and login 2 harvest at the same time (owner's decision of
-    13 October 2026, handbook R3.1): each tick holds its own slot's singleton lock, works only ledger rows of its own
-    reporter share, and opens only its own login. A slot that has been logged out for
-    PLS_SEARCH_HARVEST_TAKEOVER_MINUTES has its share taken over by the other. A tick queued with no slot (the CLI,
-    or one queued before this change) takes the first ACTIVE slot whose harvest is free."""
+    """One search-harvest tick on Account 1.
+
+    Owner ruling 16 October 2026: slot 1 is acquisition; slot 2 is an independent verifier.
+    No takeover or manual fallback may turn the verifier account into an acquisition account.
+    """
     if not settings.login_scraping_effective:
         return {"skipped": True, "reason": "login scraping not permitted in this environment"}
     source = await _source_row(db)
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": True, "reason": f"source state {source.state}"}
-    slots = [int(slot)] if slot in SEARCH_HARVEST_SLOTS else list(SEARCH_HARVEST_SLOTS)
+    harvest_slot = 1
+    if slot is not None and int(slot) != harvest_slot:
+        return {"skipped": True, "reason": f"slot {slot} is reserved for independent verification", "slot": int(slot)}
+    slots = [harvest_slot]
 
     harvest_lock: Optional[SessionLock] = None
     chosen: Optional[int] = None
@@ -835,7 +885,7 @@ async def run_search_harvest(
     for n in slots:
         state = await _slot_state(db, n)
         if state != "ACTIVE":
-            reasons.append(f"slot {n} is {state or 'missing'}; the other slot takes over its share after {settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES} minutes")
+            reasons.append(f"harvester slot {n} is {state or 'missing'}; verifier slot is never used for acquisition")
             continue
         # one harvest per slot (R3.7): a second tick for the same slot exits at once
         candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1)
@@ -856,7 +906,6 @@ async def run_search_harvest(
     slot_lock: Optional[SessionLock] = None
     runner: Optional[SearchHarvestRunner] = None
     query_row: Optional[PlsSearchHarvestQuery] = None
-    took_over = False
     try:
         if query_key:
             query_row = await pick_next_query(db, query_key=query_key)
@@ -870,9 +919,6 @@ async def run_search_harvest(
                 await db.commit()
         else:
             query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
-            if query_row is None and await slot_takeover_due(db, chosen):
-                took_over = True
-                query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
         if query_row is None:
             return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
         m = await active_map(db, SOURCE_NAME)
@@ -919,7 +965,7 @@ async def run_search_harvest(
             search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
-        return {**result, "slot": chosen, "took_over": took_over}
+        return {**result, "slot": chosen}
     except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit, LoginRequired) as exc:
         if query_row is not None:
             query_row.status = "pending"
@@ -946,16 +992,17 @@ def _continue_slot(result: Dict[str, Any]) -> Optional[int]:
     if result.get("skipped") or result.get("paused") or not result.get("query_key"):
         return None
     slot = result.get("slot")
-    return int(slot) if slot in SEARCH_HARVEST_SLOTS else None
+    return 1 if slot == 1 else None
 
 
-def queue_search_harvest_ticks(app, *, slots=SEARCH_HARVEST_SLOTS) -> List[int]:
-    """Queue one search-harvest tick per login slot on the login queue. Harvest ticks never expire (R3.7): a tick
-    that finds its slot's harvest already running exits at once, so queued ticks cannot pile up into work."""
+def queue_search_harvest_ticks(app, *, slots=(1,)) -> List[int]:
+    """Queue acquisition only on Account 1. Account 2 is reserved for independent verification."""
     queued: List[int] = []
     for n in slots:
-        app.send_task("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", kwargs={"slot": int(n)}, queue="login_session")
-        queued.append(int(n))
+        if int(n) != 1:
+            continue
+        app.send_task("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", kwargs={"slot": 1}, queue="login_session")
+        queued.append(1)
     return queued
 
 

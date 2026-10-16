@@ -139,7 +139,7 @@ async def _activate_pls_slots(db, slots):
     await db.flush()
 
 
-async def test_dispatch_due_sources_enqueues_two_reporter_shards_when_concurrency_is_2(db, monkeypatch):
+async def test_dispatch_due_sources_uses_only_account1_when_both_accounts_are_active(db, monkeypatch):
     from scraper.harvest_mode import set_harvest_mode
     from scraper.tasks.celery_app import app
 
@@ -147,54 +147,40 @@ async def test_dispatch_due_sources_enqueues_two_reporter_shards_when_concurrenc
     sources = (await db.execute(select(ScraperSource))).scalars().all()
     for source in sources:
         source.next_scrape_at = now + timedelta(hours=1)
-    target = next((s for s in sources if s.source_name == "PakistanLawSite"), None)
-    assert target is not None
+    target = next(s for s in sources if s.source_name == "PakistanLawSite")
     target.next_scrape_at = now - timedelta(minutes=1)
     target.state = "ACTIVE"
     target.is_active = True
     await _activate_pls_slots(db, (1, 2))
     monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
-    await set_harvest_mode(db, "backfill", changed_by="qa", reason="shard enqueue")
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="account separation")
     await db.commit()
 
     queued = []
-
-    def fake_send_task(name, args=(), kwargs=None, queue=None):
-        queued.append((name, args, kwargs or {}, queue))
-
-    monkeypatch.setattr(app, "send_task", fake_send_task)
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None: queued.append((name, args, kwargs or {}, queue)),
+    )
     result = await dispatch_due_sources()
-    assert "PakistanLawSite:shard0" in result["queued"]
-    assert "PakistanLawSite:shard1" in result["queued"]
-    assert (
-        "scraper.tasks.dispatcher.run_login_session_job",
-        ("PakistanLawSite",),
-        {"reporter_shard": 0},
-        "login_session",
-    ) in queued
-    assert (
-        "scraper.tasks.dispatcher.run_login_session_job",
-        ("PakistanLawSite",),
-        {"reporter_shard": 1},
-        "login_session",
-    ) in queued
-
-
-async def test_run_source_allows_second_login_job_when_concurrency_is_2(db, monkeypatch):
-    from scraper.harvest_mode import set_harvest_mode
-
-    source = (
-        await db.execute(
-            select(ScraperSource).where(
-                ScraperSource.source_name == "PakistanLawSite",
-            )
+    assert result["queued"] == ["PakistanLawSite"]
+    assert queued == [
+        (
+            "scraper.tasks.dispatcher.run_login_session_job",
+            ("PakistanLawSite",),
+            {"reporter_shard": None},
+            "login_session",
         )
+    ]
+
+
+async def test_run_source_does_not_allow_second_pls_acquisition_job_when_verifier_is_active(db, monkeypatch):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))
     ).scalars().first()
-    assert source is not None
     source.state = "ACTIVE"
     source.is_active = True
-    await _activate_pls_slots(db, (1, 2))  # a second job needs a second human login
-    await set_harvest_mode(db, "backfill", changed_by="qa", reason="dual lock holders")
+    await _activate_pls_slots(db, (1, 2))
     running = ScraperJob(
         source_id=source.id,
         source_name=source.source_name,
@@ -204,27 +190,8 @@ async def test_run_source_allows_second_login_job_when_concurrency_is_2(db, monk
     )
     db.add(running)
     await db.commit()
-
-    async def fake_connector_for(_source):
-        async def fake_connector(_source_obj, _db, **_kwargs):
-            return {"pages": 1, "staged": 1}
-
-        return fake_connector
-
-    monkeypatch.setattr(dispatcher, "_connector_for", fake_connector_for)
     result = await run_source(source.source_name, reporter_shard=1)
-    assert result["staged"] == 1
-    running_jobs = (
-        await db.execute(
-            select(func.count())
-            .select_from(ScraperJob)
-            .where(
-                ScraperJob.source_name == source.source_name,
-                ScraperJob.status == "running",
-            )
-        )
-    ).scalar()
-    assert running_jobs == 1
+    assert result["skipped"] == "already_running"
 
 
 async def test_dispatch_due_sources_runs_one_unsharded_job_when_only_one_slot_is_active(db, monkeypatch):
@@ -254,7 +221,7 @@ async def test_dispatch_due_sources_runs_one_unsharded_job_when_only_one_slot_is
     monkeypatch.setattr(app, "send_task", fake_send_task)
     result = await dispatch_due_sources()
     assert result["queued"] == ["PakistanLawSite"]
-    assert queued == [("scraper.tasks.dispatcher.run_login_session_job", ("PakistanLawSite",), {}, "login_session")]
+    assert queued == [("scraper.tasks.dispatcher.run_login_session_job", ("PakistanLawSite",), {"reporter_shard": None}, "login_session")]
 
 
 async def test_run_source_retires_running_job_without_heartbeat(db, monkeypatch):
@@ -296,9 +263,8 @@ async def test_run_source_keeps_running_job_with_recent_heartbeat(db):
     assert result == {"skipped": "already_running", "job_id": str(live.id)}
 
 
-async def test_login_session_max_active_is_capped_by_active_slots(db, monkeypatch):
-    """Backfill targets two login-session workers, but every concurrent browser needs its own human
-    login: with one ACTIVE slot only one job may run (two browsers on one login end each other)."""
+async def test_login_session_max_active_keeps_pls_acquisition_at_one_even_with_verifier_active(db, monkeypatch):
+    """Account 2 does not increase acquisition concurrency because it is verification-only."""
     from scraper.harvest_mode import set_harvest_mode
 
     monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
@@ -309,7 +275,7 @@ async def test_login_session_max_active_is_capped_by_active_slots(db, monkeypatc
 
     await _activate_pls_slots(db, (2,))
     await db.commit()
-    assert await dispatcher._login_session_max_active(db, "PakistanLawSite") == 2
+    assert await dispatcher._login_session_max_active(db, "PakistanLawSite") == 1
 
 
 async def test_dispatch_due_sources_does_not_queue_second_job_on_single_slot(db, monkeypatch):
@@ -361,16 +327,13 @@ async def _prepare_pls_due(db, slots):
     return target
 
 
-async def test_dispatch_starts_only_the_missing_shard_when_one_shard_is_running(db, monkeypatch):
-    """Slot 2 recovered while shard 0 still runs on slot 1: only shard 1 is started, never a second
-    browser for shard 0."""
+async def test_dispatch_starts_no_second_pls_job_beside_account1_harvester(db, monkeypatch):
     from scraper.harvest_mode import set_harvest_mode
     from scraper.tasks.celery_app import app
 
     target = await _prepare_pls_due(db, (1, 2))
     monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
-    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
-    await set_harvest_mode(db, "backfill", changed_by="qa", reason="one shard running")
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="account1 already running")
     db.add(
         ScraperJob(
             source_id=target.id,
@@ -378,14 +341,15 @@ async def test_dispatch_starts_only_the_missing_shard_when_one_shard_is_running(
             job_type="scrape",
             status="running",
             started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
-            result_summary={"reporter_shard": 0, "pages_charged": 12},
+            result_summary={"reporter_shard": None, "pages_charged": 12},
         )
     )
     await db.commit()
     queued = []
-    monkeypatch.setattr(app, "send_task", lambda name, args=(), kwargs=None, queue=None: queued.append((kwargs or {}).get("reporter_shard")))
+    monkeypatch.setattr(app, "send_task", lambda *args, **kwargs: queued.append((args, kwargs)))
     result = await dispatch_due_sources()
-    assert result["queued"] == ["PakistanLawSite:shard1"] and queued == [1]
+    assert result["queued"] == []
+    assert queued == []
 
 
 async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monkeypatch):

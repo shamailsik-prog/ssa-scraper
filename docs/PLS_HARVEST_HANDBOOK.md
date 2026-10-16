@@ -1,6 +1,6 @@
 # PakistanLawSite Complete-Harvest Handbook
 
-**Owner:** Shamail Sikander | **System:** SSA scraper (repo `shamailsik-prog/ssa-scraper`, branch `claude/ssh-scraper-performance-ks50bv`) | **Version:** 1.0, 12 October 2026
+**Owner:** Shamail Sikander | **System:** SSA scraper (repo `shamailsik-prog/ssa-scraper`) | **Version:** 2.0, 16 October 2026
 
 **Who this is for:** Shamail (owner, lawyer, not a coder) and Claude Code (sole engineer). New Bot (ops) and Scraper Auditor (read-only audits) follow it too. Where this handbook and older notes disagree, this handbook wins. Where this handbook and Shamail's design disagree, Shamail's design wins.
 
@@ -27,7 +27,7 @@ Parsing gaps caused the rest: spaced "P L D", missing reporters (PLC, CLD, GBLR)
 - Check the DB before opening any judgment.
 - Keep a coverage ledger per reporter × year.
 - Split capped searches by court, then by page range.
-- Give each of the two login slots its own reporter share, with no overlap.
+- Keep the two PLS accounts independent: Account 1 harvests; Account 2 verifies judgments and challenges coverage. Account 2 never acquires corpus data on behalf of Account 1.
 - Snowball the citations found inside judgments as a cross-check.
 - Use judge and keyword searches only for gaps left at the end.
 
@@ -52,7 +52,7 @@ We make progress durable (commit per row, deploys that drain rather than kill), 
 
 > Acceptance test: the daily coverage report (R6.6) shows `gap = site_total − stored − quarantined_explained = 0` and `status = done` for that row, and an Auditor spot check of 10 random citations from the site finds all 10 in the DB.
 
-**R1.3 Whole-corpus done** means every reporter × year from the earliest year on the site to the current year is `done`. Current-year rows are reopened weekly (R2.12), because new judgments keep being published.
+**R1.3 Whole-corpus done** means every reporter × year from the earliest year on the site to the current year is `done`, every promoted statute section has a Tier-2 discovery frontier, no due Tier-4 fresh wave remains, and Account 2 has performed a recent coverage challenge with zero misses. Current-year rows remain continuously reopenable because new judgments keep being published.
 
 **R1.4 Stored means four things:** the text is in the DB, it passed the quality gates (Section 5), it is mirrored to Drive (Section 8), and it is embedded. A judgment that is in the DB but missing on Drive counts as stored-but-unmirrored, and the reconcile job (R8.3) repairs it.
 
@@ -153,33 +153,39 @@ Judge and keyword searches are never part of normal enumeration.
 
 ## 3. Session and slot management
 
-### 3.1 The two slots
+### 3.1 The two accounts
 
-**R3.1 Two login slots, each with its own reporter share, with no overlap.** Shares are in config and balanced by expected volume (*example*: Slot A gets PLD, SCMR, CLC, YLR, PTD, GBLR, PLJ; Slot B gets PLC, PLC(CS), PCrLJ, MLD, CLD, plus the others). No reporter appears in both shares. Ledger rows carry `slot`, and a tick may only take rows for its own slot.
+**R3.1 Fixed roles, no cross-over.** Account/slot 1 is the acquisition account. Account/slot 2 is
+the independent verification account. Search harvest, citation-grid harvest and case-ID walks run
+only on Account 1. Account 2 never takes over acquisition when Account 1 is unavailable. Likewise,
+verification never falls back to Account 1.
 
-> Acceptance test: a config check asserts the two shares do not intersect and together cover the whole dropdown. A DB check finds no ledger row touched by both slots in the same day.
+> Acceptance test: scheduler, dispatcher, continuation helpers and manual task entry points refuse
+> acquisition work on slot 2. Verification tests assert every verifier browser call uses slot 2.
 
-**R3.2 Health probe every 5 minutes per slot.** The probe makes a cheap authenticated request (e.g. load the search page and confirm the logged-in marker). It records `slot_ok`, latency and `last_ok_at`. A failed probe triggers R3.3. The probe runs outside the login queue, so it can never block a harvest.
+**R3.2 Independent verification.** At each verifier cycle Account 2 performs both:
 
-**R3.3 Automatic re-login, never ask a human.** After a probe failure or a logged-out page, the server logs in again with the saved credentials (held in the server's secret store, never in code or logs). It allows at most 3 attempts with backoff (1, 5, 15 min). If all 3 fail, the slot is set to `blocked: login` and an alert goes out. A login-expired event (like the one after 16 h of downtime) needs no human action.
+1. **Document verification:** randomly select promoted PLS judgments, open each live source and compare
+   substantive text and identity with the corpus.
+2. **Coverage challenge:** randomly select search queries already marked `done`, re-run them independently,
+   and compare live result identities against corpus/staging. Any missing identity reopens the affected
+   query to `pending`; no human has to notice the omission first.
 
-> Acceptance test: invalidate a slot's session cookie in staging. Within 10 minutes the probe recovers it, with no human action logged.
+A verifier run that cannot authenticate, cannot express the query, or cannot identify live result
+keys records **no completeness verdict**. Silence is never treated as proof of completeness.
 
-**R3.4 Rate limits and politeness.** For each slot:
+**R3.3 Session recovery preserves role separation.** Saved credentials may re-authenticate each account,
+but recovery never changes the account's role. If Account 1 fails, harvesting pauses. If Account 2
+fails, completeness becomes unverified until independent checking resumes. Neither condition authorises
+borrowing the other account.
 
-- Wait at least a few seconds between requests, with random jitter. Claude sets the exact value in config and must not lower it without Shamail's approval.
-- Only one request in flight at a time.
-- Back off on HTTP 429/5xx or captcha pages.
-- Pause for a night window if the site slows down.
+**R3.4 Rate limits and politeness.** Each account has its own pacing counters. Only one request is in
+flight per account. Back off on HTTP 429/5xx and stop on CAPTCHA, suspension or explicit automated-access
+warnings. No proxy, stealth or technical-control bypass is permitted.
 
-The rate target is steady throughput (currently about 130–240 judgments an hour), not peak speed.
-
-**R3.5 Lockout risk.** PLS is a paid subscription with only 2 login slots. Losing it is the worst outcome. To protect it:
-
-- Never log in from a third place (laptop, bot, or a parallel container) while the server holds both slots.
-- Never run two workers on the same slot.
-- Stop a slot immediately if the site shows a warning, a captcha, or "session in use elsewhere".
-- Never try to defeat a technical control (captcha, IP blocking).
+**R3.5 Lockout risk.** PLS is a paid subscription with two accounts. Never open a second browser on one
+account while its worker holds that session. Never use a third login location while the server holds
+the account. Account separation is a correctness control as well as an operational control.
 
 ### 3.2 Keeping the login queue free
 
@@ -187,14 +193,12 @@ The rate target is steady throughput (currently about 130–240 judgments an hou
 
 | Queue | Jobs | Needs login? |
 |---|---|---|
-| `harvest_slotA`, `harvest_slotB` | Harvest ticks (grid page + fetch unknown rows) | Yes |
-| `probe` | Slot health probes, canary | Yes (cheap and short) |
-| `parse` | Parsing, quality gates, re-parse backfills | No |
-| `promote` | Promotion from staging to the main DB | No |
-| `mirror` | Drive mirror, reconcile | No |
-| `embed` | Embeddings | No |
-| `maint` | Maintenance, reports, ledger planner | No |
-| `public` | PakistanCode, court and assembly sites | No (not PLS) |
+| `login_session` | Account-1 PLS harvest/search/case-ID acquisition | Yes — Account 1 only |
+| `pls_verify` | Account-2 judgment checks + coverage challenges | Yes — Account 2 only |
+| `login_recovery` | role-preserving account recovery | Yes |
+| `maintenance` | promotion, reported↔unreported reconciliation, reports, archive reconcile | No |
+| `scraper` | public sources | No |
+| `embeddings` | embeddings | No |
 
 Grid-walk-only jobs and the case-ID walk run inside the harvest tick's time budget. They never run as separate long jobs that hold the slot.
 

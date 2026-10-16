@@ -176,6 +176,47 @@ async def test_an_unreported_judgment_that_later_gets_its_citation_takes_it(db, 
     assert old_identity in aliases and "2024 SCMR 77" in aliases
 
 
+
+async def test_later_reported_copy_with_formatting_differences_reuses_unreported_row(db, source):
+    """A reporter header/formatting change must not leave a second copy of the same court judgment."""
+    from scraper.models import Citation
+
+    first = await _held(db, source)
+    await release_unreported(db)
+    assert await promote_judgment_staging(db, first) == "promoted"
+    original = (await db.execute(select(Judgment).where(Judgment.id == first.promoted_to_id))).scalars().one()
+    original_id = original.id
+    old_identity = original.canonical_citation
+
+    reported_body = BODY + "  Reported copy formatting."
+    reported = await _held(db, source, body=reported_body)
+    reported.source_name = "PakistanLawSite"
+    reported.status, reported.quarantine_reason = "extracted", None
+    reported.reconciled_json = {
+        **(reported.reconciled_json or {}),
+        "citations": ["2024 SCMR 77"],
+    }
+    assert reported.raw_text_hash != original.full_text_hash
+
+    assert await promote_judgment_staging(db, reported) == "duplicate"
+    await db.flush()
+
+    judgments = (await db.execute(select(Judgment))).scalars().all()
+    matched = [j for j in judgments if j.id == original_id]
+    assert len(matched) == 1
+    j = matched[0]
+    assert j.canonical_citation == "2024 SCMR 77"
+    assert j.unreported is False
+    assert j.source_name == "PakistanLawSite"
+    aliases = {
+        row.citation_string
+        for row in (
+            await db.execute(select(Citation).where(Citation.judgment_id == original_id))
+        ).scalars().all()
+    }
+    assert old_identity in aliases and "2024 SCMR 77" in aliases
+
+
 async def test_an_older_hold_recorded_only_on_its_review_item_is_released(db, source):
     """Rows held before the reason was copied onto the staging row carry it only on the review item."""
     st = await _held(db, source)
@@ -253,3 +294,71 @@ async def test_migration_017_supersedes_archive_copies_left_under_the_old_court(
     status = {o.judgment_id: o.status for o in (await db.execute(select(ArchiveObject))).scalars().all()}
     assert status[moved_id] == "superseded"  # the mirror writes it again under the corrected court
     assert status[kept_id] == "written"  # already in the right folder: untouched
+
+
+async def test_nightly_reconciliation_collapses_preexisting_reported_unreported_pair(db, source):
+    """Historical duplicate pairs are collapsed conservatively while retaining the earlier row id."""
+    from scraper.fetchers import canonical_text_hash
+    from scraper.models import Citation
+    from scraper.tasks.promotion import reconcile_reported_unreported_once
+
+    staged = await _held(db, source)
+    await release_unreported(db)
+    assert await promote_judgment_staging(db, staged) == "promoted"
+    unreported = (
+        await db.execute(select(Judgment).where(Judgment.id == staged.promoted_to_id))
+    ).scalars().one()
+    retained_id = unreported.id
+    old_identity = unreported.canonical_citation
+
+    reported_text = (unreported.full_text or "") + " Reporter formatting note."
+    reported = Judgment(
+        canonical_citation="2024 SCMR 88",
+        full_text=reported_text,
+        full_text_hash=canonical_text_hash(reported_text),
+        court_id=unreported.court_id,
+        court_name=unreported.court_name,
+        decision_date=unreported.decision_date,
+        year=2024,
+        reporter="SCMR",
+        page_number=88,
+        docket_number=unreported.docket_number,
+        case_title=unreported.case_title,
+        source_name="PakistanLawSite",
+        source_url="https://www.pakistanlawsite.com/reported/88",
+        access_method="login_session",
+        unreported=False,
+    )
+    db.add(reported)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=reported.id,
+            citation_string="2024 SCMR 88",
+            raw_string="2024 SCMR 88",
+            reporter="SCMR",
+            year=2024,
+            page=88,
+            is_primary=True,
+        )
+    )
+    loser_id = reported.id
+    await db.commit()
+
+    result = await reconcile_reported_unreported_once(db, limit=100)
+    await db.commit()
+    assert result["merged"] == 1
+
+    retained = await db.get(Judgment, retained_id)
+    assert retained is not None
+    assert retained.canonical_citation == "2024 SCMR 88"
+    assert retained.unreported is False
+    assert await db.get(Judgment, loser_id) is None
+    aliases = {
+        row.citation_string
+        for row in (
+            await db.execute(select(Citation).where(Citation.judgment_id == retained_id))
+        ).scalars().all()
+    }
+    assert old_identity in aliases
+    assert "2024 SCMR 88" in aliases
