@@ -148,7 +148,7 @@ if settings.PLS_SEARCH_HARVEST_ENABLED:
     app.conf.beat_schedule.update(search_harvest_beat_entries())
 if settings.PLS_CASEID_WALK_ENABLED:
     # Account 1 only. Slot 2 is an independent verifier and never runs acquisition work.
-    for _name, _partition in (("pls-caseid-walk", 0),):
+    for _name, _partition in (("pls-caseid-walk", None),):
         app.conf.beat_schedule[_name] = {
             "task": "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
             "schedule": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS,
