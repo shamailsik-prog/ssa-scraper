@@ -348,14 +348,17 @@ async def check_judgments(
         pipeline._session_lock = lock
         if claim_turn and not await claim_spot_check_turn(redis_client):
             return [{"skipped": "checked between search-harvest pages within the last spot-check interval"}]
-        slot = await pipeline.manager.current_slot()
-        if slot is None:
-            return [{"skipped": "no ACTIVE slot"}]
-        # The page is fetched on the current slot only: a spot check never walks the continuity
-        # ladder (no reconnect on the alternate slot, no switch of the current slot), so a bounce
-        # here costs one slot its state exactly as a harvest would, and nothing more.
+        verifier_slot_no = int(settings.PLS_VERIFIER_SLOT or 2)
+        slot = await pipeline.manager.slot(verifier_slot_no)
+        if slot.state != "ACTIVE":
+            return [{"skipped": f"independent verifier slot {verifier_slot_no} is {slot.state}"}]
+        # Verification is deliberately pinned to Account 2. It never follows the harvester's current
+        # slot and never falls back to Account 1, otherwise both sides could share the same session/error.
+        pipeline.runner.preferred_slot_number = verifier_slot_no
+        pipeline.runner.exclusive_slot = True
         browser = await pipeline.runner.open(slot)
         results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
+        results.extend(await _coverage_challenges_on_browser(db, pipeline, browser))
         await db.flush()
         return results
     finally:
