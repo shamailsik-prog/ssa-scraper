@@ -13,6 +13,7 @@ hash, version_confidence 0.5 unless an effective date is evidenced). Instruments
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from scraper.extractors.judgment_guards import (
 from scraper.extractors.login_surface_stub import is_login_surface_stub
 from scraper.fetchers import canonical_text_hash, sha256_text
 from scraper.models import (
+    ArchiveObject,
     Citation,
     CorpusMetadata,
     Court,
@@ -146,6 +148,84 @@ def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[s
     if len((full_text or "").strip()) < int(settings.UNREPORTED_MIN_TEXT_CHARS or 0):
         return "text too short for a judgment"
     return None
+
+
+
+def _identity_text(value: Optional[str]) -> str:
+    """Conservative identity normaliser for court case numbers; it never guesses a missing number."""
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _substantive_text(value: Optional[str]) -> str:
+    """Normalise formatting noise while retaining the words used by the court."""
+    return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip().lower()
+
+
+def _reported_unreported_similarity(a: Optional[str], b: Optional[str]) -> float:
+    left, right = _substantive_text(a), _substantive_text(b)
+    if not left or not right:
+        return 0.0
+    # SequenceMatcher is deterministic. A high threshold is deliberate: an uncertain pair must remain
+    # separate for human review rather than collapsing two orders in the same case.
+    return difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
+
+
+async def _find_unreported_version_of_reported(
+    db: AsyncSession,
+    *,
+    docket_number: Optional[str],
+    decision_date: Optional[date],
+    court: Optional[Court],
+    full_text: str,
+) -> Optional[Judgment]:
+    """Find the earlier court-site copy of a newly reported judgment.
+
+    Automatic reconciliation is intentionally strict: same normalised case number, same decision date
+    when both sides have one, same court when both sides have one, and >= 0.92 substantive-text
+    similarity. This catches reporter formatting/headings without merging distinct orders in one case.
+    """
+    docket_key = _identity_text(docket_number)
+    if not docket_key:
+        return None
+    stmt = select(Judgment).where(Judgment.unreported.is_(True), Judgment.docket_number.isnot(None))
+    if decision_date is not None:
+        stmt = stmt.where(or_(Judgment.decision_date == decision_date, Judgment.decision_date.is_(None)))
+    if court is not None:
+        stmt = stmt.where(or_(Judgment.court_id == court.id, Judgment.court_id.is_(None)))
+    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()).limit(250))).scalars().all()
+    strong = []
+    for candidate in candidates:
+        if _identity_text(candidate.docket_number) != docket_key:
+            continue
+        if candidate.decision_date and decision_date and candidate.decision_date != decision_date:
+            continue
+        if candidate.court_id and court and candidate.court_id != court.id:
+            continue
+        similarity = _reported_unreported_similarity(candidate.full_text, full_text)
+        if similarity >= 0.92:
+            strong.append((similarity, candidate))
+    if not strong:
+        return None
+    strong.sort(key=lambda item: item[0], reverse=True)
+    # Two near-equal candidates can be two orders in the same case. Refuse an automatic merge.
+    if len(strong) > 1 and abs(strong[0][0] - strong[1][0]) < 0.01:
+        return None
+    return strong[0][1]
+
+
+async def _supersede_old_archive_layout(db: AsyncSession, judgment_id) -> None:
+    """A reclassified unreported judgment must be mirrored again under its reported citation."""
+    rows = (
+        await db.execute(
+            select(ArchiveObject).where(
+                ArchiveObject.judgment_id == judgment_id,
+                ArchiveObject.status.in_(("written", "mismatch", "missing")),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        row.status = "superseded"
+        row.error = "unreported judgment later reported; archive under reported citation"
 
 
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
