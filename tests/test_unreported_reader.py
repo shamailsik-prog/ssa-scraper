@@ -62,7 +62,8 @@ async def test_the_agent_reads_unreported_judgments_once_and_keeps_only_evidence
     monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
     calls = []
 
-    async def fake_model(text):
+    async def fake_model(text, *, access_method):
+        assert access_method == "public"
         calls.append(text)
         return MODEL_ANSWER
 
@@ -94,7 +95,7 @@ async def test_a_failed_reading_is_recorded_and_retried_later_not_in_a_loop(db, 
     monkeypatch.setattr(settings, "READER_MODEL", "test-model")
     monkeypatch.setattr(settings, "READER_BASE_URL", "http://reader.test/v1")
 
-    async def broken(_text):
+    async def broken(_text, **_kw):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(unreported_reader, "call_reader_model", broken)
@@ -140,7 +141,7 @@ async def test_the_model_call_sends_the_judgment_as_data_and_reads_the_json_back
 
     real = httpx.AsyncClient
     monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    out = await unreported_reader.call_reader_model(TEXT)
+    out = await unreported_reader.call_reader_model(TEXT, access_method="public")
     assert out["outcome"] == "allowed"
     assert seen["url"] == "http://reader.test/v1/chat/completions"
     assert seen["body"]["model"] == "test-model" and seen["body"]["response_format"] == {"type": "json_object"}
@@ -164,7 +165,7 @@ async def test_an_answer_without_a_reading_is_a_failure_not_an_empty_reading(mon
         handler = lambda request, c=content: httpx.Response(200, json={"choices": [{"message": {"content": c}}]})
         monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
         with pytest.raises(ValueError):
-            await unreported_reader.call_reader_model(TEXT)
+            await unreported_reader.call_reader_model(TEXT, access_method="public")
 
 
 async def test_a_second_reading_run_skips_while_one_is_in_progress(db, monkeypatch):
