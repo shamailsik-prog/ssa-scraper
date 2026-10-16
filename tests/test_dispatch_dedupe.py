@@ -260,3 +260,42 @@ async def test_tier2_seeding_never_truncates_after_two_thousand_sections(db):
     assert len(ours) == 2005
     assert {(row.query_json or {}).get("section") for row in ours} == {str(i) for i in range(1, 2006)}
     await db.rollback()
+
+
+async def test_fresh_tier4_frontier_precedes_backfill_even_with_worse_numeric_priority(db):
+    """Fresh judgments have reserved scheduler precedence; Tier 1 cannot starve the current-year lane."""
+    from scraper.models import CrawlFrontier
+    from scraper.tasks.pakistanlawsite import frontier_ordering
+
+    db.add_all(
+        [
+            CrawlFrontier(
+                source_name="PakistanLawSite",
+                tier=1,
+                query_key="fresh-order-test:backfill",
+                query_json={"reporter": "PLD", "year": 2000},
+                cursor_json={"page_no": 1},
+                status="pending",
+                priority=1,
+            ),
+            CrawlFrontier(
+                source_name="PakistanLawSite",
+                tier=4,
+                query_key="fresh-order-test:fresh",
+                query_json={"reporter": "PLD", "year": 2026, "daily": True},
+                cursor_json={"page": 1},
+                status="pending",
+                priority=999,
+            ),
+        ]
+    )
+    await db.flush()
+    rows = (
+        await db.execute(
+            select(CrawlFrontier)
+            .where(CrawlFrontier.query_key.like("fresh-order-test:%"))
+            .order_by(*frontier_ordering())
+        )
+    ).scalars().all()
+    assert [row.tier for row in rows] == [4, 1]
+    await db.rollback()
