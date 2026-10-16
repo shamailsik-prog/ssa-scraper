@@ -194,7 +194,7 @@ the account. Account separation is a correctness control as well as an operation
 | Queue | Jobs | Needs login? |
 |---|---|---|
 | `login_session` | Account-1 PLS harvest/search/case-ID acquisition | Yes — Account 1 only |
-| `login_session` verifier task | Account-2 judgment checks + coverage challenges | Yes — Account 2 only |
+| `pls_verify` | Account-2 judgment checks + coverage challenges | Yes — Account 2 only |
 | `login_recovery` | role-preserving account recovery | Yes |
 | `maintenance` | promotion, reported↔unreported reconciliation, reports, archive reconcile | No |
 | `scraper` | public sources | No |
