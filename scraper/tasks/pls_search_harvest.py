@@ -501,31 +501,6 @@ async def claim_next_query(
     return None, None
 
 
-def _slot_known_good_at(slot_row: BrowserSessionSlot) -> Optional[datetime]:
-    seen = [t for t in (slot_row.last_used_at, slot_row.last_verified_at, slot_row.logged_in_at) if t is not None]
-    return max(seen) if seen else slot_row.updated_at
-
-
-async def slot_takeover_due(db: AsyncSession, slot: int, *, now: Optional[datetime] = None) -> bool:
-    """True when the other login has been logged out (not ACTIVE) for PLS_SEARCH_HARVEST_TAKEOVER_MINUTES, counted
-    from the last time it was known to work, so `slot` may also work the other slot's share."""
-    other = 2 if slot == 1 else 1
-    row = (
-        await db.execute(
-            select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == SOURCE_NAME, BrowserSessionSlot.slot_number == other)
-        )
-    ).scalars().first()
-    if row is None:
-        return True  # there is no other login at all: its share is nobody's but this one's
-    if row.state == "ACTIVE":
-        return False
-    since = _slot_known_good_at(row)
-    if since is None:
-        return True
-    now = now or datetime.now(timezone.utc)
-    return now - since >= timedelta(minutes=int(settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES))
-
-
 class SearchHarvestRunner:
     def __init__(
         self,
