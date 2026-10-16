@@ -45,3 +45,19 @@ def test_inspect_shows_the_auto_deploy_state_and_only_its_own_log_lines(tmp_path
     assert "Admin key" not in out and "From https" not in out
     assert "tip_sha: 057294c" in out and "rollout_sha: 057294c" in out
     assert "origin: https://github.com/shamailsik-prog/ssa-scraper.git" in out
+
+
+def test_inspect_never_prints_credentials_embedded_in_the_origin_url(tmp_path):
+    """Codex review (#224): an origin like https://user:TOKEN@github.com/... would print the token into the public
+    workflow log; the 64-hex scrub does not match GitHub tokens. The userinfo is stripped before printing."""
+    line = next(ln for ln in _inspect_script().splitlines() if "== auto-deploy" in ln)
+    srv = tmp_path / "opt-ssa-scraper"
+    (srv / "state").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(srv)], check=True)
+    token = "github_pat_11ABCDEFG0123456789_secretpart"
+    subprocess.run(["git", "-C", str(srv), "remote", "add", "origin", f"https://x-access-token:{token}@example.test/shamailsik-prog/ssa-scraper.git"], check=True)
+
+    out = subprocess.run(["bash", "-c", line.replace("/opt/ssa-scraper", str(srv))], capture_output=True, text=True, check=True).stdout
+
+    assert token not in out and "x-access-token" not in out
+    assert "origin: https://example.test/shamailsik-prog/ssa-scraper.git" in out
