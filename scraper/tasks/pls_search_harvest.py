@@ -310,8 +310,12 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         )
     ).all()
     verifier = {result: int(count) for result, count in verifier_rows}
-    verifier_checks = sum(verifier.values())
+    verifier_matches = int(verifier.get("match", 0))
     verifier_misses = int(verifier.get("differs", 0))
+    verifier_no_verdict = sum(
+        int(verifier.get(status, 0))
+        for status in ("skipped", "unreachable", "login_required")
+    )
 
     return {
         "queue": status_counts,
@@ -328,10 +332,11 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         },
         "fresh_lane": {"due_now": fresh_due},
         "account2_coverage_verifier": {
-            "last_24h_checks": verifier_checks,
-            "matches": int(verifier.get("match", 0)),
+            "last_24h_attempts": sum(verifier.values()),
+            "matches": verifier_matches,
             "misses": verifier_misses,
-            "demonstrated": verifier_checks > 0,
+            "no_verdict": verifier_no_verdict,
+            "demonstrated": verifier_matches > 0 and verifier_misses == 0 and verifier_no_verdict == 0,
         },
         "complete": bool(
             status_counts.get("pending", 0)
@@ -342,8 +347,9 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
             and not holes
             and tier2_missing == 0
             and fresh_due == 0
-            and verifier_checks > 0
+            and verifier_matches > 0
             and verifier_misses == 0
+            and verifier_no_verdict == 0
         ),
     }
 
@@ -467,7 +473,6 @@ async def claim_next_query(
     slot: int,
     *,
     redis_client=None,
-    take_over: bool = False,
     candidates: int = 25,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
     """Take the next ledger row owned by the requested acquisition slot. Account 2 owns no acquisition rows.
