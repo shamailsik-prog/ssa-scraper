@@ -49,6 +49,8 @@ from scraper.models import (
     Judge,
     Judgment,
     JudgmentCitationRelation,
+    JudgmentReading,
+    JudgmentReadingVersion,
     Treatment,
     QuarantineQueue,
     ScraperStaging,
@@ -215,6 +217,23 @@ async def _find_unreported_version_of_reported(
     return strong[0][1]
 
 
+async def _retire_unreported_reading(db: AsyncSession, judgment_id) -> None:
+    """Stop serving a machine reading when an unreported judgment becomes reported.
+
+    Immutable attempt history remains for audit, but no historical attempt is current after the
+    canonical text/identity changes to the reported version.
+    """
+    await db.execute(
+        update(JudgmentReadingVersion)
+        .where(
+            JudgmentReadingVersion.judgment_id == judgment_id,
+            JudgmentReadingVersion.is_current.is_(True),
+        )
+        .values(is_current=False)
+    )
+    await db.execute(delete(JudgmentReading).where(JudgmentReading.judgment_id == judgment_id))
+
+
 async def _supersede_old_archive_layout(db: AsyncSession, judgment_id) -> None:
     """A reclassified unreported judgment must be mirrored again under its reported citation."""
     rows = (
@@ -247,6 +266,7 @@ async def _merge_reported_duplicate_into_unreported(
         raise ValueError("reconciliation requires unreported winner and reported loser")
     old_identity = unreported_row.canonical_citation
     reported_citation = reported_row.canonical_citation
+    await _retire_unreported_reading(db, unreported_row.id)
 
     # Free the two unique judgment keys before assigning the reported identity/text to the winner.
     reported_row.canonical_citation = f"MERGING-{reported_row.id}"
@@ -746,6 +766,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                         source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500],
                     )
                 )
+                await _retire_unreported_reading(db, existing.id)
                 await _supersede_old_archive_layout(db, existing.id)
                 await db.flush()
         # alternate citations learned from another route
