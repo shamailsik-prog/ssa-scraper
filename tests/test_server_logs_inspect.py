@@ -21,3 +21,43 @@ def test_inspect_prints_the_walk_and_harvest_switches_and_nothing_secret():
     assert {"PLS_CASEID_WALK_ENABLED", "PLS_SEARCH_HARVEST_ENABLED", "DEPLOY_ROLE", "HARVEST_MODE"} <= set(names)
     assert not [n for n in names if re.search(r"KEY|SECRET|TOKEN|PASS|CREDENTIAL|URL|DSN", n)]
     subprocess.run(["bash", "-n", "-c", script], check=True)
+
+
+def test_inspect_shows_the_auto_deploy_state_and_only_its_own_log_lines(tmp_path):
+    """The auto-deploy failed on every cron run from 13 to 16 October and nothing showed it (#223). Inspect now prints
+    its own timestamped log lines (never raw command output: the workflow log is public), the recorded tip and rollout
+    commits, and the origin the cron fetches."""
+    line = next(ln for ln in _inspect_script().splitlines() if "== auto-deploy" in ln)
+    srv = tmp_path / "opt-ssa-scraper"
+    (srv / "state").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(srv)], check=True)
+    subprocess.run(["git", "-C", str(srv), "remote", "add", "origin", "https://github.com/shamailsik-prog/ssa-scraper.git"], check=True)
+    own = [f"[2026-10-16T04:{m:02d}:00Z] auto_deploy: fetch origin main" for m in range(45)]
+    raw = ["From https://github.com/shamailsik-prog/ssa-scraper", " Admin key:  not-a-hex-secret-from-old-installer-output"]
+    (srv / "state" / "auto_deploy.log").write_text("\n".join(own[:20] + raw + own[20:]) + "\n")
+    (srv / "state" / "tip_sha.txt").write_text("057294c\n")
+    (srv / "state" / "rollout_sha.txt").write_text("057294c\n")
+
+    out = subprocess.run(["bash", "-c", line.replace("/opt/ssa-scraper", str(srv))], capture_output=True, text=True, check=True).stdout
+
+    shown = [ln for ln in out.splitlines() if ln.startswith("[2026-")]
+    assert shown == own[-40:]
+    assert "Admin key" not in out and "From https" not in out
+    assert "tip_sha: 057294c" in out and "rollout_sha: 057294c" in out
+    assert "origin: https://github.com/shamailsik-prog/ssa-scraper.git" in out
+
+
+def test_inspect_never_prints_credentials_embedded_in_the_origin_url(tmp_path):
+    """Codex review (#224): an origin like https://user:TOKEN@github.com/... would print the token into the public
+    workflow log; the 64-hex scrub does not match GitHub tokens. The userinfo is stripped before printing."""
+    line = next(ln for ln in _inspect_script().splitlines() if "== auto-deploy" in ln)
+    srv = tmp_path / "opt-ssa-scraper"
+    (srv / "state").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(srv)], check=True)
+    token = "github_pat_11ABCDEFG0123456789_secretpart"
+    subprocess.run(["git", "-C", str(srv), "remote", "add", "origin", f"https://x-access-token:{token}@example.test/shamailsik-prog/ssa-scraper.git"], check=True)
+
+    out = subprocess.run(["bash", "-c", line.replace("/opt/ssa-scraper", str(srv))], capture_output=True, text=True, check=True).stdout
+
+    assert token not in out and "x-access-token" not in out
+    assert "origin: https://example.test/shamailsik-prog/ssa-scraper.git" in out
