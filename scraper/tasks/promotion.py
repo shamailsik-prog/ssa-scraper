@@ -338,6 +338,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
     dd = data.get("decision_date")
     decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
+    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     case_number = proceeding = None
     if unreported:
         if st.source_name in SOURCE_COURT_CODE:
@@ -358,8 +359,25 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     else:
         canonical = cits[0]
         parts = _parse_citation_parts(canonical)
-    # dedupe by identity and by content
-    existing = (await db.execute(select(Judgment).where((Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)))).scalars().first()
+    # Dedupe by identity/content first. A reported judgment may also be the same court-site
+    # judgment previously stored as unreported even where reporter formatting changed the text hash.
+    existing = (
+        await db.execute(
+            select(Judgment).where(
+                (Judgment.canonical_citation == canonical) | (Judgment.full_text_hash == text_hash)
+            )
+        )
+    ).scalars().first()
+    reconciled_unreported = False
+    if existing is None and not unreported and cits and meta is not None:
+        existing = await _find_unreported_version_of_reported(
+            db,
+            docket_number=meta.docket_number,
+            decision_date=decision_date,
+            court=court,
+            full_text=full_text,
+        )
+        reconciled_unreported = existing is not None
     if existing is None:
         # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
         # just means that string is not ours to attach: drop it and promote under the canonical one.
@@ -465,18 +483,61 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             if st.route_json and st.route_json not in routes:
                 routes.append(st.route_json)
                 prov.routes = routes
-        if getattr(existing, "unreported", False) and cits and existing.full_text_hash == text_hash:
-            # the same judgment, entered as unreported, now arrives with a citation of its own: it takes that
-            # citation as its identity; the unreported identity stays as an alias, so earlier links still resolve
+        if getattr(existing, "unreported", False) and cits and (
+            existing.full_text_hash == text_hash or reconciled_unreported
+        ):
+            # The same judgment, entered from the court site as unreported, now has its reporter citation.
+            # Keep one judgment row: preserve the old unreported identity as an alias, then reclassify this
+            # row under the reported citation and refresh it from the reported source.
             taken = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
             if taken is None and (await db.execute(select(Judgment.id).where(Judgment.canonical_citation == canonical))).first() is None:
-                db.add(Citation(judgment_id=existing.id, citation_string=existing.canonical_citation[:200], raw_string=existing.canonical_citation, is_primary=False, source_evidence="unreported identity before a citation was known"))
+                old_identity = existing.canonical_citation
+                db.add(
+                    Citation(
+                        judgment_id=existing.id,
+                        citation_string=old_identity[:200],
+                        raw_string=old_identity,
+                        is_primary=False,
+                        source_evidence="unreported identity before a citation was known",
+                    )
+                )
                 cparts = _parse_citation_parts(canonical)
                 existing.canonical_citation = canonical
                 existing.unreported = False
                 existing.reporter, existing.page_number = cparts["reporter"], cparts["page"]
-                existing.year = existing.year or cparts["year"]
-                db.add(Citation(judgment_id=existing.id, citation_string=canonical, raw_string=canonical, reporter=cparts["reporter"], year=cparts["year"], page=cparts["page"], is_primary=True, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
+                existing.year = cparts["year"] or existing.year
+                existing.case_title = data.get("case_title") or existing.case_title
+                existing.court_id = court.id if court else existing.court_id
+                existing.court_name = court.name if court else (data.get("court") or existing.court_name)
+                existing.judge_names = data.get("judge_names") or existing.judge_names
+                existing.decision_date = decision_date or existing.decision_date
+                existing.docket_number = (meta.docket_number if meta else None) or existing.docket_number
+                existing.full_text = full_text
+                existing.full_text_hash = text_hash
+                existing.headnotes = data.get("headnotes") or existing.headnotes
+                existing.statutes_cited = data.get("statutes_cited") or existing.statutes_cited
+                existing.citations_cited = data.get("citations_cited") or existing.citations_cited
+                existing.access_method = st.access_method
+                existing.source_name = st.source_name
+                existing.source_url = st.source_url
+                existing.source_provenance_id = st.provenance_id
+                existing.original_document_id = st.pdf_provenance_id
+                existing.has_original_pdf = st.pdf_provenance_id is not None
+                existing.confidence_score = st.confidence_score or existing.confidence_score
+                existing.extraction_engine = st.extraction_engine
+                db.add(
+                    Citation(
+                        judgment_id=existing.id,
+                        citation_string=canonical,
+                        raw_string=canonical,
+                        reporter=cparts["reporter"],
+                        year=cparts["year"],
+                        page=cparts["page"],
+                        is_primary=True,
+                        source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500],
+                    )
+                )
+                await _supersede_old_archive_layout(db, existing.id)
                 await db.flush()
         # alternate citations learned from another route
         known = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == existing.id))).scalars().all()}
@@ -489,7 +550,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await db.flush()
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
-    meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     j = Judgment(
         docket_number=meta.docket_number if meta else case_number,
         unreported=unreported,
