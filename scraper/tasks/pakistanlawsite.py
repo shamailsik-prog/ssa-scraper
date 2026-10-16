@@ -356,6 +356,10 @@ class PakistanLawSitePipeline:
         self.source = source
         self.manager = SessionManager(db, source)
         self.runner = ContinuityRunner(self.manager, browser_factory, sleep=sleep)
+        # Owner ruling 16 October 2026: Account 1 is acquisition; Account 2 is verification only.
+        # Verification code may explicitly override this runner before opening slot 2.
+        self.runner.preferred_slot_number = 1
+        self.runner.exclusive_slot = True
         self.local_engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
         self.redis_client = redis_client
         self.job_id = job_id
@@ -1743,22 +1747,18 @@ class PakistanLawSitePipeline:
                 candidate = await self.manager.slot(preferred)
                 if candidate.state == "ACTIVE":
                     slot = candidate
-                elif self.reporter_shard is not None:
-                    # A shard runs on its own slot only. Borrowing the other shard's slot would put two
-                    # browsers on one login at the same time and the site would end one of them.
-                    if await self.manager.current_slot() is None:
-                        await self.manager.pause_source("no ACTIVE slot: human login required")
-                        self.stats["paused"] = True
-                    else:
-                        self.stats["skipped"] = "shard_slot_not_active"
-                        self.stats["preferred_slot"] = preferred
-                        logger.info(
-                            "PakistanLawSite shard %s skipped: its slot %s is %s (%s)",
-                            self.reporter_shard,
-                            preferred,
-                            candidate.state,
-                            candidate.state_reason,
-                        )
+                elif self.runner.exclusive_slot:
+                    # Never fail over acquisition to Account 2. A dead harvester account is an
+                    # operational pause, not permission to destroy verifier independence.
+                    self.stats["skipped"] = "harvester_slot_not_active"
+                    self.stats["preferred_slot"] = preferred
+                    self.stats["paused"] = True
+                    logger.warning(
+                        "PakistanLawSite acquisition paused: dedicated slot %s is %s (%s)",
+                        preferred,
+                        candidate.state,
+                        candidate.state_reason,
+                    )
                     return self.stats
             if slot is None:
                 slot = await self.manager.current_slot()
@@ -1930,34 +1930,23 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
-    """Take the slot lock of an ACTIVE login nobody else holds (the current login first) and bind `pipeline` to it:
-    its browser opens that login only and never fails over onto the other one, which another job may be using.
-    Login 1 and login 2 are separate accounts that run at the same time (operator decision, 11 Oct 2026), but two
-    browsers on ONE login end each other. Returns the slot, or None when every ACTIVE login is in use.
-    The login with the most of its hourly page budget left goes first: each login has its own budget, and always
-    opening the current one spent login 1's hour while login 2 sat unused (11 Oct 2026)."""
-    current = await pipeline.manager.current_slot()
-    active = [s for s in await pipeline.manager.slots() if s.state == "ACTIVE"]
-    cfg = dict(pipeline.source.config_json or {})
-    hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    """Claim the dedicated acquisition account (slot 1) only.
 
-    def pages_this_hour(slot) -> int:
-        pacing = dict(cfg.get(pacing_key(slot.slot_number)) or {})
-        return int(pacing.get("hour_pages") or 0) if pacing.get("hour") == hour_key else 0
-
-    active.sort(key=lambda s: (pages_this_hour(s), current is None or s.slot_number != current.slot_number, s.slot_number))
-    for slot in active:
-        lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", pipeline.redis_client, max_holders=1)
-        try:
-            await lock.acquire()
-        except SessionLockHeld:
-            await lock.release()
-            continue
-        pipeline._slot_lock = lock
-        pipeline.runner.preferred_slot_number = slot.slot_number
-        pipeline.runner.exclusive_slot = True
-        return slot
-    return None
+    Slot 2 is a verifier account and may never be borrowed by case-ID walks or other acquisition jobs.
+    """
+    slot = await pipeline.manager.slot(1)
+    if slot.state != "ACTIVE":
+        return None
+    lock = SessionLock(f"{SOURCE_NAME}:slot1", pipeline.redis_client, max_holders=1)
+    try:
+        await lock.acquire()
+    except SessionLockHeld:
+        await lock.release()
+        return None
+    pipeline._slot_lock = lock
+    pipeline.runner.preferred_slot_number = 1
+    pipeline.runner.exclusive_slot = True
+    return slot
 
 
 async def release_claimed_slot(pipeline: "PakistanLawSitePipeline") -> None:
