@@ -428,10 +428,8 @@ def _reporter_sql():
 
 
 def _share_filter(slot: int):
-    share = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_SLOT1_REPORTERS))
-    if slot == 1:
-        return _reporter_sql().in_(share) if share else false()
-    return _reporter_sql().notin_(share) if share else true()
+    """Owner ruling 16 Oct 2026: Account 1 owns the complete acquisition ledger; Account 2 owns none."""
+    return true() if int(slot) == 1 else false()
 
 
 async def pick_next_query(
@@ -928,9 +926,6 @@ async def run_search_harvest(
                 await db.commit()
         else:
             query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
-            if query_row is None and await slot_takeover_due(db, chosen):
-                took_over = True
-                query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
         if query_row is None:
             return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
         m = await active_map(db, SOURCE_NAME)
