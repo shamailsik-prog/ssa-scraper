@@ -52,6 +52,7 @@ app.conf.update(
         "scraper.tasks.promotion.promote_staging_records": {"queue": "maintenance"},
         "scraper.tasks.pls_backfill.requalify_quarantined": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
+        "scraper.tasks.promotion.reconcile_reported_unreported": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
         "scraper.tasks.unreported_reader.read_unreported_batch": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
@@ -103,6 +104,11 @@ app.conf.update(
             "task": "scraper.tasks.promotion.reconcile_instrument_relations",
             "schedule": settings.INSTRUMENT_RELATION_RECONCILE_SCHEDULE_SECONDS,
         },
+        "reconcile-reported-unreported": {
+            "task": "scraper.tasks.promotion.reconcile_reported_unreported",
+            "schedule": 86400,
+            "kwargs": {"limit": 250},
+        },
         "classify-treatment-nightly": {"task": "scraper.tasks.treatment.classify_treatment", "schedule": 86400},
         "read-unreported": {"task": "scraper.tasks.unreported_reader.read_unreported_batch", "schedule": settings.READER_SCHEDULE_SECONDS},
         "process-embeddings": {"task": "scraper.tasks.embeddings.process_embedding_queue", "schedule": 300},
@@ -123,28 +129,26 @@ if settings.TREATMENT_RECONCILE_ENABLED:
 
 
 def search_harvest_beat_entries() -> dict:
-    """One search-harvest tick per login slot, each on its own reporter share (handbook R3.1; owner's decision of
-    13 October 2026). No expiry (R3.7): a tick whose slot's harvest is already running exits at once, and an
-    expiring tick queued behind a long job was revoked before it ran. A tick that worked queues its slot's next
-    one itself (PLS_SEARCH_HARVEST_CONTINUE); the beat is the fallback that restarts a slot whose tick was skipped
-    (its login briefly busy with another job), so it fires at least once per tick budget."""
+    """Account 1 owns harvesting; Account 2 is reserved for independent verification.
+
+    The harvester has no expiry: a busy tick resumes from durable cursors rather than being revoked.
+    """
     budget = int(settings.PLS_SEARCH_HARVEST_TICK_SECONDS or 0)
     schedule = min(settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS, budget) if budget > 0 else settings.PLS_SEARCH_HARVEST_SCHEDULE_SECONDS
     return {
-        name: {
+        "pls-search-harvest": {
             "task": "scraper.tasks.pls_search_harvest.pls_search_harvest_tick",
             "schedule": schedule,
-            "kwargs": {"slot": slot},
+            "kwargs": {"slot": 1},
         }
-        for name, slot in (("pls-search-harvest", 1), ("pls-search-harvest-s2", 2))
     }
 
 
 if settings.PLS_SEARCH_HARVEST_ENABLED:
     app.conf.beat_schedule.update(search_harvest_beat_entries())
 if settings.PLS_CASEID_WALK_ENABLED:
-    # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
-    for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):
+    # Account 1 only. Slot 2 is an independent verifier and never runs acquisition work.
+    for _name, _partition in (("pls-caseid-walk", 0),):
         app.conf.beat_schedule[_name] = {
             "task": "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
             "schedule": settings.PLS_CASEID_WALK_SCHEDULE_SECONDS,
