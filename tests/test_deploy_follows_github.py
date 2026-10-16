@@ -15,6 +15,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "cloud" / "follow_github.sh"
 
@@ -61,9 +63,18 @@ def test_a_file_url_upload_is_local_too(tmp_path):
     assert _git("remote", "get-url", "origin", cwd=service) == "https://example.test/fork.git"
 
 
-def test_a_checkout_installed_from_a_remote_url_is_left_alone(tmp_path):
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://github.com/someone/ssa-scraper-fork.git",
+        "ssh://git@example.test/ssa-scraper.git",
+        "git@example.test:someone/ssa-scraper.git",
+        "git://example.test/ssa-scraper.git",
+        "deploy@example.test:ssa-scraper.git",  # scp-like SSH with a user other than git (Codex review, #223)
+    ],
+)
+def test_a_checkout_installed_from_a_remote_url_is_left_alone(tmp_path, remote):
     _upload, service = _service_checkout_from_upload(tmp_path)
-    remote = "https://github.com/someone/ssa-scraper-fork.git"
     _git("remote", "set-url", "origin", remote, cwd=service)
 
     res = _run_helper(service, remote)
