@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 JUDGMENT_LINK_HINT = re.compile(r"(?i)(judg|judgement|judgment|order|decision|case|\.pdf$)")
 STATUTE_LINK_HINT = re.compile(r"(?i)(act|ordinance|statute|law|code|rules|regulation|bill|gazette|notification|\.pdf$)")
+# A frontier row the worker has died on this many times (out of memory, killed, hard time limit) is retired.
+WORKER_DEATH_RETIRE_AFTER = 3
 
 
 def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -366,6 +368,10 @@ class PublicPipeline:
                     self.stats["limit_reached"] = True
                     return
                 processed.add(fr.id)
+                if await self._claim(fr) == "retired":
+                    self.stats["completed"] += 1
+                    await self._persist_frontier_progress()
+                    continue
                 if await self._drain_one(fr) == "halted":
                     await self._persist_frontier_progress()
                     return
@@ -373,6 +379,26 @@ class PublicPipeline:
                     self.stats["completed"] += 1
                 await self._persist_frontier_progress()
         self.stats["limit_reached"] = True
+
+    async def _claim(self, fr: CrawlFrontier) -> str:
+        """Commit that a frontier row is being worked on before the work starts. Returns 'claimed' or 'retired'.
+
+        A worker killed mid-item (out of memory, SIGKILL, hard time limit) rolls back everything it had not
+        committed, including the attempt _drain_one counted, so the item came back 'pending' with attempts=0
+        and killed the worker again: a Senate PDF did so every six hours (16 October 2026). Every normal path
+        leaves a row 'pending', 'done' or 'retired', so a row still 'in_progress' here is a run that died on
+        it. That death is counted, and after WORKER_DEATH_RETIRE_AFTER of them the row is retired."""
+        if fr.status == "in_progress":
+            fr.attempts += 1
+            if fr.attempts >= WORKER_DEATH_RETIRE_AFTER:
+                fr.status = "retired"
+                fr.last_error = f"retired: the worker died {fr.attempts} times while processing this item (out of memory, killed or timed out)"
+                self.stats["retired_after_worker_death"] = int(self.stats.get("retired_after_worker_death", 0)) + 1
+                logger.warning("%s: retired frontier item after %s worker deaths: %s", self.source.source_name, fr.attempts, fr.query_json.get("url"))
+                return "retired"
+        fr.status = "in_progress"
+        await self.db.commit()
+        return "claimed"
 
     async def _persist_frontier_progress(self) -> None:
         """Durably persist one frontier step and mirror live counters onto the running job."""

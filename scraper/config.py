@@ -379,6 +379,14 @@ class Settings(BaseSettings):
         default=900,
         description="OCR of one PDF stops after this long and the document yields no text (held for review), so one long scan cannot hold a public worker for hours. 0 = no limit.",
     )
+    OCR_MAX_PAGE_PIXELS: int = Field(
+        default=12_000_000,
+        description=(
+            "Largest image OCR renders for one page. A page that would exceed it at 300 DPI is rendered at a lower DPI. "
+            "A legal-size page at 300 DPI is 10.7 MP, so ordinary pages are unaffected; a 34 x 50 inch photo page "
+            "(senate.gov.pk, 16 October 2026) would be 151 MP and drove a public worker to 1.9 GB."
+        ),
+    )
 
     # --------------------------------------------------------------- archive
     GOOGLE_DRIVE_ENABLED: bool = Field(default=False)

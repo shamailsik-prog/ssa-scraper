@@ -69,6 +69,31 @@ def _ocr_limits() -> tuple[int, int]:
         return 120, 900
 
 
+def _ocr_max_pixels() -> int:
+    try:
+        from scraper.config import settings
+
+        return int(settings.OCR_MAX_PAGE_PIXELS or 0)
+    except Exception:
+        return 12_000_000
+
+
+def _ocr_resolution(page, preferred: int) -> int:
+    """DPI to render one page for OCR: `preferred`, lowered so the image stays within OCR_MAX_PAGE_PIXELS.
+
+    A phone photo saved as a PDF can declare a 34 x 50 inch page. At 300 DPI that is a 151-megapixel
+    image; the worker peaked at 1.9 GB and the kernel killed it (senate.gov.pk, 16 October 2026). Such a
+    photo holds about 72 pixels per inch, so a lower DPI loses nothing that OCR could read."""
+    max_pixels = _ocr_max_pixels()
+    try:
+        area_sq_in = (float(page.width) / 72) * (float(page.height) / 72)
+    except Exception:
+        return preferred
+    if max_pixels <= 0 or area_sq_in <= 0:
+        return preferred
+    return max(1, min(preferred, int((max_pixels / area_sq_in) ** 0.5)))
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -191,13 +216,13 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
                     # Render page to image at 300 DPI for decent OCR
                     # pdfplumber's to_image requires Wand or pdfium optional; handle fallback
                     try:
-                        pil_image: Image.Image = page.to_image(resolution=300).original
+                        pil_image: Image.Image = page.to_image(resolution=_ocr_resolution(page, 300)).original
                     except Exception:
                         # Fallback: try to extract embedded images and OCR them (less accurate)
                         # If no image rendering, skip
                         logger.debug("page.to_image failed on page %d, trying crop render", idx)
                         # Some pdfplumber versions need explicit
-                        im = page.to_image(resolution=250)
+                        im = page.to_image(resolution=_ocr_resolution(page, 250))
                         pil_image = im.original if hasattr(im, "original") else None
                         if pil_image is None:
                             continue
