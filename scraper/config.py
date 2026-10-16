@@ -192,6 +192,8 @@ class Settings(BaseSettings):
     EMBED_QUEUE_ALERT_HOURS: float = Field(default=6.0, description="Alert (EMBED_QUEUE_STALLED) when pending embeddings are older than this and none were embedded in that time.")
     SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Every 30 minutes a few promoted records are re-fetched and compared with the corpus.")
     SPOT_CHECK_JUDGMENTS: int = Field(default=3, description="Promoted PakistanLawSite judgments re-fetched per spot-check run.")
+    PLS_VERIFIER_SLOT: int = Field(default=2, ge=1, le=2, description="Dedicated independent PakistanLawSite verification account/slot. Harvesting must not use this slot for verifier work.")
+    PLS_COVERAGE_CHALLENGES: int = Field(default=1, ge=0, le=10, description="Completed search queries independently re-run by the verifier each spot-check cycle to look for judgments the harvester missed.")
     SPOT_CHECK_STATUTES: int = Field(default=2, description="Current statute sections re-fetched per spot-check run.")
     RETIRED_SOURCES: str = Field(
         default="NasirLawSite,BalochistanHighCourt",
