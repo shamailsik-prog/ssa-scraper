@@ -252,7 +252,7 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
         if verdict.kind == "block":
             raise ExplicitBlock(verdict.kind, verdict.detail)
         if verdict.kind == "verification":
-            raise VerificationRequired(verdict.kind, verdict.detail)
+            raise VerificationRequired(verdict.detail)
         if verdict.kind == "login":
             raise LoginRequired(verdict.detail)
         values = build_harvest_form_values(search_map, dict(query_row.query_json or {}), cursor)
@@ -262,7 +262,7 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
             if verdict.kind == "block":
                 raise ExplicitBlock(verdict.kind, verdict.detail)
             if verdict.kind == "verification":
-                raise VerificationRequired(verdict.kind, verdict.detail)
+                raise VerificationRequired(verdict.detail)
             if verdict.kind == "login":
                 raise LoginRequired(verdict.detail)
             live_keys = _independent_grid_keys(page.html)
