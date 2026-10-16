@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from scraper.database import SessionLocal
 from scraper.models import CrawlFrontier, ScraperSource
+from scraper.tasks import public_pipeline
 from scraper.tasks.public_pipeline import WORKER_DEATH_RETIRE_AFTER, PublicPipeline
 
 POISON_URL = "https://senate.gov.pk/uploads/documents/poison.pdf"
@@ -90,3 +91,50 @@ async def test_item_that_kills_the_worker_is_retired_after_the_limit(db, source)
     assert row.attempts == WORKER_DEATH_RETIRE_AFTER
     assert "worker died" in (row.last_error or "")
     assert pipeline.stats["retired_after_worker_death"] == 1
+
+
+def _in_container(monkeypatch, name: str) -> None:
+    monkeypatch.setattr(public_pipeline, "_container_id", lambda: name)
+
+
+async def test_a_deploy_that_replaces_the_container_is_not_a_worker_death(db, source, monkeypatch):
+    """A deploy recreates the worker container and kills whatever item it was on: that says nothing about the item.
+    Counting it retired long OCR items after a few deploys; the free-sites worker was recreated twice in three
+    minutes on 16 October 2026. A death in the same container (out of memory, SIGKILL, time limit) still counts:
+    Docker restarts a crashed container in place, under the same id."""
+    row_id = await _poison_row(db, source)
+    for n in range(WORKER_DEATH_RETIRE_AFTER + 1):
+        _in_container(monkeypatch, f"container-{n}")  # each run in a container a deploy has just replaced
+        await _die_on_the_item(source.source_name)
+
+    row = await _stored(row_id)
+    assert row.status == "in_progress"
+    assert row.attempts == 0
+
+
+async def test_deaths_in_one_container_still_retire_the_item(db, source, monkeypatch):
+    row_id = await _poison_row(db, source)
+    _in_container(monkeypatch, "container-a")
+    for _ in range(WORKER_DEATH_RETIRE_AFTER):
+        await _die_on_the_item(source.source_name)
+
+    await _run(source.source_name, _NoFetchExpected())
+
+    assert (await _stored(row_id)).status == "retired"
+
+
+async def test_a_row_claimed_before_claims_named_their_container_is_not_counted(db, source, monkeypatch):
+    """Rows left 'in_progress' by the release before this one carry no container; the deploy that brings this
+    release replaces the container anyway, so their death is not counted."""
+    row_id = await _poison_row(db, source)
+    async with SessionLocal() as other:
+        row = (await other.execute(select(CrawlFrontier).where(CrawlFrontier.id == row_id))).scalars().one()
+        row.status = "in_progress"
+        await other.commit()
+    _in_container(monkeypatch, "container-new")
+
+    await _die_on_the_item(source.source_name)
+
+    row = await _stored(row_id)
+    assert row.attempts == 0
+    assert row.cursor_json.get("claimed_by") == "container-new"

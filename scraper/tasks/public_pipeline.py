@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Type
 from urllib.parse import urljoin, urlsplit
@@ -39,6 +40,12 @@ JUDGMENT_LINK_HINT = re.compile(r"(?i)(judg|judgement|judgment|order|decision|ca
 STATUTE_LINK_HINT = re.compile(r"(?i)(act|ordinance|statute|law|code|rules|regulation|bill|gazette|notification|\.pdf$)")
 # A frontier row the worker has died on this many times (out of memory, killed, hard time limit) is retired.
 WORKER_DEATH_RETIRE_AFTER = 3
+
+
+def _container_id() -> str:
+    """The worker's container (Docker's default hostname is the container id). A crashed container is restarted in
+    place under the same id; a deploy recreates it under a new one."""
+    return socket.gethostname()
 
 
 def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -387,8 +394,13 @@ class PublicPipeline:
         committed, including the attempt _drain_one counted, so the item came back 'pending' with attempts=0
         and killed the worker again: a Senate PDF did so every six hours (16 October 2026). Every normal path
         leaves a row 'pending', 'done' or 'retired', so a row still 'in_progress' here is a run that died on
-        it. That death is counted, and after WORKER_DEATH_RETIRE_AFTER of them the row is retired."""
-        if fr.status == "in_progress":
+        it. That death is counted, and after WORKER_DEATH_RETIRE_AFTER of them the row is retired.
+
+        Only a death in the container that claimed the row counts. A deploy recreates the worker container and
+        kills whatever item it was on, which says nothing about the item; a row claimed before claims named
+        their container is treated the same way."""
+        here = _container_id()
+        if fr.status == "in_progress" and (fr.cursor_json or {}).get("claimed_by") == here:
             fr.attempts += 1
             if fr.attempts >= WORKER_DEATH_RETIRE_AFTER:
                 fr.status = "retired"
@@ -397,6 +409,7 @@ class PublicPipeline:
                 logger.warning("%s: retired frontier item after %s worker deaths: %s", self.source.source_name, fr.attempts, fr.query_json.get("url"))
                 return "retired"
         fr.status = "in_progress"
+        fr.cursor_json = {**(fr.cursor_json or {}), "claimed_by": here}
         await self.db.commit()
         return "claimed"
 
