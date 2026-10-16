@@ -29,7 +29,9 @@ import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+
+from bs4 import BeautifulSoup
 
 from celery import shared_task
 from sqlalchemy import func, select
@@ -179,6 +181,22 @@ async def check_judgments_between_pages(db, pipeline, *, sample: Optional[int] =
 
 
 
+def _independent_next_url(html: str, base_url: str, search_map: Dict[str, Any]) -> Optional[str]:
+    """Resolve a next-result-page link without using the harvester's result-row extractor."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    selector = ((search_map.get("pagination") or {}).get("next_selector") or "").strip()
+    nxt = None
+    if selector:
+        try:
+            nxt = soup.select_one(selector)
+        except Exception:
+            nxt = None
+    if nxt is None:
+        nxt = soup.find("a", string=re.compile(r"(?i)^\s*(next|›|»|>)\s*$"))
+    href = nxt.get("href") if nxt is not None else None
+    return urljoin(base_url or settings.PLS_SEARCH_URL, href) if href else None
+
+
 _CASE_NAME_IN_GRID = re.compile(r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])", re.IGNORECASE)
 
 
@@ -238,6 +256,10 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
 
     out: List[Dict[str, Any]] = []
     for query_row in queries:
+        # A completed query may span many result pages. Challenge one page across that full
+        # recorded window rather than repeatedly validating only page 1.
+        max_page = max(1, int(query_row.pages_enumerated or 1))
+        challenge_page = random.randint(1, max_page)
         cursor = {"page": 1, "page_no": 1}
         reason = unmapped_harvest_reason(search_map, dict(query_row.query_json or {}), cursor)
         if reason:
@@ -265,6 +287,31 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
         await pipeline._charge_page()
         page = await browser.submit_search(search_map, values)
         await pipeline.manager.touch(int(browser.slot_number))
+        reached_page = 1
+        # Follow live pagination independently. If the live site cannot reach the page previously
+        # recorded as complete, that is not a pass; it is an explicit no-verdict anomaly.
+        while reached_page < challenge_page:
+            nxt = _independent_next_url(page.html, page.url, search_map)
+            if not nxt:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="unreachable",
+                    detail=f"Account-2 could not reach recorded result page {challenge_page}; pagination ended at {reached_page}",
+                )
+                out.append({"query": query_row.query_key, "result": "unreachable", "challenge_page": challenge_page})
+                release_page_result(page)
+                page = None
+                break
+            release_page_result(page)
+            await pipeline._charge_page()
+            page = await browser.goto(nxt)
+            await pipeline.manager.touch(int(browser.slot_number))
+            reached_page += 1
+        if page is None:
+            continue
         try:
             verdict = page.classify()
             if verdict.kind == "block":
@@ -301,7 +348,7 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
                     result="differs",
                     detail=f"Account-2 verifier found {len(missing)} live key(s) absent from corpus/staging; query reopened",
                 )
-                out.append({"query": query_row.query_key, "result": "coverage_miss", "missing": missing[:8]})
+                out.append({"query": query_row.query_key, "result": "coverage_miss", "challenge_page": challenge_page, "missing": missing[:8]})
             else:
                 _record(
                     db,
@@ -311,7 +358,7 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
                     result="match",
                     detail=f"Account-2 verifier independently found {len(live_keys)} key(s); all resolve in corpus/staging",
                 )
-                out.append({"query": query_row.query_key, "result": "match", "keys": len(live_keys)})
+                out.append({"query": query_row.query_key, "result": "match", "challenge_page": challenge_page, "keys": len(live_keys)})
         finally:
             release_page_result(page)
     await db.flush()
