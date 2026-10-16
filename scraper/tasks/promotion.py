@@ -409,11 +409,12 @@ async def reconcile_reported_unreported_once(db: AsyncSession, *, limit: int = 1
         matched += 1
         # _find_unreported_version_of_reported already refuses near-equal ambiguous candidates.
         try:
-            await _merge_reported_duplicate_into_unreported(
-                db,
-                unreported_row=candidate,
-                reported_row=reported,
-            )
+            async with db.begin_nested():
+                await _merge_reported_duplicate_into_unreported(
+                    db,
+                    unreported_row=candidate,
+                    reported_row=reported,
+                )
             merged += 1
         except Exception:
             logger.exception(
@@ -422,8 +423,6 @@ async def reconcile_reported_unreported_once(db: AsyncSession, *, limit: int = 1
                 candidate.canonical_citation,
             )
             ambiguous += 1
-            await db.rollback()
-            break
     return {"reported_scanned": len(reported_rows), "matched": matched, "merged": merged, "ambiguous_or_failed": ambiguous}
 
 
