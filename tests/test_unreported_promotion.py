@@ -182,6 +182,9 @@ async def test_later_reported_copy_with_formatting_differences_reuses_unreported
     from scraper.models import Citation
 
     first = await _held(db, source)
+    # The court-site original is a Sindh High Court judgment, matching the source judgment heading;
+    # do not create an impossible SC/SHC pair merely to make similarity-based matching succeed.
+    first.source_name = "SindhHighCourt"
     await release_unreported(db)
     assert await promote_judgment_staging(db, first) == "promoted"
     original = (await db.execute(select(Judgment).where(Judgment.id == first.promoted_to_id))).scalars().one()
@@ -203,6 +206,8 @@ async def test_later_reported_copy_with_formatting_differences_reuses_unreported
 
     judgments = (await db.execute(select(Judgment))).scalars().all()
     matched = [j for j in judgments if j.id == original_id]
+    # One active judgment in total, not merely one surviving instance with the original UUID.
+    assert len(judgments) == 1
     assert len(matched) == 1
     j = matched[0]
     assert j.canonical_citation == "2024 SCMR 77"
@@ -215,6 +220,40 @@ async def test_later_reported_copy_with_formatting_differences_reuses_unreported
         ).scalars().all()
     }
     assert old_identity in aliases and "2024 SCMR 77" in aliases
+
+
+
+async def test_distinct_order_in_same_case_and_date_is_not_falsely_merged(db, source):
+    """The case number and date are not enough: substantive disagreement keeps two legal orders."""
+    first = await _held(db, source)
+    first.source_name = "SindhHighCourt"
+    await release_unreported(db)
+    assert await promote_judgment_staging(db, first) == "promoted"
+    first_id = first.promoted_to_id
+
+    substantially_different_order = (
+        "On hearing the parties, the Court observes that the application raises no ground "
+        "for interference. The prosecution evidence, documents and reasons recorded by the "
+        "trial court have been considered in detail. The previous directions remain in force. "
+        "Accordingly this application is dismissed. " * 3
+    )
+    reported = await _held(db, source, body=substantially_different_order)
+    reported.source_name = "PakistanLawSite"
+    reported.status, reported.quarantine_reason = "extracted", None
+    reported.reconciled_json = {
+        **(reported.reconciled_json or {}),
+        "citations": ["2024 SCMR 78"],
+    }
+    assert await promote_judgment_staging(db, reported) == "promoted"
+
+    rows = (await db.execute(select(Judgment))).scalars().all()
+    assert len(rows) == 2
+    original = next(row for row in rows if row.id == first_id)
+    assert original.unreported is True
+    assert original.canonical_citation.startswith("UNREPORTED SHC")
+    reported_row = next(row for row in rows if row.id != first_id)
+    assert reported_row.canonical_citation == "2024 SCMR 78"
+    assert reported_row.unreported is False
 
 
 async def test_an_older_hold_recorded_only_on_its_review_item_is_released(db, source):
