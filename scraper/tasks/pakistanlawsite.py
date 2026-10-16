@@ -364,7 +364,9 @@ class PakistanLawSitePipeline:
         self.redis_client = redis_client
         self.job_id = job_id
         self.sleep = sleep
-        self.reporter_shard = reporter_shard if reporter_shard in (0, 1) else None
+        if reporter_shard is not None:
+            logger.warning("reporter_shard=%s ignored: Account 1 now owns the complete acquisition corpus", reporter_shard)
+        self.reporter_shard = None
         self.reporter_shard_reporters: List[str] = []
         self._other_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
