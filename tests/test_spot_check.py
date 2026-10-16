@@ -13,9 +13,9 @@ from scraper.auth.session_manager import PageResult
 from scraper.config import settings
 from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.fetchers import canonical_text_hash
-from scraper.models import BrowserSessionSlot, Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import BrowserSessionSlot, Judgment, PlsSearchHarvestQuery, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
 from scraper.parsers.text_cleaner import clean_html
-from scraper.tasks.spot_check import check_judgments, check_statute_sections
+from scraper.tasks.spot_check import _coverage_challenges_on_browser, check_judgments, check_statute_sections
 from tests.fixtures import LOGIN_PAGE, BrowserScript, judgment_html
 from tests.test_auth_playwright import _activate, _nosleep
 
@@ -293,3 +293,55 @@ def test_status_spot_checks_carry_no_urls(client, admin_headers):
     data = client.get("/status.json").json()
     for row in data["spot_checks"]["recent"]:
         assert "source_url" not in row and "http" not in json.dumps(row).lower()
+
+
+async def test_account2_coverage_challenge_reopens_a_completed_query_when_it_finds_a_missing_case(db, login_source):
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from scraper.tasks.search_map import map_search_form
+    from tests.fixtures import search_form_html
+
+    await _activate(db, login_source, slots=(1, 2))
+    await map_search_form(db, login_source, search_form_html())
+    known = Judgment(
+        canonical_citation="PLD 2024 SC 123",
+        full_text_hash="1" * 64,
+        full_text="known judgment text",
+        source_name="PakistanLawSite",
+        source_url="https://www.pakistanlawsite.com/CaseLaw/CaseLawView?CaseName=2024L123",
+        reporter="PLD",
+        year=2024,
+    )
+    query = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="verify:PLD:2024",
+        query_json={"reporter": "PLD", "year": 2024},
+        status="done",
+        priority=10,
+    )
+    db.add_all([known, query])
+    await db.commit()
+
+    sc = BrowserScript()
+    sc.default_search = lambda values, browser: PageResult(
+        url="https://www.pakistanlawsite.com/r",
+        html=(
+            "<html><body><a href='/CaseLaw/CaseLawView?CaseName=2024L123'>known</a>"
+            "<a href='/CaseLaw/CaseLawView?CaseName=2024L999'>missing</a></body></html>"
+        ),
+        status=200,
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=sc.factory(), sleep=_nosleep)
+    slot2 = await pipeline.manager.slot(2)
+    browser = await pipeline.runner.open(slot2)
+    results = await _coverage_challenges_on_browser(db, pipeline, browser, count=1)
+    await db.flush()
+
+    assert results[0]["result"] == "coverage_miss"
+    assert query.status == "pending"
+    assert "case:2024L999" in (query.last_error or "")
+    check = (
+        await db.execute(select(SpotCheck).where(SpotCheck.kind == "coverage"))
+    ).scalars().one()
+    assert check.result == "differs"
+    assert all(entry[1] == 2 for entry in sc.log)
+    await pipeline.runner.close()
