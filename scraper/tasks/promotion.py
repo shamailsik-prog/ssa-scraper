@@ -548,6 +548,13 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     dd = data.get("decision_date")
     decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
+    # Some court judgments include a docket heading but not the reporter-style party/role
+    # structure expected by parse_case_metadata. The conservative court-heading parser is a
+    # permitted fallback; it never fabricates a case number.
+    reported_docket = (
+        (meta.docket_number if meta else None)
+        or (find_case_number(full_text, st.route_json) if st.source_name == "PakistanLawSite" else None)
+    )
     case_number = proceeding = None
     if unreported:
         if st.source_name in SOURCE_COURT_CODE:
@@ -581,7 +588,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     if existing is None and not unreported and cits and meta is not None:
         existing = await _find_unreported_version_of_reported(
             db,
-            docket_number=meta.docket_number,
+            docket_number=reported_docket,
             decision_date=decision_date,
             court=court,
             full_text=full_text,
@@ -720,7 +727,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 existing.court_name = court.name if court else (data.get("court") or existing.court_name)
                 existing.judge_names = data.get("judge_names") or existing.judge_names
                 existing.decision_date = decision_date or existing.decision_date
-                existing.docket_number = (meta.docket_number if meta else None) or existing.docket_number
+                existing.docket_number = reported_docket or existing.docket_number
                 existing.full_text = full_text
                 existing.full_text_hash = text_hash
                 existing.headnotes = data.get("headnotes") or existing.headnotes
@@ -760,7 +767,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
     j = Judgment(
-        docket_number=meta.docket_number if meta else case_number,
+        docket_number=reported_docket or case_number,
         unreported=unreported,
         proceeding_type=proceeding,
         petitioner=meta.petitioner if meta else None,
