@@ -3,6 +3,32 @@
 Changes to rate limits, slot shares, confidence thresholds or the definition of done, each with the owner's
 written approval and the reason (handbook R9.6, `docs/PLS_HARVEST_HANDBOOK.md`).
 
+## 13 October 2026 — forensic reliability hardening of the unreported-judgment reader
+
+**Reason:** forensic audit of the reader found destructive reprocessing, incomplete head/tail coverage, partially
+ungrounded legal conclusions, uniform retry treatment and insufficient provenance/observability.
+
+**What changed**
+
+- `judgment_reading` is now the current validated serving snapshot. Immutable successful and failed attempts live in
+  `judgment_reading_version`, including model/provider, prompt version, taxonomy version, judgment-text hash, attempt
+  number, token counts, latency, chunk count, parse-repair use, error class and retry time.
+- Re-reading is atomic: a failed upgrade never overwrites or hides the last good reading. Successful replacement
+  switches the current version only in the same database transaction that publishes the validated snapshot.
+- Long judgments are no longer reduced to the opening and closing portions. The whole text is covered by overlapping
+  bounded chunks, consolidated, deduplicated and then validated against the complete judgment.
+- Interpretation, dispositive basis and outcome now require source quotations, just as laws and points already did.
+- The subject taxonomy has an independent version. Invalid-only subject output is a validation failure; `Other` must
+  be explicitly selected; fourth-and-later valid headings are recorded as dropped instead of silently disappearing.
+- Provider failures are classified (auth/configuration, rate-limit, transient/network, validation and database), each
+  attempt has a typed retry time, and provider-wide faults open a Redis-backed circuit breaker.
+- Reader concurrency is per judgment rather than one global run lock: PostgreSQL advisory locks prevent duplicate
+  model spend while permitting different judgments to be processed concurrently.
+- Batch selection reserves a configurable share for newest judgments while the remainder drains the historical backlog.
+- Operations diagnostics now read failure history from `judgment_reading_version` and report token/latency/chunk usage.
+
+**Migration:** `017_judgment_reading_reliability.py` adds the history table and backfills existing reader rows.
+
 ## 13 October 2026 — unreported section for court-website judgments; reading agent on the mini model
 
 **Approved by:** Shamail Sikander, in chat on 12–13 October 2026 ("If any of the citations downloaded from the free
@@ -17,11 +43,15 @@ be employed, which may be reading them simultaneously in the background"), and "
   never a court named in its text. The confidence cutoff (0.85) is unchanged: rows held for low confidence stay held.
 - **Length floor.** An unreported judgment needs at least `UNREPORTED_MIN_TEXT_CHARS` (400) characters; shorter ones
   stay held as "not taken as unreported: text too short". This is below R5.7's 1,000-character `short_text` mark,
-  because single-page court orders (bail, adjournment) are often 400–1,000 characters. **Awaiting the owner's
-  ruling** on whether to raise it to 1,000.
+  because single-page court orders (bail, adjournment) are often 400–1,000 characters. **Owner's ruling,
+  13 October 2026: keep 400.**
 - **Reading agent.** `READER_MODEL=gpt-4o-mini` on both servers (20 judgments every 10 minutes, on the maintenance
   queue, never on a login queue). It records laws, points, interpretation and subjects, and drops any law or point
   whose quoted words are not in the judgment.
+- **Fixed subject headings** (owner's instruction in chat, 13 October 2026: "Build the fixed subject headings").
+  The agent files each judgment under one to three headings from the fixed list `SUBJECTS`
+  (`scraper/tasks/unreported_reader.py`); any other heading is dropped and recorded. Readings made before this (prompt
+  `unreported-reader-1`, about 250) are read once more under the new prompt.
 
 ## 13 October 2026 — search harvest on both logins at once, with fixed reporter shares
 
