@@ -10,7 +10,8 @@ CONTRACT TABLES (Layer 17 Annex A; the only tables `sikander_reader` may SELECT)
 INTERNAL TABLES (never granted to the reader role):
     scraper_sources, scraper_jobs, scraper_staging, statutes_staging, quarantine_queue,
     embedding_queue, browser_session_slots, search_form_map, crawl_frontier, crawl_coverage,
-    pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation, archive_targets, archive_objects, sgai_usage_daily,
+    pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation,
+    judgment_reading, judgment_reading_version, archive_targets, archive_objects, sgai_usage_daily,
     notifications, schema_migrations
 
 The vector dimension is read from EMBEDDING_DIM (Annex B-6); the model/dimension pair is
@@ -250,25 +251,74 @@ class Citation(Base):
 
 
 class JudgmentReading(Base):
-    """The reading agent's reading of one unreported judgment: the law applied, the points decided (each
-    tied to words copied from the judgment), the interpretation, what it turns on, subject tags and outcome.
-    A machine reading, shown as such beside the text; never a headnote."""
+    """Current validated machine reading for one unreported judgment.
+
+    This is the serving snapshot only. Immutable attempts and prior successful readings live in
+    JudgmentReadingVersion, so a failed re-read never destroys or hides the last good legal analysis.
+    """
 
     __tablename__ = "judgment_reading"
     __table_args__ = (Index("ix_judgment_reading_status", "status"),)
     judgment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), primary_key=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, comment="read|failed")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, comment="read (legacy failed rows may remain until replaced)")
     model: Mapped[Optional[str]] = mapped_column(String(100))
     prompt_version: Mapped[Optional[str]] = mapped_column(String(40))
+    taxonomy_version: Mapped[Optional[str]] = mapped_column(String(40))
+    judgment_text_hash: Mapped[Optional[str]] = mapped_column(String(64))
     laws: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{statute, sections[], quote}]")
     points: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{point, decision, quote}]")
     interpretation: Mapped[Optional[str]] = mapped_column(Text)
+    interpretation_evidence: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{statement, quote}] source-grounded interpretation")
     turns_on: Mapped[Optional[str]] = mapped_column(Text)
+    turns_on_evidence: Mapped[Optional[list]] = mapped_column(JSONB, comment="[{statement, quote}] source-grounded dispositive basis")
     subjects: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text))
     outcome: Mapped[Optional[str]] = mapped_column(String(40))
-    dropped: Mapped[Optional[list]] = mapped_column(JSONB, comment="tags the model gave whose words are not in the judgment")
+    outcome_evidence: Mapped[Optional[dict]] = mapped_column(JSONB, comment="{value, quote} source-grounded outcome")
+    dropped: Mapped[Optional[list]] = mapped_column(JSONB, comment="model items refused by deterministic validation")
     error: Mapped[Optional[str]] = mapped_column(Text)
     read_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
+class JudgmentReadingVersion(Base):
+    """Immutable audit trail for every reader attempt, successful or failed."""
+
+    __tablename__ = "judgment_reading_version"
+    __table_args__ = (
+        Index("ix_judgment_reading_version_judgment", "judgment_id", "attempt_no"),
+        Index("ix_judgment_reading_version_status", "status", "completed_at"),
+        Index("ix_judgment_reading_version_current", "judgment_id", "is_current"),
+        UniqueConstraint("judgment_id", "attempt_no", name="uq_judgment_reading_version_attempt"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    judgment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, comment="read|failed")
+    model: Mapped[Optional[str]] = mapped_column(String(100))
+    provider: Mapped[Optional[str]] = mapped_column(String(255))
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(40))
+    taxonomy_version: Mapped[Optional[str]] = mapped_column(String(40))
+    judgment_text_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    laws: Mapped[Optional[list]] = mapped_column(JSONB)
+    points: Mapped[Optional[list]] = mapped_column(JSONB)
+    interpretation: Mapped[Optional[str]] = mapped_column(Text)
+    interpretation_evidence: Mapped[Optional[list]] = mapped_column(JSONB)
+    turns_on: Mapped[Optional[str]] = mapped_column(Text)
+    turns_on_evidence: Mapped[Optional[list]] = mapped_column(JSONB)
+    subjects: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text))
+    outcome: Mapped[Optional[str]] = mapped_column(String(40))
+    outcome_evidence: Mapped[Optional[dict]] = mapped_column(JSONB)
+    dropped: Mapped[Optional[list]] = mapped_column(JSONB)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    error_kind: Mapped[Optional[str]] = mapped_column(String(40))
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    parse_repair_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    started_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    completed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    retry_after_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 
 
 class Treatment(Base):

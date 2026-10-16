@@ -120,9 +120,10 @@ SELECT 'judgments' AS kind, source_name, status, count(*) FROM scraper_staging G
 SELECT court_name, coalesce(proceeding_type, '?') AS proceeding, count(*) FROM judgment WHERE unreported GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30;
 \\echo == reading agent: unreported judgments read (machine readings), by status and model
 SELECT status, model, count(*), max(read_at) AS latest FROM judgment_reading GROUP BY 1, 2 ORDER BY 3 DESC;
-SELECT count(*) AS unreported_not_yet_read FROM judgment j WHERE j.unreported AND NOT EXISTS (SELECT 1 FROM judgment_reading r WHERE r.judgment_id = j.id);
+SELECT count(*) AS unreported_not_yet_read FROM judgment j WHERE j.unreported AND NOT EXISTS (SELECT 1 FROM judgment_reading r WHERE r.judgment_id = j.id AND r.status = 'read');
 SELECT left(s, 60) AS subject, count(*) FROM judgment_reading, unnest(subjects) s WHERE status = 'read' GROUP BY 1 ORDER BY 2 DESC LIMIT 15;
-SELECT left(error, 120) AS latest_errors, count(*) FROM judgment_reading WHERE status = 'failed' GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+SELECT error_kind, left(error, 120) AS latest_error, count(*) FROM judgment_reading_version WHERE status = 'failed' GROUP BY 1, 2 ORDER BY max(completed_at) DESC LIMIT 8;
+SELECT model, provider, sum(input_tokens) AS input_tokens, sum(output_tokens) AS output_tokens, round(avg(latency_ms)) AS avg_latency_ms, sum(chunk_count) AS chunks FROM judgment_reading_version WHERE status = 'read' GROUP BY 1,2 ORDER BY max(completed_at) DESC;
 \\echo == court-website judgments still held without a citation (reason on the staging row)
 SELECT source_name, left(coalesce(quarantine_reason, '(none on the staging row)'), 70) AS reason, count(*) FROM scraper_staging
  WHERE status = 'quarantined' AND source_name <> 'PakistanLawSite' AND promoted_to_id IS NULL GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 15;
