@@ -912,7 +912,6 @@ async def run_search_harvest(
     slot_lock: Optional[SessionLock] = None
     runner: Optional[SearchHarvestRunner] = None
     query_row: Optional[PlsSearchHarvestQuery] = None
-    took_over = False
     try:
         if query_key:
             query_row = await pick_next_query(db, query_key=query_key)
@@ -972,7 +971,7 @@ async def run_search_harvest(
             search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
-        return {**result, "slot": chosen, "took_over": took_over}
+        return {**result, "slot": chosen}
     except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit, LoginRequired) as exc:
         if query_row is not None:
             query_row.status = "pending"
