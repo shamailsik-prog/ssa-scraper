@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -1840,7 +1840,14 @@ class PakistanLawSitePipeline:
                 select(CrawlFrontier)
                 .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status.in_(["pending", "in_progress"]))
                 .where((CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now))
-                .order_by(CrawlFrontier.tier.asc(), CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
+                # Fresh current-year work is a reserved lane: historical backfill must never sit
+                # ahead of a due Tier-4 wave merely because its numeric tier is smaller.
+                .order_by(
+                    case((CrawlFrontier.tier == 4, 0), else_=1).asc(),
+                    CrawlFrontier.priority.asc(),
+                    CrawlFrontier.tier.asc(),
+                    CrawlFrontier.created_at.asc(),
+                )
                 .limit(max_queries)
             )
             frontier_rows = (await self.db.execute(q)).scalars().all()
