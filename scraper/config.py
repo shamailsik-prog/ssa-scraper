@@ -317,10 +317,6 @@ class Settings(BaseSettings):
         default="PLD,SCMR,CLC,YLR,CLD,GBLR",
         description="Comma list: the reporters whose search-harvest ledger rows login slot 1 works. Slot 2 works every other reporter (PLC, PLC(CS), PCrLJ, MLD, PTD, PLJ and the rest, and rows with no reporter), so the two shares never overlap (handbook R3.1; owner's decision of 13 October 2026).",
     )
-    PLS_SEARCH_HARVEST_TAKEOVER_MINUTES: int = Field(
-        default=30,
-        description="A login slot that has been logged out (not ACTIVE) this long has its share of the search-harvest ledger taken over by the other slot, which keeps its own share as well.",
-    )
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
@@ -597,8 +593,6 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
         if self.SPOT_CHECK_SCHEDULE_SECONDS <= 0 or self.SPOT_CHECK_JUDGMENTS < 0 or self.SPOT_CHECK_STATUTES < 0:
             raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
-        if self.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES < 0:
-            raise ValueError("PLS_SEARCH_HARVEST_TAKEOVER_MINUTES must be >= 0")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
