@@ -477,8 +477,8 @@ class SearchHarvestRunner:
         self.memory = PlsBrowserMemoryState()
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
-        # the 30-minute spot check of three promoted judgments runs between this run's pages, on its login
-        self.spot_check_between_pages = True
+        # Verification is Account-2-only. Acquisition never substitutes its own session for the verifier.
+        self.spot_check_between_pages = False
 
     async def _pace_sleep(self) -> None:
         lo = float(self.pacing_profile["login_delay_min"])
@@ -499,22 +499,9 @@ class SearchHarvestRunner:
             logger.info("PLS search harvest recycled browser after memory/window guard")
 
     async def _maybe_spot_check(self) -> None:
-        """Between two pages: when the 30-minute spot-check turn is free, check three promoted judgments on this
-        run's own login. The beat task found the login lock held by a harvest at every turn and never ran."""
-        if self.dry_run or not getattr(self, "spot_check_between_pages", False):
-            return
-        from scraper.tasks.spot_check import check_judgments_between_pages, claim_spot_check_turn
+        """Verification is a separate Account-2 task; harvester pages never claim its verification turn."""
+        return
 
-        try:
-            if not await claim_spot_check_turn(getattr(self.pipeline, "redis_client", None)):
-                return
-            results = await check_judgments_between_pages(self.db, self.pipeline)
-            await self.db.commit()
-            logger.info("PLS search harvest: spot check between pages: %s", results)
-        except (LoginRequired, PacingBudgetExceeded):
-            raise
-        except Exception as exc:  # a spot check never ends the harvest
-            logger.warning("PLS search harvest: spot check between pages failed: %s", exc)
 
     async def run_query(
         self,
