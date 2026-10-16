@@ -253,7 +253,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     and year, the site-total comparison, and a random known-citation test against the corpus."""
     from sqlalchemy import func
 
-    from scraper.models import Citation, CrawlFrontier, Judgment, SpotCheck, StatuteSection
+    from scraper.models import Citation, CrawlFrontier, Judgment, SpotCheck, Statute, StatuteSection
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
@@ -271,20 +271,30 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     known_sample_found = len(known & set(sample))
     known_sample_ok = bool(sample) and known_sample_found == len(sample)
 
-    statute_sections = int(
-        (await db.execute(select(func.count()).select_from(StatuteSection))).scalar() or 0
-    )
-    tier2_seeded = int(
+    provision_rows = (
+        await db.execute(
+            select(StatuteSection.section_number, Statute.short_name, Statute.name)
+            .join(Statute, Statute.id == StatuteSection.statute_id)
+        )
+    ).all()
+    expected_tier2_keys = {
+        fit_key(f"t2:{short_name or statute_name}:{section_number}")
+        for section_number, short_name, statute_name in provision_rows
+    }
+    actual_tier2_keys = set(
         (
             await db.execute(
-                select(func.count())
-                .select_from(CrawlFrontier)
-                .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.tier == 2)
+                select(CrawlFrontier.query_key).where(
+                    CrawlFrontier.source_name == SOURCE_NAME,
+                    CrawlFrontier.tier == 2,
+                )
             )
-        ).scalar()
-        or 0
+        ).scalars().all()
     )
-    tier2_missing = max(0, statute_sections - tier2_seeded)
+    missing_tier2_keys = sorted(expected_tier2_keys - actual_tier2_keys)
+    statute_sections = len(expected_tier2_keys)
+    tier2_seeded = len(actual_tier2_keys & expected_tier2_keys)
+    tier2_missing = len(missing_tier2_keys)
     now = datetime.now(timezone.utc)
     fresh_due = int(
         (
@@ -335,6 +345,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
             "statute_sections": statute_sections,
             "frontiers_seeded": tier2_seeded,
             "missing": tier2_missing,
+            "missing_examples": missing_tier2_keys[:20],
         },
         "fresh_lane": {"due_now": fresh_due},
         "account2_coverage_verifier": {
