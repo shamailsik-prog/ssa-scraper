@@ -81,6 +81,16 @@ def test_install_points_origin_at_github_after_both_the_update_and_the_clone():
     assert update_end < call and clone < call < unset  # one call after the if/else, covering both paths
 
 
+def test_installer_shows_the_admin_key_only_on_a_terminal():
+    """deploy-cloud runs install.sh over ssh with its output piped into a public workflow log; the do_deploy.sh sed
+    mask only catches a 64-lowercase-hex key, so a hand-set key would pass. The installer itself must not print it."""
+    text = (ROOT / "cloud" / "install.sh").read_text()
+    banner = text[text.index('ADMIN_KEY="$(grep'):]
+    assert "if [ -t 1 ]; then" in banner
+    assert " Admin key:  $ADMIN_KEY_SHOWN" in banner
+    assert " Admin key:  $ADMIN_KEY\n" not in banner
+
+
 def test_deploy_never_writes_the_admin_key_to_the_job_summary():
     text = (ROOT / "cloud" / "do_deploy.sh").read_text()
     assert "$ADMIN_KEY" not in text

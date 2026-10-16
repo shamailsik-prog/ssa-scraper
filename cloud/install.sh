@@ -432,13 +432,16 @@ docker compose ps --format '{{.Service}} {{.Health}}' | grep -q '^api healthy' |
 install_managed_host_crons
 
 ADMIN_KEY="$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2-)"
+# Shown only on an operator's terminal: deploy-cloud runs this over ssh with the output piped into the workflow log,
+# and the repository is public (16 October 2026).
+if [ -t 1 ]; then ADMIN_KEY_SHOWN="$ADMIN_KEY"; else ADMIN_KEY_SHOWN="(not shown: the output is not a terminal)"; fi
 cat <<EOF
 
 ============================================================================
  SIKANDER AI corpus service is running.
 
  Dashboard:  $ACCESS_URL
- Admin key:  $ADMIN_KEY
+ Admin key:  $ADMIN_KEY_SHOWN
              (also in $DIR/.env — keep it private; it is the only login to the console)
 
  Next, in the dashboard:
