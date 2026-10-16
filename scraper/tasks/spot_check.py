@@ -251,7 +251,9 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
             )
             out.append({"query": query_row.query_key, "result": "skipped"})
             continue
+        await pipeline._charge_page()
         landing = await browser.goto(settings.PLS_SEARCH_URL)
+        await pipeline.manager.touch(int(browser.slot_number))
         verdict = landing.classify()
         if verdict.kind == "block":
             raise ExplicitBlock(verdict.kind, verdict.detail)
@@ -260,7 +262,9 @@ async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optio
         if verdict.kind == "login":
             raise LoginRequired(verdict.detail)
         values = build_harvest_form_values(search_map, dict(query_row.query_json or {}), cursor)
+        await pipeline._charge_page()
         page = await browser.submit_search(search_map, values)
+        await pipeline.manager.touch(int(browser.slot_number))
         try:
             verdict = page.classify()
             if verdict.kind == "block":
@@ -341,23 +345,30 @@ async def check_judgments(
     pipeline._assert_permitted()
     from scraper.auth.session_manager import SessionLock
 
-    lock = SessionLock(SOURCE_NAME, redis_client)
+    verifier_slot_no = int(settings.PLS_VERIFIER_SLOT or 2)
+    slot = await pipeline.manager.slot(verifier_slot_no)
+    if slot.state != "ACTIVE":
+        return [{"skipped": f"independent verifier slot {verifier_slot_no} is {slot.state}"}]
+
+    # Two accounts may be live concurrently. The global lock is shared up to two holders, while
+    # the slot-2 lock is exclusive. This reserves verifier independence without opening two
+    # browsers on the same PLS account.
+    lock = SessionLock(SOURCE_NAME, redis_client, max_holders=2)
+    slot_lock = SessionLock(f"{SOURCE_NAME}:slot{verifier_slot_no}", redis_client, max_holders=1)
     try:
         await lock.acquire()
+        await slot_lock.acquire()
     except SessionLockHeld:
-        await lock.release()  # closes the client the lock opened for itself
-        return [{"skipped": "a login-session job holds the lock; checked on the next run"}]
+        await slot_lock.release()
+        await lock.release()
+        return [{"skipped": "independent verifier account is already in use; no fallback to Account 1"}]
+
     results: List[Dict[str, Any]] = []
     try:
         pipeline._session_lock = lock
+        pipeline._slot_lock = slot_lock
         if claim_turn and not await claim_spot_check_turn(redis_client):
-            return [{"skipped": "checked between search-harvest pages within the last spot-check interval"}]
-        verifier_slot_no = int(settings.PLS_VERIFIER_SLOT or 2)
-        slot = await pipeline.manager.slot(verifier_slot_no)
-        if slot.state != "ACTIVE":
-            return [{"skipped": f"independent verifier slot {verifier_slot_no} is {slot.state}"}]
-        # Verification is deliberately pinned to Account 2. It never follows the harvester's current
-        # slot and never falls back to Account 1, otherwise both sides could share the same session/error.
+            return [{"skipped": "Account-2 verification already ran within the spot-check interval"}]
         pipeline.runner.preferred_slot_number = verifier_slot_no
         pipeline.runner.exclusive_slot = True
         browser = await pipeline.runner.open(slot)
@@ -366,12 +377,14 @@ async def check_judgments(
         await db.flush()
         return results
     finally:
-        pipeline._session_lock = None
         try:
             await pipeline._persist_live_session()
         except Exception as exc:
             logger.warning("spot check: could not persist the live session: %s", exc)
         await pipeline.runner.close()
+        pipeline._session_lock = None
+        pipeline._slot_lock = None
+        await slot_lock.release()
         await lock.release()
 
 
