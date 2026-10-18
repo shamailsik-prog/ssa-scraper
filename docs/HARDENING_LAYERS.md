@@ -7,5 +7,6 @@ Each layer is behind an environment flag defaulting to **off** so production beh
 | Fold #220 corpus completeness + reader (#213 superseded) | `merge: fold codex/ssa-9plus-remediation` | (always on when merged) | Revert merge commit |
 | Test alignment for Account-1 acquisition | `test: align reader mocks and dispatcher` | — | Revert commit |
 | Harvest lock clear + heartbeat | `layer: harvest lock hygiene` | `SSA_CLEAR_HARVEST_LOCKS_ON_START`, `SSA_HARVEST_LOCK_HEARTBEAT` | Revert commit; flags off |
+| Order-sheet case titles + backfill CLI | `layer: order-sheet titles` | `SSA_ORDER_SHEET_TITLE` | Revert commit; flag off; titles unchanged on new promotes |
 
 Auditors: enable flags in staging, run the cited tests, then run backfill CLIs with `--dry-run` before any production data pass.

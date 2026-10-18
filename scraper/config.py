@@ -347,6 +347,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, a search-harvest tick refreshes held harvest/query/slot SessionLocks during long runs so TTL expiry cannot stall harvest after a worker recycle.",
     )
+    SSA_ORDER_SHEET_TITLE: bool = Field(
+        default=False,
+        description="When true, PakistanLawSite case_title is taken from the order-sheet header (parse_case_metadata) instead of the first versus line in the text window.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
