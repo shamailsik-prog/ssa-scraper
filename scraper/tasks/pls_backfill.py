@@ -108,7 +108,14 @@ async def requalify_quarantined(db: AsyncSession, *, limit: Optional[int] = 2000
         text = st.raw_text or ""
         meta = {"citation": st.extracted_citation, "title": st.extracted_title, "court": st.extracted_court, "url": st.source_url}
         dj = det.extract_judgment_deterministic(html=None, text=text, source_meta=meta)
-        out = reconcile_judgment(deterministic=dj, ai=None, raw_text=text, court_directory=directory, min_confidence=min_confidence)
+        out = reconcile_judgment(
+            deterministic=dj,
+            ai=None,
+            raw_text=text,
+            court_directory=directory,
+            min_confidence=min_confidence,
+            source_name=st.source_name or SOURCE_NAME,
+        )
         if out.quarantine:
             counts["still_quarantined"] += 1
             key = (out.quarantine_reason or "")[:40]

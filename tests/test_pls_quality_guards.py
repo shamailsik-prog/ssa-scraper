@@ -40,3 +40,12 @@ def test_try_redecode_bytes():
     raw = "test".encode("utf-8")
     text, enc = try_redecode_text(raw)
     assert text == "test" and enc == "utf-8"
+
+
+def test_hybrid_extractor_forwards_source_name_into_reconcile():
+    import inspect
+
+    from scraper.extractors.hybrid_extractor import HybridExtractor
+
+    src = inspect.getsource(HybridExtractor.extract_judgment)
+    assert "source_name=self.source.source_name" in src
