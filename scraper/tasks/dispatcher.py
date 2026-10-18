@@ -175,6 +175,9 @@ async def retire_orphaned_login_jobs(*, reason: str = "login-session worker star
                     await redis_client.aclose()
                 except Exception:
                     pass
+    from scraper.pls_harvest_locks import clear_stale_harvest_locks
+
+    await clear_stale_harvest_locks(redis_client)
     return len(rows)
 
 

@@ -557,6 +557,9 @@ class SearchHarvestRunner:
             self.pipeline.runner.browser = None
             self.memory.reset_recycle_counter()
             logger.info("PLS search harvest recycled browser after memory/window guard")
+        from scraper.pls_harvest_locks import refresh_harvest_locks
+
+        await refresh_harvest_locks(getattr(self, "_held_harvest_locks", ()) or ())
 
     async def _maybe_spot_check(self) -> None:
         """Verification is a separate Account-2 task; harvester pages never claim its verification turn."""
@@ -958,6 +961,7 @@ async def run_search_harvest(
         runner.pipeline.runner.preferred_slot_number = chosen
         runner.pipeline.runner.exclusive_slot = True
         runner.pipeline._run_locks.extend([harvest_lock, query_lock])
+        runner._held_harvest_locks = [harvest_lock, query_lock, slot_lock, lock]
         runner.pipeline._assert_permitted()
         if not dashboard_harvest:
             await runner.pipeline.ensure_search_map()
