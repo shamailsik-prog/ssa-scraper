@@ -305,9 +305,11 @@ def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
         return None
     key = re.sub(r"\s+", " ", raw_court.strip()).upper()
     key = re.sub(r"\.", "", key)
-    key = re.sub(r"\s*\(\s*", " (", key)
-    key = re.sub(r"\s*\)", ")", key)
-    key = re.sub(r"\s*&\s*", "&", key)
+    # Whitespace is already single spaces here, so " ?" does what "\s*" did, in linear time (CodeQL
+    # py/polynomial-redos: citations now arrive from the corpus API).
+    key = re.sub(r" ?\( ?", " (", key)
+    key = re.sub(r" ?\)", ")", key)
+    key = re.sub(r" ?& ?", "&", key)
     if key in _EXACT_ONLY_COURTS:
         return _EXACT_ONLY_COURTS[key]
     if key in PLD_COURT_CANONICAL:
@@ -518,11 +520,12 @@ def normalise_citation(raw: str) -> str:
             return _year_first_normalised(reporter_key, m)
 
     def _paren_court_repl(match):
-        inside = match.group(1)
+        inside = match.group(1).strip() or match.group(1)
         canon = _canonical_court(inside) or inside
         return f"({canon})"
 
-    s = re.sub(r"\(\s*([^)]+?)\s*\)", _paren_court_repl, s)
+    # One greedy class and a strip, not "\s*([^)]+?)\s*", which backtracks polynomially on long runs of spaces.
+    s = re.sub(r"\(([^)]+)\)", _paren_court_repl, s)
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"\bpld\b", "PLD", s, flags=re.IGNORECASE)
     s = re.sub(r"\bscmr\b", "SCMR", s, flags=re.IGNORECASE)
