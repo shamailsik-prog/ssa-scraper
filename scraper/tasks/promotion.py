@@ -620,23 +620,32 @@ async def _resolve_statute_link(
     source_name: Optional[str],
     source_url: Optional[str],
     jurisdiction: Optional[str],
-) -> Statute:
+) -> Optional[Statute]:
+    """Resolve an instrument mention onto an existing statute row.
+
+    Historic behaviour created a sectionless stub when nothing matched. That is the root cause of
+    the 2026-10-18 auditor count (10,303 of 12,618 statutes have no sections). SSA_STATUTE_NO_MENTION_STUBS
+    refuses to insert those stubs; the mention stays unresolved until a real act is promoted.
+    """
     statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
     if statute is None:
         statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
-    if statute is None:
-        stype, year = _instrument_statute_shape(canonical_name)
-        statute = Statute(
-            name=canonical_name,
-            short_name=canonical_name[:100],
-            jurisdiction=jurisdiction or "Federal",
-            statute_type=stype,
-            year_enacted=year,
-            source_name=source_name,
-            source_url=source_url,
-        )
-        db.add(statute)
-        await db.flush()
+    if statute is not None:
+        return statute
+    if settings.SSA_STATUTE_NO_MENTION_STUBS:
+        return None
+    stype, year = _instrument_statute_shape(canonical_name)
+    statute = Statute(
+        name=canonical_name,
+        short_name=canonical_name[:100],
+        jurisdiction=jurisdiction or "Federal",
+        statute_type=stype,
+        year_enacted=year,
+        source_name=source_name,
+        source_url=source_url,
+    )
+    db.add(statute)
+    await db.flush()
     return statute
 
 
@@ -1670,6 +1679,9 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             )
             row = dict(mention)
             row["canonical_statute_name"] = canonical
+            if linked is None:
+                linked_statute_mentions.append(row)
+                continue
             row["linked_statute_id"] = str(linked.id)
             linked_statute_mentions.append(row)
             section_number = _normalized_section_identifier(row.get("section_number"))
