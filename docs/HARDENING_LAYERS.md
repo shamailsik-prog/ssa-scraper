@@ -10,6 +10,8 @@ Each layer is behind an environment flag defaulting to **off** so production beh
 | Order-sheet case titles + backfill CLI | `layer: order-sheet titles` | `SSA_ORDER_SHEET_TITLE` | Revert commit; flag off; titles unchanged on new promotes |
 | PLS encoding/court/PLD/short-text guards | `layer: PLS quality guards` | `SSA_ENCODING_GUARD`, `SSA_COURT_HEADER_GUARD`, `SSA_PLD_CITATION_RELABEL`, `SSA_SHORT_TEXT_GUARD` | Revert commit; flags off |
 | PLD citation backfill CLI | (same PR commit or next) | — | `pls_admin backfill-pld-citations --dry-run` |
-| Archive/Drive audit summary | `layer: archive audit CLI` | — | Revert commit; read-only |
+| Archive/Drive audit summary | `layer: archive audit CLI` | — | `python -m scraper.tasks.archive_audit` |
+| Dashboard source on/off | `layer: dashboard source toggles` | — | Revert commit |
+| Fold #220 completeness / reader | merge commit | (feature set in #220) | Revert merge commit |
 
 Auditors: enable flags in staging, run the cited tests, then run backfill CLIs with `--dry-run` before any production data pass.
