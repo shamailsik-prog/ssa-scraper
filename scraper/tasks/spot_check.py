@@ -29,7 +29,9 @@ import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+
+from bs4 import BeautifulSoup
 
 from celery import shared_task
 from sqlalchemy import func, select
@@ -41,13 +43,17 @@ from scraper.auth.session_manager import (
     PlaywrightBrowser,
     SessionLockHeld,
     playwright_browser_factory,
+    release_page_result,
 )
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import canonical_text_hash, pdf_text_with_ocr
-from scraper.models import Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import Judgment, PlsSearchHarvestQuery, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
+from scraper.pls_search_harvest_core import CASE_KEY_PREFIX, build_harvest_form_values, unmapped_harvest_reason
 from scraper.notify import notify
+from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.parsers.text_cleaner import clean_html
+from scraper.tasks.search_map import active_map, map_as_dict
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, VerificationRequired, check_url_policy, classify_response, robots_allows
 
 logger = logging.getLogger(__name__)
@@ -174,6 +180,191 @@ async def check_judgments_between_pages(db, pipeline, *, sample: Optional[int] =
     return results
 
 
+
+def _independent_next_url(html: str, base_url: str, search_map: Dict[str, Any]) -> Optional[str]:
+    """Resolve a next-result-page link without using the harvester's result-row extractor."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    selector = ((search_map.get("pagination") or {}).get("next_selector") or "").strip()
+    nxt = None
+    if selector:
+        try:
+            nxt = soup.select_one(selector)
+        except Exception:
+            nxt = None
+    if nxt is None:
+        nxt = soup.find("a", string=re.compile(r"(?i)^\s*(next|›|»|>)\s*$"))
+    href = nxt.get("href") if nxt is not None else None
+    return urljoin(base_url or settings.PLS_SEARCH_URL, href) if href else None
+
+
+_CASE_NAME_IN_GRID = re.compile(r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])", re.IGNORECASE)
+
+
+def _independent_grid_keys(html: str) -> set[str]:
+    """A deliberately separate verifier parser.
+
+    The harvester uses result-row extraction. The verifier does not: it independently inspects
+    detail-link CaseName identifiers and citation-like strings visible in the rendered HTML.
+    """
+    keys: set[str] = {
+        CASE_KEY_PREFIX + match.group(1).upper()
+        for match in _CASE_NAME_IN_GRID.finditer(html or "")
+    }
+    # CaseName detail identifiers are the cleanest independent result identities. Only fall back
+    # to citation text when the result surface does not expose CaseName links; otherwise citations
+    # inside snippets/headnotes could be mistaken for additional result rows.
+    if keys:
+        return keys
+    for hit in extract_citations(clean_html(html or "")):
+        raw = str(hit.get("raw") or "").strip()
+        normalized = normalise_citation(raw) if raw else None
+        if raw:
+            keys.add(raw)
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+async def _coverage_challenges_on_browser(db, pipeline, browser, *, count: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Blind Account-2 challenge of searches already declared complete.
+
+    A miss is not merely logged: the affected query is reopened so Account 1 must reconcile it.
+    """
+    from scraper.tasks.pakistanlawsite import SOURCE_NAME
+    from scraper.tasks.pls_search_harvest import load_known_citation_keys
+
+    n = int(settings.PLS_COVERAGE_CHALLENGES if count is None else count)
+    if n <= 0:
+        return []
+    map_row = await active_map(db, SOURCE_NAME)
+    if map_row is None:
+        return [{"skipped": "no active PakistanLawSite search map for coverage challenge"}]
+    search_map = map_as_dict(map_row)
+    queries = (
+        await db.execute(
+            select(PlsSearchHarvestQuery)
+            .where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.status == "done",
+            )
+            .order_by(func.random())
+            .limit(n)
+        )
+    ).scalars().all()
+    if not queries:
+        return [{"skipped": "no completed search query available for coverage challenge"}]
+
+    out: List[Dict[str, Any]] = []
+    for query_row in queries:
+        # A completed query may span many result pages. Challenge one page across that full
+        # recorded window rather than repeatedly validating only page 1.
+        max_page = max(1, int(query_row.pages_enumerated or 1))
+        challenge_page = random.randint(1, max_page)
+        cursor = {"page": 1, "page_no": 1}
+        reason = unmapped_harvest_reason(search_map, dict(query_row.query_json or {}), cursor)
+        if reason:
+            _record(
+                db,
+                kind="coverage",
+                label=query_row.query_key,
+                url=settings.PLS_SEARCH_URL,
+                result="skipped",
+                detail=f"independent verifier cannot express query: {reason}",
+            )
+            out.append({"query": query_row.query_key, "result": "skipped"})
+            continue
+        await pipeline._charge_page()
+        landing = await browser.goto(settings.PLS_SEARCH_URL)
+        await pipeline.manager.touch(int(browser.slot_number))
+        verdict = landing.classify()
+        if verdict.kind == "block":
+            raise ExplicitBlock(verdict.kind, verdict.detail)
+        if verdict.kind == "verification":
+            raise VerificationRequired(verdict.detail)
+        if verdict.kind == "login":
+            raise LoginRequired(verdict.detail)
+        values = build_harvest_form_values(search_map, dict(query_row.query_json or {}), cursor)
+        await pipeline._charge_page()
+        page = await browser.submit_search(search_map, values)
+        await pipeline.manager.touch(int(browser.slot_number))
+        reached_page = 1
+        # Follow live pagination independently. If the live site cannot reach the page previously
+        # recorded as complete, that is not a pass; it is an explicit no-verdict anomaly.
+        while reached_page < challenge_page:
+            nxt = _independent_next_url(page.html, page.url, search_map)
+            if not nxt:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="unreachable",
+                    detail=f"Account-2 could not reach recorded result page {challenge_page}; pagination ended at {reached_page}",
+                )
+                out.append({"query": query_row.query_key, "result": "unreachable", "challenge_page": challenge_page})
+                release_page_result(page)
+                page = None
+                break
+            release_page_result(page)
+            await pipeline._charge_page()
+            page = await browser.goto(nxt)
+            await pipeline.manager.touch(int(browser.slot_number))
+            reached_page += 1
+        if page is None:
+            continue
+        try:
+            verdict = page.classify()
+            if verdict.kind == "block":
+                raise ExplicitBlock(verdict.kind, verdict.detail)
+            if verdict.kind == "verification":
+                raise VerificationRequired(verdict.detail)
+            if verdict.kind == "login":
+                raise LoginRequired(verdict.detail)
+            live_keys = _independent_grid_keys(page.html)
+            if not live_keys:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="unreachable",
+                    detail="independent verifier found no citation or CaseName keys; no completeness verdict recorded",
+                )
+                out.append({"query": query_row.query_key, "result": "unreachable"})
+                continue
+            known = await load_known_citation_keys(db, live_keys)
+            missing = sorted(live_keys - known)
+            if missing:
+                query_row.status = "pending"
+                query_row.last_error = (
+                    "independent verifier coverage miss: " + ", ".join(missing[:8])
+                )[:1000]
+                query_row.updated_at = datetime.now(timezone.utc)
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="differs",
+                    detail=f"Account-2 verifier found {len(missing)} live key(s) absent from corpus/staging; query reopened",
+                )
+                out.append({"query": query_row.query_key, "result": "coverage_miss", "challenge_page": challenge_page, "missing": missing[:8]})
+            else:
+                _record(
+                    db,
+                    kind="coverage",
+                    label=query_row.query_key,
+                    url=page.url,
+                    result="match",
+                    detail=f"Account-2 verifier independently found {len(live_keys)} key(s); all resolve in corpus/staging",
+                )
+                out.append({"query": query_row.query_key, "result": "match", "challenge_page": challenge_page, "keys": len(live_keys)})
+        finally:
+            release_page_result(page)
+    await db.flush()
+    return out
+
+
 async def check_judgments(
     db,
     *,
@@ -201,34 +392,89 @@ async def check_judgments(
     pipeline._assert_permitted()
     from scraper.auth.session_manager import SessionLock
 
-    lock = SessionLock(SOURCE_NAME, redis_client)
+    verifier_slot_no = int(settings.PLS_VERIFIER_SLOT or 2)
+    slot = await pipeline.manager.slot(verifier_slot_no)
+    if slot.state != "ACTIVE":
+        return [{"skipped": f"independent verifier slot {verifier_slot_no} is {slot.state}"}]
+
+    # Two accounts may be live concurrently. The global lock is shared up to two holders, while
+    # the slot-2 lock is exclusive. This reserves verifier independence without opening two
+    # browsers on the same PLS account.
+    lock = SessionLock(SOURCE_NAME, redis_client, max_holders=2)
+    slot_lock = SessionLock(f"{SOURCE_NAME}:slot{verifier_slot_no}", redis_client, max_holders=1)
     try:
         await lock.acquire()
+        await slot_lock.acquire()
     except SessionLockHeld:
-        await lock.release()  # closes the client the lock opened for itself
-        return [{"skipped": "a login-session job holds the lock; checked on the next run"}]
+        await slot_lock.release()
+        await lock.release()
+        return [{"skipped": "independent verifier account is already in use; no fallback to Account 1"}]
+
     results: List[Dict[str, Any]] = []
     try:
         pipeline._session_lock = lock
+        pipeline._slot_lock = slot_lock
         if claim_turn and not await claim_spot_check_turn(redis_client):
-            return [{"skipped": "checked between search-harvest pages within the last spot-check interval"}]
-        slot = await pipeline.manager.current_slot()
-        if slot is None:
-            return [{"skipped": "no ACTIVE slot"}]
-        # The page is fetched on the current slot only: a spot check never walks the continuity
-        # ladder (no reconnect on the alternate slot, no switch of the current slot), so a bounce
-        # here costs one slot its state exactly as a harvest would, and nothing more.
+            return [{"skipped": "Account-2 verification already ran within the spot-check interval"}]
+        pipeline.runner.preferred_slot_number = verifier_slot_no
+        pipeline.runner.exclusive_slot = True
         browser = await pipeline.runner.open(slot)
         results = await _check_judgments_on_browser(db, pipeline, browser, slot, rows)
+        try:
+            results.extend(await _coverage_challenges_on_browser(db, pipeline, browser))
+        except Exception as exc:
+            from scraper.tasks.pakistanlawsite import PacingBudgetExceeded
+
+            if isinstance(exc, PacingBudgetExceeded):
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="skipped",
+                    detail=f"pacing budget spent: {exc}",
+                )
+                results.append({"result": "skipped", "detail": f"coverage pacing: {exc}"})
+            elif isinstance(exc, (LoginRequired, VerificationRequired)):
+                await pipeline.manager.mark_needs_human_login(
+                    verifier_slot_no, f"{type(exc).__name__}: {exc}"
+                )
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="login_required",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+                results.append({"result": "login_required", "detail": str(exc)[:300]})
+            elif isinstance(exc, ExplicitBlock):
+                await pipeline.manager.halt_source(
+                    f"explicit block during Account-2 coverage challenge: {exc}",
+                    slot_number=verifier_slot_no,
+                )
+                _record(
+                    db,
+                    kind="coverage",
+                    label="Account-2 coverage challenge",
+                    url=settings.PLS_SEARCH_URL,
+                    result="unreachable",
+                    detail=f"block, source halted: {exc}",
+                )
+                results.append({"result": "unreachable", "detail": f"block: {exc}"})
+            else:
+                raise
         await db.flush()
         return results
     finally:
-        pipeline._session_lock = None
         try:
             await pipeline._persist_live_session()
         except Exception as exc:
             logger.warning("spot check: could not persist the live session: %s", exc)
         await pipeline.runner.close()
+        pipeline._session_lock = None
+        pipeline._slot_lock = None
+        await slot_lock.release()
         await lock.release()
 
 

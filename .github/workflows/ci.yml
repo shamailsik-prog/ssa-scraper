@@ -2,7 +2,12 @@ name: corpus-service-ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: corpus-service-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

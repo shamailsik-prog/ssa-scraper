@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -223,8 +223,16 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
         if (4, key4) not in existing:
             db.add(CrawlFrontier(source_name=SOURCE_NAME, tier=4, query_key=key4, query_json={"reporter": rep, "year": current_year, "daily": True}, cursor_json={"page": 1}, priority=1, next_run_at=now))
             counts["tier4"] += 1
-    # Tier 2 from promoted statute sections (bounded per seeding run)
-    rows = (await db.execute(select(StatuteSection, Statute).join(Statute, Statute.id == StatuteSection.statute_id).limit(2000))).all()
+    # Tier 2 from every promoted statute section. Completeness is more important than keeping
+    # this one seeding SELECT artificially small: a hard LIMIT silently left later provisions
+    # undiscoverable once the statute corpus grew beyond that slice.
+    rows = (
+        await db.execute(
+            select(StatuteSection, Statute)
+            .join(Statute, Statute.id == StatuteSection.statute_id)
+            .order_by(Statute.id, StatuteSection.id)
+        )
+    ).all()
     for sec, st in rows:
         key = fit_key(f"t2:{st.short_name or st.name}:{sec.section_number}")
         if (2, key) not in existing:
@@ -245,6 +253,16 @@ async def seed_frontier(db: AsyncSession, source: ScraperSource) -> Dict[str, in
             counts["tier3"] += 1
     await db.flush()
     return counts
+
+
+def frontier_ordering():
+    """SQL ordering for runnable frontier rows: fresh current-year work before historical backfill."""
+    return (
+        case((CrawlFrontier.tier == 4, 0), else_=1).asc(),
+        CrawlFrontier.priority.asc(),
+        CrawlFrontier.tier.asc(),
+        CrawlFrontier.created_at.asc(),
+    )
 
 
 # --------------------------------------------------------------------------- query building
@@ -338,11 +356,17 @@ class PakistanLawSitePipeline:
         self.source = source
         self.manager = SessionManager(db, source)
         self.runner = ContinuityRunner(self.manager, browser_factory, sleep=sleep)
+        # Owner ruling 16 October 2026: Account 1 is acquisition; Account 2 is verification only.
+        # Verification code may explicitly override this runner before opening slot 2.
+        self.runner.preferred_slot_number = 1
+        self.runner.exclusive_slot = True
         self.local_engine = local_engine if local_engine is not None else LocalScrapeGraphEngine()
         self.redis_client = redis_client
         self.job_id = job_id
         self.sleep = sleep
-        self.reporter_shard = reporter_shard if reporter_shard in (0, 1) else None
+        if reporter_shard is not None:
+            logger.warning("reporter_shard=%s ignored: Account 1 now owns the complete acquisition corpus", reporter_shard)
+        self.reporter_shard = None
         self.reporter_shard_reporters: List[str] = []
         self._other_shard_reporters: List[str] = []
         self._session_lock: Optional[SessionLock] = None
@@ -1725,22 +1749,18 @@ class PakistanLawSitePipeline:
                 candidate = await self.manager.slot(preferred)
                 if candidate.state == "ACTIVE":
                     slot = candidate
-                elif self.reporter_shard is not None:
-                    # A shard runs on its own slot only. Borrowing the other shard's slot would put two
-                    # browsers on one login at the same time and the site would end one of them.
-                    if await self.manager.current_slot() is None:
-                        await self.manager.pause_source("no ACTIVE slot: human login required")
-                        self.stats["paused"] = True
-                    else:
-                        self.stats["skipped"] = "shard_slot_not_active"
-                        self.stats["preferred_slot"] = preferred
-                        logger.info(
-                            "PakistanLawSite shard %s skipped: its slot %s is %s (%s)",
-                            self.reporter_shard,
-                            preferred,
-                            candidate.state,
-                            candidate.state_reason,
-                        )
+                elif self.runner.exclusive_slot:
+                    # Never fail over acquisition to Account 2. A dead harvester account is an
+                    # operational pause, not permission to destroy verifier independence.
+                    self.stats["skipped"] = "harvester_slot_not_active"
+                    self.stats["preferred_slot"] = preferred
+                    self.stats["paused"] = True
+                    logger.warning(
+                        "PakistanLawSite acquisition paused: dedicated slot %s is %s (%s)",
+                        preferred,
+                        candidate.state,
+                        candidate.state_reason,
+                    )
                     return self.stats
             if slot is None:
                 slot = await self.manager.current_slot()
@@ -1832,7 +1852,9 @@ class PakistanLawSitePipeline:
                 select(CrawlFrontier)
                 .where(CrawlFrontier.source_name == SOURCE_NAME, CrawlFrontier.status.in_(["pending", "in_progress"]))
                 .where((CrawlFrontier.next_run_at.is_(None)) | (CrawlFrontier.next_run_at <= now))
-                .order_by(CrawlFrontier.tier.asc(), CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
+                # Fresh current-year work is a reserved lane: historical backfill must never sit
+                # ahead of a due Tier-4 wave merely because its numeric tier is smaller.
+                .order_by(*frontier_ordering())
                 .limit(max_queries)
             )
             frontier_rows = (await self.db.execute(q)).scalars().all()
@@ -1910,34 +1932,23 @@ def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
-    """Take the slot lock of an ACTIVE login nobody else holds (the current login first) and bind `pipeline` to it:
-    its browser opens that login only and never fails over onto the other one, which another job may be using.
-    Login 1 and login 2 are separate accounts that run at the same time (operator decision, 11 Oct 2026), but two
-    browsers on ONE login end each other. Returns the slot, or None when every ACTIVE login is in use.
-    The login with the most of its hourly page budget left goes first: each login has its own budget, and always
-    opening the current one spent login 1's hour while login 2 sat unused (11 Oct 2026)."""
-    current = await pipeline.manager.current_slot()
-    active = [s for s in await pipeline.manager.slots() if s.state == "ACTIVE"]
-    cfg = dict(pipeline.source.config_json or {})
-    hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    """Claim the dedicated acquisition account (slot 1) only.
 
-    def pages_this_hour(slot) -> int:
-        pacing = dict(cfg.get(pacing_key(slot.slot_number)) or {})
-        return int(pacing.get("hour_pages") or 0) if pacing.get("hour") == hour_key else 0
-
-    active.sort(key=lambda s: (pages_this_hour(s), current is None or s.slot_number != current.slot_number, s.slot_number))
-    for slot in active:
-        lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", pipeline.redis_client, max_holders=1)
-        try:
-            await lock.acquire()
-        except SessionLockHeld:
-            await lock.release()
-            continue
-        pipeline._slot_lock = lock
-        pipeline.runner.preferred_slot_number = slot.slot_number
-        pipeline.runner.exclusive_slot = True
-        return slot
-    return None
+    Slot 2 is a verifier account and may never be borrowed by case-ID walks or other acquisition jobs.
+    """
+    slot = await pipeline.manager.slot(1)
+    if slot.state != "ACTIVE":
+        return None
+    lock = SessionLock(f"{SOURCE_NAME}:slot1", pipeline.redis_client, max_holders=1)
+    try:
+        await lock.acquire()
+    except SessionLockHeld:
+        await lock.release()
+        return None
+    pipeline._slot_lock = lock
+    pipeline.runner.preferred_slot_number = 1
+    pipeline.runner.exclusive_slot = True
+    return slot
 
 
 async def release_claimed_slot(pipeline: "PakistanLawSitePipeline") -> None:

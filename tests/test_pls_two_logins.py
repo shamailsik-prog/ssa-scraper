@@ -1,7 +1,5 @@
-"""Operator decision of 11 Oct 2026: PakistanLawSite login 1 and login 2 are separate accounts and run at the same
-time (two reporter shards, one per login, each paced at its own 300 pages an hour). Two browsers on ONE login end
-each other, so every job that opens a browser must hold that login's slot lock: the search harvest and the case-ID
-walk used to open whichever login was current without it, and two of either could run at once over shared state."""
+"""Owner decision 16 Oct 2026: PakistanLawSite Account 1 is acquisition and Account 2 is independent
+verification. They may be live concurrently, but acquisition helpers must never borrow the verifier account."""
 
 from __future__ import annotations
 
@@ -33,17 +31,14 @@ async def _pipeline(db, active_slots):
     return PakistanLawSitePipeline(db, source, redis_client=r, sleep=_nosleep), r
 
 
-async def test_claim_free_slot_takes_the_login_nobody_holds(db):
+async def test_claim_free_slot_never_borrows_verifier_when_harvester_is_busy(db):
     pipeline, r = await _pipeline(db, (1, 2))
     other = SessionLock("PakistanLawSite:slot1", r, max_holders=1)
     await other.acquire()
     try:
-        slot = await claim_free_slot(pipeline)
-        assert slot is not None and slot.slot_number == 2
-        assert pipeline.runner.preferred_slot_number == 2
-        assert pipeline.runner.exclusive_slot is True  # never fails over onto the login the other job holds
-        assert pipeline._slot_lock is not None
-        await pipeline._slot_lock.release()
+        assert await claim_free_slot(pipeline) is None
+        assert pipeline.runner.preferred_slot_number == 1
+        assert pipeline.runner.exclusive_slot is True
     finally:
         await other.release()
         await r.delete(*SLOT_KEYS)
@@ -81,8 +76,7 @@ def test_search_harvest_and_caseid_walk_hold_a_login_and_run_one_at_a_time():
     walk = Path("scraper/tasks/pls_caseid_walk.py").read_text(encoding="utf-8")
     assert "claim_free_slot(" in walk and "no free login slot" in walk
     assert 'SessionLock(f"{SOURCE_NAME}:caseid_walk"' in walk
-    # Owner's decision of 13 October 2026: one search harvest per login, each holding its own login's slot lock
-    # (behaviour covered in tests/test_pls_search_harvest_slots.py).
+    # Account 1 is the only acquisition login; its search/case-ID paths still hold the slot lock.
     harvest = Path("scraper/tasks/pls_search_harvest.py").read_text(encoding="utf-8")
     assert 'SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}"' in harvest
     assert 'SessionLock(f"{SOURCE_NAME}:slot{chosen}"' in harvest
@@ -180,11 +174,8 @@ async def test_run_locks_are_kept_alive_with_every_page(db):
     assert calls["n"] == 1
 
 
-async def test_claim_free_slot_prefers_the_login_with_more_of_its_hour_left(db):
-    """11 Oct 2026: the case-ID walk and the search harvest always opened login 1 first, so login 1 spent its
-    300 pages an hour and the walk stopped on its budget while login 2 sat unused since 00:44."""
+async def test_claim_free_slot_always_uses_account1_even_when_account2_has_more_budget(db):
     from datetime import datetime, timezone
-
     from scraper.tasks.pakistanlawsite import pacing_key
 
     pipeline, r = await _pipeline(db, (1, 2))
@@ -196,15 +187,10 @@ async def test_claim_free_slot_prefers_the_login_with_more_of_its_hour_left(db):
     await db.flush()
     try:
         slot = await claim_free_slot(pipeline)
-        assert slot is not None and slot.slot_number == 2
-        await pipeline._slot_lock.release()
-        cfg[pacing_key(2)] = {"hour": "2000-01-01T00", "hour_pages": 999}  # an old hour counts as unused
-        cfg[pacing_key(1)] = {"hour": hour, "hour_pages": 5}
-        pipeline.source.config_json = dict(cfg)
-        await db.flush()
-        slot = await claim_free_slot(pipeline)
-        assert slot is not None and slot.slot_number == 2
+        assert slot is not None and slot.slot_number == 1
+        assert pipeline.runner.preferred_slot_number == 1
         await pipeline._slot_lock.release()
     finally:
         await r.delete(*SLOT_KEYS)
         await r.aclose()
+

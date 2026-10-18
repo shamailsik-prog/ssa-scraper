@@ -40,26 +40,38 @@ A background task (`scraper/tasks/unreported_reader.py`, every `READER_SCHEDULE_
 
 - **Laws**: each statute and section the court applies or interprets, with the words of the judgment that show it.
 - **Points**: each point decided and how, with the words of the judgment that show it.
-- **Interpretation**: the reading of the law the court adopts, in a sentence or two.
-- **Turns on**: what the decision rests on.
-- **Subjects**: two to five subject headings (e.g. "Bail - further inquiry"), and the **outcome**.
+- **Interpretation**: each legal interpretation is stored only with a supporting quotation copied from the judgment.
+- **Turns on**: each dispositive proposition is stored only with a supporting quotation.
+- **Subjects**: one to three headings taken only from the fixed list `SUBJECTS` in
+  `scraper/tasks/unreported_reader.py` (taxonomy version `legal-subjects-1`). Invalid headings and valid headings
+  beyond the three-heading ceiling are recorded in `dropped`; `Other` is used only when the model explicitly selects it.
+- **Outcome**: accepted only when the disposition is supported by quoted words found in the judgment.
 
-Guard against invention: a law or point whose quoted words are not found in the judgment is dropped
-(kept aside in `dropped`, never shown as a finding). Interpretation and "turns on" are one-line summaries.
-All of it is a **machine reading**: the viewer labels it so, shows it above the full judgment, and it is
-never a substitute for reading the judgment.
+Guard against invention: laws, points, interpretation, dispositive reasoning and outcome are source-grounded
+before they become the current reading. Rejected items remain auditable in `dropped`. Every reader attempt is written
+to immutable `judgment_reading_version` history; `judgment_reading` is only the current validated serving snapshot.
+A failed re-read therefore never destroys or hides the last good reading. All of it remains a **machine reading**:
+the viewer labels it so and it is never a substitute for reading the judgment.
 
 **Switching it on.** Set `READER_MODEL` (or `TREATMENT_MODEL`) and an API key (`OPENAI_API_KEY`, or
-`READER_BASE_URL` + `READER_API_KEY` for any OpenAI-compatible endpoint) in `/opt/ssa-scraper/.env`, then
+`READER_BASE_URL` + `READER_API_KEY` for an OpenAI Chat-Completions-compatible endpoint that supports JSON-object response mode) in `/opt/ssa-scraper/.env`, then
 restart, or run the deploy-cloud workflow with `reader_model` set (it writes `READER_MODEL` and restarts; `off`
-stops it, even where TREATMENT_MODEL is set). One reading run at a time (advisory lock); an answer without a
-reading counts as a failure and is retried after `READER_RETRY_HOURS`. Without them the agent does nothing and the dashboard lists `READER_MODEL` under "Not configured".
-Only public judgments are sent (the unreported section is court websites); PakistanLawSite text never is.
+stops it, even where TREATMENT_MODEL is set). Concurrent workers are safe: each judgment is protected by its own
+PostgreSQL advisory lock, so different judgments can be read in parallel without duplicate model spend. Failures are
+classified (authentication/configuration, rate-limit, transient provider/network, validation, database), each attempt
+gets its own `retry_after_at`, and provider-wide failures open a Redis-backed circuit breaker. Without a configured
+model/key the agent does nothing and the dashboard lists `READER_MODEL` under "Not configured". Only public judgments
+are sent (the unreported section is court websites); PakistanLawSite text never is.
 
-**Cost.** Up to `READER_MAX_CHARS` (24,000) characters of each judgment are sent (the opening and the
-closing part of a long one), about 6,000 tokens. Twelve thousand judgments are roughly 75 million input
-tokens; the price depends on the model chosen. At 20 a run every 10 minutes the agent reads about 2,900
-judgments a day.
+**Whole-judgment coverage.** `READER_MAX_CHARS` (24,000 by default) is now the maximum **per chunk**, not a
+head/tail truncation limit. Longer judgments are read through overlapping chunks (`READER_CHUNK_OVERLAP_CHARS`,
+1,200 by default), so middle paragraphs are not omitted. Chunk results are consolidated and then checked against the
+full judgment text before publication.
+
+**Cost and observability.** Every successful or failed attempt records provider/model, prompt and taxonomy version,
+judgment-text hash, input/output token counts, total latency, chunk count, parse-repair use and error class. Actual
+token usage therefore comes from the provider response instead of a fixed estimate. The 80/20 historical/fresh default
+(`READER_FRESH_SHARE=0.2`) drains backlog while keeping newly promoted judgments from waiting behind the entire archive.
 
 **Viewer.** Corpus viewer → judgments → Section *unreported*: the **Subject** filter lists the headings the
 agent has assigned, with counts; opening a judgment shows the reading above the text.

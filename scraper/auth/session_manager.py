@@ -362,7 +362,7 @@ class SessionLock:
 async def merge_source_config(db: AsyncSession, source: ScraperSource, patch: Dict[str, Any]) -> Dict[str, Any]:
     """Merge top-level keys into scraper_sources.config_json atomically (JSONB `||`).
 
-    Two reporter shards run at the same time in two worker processes, each holding its own copy of
+    Acquisition and verification may run at the same time on separate accounts, each holding its own
     the source row; writing the whole JSON back from either copy would overwrite the other shard's
     cursor and pacing counters. Each writer therefore sends only its own keys, and the in-memory
     row is set to the merged value the database returns."""

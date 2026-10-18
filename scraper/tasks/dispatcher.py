@@ -188,6 +188,8 @@ async def _login_session_max_active(db, source_name: Optional[str] = None) -> in
     """How many login-session jobs may run at once for a source: the pacing profile's target,
     capped by the number of ACTIVE slots. Each concurrent browser needs its own human login; two
     browsers on one login share one server-side session and the site ends one of them."""
+    if source_name == PLS_SOURCE_NAME:
+        return 1
     mode = await get_harvest_mode(db)
     target = int(login_pacing_profile(mode)["login_session_concurrency"] or 1)
     if source_name is None or target <= 1:
@@ -417,7 +419,13 @@ def run_source_job(self, source_name: str, queued_at: Optional[str] = None, manu
 
 @shared_task(name="scraper.tasks.dispatcher.run_login_session_job", bind=True, max_retries=0)
 def run_login_session_job(self, source_name: str = "PakistanLawSite", reporter_shard=None):
-    """Login-session queue. When concurrency is 2, Beat enqueues one job per reporter shard."""
+    """Login-session acquisition task.
+
+    PakistanLawSite always runs unsharded on Account 1. Account 2 is reserved for independent verification,
+    including when an old/manual caller still supplies reporter_shard=1.
+    """
+    if source_name == PLS_SOURCE_NAME:
+        reporter_shard = None
     return run_async(run_source(source_name, reporter_shard=reporter_shard))
 
 
@@ -586,6 +594,30 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
                     continue
                 active_slots = await _active_slot_numbers(db, s.source_name)
+                if s.source_name == PLS_SOURCE_NAME:
+                    # Owner ruling 16 Oct 2026: Account 1 harvests; Account 2 independently verifies.
+                    # Do not use concurrency=2, sharding, takeover or an alternate login for acquisition.
+                    if running_jobs:
+                        logger.info("%s: Account-1 acquisition job already running", s.source_name)
+                        continue
+                    if 1 not in active_slots:
+                        logger.warning("%s: harvester Account 1 is not ACTIVE; verifier Account 2 will not be borrowed", s.source_name)
+                        skipped_saturated.append(f"{s.source_name}:harvester_slot_not_active")
+                        continue
+                    if dispatch_saturated(dict(s.config_json or {}), None, now=now):
+                        logger.info("skip enqueue %s: the Account-1 grid walk is saturated; recheck later", s.source_name)
+                        skipped_saturated.append(s.source_name)
+                        s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                        continue
+                    app.send_task(
+                        "scraper.tasks.dispatcher.run_login_session_job",
+                        args=(s.source_name,),
+                        kwargs={"reporter_shard": None},
+                        queue="login_session",
+                    )
+                    queued.append(s.source_name)
+                    s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                    continue
                 running_shards = _running_reporter_shards(running_jobs)
                 if running_jobs and any(shard not in (0, 1) for shard in running_shards):
                     # An unsharded job may fail over to any ACTIVE slot: nothing else may start.

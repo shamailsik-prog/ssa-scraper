@@ -230,3 +230,72 @@ async def test_seeding_twice_with_an_over_long_statute_name_stays_idempotent(db)
         await seed_extended_plan(db, judge_limit=0)
         await db.flush()
     await db.rollback()
+
+
+async def test_tier2_seeding_never_truncates_after_two_thousand_sections(db):
+    """Every promoted provision must become a discovery route; a LIMIT here creates a silent corpus hole."""
+    from scraper.models import CrawlFrontier, Statute, StatuteSection
+    from scraper.tasks.pakistanlawsite import seed_frontier
+
+    statute = Statute(name="Tier Two Exhaustive Coverage Act", short_name="T2ECA", source_name="PakistanCode")
+    db.add(statute)
+    await db.flush()
+    db.add_all(
+        [StatuteSection(statute_id=statute.id, section_number=str(i)) for i in range(1, 2006)]
+    )
+    await db.flush()
+
+    await seed_frontier(db, None)
+    await db.flush()
+
+    rows = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PakistanLawSite",
+                CrawlFrontier.tier == 2,
+            )
+        )
+    ).scalars().all()
+    ours = [row for row in rows if (row.query_json or {}).get("statute") == "T2ECA"]
+    assert len(ours) == 2005
+    assert {(row.query_json or {}).get("section") for row in ours} == {str(i) for i in range(1, 2006)}
+    await db.rollback()
+
+
+async def test_fresh_tier4_frontier_precedes_backfill_even_with_worse_numeric_priority(db):
+    """Fresh judgments have reserved scheduler precedence; Tier 1 cannot starve the current-year lane."""
+    from scraper.models import CrawlFrontier
+    from scraper.tasks.pakistanlawsite import frontier_ordering
+
+    db.add_all(
+        [
+            CrawlFrontier(
+                source_name="PakistanLawSite",
+                tier=1,
+                query_key="fresh-order-test:backfill",
+                query_json={"reporter": "PLD", "year": 2000},
+                cursor_json={"page_no": 1},
+                status="pending",
+                priority=1,
+            ),
+            CrawlFrontier(
+                source_name="PakistanLawSite",
+                tier=4,
+                query_key="fresh-order-test:fresh",
+                query_json={"reporter": "PLD", "year": 2026, "daily": True},
+                cursor_json={"page": 1},
+                status="pending",
+                priority=999,
+            ),
+        ]
+    )
+    await db.flush()
+    rows = (
+        await db.execute(
+            select(CrawlFrontier)
+            .where(CrawlFrontier.query_key.like("fresh-order-test:%"))
+            .order_by(*frontier_ordering())
+        )
+    ).scalars().all()
+    assert [row.tier for row in rows] == [4, 1]
+    await db.rollback()
