@@ -24,9 +24,9 @@ def test_allowed_vs_dismissed_with_high_boilerplate_similarity_conflicts():
     assert dispositive_signals_conflict(BODY_ALLOWED, dismissed)
 
 
-def test_guard_off_permits_legacy_merge_decision():
+def test_guard_off_still_blocks_materially_different_orders():
     dismissed = BODY_ALLOWED.replace("allowed", "dismissed").replace("Rs.100,000", "Rs.50,000")
-    assert reconciliation_pair_allowed(BODY_ALLOWED, dismissed, guard_enabled=False)
+    assert not reconciliation_pair_allowed(BODY_ALLOWED, dismissed, guard_enabled=False)
 
 
 def test_guard_on_blocks_incompatible_pair():
