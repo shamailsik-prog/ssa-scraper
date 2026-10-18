@@ -351,7 +351,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, PakistanLawSite case_title is taken from the order-sheet header (parse_case_metadata) instead of the first versus line in the text window.",
     )
-    SSA_ENCODING_GUARD: bool = Field(default=False, description="Quarantine PLS rows whose preserved text contains ???? mojibake runs.")
+    SSA_ENCODING_GUARD: bool = Field(
+        default=False,
+        description="Classify ???? runs: quarantine only when the English body is damaged; flag Urdu headnote-only damage (auditor 2026-10-18: 6,708 rows, sample was headnote-only). Do not re-fetch blindly.",
+    )
     SSA_COURT_HEADER_GUARD: bool = Field(default=False, description="Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header).")
     SSA_PLD_CITATION_RELABEL: bool = Field(default=False, description="Relabel PLD citations missing a court token using the judgment header.")
     SSA_SHORT_TEXT_GUARD: bool = Field(default=False, description="Quarantine PLS judgments shorter than 500 characters of preserved text.")
