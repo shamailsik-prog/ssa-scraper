@@ -360,6 +360,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, instrument mentions must link to an existing statute; they must not insert sectionless stub rows (auditor 2026-10-18: 10,303 of 12,618 statutes have no sections).",
     )
+    SSA_STATUTE_PDF_FOLLOW: bool = Field(
+        default=False,
+        description="When true, statute ingest follows a linked PDF and uses its extracted text when it is longer than the HTML listing (auditor 2026-10-18: act text often exists only as PDFs).",
+    )
     PLS_MAX_FAILOVER_RETRIES: int = Field(default=0)  # legacy; automatic failover past a block is forbidden
     PLS_SESSION_TTL_MINUTES: int = Field(default=720)
     # Legacy automated-login names. Accepted so old .env files do not break; never used to log in.
