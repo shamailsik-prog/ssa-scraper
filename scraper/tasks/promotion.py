@@ -1721,6 +1721,17 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     name = (data.get("statute_name") or "").strip()
     sections = data.get("sections") or []
     evidence = data.get("field_evidence") or {}
+    if settings.SSA_STATUTE_NAME_QUALITY and name and (
+        is_short_title_clause(name) or looks_like_fragment_name(name)
+    ):
+        await _quarantine(
+            db,
+            st,
+            "statute_name_quality: fragment, clause, or garbage name",
+            "statute",
+            {"reason_code": "statute_name_quality", "statute_name": name[:280]},
+        )
+        return "quarantined"
     if st.source_name == "PakistanCode":
         # Every PakistanCode statute is read against its own table of contents (statute_contents.py);
         # only a statute whose title matched and whose listed sections were all found with real text

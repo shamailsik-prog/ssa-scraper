@@ -244,11 +244,36 @@ def _is_plausible_act_title(name: str) -> bool:
     return bool(re.search(r'\b(Act|Ordinance|Order|Code|Rules|Regulations|Constitution)\b', candidate, re.IGNORECASE))
 
 
+def looks_like_clause_fragment(name: str) -> bool:
+    """Auditor 2026-10-18: about a third of names are clause fragments ('means the ... Act')."""
+    lowered = _normalize_whitespace(name or "").lower()
+    if not lowered:
+        return False
+    if lowered.startswith("means the ") or lowered.startswith("further to amend"):
+        return True
+    if " further to amend " in f" {lowered} ":
+        return True
+    return False
+
+
+def looks_like_garbage_name(name: str) -> bool:
+    """Binary leftovers (JPEG/PDF bytes) used as a statute title."""
+    raw = name or ""
+    if not raw:
+        return True
+    if any(sig in raw for sig in ("JFIF", "%PDF", "\x00", "\xff\xd8")):
+        return True
+    printable = sum(1 for ch in raw if ch.isprintable())
+    return printable / max(len(raw), 1) < 0.85
+
+
 def looks_like_fragment_name(name: str) -> bool:
     """True for URL slugs, ViewerJS fragments, encoded PakistanCode ids, or filename leftovers."""
     candidate = _normalize_whitespace(name or "")
     if not candidate:
         return False
+    if looks_like_clause_fragment(candidate) or looks_like_garbage_name(candidate):
+        return True
     lowered = candidate.lower()
     if any(token in lowered for token in ("pdffiles", "viewerjs", "uy2f", "lgu0x", "%3d", "%2f")):
         return True

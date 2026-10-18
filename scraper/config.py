@@ -360,6 +360,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, instrument mentions must link to an existing statute; they must not insert sectionless stub rows (auditor 2026-10-18: 10,303 of 12,618 statutes have no sections).",
     )
+    SSA_STATUTE_NAME_QUALITY: bool = Field(
+        default=False,
+        description="When true, quarantine statute names that are clause fragments, URL leftovers, or binary garbage (auditor 2026-10-18: 'means the ... Act', JPEG bytes).",
+    )
     PLS_MAX_FAILOVER_RETRIES: int = Field(default=0)  # legacy; automatic failover past a block is forbidden
     PLS_SESSION_TTL_MINUTES: int = Field(default=720)
     # Legacy automated-login names. Accepted so old .env files do not break; never used to log in.
