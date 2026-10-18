@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from typing import FrozenSet, Optional, Set
 
 # Outcome families that must not be collapsed into one judgment row.
 _FAMILY_PATTERNS = (
     ("allowed", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+allowed\b|\b(?:partly\s+)?allowed\b", re.I)),
+    ("not_allowed", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+not\s+allowed\b", re.I)),
+    ("rejected", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+(?:is|stands)\s+rejected\b", re.I)),
     ("dismissed", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+dismissed\b|\b(?:partly\s+)?dismissed\b", re.I)),
     ("remanded", re.compile(r"\bremanded\b", re.I)),
     ("disposed", re.compile(r"\bdisposed\s+of\b", re.I)),
@@ -29,17 +32,20 @@ _CONFLICT_PAIRS = frozenset(
 )
 
 _MONEY_RE = re.compile(
-    r"(?:rs\.?|pkr|rupees?)\s*([\d][\d,]*(?:\.\d+)?)\s*(?:lakh|lac|million|m)?",
+    r"(?:rs\.?|pkr|rupees?)\s*([\d][\d,]*(?:\.\d+)?)\s*(lakh|lac|million|crore|m)?\b",
     re.IGNORECASE,
 )
 
 
-def _normalise_amount(raw: str) -> int:
-    digits = re.sub(r"[^\d.]", "", raw or "")
-    if not digits:
+def _normalise_amount(raw: str, unit: str = "") -> int:
+    """Parse rupee amounts without binary floating-point rounding."""
+    try:
+        value = Decimal(raw.replace(",", ""))
+    except (InvalidOperation, AttributeError):
         return 0
-    value = float(digits)
-    return int(round(value))
+    scale = {"lakh": 100_000, "lac": 100_000, "million": 1_000_000,
+             "m": 1_000_000, "crore": 10_000_000}.get(unit.lower(), 1)
+    return int(value * scale) if value > 0 else 0
 
 
 def extract_dispositive_outcomes(text: Optional[str]) -> FrozenSet[str]:
@@ -57,30 +63,25 @@ def extract_monetary_amounts(text: Optional[str]) -> FrozenSet[int]:
         return frozenset()
     amounts: Set[int] = set()
     for match in _MONEY_RE.finditer(text):
-        base = _normalise_amount(match.group(1))
+        base = _normalise_amount(match.group(1), match.group(2) or "")
         if base <= 0:
             continue
-        tail = (match.group(0) or "").lower()
-        if "lakh" in tail or "lac" in tail:
-            base *= 100_000
-        elif "million" in tail or re.search(r"\bm\b", tail):
-            base *= 1_000_000
         amounts.add(base)
     return frozenset(amounts)
 
 
 def dispositive_signals_conflict(left: Optional[str], right: Optional[str]) -> bool:
-    """True when both texts carry incompatible dispositive signals (outcome or surety amount)."""
+    """Divergent or missing judicial signals are not affirmative identity evidence."""
     lo, ro = extract_dispositive_outcomes(left), extract_dispositive_outcomes(right)
-    if lo and ro and lo != ro:
+    if lo != ro:
         return True
-    if lo and ro:
-        for pair in _CONFLICT_PAIRS:
-            if (pair & lo) and (pair & ro) and (pair & lo) != (pair & ro):
-                return True
     la, ra = extract_monetary_amounts(left), extract_monetary_amounts(right)
-    if la and ra and la != ra:
+    if la != ra:
         return True
+    if not lo:
+        normalized_left = re.sub(r"\s+", " ", left or "").strip().casefold()
+        normalized_right = re.sub(r"\s+", " ", right or "").strip().casefold()
+        return normalized_left != normalized_right
     return False
 
 
