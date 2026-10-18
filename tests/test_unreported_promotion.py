@@ -223,6 +223,32 @@ async def test_later_reported_copy_with_formatting_differences_reuses_unreported
 
 
 
+async def test_near_identical_boilerplate_but_opposite_outcome_stays_separate_with_guard(db, source, monkeypatch):
+    """Regression: >0.98 similarity must not merge allowed vs dismissed or different surety amounts."""
+    monkeypatch.setattr(settings, "SSA_REPORTED_UNREPORTED_DISPOSITIVE_GUARD", True)
+    first = await _held(db, source)
+    first.source_name = "SindhHighCourt"
+    await release_unreported(db)
+    assert await promote_judgment_staging(db, first) == "promoted"
+    first_id = first.promoted_to_id
+
+    dismissed_body = BODY.replace("allowed", "dismissed").replace("Rs.100,000", "Rs.50,000")
+    reported = await _held(db, source, body=dismissed_body)
+    reported.source_name = "PakistanLawSite"
+    reported.status, reported.quarantine_reason = "extracted", None
+    reported.reconciled_json = {
+        **(reported.reconciled_json or {}),
+        "citations": ["2024 SCMR 79"],
+        "court": "High Court of Sindh",
+        "court_canonical": "High Court of Sindh",
+    }
+    assert await promote_judgment_staging(db, reported) == "promoted"
+    rows = (await db.execute(select(Judgment))).scalars().all()
+    assert len(rows) == 2
+    assert next(row for row in rows if row.id == first_id).unreported is True
+    assert next(row for row in rows if row.id != first_id).canonical_citation == "2024 SCMR 79"
+
+
 async def test_distinct_order_in_same_case_and_date_is_not_falsely_merged(db, source):
     """The case number and date are not enough: substantive disagreement keeps two legal orders."""
     first = await _held(db, source)

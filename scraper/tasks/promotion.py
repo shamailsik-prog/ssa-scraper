@@ -205,6 +205,15 @@ async def _find_unreported_version_of_reported(
             continue
         similarity = _reported_unreported_similarity(candidate.full_text, full_text)
         if similarity >= 0.92:
+            from scraper.config import settings as _settings
+            from scraper.reported_unreported_guard import reconciliation_pair_allowed
+
+            if not reconciliation_pair_allowed(
+                candidate.full_text,
+                full_text,
+                guard_enabled=_settings.SSA_REPORTED_UNREPORTED_DISPOSITIVE_GUARD,
+            ):
+                continue
             strong.append((similarity, candidate))
     if not strong:
         return None

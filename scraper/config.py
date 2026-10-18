@@ -356,6 +356,10 @@ class Settings(BaseSettings):
         default=True,
         description="Block image/font/media requests in Playwright to reduce CitationSearch memory use.",
     )
+    SSA_REPORTED_UNREPORTED_DISPOSITIVE_GUARD: bool = Field(
+        default=False,
+        description="When true, block reported/unreported reconciliation when outcome or monetary signals disagree.",
+    )
     PLS_MAX_FAILOVER_RETRIES: int = Field(default=0)  # legacy; automatic failover past a block is forbidden
     PLS_SESSION_TTL_MINUTES: int = Field(default=720)
     # Legacy automated-login names. Accepted so old .env files do not break; never used to log in.
