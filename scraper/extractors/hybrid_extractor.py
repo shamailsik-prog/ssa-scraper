@@ -280,6 +280,7 @@ class HybridExtractor:
                 raw_html=html,
                 court_directory=directory,
                 min_confidence=self.min_confidence,
+                source_name=self.source.source_name,
             ),
             deterministic_only=deterministic_only,
         )

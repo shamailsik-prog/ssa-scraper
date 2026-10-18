@@ -192,6 +192,8 @@ class Settings(BaseSettings):
     EMBED_QUEUE_ALERT_HOURS: float = Field(default=6.0, description="Alert (EMBED_QUEUE_STALLED) when pending embeddings are older than this and none were embedded in that time.")
     SPOT_CHECK_SCHEDULE_SECONDS: int = Field(default=1800, description="Every 30 minutes a few promoted records are re-fetched and compared with the corpus.")
     SPOT_CHECK_JUDGMENTS: int = Field(default=3, description="Promoted PakistanLawSite judgments re-fetched per spot-check run.")
+    PLS_VERIFIER_SLOT: int = Field(default=2, ge=1, le=2, description="Dedicated independent PakistanLawSite verification account/slot. Harvesting must not use this slot for verifier work.")
+    PLS_COVERAGE_CHALLENGES: int = Field(default=1, ge=0, le=10, description="Completed search queries independently re-run by the verifier each spot-check cycle to look for judgments the harvester missed.")
     SPOT_CHECK_STATUTES: int = Field(default=2, description="Current statute sections re-fetched per spot-check run.")
     RETIRED_SOURCES: str = Field(
         default="NasirLawSite,BalochistanHighCourt",
@@ -203,13 +205,18 @@ class Settings(BaseSettings):
     )
     UNREPORTED_MIN_TEXT_CHARS: int = Field(default=400, description="An unreported judgment needs at least this much text; shorter captures (cause lists, stubs) stay held.")
     UNREPORTED_RELEASE_BATCH: int = Field(default=500, description="Held 'no citation' judgments released for promotion as unreported per promotion run.")
-    READER_MODEL: str = Field(default="", description="Model the reading agent uses on unreported judgments (OpenAI-compatible chat API). Blank = TREATMENT_MODEL; both blank, or off, = the agent does nothing.")
-    READER_BASE_URL: str = Field(default="", description="OpenAI-compatible endpoint for the reading agent. Blank = https://api.openai.com/v1 with OPENAI_API_KEY.")
+    READER_MODEL: str = Field(default="", description="Model the reading agent uses on unreported judgments (OpenAI Chat-Completions-compatible API with JSON-object response mode). Blank = TREATMENT_MODEL; both blank, or off, = the agent does nothing.")
+    READER_BASE_URL: str = Field(default="", description="OpenAI Chat-Completions-compatible endpoint supporting response_format=json_object. Blank = https://api.openai.com/v1 with OPENAI_API_KEY.")
     READER_API_KEY: SecretStr = Field(default=SecretStr(""), description="Key for READER_BASE_URL. Blank = OPENAI_API_KEY.")
     READER_BATCH: int = Field(default=20, description="Unreported judgments the reading agent reads per run.")
     READER_SCHEDULE_SECONDS: int = Field(default=600, description="How often the reading agent runs.")
-    READER_MAX_CHARS: int = Field(default=24000, description="Judgment text sent to the model: the opening and the closing part when longer.")
-    READER_RETRY_HOURS: float = Field(default=24.0, description="A failed reading is tried again after this long.")
+    READER_MAX_CHARS: int = Field(default=24000, description="Maximum characters per reader-model chunk; long judgments are read in overlapping chunks, never head/tail truncated.")
+    READER_CHUNK_OVERLAP_CHARS: int = Field(default=1200, description="Overlap between adjacent reader chunks so propositions crossing a boundary are not lost.")
+    READER_RETRY_HOURS: float = Field(default=24.0, description="Base delay before retrying a failed judgment after transient/validation failures.")
+    READER_HTTP_RETRIES: int = Field(default=2, description="Immediate retries for transient reader-provider HTTP/network failures before recording a failed attempt.")
+    READER_AUTH_CIRCUIT_SECONDS: int = Field(default=3600, description="Circuit-breaker period after reader-provider authentication/authorization failures.")
+    READER_TRANSIENT_CIRCUIT_SECONDS: int = Field(default=120, description="Circuit-breaker period after repeated provider/network failures.")
+    READER_FRESH_SHARE: float = Field(default=0.2, ge=0.0, le=1.0, description="Share of each reader batch reserved for newest eligible judgments; the rest drains historical backlog.")
     DEPLOY_ROLE: Literal["all", "pls", "public"] = Field(
         default="all",
         description="What this server harvests: all (one server does everything), pls (PakistanLawSite only) or public (the free sites only). See scraper/deploy_role.py.",
@@ -310,10 +317,6 @@ class Settings(BaseSettings):
         default="PLD,SCMR,CLC,YLR,CLD,GBLR",
         description="Comma list: the reporters whose search-harvest ledger rows login slot 1 works. Slot 2 works every other reporter (PLC, PLC(CS), PCrLJ, MLD, PTD, PLJ and the rest, and rows with no reporter), so the two shares never overlap (handbook R3.1; owner's decision of 13 October 2026).",
     )
-    PLS_SEARCH_HARVEST_TAKEOVER_MINUTES: int = Field(
-        default=30,
-        description="A login slot that has been logged out (not ACTIVE) this long has its share of the search-harvest ledger taken over by the other slot, which keeps its own share as well.",
-    )
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
@@ -336,6 +339,22 @@ class Settings(BaseSettings):
         default=1200,
         description="A search-harvest tick stops after this long (between rows or pages) and resumes from its cursor on the next tick, so one long query cannot hold the single login worker for an hour while case-ID walk ticks expire. 0 = no limit.",
     )
+    SSA_CLEAR_HARVEST_LOCKS_ON_START: bool = Field(
+        default=False,
+        description="When true, the login-session worker clears stale PakistanLawSite search-harvest slot/query Redis locks at boot (dead deploy/OOM). Off = legacy behaviour.",
+    )
+    SSA_HARVEST_LOCK_HEARTBEAT: bool = Field(
+        default=False,
+        description="When true, a search-harvest tick refreshes held harvest/query/slot SessionLocks during long runs so TTL expiry cannot stall harvest after a worker recycle.",
+    )
+    SSA_ORDER_SHEET_TITLE: bool = Field(
+        default=False,
+        description="When true, PakistanLawSite case_title is taken from the order-sheet header (parse_case_metadata) instead of the first versus line in the text window.",
+    )
+    SSA_ENCODING_GUARD: bool = Field(default=False, description="Quarantine PLS rows whose preserved text contains ???? mojibake runs.")
+    SSA_COURT_HEADER_GUARD: bool = Field(default=False, description="Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header).")
+    SSA_PLD_CITATION_RELABEL: bool = Field(default=False, description="Relabel PLD citations missing a court token using the judgment header.")
+    SSA_SHORT_TEXT_GUARD: bool = Field(default=False, description="Quarantine PLS judgments shorter than 500 characters of preserved text.")
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
@@ -598,8 +617,6 @@ class Settings(BaseSettings):
             raise ValueError("LOGIN_RECOVERY_* settings must be non-negative (schedule positive)")
         if self.SPOT_CHECK_SCHEDULE_SECONDS <= 0 or self.SPOT_CHECK_JUDGMENTS < 0 or self.SPOT_CHECK_STATUTES < 0:
             raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
-        if self.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES < 0:
-            raise ValueError("PLS_SEARCH_HARVEST_TAKEOVER_MINUTES must be >= 0")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
