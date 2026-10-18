@@ -359,14 +359,27 @@ SOURCE_SEED = [
 
 async def seed_data() -> None:
     from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     from scraper.models import ArchiveTarget, BrowserSessionSlot, Court, CorpusMetadata, ScraperSource
 
     async with SessionLocal() as db:
         existing_courts = {c.short_code for c in (await db.execute(select(Court))).scalars().all()}
         for name, code, level, prov, city, aliases in COURT_SEED:
-            if code not in existing_courts:
-                db.add(Court(name=name, short_code=code, court_level=level, jurisdiction_province=prov, city=city, aliases=aliases))
+            if code in existing_courts:
+                continue
+            await db.execute(
+                pg_insert(Court)
+                .values(
+                    name=name,
+                    short_code=code,
+                    court_level=level,
+                    jurisdiction_province=prov,
+                    city=city,
+                    aliases=aliases,
+                )
+                .on_conflict_do_nothing()
+            )
         existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:
