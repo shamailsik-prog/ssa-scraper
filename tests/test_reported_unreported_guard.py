@@ -38,3 +38,18 @@ def test_same_outcome_and_amount_is_compatible():
     twin = BODY_ALLOWED + "  Reported copy formatting."
     assert not dispositive_signals_conflict(BODY_ALLOWED, twin)
     assert reconciliation_pair_allowed(BODY_ALLOWED, twin, guard_enabled=True)
+
+
+BAIL_GRANTED = (
+    "The applicant seeks post-arrest bail. Learned counsel submits that the offence does not fall "
+    "within the prohibitory clause. The learned Deputy Prosecutor General opposes the application. "
+    "Having heard the parties, bail is granted subject to furnishing solvent surety."
+)
+BAIL_REFUSED = BAIL_GRANTED.replace("bail is granted", "bail is refused")
+
+
+def test_bail_granted_versus_bail_refused_conflicts():
+    assert "bail_granted" in extract_dispositive_outcomes(BAIL_GRANTED)
+    assert "bail_refused" in extract_dispositive_outcomes(BAIL_REFUSED)
+    assert dispositive_signals_conflict(BAIL_GRANTED, BAIL_REFUSED)
+    assert not reconciliation_pair_allowed(BAIL_GRANTED, BAIL_REFUSED, guard_enabled=True)

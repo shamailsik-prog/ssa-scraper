@@ -4,4 +4,4 @@
 | --- | --- | --- |
 | Reported/unreported dispositive reconciliation guard | `SSA_REPORTED_UNREPORTED_DISPOSITIVE_GUARD` | Set flag off or revert the guard commit |
 
-When the flag is off, reconciliation keeps the pre-guard similarity-only behaviour. When on, automatic merges require compatible outcome and monetary signals.
+When the flag is off, reconciliation keeps the pre-guard similarity-only behaviour. When on, automatic merges require compatible outcome and monetary signals (allowed/dismissed, bail granted/refused, acquitted/convicted, stay granted/vacated, and surety amounts). Matching uses the normalised docket in SQL rather than an arbitrary 250-row candidate slice.

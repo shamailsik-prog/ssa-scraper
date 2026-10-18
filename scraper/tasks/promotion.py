@@ -189,12 +189,18 @@ async def _find_unreported_version_of_reported(
     docket_key = _identity_text(docket_number)
     if not docket_key:
         return None
-    stmt = select(Judgment).where(Judgment.unreported.is_(True), Judgment.docket_number.isnot(None))
+    normalized_docket = func.regexp_replace(func.lower(Judgment.docket_number), r"[^a-z0-9]+", "", "g")
+    stmt = select(Judgment).where(
+        Judgment.unreported.is_(True),
+        Judgment.docket_number.isnot(None),
+        normalized_docket == docket_key,
+    )
     if decision_date is not None:
         stmt = stmt.where(or_(Judgment.decision_date == decision_date, Judgment.decision_date.is_(None)))
     if court is not None:
         stmt = stmt.where(or_(Judgment.court_id == court.id, Judgment.court_id.is_(None)))
-    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()).limit(250))).scalars().all()
+    # Docket is filtered in SQL so this is same-case rows, not an arbitrary 250-row slice of the corpus.
+    candidates = (await db.execute(stmt.order_by(Judgment.promoted_at.desc()).limit(50))).scalars().all()
     strong = []
     for candidate in candidates:
         if _identity_text(candidate.docket_number) != docket_key:

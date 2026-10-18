@@ -3,19 +3,31 @@
 from __future__ import annotations
 
 import re
-from typing import FrozenSet, Optional, Set, Tuple
+from typing import FrozenSet, Optional, Set
 
 # Outcome families that must not be collapsed into one judgment row.
-_OUTCOME_ALLOWED = re.compile(
-    r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+allowed\b|\b(?:partly\s+)?allowed\b",
-    re.IGNORECASE,
+_FAMILY_PATTERNS = (
+    ("allowed", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+allowed\b|\b(?:partly\s+)?allowed\b", re.I)),
+    ("dismissed", re.compile(r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+dismissed\b|\b(?:partly\s+)?dismissed\b", re.I)),
+    ("remanded", re.compile(r"\bremanded\b", re.I)),
+    ("disposed", re.compile(r"\bdisposed\s+of\b", re.I)),
+    ("bail_granted", re.compile(r"\bbail\s+(?:is\s+)?granted\b|\bgranted\s+bail\b|\badmitted\s+to\s+bail\b", re.I)),
+    ("bail_refused", re.compile(r"\bbail\s+(?:is\s+)?(?:refused|declined|rejected)\b|\brefused\s+bail\b", re.I)),
+    ("acquitted", re.compile(r"\bacquitted\b", re.I)),
+    ("convicted", re.compile(r"\bconvicted\b|\bconviction\s+(?:is\s+)?upheld\b", re.I)),
+    ("stay_granted", re.compile(r"\bstay\s+(?:is\s+)?granted\b", re.I)),
+    ("stay_vacated", re.compile(r"\bstay\s+(?:is\s+)?vacated\b|\bstay.{0,20}recalled\b", re.I)),
 )
-_OUTCOME_DISMISSED = re.compile(
-    r"\b(?:application|petition|appeal|suit|revision|review)\s+is\s+dismissed\b|\b(?:partly\s+)?dismissed\b",
-    re.IGNORECASE,
+
+_CONFLICT_PAIRS = frozenset(
+    {
+        frozenset({"allowed", "dismissed"}),
+        frozenset({"bail_granted", "bail_refused"}),
+        frozenset({"acquitted", "convicted"}),
+        frozenset({"stay_granted", "stay_vacated"}),
+    }
 )
-_OUTCOME_REMANDED = re.compile(r"\bremanded\b", re.IGNORECASE)
-_OUTCOME_DISPOSED = re.compile(r"\bdisposed\s+of\b", re.IGNORECASE)
+
 _MONEY_RE = re.compile(
     r"(?:rs\.?|pkr|rupees?)\s*([\d][\d,]*(?:\.\d+)?)\s*(?:lakh|lac|million|m)?",
     re.IGNORECASE,
@@ -34,14 +46,9 @@ def extract_dispositive_outcomes(text: Optional[str]) -> FrozenSet[str]:
     if not text:
         return frozenset()
     found: Set[str] = set()
-    if _OUTCOME_ALLOWED.search(text):
-        found.add("allowed")
-    if _OUTCOME_DISMISSED.search(text):
-        found.add("dismissed")
-    if _OUTCOME_REMANDED.search(text):
-        found.add("remanded")
-    if _OUTCOME_DISPOSED.search(text):
-        found.add("disposed")
+    for name, pat in _FAMILY_PATTERNS:
+        if pat.search(text):
+            found.add(name)
     return frozenset(found)
 
 
@@ -67,6 +74,10 @@ def dispositive_signals_conflict(left: Optional[str], right: Optional[str]) -> b
     lo, ro = extract_dispositive_outcomes(left), extract_dispositive_outcomes(right)
     if lo and ro and lo != ro:
         return True
+    if lo and ro:
+        for pair in _CONFLICT_PAIRS:
+            if (pair & lo) and (pair & ro) and (pair & lo) != (pair & ro):
+                return True
     la, ra = extract_monetary_amounts(left), extract_monetary_amounts(right)
     if la and ra and la != ra:
         return True
