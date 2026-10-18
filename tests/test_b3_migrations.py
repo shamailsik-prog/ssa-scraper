@@ -381,6 +381,14 @@ async def test_migration_024_backfill_commits_per_batch_on_autocommit_connection
     await db.commit()
     await db.close()
 
+    async def _index_only_after_backfill() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "scraper.database.ensure_statute_canonical_name_key_index_valid",
+        _index_only_after_backfill,
+    )
+
     original_execute = AsyncConnection.execute
     updates_done = 0
 
@@ -395,32 +403,28 @@ async def test_migration_024_backfill_commits_per_batch_on_autocommit_connection
 
     monkeypatch.setattr(AsyncConnection, "execute", pause_after_first_batch_update)
 
-    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
-        isolation = (await conn.execute(text("SHOW transaction_isolation"))).scalar()
-        assert isolation is not None and isolation.lower() == "read committed"
-
-        async def count_filled() -> int:
-            async with engine.connect() as other:
-                return (
-                    await other.execute(
-                        text(
-                            "SELECT count(*) FROM statute "
-                            "WHERE name LIKE 'Batch Commit Act %' AND canonical_name_key IS NOT NULL"
-                        )
+    async def count_filled() -> int:
+        async with engine.connect() as other:
+            return (
+                await other.execute(
+                    text(
+                        "SELECT count(*) FROM statute "
+                        "WHERE name LIKE 'Batch Commit Act %' AND canonical_name_key IS NOT NULL"
                     )
-                ).scalar_one()
+                )
+            ).scalar_one()
 
-        task = asyncio.create_task(mig._backfill_canonical_name_keys(conn))
-        saw_partial = False
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            filled = await count_filled()
-            if 0 < filled < 4:
-                saw_partial = True
-                break
-        await task
-        assert saw_partial
-        assert await count_filled() == 4
+    task = asyncio.create_task(mig.upgrade_post_commit())
+    saw_partial = False
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        filled = await count_filled()
+        if 0 < filled < 4:
+            saw_partial = True
+            break
+    await task
+    assert saw_partial
+    assert await count_filled() == 4
 
 
 @pytest.mark.asyncio

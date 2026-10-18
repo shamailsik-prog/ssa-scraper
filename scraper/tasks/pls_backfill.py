@@ -19,6 +19,7 @@ from scraper.extractors.validation import reconcile_judgment
 from scraper.models import Citation, Judgment, QuarantineQueue, ScraperStaging
 from scraper.tasks.promotion import normalize_docket_key
 from scraper.parsers.case_metadata import parse_case_metadata
+from scraper.parsers.order_sheet_title import case_title_from_order_sheet
 
 try:
     from scraper.parsers.order_sheet_title import case_title_from_order_sheet
