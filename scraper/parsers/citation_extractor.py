@@ -475,6 +475,32 @@ def _neutral_normalised(m: re.Match) -> str:
     return f"{m.group('year')} {court}{' ' + seat.upper() if seat else ''} {int(m.group('page'))}"
 
 
+def _canonicalise_bracketed_courts(s: str) -> str:
+    r"""Replace each "(court)" with "(canonical court)": the same matches as re.sub(r"\(\s*([^)]+?)\s*\)", ...),
+    found by a single left-to-right scan. The regex rescanned from every "(" of an unclosed run, which is
+    quadratic on user-supplied text (CodeQL py/polynomial-redos; citations now arrive from the corpus API)."""
+    out: List[str] = []
+    pos = 0
+    while True:
+        i = s.find("(", pos)
+        if i < 0:
+            break
+        j = s.find(")", i + 1)
+        if j < 0:
+            break  # no ")" after this "(", so none after any later "(" either
+        if j == i + 1:  # "()" has nothing inside: no match here; look again from the next character
+            out.append(s[pos : i + 1])
+            pos = i + 1
+            continue
+        raw_inside = s[i + 1 : j]
+        inside = raw_inside.strip() or raw_inside
+        out.append(s[pos:i])
+        out.append(f"({_canonical_court(inside) or inside})")
+        pos = j + 1
+    out.append(s[pos:])
+    return "".join(out)
+
+
 def normalise_citation(raw: str) -> str:
     """
     Normalise a raw Pakistani legal citation string.
@@ -519,13 +545,7 @@ def normalise_citation(raw: str) -> str:
         if m:
             return _year_first_normalised(reporter_key, m)
 
-    def _paren_court_repl(match):
-        inside = match.group(1).strip() or match.group(1)
-        canon = _canonical_court(inside) or inside
-        return f"({canon})"
-
-    # One greedy class and a strip, not "\s*([^)]+?)\s*", which backtracks polynomially on long runs of spaces.
-    s = re.sub(r"\(([^)]+)\)", _paren_court_repl, s)
+    s = _canonicalise_bracketed_courts(s)
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"\bpld\b", "PLD", s, flags=re.IGNORECASE)
     s = re.sub(r"\bscmr\b", "SCMR", s, flags=re.IGNORECASE)
