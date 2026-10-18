@@ -336,6 +336,14 @@ class Settings(BaseSettings):
         default=1200,
         description="A search-harvest tick stops after this long (between rows or pages) and resumes from its cursor on the next tick, so one long query cannot hold the single login worker for an hour while case-ID walk ticks expire. 0 = no limit.",
     )
+    SSA_CLEAR_HARVEST_LOCKS_ON_START: bool = Field(
+        default=False,
+        description="When true, the login-session worker clears stale PakistanLawSite search-harvest slot/query Redis locks at boot (dead deploy/OOM). Off = legacy behaviour.",
+    )
+    SSA_HARVEST_LOCK_HEARTBEAT: bool = Field(
+        default=False,
+        description="When true, a search-harvest tick refreshes held harvest/query/slot SessionLocks during long runs so TTL expiry cannot stall harvest after a worker recycle.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
