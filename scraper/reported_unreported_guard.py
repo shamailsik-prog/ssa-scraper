@@ -37,15 +37,15 @@ _MONEY_RE = re.compile(
 )
 
 
-def _normalise_amount(raw: str, unit: str = "") -> int:
+def _normalise_amount(raw: str, unit: str = "") -> Decimal:
     """Parse rupee amounts without binary floating-point rounding."""
     try:
         value = Decimal(raw.replace(",", ""))
     except (InvalidOperation, AttributeError):
-        return 0
+        return Decimal(0)
     scale = {"lakh": 100_000, "lac": 100_000, "million": 1_000_000,
              "m": 1_000_000, "crore": 10_000_000}.get(unit.lower(), 1)
-    return int(value * scale) if value > 0 else 0
+    return (value * scale).normalize() if value > 0 else Decimal(0)
 
 
 def extract_dispositive_outcomes(text: Optional[str]) -> FrozenSet[str]:
@@ -58,10 +58,10 @@ def extract_dispositive_outcomes(text: Optional[str]) -> FrozenSet[str]:
     return frozenset(found)
 
 
-def extract_monetary_amounts(text: Optional[str]) -> FrozenSet[int]:
+def extract_monetary_amounts(text: Optional[str]) -> FrozenSet[Decimal]:
     if not text:
         return frozenset()
-    amounts: Set[int] = set()
+    amounts: Set[Decimal] = set()
     for match in _MONEY_RE.finditer(text):
         base = _normalise_amount(match.group(1), match.group(2) or "")
         if base <= 0:
@@ -70,16 +70,22 @@ def extract_monetary_amounts(text: Optional[str]) -> FrozenSet[int]:
     return frozenset(amounts)
 
 
-# Editorial tokens may be added by a reporter without altering an order. Every other
-# insertion, deletion, or substitution is treated as potentially dispositive.
-# This deliberately favours separate records/manual review over a destructive false merge.
-_EDITORIAL_TOKENS = frozenset({"reported", "copy", "formatting", "layout", "pagination", "headnote"})
+# Only ignore a complete, explicitly identified terminal reporter suffix.
+# Removing individual words from within a judicial order can erase its directions.
+_EDITORIAL_SUFFIXES = (("reported", "copy", "formatting"),)
+
+
+def _without_editorial_suffix(tokens: list[str]) -> list[str]:
+    for suffix in _EDITORIAL_SUFFIXES:
+        if len(tokens) > len(suffix) and tuple(tokens[-len(suffix):]) == suffix:
+            return tokens[:-len(suffix)]
+    return tokens
 
 
 def _identity_tokens(value: Optional[str]) -> list[str]:
     """Ignore typography, but preserve all judicial words, numbers, and negations."""
     def canonical_money(match: re.Match[str]) -> str:
-        return f" pkramount{_normalise_amount(match.group(1), match.group(2) or '')} "
+        return f" pkramount{format(_normalise_amount(match.group(1), match.group(2) or ''), 'f')} "
 
     canonical = _MONEY_RE.sub(canonical_money, value or "")
     return re.findall(r"[^\W_]+", canonical.casefold(), flags=re.UNICODE)
@@ -94,9 +100,7 @@ def _material_text_difference(left: Optional[str], right: Optional[str]) -> bool
     a, b = _identity_tokens(left), _identity_tokens(right)
     if not a or not b:
         return True
-    return [t for t in a if t not in _EDITORIAL_TOKENS] != [
-        t for t in b if t not in _EDITORIAL_TOKENS
-    ]
+    return _without_editorial_suffix(a) != _without_editorial_suffix(b)
 
 
 def dispositive_signals_conflict(left: Optional[str], right: Optional[str]) -> bool:
