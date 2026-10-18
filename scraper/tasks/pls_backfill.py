@@ -18,7 +18,11 @@ from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
 from scraper.models import Citation, Judgment, QuarantineQueue, ScraperStaging
 from scraper.parsers.case_metadata import parse_case_metadata
-from scraper.parsers.order_sheet_title import case_title_from_order_sheet
+
+try:
+    from scraper.parsers.order_sheet_title import case_title_from_order_sheet
+except ImportError:  # order-sheet titles ship on a sibling layer PR
+    case_title_from_order_sheet = None
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +177,8 @@ async def backfill_order_sheet_titles(
     """Rewrite case_title from the order-sheet header when SSA_ORDER_SHEET_TITLE logic applies.
 
     Only updates rows where the derived title differs from the stored title. Safe to dry-run."""
+    if case_title_from_order_sheet is None:
+        return {"skipped": "order_sheet_title parser not present on this branch"}
     counts = {"scanned": 0, "updated": 0, "cleared_bad": 0}
     last_id = None
     while True:
