@@ -204,6 +204,7 @@ put("ENCRYPTION_KEY", base64.urlsafe_b64encode(os.urandom(32)).decode())   # a v
 put("ADMIN_API_KEY", secrets.token_hex(32))
 put("SECRET_KEY", secrets.token_hex(32))
 put("SIKANDER_READER_PASSWORD", secrets.token_urlsafe(24))
+put("CORPUS_API_KEY", secrets.token_hex(32))
 put("CORPUS_WRITER_PASSWORD", secrets.token_urlsafe(24))
 put("POSTGRES_PASSWORD", pg)
 put("DATABASE_URL", f"postgresql+asyncpg://legal:{pg}@postgres:5432/legal_scraper")

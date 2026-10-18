@@ -14,6 +14,7 @@
 #   DOMAIN           DNS name pointing at the server (optional)
 #   REPORTERS, EARLIEST_YEAR, DEPLOY_REGION_LABEL   firm values passed to the installer
 #   SGAI_API_KEY     optional; written to .env on the server over stdin, never printed
+#   CORPUS_API_KEY   optional; turns on the read-only corpus API (/corpus/v1), written the same way
 #   SRC_DIR          the checked-out repository to upload                          default: this repo
 #   SUMMARY_FILE     if set, a markdown summary is appended there (GitHub job summary)
 # =============================================================================
@@ -123,6 +124,10 @@ ssh "${SSH_OPTS[@]}" "root@$IP" "bash /root/ssa-src/cloud/install.sh $(printf '%
 if [ -n "${SGAI_API_KEY:-}" ]; then
   log "Storing the ScrapeGraph key in the server's .env"
   printf '%s' "$SGAI_API_KEY" | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py SGAI_API_KEY >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1'
+fi
+if [ -n "${CORPUS_API_KEY:-}" ]; then
+  log "Storing the corpus API key in the server's .env"
+  printf '%s' "$CORPUS_API_KEY" | ssh "${SSH_OPTS[@]}" "root@$IP" 'python3 /root/ssa-src/cloud/set_env.py CORPUS_API_KEY >/dev/null && cd /opt/ssa-scraper && docker compose up -d >/dev/null 2>&1'
 fi
 
 case "${READER_MODEL_CHOICE:-keep}" in

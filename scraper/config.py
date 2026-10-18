@@ -43,6 +43,7 @@ SECRET_FIELD_NAMES = (
     "SGAI_API_KEY",
     "SIKANDER_READER_PASSWORD",
     "CORPUS_WRITER_PASSWORD",
+    "CORPUS_API_KEY",
     "GOOGLE_APPLICATION_CREDENTIALS_JSON",
     "PLS_PASS",
     "PLS_PASS_B",
@@ -91,6 +92,10 @@ class Settings(BaseSettings):
     DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS: int = 1800
     SIKANDER_READER_ROLE: str = Field(default="sikander_reader")
     SIKANDER_READER_PASSWORD: SecretStr = Field(default=SecretStr(""), description="Blank = role not created; dashboard shows NOT CONFIGURED.")
+    CORPUS_API_KEY: str = Field(
+        default="",
+        description="Key for the read-only corpus API (/corpus/v1) used by the legal research agent; sent as X-Corpus-Key. Separate from ADMIN_API_KEY. Blank = the API answers 503 not configured.",
+    )
     CORPUS_WRITER_ROLE: str = Field(default="corpus_writer")
     CORPUS_WRITER_PASSWORD: SecretStr = Field(default=SecretStr(""))
 
