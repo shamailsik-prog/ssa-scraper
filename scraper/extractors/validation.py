@@ -263,6 +263,10 @@ def reconcile_judgment(
             conflicts.append({"field": "case_title", "ai": cand, "reason": "not supported by heading or result row"})
     out["case_title"] = title
 
+    from scraper.pls_quality_guards import apply_pls_quality_guards
+
+    apply_pls_quality_guards(out, raw_text=raw_text, source_name=source_name, errors=errors)
+
     # statutes must be found in raw text
     statutes = list(out.get("statutes_cited") or [])
     if ai:

@@ -16,7 +16,7 @@ from scraper.database import SessionLocal, run_async
 from scraper.extractors import deterministic as det
 from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
-from scraper.models import Judgment, QuarantineQueue, ScraperStaging
+from scraper.models import Citation, Judgment, QuarantineQueue, ScraperStaging
 from scraper.parsers.case_metadata import parse_case_metadata
 from scraper.parsers.order_sheet_title import case_title_from_order_sheet
 
@@ -208,6 +208,54 @@ async def run_backfill_metadata(**kw) -> Dict[str, int]:
 async def run_backfill_order_sheet_titles(**kw) -> Dict[str, int]:
     async with SessionLocal() as db:
         return await backfill_order_sheet_titles(db, **kw)
+
+
+async def backfill_pld_citations(
+    db: AsyncSession,
+    *,
+    batch: int = 500,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    from scraper.parsers.pld_citation_relabel import relabel_pld_citation
+
+    counts = {"scanned": 0, "updated": 0}
+    last_id = None
+    while True:
+        q = (
+            select(Judgment, Citation)
+            .join(Citation, Citation.judgment_id == Judgment.id)
+            .where(Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True))
+            .order_by(Judgment.id)
+            .limit(batch)
+        )
+        if last_id is not None:
+            q = q.where(Judgment.id > last_id)
+        rows = (await db.execute(q)).all()
+        if not rows:
+            break
+        for j, cit in rows:
+            last_id = j.id
+            counts["scanned"] += 1
+            new = relabel_pld_citation(cit.citation_string or j.canonical_citation, j.full_text)
+            if not new or new == j.canonical_citation:
+                continue
+            if not dry_run:
+                j.canonical_citation = new
+                cit.citation_string = new
+            counts["updated"] += 1
+            if limit and counts["scanned"] >= limit:
+                break
+        if not dry_run:
+            await db.commit()
+        if limit and counts["scanned"] >= limit:
+            break
+    return counts
+
+
+async def run_backfill_pld_citations(**kw) -> Dict[str, int]:
+    async with SessionLocal() as db:
+        return await backfill_pld_citations(db, **kw)
 
 
 REQUALIFY_LOCK_KEY = 0x55A_9702  # pg advisory lock: one requalify run at a time (scheduled or by hand)

@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     titles.add_argument("--dry-run", action="store_true")
     titles.add_argument("--limit", type=int, default=None)
+    pld = sub.add_parser("backfill-pld-citations", help="Relabel primary PLD citations missing a court token (dry-run safe)")
+    pld.add_argument("--dry-run", action="store_true")
+    pld.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
     req.add_argument("--dry-run", action="store_true")
     req.add_argument("--limit", type=int, default=2000)
@@ -85,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_backfill import run_backfill_order_sheet_titles
 
         print(run_async(run_backfill_order_sheet_titles(dry_run=args.dry_run, limit=args.limit)))
+        return 0
+    if args.command == "backfill-pld-citations":
+        from scraper.tasks.pls_backfill import run_backfill_pld_citations
+
+        print(run_async(run_backfill_pld_citations(dry_run=args.dry_run, limit=args.limit)))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
