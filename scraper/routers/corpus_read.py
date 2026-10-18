@@ -7,7 +7,7 @@ verification, the judgments citing a judgment with their treatment, and the curr
 section. Nothing here writes.
 
 * Its own key: X-Corpus-Key = CORPUS_API_KEY, never the admin key, so the agent holds no admin power.
-  Repeated wrong keys from one address are refused for a while, as on /admin.
+  Repeated wrong keys from one address are refused for a while, counted apart from /admin's.
 * Its own login: every query runs as the sikander_reader role (SELECT on the contract tables only), in a
   read-only transaction with a statement time limit, so a slow search cannot hold the database.
 """
@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hmac
 import re
+import time
+from collections import defaultdict
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -27,10 +29,15 @@ from sqlalchemy.pool import NullPool
 from scraper.config import settings
 from scraper.models import Citation, Judgment, Statute, StatuteSection, StatuteSectionVersion, Treatment
 from scraper.parsers.citation_extractor import normalise_citation
-from scraper.routers.auth import _auth_failures, _AUTH_FAIL_LIMIT, _client_ip, _record_auth_failure
+from scraper.routers.auth import _client_ip
 
 STATEMENT_TIMEOUT_MS = 15000
 SNIPPET_CHARS = 300
+# Wrong corpus keys are counted apart from wrong admin keys: a misconfigured agent must not lock the operator
+# out of /admin, nor admin mistakes lock the agent out.
+_KEY_FAILS: dict[str, list[float]] = defaultdict(list)
+_KEY_FAIL_WINDOW_SECONDS = 300
+_KEY_FAIL_LIMIT = 20
 
 _reader_engine: Optional[AsyncEngine] = None
 
@@ -62,14 +69,24 @@ async def reader_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
+def _key_failures(ip: str) -> int:
+    now = time.time()
+    kept = [stamp for stamp in _KEY_FAILS.get(ip, []) if now - stamp < _KEY_FAIL_WINDOW_SECONDS]
+    if kept:
+        _KEY_FAILS[ip] = kept
+    else:
+        _KEY_FAILS.pop(ip, None)
+    return len(kept)
+
+
 def require_corpus_key(request: Request, x_corpus_key: Optional[str] = Header(default=None)) -> None:
     if not settings.CORPUS_API_KEY:
         raise HTTPException(status_code=503, detail="corpus API not configured: CORPUS_API_KEY is blank")
     ip = _client_ip(request)
-    if _auth_failures(ip) >= _AUTH_FAIL_LIMIT:
+    if _key_failures(ip) >= _KEY_FAIL_LIMIT:
         raise HTTPException(status_code=429, detail="Too many invalid corpus-key attempts")
     if x_corpus_key is None or not hmac.compare_digest(x_corpus_key, settings.CORPUS_API_KEY):
-        _record_auth_failure(ip)
+        _KEY_FAILS[ip].append(time.time())
         raise HTTPException(status_code=401, detail="Invalid key")
 
 

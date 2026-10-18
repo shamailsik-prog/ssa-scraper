@@ -18,7 +18,12 @@ H = {"X-Corpus-Key": KEY}
 
 @pytest.fixture(autouse=True)
 def _corpus_key(monkeypatch):
+    from scraper.routers import corpus_read
+
     monkeypatch.setattr(settings, "CORPUS_API_KEY", KEY)
+    corpus_read._KEY_FAILS.clear()
+    yield
+    corpus_read._KEY_FAILS.clear()
 
 
 async def _seed(db):
@@ -87,6 +92,17 @@ async def test_the_api_needs_its_own_key(db, client, monkeypatch):
     monkeypatch.setattr(settings, "CORPUS_API_KEY", "")
     off = client.get("/corpus/v1/judgments/search", params={"q": "bail"}, headers=H)
     assert off.status_code == 503 and "not configured" in off.json()["detail"]
+
+
+async def test_wrong_corpus_keys_lock_out_only_the_corpus_api(db, client, admin_headers):
+    """A misconfigured agent hammering the corpus API must not lock the operator out of /admin."""
+    from scraper.routers import auth
+
+    before = auth._auth_failures("testclient")
+    for _ in range(20):
+        assert client.get("/corpus/v1/judgments/search", params={"q": "bail"}, headers={"X-Corpus-Key": "wrong"}).status_code == 401
+    assert client.get("/corpus/v1/judgments/search", params={"q": "bail"}, headers=H).status_code == 429
+    assert auth._auth_failures("testclient") == before  # the admin counter did not move
 
 
 async def test_search_matches_every_word_in_the_text_and_filters_by_court_and_year(db, client):
