@@ -148,7 +148,7 @@ async def test_agent_reads_once_and_persists_grounded_current_and_version(db, mo
     _configure_custom_reader(monkeypatch)
     calls = []
 
-    async def fake_model(text):
+    async def fake_model(text, **kwargs):
         calls.append(text)
         ans = _model_answer()
         ans["_reader_meta"] = {
@@ -201,7 +201,7 @@ async def test_without_a_model_agent_does_nothing(db, monkeypatch):
 async def test_failed_first_read_is_versioned_and_not_hot_looped(db, monkeypatch):
     _configure_custom_reader(monkeypatch)
 
-    async def broken(_text):
+    async def broken(_text, **kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(unreported_reader, "call_reader_model", broken)
@@ -232,7 +232,7 @@ async def test_database_publish_failure_rolls_back_and_records_attempt_without_c
     db.add(old)
     await db.commit()
 
-    async def fake_model(_text):
+    async def fake_model(_text, **kwargs):
         return _model_answer()
 
     async def broken_publish(*_args, **_kwargs):
@@ -285,7 +285,7 @@ async def test_failed_upgrade_preserves_last_good_reading(db, monkeypatch):
     db.add(old)
     await db.commit()
 
-    async def broken(_text):
+    async def broken(_text, **kwargs):
         raise RuntimeError("upgrade failed")
 
     monkeypatch.setattr(unreported_reader, "call_reader_model", broken)
@@ -334,7 +334,7 @@ async def test_successful_upgrade_keeps_immutable_history_and_switches_current(d
     )
     await db.commit()
 
-    async def fake_model(_text):
+    async def fake_model(_text, **kwargs):
         return _model_answer()
 
     monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
@@ -366,7 +366,7 @@ def test_subject_taxonomy_records_overflow_and_never_invents_other():
 
 
 async def test_invalid_only_subject_output_is_a_validation_failure(monkeypatch):
-    async def fake_model(_text):
+    async def fake_model(_text, **kwargs):
         ans = _model_answer()
         ans["subjects"] = ["Invented heading"]
         return ans
@@ -383,7 +383,7 @@ async def test_long_judgment_reads_the_middle_instead_of_head_tail_truncation(mo
     long_text = ("A" * 2600) + "\n" + middle + "\n" + ("Z" * 2600)
     seen = []
 
-    async def fake_model(chunk):
+    async def fake_model(chunk, **kwargs):
         seen.append(chunk)
         return {
             "laws": [],
@@ -414,7 +414,7 @@ async def test_subjects_are_ranked_across_chunks_not_first_three_seen(monkeypatc
         ]
     )
 
-    async def fake_model(_chunk):
+    async def fake_model(_chunk, **kwargs):
         return next(answers)
 
     monkeypatch.setattr(unreported_reader, "call_reader_model", fake_model)
@@ -432,7 +432,7 @@ async def test_outcome_is_taken_only_from_final_chunk(monkeypatch):
     long_text = first + last
     calls = 0
 
-    async def fake_model(chunk):
+    async def fake_model(chunk, **kwargs):
         nonlocal calls
         calls += 1
         if "trial court allowed" in chunk:
@@ -457,7 +457,7 @@ async def test_outcome_is_taken_only_from_final_chunk(monkeypatch):
 
 
 async def test_ungrounded_interpretation_turns_on_and_outcome_are_refused(monkeypatch):
-    async def fake_model(_text):
+    async def fake_model(_text, **kwargs):
         ans = _model_answer()
         ans["interpretation"] = [{"statement": "Invented rule", "quote": "not in the judgment at all"}]
         ans["turns_on"] = [{"statement": "Invented basis", "quote": "also absent from source"}]
@@ -470,6 +470,11 @@ async def test_ungrounded_interpretation_turns_on_and_outcome_are_refused(monkey
     assert result["turns_on"] is None and result["turns_on_evidence"] == []
     assert result["outcome"] is None and result["outcome_evidence"] is None
     assert {"interpretation", "turns_on", "outcome"} <= {d["kind"] for d in result["dropped"]}
+
+
+async def test_login_session_text_is_never_sent_to_external_reader():
+    with pytest.raises(unreported_reader.ExternalModelRefused):
+        await unreported_reader.call_reader_model("secret judgment", access_method="login_session")
 
 
 async def test_model_call_sends_data_reads_json_and_tracks_usage(monkeypatch):
@@ -492,7 +497,7 @@ async def test_model_call_sends_data_reads_json_and_tracks_usage(monkeypatch):
 
     real = httpx.AsyncClient
     monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    out = await unreported_reader.call_reader_model(TEXT)
+    out = await unreported_reader.call_reader_model(TEXT, access_method="public")
     assert out["outcome"]["value"] == "allowed"
     assert out["_reader_meta"]["input_tokens"] == 123 and out["_reader_meta"]["output_tokens"] == 45
     assert out["_reader_meta"]["parse_repair_used"] is True
@@ -566,7 +571,7 @@ async def test_answer_without_a_reading_is_failure(monkeypatch):
         handler = lambda request, c=response_content: httpx.Response(200, json={"choices": [{"message": {"content": c}}]})
         monkeypatch.setattr(unreported_reader.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
         with pytest.raises(unreported_reader.ReaderValidationError):
-            await unreported_reader.call_reader_model(TEXT)
+            await unreported_reader.call_reader_model(TEXT, access_method="public")
 
 
 async def test_per_judgment_lock_allows_parallel_workers_without_duplicate_spend(db, monkeypatch):
@@ -578,7 +583,7 @@ async def test_per_judgment_lock_allows_parallel_workers_without_duplicate_spend
     (j,) = await _unreported(db)
     calls = []
 
-    async def fake_model(_text):
+    async def fake_model(_text, **kwargs):
         calls.append(1)
         return _model_answer()
 

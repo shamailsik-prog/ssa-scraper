@@ -387,7 +387,6 @@ async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monke
     assert "PakistanLawSite:search_harvest_tick" in result["queued"]
     assert sent == [
         ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 1}, "login_session"),
-        ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 2}, "login_session"),
     ]
     assert "PakistanLawSite:search_harvest_priority" in result["skipped_saturated"]
 
@@ -442,7 +441,6 @@ async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harves
     assert "PakistanLawSite:search_harvest_tick" in result["queued"]
     assert sent == [
         ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 1}, "login_session"),
-        ("scraper.tasks.pls_search_harvest.pls_search_harvest_tick", {"slot": 2}, "login_session"),
     ]
 
 
