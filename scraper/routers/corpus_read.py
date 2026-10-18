@@ -228,6 +228,15 @@ async def citing_judgments(
     empty list means no treatment is recorded in the corpus, not that the judgment is good law."""
     cited = await _judgment_for(db, citation)
     variants = _citation_variants(citation)
+    if cited is not None:
+        extra = [cited.canonical_citation]
+        extra.extend(
+            (await db.execute(select(Citation.citation_string).where(Citation.judgment_id == cited.id))).scalars().all()
+        )
+        for cite in extra:
+            for v in _citation_variants(cite or ""):
+                if v and v not in variants:
+                    variants.append(v)
     match = Treatment.cited_citation.in_(variants)
     if cited is not None:
         match = or_(match, Treatment.cited_judgment_id == cited.id)
@@ -268,6 +277,8 @@ async def statute_section(
     """The current text of one section. The statute is matched by its short name exactly (case-insensitive),
     else by its name containing the words given; the section number must match exactly."""
     name = " ".join(statute.split())
+    if not name:
+        raise HTTPException(status_code=422, detail="statute must contain at least one non-whitespace character")
     s = (await db.execute(select(Statute).where(func.lower(Statute.short_name) == name.lower()))).scalars().first()
     if s is None:
         words = [w for w in name.split() if w]
