@@ -48,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
     meta.add_argument("--dry-run", action="store_true")
     meta.add_argument("--limit", type=int, default=None)
+    titles = sub.add_parser(
+        "backfill-order-sheet-titles",
+        help="Rewrite PakistanLawSite case_title from order-sheet header parties (dry-run safe; not run in prod by default)",
+    )
+    titles.add_argument("--dry-run", action="store_true")
+    titles.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
     req.add_argument("--dry-run", action="store_true")
     req.add_argument("--limit", type=int, default=2000)
@@ -74,6 +80,11 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_backfill import run_backfill_metadata
 
         print(run_async(run_backfill_metadata(dry_run=args.dry_run, limit=args.limit)))
+        return 0
+    if args.command == "backfill-order-sheet-titles":
+        from scraper.tasks.pls_backfill import run_backfill_order_sheet_titles
+
+        print(run_async(run_backfill_order_sheet_titles(dry_run=args.dry_run, limit=args.limit)))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify

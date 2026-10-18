@@ -18,6 +18,7 @@ from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
 from scraper.models import Judgment, QuarantineQueue, ScraperStaging
 from scraper.parsers.case_metadata import parse_case_metadata
+from scraper.parsers.order_sheet_title import case_title_from_order_sheet
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +163,51 @@ async def requalify_quarantined(db: AsyncSession, *, limit: Optional[int] = 2000
     return counts
 
 
+async def backfill_order_sheet_titles(
+    db: AsyncSession,
+    *,
+    batch: int = 500,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    """Rewrite case_title from the order-sheet header when SSA_ORDER_SHEET_TITLE logic applies.
+
+    Only updates rows where the derived title differs from the stored title. Safe to dry-run."""
+    counts = {"scanned": 0, "updated": 0, "cleared_bad": 0}
+    last_id = None
+    while True:
+        q = select(Judgment).where(Judgment.source_name == SOURCE_NAME).order_by(Judgment.id).limit(batch)
+        if last_id is not None:
+            q = q.where(Judgment.id > last_id)
+        rows = (await db.execute(q)).scalars().all()
+        if not rows:
+            break
+        for j in rows:
+            last_id = j.id
+            counts["scanned"] += 1
+            new_title = case_title_from_order_sheet(j.full_text or "")
+            if not new_title or new_title == (j.case_title or ""):
+                continue
+            if not dry_run:
+                j.case_title = new_title
+            counts["updated"] += 1
+            if limit and counts["scanned"] >= limit:
+                break
+        if not dry_run:
+            await db.commit()
+        if limit and counts["scanned"] >= limit:
+            break
+    return counts
+
+
 async def run_backfill_metadata(**kw) -> Dict[str, int]:
     async with SessionLocal() as db:
         return await backfill_case_metadata(db, **kw)
+
+
+async def run_backfill_order_sheet_titles(**kw) -> Dict[str, int]:
+    async with SessionLocal() as db:
+        return await backfill_order_sheet_titles(db, **kw)
 
 
 REQUALIFY_LOCK_KEY = 0x55A_9702  # pg advisory lock: one requalify run at a time (scheduled or by hand)
