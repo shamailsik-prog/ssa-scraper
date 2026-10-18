@@ -235,7 +235,12 @@ async function loadSources(){
   try{
     const rows=await get('/admin/sources');
     $('sourceMeta').textContent=rows.length+' sources';
-    $('sourceList').innerHTML='<table><tr><th>source</th><th>state</th><th>access</th><th></th></tr>'+rows.map(r=>'<tr>'+cell(r.source_name)+cell(r.state)+cell(r.access_method)+'<td><button onclick="triggerSource(\''+esc(r.source_name)+'\')">Trigger</button></td></tr>').join('')+'</table>';
+    $('sourceList').innerHTML='<table><tr><th>source</th><th>state</th><th>access</th><th></th></tr>'+rows.map(r=>{
+      const on=r.state==='ACTIVE';
+      const toggle=on?'<button onclick="sourceStateAction(\''+esc(r.source_name)+'\',\'pause\')">Pause</button>':'<button onclick="sourceStateAction(\''+esc(r.source_name)+'\',\'resume\')">Resume</button>';
+      const off=r.is_active?'<button onclick="sourceStateAction(\''+esc(r.source_name)+'\',\'disable\')">Disable</button>':'<button onclick="sourceStateAction(\''+esc(r.source_name)+'\',\'enable\')">Enable</button>';
+      return '<tr>'+cell(r.source_name)+cell(r.state)+cell(r.access_method)+'<td>'+toggle+' '+off+' <button onclick="triggerSource(\''+esc(r.source_name)+'\')">Trigger</button></td></tr>';
+    }).join('')+'</table>';
   }catch(e){$('sourceMeta').textContent='error: '+e.message}
 }
 async function triggerSource(name){
@@ -243,6 +248,12 @@ async function triggerSource(name){
     await fetch('/admin/sources/'+encodeURIComponent(name)+'/trigger',{method:'POST',headers:{'X-API-Key':KEY}});
     loadSources();
   }catch(e){$('sourceMeta').textContent='trigger failed: '+e.message}
+}
+async function sourceStateAction(name,action){
+  try{
+    await post('/admin/sources/'+encodeURIComponent(name)+'/state',{action:action,reason:'dashboard'});
+    loadSources();
+  }catch(e){$('sourceMeta').textContent='state change failed: '+e.message}
 }
 async function loadLogin(){
   try{
