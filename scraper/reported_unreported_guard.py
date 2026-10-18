@@ -70,22 +70,47 @@ def extract_monetary_amounts(text: Optional[str]) -> FrozenSet[int]:
     return frozenset(amounts)
 
 
+# Editorial tokens may be added by a reporter without altering an order. Every other
+# insertion, deletion, or substitution is treated as potentially dispositive.
+# This deliberately favours separate records/manual review over a destructive false merge.
+_EDITORIAL_TOKENS = frozenset({"reported", "copy", "formatting", "layout", "pagination", "headnote"})
+
+
+def _identity_tokens(value: Optional[str]) -> list[str]:
+    """Ignore typography, but preserve all judicial words, numbers, and negations."""
+    def canonical_money(match: re.Match[str]) -> str:
+        return f" pkramount{_normalise_amount(match.group(1), match.group(2) or '')} "
+
+    canonical = _MONEY_RE.sub(canonical_money, value or "")
+    return re.findall(r"[^\W_]+", canonical.casefold(), flags=re.UNICODE)
+
+
+def _material_text_difference(left: Optional[str], right: Optional[str]) -> bool:
+    """Linear-time conservative identity check; never rely on 92% similarity alone.
+
+    The only tolerated word differences are known reporter/editorial labels.
+    Every judicial word, number, party identifier and negation must match in order.
+    """
+    a, b = _identity_tokens(left), _identity_tokens(right)
+    if not a or not b:
+        return True
+    return [t for t in a if t not in _EDITORIAL_TOKENS] != [
+        t for t in b if t not in _EDITORIAL_TOKENS
+    ]
+
+
 def dispositive_signals_conflict(left: Optional[str], right: Optional[str]) -> bool:
-    """Divergent or missing judicial signals are not affirmative identity evidence."""
-    lo, ro = extract_dispositive_outcomes(left), extract_dispositive_outcomes(right)
-    if lo != ro:
+    """Refuse automatic reconciliation when any substantive difference is unresolved."""
+    if extract_dispositive_outcomes(left) != extract_dispositive_outcomes(right):
         return True
-    la, ra = extract_monetary_amounts(left), extract_monetary_amounts(right)
-    if la != ra:
+    if extract_monetary_amounts(left) != extract_monetary_amounts(right):
         return True
-    if not lo:
-        normalized_left = re.sub(r"\s+", " ", left or "").strip().casefold()
-        normalized_right = re.sub(r"\s+", " ", right or "").strip().casefold()
-        return normalized_left != normalized_right
-    return False
+    return _material_text_difference(left, right)
 
 
 def reconciliation_pair_allowed(left: Optional[str], right: Optional[str], *, guard_enabled: bool) -> bool:
-    if not guard_enabled:
-        return True
-    return not dispositive_signals_conflict(left, right)
+    # The flag may disable the additional outcome extractor, but must never disable
+    # the non-destructive identity floor. Existing .env files can still set it to 0.
+    if _material_text_difference(left, right):
+        return False
+    return not guard_enabled or not dispositive_signals_conflict(left, right)
