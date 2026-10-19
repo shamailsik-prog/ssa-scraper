@@ -438,9 +438,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             decision_date=decision_date,
         )
     ]
+    hash_ids = {row.id for row in hash_rows}
     if hash_rows:
         if by_citation is not None:
-            if len(matching_hash) != 1 or matching_hash[0].id != by_citation.id:
+            if by_citation.id not in hash_ids:
                 await _quarantine(
                     db,
                     st,
