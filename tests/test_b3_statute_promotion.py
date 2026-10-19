@@ -7,7 +7,6 @@ import inspect
 import pytest
 from sqlalchemy import func, select
 
-from scraper.config import settings
 from scraper.fetchers import record_provenance, stage_statute
 from scraper.models import ScraperSource, Statute
 from scraper.tasks.promotion import promote_statute_staging
@@ -55,8 +54,7 @@ async def test_listing_only_staging_quarantined_not_promoted(db):
 
 
 @pytest.mark.asyncio
-async def test_no_year_quarantined_when_name_quality_on(db, monkeypatch):
-    monkeypatch.setattr(settings, "SSA_STATUTE_NAME_QUALITY", True)
+async def test_no_year_quarantined_by_default(db):
     st = await _make_statute_staging(
         db,
         {
@@ -72,8 +70,7 @@ async def test_no_year_quarantined_when_name_quality_on(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_name_quarantined_when_name_quality_on(db, monkeypatch):
-    monkeypatch.setattr(settings, "SSA_STATUTE_NAME_QUALITY", True)
+async def test_duplicate_name_quarantined_by_default(db):
     db.add(Statute(name="Other Sample Act", jurisdiction="Federal", year_enacted=2020))
     await db.flush()
     st = await _make_statute_staging(
@@ -132,9 +129,3 @@ def test_mutant_b3_m1_promote_statute_staging_never_deletes_statute():
     assert "db.delete(statute)" not in src
 
 
-def test_mutant_b3_m2_mention_stubs_flag_default_off():
-    assert settings.SSA_STATUTE_NO_MENTION_STUBS is False
-
-
-def test_mutant_b3_m3_pdf_follow_flag_default_off():
-    assert settings.SSA_STATUTE_PDF_FOLLOW is False

@@ -34,7 +34,22 @@ def test_clause_and_garbage_name_detectors():
 
 
 @pytest.mark.asyncio
-async def test_mention_link_creates_sectionless_stub_when_flag_off(db):
+async def test_mention_link_does_not_create_stub_by_default(db):
+    created = await _resolve_statute_link(
+        db,
+        canonical_name="means the Foo Act",
+        source_name="Senate",
+        source_url=None,
+        jurisdiction="Federal",
+    )
+    assert created is None
+    rows = (await db.execute(select(Statute).where(Statute.name == "means the Foo Act"))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_mention_link_creates_sectionless_stub_when_flag_off(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_STATUTE_NO_MENTION_STUBS", False)
     created = await _resolve_statute_link(
         db,
         canonical_name="means the Foo Act",
@@ -50,23 +65,7 @@ async def test_mention_link_creates_sectionless_stub_when_flag_off(db):
 
 
 @pytest.mark.asyncio
-async def test_mention_link_does_not_create_stub_when_flag_on(db, monkeypatch):
-    monkeypatch.setattr(settings, "SSA_STATUTE_NO_MENTION_STUBS", True)
-    created = await _resolve_statute_link(
-        db,
-        canonical_name="means the Foo Act",
-        source_name="Senate",
-        source_url=None,
-        jurisdiction="Federal",
-    )
-    assert created is None
-    rows = (await db.execute(select(Statute).where(Statute.name == "means the Foo Act"))).scalars().all()
-    assert rows == []
-
-
-@pytest.mark.asyncio
-async def test_mention_link_reuses_existing_complete_statute(db, monkeypatch):
-    monkeypatch.setattr(settings, "SSA_STATUTE_NO_MENTION_STUBS", True)
+async def test_mention_link_reuses_existing_complete_statute(db):
     statute = Statute(name="Pakistan Penal Code, 1860", jurisdiction="Federal", year_enacted=1860, source_name="PakistanCode")
     db.add(statute)
     await db.flush()

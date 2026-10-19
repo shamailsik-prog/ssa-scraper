@@ -22,5 +22,5 @@ def test_garbage_jpeg_and_pdf_bytes_as_names():
     assert not looks_like_garbage_name("Sales Tax Act, 1990")
 
 
-def test_name_quality_flag_defaults_off():
-    assert settings.SSA_STATUTE_NAME_QUALITY is False
+def test_name_quality_flag_defaults_on():
+    assert settings.SSA_STATUTE_NAME_QUALITY is True

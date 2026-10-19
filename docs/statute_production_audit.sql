@@ -1,4 +1,5 @@
 -- Read-only production audit queries (Scraper Auditor baselines 2026-10-18).
+-- Flag semantics: docs/STATUTE_SAFETY_FLAGS.md
 -- Run against the corpus database with a read-only role; no writes.
 
 -- Total statutes

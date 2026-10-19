@@ -1236,6 +1236,7 @@ async def test_pakistancode_statute_promotion_accepts_real_name_and_operative_te
     st.status = "extracted"
     st.reconciled_json = {
         "statute_name": "Pakistan Penal Code, 1860",
+        "year_enacted": 1860,
         "jurisdiction": "Federal",
         "statute_type": "act",
         "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
@@ -1561,6 +1562,15 @@ async def test_instrument_promotion_persists_and_links_mentions(db):
             select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
         )
     ).scalars().first()
+    db.add(
+        Statute(
+            name="Pakistan Penal Code, 1860",
+            jurisdiction="Federal",
+            year_enacted=1860,
+            source_name="PakistanCode",
+        )
+    )
+    await db.flush()
     text = """
     THE GAZETTE OF PAKISTAN EXTRAORDINARY
     ACT No. XXI of 2017
@@ -1646,6 +1656,16 @@ async def test_instrument_relation_graph_persists_verified_edges_with_provenance
             select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
         )
     ).scalars().first()
+    read_with_canonical = "The substituted provision shall be read with Pakistan Penal Code, 1860"
+    db.add(
+        Statute(
+            name=read_with_canonical,
+            jurisdiction="Federal",
+            year_enacted=1860,
+            source_name="PakistanCode",
+        )
+    )
+    await db.flush()
 
     async def _promote(text: str, url: str) -> Instrument:
         prov = await record_provenance(
