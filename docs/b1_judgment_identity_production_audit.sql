@@ -31,11 +31,13 @@ WHERE j.reporter = 'PLD'
   );
 
 -- Pre-migration: rows that would block uq_judgment_case_text_hash (same court, docket, date, hash).
-SELECT court_id, docket_number, decision_date, full_text_hash, count(*) AS n
+SELECT court_id, lower(regexp_replace(coalesce(docket_number, ''), '\s+', '', 'g')) AS docket_key,
+       decision_date, full_text_hash, count(*) AS n
 FROM judgment
 WHERE full_text_hash IS NOT NULL
   AND court_id IS NOT NULL
   AND docket_number IS NOT NULL
   AND decision_date IS NOT NULL
+  AND lower(regexp_replace(coalesce(docket_number, ''), '\s+', '', 'g')) <> ''
 GROUP BY 1, 2, 3, 4
 HAVING count(*) > 1;
