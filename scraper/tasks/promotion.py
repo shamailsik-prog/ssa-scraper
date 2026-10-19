@@ -1958,19 +1958,6 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     sections = data.get("sections") or []
     parseable_sections = _parseable_statute_sections(sections)
     evidence = data.get("field_evidence") or {}
-    if settings.SSA_STATUTE_NAME_QUALITY and name and (
-        looks_like_clause_fragment(name)
-        or looks_like_fragment_name(name)
-        or looks_like_garbage_name(name)
-    ):
-        await _quarantine(
-            db,
-            st,
-            "statute_name_quality: fragment, clause, or garbage name",
-            "statute",
-            {"reason_code": "statute_name_quality", "statute_name": name[:280]},
-        )
-        return "quarantined"
     if st.source_name == "PakistanCode":
         # Every PakistanCode statute is read against its own table of contents (statute_contents.py);
         # only a statute whose title matched and whose listed sections were all found with real text
@@ -2043,6 +2030,24 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
+    if (
+        settings.SSA_STATUTE_NAME_QUALITY
+        and st.source_name != "PakistanCode"
+        and name
+        and (
+            looks_like_clause_fragment(name)
+            or looks_like_fragment_name(name)
+            or looks_like_garbage_name(name)
+        )
+    ):
+        await _quarantine(
+            db,
+            st,
+            "statute_name_quality: fragment, clause, or garbage name",
+            "statute",
+            {"reason_code": "statute_name_quality", "statute_name": name[:280]},
+        )
+        return "quarantined"
     if evidence.get("listing_only"):
         existing = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first() if name else None
         if existing is not None:
