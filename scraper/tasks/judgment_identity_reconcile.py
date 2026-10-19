@@ -125,7 +125,7 @@ async def link_exact_identity(
         decision_date=rep.decision_date,
     ):
         raise ValueError("exact identity does not match")
-    if False and (not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash):
+    if not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash:
         raise ValueError("full text hash must match for reported/unreported link")
     exists = (
         await db.execute(

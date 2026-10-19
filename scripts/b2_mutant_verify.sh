@@ -11,13 +11,6 @@ run_test() {
 }
 
 # M1
-cp scraper/tasks/judgment_identity_reconcile.py /tmp/jir.py
-sed -i '/full text hash must match/d' /tmp/jir.py || true
-sed -i 's/if not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash:/if False and (not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash):/' scraper/tasks/judgment_identity_reconcile.py 2>/dev/null || true
-# simpler: use python patch
-
-restore_jir() { cp /tmp/jir.py scraper/tasks/judgment_identity_reconcile.py 2>/dev/null || git checkout -- scraper/tasks/judgment_identity_reconcile.py; }
-
 cp scraper/tasks/judgment_identity_reconcile.py /tmp/jir.bak
 $PY <<'PY'
 from pathlib import Path
