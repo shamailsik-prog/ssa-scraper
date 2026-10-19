@@ -326,6 +326,30 @@ class PublicPipeline:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
             html = res.text
             text = clean_html(html)
+            if settings.SSA_STATUTE_PDF_FOLLOW and html:
+                from scraper.statute_pdf_body import prefer_pdf_statute_text
+
+                for pdf_url in self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)"))[:1]:
+                    try:
+                        pdf_res = await self.fetch(pdf_url)
+                        if pdf_res.is_pdf:
+                            await record_provenance(
+                                self.db,
+                                source=self.source,
+                                url=pdf_res.final_url,
+                                content=pdf_res.content,
+                                content_kind="pdf",
+                                route=route,
+                                is_original_document=True,
+                                document_kind="original_pdf",
+                                parent=prov,
+                            )
+                            pdf_text, _ = pdf_text_with_ocr(pdf_res.content)
+                            text = prefer_pdf_statute_text(text, pdf_text, flag_on=True)
+                    except ExplicitBlock:
+                        raise
+                    except Exception as exc:
+                        logger.warning("%s: statute PDF follow failed %s: %s", self.source.source_name, pdf_url, exc)
         staging = await stage_statute(
             self.db,
             source=self.source,

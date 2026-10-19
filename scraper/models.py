@@ -325,6 +325,15 @@ class Statute(Base):
     repealed_by: Mapped[Optional[str]] = mapped_column(String(500))
     source_name: Mapped[Optional[str]] = mapped_column(String(100))
     source_url: Mapped[Optional[str]] = mapped_column(Text)
+    needs_section_refetch: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    quality_flag_no_year: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    quality_flag_duplicate_name: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 

@@ -371,6 +371,19 @@ class Settings(BaseSettings):
     PLS_PASS_B: SecretStr = Field(default=SecretStr(""))
     PLS_JOURNALS_B: str = Field(default="")
 
+    SSA_STATUTE_NO_MENTION_STUBS: bool = Field(
+        default=False,
+        description="When true, instrument mentions must link to an existing statute; they must not insert sectionless stub rows (auditor 2026-10-18: 10,303 of 12,618 statutes have no sections).",
+    )
+    SSA_STATUTE_PDF_FOLLOW: bool = Field(
+        default=False,
+        description="When true, statute ingest follows a linked PDF and uses its extracted text when it is longer than the HTML listing.",
+    )
+    SSA_STATUTE_NAME_QUALITY: bool = Field(
+        default=False,
+        description="When true, promotion quarantines fragment/garbage names, missing year_enacted, and duplicate statute names (never guess or merge).",
+    )
+
     # ----------------------------------------------------------- pdf/storage
     PDF_STORAGE_PATH: str = Field(default="/app/live")
     STATE_STORAGE_PATH: str = Field(default="/app/state")

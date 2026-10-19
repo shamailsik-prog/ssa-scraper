@@ -48,7 +48,8 @@ async def test_b2_exact_identity_and_hash_create_link(db):
     )
     db.add_all([unrep, rep])
     await db.commit()
-    link = await link_exact_identity(db, unrep.id, rep.id, source="test")
+    link, created = await link_exact_identity(db, unrep.id, rep.id, source="test")
+    assert created is True
     assert link.unreported_judgment_id == unrep.id and link.reported_judgment_id == rep.id
 
 
@@ -358,6 +359,38 @@ async def test_reconcile_links_exact_match_and_flags_conflicting_hash_peer(db):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_linked_count_only_new_link_rows(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "lnk" * 120
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED lnk",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 7, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR lnk",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 7, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    first = await reconcile_judgment_identity_pairs(db)
+    await db.commit()
+    assert first["linked"] == 1
+    second = await reconcile_judgment_identity_pairs(db)
+    assert second["linked"] == 0
+
+
+@pytest.mark.asyncio
 async def test_reconcile_flagged_count_only_new_review_rows(db):
     sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
     body = "cnt" * 120
@@ -387,6 +420,44 @@ async def test_reconcile_flagged_count_only_new_review_rows(db):
     assert first["flagged"] == 1
     second = await reconcile_judgment_identity_pairs(db)
     assert second["flagged"] == 0
+
+
+@pytest.mark.asyncio
+async def test_n5_exactly_one_exact_identity_different_text_review(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    unrep = Judgment(
+        canonical_citation="UNREPORTED SC N5",
+        full_text="c" * 600,
+        full_text_hash=canonical_text_hash("c" * 600),
+        court_id=sc.id,
+        docket_number="C.P. 9 of 2024",
+        decision_date=date(2024, 1, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR 9",
+        full_text="d" * 600,
+        full_text_hash=canonical_text_hash("d" * 600),
+        court_id=sc.id,
+        docket_number="C.P. 9 of 2024",
+        decision_date=date(2024, 1, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    counts = await reconcile_judgment_identity_pairs(db)
+    await db.commit()
+    assert counts["linked"] == 0 and counts["flagged"] == 1
+    rows = (
+        await db.execute(
+            select(JudgmentIdentityReview).where(
+                JudgmentIdentityReview.reason == IDENTITY_REVIEW_SAME_IDENTITY_DIFFERENT_TEXT,
+                JudgmentIdentityReview.unreported_judgment_id == unrep.id,
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert len((await db.execute(select(Judgment))).scalars().all()) == 2
 
 
 @pytest.mark.asyncio
