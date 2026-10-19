@@ -177,6 +177,9 @@ def _judgment_case_identity_matches(
     return incoming_key == stored_key
 
 
+judgment_exact_identity_matches = _judgment_case_identity_matches
+
+
 def _header_citation_set(page_text: str) -> set[str]:
     raw_text = page_text or ""
     header_end = len(judgment_header_slice(raw_text))
@@ -468,7 +471,23 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 },
             )
             return "quarantined"
-    existing = by_citation if by_citation is not None else (matching_hash[0] if matching_hash else None)
+    link_unreported_id: Optional[UUID] = None
+    existing = by_citation
+    if existing is None and matching_hash:
+        sole = matching_hash[0]
+        if (
+            not unreported
+            and sole.unreported
+            and _judgment_case_identity_matches(
+                sole,
+                court_id=incoming_court_id,
+                docket_number=incoming_docket,
+                decision_date=decision_date,
+            )
+        ):
+            link_unreported_id = sole.id
+        else:
+            existing = sole
     if existing is None:
         # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
         # just means that string is not ours to attach: drop it and promote under the canonical one.
@@ -574,29 +593,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             if st.route_json and st.route_json not in routes:
                 routes.append(st.route_json)
                 prov.routes = routes
-        if (
-            getattr(existing, "unreported", False)
-            and cits
-            and existing.full_text_hash == text_hash
-            and _judgment_case_identity_matches(
-                existing,
-                court_id=incoming_court_id,
-                docket_number=incoming_docket,
-                decision_date=decision_date,
-            )
-        ):
-            # the same judgment, entered as unreported, now arrives with a citation of its own: it takes that
-            # citation as its identity; the unreported identity stays as an alias, so earlier links still resolve
-            taken = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
-            if taken is None and (await db.execute(select(Judgment.id).where(Judgment.canonical_citation == canonical))).first() is None:
-                db.add(Citation(judgment_id=existing.id, citation_string=existing.canonical_citation[:200], raw_string=existing.canonical_citation, is_primary=False, source_evidence="unreported identity before a citation was known"))
-                cparts = _parse_citation_parts(canonical)
-                existing.canonical_citation = canonical
-                existing.unreported = False
-                existing.reporter, existing.page_number = cparts["reporter"], cparts["page"]
-                existing.year = existing.year or cparts["year"]
-                db.add(Citation(judgment_id=existing.id, citation_string=canonical, raw_string=canonical, reporter=cparts["reporter"], year=cparts["year"], page=cparts["page"], is_primary=True, source_evidence=(data.get("field_evidence") or {}).get("citations", "")[:500]))
-                await db.flush()
         # alternate citations learned from another route
         known = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == existing.id))).scalars().all()}
         for c in cits:
@@ -656,6 +652,17 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
 
     await sync_judgment_citation_relations(db, j)
     await _ensure_judges(db, data.get("judge_names"), court)
+    if link_unreported_id is not None:
+        from scraper.tasks.judgment_identity_reconcile import link_exact_identity
+
+        unrep_row = (await db.execute(select(Judgment).where(Judgment.id == link_unreported_id))).scalars().one()
+        j.court_id = unrep_row.court_id
+        j.court_name = unrep_row.court_name
+        j.docket_number = unrep_row.docket_number
+        j.docket_key = unrep_row.docket_key
+        j.decision_date = unrep_row.decision_date
+        await db.flush()
+        await link_exact_identity(db, link_unreported_id, j.id, source="promotion")
     if prov is not None:
         prov.promoted_table = "judgment"
         prov.promoted_id = j.id

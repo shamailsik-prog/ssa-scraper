@@ -117,3 +117,32 @@ async def test_migration_018_unique_constraint_uses_docket_key(db):
     with pytest.raises(Exception):
         await db.commit()
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_migration_018_m20_whitespace_docket_yields_null_docket_key(db):
+    """M20: whitespace-only docket_number must not produce a docket_key after 018 upgrade."""
+    mig = importlib.import_module("migrations.018_judgment_case_text_hash")
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE judgment DROP CONSTRAINT IF EXISTS uq_judgment_case_text_hash"))
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "z" * 600
+    h = "d" * 64
+    row = Judgment(
+        canonical_citation="PLD 2024 SC 40",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="   ",
+        docket_key=None,
+        decision_date=date(2024, 3, 1),
+        reporter="PLD",
+    )
+    db.add(row)
+    await db.commit()
+    row_id = row.id
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    db.expire_all()
+    refreshed = (await db.execute(select(Judgment).where(Judgment.id == row_id))).scalars().one()
+    assert refreshed.docket_key is None
