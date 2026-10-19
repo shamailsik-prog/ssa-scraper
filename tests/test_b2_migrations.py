@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select, text
 
 from scraper.database import engine
-from scraper.models import Court, Judgment, JudgmentIdentityLink
+from scraper.models import Court, Judgment, JudgmentIdentityLink, JudgmentIdentityReview
 
 
 @pytest.mark.asyncio
@@ -36,6 +36,33 @@ async def test_migration_019_downgrade_refuses_when_link_rows_exist(db):
     await db.commit()
     async with engine.begin() as conn:
         with pytest.raises(RuntimeError, match="judgment_identity_link has rows"):
+            await mig.downgrade(conn)
+
+
+@pytest.mark.asyncio
+async def test_migration_019_downgrade_refuses_when_review_rows_only(db):
+    mig = importlib.import_module("migrations.019_judgment_identity_reconcile")
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    u = Judgment(
+        canonical_citation="UNREPORTED mig19b",
+        full_text="t" * 600,
+        full_text_hash="5" * 64,
+        court_id=sc.id,
+        unreported=True,
+    )
+    db.add(u)
+    await db.flush()
+    db.add(
+        JudgmentIdentityReview(
+            unreported_judgment_id=u.id,
+            reported_judgment_id=None,
+            reason="hash_match_without_exact_identity",
+            details={},
+        )
+    )
+    await db.commit()
+    async with engine.begin() as conn:
+        with pytest.raises(RuntimeError, match="judgment_identity_review has rows"):
             await mig.downgrade(conn)
 
 

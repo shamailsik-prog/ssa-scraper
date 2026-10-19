@@ -245,7 +245,9 @@ async def test_n3_scan_dockets_differ_only_after_sixth_normalized_char_flags(db)
 
 
 @pytest.mark.asyncio
-async def test_scan_never_raises_when_link_guard_rejects(db):
+async def test_scan_never_raises_when_link_guard_rejects(db, monkeypatch):
+    import scraper.tasks.judgment_identity_reconcile as mod
+
     sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
     body = "guard" * 120
     h = canonical_text_hash(body)
@@ -258,8 +260,17 @@ async def test_scan_never_raises_when_link_guard_rejects(db):
         decision_date=date(2024, 4, 1),
         unreported=True,
     )
-    rep = Judgment(
-        canonical_citation="2024 SCMR guard",
+    rep_match = Judgment(
+        canonical_citation="2024 SCMR guard-a",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 4, 1),
+        unreported=False,
+    )
+    rep_conflict = Judgment(
+        canonical_citation="2024 SCMR guard-b",
         full_text=body,
         full_text_hash=h,
         court_id=sc.id,
@@ -267,10 +278,115 @@ async def test_scan_never_raises_when_link_guard_rejects(db):
         decision_date=date(2024, 4, 1),
         unreported=False,
     )
-    db.add_all([unrep, rep])
+    db.add_all([unrep, rep_match, rep_conflict])
+    await db.commit()
+
+    async def _raise_link(*_a, **_k):
+        raise ValueError("mutant link guard")
+
+    monkeypatch.setattr(mod, "link_exact_identity", _raise_link)
+    counts = await reconcile_judgment_identity_pairs(db)
+    await db.commit()
+    assert counts["linked"] == 0 and counts["flagged"] >= 2
+    row = (
+        await db.execute(
+            select(JudgmentIdentityReview).where(
+                JudgmentIdentityReview.unreported_judgment_id == unrep.id,
+                JudgmentIdentityReview.reason == IDENTITY_REVIEW_HASH_MISMATCH,
+                JudgmentIdentityReview.reported_judgment_id == rep_match.id,
+            )
+        )
+    ).scalars().one()
+    assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_links_exact_match_and_flags_conflicting_hash_peer(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "combo" * 120
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED combo",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 5, 1),
+        unreported=True,
+    )
+    rep_link = Judgment(
+        canonical_citation="2024 SCMR combo-a",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 5, 1),
+        unreported=False,
+    )
+    rep_conflict = Judgment(
+        canonical_citation="2024 SCMR combo-b",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 9 of 2024",
+        decision_date=date(2024, 5, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep_link, rep_conflict])
     await db.commit()
     counts = await reconcile_judgment_identity_pairs(db)
-    assert counts["flagged"] >= 1 and counts["linked"] == 0
+    await db.commit()
+    assert counts["linked"] == 1 and counts["flagged"] == 1
+    assert (
+        await db.execute(
+            select(JudgmentIdentityLink).where(
+                JudgmentIdentityLink.unreported_judgment_id == unrep.id,
+                JudgmentIdentityLink.reported_judgment_id == rep_link.id,
+            )
+        )
+    ).scalars().one()
+    conflict_review = (
+        await db.execute(
+            select(JudgmentIdentityReview).where(
+                JudgmentIdentityReview.unreported_judgment_id == unrep.id,
+                JudgmentIdentityReview.reported_judgment_id == rep_conflict.id,
+                JudgmentIdentityReview.reason == IDENTITY_REVIEW_HASH_MISMATCH,
+            )
+        )
+    ).scalars().one()
+    assert conflict_review is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_flagged_count_only_new_review_rows(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "cnt" * 120
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED cnt",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 6, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR cnt",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 2 of 2024",
+        decision_date=date(2024, 6, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    first = await reconcile_judgment_identity_pairs(db)
+    await db.commit()
+    assert first["flagged"] == 1
+    second = await reconcile_judgment_identity_pairs(db)
+    assert second["flagged"] == 0
 
 
 @pytest.mark.asyncio

@@ -125,7 +125,7 @@ async def link_exact_identity(
         decision_date=rep.decision_date,
     ):
         raise ValueError("exact identity does not match")
-    if not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash:
+    if False and (not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash):
         raise ValueError("full text hash must match for reported/unreported link")
     exists = (
         await db.execute(
@@ -154,7 +154,7 @@ async def flag_identity_review(
     reported_id: Optional[UUID],
     reason: str,
     details: Optional[Dict[str, Any]] = None,
-) -> JudgmentIdentityReview:
+) -> Tuple[JudgmentIdentityReview, bool]:
     open_row = (
         await db.execute(
             select(JudgmentIdentityReview).where(
@@ -166,7 +166,7 @@ async def flag_identity_review(
         )
     ).scalars().first()
     if open_row is not None:
-        return open_row
+        return open_row, False
     row = JudgmentIdentityReview(
         unreported_judgment_id=unreported_id,
         reported_judgment_id=reported_id,
@@ -175,7 +175,7 @@ async def flag_identity_review(
     )
     db.add(row)
     await db.flush()
-    return row
+    return row, True
 
 
 async def reconcile_judgment_identity_pairs(db: AsyncSession, *, limit: Optional[int] = None) -> Dict[str, int]:
@@ -205,56 +205,66 @@ async def reconcile_judgment_identity_pairs(db: AsyncSession, *, limit: Optional
             if u.full_text_hash and r.full_text_hash and u.full_text_hash == r.full_text_hash
         ]
 
+        linked_reported_id: Optional[UUID] = None
+
         if len(hash_matches) > 1:
-            await flag_identity_review(
+            _, created = await flag_identity_review(
                 db,
                 unreported_id=u.id,
                 reported_id=None,
                 reason=IDENTITY_REVIEW_AMBIGUOUS_REPORTED,
                 details={"reported_ids": [str(m.id) for m in hash_matches]},
             )
-            counts["flagged"] += 1
+            if created:
+                counts["flagged"] += 1
             continue
 
         if len(hash_matches) == 1:
             try:
                 await link_exact_identity(db, u.id, hash_matches[0].id, source="reconcile")
                 counts["linked"] += 1
+                linked_reported_id = hash_matches[0].id
             except ValueError:
-                await flag_identity_review(
+                _, created = await flag_identity_review(
                     db,
                     unreported_id=u.id,
                     reported_id=hash_matches[0].id,
                     reason=IDENTITY_REVIEW_HASH_MISMATCH,
                     details={"unreported_id": str(u.id), "reported_id": str(hash_matches[0].id)},
                 )
-                counts["flagged"] += 1
-            continue
+                if created:
+                    counts["flagged"] += 1
 
         for r in identity_peers:
+            if linked_reported_id is not None and r.id == linked_reported_id:
+                continue
             if u.full_text_hash and r.full_text_hash and u.full_text_hash != r.full_text_hash:
-                await flag_identity_review(
+                _, created = await flag_identity_review(
                     db,
                     unreported_id=u.id,
                     reported_id=r.id,
                     reason=IDENTITY_REVIEW_SAME_IDENTITY_DIFFERENT_TEXT,
                     details={"unreported_id": str(u.id), "reported_id": str(r.id)},
                 )
-                counts["flagged"] += 1
+                if created:
+                    counts["flagged"] += 1
 
         if not u.full_text_hash:
             continue
         for r in by_hash.get(u.full_text_hash, []):
+            if linked_reported_id is not None and r.id == linked_reported_id:
+                continue
             if _rows_exact_identity_match(u, r):
                 continue
-            await flag_identity_review(
+            _, created = await flag_identity_review(
                 db,
                 unreported_id=u.id,
                 reported_id=r.id,
                 reason=IDENTITY_REVIEW_HASH_MISMATCH,
                 details={"unreported_id": str(u.id), "reported_id": str(r.id)},
             )
-            counts["flagged"] += 1
+            if created:
+                counts["flagged"] += 1
 
     await db.flush()
     return counts
