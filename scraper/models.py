@@ -166,7 +166,7 @@ class Judgment(Base):
         UniqueConstraint("canonical_citation", name="uq_judgment_canonical_citation"),
         UniqueConstraint(
             "court_id",
-            "docket_number",
+            "docket_key",
             "decision_date",
             "full_text_hash",
             name="uq_judgment_case_text_hash",
@@ -206,6 +206,10 @@ class Judgment(Base):
     volume: Mapped[Optional[str]] = mapped_column(String(50))
     page_number: Mapped[Optional[int]] = mapped_column(Integer)
     docket_number: Mapped[Optional[str]] = mapped_column(String(300))
+    docket_key: Mapped[Optional[str]] = mapped_column(
+        String(300),
+        comment="Lowercase docket with whitespace removed; used for identity uniqueness with court and date",
+    )
     unreported: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False, comment="From a court's own website and cited by no law report; identity is court + case number + date")
     proceeding_type: Mapped[Optional[str]] = mapped_column(String(40), comment="bail|constitutional_petition|civil_suit|civil_appeal|... (scraper/unreported.py)")
     petitioner: Mapped[Optional[str]] = mapped_column(String(1000))

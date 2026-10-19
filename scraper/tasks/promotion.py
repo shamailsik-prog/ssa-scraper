@@ -55,10 +55,10 @@ from scraper.models import (
     StatutesStaging,
 )
 from scraper.parsers.bench_parser import normalise_judge_name
-from scraper.parsers.case_metadata import parse_case_metadata
-from scraper.extractors.deterministic import _REFERRED_AFTER
+from scraper.extractors.deterministic import decision_date_from_text, referred_after_citation
+from scraper.parsers.case_metadata import judgment_header_slice, parse_case_metadata, parse_pls_header_court
 from scraper.parsers.citation_extractor import (
-    _canonical_court,
+    canonical_court,
     canonicalise_statute_name,
     extract_citations,
     normalise_citation,
@@ -132,10 +132,31 @@ class PlsOwnCitationResult(NamedTuple):
     quarantine_reason: Optional[str] = None
 
 
-def _normalize_docket(docket: Optional[str]) -> str:
+def normalize_docket_key(docket: Optional[str]) -> str:
     if not docket:
         return ""
     return re.sub(r"\s+", "", docket.lower())
+
+
+def _resolve_incoming_docket(
+    *,
+    full_text: str,
+    route_json: Optional[Dict[str, Any]],
+    data: Dict[str, Any],
+    unreported: bool,
+    case_number: Optional[str],
+    source_name: Optional[str],
+) -> Optional[str]:
+    docket = case_number
+    if not unreported:
+        if source_name == "PakistanLawSite":
+            meta_pre = parse_case_metadata(full_text)
+            docket = meta_pre.docket_number if meta_pre else None
+        else:
+            docket = data.get("docket_number") or docket
+    if not docket:
+        docket = find_case_number(full_text, route_json)
+    return docket
 
 
 def _judgment_case_identity_matches(
@@ -149,19 +170,23 @@ def _judgment_case_identity_matches(
         return False
     if decision_date is None or judgment.decision_date is None or decision_date != judgment.decision_date:
         return False
-    return _normalize_docket(docket_number) == _normalize_docket(judgment.docket_number)
+    incoming_key = normalize_docket_key(docket_number)
+    stored_key = normalize_docket_key(judgment.docket_number)
+    if not incoming_key or not stored_key:
+        return False
+    return incoming_key == stored_key
 
 
 def _header_citation_set(page_text: str) -> set[str]:
     raw_text = page_text or ""
-    head_limit = max(300, min(800, int(len(raw_text) * 0.15)))
+    header_end = len(judgment_header_slice(raw_text))
     header: set[str] = set()
     for c in extract_citations(raw_text):
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if not norm:
             continue
-        referred = _REFERRED_AFTER.match(raw_text, c["span"][1]) is not None
-        if c["span"][0] < head_limit and not referred:
+        referred = referred_after_citation.match(raw_text, c["span"][1]) is not None
+        if c["span"][0] < header_end and not referred:
             header.add(norm)
     return header
 
@@ -187,8 +212,8 @@ def _pld_court_token(citation: str) -> Optional[str]:
 
 def _pld_court_agrees_with_header(citation: str, header_court_name: Optional[str]) -> bool:
     if not header_court_name:
-        return True
-    expected = _canonical_court(header_court_name)
+        return False
+    expected = canonical_court(header_court_name)
     token = _pld_court_token(citation)
     if not expected or not token:
         return False
@@ -214,27 +239,28 @@ def pls_own_citation(
     if not m:
         return PlsOwnCitationResult(own)
     year, page = m.group("y1") or m.group("y2"), m.group("page").upper()
-    header = _header_citation_set(page_text) if page_text else None
+    if not page_text:
+        return PlsOwnCitationResult(None, "pld_court_ambiguous")
+    header_court_name = parse_pls_header_court(page_text) or header_court_name
+    if not header_court_name:
+        return PlsOwnCitationResult(None, "pld_court_ambiguous")
+    header = _header_citation_set(page_text)
     candidates: List[str] = []
     for c in page_citations:
         norm = normalise_citation(c)
         yp = _pld_year_page(norm)
         if yp != (year, page):
             continue
-        if header is not None and norm not in header:
+        if norm not in header:
             continue
         if _pld_court_token(norm):
             candidates.append(norm)
-    if not candidates:
+    if len(candidates) != 1:
         return PlsOwnCitationResult(None, "pld_court_ambiguous")
-    agreeing = [c for c in candidates if _pld_court_agrees_with_header(c, header_court_name)]
-    if len(agreeing) == 1:
-        return PlsOwnCitationResult(agreeing[0])
-    if len(agreeing) > 1:
+    chosen = candidates[0]
+    if not _pld_court_agrees_with_header(chosen, header_court_name):
         return PlsOwnCitationResult(None, "pld_court_ambiguous")
-    if len(candidates) == 1 and header_court_name is None:
-        return PlsOwnCitationResult(candidates[0])
-    return PlsOwnCitationResult(None, "pld_court_ambiguous")
+    return PlsOwnCitationResult(chosen)
 
 
 def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[str, Any], source_name: Optional[str] = None) -> Optional[str]:
@@ -345,12 +371,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         # the extractor puts first. Any other citation found in the top of the page is a case cited in
         # the headnote ("1984 CLC 2384 rel."), not this judgment's own citation; keeping it made ~280
         # judgments collide with the judgments those citations really belong to (2026-09-30 audit).
-        own_result = pls_own_citation(
-            st.extracted_citation,
-            cits,
-            page_text=full_text,
-            header_court_name=data.get("court_canonical") or data.get("court"),
-        )
+        own_result = pls_own_citation(st.extracted_citation, cits, page_text=full_text)
         if own_result.quarantine_reason:
             await _quarantine(
                 db,
@@ -367,8 +388,12 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         return "quarantined"
     prov = (await db.execute(select(SourceProvenance).where(SourceProvenance.id == st.provenance_id))).scalars().first()
     court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
+    if court is None and st.source_name in SOURCE_COURT_CODE:
+        court = await _court_by_name(db, SOURCE_COURT_CODE[st.source_name])
     dd = data.get("decision_date")
     decision_date = date.fromisoformat(dd) if isinstance(dd, str) and dd else None
+    if decision_date is None:
+        decision_date, _ = decision_date_from_text(full_text)
     case_number = proceeding = None
     if unreported:
         if st.source_name in SOURCE_COURT_CODE:
@@ -389,36 +414,60 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     else:
         canonical = cits[0]
         parts = _parse_citation_parts(canonical)
-    incoming_docket = case_number
-    if not unreported and st.source_name == "PakistanLawSite":
-        meta_pre = parse_case_metadata(full_text)
-        incoming_docket = meta_pre.docket_number if meta_pre else None
-    elif not unreported:
-        incoming_docket = data.get("docket_number") or incoming_docket
-    incoming_court_id = court.id if court else None
+    incoming_docket = _resolve_incoming_docket(
+        full_text=full_text,
+        route_json=st.route_json,
+        data=data,
+        unreported=unreported,
+        case_number=case_number,
+        source_name=st.source_name,
+    )
+    identity_court = court
+    if st.source_name in SOURCE_COURT_CODE:
+        identity_court = await _court_by_name(db, SOURCE_COURT_CODE[st.source_name]) or court
+    incoming_court_id = identity_court.id if identity_court else None
     by_citation = (await db.execute(select(Judgment).where(Judgment.canonical_citation == canonical))).scalars().first()
-    by_hash = (await db.execute(select(Judgment).where(Judgment.full_text_hash == text_hash))).scalars().first()
-    if by_citation is not None and by_hash is not None and by_citation.id != by_hash.id:
-        await _quarantine(
-            db,
-            st,
-            "identity_conflict: citation and text hash match different judgments",
-            "judgment",
-            {
-                "citation_judgment_id": str(by_citation.id),
-                "hash_judgment_id": str(by_hash.id),
-                "canonical_citation": canonical,
-            },
+    hash_rows = (await db.execute(select(Judgment).where(Judgment.full_text_hash == text_hash))).scalars().all()
+    matching_hash = [
+        row
+        for row in hash_rows
+        if _judgment_case_identity_matches(
+            row,
+            court_id=incoming_court_id,
+            docket_number=incoming_docket,
+            decision_date=decision_date,
         )
-        return "quarantined"
-    existing = by_citation
-    if existing is None and by_hash is not None and _judgment_case_identity_matches(
-        by_hash,
-        court_id=incoming_court_id,
-        docket_number=incoming_docket,
-        decision_date=decision_date,
-    ):
-        existing = by_hash
+    ]
+    if hash_rows:
+        if by_citation is not None:
+            if len(matching_hash) != 1 or matching_hash[0].id != by_citation.id:
+                await _quarantine(
+                    db,
+                    st,
+                    "identity_conflict: citation and text hash match different judgments",
+                    "judgment",
+                    {
+                        "citation_judgment_id": str(by_citation.id),
+                        "hash_judgment_ids": [str(r.id) for r in hash_rows],
+                        "matching_hash_ids": [str(r.id) for r in matching_hash],
+                        "canonical_citation": canonical,
+                    },
+                )
+                return "quarantined"
+        elif len(matching_hash) != 1:
+            await _quarantine(
+                db,
+                st,
+                "identity_conflict: text hash matches multiple or no judgments for this court/docket/date",
+                "judgment",
+                {
+                    "hash_judgment_ids": [str(r.id) for r in hash_rows],
+                    "matching_hash_ids": [str(r.id) for r in matching_hash],
+                    "canonical_citation": canonical,
+                },
+            )
+            return "quarantined"
+    existing = by_citation if by_citation is not None else (matching_hash[0] if matching_hash else None)
     if existing is None:
         # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
         # just means that string is not ours to attach: drop it and promote under the canonical one.
@@ -559,8 +608,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
+    final_docket = incoming_docket or (meta.docket_number if meta else case_number)
     j = Judgment(
-        docket_number=meta.docket_number if meta else case_number,
+        docket_number=final_docket,
+        docket_key=normalize_docket_key(final_docket) or None,
         unreported=unreported,
         proceeding_type=proceeding,
         petitioner=meta.petitioner if meta else None,
