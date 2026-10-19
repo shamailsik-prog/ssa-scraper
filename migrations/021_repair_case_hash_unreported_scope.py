@@ -32,4 +32,22 @@ async def upgrade(conn) -> None:
 
 
 async def downgrade(conn) -> None:
-    pass
+    row = await conn.execute(
+        text(
+            """
+            SELECT pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conname = 'uq_judgment_case_text_hash'
+            """
+        )
+    )
+    defn = (row.scalar() or "").lower()
+    if "unreported" not in defn:
+        return
+    await conn.execute(text("ALTER TABLE judgment DROP CONSTRAINT IF EXISTS uq_judgment_case_text_hash"))
+    await conn.execute(
+        text(
+            "ALTER TABLE judgment ADD CONSTRAINT uq_judgment_case_text_hash "
+            "UNIQUE (court_id, docket_key, decision_date, full_text_hash)"
+        )
+    )
