@@ -100,21 +100,37 @@ def test_a_headnote_citation_marked_ref_is_never_the_pages_own():
 
 
 @pytest.mark.parametrize(
-    "grid, page, expected",
+    "grid, page, header_court, page_text, expected, quarantine",
     [
         # the grid prints PLD without its court; PLD restarts page numbers per court, so the page's own
         # "P L D 2026 Lahore 7" is the identity (45 distinct PLD judgments were dropped as duplicates)
-        ("2026 PLD 7", ["PLD 2026 Lahore 7"], "PLD 2026 Lahore 7"),
-        ("PLD 2026 7", ["PLD 2026 Sindh 7"], "PLD 2026 Sindh 7"),
-        # a court-form page citation for a different page is not this judgment's
-        ("2026 PLD 7", ["PLD 2026 Lahore 8"], "2026 PLD 7"),
+        (
+            "2026 PLD 7",
+            ["PLD 2026 Lahore 7"],
+            "Lahore High Court",
+            "PLD 2026 Lahore 7\nIN THE LAHORE HIGH COURT\n",
+            "PLD 2026 Lahore 7",
+            None,
+        ),
+        (
+            "PLD 2026 7",
+            ["PLD 2026 Sindh 7"],
+            "Sindh High Court",
+            "PLD 2026 Sindh 7\nIN THE SINDH HIGH COURT\n",
+            "PLD 2026 Sindh 7",
+            None,
+        ),
+        # a court-form page citation for a different page cannot be completed safely
+        ("2026 PLD 7", ["PLD 2026 Lahore 8"], "Lahore High Court", "IN THE LAHORE HIGH COURT\n", None, "pld_court_ambiguous"),
         # other reporters keep the grid row's citation
-        ("2025 SCMR 1967", ["2025 SCMR 1967"], "2025 SCMR 1967"),
-        ("2025 PLC 45", [], "2025 PLC 45"),
-        (None, ["PLD 2025 Lahore 98"], "PLD 2025 Lahore 98"),
+        ("2025 SCMR 1967", ["2025 SCMR 1967"], None, None, "2025 SCMR 1967", None),
+        ("2025 PLC 45", [], None, None, "2025 PLC 45", None),
+        (None, ["PLD 2025 Lahore 98"], None, None, "PLD 2025 Lahore 98", None),
     ],
 )
-def test_pls_own_citation_prefers_the_pages_court_form_for_pld(grid, page, expected):
+def test_pls_own_citation_prefers_the_pages_court_form_for_pld(grid, page, header_court, page_text, expected, quarantine):
     from scraper.tasks.promotion import pls_own_citation
 
-    assert pls_own_citation(grid, page) == expected
+    result = pls_own_citation(grid, page, page_text=page_text, header_court_name=header_court)
+    assert result.citation == expected
+    assert result.quarantine_reason == quarantine
