@@ -69,6 +69,22 @@ from tests.fixtures import FixtureServer  # noqa: E402
 TMP = _TMP
 
 
+async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
+    """Migration downgrade tests can leave a 4-column unique; B2/models require unreported in the key."""
+    row = await conn.execute(
+        text(
+            "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint "
+            "WHERE conname = 'uq_judgment_case_text_hash'"
+        )
+    )
+    defn = (row.scalar() or "").lower()
+    if defn and "unreported" not in defn:
+        import importlib
+
+        mig = importlib.import_module("migrations.020_judgment_case_hash_unreported_scope")
+        await mig.upgrade(conn)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _initialised_database():
     asyncio.run(init_db())
@@ -84,6 +100,7 @@ async def clean_db():
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
+        await _ensure_judgment_case_hash_includes_unreported(conn)
     await seed_data()
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache

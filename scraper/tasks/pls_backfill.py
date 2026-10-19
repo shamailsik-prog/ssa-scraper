@@ -17,6 +17,7 @@ from scraper.extractors import deterministic as det
 from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
 from scraper.models import Judgment, QuarantineQueue, ScraperStaging
+from scraper.tasks.promotion import normalize_docket_key
 from scraper.parsers.case_metadata import parse_case_metadata
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ async def backfill_case_metadata(db: AsyncSession, *, batch: int = 500, limit: O
                 if value and not getattr(j, col):
                     if not dry_run:
                         setattr(j, col, value)
+                        if col == "docket_number":
+                            j.docket_key = normalize_docket_key(value) or None
                     counts[col] += 1
                     changed = True
             counts["updated"] += int(changed)

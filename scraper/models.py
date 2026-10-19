@@ -169,6 +169,7 @@ class Judgment(Base):
             "docket_key",
             "decision_date",
             "full_text_hash",
+            "unreported",
             name="uq_judgment_case_text_hash",
         ),
         Index("ix_judgment_court_id", "court_id"),
@@ -680,6 +681,47 @@ class StatutesStaging(Base):
     validation_errors: Mapped[Optional[list]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
+
+
+class JudgmentIdentityLink(Base):
+    """Non-destructive link between an unreported judgment and its reported counterpart (same court/docket/date)."""
+
+    __tablename__ = "judgment_identity_link"
+    __table_args__ = (
+        UniqueConstraint("unreported_judgment_id", "reported_judgment_id", name="uq_judgment_identity_link_pair"),
+        Index("ix_judgment_identity_link_unreported", "unreported_judgment_id"),
+        Index("ix_judgment_identity_link_reported", "reported_judgment_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    unreported_judgment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False
+    )
+    reported_judgment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(String(40), nullable=False, default="reconcile", server_default=text("'reconcile'"))
+    created_at: Mapped[datetime] = _created()
+
+
+class JudgmentIdentityReview(Base):
+    """Operator review when reported/unreported rows may correspond but exact identity does not (or is ambiguous)."""
+
+    __tablename__ = "judgment_identity_review"
+    __table_args__ = (
+        Index("ix_judgment_identity_review_unreported", "unreported_judgment_id"),
+        Index("ix_judgment_identity_review_reviewed", "reviewed"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    unreported_judgment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="CASCADE"), nullable=False
+    )
+    reported_judgment_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("judgment.id", ondelete="SET NULL")
+    )
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    details: Mapped[Optional[dict]] = mapped_column(JSONB)
+    reviewed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
+    created_at: Mapped[datetime] = _created()
 
 
 class QuarantineQueue(Base):

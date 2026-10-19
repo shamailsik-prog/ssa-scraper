@@ -158,7 +158,7 @@ def test_the_viewer_lists_the_unreported_section_by_proceeding(client, admin_hea
 
 
 async def test_an_unreported_judgment_that_later_gets_its_citation_takes_it(db, source):
-    from scraper.models import Citation
+    from scraper.models import JudgmentIdentityLink
 
     st = await _held(db, source)
     await release_unreported(db)
@@ -169,11 +169,20 @@ async def test_an_unreported_judgment_that_later_gets_its_citation_takes_it(db, 
     again = await _held(db, source)  # the same judgment, now with the citation its result row names
     again.status, again.quarantine_reason = "extracted", None
     again.reconciled_json = {**(again.reconciled_json or {}), "citations": ["2024 SCMR 77"]}
-    assert await promote_judgment_staging(db, again) == "duplicate"
+    assert await promote_judgment_staging(db, again) == "promoted"
     await db.refresh(j)
-    assert j.canonical_citation == "2024 SCMR 77" and j.unreported is False and j.reporter == "SCMR"
-    aliases = {c.citation_string for c in (await db.execute(select(Citation).where(Citation.judgment_id == j.id))).scalars().all()}
-    assert old_identity in aliases and "2024 SCMR 77" in aliases
+    reported = (await db.execute(select(Judgment).where(Judgment.id == again.promoted_to_id))).scalars().one()
+    assert j.unreported is True and j.canonical_citation == old_identity
+    assert reported.canonical_citation == "2024 SCMR 77" and reported.unreported is False and reported.reporter == "SCMR"
+    link = (
+        await db.execute(
+            select(JudgmentIdentityLink).where(
+                JudgmentIdentityLink.unreported_judgment_id == j.id,
+                JudgmentIdentityLink.reported_judgment_id == reported.id,
+            )
+        )
+    ).scalars().one()
+    assert link is not None
 
 
 async def test_an_older_hold_recorded_only_on_its_review_item_is_released(db, source):
