@@ -47,7 +47,7 @@ async def upgrade(conn) -> None:
     await conn.execute(
         text(
             "ALTER TABLE judgment ADD CONSTRAINT uq_judgment_case_text_hash "
-            "UNIQUE (court_id, docket_key, decision_date, full_text_hash, unreported)"
+            "UNIQUE (court_id, docket_key, decision_date, full_text_hash)"
         )
     )
 

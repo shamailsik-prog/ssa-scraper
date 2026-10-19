@@ -35,6 +35,7 @@ app = Celery(
         "scraper.tasks.pls_search_harvest",
         "scraper.tasks.pls_caseid_walk",
         "scraper.tasks.pls_backfill",
+        "scraper.tasks.judgment_identity_reconcile",
     ],
 )
 app.conf.update(

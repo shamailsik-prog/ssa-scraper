@@ -44,5 +44,13 @@ async def upgrade(conn) -> None:
 
 
 async def downgrade(conn) -> None:
+    if (await conn.execute(text("SELECT 1 FROM judgment_identity_link LIMIT 1"))).first():
+        raise RuntimeError(
+            "cannot downgrade 019_judgment_identity_reconcile: judgment_identity_link has rows"
+        )
+    if (await conn.execute(text("SELECT 1 FROM judgment_identity_review LIMIT 1"))).first():
+        raise RuntimeError(
+            "cannot downgrade 019_judgment_identity_reconcile: judgment_identity_review has rows"
+        )
     await conn.execute(text("DROP TABLE IF EXISTS judgment_identity_review"))
     await conn.execute(text("DROP TABLE IF EXISTS judgment_identity_link"))

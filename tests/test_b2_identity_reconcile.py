@@ -10,14 +10,14 @@ from sqlalchemy import select
 from scraper.fetchers import canonical_text_hash
 from scraper.models import Court, Judgment, JudgmentIdentityLink, JudgmentIdentityReview
 from scraper.tasks.judgment_identity_reconcile import (
+    IDENTITY_REVIEW_AMBIGUOUS_REPORTED,
     IDENTITY_REVIEW_HASH_MISMATCH,
     IDENTITY_REVIEW_SAME_IDENTITY_DIFFERENT_TEXT,
-    flag_identity_review,
     link_exact_identity,
     reconcile_judgment_identity_pairs,
 )
-from tests.test_unreported_promotion import BODY, _held, _html
 from scraper.tasks.promotion import promote_judgment_staging, release_unreported
+from tests.test_unreported_promotion import _held
 
 
 @pytest.mark.asyncio
@@ -53,7 +53,7 @@ async def test_b2_exact_identity_and_hash_create_link(db):
 
 
 @pytest.mark.asyncio
-async def test_b2_same_hash_different_docket_flags_not_links(db):
+async def test_n12_scan_same_hash_different_docket_flags_with_counts(db):
     sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
     body = "b" * 600
     h = canonical_text_hash(body)
@@ -77,15 +77,9 @@ async def test_b2_same_hash_different_docket_flags_not_links(db):
     )
     db.add_all([unrep, rep])
     await db.commit()
-    with pytest.raises(ValueError, match="exact identity"):
-        await link_exact_identity(db, unrep.id, rep.id)
-    await flag_identity_review(
-        db,
-        unreported_id=unrep.id,
-        reported_id=rep.id,
-        reason=IDENTITY_REVIEW_HASH_MISMATCH,
-    )
+    counts = await reconcile_judgment_identity_pairs(db)
     await db.commit()
+    assert counts["linked"] == 0 and counts["flagged"] == 1
     row = (
         await db.execute(
             select(JudgmentIdentityReview).where(
@@ -95,6 +89,188 @@ async def test_b2_same_hash_different_docket_flags_not_links(db):
         )
     ).scalars().one()
     assert row.reported_judgment_id == rep.id
+    assert (
+        await db.execute(select(JudgmentIdentityLink).where(JudgmentIdentityLink.unreported_judgment_id == unrep.id))
+    ).scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_n13_two_reported_same_identity_and_hash_flags_no_link(db, monkeypatch):
+    from uuid import uuid4
+
+    import scraper.tasks.judgment_identity_reconcile as mod
+
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "n13" * 200
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED SC N13",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 10 of 2024",
+        decision_date=date(2024, 10, 1),
+        unreported=True,
+    )
+    db.add(unrep)
+    await db.commit()
+    await db.refresh(unrep)
+    rep_a = mod._IdentityRow(
+        id=uuid4(),
+        court_id=sc.id,
+        docket_number="C.P. 10 of 2024",
+        decision_date=date(2024, 10, 1),
+        full_text_hash=h,
+        unreported=False,
+    )
+    rep_b = mod._IdentityRow(
+        id=uuid4(),
+        court_id=sc.id,
+        docket_number="C.P. 10 of 2024",
+        decision_date=date(2024, 10, 1),
+        full_text_hash=h,
+        unreported=False,
+    )
+    key = mod.identity_tuple_from_row(rep_a)
+
+    async def _fake_load(_db):
+        return {h: [rep_a, rep_b]}, {key: [rep_a, rep_b]}
+
+    monkeypatch.setattr(mod, "_load_reported_identity_rows", _fake_load)
+    counts = await reconcile_judgment_identity_pairs(db)
+    await db.commit()
+    assert counts["linked"] == 0 and counts["flagged"] == 1
+    review = (
+        await db.execute(
+            select(JudgmentIdentityReview).where(
+                JudgmentIdentityReview.unreported_judgment_id == unrep.id,
+                JudgmentIdentityReview.reason == IDENTITY_REVIEW_AMBIGUOUS_REPORTED,
+            )
+        )
+    ).scalars().one()
+    assert review.reported_judgment_id is None
+    assert (
+        await db.execute(select(JudgmentIdentityLink).where(JudgmentIdentityLink.unreported_judgment_id == unrep.id))
+    ).scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_n1_scan_same_hash_different_court_flags_not_linked(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    lhc = (await db.execute(select(Court).where(Court.short_code == "LHC"))).scalars().one()
+    body = "n1" * 200
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED SC N1",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 1, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR N1",
+        full_text=body,
+        full_text_hash=h,
+        court_id=lhc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 1, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    counts = await reconcile_judgment_identity_pairs(db)
+    assert counts["linked"] == 0 and counts["flagged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_n2_scan_same_hash_different_date_flags_not_linked(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "n2" * 200
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED SC N2",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 1, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR N2",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 2, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    counts = await reconcile_judgment_identity_pairs(db)
+    assert counts["linked"] == 0 and counts["flagged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_n3_scan_dockets_differ_only_after_sixth_normalized_char_flags(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "n3" * 200
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED SC N3",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="Abcdef 1 of 2024",
+        decision_date=date(2024, 3, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR N3",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="Abcdef 2 of 2024",
+        decision_date=date(2024, 3, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    counts = await reconcile_judgment_identity_pairs(db)
+    assert counts["linked"] == 0 and counts["flagged"] == 1
+    with pytest.raises(ValueError):
+        await link_exact_identity(db, unrep.id, rep.id)
+
+
+@pytest.mark.asyncio
+async def test_scan_never_raises_when_link_guard_rejects(db):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = "guard" * 120
+    h = canonical_text_hash(body)
+    unrep = Judgment(
+        canonical_citation="UNREPORTED guard",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 1 of 2024",
+        decision_date=date(2024, 4, 1),
+        unreported=True,
+    )
+    rep = Judgment(
+        canonical_citation="2024 SCMR guard",
+        full_text=body,
+        full_text_hash=h,
+        court_id=sc.id,
+        docket_number="C.P. 9 of 2024",
+        decision_date=date(2024, 4, 1),
+        unreported=False,
+    )
+    db.add_all([unrep, rep])
+    await db.commit()
+    counts = await reconcile_judgment_identity_pairs(db)
+    assert counts["flagged"] >= 1 and counts["linked"] == 0
 
 
 @pytest.mark.asyncio
@@ -172,6 +348,12 @@ def test_b2_no_similarity_merge_in_promotion():
     assert "SequenceMatcher" not in src
 
 
+def test_b2_reconcile_celery_task_registered():
+    from scraper.tasks.celery_app import app
+
+    assert "scraper.tasks.judgment_identity_reconcile.reconcile_judgment_identity_pairs" in app.tasks
+
+
 @pytest.mark.asyncio
 async def test_mutant_b2_m1_link_requires_matching_hash(db):
     sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
@@ -224,4 +406,4 @@ async def test_mutant_b2_m2_reconcile_skips_link_without_hash_match(db):
     db.add_all([unrep, rep])
     await db.commit()
     counts = await reconcile_judgment_identity_pairs(db)
-    assert counts["linked"] == 0
+    assert counts["linked"] == 0 and counts["flagged"] >= 1
