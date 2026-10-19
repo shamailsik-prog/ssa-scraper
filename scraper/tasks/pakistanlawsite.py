@@ -103,7 +103,7 @@ for _reporter in KNOWN_REPORTERS:
 QUARANTINE_REFETCH_MAX = 3
 PLS_STUB_PAGE_MAX_BYTES = 3000  # a capture smaller than this (octet_length) is an error, stub or empty page
 # quarantined on the merits (a real citation conflict or a human decision): never fetched again
-_FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|reviewed|rejected")
+_FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|identity_conflict:|reviewed|rejected")
 _RETRYABLE_QUARANTINE = re.compile(
     r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
 )
