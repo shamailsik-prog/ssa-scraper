@@ -164,8 +164,15 @@ class Judgment(Base):
     __tablename__ = "judgment"
     __table_args__ = (
         UniqueConstraint("canonical_citation", name="uq_judgment_canonical_citation"),
-        UniqueConstraint("full_text_hash", name="uq_judgment_full_text_hash"),
+        UniqueConstraint(
+            "court_id",
+            "docket_key",
+            "decision_date",
+            "full_text_hash",
+            name="uq_judgment_case_text_hash",
+        ),
         Index("ix_judgment_court_id", "court_id"),
+        Index("ix_judgment_full_text_hash", "full_text_hash"),
         Index("ix_judgment_year", "year"),
         Index("ix_judgment_reporter", "reporter"),
         Index("ix_judgment_decision_date", "decision_date"),
@@ -199,6 +206,10 @@ class Judgment(Base):
     volume: Mapped[Optional[str]] = mapped_column(String(50))
     page_number: Mapped[Optional[int]] = mapped_column(Integer)
     docket_number: Mapped[Optional[str]] = mapped_column(String(300))
+    docket_key: Mapped[Optional[str]] = mapped_column(
+        String(300),
+        comment="Lowercase docket with whitespace removed; used for identity uniqueness with court and date",
+    )
     unreported: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False, comment="From a court's own website and cited by no law report; identity is court + case number + date")
     proceeding_type: Mapped[Optional[str]] = mapped_column(String(40), comment="bail|constitutional_petition|civil_suit|civil_appeal|... (scraper/unreported.py)")
     petitioner: Mapped[Optional[str]] = mapped_column(String(1000))

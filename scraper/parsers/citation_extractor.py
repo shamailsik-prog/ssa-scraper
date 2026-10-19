@@ -300,7 +300,7 @@ STATUTE_NAME_WITH_YEAR_PATTERN = re.compile(
 # Helpers
 # ============================================================================
 
-def _canonical_court(raw_court: Optional[str]) -> Optional[str]:
+def canonical_court(raw_court: Optional[str]) -> Optional[str]:
     if not raw_court:
         return None
     key = re.sub(r"\s+", " ", raw_court.strip()).upper()
@@ -463,7 +463,7 @@ def _year_first_normalised(reporter_key: str, m: re.Match) -> str:
         rep_out = "PLC (CS)"
     out = f"{m.group('year')} {rep_out}"
     if gd.get("court"):
-        out += f" ({_canonical_court(gd['court'])})"
+        out += f" ({canonical_court(gd['court'])})"
     if gd.get("note"):
         out += " Note"
     return f"{out} {_clean_page(m.group('page'))}"
@@ -495,7 +495,7 @@ def _canonicalise_bracketed_courts(s: str) -> str:
         raw_inside = s[i + 1 : j]
         inside = raw_inside.strip() or raw_inside
         out.append(s[pos:i])
-        out.append(f"({_canonical_court(inside) or inside})")
+        out.append(f"({canonical_court(inside) or inside})")
         pos = j + 1
     out.append(s[pos:])
     return "".join(out)
@@ -533,7 +533,7 @@ def normalise_citation(raw: str) -> str:
         year = m_pld.group("year")
         court_raw = m_pld.group("court")
         page = _clean_page(m_pld.group("page"))
-        court_canonical = _canonical_court(court_raw) or court_raw.strip()
+        court_canonical = canonical_court(court_raw) or court_raw.strip()
         if court_canonical in ("SC", "FSC", "IHC", "AJ&K", "GB"):
             court_out = court_canonical
         else:
@@ -612,7 +612,7 @@ def extract_citations(text: str) -> List[Dict[str, Any]]:
                 year = None
 
             court_raw = gd.get("court")
-            court = _canonical_court(court_raw) if court_raw else None
+            court = canonical_court(court_raw) if court_raw else None
 
             page_raw = gd.get("page") or ""
             page = _clean_page(page_raw)

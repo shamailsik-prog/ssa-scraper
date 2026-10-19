@@ -56,6 +56,42 @@ def _norm_lines(text: str) -> List[str]:
     return [ln.strip() for ln in text.replace("\xa0", " ").translate(_DASH_TABLE).split("\n") if ln.strip()]
 
 
+_HEADER_REL_REF = re.compile(r"\b(?:rel|ref)\.", re.I)
+_PLS_COURT_LINE = re.compile(
+    r"\b(?:IN\s+THE\s+)?(SUPREME\s+COURT\s+OF\s+PAKISTAN|"
+    r"LAHORE\s+HIGH\s+COURT|SINDH\s+HIGH\s+COURT|PESHAWAR\s+HIGH\s+COURT|"
+    r"BALOCHISTAN\s+HIGH\s+COURT|ISLAMABAD\s+HIGH\s+COURT|"
+    r"FEDERAL\s+SHARIAT\s+COURT|FEDERAL\s+CONSTITUTIONAL\s+COURT)\b",
+    re.I,
+)
+
+
+def judgment_header_slice(text: Optional[str]) -> str:
+    """Top of judgment text before the first rel./ref. marker, capped like the extractor head limit."""
+    raw = text or ""
+    head_limit = max(300, min(800, int(len(raw) * 0.15)))
+    window = raw[:head_limit]
+    cut = _HEADER_REL_REF.search(window)
+    return window[: cut.start()] if cut else window
+
+
+def parse_pls_header_court(text: Optional[str]) -> Optional[str]:
+    """Court name from the PLS header block only (not reconciled metadata)."""
+    header = judgment_header_slice(text)
+    if not header:
+        return None
+    m = _PLS_COURT_LINE.search(header)
+    if not m:
+        bracket = re.search(r"^\s*\[([A-Za-z][A-Za-z\s&]+)\]\s*$", header, re.M)
+        if bracket:
+            return bracket.group(1).strip()
+        return None
+    name = re.sub(r"\s+", " ", m.group(1)).strip()
+    if name.upper() == "SUPREME COURT OF PAKISTAN":
+        return "Supreme Court of Pakistan"
+    return name.title()
+
+
 def _title_start(lines: List[str]) -> int:
     """Line index after the citation line, [court] and 'Before ...' lines."""
     idx = 0

@@ -124,7 +124,10 @@ def case_title_from_text(text: str, html: Optional[str] = None) -> tuple[Optiona
     return None, None
 
 
-_REFERRED_AFTER = re.compile(r"\s*[,;]?\s*(?:ref|rel|fol|foll|distinguished|dist|considered|overruled|approved|referred)\b\.?", re.IGNORECASE)
+referred_after_citation = re.compile(
+    r"\s*[,;]?\s*(?:ref|rel|fol|foll|distinguished|dist|considered|overruled|approved|referred)\b\.?",
+    re.IGNORECASE,
+)
 
 
 def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], source_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -142,7 +145,7 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
         cit_end.setdefault(norm, c["span"][1])
         # "Muhammad Ahmad Ameen 2006 SCMR 631 ref." in a headnote is a case the judgment cites, never its own
         # citation, however near the top it sits (staging 6404c66e was promoted as 2006 SCMR 631 that way)
-        referred = _REFERRED_AFTER.match(raw_text, c["span"][1]) is not None
+        referred = referred_after_citation.match(raw_text, c["span"][1]) is not None
         if c["span"][0] < head_limit and len(own) < 6 and not referred:
             own.append(norm)
             if own_end is None:
