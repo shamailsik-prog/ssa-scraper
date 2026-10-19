@@ -255,6 +255,116 @@ def test_mutant_m6_multi_court_pld_in_header_quarantines():
     assert res.quarantine_reason == "pld_court_ambiguous"
 
 
+@pytest.mark.asyncio
+async def test_citation_row_in_hash_rows_refetch_duplicate_without_docket_or_date(db, login_source):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    body = _judgment_body("PLD 2024 SC 50", "IN THE SUPREME COURT OF PAKISTAN", "C.P. No. 50 of 2024")
+    h = canonical_text_hash(body)
+    db.add(
+        Judgment(
+            canonical_citation="PLD 2024 SC 50",
+            full_text=body,
+            full_text_hash=h,
+            court_id=sc.id,
+            court_name=sc.name,
+            docket_number=None,
+            decision_date=None,
+            reporter="PLD",
+            source_name="PakistanLawSite",
+        )
+    )
+    await db.commit()
+    st = await _stage_pls(
+        db,
+        login_source,
+        extracted="PLD 2024 SC 50",
+        citations=["PLD 2024 SC 50"],
+        body=body,
+        court="Supreme Court of Pakistan",
+    )
+    st.reconciled_json.pop("decision_date", None)
+    assert await promote_judgment_staging(db, st) == "duplicate"
+
+
+def test_mutant_m8_sc_header_lahore_only_candidate_quarantines():
+    body = "IN THE SUPREME COURT OF PAKISTAN\nC.P. No. 1 of 2026\nPLD 2026 Lahore 7\n" + _PAD
+    res = pls_own_citation("2026 PLD 7", ["PLD 2026 Lahore 7"], page_text=body)
+    assert res.quarantine_reason == "pld_court_ambiguous"
+
+
+def test_mutant_m11_rel_marker_cut_keeps_later_pld_out_of_header_citations():
+    from scraper.parsers.case_metadata import judgment_header_slice
+    from scraper.tasks.promotion import _header_citation_set
+
+    body = (
+        "IN THE SUPREME COURT OF PAKISTAN\n"
+        "PLD 2025 SC 1 rel. prior case\n"
+        "PLD 2025 SC 2\n"
+        "C.P. No. 1 of 2025\n"
+        + _PAD
+    )
+    header = judgment_header_slice(body)
+    assert "PLD 2025 SC 2" not in header
+    assert "PLD 2025 SC 2" not in _header_citation_set(body)
+
+
+@pytest.mark.asyncio
+async def test_mutant_m18_shared_hash_lhc_duplicate_or_quarantine_not_insert(db, login_source):
+    sc = (await db.execute(select(Court).where(Court.short_code == "SC"))).scalars().one()
+    lhc = (await db.execute(select(Court).where(Court.short_code == "LHC"))).scalars().one()
+    shared = _judgment_body("PLD 2024 SC 400", "IN THE SUPREME COURT OF PAKISTAN", "C.P. No. 10 of 2024")
+    h = canonical_text_hash(shared)
+    db.add(
+        Judgment(
+            canonical_citation="PLD 2024 SC 400",
+            full_text=shared,
+            full_text_hash=h,
+            court_id=sc.id,
+            court_name=sc.name,
+            docket_number="C.P. No. 10 of 2024",
+            decision_date=date(2024, 1, 1),
+            reporter="PLD",
+            source_name="PakistanLawSite",
+        )
+    )
+    db.add(
+        Judgment(
+            canonical_citation="PLD 2024 Lahore 400",
+            full_text=shared,
+            full_text_hash=h,
+            court_id=lhc.id,
+            court_name=lhc.name,
+            docket_number="W.P. No. 20 of 2024",
+            decision_date=date(2024, 1, 1),
+            reporter="PLD",
+            source_name="PakistanLawSite",
+        )
+    )
+    await db.commit()
+
+    match_b = await _stage_pls(
+        db,
+        login_source,
+        extracted="PLD 2024 Lahore 400",
+        citations=["PLD 2024 Lahore 400"],
+        body=shared,
+        court="Lahore High Court",
+    )
+    assert await promote_judgment_staging(db, match_b) == "duplicate"
+
+    clash = await _stage_pls(
+        db,
+        login_source,
+        extracted="PLD 2024 Lahore 401",
+        citations=["PLD 2024 Lahore 401"],
+        body=shared,
+        court="Lahore High Court",
+    )
+    clash.reconciled_json["decision_date"] = "2024-06-01"
+    assert await promote_judgment_staging(db, clash) == "quarantined"
+    assert len((await db.execute(select(Judgment).where(Judgment.full_text_hash == h))).scalars().all()) == 2
+
+
 async def test_mutant_m8_empty_docket_never_identity_matches(db):
     from scraper.tasks.promotion import _judgment_case_identity_matches
 

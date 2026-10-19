@@ -15,7 +15,10 @@ _DOCKET_KEY_SQL = "lower(regexp_replace(coalesce(docket_number, ''), '\\s+', '',
 async def upgrade(conn) -> None:
     await conn.execute(text("ALTER TABLE judgment ADD COLUMN IF NOT EXISTS docket_key VARCHAR(300)"))
     await conn.execute(
-        text(f"UPDATE judgment SET docket_key = {_DOCKET_KEY_SQL} WHERE docket_number IS NOT NULL AND docket_key IS NULL")
+        text(
+            f"UPDATE judgment SET docket_key = NULLIF({_DOCKET_KEY_SQL}, '') "
+            "WHERE docket_number IS NOT NULL AND docket_key IS NULL"
+        )
     )
     conflicts = await conn.execute(
         text(
