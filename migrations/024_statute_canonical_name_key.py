@@ -1,8 +1,8 @@
 """
 024 — Indexed canonical_name_key for statute mention resolution (B3).
 
-Adds the column in the migration transaction, backfills in batches (only NULL keys), then builds
-the index CONCURRENTLY after commit (see upgrade_post_commit + run_migrations).
+Adds the column in the migration transaction only. Batched backfill and CONCURRENTLY index build
+run in upgrade_post_commit (autocommit batches + run_migrations records the version after the hook).
 """
 
 from __future__ import annotations
@@ -65,22 +65,14 @@ async def upgrade(conn) -> None:
             """
         )
     )
-    await _backfill_canonical_name_keys(conn)
 
 
 async def upgrade_post_commit() -> None:
-    from scraper.database import engine
+    from scraper.database import engine, ensure_statute_canonical_name_key_index_valid
 
-    async with engine.connect() as conn:
-        await conn.execution_options(isolation_level="AUTOCOMMIT")
-        await conn.execute(
-            text(
-                """
-                CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_statute_canonical_name_key
-                    ON statute (canonical_name_key)
-                """
-            )
-        )
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        await _backfill_canonical_name_keys(conn)
+    await ensure_statute_canonical_name_key_index_valid()
 
 
 async def downgrade(conn) -> None:
