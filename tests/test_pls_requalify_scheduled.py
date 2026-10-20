@@ -48,7 +48,7 @@ async def test_scheduled_requalify_releases_court_unknown_but_keeps_merits_holds
     db.add(QuarantineQueue(staging_id=court_unknown.id, reason="court unknown", source_name="PakistanLawSite"))
     await db.commit()
 
-    counts = await requalify_quarantined(db, skip_final=True)
+    counts = await requalify_quarantined(db, dry_run=False, skip_final=True)
     await db.commit()
 
     st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == court_unknown.id))).scalars().one()
@@ -69,7 +69,7 @@ async def test_merits_holds_do_not_fill_the_batch_ahead_of_releasable_rows(db):
     releasable = await _held(db, source, reason="court unknown", n=0)
     await db.commit()
 
-    await requalify_quarantined(db, limit=2, skip_final=True)
+    await requalify_quarantined(db, dry_run=False, limit=2, skip_final=True)
     await db.commit()
     st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == releasable.id))).scalars().one()
     assert st.status in ("promoted", "duplicate")
@@ -88,7 +88,7 @@ async def test_still_held_row_shows_its_current_reason_in_the_review_queue(db):
     st.raw_text = "1983 PCrLJ 2063 short page"  # still fails, for another reason now
     db.add(QuarantineQueue(staging_id=st.id, reason="court unknown", source_name="PakistanLawSite"))
     await db.commit()
-    await requalify_quarantined(db, skip_final=True)
+    await requalify_quarantined(db, dry_run=False, skip_final=True)
     await db.commit()
     st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == st.id))).scalars().one()
     item = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id))).scalars().one()
