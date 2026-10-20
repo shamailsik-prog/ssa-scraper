@@ -314,9 +314,11 @@ class Statute(Base):
         UniqueConstraint("name", name="uq_statute_name"),
         Index("ix_statute_short_name", "short_name"),
         Index("ix_statute_name_trgm", "name", postgresql_using="gin", postgresql_ops={"name": "gin_trgm_ops"}),
+        Index("ix_statute_canonical_name_key", "canonical_name_key"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     name: Mapped[str] = mapped_column(String(1000), nullable=False)
+    canonical_name_key: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     short_name: Mapped[Optional[str]] = mapped_column(String(100))
     jurisdiction: Mapped[str] = mapped_column(String(50), default="Federal", server_default=text("'Federal'"), nullable=False)
     statute_type: Mapped[Optional[str]] = mapped_column(String(40), comment="act|ordinance|constitution|rules|regulations|order")

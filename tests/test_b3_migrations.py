@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from scraper.database import engine
 from scraper.models import Statute
@@ -23,8 +23,32 @@ async def test_migration_023_creates_lower_name_index(db):
                 )
             )
         ).first()
+        indexdef = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_statute_name_lower' LIMIT 1"
+                )
+            )
+        ).scalar()
         assert row is not None
+        assert indexdef is not None
+        assert "lower(" in indexdef.lower() and "name" in indexdef.lower()
         await mig.downgrade(conn)
+
+
+@pytest.mark.asyncio
+async def test_migration_024_backfills_canonical_name_key(db):
+    mig = importlib.import_module("migrations.024_statute_canonical_name_key")
+    from scraper.tasks.promotion import _normalized_statute_name_key
+
+    db.add(Statute(name="Court fees Act, 1870", jurisdiction="Federal", year_enacted=1870))
+    await db.commit()
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    row = (
+        await db.execute(select(Statute).where(Statute.name == "Court fees Act, 1870"))
+    ).scalars().one()
+    assert row.canonical_name_key == _normalized_statute_name_key("Court fees Act, 1870")
 
 
 @pytest.mark.asyncio

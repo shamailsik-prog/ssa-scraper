@@ -841,6 +841,14 @@ def _normalized_statute_name_key(name: str) -> str:
     return canonical.casefold()
 
 
+def _promotion_year_max() -> int:
+    return datetime.now(timezone.utc).year
+
+
+def _year_in_promotion_range(year: int) -> bool:
+    return 1800 <= year <= _promotion_year_max()
+
+
 def _parse_promotion_year_enacted(value: Any) -> Tuple[Optional[int], bool]:
     """Return (year, invalid). Missing year is (None, False); garbage values are (None, True)."""
     if value is None:
@@ -848,19 +856,25 @@ def _parse_promotion_year_enacted(value: Any) -> Tuple[Optional[int], bool]:
     if isinstance(value, bool):
         return None, True
     if isinstance(value, int):
-        return value, False
+        return (value, False) if _year_in_promotion_range(value) else (None, True)
     if isinstance(value, float):
         if value.is_integer():
-            return int(value), False
+            y = int(value)
+            return (y, False) if _year_in_promotion_range(y) else (None, True)
         return None, True
     if isinstance(value, str):
         s = value.strip()
         if not s:
             return None, False
-        if re.fullmatch(r"(19\d{2}|20\d{2})", s):
-            return int(s), False
+        if re.fullmatch(r"\d{4}", s):
+            y = int(s)
+            return (y, False) if _year_in_promotion_range(y) else (None, True)
         return None, True
     return None, True
+
+
+def _statute_canonical_name_key_for_name(name: str) -> str:
+    return _normalized_statute_name_key(name)
 
 
 async def _find_statute_by_exact_or_normalized_name(db: AsyncSession, canonical_name: str) -> Optional[Statute]:
@@ -870,7 +884,24 @@ async def _find_statute_by_exact_or_normalized_name(db: AsyncSession, canonical_
     key = _normalized_statute_name_key(canonical_name)
     if not key:
         return None
+    statute = (
+        await db.execute(select(Statute).where(Statute.canonical_name_key == key).limit(1))
+    ).scalars().first()
+    if statute is not None:
+        return statute
     return (await db.execute(select(Statute).where(func.lower(Statute.name) == key).limit(1))).scalars().first()
+
+
+async def _statute_other_lower_name_exists(db: AsyncSession, *, statute_id: UUID, name: str) -> bool:
+    lowered = name.strip().lower()
+    if not lowered:
+        return False
+    other = (
+        await db.execute(
+            select(Statute.id).where(func.lower(Statute.name) == lowered, Statute.id != statute_id).limit(1)
+        )
+    ).first()
+    return other is not None
 
 
 async def _statute_duplicate_lower_name_exists(db: AsyncSession, name: str) -> bool:
@@ -911,6 +942,7 @@ async def _resolve_statute_link(
     stype, year = _instrument_statute_shape(canonical_name)
     statute = Statute(
         name=canonical_name,
+        canonical_name_key=_statute_canonical_name_key_for_name(canonical_name),
         short_name=canonical_name[:100],
         jurisdiction=jurisdiction or "Federal",
         statute_type=stype,
@@ -2124,7 +2156,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         await _quarantine(db, st, "statute name or sections missing", "statute")
         return "quarantined"
     incoming_year, year_invalid = _parse_promotion_year_enacted(data.get("year_enacted"))
-    if year_invalid:
+    if settings.SSA_STATUTE_NAME_QUALITY and year_invalid:
         await _quarantine(
             db,
             st,
@@ -2155,10 +2187,22 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     created_new_statute = statute is None
     if not created_new_statute and statute is not None and incoming_year is not None:
         existing_year = statute.year_enacted
-        year_conflict = (
-            existing_year is not None and incoming_year != existing_year
-        ) or (existing_year is None)
-        if year_conflict:
+        if existing_year is None:
+            await _quarantine(
+                db,
+                st,
+                "statute_existing_year_null: existing row has no year_enacted; backfill before re-promote",
+                "statute",
+                {
+                    "reason_code": "statute_existing_year_null",
+                    "statute_name": name[:280],
+                    "existing_year_enacted": existing_year,
+                    "incoming_year_enacted": incoming_year,
+                    "review_route": "year_backfill",
+                },
+            )
+            return "quarantined"
+        if incoming_year != existing_year:
             await _quarantine(
                 db,
                 st,
@@ -2175,6 +2219,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     if created_new_statute:
         statute = Statute(
             name=name,
+            canonical_name_key=_statute_canonical_name_key_for_name(name),
             short_name=data.get("short_name"),
             jurisdiction=data.get("jurisdiction") or "Federal",
             statute_type=data.get("statute_type"),
@@ -2183,6 +2228,9 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             source_url=st.source_url,
         )
         db.add(statute)
+        await db.flush()
+    elif statute is not None and not statute.canonical_name_key:
+        statute.canonical_name_key = _statute_canonical_name_key_for_name(name)
         await db.flush()
     new_versions = 0
     order = 0
@@ -2241,7 +2289,8 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         return "quarantined"
     statute.needs_section_refetch = False
     statute.quality_flag_no_year = False
-    statute.quality_flag_duplicate_name = False
+    if not await _statute_other_lower_name_exists(db, statute_id=statute.id, name=name):
+        statute.quality_flag_duplicate_name = False
     await db.flush()
     if prov is not None:
         prov.promoted_table, prov.promoted_id = "statute", statute.id

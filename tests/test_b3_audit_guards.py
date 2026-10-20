@@ -14,7 +14,12 @@ from scraper.config import settings
 from scraper.database import engine
 from scraper.fetchers import FetchResult, PDF_MAGIC
 from scraper.models import QuarantineQueue, Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
-from scraper.tasks.promotion import _resolve_statute_link, promote_statute_staging
+from scraper.tasks.promotion import (
+    _find_statute_by_exact_or_normalized_name,
+    _normalized_statute_name_key,
+    _resolve_statute_link,
+    promote_statute_staging,
+)
 from scraper.tasks.public_pipeline import PublicPipeline
 from tests.test_b3_statute_promotion import _make_statute_staging
 
@@ -208,9 +213,10 @@ async def test_existing_null_year_incoming_year_quarantines_duplicate_name(db):
     )
     assert await promote_statute_staging(db, st) == "quarantined"
     details = await _quarantine_details(db, st)
-    assert details.get("reason_code") == "statute_duplicate_name"
+    assert details.get("reason_code") == "statute_existing_year_null"
     assert details.get("existing_year_enacted") is None
     assert details.get("incoming_year_enacted") == 2024
+    assert details.get("review_route") == "year_backfill"
 
 
 @pytest.mark.asyncio
@@ -274,6 +280,114 @@ async def test_successful_promote_clears_quality_flags(db):
     await db.refresh(statute)
     assert statute.quality_flag_no_year is False
     assert statute.quality_flag_duplicate_name is False
+
+
+@pytest.mark.asyncio
+async def test_promote_accepts_string_year_1860(db):
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Pakistan Penal Code, 1860",
+            "year_enacted": "1860",
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act is the Pakistan Penal Code, 1860.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "promoted"
+    row = (await db.execute(select(Statute).where(Statute.name == "Pakistan Penal Code, 1860"))).scalars().one()
+    assert row.year_enacted == 1860
+
+
+@pytest.mark.asyncio
+async def test_invalid_year_ignored_when_name_quality_off(db, monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "SSA_STATUTE_NAME_QUALITY", False)
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Legacy Bad Year Act",
+            "year_enacted": "not-a-year",
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act promotes without year quality gates.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "promoted"
+    row = (await db.execute(select(Statute).where(Statute.name == "Legacy Bad Year Act"))).scalars().one()
+    assert row.year_enacted is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_statute_via_canonical_name_key_column(db):
+    stored_title = "This Act may be called the Court fees Act 1870"
+    key = _normalized_statute_name_key("Court fees Act, 1870")
+    db.add(
+        Statute(
+            name=stored_title,
+            canonical_name_key=key,
+            jurisdiction="Federal",
+            year_enacted=1870,
+        )
+    )
+    await db.flush()
+    found = await _find_statute_by_exact_or_normalized_name(db, "Court fees Act, 1870")
+    assert found is not None
+    assert found.name == stored_title
+
+
+def test_find_statute_lookup_never_scans_full_table():
+    import inspect
+    from scraper.tasks import promotion as promotion_mod
+
+    src = inspect.getsource(promotion_mod._find_statute_by_exact_or_normalized_name)
+    assert "scalars().all()" not in src
+    assert "canonical_name_key" in src
+
+
+@pytest.mark.asyncio
+async def test_duplicate_quality_flag_not_cleared_when_other_lower_name_exists(db, monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "SSA_STATUTE_NAME_QUALITY", False)
+    primary = Statute(
+        name="Conditional Dup Act",
+        jurisdiction="Federal",
+        year_enacted=2020,
+        quality_flag_duplicate_name=True,
+    )
+    db.add(primary)
+    db.add(Statute(name="conditional dup act", jurisdiction="Federal", year_enacted=2021))
+    await db.flush()
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Conditional Dup Act",
+            "year_enacted": 2020,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act keeps duplicate flag when a case-variant row exists.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) in ("promoted", "duplicate")
+    await db.refresh(primary)
+    assert primary.quality_flag_duplicate_name is True
 
 
 @pytest.mark.asyncio

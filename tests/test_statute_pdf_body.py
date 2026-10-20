@@ -48,6 +48,16 @@ def test_choose_best_picks_second_pdf_when_both_qualify_and_second_is_longer():
     assert len(chosen) > len(first)
 
 
+def test_choose_best_keeps_html_when_pdf_below_min_chars_even_if_longer_than_tiny_listing():
+    html = "Acts listing chrome"
+    pdf = "1. Short title.- PDF extract.\n" + ("pdf section body " * 70)
+    assert len(pdf) > len(html)
+    assert len(pdf.strip()) < 1500
+    chosen, followed = choose_best_statute_body_from_pdfs(html, [pdf], flag_on=True)
+    assert followed is False
+    assert chosen == html
+
+
 def test_choose_best_keeps_html_when_pdf_is_long_raw_but_shorter_than_html():
     html = "1. Short title.- This Act may be called the Sample Act, 2024.\n" + ("html operative body " * 120)
     pdf = "1. Short title.- PDF extract.\n" + ("pdf body " * 200)

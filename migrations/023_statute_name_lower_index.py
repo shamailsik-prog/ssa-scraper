@@ -1,5 +1,8 @@
 """
 023 — Functional index on lower(statute.name) for mention resolution (B3). No data changes.
+
+Production: CREATE INDEX (non-concurrent) blocks writes on statute until the build completes.
+See docs/B2_IDENTITY_RECONCILE_DEPLOY.md for CONCURRENTLY guidance on large tables.
 """
 
 from __future__ import annotations
