@@ -40,6 +40,7 @@ JUDGMENT_LINK_HINT = re.compile(r"(?i)(judg|judgement|judgment|order|decision|ca
 STATUTE_LINK_HINT = re.compile(r"(?i)(act|ordinance|statute|law|code|rules|regulation|bill|gazette|notification|\.pdf$)")
 # A frontier row the worker has died on this many times (out of memory, killed, hard time limit) is retired.
 WORKER_DEATH_RETIRE_AFTER = 3
+STATUTE_PDF_FOLLOW_MAX = 5
 
 
 def _container_id() -> str:
@@ -332,7 +333,10 @@ class PublicPipeline:
                 from scraper.statute_pdf_body import choose_best_statute_body_from_pdfs
 
                 pdf_texts: list[str] = []
-                for pdf_url in self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)")):
+                pdf_links = self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)"))[
+                    :STATUTE_PDF_FOLLOW_MAX
+                ]
+                for pdf_url in pdf_links:
                     try:
                         pdf_res = await self.fetch(pdf_url)
                         if pdf_res.is_pdf:

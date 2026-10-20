@@ -167,6 +167,53 @@ async def test_same_name_different_year_quarantine_reason_code(db):
 
 
 @pytest.mark.asyncio
+async def test_non_numeric_year_quarantines_statute_no_year_without_raising(db):
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Bad Year Act",
+            "year_enacted": "not-a-year",
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act has a non-numeric year_enacted value.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "quarantined"
+    assert (await _quarantine_details(db, st)).get("reason_code") == "statute_no_year"
+
+
+@pytest.mark.asyncio
+async def test_existing_null_year_incoming_year_quarantines_duplicate_name(db):
+    db.add(Statute(name="Unset Year Act", jurisdiction="Federal", year_enacted=None))
+    await db.flush()
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Unset Year Act",
+            "year_enacted": 2024,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. Incoming row would attach a year to an existing name.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "quarantined"
+    details = await _quarantine_details(db, st)
+    assert details.get("reason_code") == "statute_duplicate_name"
+    assert details.get("existing_year_enacted") is None
+    assert details.get("incoming_year_enacted") == 2024
+
+
+@pytest.mark.asyncio
 async def test_successful_promote_clears_needs_section_refetch(db):
     statute = Statute(
         name="Refetch Clear Act, 2020",
@@ -194,6 +241,39 @@ async def test_successful_promote_clears_needs_section_refetch(db):
     assert await promote_statute_staging(db, st) in ("promoted", "duplicate")
     await db.refresh(statute)
     assert statute.needs_section_refetch is False
+
+
+@pytest.mark.asyncio
+async def test_successful_promote_clears_quality_flags(db):
+    statute = Statute(
+        name="Quality Flag Clear Act, 2021",
+        jurisdiction="Federal",
+        year_enacted=2021,
+        needs_section_refetch=True,
+        quality_flag_no_year=True,
+        quality_flag_duplicate_name=True,
+    )
+    db.add(statute)
+    await db.flush()
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Quality Flag Clear Act, 2021",
+            "year_enacted": 2021,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act clears migration quality flags on promote.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) in ("promoted", "duplicate")
+    await db.refresh(statute)
+    assert statute.quality_flag_no_year is False
+    assert statute.quality_flag_duplicate_name is False
 
 
 @pytest.mark.asyncio
@@ -411,3 +491,54 @@ async def test_ingest_statute_pdf_follow_picks_longest_pdf_and_clears_listing_on
     st = (await db.execute(select(StatutesStaging).order_by(StatutesStaging.created_at.desc()))).scalars().first()
     assert st is not None
     assert st.reconciled_json.get("field_evidence", {}).get("listing_only") is not True
+
+
+@pytest.mark.asyncio
+async def test_ingest_statute_pdf_follow_caps_fetches_at_five(db, source, monkeypatch):
+    links = "".join(f'<a href="/doc{i}.pdf">p{i}</a>' for i in range(8))
+    html = f"<html><body>{links}</body></html>"
+    res = FetchResult(
+        url="http://127.0.0.1/listing.html",
+        final_url="http://127.0.0.1/listing.html",
+        status_code=200,
+        content=html.encode("utf-8"),
+        content_type="text/html",
+    )
+    fetch_calls: list[str] = []
+
+    async def _fetch(url: str):
+        fetch_calls.append(url)
+        body = _fake_pdf_text(f"Act {url}", 40)
+        return FetchResult(url=url, final_url=url, status_code=200, content=body, content_type="application/pdf")
+
+    def _pdf_text_with_ocr(content: bytes):
+        if content.startswith(PDF_MAGIC):
+            return content.split(b"\n", 1)[-1].decode("utf-8"), False
+        return "", False
+
+    import scraper.tasks.public_pipeline as public_pipeline_mod
+
+    pipeline = PublicPipeline(db, source)
+    pipeline.fetch = _fetch
+    monkeypatch.setattr(public_pipeline_mod, "pdf_text_with_ocr", _pdf_text_with_ocr)
+    monkeypatch.setattr(settings, "SSA_STATUTE_PDF_FOLLOW", True)
+
+    async def _extract_statute(**_kwargs):
+        return _Outcome(
+            data={
+                "statute_name": "Cap Test Act, 2024",
+                "year_enacted": 2024,
+                "jurisdiction": "Federal",
+                "sections": [{"section_number": "1", "section_title": "t", "section_text": "1. Body"}],
+            }
+        )
+
+    monkeypatch.setattr(
+        pipeline,
+        "_extractor",
+        lambda *a, **k: SimpleNamespace(extract_statute=AsyncMock(side_effect=_extract_statute)),
+    )
+    assert await pipeline.ingest_statute(res, route={}) == "staged"
+    assert len(fetch_calls) == public_pipeline_mod.STATUTE_PDF_FOLLOW_MAX
+    assert len(fetch_calls) < 8
+    assert fetch_calls[-1].endswith("/doc4.pdf")
