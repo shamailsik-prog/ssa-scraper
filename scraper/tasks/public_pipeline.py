@@ -334,7 +334,7 @@ class PublicPipeline:
 
                 pdf_texts: list[str] = []
                 pdf_links = self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)"))[
-                    :STATUTE_PDF_FOLLOW_MAX
+                    :999
                 ]
                 for pdf_url in pdf_links:
                     try:
