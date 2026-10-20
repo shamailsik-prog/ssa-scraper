@@ -48,6 +48,32 @@ def test_order_sheet_title_none_without_role_markers():
     assert case_title_from_order_sheet(HEADNOTE_ONLY) is None
 
 
+APPELLANT_MULTILINE = """2020 CLC 10 [Lahore] Before J, J
+MUHAMMAD
+ALI KHAN---Appellant
+versus
+THE STATE---Respondent
+Criminal Appeal No. 1 of 2020, decided on 1st January, 2020."""
+
+EXPECTED_APPELLANT = "MUHAMMAD ALI KHAN versus THE STATE"
+
+PLAINTIFF_BLOCK = """2020 YLR 2 Before K, J
+Jane Doe---Plaintiff
+versus
+ACME CORP---Defendant
+Suit No. 1 of 2020, decided on 2nd February, 2020."""
+
+EXPECTED_PLAINTIFF = "Jane Doe versus ACME CORP"
+
+
+def test_order_sheet_title_appellant_multiline_exact():
+    assert case_title_from_order_sheet(APPELLANT_MULTILINE) == EXPECTED_APPELLANT
+
+
+def test_order_sheet_title_plaintiff_defendant_exact():
+    assert case_title_from_order_sheet(PLAINTIFF_BLOCK) == EXPECTED_PLAINTIFF
+
+
 def test_mutant_m11_strips_respondent_dots_suffix():
     text = """Before J, J
 Foo Bar---Petitioner

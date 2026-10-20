@@ -30,3 +30,12 @@ def test_pld_relabel_balochistan():
 
 def test_pld_relabel_islamabad():
     assert relabel_pld_citation("2022 PLD 66", _IHC) == "PLD 2022 Islamabad 66"
+
+
+_AJK_SC = "IN THE SUPREME COURT OF AZAD JAMMU AND KASHMIR\nBefore C, J\n" + "d" * 200
+
+
+def test_pld_relabel_ajk_supreme_court_not_pakistan_sc():
+    out = relabel_pld_citation("2024 PLD 50", _AJK_SC)
+    assert out == "PLD 2024 SC (AJ&K) 50"
+    assert "PLD 2024 SC 50" != out

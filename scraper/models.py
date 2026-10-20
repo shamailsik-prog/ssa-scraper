@@ -234,6 +234,11 @@ class Judgment(Base):
     quality_flag_urdu_headnote_mojibake: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
+    headnote_stripped_full_text: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Urdu headnote ???? stripped for display/spot-check; preserved full_text bytes stay in full_text",
+    )
     extraction_engine: Mapped[Optional[str]] = mapped_column(String(40), comment="deterministic|hybrid|scrapegraph_managed|scrapegraph_local")
     promoted_at: Mapped[datetime] = _created()
     created_at: Mapped[datetime] = _created()

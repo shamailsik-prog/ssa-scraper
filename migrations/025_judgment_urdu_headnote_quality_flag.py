@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 
 async def upgrade(conn) -> None:
+    await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
     await conn.execute(
         text(
             """
@@ -17,6 +18,7 @@ async def upgrade(conn) -> None:
 
 
 async def downgrade(conn) -> None:
+    await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
     await conn.execute(
         text(
             """

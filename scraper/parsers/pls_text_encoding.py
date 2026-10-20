@@ -1,13 +1,11 @@
-"""Detect Urdu mojibake (???? runs) and attempt conservative re-decode of raw bytes."""
+"""Detect Urdu mojibake (???? runs) in PakistanLawSite judgment text."""
 
 from __future__ import annotations
 
 import re
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional
 
 _MOJIBAKE_RUN = re.compile(r"\?{4,}")
-_CANDIDATE_ENCODINGS = ("utf-8", "cp1256", "windows-1256", "iso-8859-1")
-# Closing signature / announcement only — not a "Before X, J" bench caption.
 _SIGNATURE_LINE = re.compile(
     r"(?i)^\s*(?:\(sd/?-?\)|sd/?-?|announced\.?|pronounced\.?|j\.|judge\.|"
     r".{0,60}\b(?:chief\s+justice)\s*\.?)\s*$"
@@ -44,6 +42,10 @@ def _line_is_mojibake_or_urdu_only(line: str) -> bool:
     return False
 
 
+def _line_latin_plus_mojibake(line: str) -> bool:
+    return has_mojibake_run(line) and len(_LATIN_WORD.findall(line)) >= 3
+
+
 def _classify_without_signature(lines: list[str]) -> MojibakeKind:
     mojibake_idxs = [i for i, ln in enumerate(lines) if has_mojibake_run(ln)]
     if not mojibake_idxs:
@@ -65,35 +67,32 @@ def _classify_without_signature(lines: list[str]) -> MojibakeKind:
 
 
 def classify_mojibake(text: Optional[str]) -> MojibakeKind:
-    """Auditor 2026-10-18: 6,708 rows have ???? runs; in-sample they were only the Urdu headnote after the signature.
-
-    Re-fetch only when the English body is damaged. Headnote-only damage is strip/flag, not a new fetch.
-    Without a signature line, ???? is headnote-only when every damaged line sits in a trailing block that is
-    mostly question marks or Urdu; Latin text plus ???? elsewhere is body damage.
-    """
     if not has_mojibake_run(text):
         return "none"
     lines = (text or "").replace("\r\n", "\n").split("\n")
     sig = _signature_line_index(lines)
     if sig < 0:
         return _classify_without_signature(lines)
-    after = "\n".join(lines[sig + 1 :])
-    before = "\n".join(lines[: sig + 1])
-    if has_mojibake_run(before):
+    before = lines[: sig + 1]
+    after = lines[sig + 1 :]
+    if any(_line_latin_plus_mojibake(ln) for ln in before):
         return "body"
-    if has_mojibake_run(after):
+    if has_mojibake_run("\n".join(before)):
+        return "body"
+    for ln in after:
+        if _line_latin_plus_mojibake(ln):
+            return "body"
+    if any(has_mojibake_run(ln) for ln in after):
         return "headnote"
     return "body"
 
 
 def strip_mojibake_headnote_lines(text: Optional[str]) -> str:
-    """Drop post-signature lines that are ???? runs. Leaves the English body untouched."""
     if not text:
         return ""
     lines = text.replace("\r\n", "\n").split("\n")
     sig = _signature_line_index(lines)
     if sig < 0:
-        # No signature: strip trailing mojibake-only / Urdu-only lines only.
         cut = len(lines)
         while cut > 0 and _line_is_mojibake_or_urdu_only(lines[cut - 1]):
             cut -= 1
@@ -106,26 +105,3 @@ def strip_mojibake_headnote_lines(text: Optional[str]) -> str:
             continue
         kept.append(line)
     return "\n".join(kept).rstrip() + ("\n" if text.endswith("\n") else "")
-
-
-def try_redecode_text(raw: bytes) -> Tuple[Optional[str], str]:
-    """Return (best_text, encoding_used). Never raises."""
-    if not raw:
-        return None, "empty"
-    best: Optional[str] = None
-    best_score = -1
-    best_enc = "utf-8"
-    for enc in _CANDIDATE_ENCODINGS:
-        try:
-            decoded = raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-        score = decoded.count("؟") + decoded.count("ا")  # crude Urdu signal
-        penalty = len(_MOJIBAKE_RUN.findall(decoded)) * 10
-        score -= penalty
-        if score > best_score:
-            best_score, best, best_enc = score, decoded, enc
-    if best is None:
-        best = raw.decode("utf-8", errors="replace")
-        best_enc = "utf-8-replace"
-    return best, best_enc

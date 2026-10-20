@@ -66,6 +66,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     strip.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     strip.add_argument("--limit", type=int, default=None)
+    flag = sub.add_parser(
+        "backfill-flag-urdu-headnote-mojibake",
+        help="Set quality_flag_urdu_headnote_mojibake on PLS rows with headnote-only ???? (dry-run by default)",
+    )
+    flag.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    flag.add_argument("--limit", type=int, default=None)
     sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
     args = parser.parse_args(argv)
     if args.command == "reset-retired-frontier-no-reason":
@@ -109,6 +115,11 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_backfill import run_strip_urdu_headnote_mojibake
 
         print(run_async(run_strip_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "backfill-flag-urdu-headnote-mojibake":
+        from scraper.tasks.pls_backfill import run_backfill_flag_urdu_headnote_mojibake
+
+        print(run_async(run_backfill_flag_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "grid-report":
         import json

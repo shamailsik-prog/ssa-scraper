@@ -2,12 +2,7 @@ from scraper.config import settings
 from scraper.extractors.validation import reconcile_judgment
 from scraper.parsers.pld_citation_relabel import relabel_pld_citation
 from scraper.pls_quality_guards import apply_pls_quality_guards
-from scraper.parsers.pls_text_encoding import (
-    classify_mojibake,
-    has_mojibake_run,
-    strip_mojibake_headnote_lines,
-    try_redecode_text,
-)
+from scraper.parsers.pls_text_encoding import classify_mojibake, has_mojibake_run, strip_mojibake_headnote_lines
 
 
 def test_mojibake_detector():
@@ -43,12 +38,6 @@ def test_encoding_guard_quarantines(monkeypatch):
     )
     assert out.quarantine
     assert any("mojibake" in e for e in out.errors)
-
-
-def test_try_redecode_bytes():
-    raw = "test".encode("utf-8")
-    text, enc = try_redecode_text(raw)
-    assert text == "test" and enc == "utf-8"
 
 
 def test_hybrid_extractor_forwards_source_name_into_reconcile():
@@ -108,6 +97,22 @@ def test_mutant_m2_latin_then_mojibake_without_signature_is_body():
         "The applicant seeks bail in this matter.\n"
         "???? ???? damaged line\n"
     )
+    assert classify_mojibake(text) == "body"
+
+
+def test_classify_latin_words_and_mojibake_after_signature_is_body():
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "Announced.\n"
+        "J.\n"
+        "The applicant ???? seeks relief here.\n"
+    )
+    assert classify_mojibake(text) == "body"
+
+
+def test_classify_mojibake_before_signature_line_is_body():
+    text = "IN THE HIGH COURT OF SINDH\nThe ???? applicant seeks bail.\nAnnounced.\nJ.\n"
     assert classify_mojibake(text) == "body"
 
 

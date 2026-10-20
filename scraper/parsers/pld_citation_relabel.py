@@ -21,7 +21,13 @@ def _pld_token_from_header_court(header_court: str) -> Optional[str]:
         return None
     upper = label.upper()
     low = label.lower()
-    if "SUPREME COURT" in upper and not re.search(r"high\s+court\s+of", low):
+    if re.search(r"azad\s+jammu|jammu\s+and\s+kashmir", low):
+        if "supreme court" in low:
+            return "SC (AJ&K)"
+        return "Aj&K"
+    if "supreme court of pakistan" in low or (
+        "supreme court" in low and "azad" not in low and "jammu" not in low and "kashmir" not in low
+    ):
         return "SC"
     if "high court of sindh" in low or ("sindh" in low and "high court" in low):
         return "Sindh"
@@ -35,8 +41,6 @@ def _pld_token_from_header_court(header_court: str) -> Optional[str]:
         return "Lahore"
     if "karachi" in low and "high court" in low:
         return "Karachi"
-    if "SUPREME COURT OF PAKISTAN" in upper:
-        return "SC"
     return None
 
 
