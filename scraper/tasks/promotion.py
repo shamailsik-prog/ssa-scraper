@@ -836,6 +836,24 @@ def _parseable_statute_sections(sections: List[Dict[str, Any]]) -> List[Dict[str
     return out
 
 
+def _normalized_statute_name_key(name: str) -> str:
+    canonical = canonicalise_statute_name(name) or (name or "").strip()
+    return canonical.casefold()
+
+
+async def _find_statute_by_exact_or_normalized_name(db: AsyncSession, canonical_name: str) -> Optional[Statute]:
+    statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
+    if statute is not None:
+        return statute
+    key = _normalized_statute_name_key(canonical_name)
+    if not key:
+        return None
+    for row in (await db.execute(select(Statute))).scalars().all():
+        if _normalized_statute_name_key(row.name) == key:
+            return row
+    return None
+
+
 async def _statute_duplicate_lower_name_exists(db: AsyncSession, name: str) -> bool:
     lowered = name.strip().lower()
     if not lowered:
@@ -863,13 +881,14 @@ async def _resolve_statute_link(
     the 2026-10-18 auditor count (10,303 of 12,618 statutes have no sections). SSA_STATUTE_NO_MENTION_STUBS
     refuses to insert those stubs; the mention stays unresolved until a real act is promoted.
     """
-    statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
-    if statute is None:
-        statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
+    statute = await _find_statute_by_exact_or_normalized_name(db, canonical_name)
     if statute is not None:
         return statute
     if settings.SSA_STATUTE_NO_MENTION_STUBS:
         return None
+    statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
+    if statute is not None:
+        return statute
     stype, year = _instrument_statute_shape(canonical_name)
     statute = Statute(
         name=canonical_name,
@@ -2105,6 +2124,27 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         return "quarantined"
     statute = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
     created_new_statute = statute is None
+    incoming_year = data.get("year_enacted")
+    if (
+        not created_new_statute
+        and statute is not None
+        and incoming_year is not None
+        and statute.year_enacted is not None
+        and int(incoming_year) != int(statute.year_enacted)
+    ):
+        await _quarantine(
+            db,
+            st,
+            "statute_duplicate_name: same name with a different year_enacted",
+            "statute",
+            {
+                "reason_code": "statute_duplicate_name",
+                "statute_name": name[:280],
+                "existing_year_enacted": statute.year_enacted,
+                "incoming_year_enacted": incoming_year,
+            },
+        )
+        return "quarantined"
     if created_new_statute:
         statute = Statute(
             name=name,
@@ -2172,6 +2212,8 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             },
         )
         return "quarantined"
+    statute.needs_section_refetch = False
+    await db.flush()
     if prov is not None:
         prov.promoted_table, prov.promoted_id = "statute", statute.id
     st.status = "promoted" if new_versions else "duplicate"

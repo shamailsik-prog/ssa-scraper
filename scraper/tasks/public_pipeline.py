@@ -318,6 +318,7 @@ class PublicPipeline:
         for key in ("act_title", "detail_title", "act_no", "act_year", "detail_url", "source_section", "jurisdiction"):
             if not meta.get(key) and route.get(key):
                 meta[key] = route[key]
+        pdf_followed = bool(res.is_pdf)
         if res.is_pdf:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind="pdf", route=route, http_status=res.status_code, is_original_document=True, document_kind="original_pdf")
             text, _ = pdf_text_with_ocr(res.content)
@@ -326,10 +327,12 @@ class PublicPipeline:
             prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
             html = res.text
             text = clean_html(html)
+            pdf_followed = False
             if settings.SSA_STATUTE_PDF_FOLLOW and html:
-                from scraper.statute_pdf_body import prefer_pdf_statute_text
+                from scraper.statute_pdf_body import choose_best_statute_body_from_pdfs
 
-                for pdf_url in self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)"))[:1]:
+                pdf_texts: list[str] = []
+                for pdf_url in self.links_from_html(html, res.final_url, re.compile(r"(?i)\.pdf($|\?)")):
                     try:
                         pdf_res = await self.fetch(pdf_url)
                         if pdf_res.is_pdf:
@@ -345,11 +348,14 @@ class PublicPipeline:
                                 parent=prov,
                             )
                             pdf_text, _ = pdf_text_with_ocr(pdf_res.content)
-                            text = prefer_pdf_statute_text(text, pdf_text, flag_on=True)
+                            pdf_texts.append(pdf_text)
                     except ExplicitBlock:
                         raise
                     except Exception as exc:
                         logger.warning("%s: statute PDF follow failed %s: %s", self.source.source_name, pdf_url, exc)
+                text, pdf_followed = choose_best_statute_body_from_pdfs(text, pdf_texts, flag_on=True)
+            else:
+                pdf_followed = False
         staging = await stage_statute(
             self.db,
             source=self.source,
@@ -371,6 +377,14 @@ class PublicPipeline:
             outcome = await extractor.extract_instrument(html=html, text=text, source_meta=meta, content_hash=prov.content_hash)
         else:
             outcome = await extractor.extract_statute(html=html, text=text, source_meta=meta, content_hash=prov.content_hash)
+        if kind == "statute" and isinstance(outcome.data, dict):
+            payload = dict(outcome.data)
+            sections = payload.get("sections") or []
+            field_evidence = dict(payload.get("field_evidence") or {})
+            if not pdf_followed and not sections:
+                field_evidence["listing_only"] = True
+            payload["field_evidence"] = field_evidence
+            outcome.data = payload
         staging.deterministic_json = _slim(outcome.deterministic_json)
         staging.ai_json = _slim(outcome.ai_json)
         staging.reconciled_json = outcome.data if kind == "statute" else _slim(outcome.data)

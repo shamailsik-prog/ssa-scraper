@@ -7,7 +7,7 @@ PDF links; statute ingest did not.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 
 def prefer_pdf_statute_text(
@@ -24,3 +24,23 @@ def prefer_pdf_statute_text(
     if len(pdf) >= min_chars and len(pdf) > len(html):
         return pdf
     return html_text
+
+
+def choose_best_statute_body_from_pdfs(
+    html_text: str,
+    pdf_texts: List[str],
+    *,
+    flag_on: bool,
+    min_chars: int = 1500,
+) -> Tuple[str, bool]:
+    """Try each PDF body against the listing HTML; return the longest text that passes prefer_pdf."""
+    if not flag_on:
+        return html_text, False
+    best = html_text
+    followed = False
+    for raw_pdf in pdf_texts:
+        candidate = prefer_pdf_statute_text(html_text, raw_pdf, flag_on=True, min_chars=min_chars)
+        if candidate != html_text and len(candidate.strip()) > len(best.strip()):
+            best = candidate
+            followed = True
+    return best, followed
