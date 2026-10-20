@@ -220,10 +220,41 @@ async def backfill_order_sheet_titles(
 
 
 async def _build_pld_identity_index(db: AsyncSession, *, batch: int = 500) -> Dict[str, Set[UUID]]:
-    """Map PLD citation strings (canonical, primary, relabel targets) to judgment ids — one keyset pass."""
+    """Map citation strings to judgment ids: all sources' canonical + citation rows; PLS relabel targets only."""
+    from scraper.models import Citation as CitationModel
     from scraper.parsers.pld_citation_relabel import relabel_pld_citation
 
     index: Dict[str, Set[UUID]] = {}
+    last_id = None
+    while True:
+        q = (
+            select(Judgment.id, Judgment.canonical_citation)
+            .where(Judgment.canonical_citation.isnot(None))
+            .order_by(Judgment.id)
+            .limit(batch)
+        )
+        if last_id is not None:
+            q = q.where(Judgment.id > last_id)
+        rows = (await db.execute(q)).all()
+        if not rows:
+            break
+        for j_id, canon in rows:
+            last_id = j_id
+            index.setdefault(canon, set()).add(j_id)
+
+    last_cit_id = None
+    while True:
+        q = select(CitationModel.id, CitationModel.judgment_id, CitationModel.citation_string).order_by(CitationModel.id).limit(batch)
+        if last_cit_id is not None:
+            q = q.where(CitationModel.id > last_cit_id)
+        rows = (await db.execute(q)).all()
+        if not rows:
+            break
+        for cit_id, j_id, cit_str in rows:
+            last_cit_id = cit_id
+            if cit_str:
+                index.setdefault(cit_str, set()).add(j_id)
+
     last_id = None
     while True:
         q = (
@@ -247,7 +278,6 @@ async def _build_pld_identity_index(db: AsyncSession, *, batch: int = 500) -> Di
             for cand in (canon, cit_str):
                 if not cand:
                     continue
-                index.setdefault(cand, set()).add(j_id)
                 relabelled = relabel_pld_citation(cand, header)
                 if relabelled:
                     index.setdefault(relabelled, set()).add(j_id)
@@ -374,10 +404,6 @@ async def strip_urdu_headnote_mojibake(
                 continue
             raw = j.full_text or ""
             stripped = strip_mojibake_headnote_lines(raw)
-            if stripped == raw:
-                if not dry_run:
-                    j.quality_flag_urdu_headnote_mojibake = False
-                continue
             counts["stripped"] += 1
             if not dry_run:
                 j.headnote_stripped_full_text = stripped

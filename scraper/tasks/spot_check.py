@@ -62,7 +62,13 @@ def _similarity(a: str, b: str, limit: int = 4000) -> float:
 
 
 def judgment_spot_check_stored_text(j: Judgment) -> str:
-    """Text the corpus uses for PLS spot-check hash comparison (overlay or stripped headnote tail only)."""
+    """Text used for spot-check hash comparison.
+
+    PakistanLawSite: compares via ``headnote_stripped_full_text`` or ``strip_mojibake_headnote_lines`` on
+    ``full_text``. Post-signature Urdu headnote / mojibake-only tail lines are intentionally ignored so
+    cosmetic headnote churn on the live site does not surface as corpus drift. Latin-plus-mojibake body
+    damage and pre-signature text still affect the hash. Other sources compare raw ``full_text`` verbatim.
+    """
     from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
 
     if (j.source_name or "") == "PakistanLawSite":

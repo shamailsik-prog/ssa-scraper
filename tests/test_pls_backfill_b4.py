@@ -333,6 +333,67 @@ def test_pipeline_rejects_junk_citation_case_title(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pld_backfill_collides_with_non_pls_canonical_holder(db):
+    """R4 Q1: non-PLS row already owns relabel target — collision, no UniqueViolation (red on 6790129)."""
+    header = "IN THE LAHORE HIGH COURT, LAHORE\nBefore J\n" + "x" * 600
+    holder = Judgment(
+        canonical_citation="PLD 2026 Lahore 200",
+        full_text_hash="h1" * 32,
+        full_text=header,
+        source_name="PakistanCode",
+    )
+    pls = Judgment(
+        canonical_citation="2026 PLD 200",
+        full_text_hash="h2" * 32,
+        full_text=header,
+        source_name="PakistanLawSite",
+    )
+    db.add(holder)
+    db.add(pls)
+    await db.flush()
+    db.add(Citation(judgment_id=pls.id, citation_string="2026 PLD 200", raw_string="2026 PLD 200", is_primary=True))
+    await db.commit()
+    counts = await backfill_pld_citations(db, limit=10, dry_run=False)
+    assert counts["collisions"] == 1
+    assert counts["updated"] == 0
+    refreshed = (await db.execute(select(Judgment).where(Judgment.id == pls.id))).scalars().one()
+    assert refreshed.canonical_citation == "2026 PLD 200"
+
+
+@pytest.mark.asyncio
+async def test_pld_backfill_canonical_only_row_collides_with_expanded_target(db):
+    """R4 Q2: PLS row with canonical only collides via identity index (red on 6790129)."""
+    header = "IN THE LAHORE HIGH COURT, LAHORE\nBefore J\n" + "x" * 600
+    expanded = Judgment(
+        canonical_citation="PLD 2026 Lahore 300",
+        full_text_hash="e1" * 32,
+        full_text=header,
+        source_name="PakistanLawSite",
+    )
+    short_only = Judgment(
+        canonical_citation="2026 PLD 300",
+        full_text_hash="e2" * 32,
+        full_text=header,
+        source_name="PakistanLawSite",
+    )
+    db.add(expanded)
+    db.add(short_only)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=short_only.id,
+            citation_string="2026 PLD 300",
+            raw_string="2026 PLD 300",
+            is_primary=True,
+        )
+    )
+    await db.commit()
+    counts = await backfill_pld_citations(db, limit=10, dry_run=False)
+    assert counts["collisions"] >= 1
+    assert counts["updated"] == 0
+
+
+@pytest.mark.asyncio
 async def test_pld_backfill_duplicate_relabel_target_in_one_batch(db):
     """Two rows in one scan batch: short PLD on j1 collides with j2's expanded canonical."""
     header = "IN THE LAHORE HIGH COURT, LAHORE\nBefore J\n" + "x" * 600
@@ -375,6 +436,79 @@ async def test_backfill_flag_urdu_headnote_dry_run_writes_nothing(db):
     refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
     assert counts["flagged"] == 1
     assert refreshed.quality_flag_urdu_headnote_mojibake is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_backfill_flag_skips_row_with_headnote_overlay(db):
+    """R4 Q7: flag backfill skips when overlay already set."""
+    from tests.test_pls_quality_guards import HEADNOTE_ONLY
+
+    j = Judgment(
+        canonical_citation="PLS flag overlay",
+        full_text=HEADNOTE_ONLY,
+        full_text_hash=canonical_text_hash(HEADNOTE_ONLY),
+        source_name="PakistanLawSite",
+        quality_flag_urdu_headnote_mojibake=False,
+        headnote_stripped_full_text="overlay already written",
+    )
+    db.add(j)
+    await db.commit()
+    counts = await backfill_flag_urdu_headnote_mojibake(db, limit=5, dry_run=False)
+    assert counts["flagged"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strip_skips_row_with_headnote_overlay(db):
+    """R4 Q8: strip backfill skips when overlay already set."""
+    from tests.test_pls_quality_guards import HEADNOTE_ONLY
+
+    j = Judgment(
+        canonical_citation="PLS strip overlay",
+        full_text=HEADNOTE_ONLY,
+        full_text_hash=canonical_text_hash(HEADNOTE_ONLY),
+        source_name="PakistanLawSite",
+        quality_flag_urdu_headnote_mojibake=True,
+        headnote_stripped_full_text="existing overlay",
+    )
+    db.add(j)
+    await db.commit()
+    counts = await strip_urdu_headnote_mojibake(db, limit=5, dry_run=False)
+    assert counts["stripped"] == 0
+    refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
+    assert refreshed.headnote_stripped_full_text == "existing overlay"
+
+
+@pytest.mark.asyncio
+async def test_flag_strip_three_cycles_no_reflag(db):
+    """R4 Q9: three flag→strip cycles; cycles 2–3 flag zero (red on 6790129 when flag cleared on no-op)."""
+    cases = [
+        "IN THE LAHORE HIGH COURT\nOrder body.\nSd/-\n?????, ????.\n",
+        "IN THE LAHORE HIGH COURT\nOrder body.\nJ.\nRef ???? ab\n",
+        "IN THE LAHORE HIGH COURT\nOrder body.\nJ.\nPage 2 ????\n",
+    ]
+    for idx, text in enumerate(cases):
+        j = Judgment(
+            canonical_citation=f"PLS cycle {idx}",
+            full_text=text,
+            full_text_hash=canonical_text_hash(text),
+            source_name="PakistanLawSite",
+            quality_flag_urdu_headnote_mojibake=False,
+        )
+        db.add(j)
+        await db.commit()
+        for cycle in range(3):
+            flag_counts = await backfill_flag_urdu_headnote_mojibake(db, limit=5, dry_run=False)
+            strip_counts = await strip_urdu_headnote_mojibake(db, limit=5, dry_run=False)
+            if cycle == 0:
+                assert flag_counts["flagged"] == 1
+                assert strip_counts["stripped"] == 1
+            else:
+                assert flag_counts["flagged"] == 0
+                assert strip_counts["stripped"] == 0
+            refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
+            assert refreshed.headnote_stripped_full_text is not None
+            assert refreshed.quality_flag_urdu_headnote_mojibake is False
 
 
 @pytest.mark.asyncio

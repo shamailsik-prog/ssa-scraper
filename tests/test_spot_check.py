@@ -354,3 +354,30 @@ def test_non_pls_spot_check_compares_raw_full_text():
     assert judgment_spot_check_stored_text(j) == raw
     assert judgment_spot_check_live_text(raw, j.source_name) == raw
     assert judgment_spot_check_hashes_match(j, raw)
+
+
+def test_non_pls_spot_check_differs_when_only_mojibake_lines_change():
+    """R4 Q11: non-PLS compares raw text; ???? tail change must not match."""
+    raw = "Public source text.\nLine two.\n"
+    j = Judgment(
+        canonical_citation="Non-PLS mojibake drift",
+        source_name="PakistanCode",
+        full_text=raw,
+        full_text_hash=canonical_text_hash(raw),
+    )
+    live = raw + "???? ????\n"
+    assert judgment_spot_check_hashes_match(j, raw)
+    assert not judgment_spot_check_hashes_match(j, live)
+
+
+def test_pls_spot_check_ignores_post_signature_urdu_headnote_churn():
+    """R4 ruling: cosmetic Urdu/mojibake tail after signature still matches stored hash."""
+    stored = _PLS_PAGE_WITH_HEADNOTE
+    j = Judgment(
+        canonical_citation="PLS headnote churn",
+        source_name="PakistanLawSite",
+        full_text=stored,
+        full_text_hash=canonical_text_hash(stored),
+    )
+    live = _PLS_PAGE + "???? ???? ????\n???? ????????\n"
+    assert judgment_spot_check_hashes_match(j, live)

@@ -46,6 +46,20 @@ def _line_latin_plus_mojibake(line: str) -> bool:
     return has_mojibake_run(line) and len(_LATIN_WORD.findall(line)) >= 3
 
 
+def _line_is_strippable_headnote_tail(line: str) -> bool:
+    """Per-line rule shared by classify (headnote tail) and strip: drop mojibake unless Latin body damage."""
+    if _line_latin_plus_mojibake(line):
+        return False
+    if has_mojibake_run(line):
+        words = _LATIN_WORD.findall(line)
+        if any(len(w) >= 7 for w in words):
+            return False
+        if len(re.sub(r"[?\s]", "", line)) > 15:
+            return False
+        return True
+    return _line_is_mojibake_or_urdu_only(line)
+
+
 def _classify_without_signature(lines: list[str]) -> MojibakeKind:
     mojibake_idxs = [i for i, ln in enumerate(lines) if has_mojibake_run(ln)]
     if not mojibake_idxs:
@@ -61,7 +75,7 @@ def _classify_without_signature(lines: list[str]) -> MojibakeKind:
     tail = lines[last_english + 1 :]
     if not tail:
         return "body"
-    if all(_line_is_mojibake_or_urdu_only(ln) for ln in tail):
+    if all(_line_is_strippable_headnote_tail(ln) for ln in tail):
         return "headnote"
     return "body"
 
@@ -83,7 +97,10 @@ def classify_mojibake(text: Optional[str]) -> MojibakeKind:
         if _line_latin_plus_mojibake(ln):
             return "body"
     if any(has_mojibake_run(ln) for ln in after):
-        return "headnote"
+        non_empty = [ln for ln in after if ln.strip()]
+        if non_empty and all(_line_is_strippable_headnote_tail(ln) for ln in non_empty):
+            return "headnote"
+        return "body"
     return "body"
 
 
@@ -94,12 +111,12 @@ def strip_mojibake_headnote_lines(text: Optional[str]) -> str:
     sig = _signature_line_index(lines)
     if sig < 0:
         cut = len(lines)
-        while cut > 0 and _line_is_mojibake_or_urdu_only(lines[cut - 1]):
+        while cut > 0 and _line_is_strippable_headnote_tail(lines[cut - 1]):
             cut -= 1
         return "\n".join(lines[:cut]).rstrip() + ("\n" if text.endswith("\n") else "")
     kept = lines[: sig + 1]
     for line in lines[sig + 1 :]:
-        if _line_is_mojibake_or_urdu_only(line):
+        if _line_is_strippable_headnote_tail(line):
             continue
         kept.append(line)
     return "\n".join(kept).rstrip() + ("\n" if text.endswith("\n") else "")

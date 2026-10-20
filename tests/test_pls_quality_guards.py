@@ -117,6 +117,7 @@ def test_classify_mojibake_before_signature_line_is_body():
 
 
 def test_classify_all_mojibake_line_before_signature_is_body():
+    """R4 M2: all-???? line before signature is body damage (pls_text_encoding before-block guard)."""
     text = (
         "IN THE HIGH COURT OF SINDH\n"
         "???? ???? ????\n"
