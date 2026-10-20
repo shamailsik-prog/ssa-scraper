@@ -44,6 +44,25 @@ def _pld_token_from_header_court(header_court: str) -> Optional[str]:
     return None
 
 
+def _unambiguous_header_token(header_text: Optional[str]) -> Optional[str]:
+    """Require agreement across all explicit court captions in the inspected text.
+
+    Unknown captions and contradictory courts are not safe for automatic relabelling.
+    """
+    tokens = set()
+    for line in (header_text or "")[:8000].splitlines():
+        label = court_from_judgment_header(line)
+        if not label:
+            continue
+        token = _pld_token_from_header_court(label)
+        if not token:
+            return None
+        tokens.add(token)
+        if len(tokens) > 1:
+            return None
+    return next(iter(tokens)) if len(tokens) == 1 else None
+
+
 def relabel_pld_citation(citation: Optional[str], header_text: Optional[str]) -> Optional[str]:
     if not citation:
         return citation
@@ -53,10 +72,7 @@ def relabel_pld_citation(citation: Optional[str], header_text: Optional[str]) ->
         return citation
     year = m.group("year1") or m.group("year2")
     page = m.group("page1") or m.group("page2")
-    header_court = court_from_judgment_header(header_text)
-    if not header_court:
-        return citation
-    court = _pld_token_from_header_court(header_court)
+    court = _unambiguous_header_token(header_text)
     if not court:
         return citation
     return f"PLD {year} {court} {page}"
