@@ -547,6 +547,8 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             existing.has_original_pdf = st.pdf_provenance_id is not None
             existing.confidence_score = st.confidence_score or existing.confidence_score
             existing.extraction_engine = st.extraction_engine
+            if data.get("quality_flag_urdu_headnote_mojibake"):
+                existing.quality_flag_urdu_headnote_mojibake = True
             if prov is not None:
                 prov.promoted_table = "judgment"
                 prov.promoted_id = existing.id
@@ -641,6 +643,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         original_document_id=st.pdf_provenance_id,
         has_original_pdf=st.pdf_provenance_id is not None,
         confidence_score=st.confidence_score or 0.0,
+        quality_flag_urdu_headnote_mojibake=bool(data.get("quality_flag_urdu_headnote_mojibake")),
         extraction_engine=st.extraction_engine,
     )
     db.add(j)

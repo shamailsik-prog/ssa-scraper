@@ -1,15 +1,13 @@
 from scraper.config import settings
 from scraper.extractors.validation import reconcile_judgment
-
-HEADER = """1990 C L C 1205   [Peshawar]   Before J
-Mst. KAUSAR BIBI---Petitioner
-versus
-MUHAMMAD MUSHTAQ---Respondents
-Civil Revision No.329 of 1989, decided on 22nd November, 1989."""
+from tests.test_order_sheet_title import EXPECTED_HEADER_TITLE, HEADER
 
 
 def test_order_sheet_title_flag_overrides_deterministic_title(monkeypatch):
     monkeypatch.setattr(settings, "SSA_ORDER_SHEET_TITLE", True)
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    monkeypatch.setattr(settings, "SSA_PLD_CITATION_RELABEL", False)
+    monkeypatch.setattr(settings, "SSA_COURT_HEADER_GUARD", False)
     det = {
         "case_title": "1999 CLC 1 cited case versus other",
         "citations": ["1990 CLC 1205"],
@@ -26,4 +24,4 @@ def test_order_sheet_title_flag_overrides_deterministic_title(monkeypatch):
         min_confidence=0.5,
         source_name="PakistanLawSite",
     )
-    assert "KAUSAR BIBI" in (out.data.get("case_title") or "")
+    assert out.data.get("case_title") == EXPECTED_HEADER_TITLE

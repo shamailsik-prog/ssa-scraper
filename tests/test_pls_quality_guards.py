@@ -25,7 +25,7 @@ def test_encoding_guard_quarantines(monkeypatch):
     monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
     monkeypatch.setattr(settings, "SSA_PLD_CITATION_RELABEL", False)
     monkeypatch.setattr(settings, "SSA_COURT_HEADER_GUARD", False)
-    text = "Before X, J\n" + "x" * 600 + "\n????????"
+    text = "IN THE LAHORE HIGH COURT\nBefore X, J\n" + ("x" * 280) + " ???? " + ("y" * 280)
     det = {
         "citations": ["2020 CLC 1"],
         "court": "Lahore",
@@ -89,7 +89,35 @@ def test_encoding_guard_flags_headnote_without_refetch_error(monkeypatch):
     apply_pls_quality_guards(out, raw_text=HEADNOTE_ONLY, source_name="PakistanLawSite", errors=errors)
     assert errors == []
     assert out.get("encoding_flag") == "urdu_headnote_mojibake"
+    assert out.get("quality_flag_urdu_headnote_mojibake") is True
     assert "????" not in (out.get("encoding_headnote_stripped_preview") or "")
+
+
+def test_encoding_guard_apply_appends_body_mojibake_error(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", True)
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    text = "IN THE LAHORE HIGH COURT\nBefore X, J\n" + ("x" * 280) + " ???? " + ("y" * 280)
+    errors: list[str] = []
+    apply_pls_quality_guards({}, raw_text=text, source_name="PakistanLawSite", errors=errors)
+    assert any("mojibake" in e for e in errors)
+
+
+def test_mutant_m2_latin_then_mojibake_without_signature_is_body():
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The applicant seeks bail in this matter.\n"
+        "???? ???? damaged line\n"
+    )
+    assert classify_mojibake(text) == "body"
+
+
+def test_headnote_only_trailing_mojibake_without_signature():
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "???? ???? ???? سرخی\n"
+    )
+    assert classify_mojibake(text) == "headnote"
 
 
 def test_auditor_mojibake_baseline_is_6708():

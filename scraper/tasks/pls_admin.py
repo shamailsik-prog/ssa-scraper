@@ -58,8 +58,14 @@ def main(argv: list[str] | None = None) -> int:
     pld.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     pld.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
-    req.add_argument("--dry-run", action="store_true")
+    req.add_argument("--apply", action="store_true", help="Promote/write changes (default is dry-run)")
     req.add_argument("--limit", type=int, default=2000)
+    strip = sub.add_parser(
+        "strip-urdu-headnote-mojibake",
+        help="Strip flagged Urdu headnote ???? lines from preserved PLS text (dry-run by default)",
+    )
+    strip.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    strip.add_argument("--limit", type=int, default=None)
     sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
     args = parser.parse_args(argv)
     if args.command == "reset-retired-frontier-no-reason":
@@ -97,7 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
 
-        print(run_async(run_requalify(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_requalify(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "strip-urdu-headnote-mojibake":
+        from scraper.tasks.pls_backfill import run_strip_urdu_headnote_mojibake
+
+        print(run_async(run_strip_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "grid-report":
         import json

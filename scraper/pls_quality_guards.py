@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from scraper.config import settings
+from scraper.parsers.citation_extractor import normalise_citation
 from scraper.parsers.judgment_header_court import court_from_judgment_header
 from scraper.parsers.pld_citation_relabel import relabel_pld_citation
 from scraper.parsers.pls_text_encoding import classify_mojibake, strip_mojibake_headnote_lines
 
 SHORT_TEXT_MIN_CHARS = 500
+_REPORTED_CITATION = re.compile(
+    r"\b(PLD|SCMR|CLC|YLR|CLD|PLC|MLD|PCrLJ|PTD|GBLR)\b",
+    re.I,
+)
+
+
+def _primary_is_reported(citations: List[str]) -> bool:
+    if not citations:
+        return False
+    c = normalise_citation(citations[0]) or citations[0]
+    return bool(_REPORTED_CITATION.search(c))
 
 
 def apply_pls_quality_guards(
@@ -27,11 +40,12 @@ def apply_pls_quality_guards(
         if kind == "body":
             errors.append("preserved text contains mojibake (????) in the English body; re-fetch required")
         elif kind == "headnote":
-            # Flag only: full_text stays the preserved bytes (hash identity). A dry-run backfill strips later.
             out["encoding_flag"] = "urdu_headnote_mojibake"
+            out["quality_flag_urdu_headnote_mojibake"] = True
             out["encoding_headnote_stripped_preview"] = strip_mojibake_headnote_lines(raw_text)[-200:]
     if settings.SSA_SHORT_TEXT_GUARD and len((raw_text or "").strip()) < SHORT_TEXT_MIN_CHARS:
-        errors.append(f"judgment text shorter than {SHORT_TEXT_MIN_CHARS} characters")
+        if not _primary_is_reported(list(out.get("citations") or [])):
+            errors.append(f"judgment text shorter than {SHORT_TEXT_MIN_CHARS} characters")
     if settings.SSA_COURT_HEADER_GUARD:
         header_court = court_from_judgment_header(raw_text)
         stored = out.get("court")

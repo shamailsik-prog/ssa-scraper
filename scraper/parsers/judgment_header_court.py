@@ -6,7 +6,10 @@ import re
 from typing import Optional
 
 _HEADER_COURT = re.compile(
-    r"(?im)^\s*in\s+the\s+([A-Z][^\n]{5,120}?\bcourt\b[^\n]{0,40})",
+    r"(?im)^\s*in\s+the\s+("
+    r"high\s+court\s+of\s+[^\n,]+|"
+    r"[A-Z][^\n]{5,120}?\bcourt\b[^\n]{0,40}"
+    r")",
 )
 _SC_LABEL = re.compile(r"(?i)supreme\s+court\s+of\s+pakistan")
 _HC_LABEL = re.compile(r"(?i)high\s+court")

@@ -12,6 +12,8 @@ _SIGNATURE_LINE = re.compile(
     r"(?i)^\s*(?:\(sd/?-?\)|sd/?-?|announced\.?|pronounced\.?|j\.|judge\.|"
     r".{0,60}\b(?:chief\s+justice)\s*\.?)\s*$"
 )
+_LATIN_WORD = re.compile(r"[A-Za-z]{3,}")
+_URDU_CHAR = re.compile(r"[\u0600-\u06FF]")
 AUDITOR_2026_10_18_MOJIBAKE_ROWS = 6708
 
 MojibakeKind = Literal["none", "headnote", "body"]
@@ -31,17 +33,50 @@ def _signature_line_index(lines: list[str]) -> int:
     return last
 
 
+def _line_is_mojibake_or_urdu_only(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if has_mojibake_run(stripped):
+        return len(re.sub(r"[?\s]", "", stripped)) == 0 or bool(_URDU_CHAR.search(stripped))
+    if _URDU_CHAR.search(stripped) and not _LATIN_WORD.search(stripped):
+        return True
+    return False
+
+
+def _classify_without_signature(lines: list[str]) -> MojibakeKind:
+    mojibake_idxs = [i for i, ln in enumerate(lines) if has_mojibake_run(ln)]
+    if not mojibake_idxs:
+        return "none"
+    last_english = -1
+    for i, ln in enumerate(lines):
+        if has_mojibake_run(ln):
+            continue
+        if _LATIN_WORD.search(ln):
+            last_english = i
+    if any(i <= last_english for i in mojibake_idxs):
+        return "body"
+    tail = lines[last_english + 1 :]
+    if not tail:
+        return "body"
+    if all(_line_is_mojibake_or_urdu_only(ln) for ln in tail):
+        return "headnote"
+    return "body"
+
+
 def classify_mojibake(text: Optional[str]) -> MojibakeKind:
     """Auditor 2026-10-18: 6,708 rows have ???? runs; in-sample they were only the Urdu headnote after the signature.
 
     Re-fetch only when the English body is damaged. Headnote-only damage is strip/flag, not a new fetch.
+    Without a signature line, ???? is headnote-only when every damaged line sits in a trailing block that is
+    mostly question marks or Urdu; Latin text plus ???? elsewhere is body damage.
     """
     if not has_mojibake_run(text):
         return "none"
     lines = (text or "").replace("\r\n", "\n").split("\n")
     sig = _signature_line_index(lines)
     if sig < 0:
-        return "body"
+        return _classify_without_signature(lines)
     after = "\n".join(lines[sig + 1 :])
     before = "\n".join(lines[: sig + 1])
     if has_mojibake_run(before):
@@ -58,7 +93,11 @@ def strip_mojibake_headnote_lines(text: Optional[str]) -> str:
     lines = text.replace("\r\n", "\n").split("\n")
     sig = _signature_line_index(lines)
     if sig < 0:
-        return text
+        # No signature: strip trailing mojibake-only / Urdu-only lines only.
+        cut = len(lines)
+        while cut > 0 and _line_is_mojibake_or_urdu_only(lines[cut - 1]):
+            cut -= 1
+        return "\n".join(lines[:cut]).rstrip() + ("\n" if text.endswith("\n") else "")
     kept = lines[: sig + 1]
     for line in lines[sig + 1 :]:
         if has_mojibake_run(line) and len(re.sub(r"[?\s]", "", line)) == 0:

@@ -250,10 +250,10 @@ def reconcile_judgment(
     # case title must be supported by heading / result row
     title = out.get("case_title")
     if settings.SSA_ORDER_SHEET_TITLE and source_name == "PakistanLawSite":
-        from scraper.parsers.order_sheet_title import case_title_from_order_sheet
+        from scraper.parsers.order_sheet_title import case_title_from_order_sheet, is_valid_order_sheet_case_title
 
         order_title = case_title_from_order_sheet(raw_text)
-        if order_title:
+        if order_title and is_valid_order_sheet_case_title(order_title):
             title = order_title
     if ai and ai.get("case_title") and not title:
         cand = str(ai["case_title"])

@@ -65,7 +65,7 @@ def test_mutant_b4_config_order_sheet_title_default_on():
 def test_encoding_body_mojibake_quarantines_with_defaults_on(monkeypatch):
     monkeypatch.delenv("SSA_ENCODING_GUARD", raising=False)
     monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", True)
-    text = "Before X, J\n" + "x" * 600 + "\n????????"
+    text = "IN THE LAHORE HIGH COURT\nBefore X, J\n" + ("x" * 280) + " ???? " + ("y" * 280)
     det = {
         "citations": ["2020 CLC 1"],
         "court": "Lahore",
@@ -114,6 +114,7 @@ def test_headnote_classification_with_defaults_on(monkeypatch):
     apply_pls_quality_guards(out, raw_text=HEADNOTE_ONLY_TEXT, source_name="PakistanLawSite", errors=errors)
     assert errors == []
     assert out.get("encoding_flag") == "urdu_headnote_mojibake"
+    assert out.get("quality_flag_urdu_headnote_mojibake") is True
 
 
 def test_headnote_flag_off_skips_classification(monkeypatch):
@@ -147,9 +148,75 @@ def test_short_text_guard_with_defaults_on(monkeypatch):
     monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", True)
     short = "x" * (SHORT_TEXT_MIN_CHARS - 1)
     errors: list[str] = []
-    out: dict = {"citations": ["2020 CLC 1"]}
+    out: dict = {"citations": ["unreported docket only"]}
     apply_pls_quality_guards(out, raw_text=short, source_name="PakistanLawSite", errors=errors)
     assert any("shorter than" in e for e in errors)
+
+
+def test_short_text_guard_499_chars_errors(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", True)
+    short = "x" * 499
+    errors: list[str] = []
+    out: dict = {"citations": ["misc unreported"]}
+    apply_pls_quality_guards(out, raw_text=short, source_name="PakistanLawSite", errors=errors)
+    assert any("shorter than" in e for e in errors)
+
+
+def test_short_text_guard_500_chars_ok(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", True)
+    ok = "x" * 500
+    errors: list[str] = []
+    out: dict = {"citations": ["misc"]}
+    apply_pls_quality_guards(out, raw_text=ok, source_name="PakistanLawSite", errors=errors)
+    assert errors == []
+
+
+def test_short_text_guard_exempts_reported_citation_at_499(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", True)
+    short = "x" * 499
+    errors: list[str] = []
+    out: dict = {"citations": ["PLD 2020 SC 1"]}
+    apply_pls_quality_guards(out, raw_text=short, source_name="PakistanLawSite", errors=errors)
+    assert errors == []
+
+
+def test_mutant_m4_short_text_guard_disabled_branch(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    short = "x" * 10
+    errors: list[str] = []
+    out: dict = {"citations": []}
+    apply_pls_quality_guards(out, raw_text=short, source_name="PakistanLawSite", errors=errors)
+    assert errors == []
+
+
+def test_pls_quality_guards_skipped_for_non_pls_source(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", True)
+    errors: list[str] = []
+    apply_pls_quality_guards({}, raw_text="x" * 10, source_name="SupremeCourt", errors=errors)
+    assert errors == []
+
+
+def test_mutant_m10_order_sheet_not_applied_off_pls(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_ORDER_SHEET_TITLE", True)
+    from tests.test_order_sheet_title_validation import HEADER
+
+    det = {
+        "case_title": "headnote wrong versus line",
+        "citations": ["1990 CLC 1205"],
+        "court": "Peshawar",
+        "year": 1990,
+        "full_text_candidate": HEADER,
+        "judge_names": ["J"],
+    }
+    out = reconcile_judgment(
+        deterministic=det,
+        ai=None,
+        raw_text=HEADER,
+        court_directory={},
+        min_confidence=0.5,
+        source_name="SupremeCourt",
+    )
+    assert out.data.get("case_title") == "headnote wrong versus line"
 
 
 def test_short_text_guard_off_skips(monkeypatch):
