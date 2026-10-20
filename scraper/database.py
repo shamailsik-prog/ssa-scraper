@@ -176,6 +176,9 @@ async def run_migrations() -> List[str]:
         async with engine.begin() as conn:
             await module.upgrade(conn)
             await conn.execute(text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"), {"v": name})
+        post_commit = getattr(module, "upgrade_post_commit", None)
+        if post_commit is not None:
+            await post_commit()
         applied_now.append(name)
         logger.info("migration applied: %s", name)
     return applied_now

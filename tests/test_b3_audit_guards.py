@@ -14,10 +14,14 @@ from scraper.config import settings
 from scraper.database import engine
 from scraper.fetchers import FetchResult, PDF_MAGIC
 from scraper.models import QuarantineQueue, Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
+from sqlalchemy import event
+
+from scraper.database import engine
 from scraper.tasks.promotion import (
     _find_statute_by_exact_or_normalized_name,
     _normalized_statute_name_key,
     _resolve_statute_link,
+    _statute_canonical_name_key_for_name,
     promote_statute_staging,
 )
 from scraper.tasks.public_pipeline import PublicPipeline
@@ -302,6 +306,28 @@ async def test_promote_accepts_string_year_1860(db):
     assert await promote_statute_staging(db, st) == "promoted"
     row = (await db.execute(select(Statute).where(Statute.name == "Pakistan Penal Code, 1860"))).scalars().one()
     assert row.year_enacted == 1860
+    assert row.canonical_name_key == _statute_canonical_name_key_for_name("Pakistan Penal Code, 1860")
+
+
+@pytest.mark.asyncio
+async def test_year_2099_quarantines_statute_no_year(db):
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Future Year Act, 2099",
+            "year_enacted": 2099,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act has a year beyond the promotion ceiling.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "quarantined"
+    assert (await _quarantine_details(db, st)).get("reason_code") == "statute_no_year"
 
 
 @pytest.mark.asyncio
@@ -327,6 +353,53 @@ async def test_invalid_year_ignored_when_name_quality_off(db, monkeypatch):
     assert await promote_statute_staging(db, st) == "promoted"
     row = (await db.execute(select(Statute).where(Statute.name == "Legacy Bad Year Act"))).scalars().one()
     assert row.year_enacted is None
+    assert row.canonical_name_key == _statute_canonical_name_key_for_name("Legacy Bad Year Act")
+
+
+@pytest.mark.asyncio
+async def test_mention_stub_flag_off_sets_canonical_name_key(db, monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "SSA_STATUTE_NO_MENTION_STUBS", False)
+    created = await _resolve_statute_link(
+        db,
+        canonical_name="means the Stub Canonical Act",
+        source_name="Senate",
+        source_url=None,
+        jurisdiction="Federal",
+    )
+    assert created is not None
+    assert created.canonical_name_key == _statute_canonical_name_key_for_name("means the Stub Canonical Act")
+
+
+@pytest.mark.asyncio
+async def test_promote_backfills_canonical_name_key_when_existing_row_key_null(db):
+    statute = Statute(
+        name="Null Key Existing Act, 2022",
+        jurisdiction="Federal",
+        year_enacted=2022,
+        canonical_name_key=None,
+    )
+    db.add(statute)
+    await db.flush()
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Null Key Existing Act, 2022",
+            "year_enacted": 2022,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_title": "Short title",
+                    "section_text": "1. This Act backfills canonical_name_key on promote.",
+                }
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) in ("promoted", "duplicate")
+    await db.refresh(statute)
+    assert statute.canonical_name_key == _statute_canonical_name_key_for_name("Null Key Existing Act, 2022")
 
 
 @pytest.mark.asyncio
@@ -347,13 +420,34 @@ async def test_resolve_statute_via_canonical_name_key_column(db):
     assert found.name == stored_title
 
 
-def test_find_statute_lookup_never_scans_full_table():
-    import inspect
-    from scraper.tasks import promotion as promotion_mod
+@pytest.mark.asyncio
+async def test_find_statute_lookup_selects_on_statute_always_have_where(db):
+    stored_title = "This Act may be called the Court fees Act 1870"
+    key = _normalized_statute_name_key("Court fees Act, 1870")
+    db.add(
+        Statute(
+            name=stored_title,
+            canonical_name_key=key,
+            jurisdiction="Federal",
+            year_enacted=1870,
+        )
+    )
+    await db.flush()
+    violations: list[str] = []
 
-    src = inspect.getsource(promotion_mod._find_statute_by_exact_or_normalized_name)
-    assert "scalars().all()" not in src
-    assert "canonical_name_key" in src
+    def _before_cursor_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+        stmt = statement if isinstance(statement, str) else str(statement)
+        lowered = stmt.lower()
+        if lowered.lstrip().startswith("select") and " from statute" in lowered and " where " not in lowered:
+            violations.append(stmt)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        found = await _find_statute_by_exact_or_normalized_name(db, "Court fees Act, 1870")
+        assert found is not None
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _before_cursor_execute)
+    assert violations == []
 
 
 @pytest.mark.asyncio
