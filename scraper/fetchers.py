@@ -371,8 +371,9 @@ async def stage_statute(
         StatutesStaging.source_name == source.source_name,
         StatutesStaging.content_hash == prov.content_hash,
     )
-    if identity_key:
-        existing_q = existing_q.where(StatutesStaging.source_url == identity_key)
+    # Distinct statute listings may share identical PDF bytes; retain listing identity.
+    if stored_url:
+        existing_q = existing_q.where(StatutesStaging.source_url == stored_url)
     existing = (await db.execute(existing_q)).scalars().first()
     if existing is not None:
         return existing
