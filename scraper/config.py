@@ -348,25 +348,26 @@ class Settings(BaseSettings):
         default=1200,
         description="A search-harvest tick stops after this long (between rows or pages) and resumes from its cursor on the next tick, so one long query cannot hold the single login worker for an hour while case-ID walk ticks expire. 0 = no limit.",
     )
-    SSA_CLEAR_HARVEST_LOCKS_ON_START: bool = Field(
-        default=False,
-        description="When true, the login-session worker clears stale PakistanLawSite search-harvest slot/query Redis locks at boot (dead deploy/OOM). Off = legacy behaviour.",
-    )
-    SSA_HARVEST_LOCK_HEARTBEAT: bool = Field(
-        default=False,
-        description="When true, a search-harvest tick refreshes held harvest/query/slot SessionLocks during long runs so TTL expiry cannot stall harvest after a worker recycle.",
-    )
     SSA_ORDER_SHEET_TITLE: bool = Field(
-        default=False,
-        description="When true, PakistanLawSite case_title is taken from the order-sheet header (parse_case_metadata) instead of the first versus line in the text window.",
+        default=True,
+        description="Default on. PakistanLawSite case_title is taken from the order-sheet header instead of the first versus line in the text window. Set SSA_ORDER_SHEET_TITLE=0 or false to disable.",
     )
     SSA_ENCODING_GUARD: bool = Field(
-        default=False,
-        description="Classify ???? runs: quarantine only when the English body is damaged; flag Urdu headnote-only damage (auditor 2026-10-18: 6,708 rows, sample was headnote-only). Do not re-fetch blindly.",
+        default=True,
+        description="Default on. Classify ???? runs: quarantine when the English body is damaged; flag Urdu headnote-only damage (auditor 2026-10-18: 6,708 rows). Set SSA_ENCODING_GUARD=0 or false to disable.",
     )
-    SSA_COURT_HEADER_GUARD: bool = Field(default=False, description="Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header).")
-    SSA_PLD_CITATION_RELABEL: bool = Field(default=False, description="Relabel PLD citations missing a court token using the judgment header.")
-    SSA_SHORT_TEXT_GUARD: bool = Field(default=False, description="Quarantine PLS judgments shorter than 500 characters of preserved text.")
+    SSA_COURT_HEADER_GUARD: bool = Field(
+        default=True,
+        description="Default on. Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header). Set SSA_COURT_HEADER_GUARD=0 or false to disable.",
+    )
+    SSA_PLD_CITATION_RELABEL: bool = Field(
+        default=True,
+        description="Default on. Relabel PLD citations missing a court token using the judgment header. Set SSA_PLD_CITATION_RELABEL=0 or false to disable.",
+    )
+    SSA_SHORT_TEXT_GUARD: bool = Field(
+        default=True,
+        description="Default on. Quarantine PLS judgments shorter than 500 characters of preserved text. Set SSA_SHORT_TEXT_GUARD=0 or false to disable.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",

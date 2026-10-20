@@ -46,16 +46,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     remap.add_argument("--dry-run", action="store_true")
     meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
-    meta.add_argument("--dry-run", action="store_true")
+    meta.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     meta.add_argument("--limit", type=int, default=None)
     titles = sub.add_parser(
         "backfill-order-sheet-titles",
-        help="Rewrite PakistanLawSite case_title from order-sheet header parties (dry-run safe; not run in prod by default)",
+        help="Rewrite PakistanLawSite case_title from order-sheet header parties (dry-run by default)",
     )
-    titles.add_argument("--dry-run", action="store_true")
+    titles.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     titles.add_argument("--limit", type=int, default=None)
-    pld = sub.add_parser("backfill-pld-citations", help="Relabel primary PLD citations missing a court token (dry-run safe)")
-    pld.add_argument("--dry-run", action="store_true")
+    pld = sub.add_parser("backfill-pld-citations", help="Relabel primary PLD citations missing a court token (dry-run by default)")
+    pld.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     pld.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
     req.add_argument("--dry-run", action="store_true")
@@ -82,17 +82,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-metadata":
         from scraper.tasks.pls_backfill import run_backfill_metadata
 
-        print(run_async(run_backfill_metadata(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_backfill_metadata(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "backfill-order-sheet-titles":
         from scraper.tasks.pls_backfill import run_backfill_order_sheet_titles
 
-        print(run_async(run_backfill_order_sheet_titles(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_backfill_order_sheet_titles(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "backfill-pld-citations":
         from scraper.tasks.pls_backfill import run_backfill_pld_citations
 
-        print(run_async(run_backfill_pld_citations(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_backfill_pld_citations(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
