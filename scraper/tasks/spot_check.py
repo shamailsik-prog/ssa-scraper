@@ -61,6 +61,29 @@ def _similarity(a: str, b: str, limit: int = 4000) -> float:
     return round(difflib.SequenceMatcher(None, a[:limit], b[:limit]).ratio(), 3)
 
 
+def judgment_spot_check_stored_text(j: Judgment) -> str:
+    """Text the corpus uses for PLS spot-check hash comparison (overlay or stripped headnote tail only)."""
+    from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
+
+    if (j.source_name or "") == "PakistanLawSite":
+        return j.headnote_stripped_full_text or strip_mojibake_headnote_lines(j.full_text or "")
+    return j.full_text or ""
+
+
+def judgment_spot_check_live_text(text: str, source_name: Optional[str]) -> str:
+    from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
+
+    if (source_name or "") == "PakistanLawSite":
+        return strip_mojibake_headnote_lines(text)
+    return text
+
+
+def judgment_spot_check_hashes_match(j: Judgment, live_text: str) -> bool:
+    stored = judgment_spot_check_stored_text(j)
+    live = judgment_spot_check_live_text(live_text, j.source_name)
+    return canonical_text_hash(live) == canonical_text_hash(stored)
+
+
 def _record(db, *, kind: str, label: str, url: Optional[str], result: str, detail: str, similarity: Optional[float] = None, record_id=None) -> SpotCheck:
     row = SpotCheck(kind=kind, label=label[:300], source_url=(url or "")[:1000] or None, result=result, detail=detail[:1000], similarity=similarity, record_id=record_id)
     db.add(row)
@@ -140,13 +163,8 @@ async def _check_judgments_on_browser(db, pipeline, browser, slot, rows) -> List
         if modal_text:
             text = modal_text
         text = strip_leading_judgment_chrome(text)
-        from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
-
-        if (j.source_name or "") == "PakistanLawSite":
-            text = strip_mojibake_headnote_lines(text)
-            stored_body = j.headnote_stripped_full_text or strip_mojibake_headnote_lines(j.full_text or "")
-        else:
-            stored_body = j.full_text or ""
+        text = judgment_spot_check_live_text(text, j.source_name)
+        stored_body = judgment_spot_check_stored_text(j)
         live_hash = canonical_text_hash(text)
         stored_hash = canonical_text_hash(stored_body)
         citation_seen = _norm(j.canonical_citation).lower() in _norm(page.html).lower() or _norm(j.canonical_citation).lower() in _norm(text).lower()

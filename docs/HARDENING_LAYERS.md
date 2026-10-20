@@ -13,4 +13,6 @@ Judgment-content and PLS quality layers default to **on** (same policy as B3 sta
 
 **Backfill / maintenance CLIs** (`pls_admin backfill-metadata`, `backfill-order-sheet-titles`, `backfill-pld-citations`, `strip-urdu-headnote-mojibake`, `requalify-quarantine`): default is **dry-run** (no writes). Pass **`--apply`** to commit changes. Manual operator runs only; not part of deploy.
 
+**Migrations 025–026 (B4):** each upgrade/downgrade sets `SET LOCAL lock_timeout = '2s'`. If DDL hits `lock_timeout`, retry the migration after harvest drain (same pattern as `docs/B2_IDENTITY_RECONCILE_DEPLOY.md` §2).
+
 Auditors: confirm flags in staging (defaults on), run the cited tests, then run backfill CLIs without `--apply` before any production data pass.

@@ -24,7 +24,7 @@ def _pld_token_from_header_court(header_court: str) -> Optional[str]:
     if re.search(r"azad\s+jammu|jammu\s+and\s+kashmir", low):
         if "supreme court" in low:
             return "SC (AJ&K)"
-        return "Aj&K"
+        return "AJ&K"
     if "supreme court of pakistan" in low or (
         "supreme court" in low and "azad" not in low and "jammu" not in low and "kashmir" not in low
     ):

@@ -99,9 +99,7 @@ def strip_mojibake_headnote_lines(text: Optional[str]) -> str:
         return "\n".join(lines[:cut]).rstrip() + ("\n" if text.endswith("\n") else "")
     kept = lines[: sig + 1]
     for line in lines[sig + 1 :]:
-        if has_mojibake_run(line) and len(re.sub(r"[?\s]", "", line)) == 0:
-            continue
-        if has_mojibake_run(line):
+        if _line_is_mojibake_or_urdu_only(line):
             continue
         kept.append(line)
     return "\n".join(kept).rstrip() + ("\n" if text.endswith("\n") else "")

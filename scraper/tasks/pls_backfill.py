@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
+from uuid import UUID
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -218,34 +219,44 @@ async def backfill_order_sheet_titles(
     return counts
 
 
-async def _pld_relabel_collision(db: AsyncSession, judgment_id, new: str) -> bool:
-    """True when another PLS row already owns this PLD identity (canonical, citation, or relabelled short form)."""
+async def _build_pld_identity_index(db: AsyncSession, *, batch: int = 500) -> Dict[str, Set[UUID]]:
+    """Map PLD citation strings (canonical, primary, relabel targets) to judgment ids — one keyset pass."""
     from scraper.parsers.pld_citation_relabel import relabel_pld_citation
 
-    other_j = (
-        await db.execute(select(Judgment.id).where(Judgment.canonical_citation == new, Judgment.id != judgment_id).limit(1))
-    ).scalar()
-    if other_j:
-        return True
-    other_c = (
-        await db.execute(
-            select(Citation.judgment_id).where(Citation.citation_string == new, Citation.judgment_id != judgment_id).limit(1)
+    index: Dict[str, Set[UUID]] = {}
+    last_id = None
+    while True:
+        q = (
+            select(Judgment.id, Judgment.canonical_citation, func.left(Judgment.full_text, 4000), Citation.citation_string)
+            .outerjoin(
+                Citation,
+                (Citation.judgment_id == Judgment.id) & Citation.is_primary.is_(True),
+            )
+            .where(Judgment.source_name == SOURCE_NAME)
+            .order_by(Judgment.id)
+            .limit(batch)
         )
-    ).scalar()
-    if other_c:
-        return True
-    rows = (
-        await db.execute(
-            select(Judgment.id, Judgment.canonical_citation, Judgment.full_text, Citation.citation_string)
-            .join(Citation, Citation.judgment_id == Judgment.id)
-            .where(Judgment.id != judgment_id, Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True))
-        )
-    ).all()
-    for oid, canon, ft, cit_str in rows:
-        for cand in (canon, cit_str):
-            if cand and relabel_pld_citation(cand, ft) == new and cand != new:
-                return True
-    return False
+        if last_id is not None:
+            q = q.where(Judgment.id > last_id)
+        rows = (await db.execute(q)).all()
+        if not rows:
+            break
+        for j_id, canon, ft_head, cit_str in rows:
+            last_id = j_id
+            header = ft_head or ""
+            for cand in (canon, cit_str):
+                if not cand:
+                    continue
+                index.setdefault(cand, set()).add(j_id)
+                relabelled = relabel_pld_citation(cand, header)
+                if relabelled:
+                    index.setdefault(relabelled, set()).add(j_id)
+    return index
+
+
+def _pld_identity_collision(index: Dict[str, Set[UUID]], judgment_id: UUID, new: str) -> bool:
+    owners = index.get(new) or set()
+    return bool(owners - {judgment_id})
 
 
 async def backfill_pld_citations(
@@ -258,6 +269,7 @@ async def backfill_pld_citations(
     from scraper.parsers.pld_citation_relabel import relabel_pld_citation
 
     counts = {"scanned": 0, "updated": 0, "collisions": 0}
+    identity_index = await _build_pld_identity_index(db)
     last_id = None
     while True:
         q = (
@@ -278,7 +290,7 @@ async def backfill_pld_citations(
             new = relabel_pld_citation(cit.citation_string or j.canonical_citation, j.full_text)
             if not new or new == j.canonical_citation:
                 continue
-            if await _pld_relabel_collision(db, j.id, new):
+            if _pld_identity_collision(identity_index, j.id, new):
                 counts["collisions"] += 1
                 logger.warning("pld citation backfill collision: judgment %s -> %s", j.id, new)
                 continue
@@ -315,6 +327,8 @@ async def backfill_flag_urdu_headnote_mojibake(
         for j in rows:
             last_id = j.id
             counts["scanned"] += 1
+            if j.headnote_stripped_full_text is not None:
+                continue
             if j.quality_flag_urdu_headnote_mojibake:
                 continue
             if classify_mojibake(j.full_text or "") != "headnote":
@@ -356,9 +370,13 @@ async def strip_urdu_headnote_mojibake(
         for j in rows:
             last_id = j.id
             counts["scanned"] += 1
+            if j.headnote_stripped_full_text is not None:
+                continue
             raw = j.full_text or ""
             stripped = strip_mojibake_headnote_lines(raw)
             if stripped == raw:
+                if not dry_run:
+                    j.quality_flag_urdu_headnote_mojibake = False
                 continue
             counts["stripped"] += 1
             if not dry_run:

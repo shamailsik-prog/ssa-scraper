@@ -116,6 +116,43 @@ def test_classify_mojibake_before_signature_line_is_body():
     assert classify_mojibake(text) == "body"
 
 
+def test_classify_all_mojibake_line_before_signature_is_body():
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "???? ???? ????\n"
+        "The application is allowed.\n"
+        "J.\n"
+    )
+    assert classify_mojibake(text) == "body"
+
+
+def test_classify_mojibake_between_english_lines_without_signature_is_body():
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "???? ????\n"
+        "Further reasons follow here.\n"
+    )
+    assert classify_mojibake(text) == "body"
+
+
+def test_strip_keeps_latin_mojibake_line_after_signature():
+    from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
+
+    raw = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "J.\n"
+        "???? ????\n"
+        "The applicant ???? seeks relief here.\n"
+    )
+    stripped = strip_mojibake_headnote_lines(raw)
+    assert "The applicant ???? seeks relief here." in stripped
+    tail = stripped.split("J.\n", 1)[1]
+    assert "????" in tail
+    assert tail.strip().startswith("The applicant")
+
+
 def test_headnote_only_trailing_mojibake_without_signature():
     text = (
         "IN THE HIGH COURT OF SINDH\n"

@@ -52,9 +52,10 @@ async def test_order_sheet_title_backfill_dry_run_does_not_write(db, monkeypatch
 async def test_order_sheet_title_backfill_rejects_junk_citation_prefix(db, monkeypatch):
     monkeypatch.setattr(settings, "SSA_ORDER_SHEET_TITLE", True)
     junk = "1999 CLC 1 cited case versus other party"
+    monkeypatch.setattr(pls_backfill, "case_title_from_order_sheet", lambda _text: junk)
     j = Judgment(
         canonical_citation="PLS junk title",
-        case_title=junk,
+        case_title="Keep this title versus Other",
         full_text=TEXT,
         full_text_hash="b2" * 32,
         source_name="PakistanLawSite",
@@ -63,8 +64,9 @@ async def test_order_sheet_title_backfill_rejects_junk_citation_prefix(db, monke
     await db.commit()
     counts = await backfill_order_sheet_titles(db, limit=5, dry_run=False)
     refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
-    assert counts["updated"] == 1
-    assert refreshed.case_title == EXPECTED_HEADER_TITLE
+    assert counts["skipped_invalid"] >= 1
+    assert counts["updated"] == 0
+    assert refreshed.case_title == "Keep this title versus Other"
 
 
 @pytest.mark.asyncio
@@ -306,8 +308,13 @@ async def test_promotion_persists_urdu_headnote_quality_flag(db, login_source, m
 def test_pipeline_rejects_junk_citation_case_title(monkeypatch):
     monkeypatch.setattr(settings, "SSA_ORDER_SHEET_TITLE", True)
     monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    junk = "1999 CLC 1 cited versus other party"
+    monkeypatch.setattr(
+        "scraper.parsers.order_sheet_title.case_title_from_order_sheet",
+        lambda _text: junk,
+    )
     det = {
-        "case_title": "1999 CLC 1 cited versus other",
+        "case_title": "Keep deterministic title versus Other",
         "citations": ["1990 CLC 1205"],
         "court": "Peshawar",
         "year": 1990,
@@ -322,4 +329,72 @@ def test_pipeline_rejects_junk_citation_case_title(monkeypatch):
         min_confidence=0.5,
         source_name="PakistanLawSite",
     )
-    assert out.data.get("case_title") == EXPECTED_HEADER_TITLE
+    assert out.data.get("case_title") == "Keep deterministic title versus Other"
+
+
+@pytest.mark.asyncio
+async def test_pld_backfill_duplicate_relabel_target_in_one_batch(db):
+    """Two rows in one scan batch: short PLD on j1 collides with j2's expanded canonical."""
+    header = "IN THE LAHORE HIGH COURT, LAHORE\nBefore J\n" + "x" * 600
+    j1 = Judgment(
+        canonical_citation="2026 PLD 100",
+        full_text_hash="f1" * 32,
+        full_text=header,
+        source_name="PakistanLawSite",
+    )
+    j2 = Judgment(
+        canonical_citation="PLD 2026 Lahore 100",
+        full_text_hash="f2" * 32,
+        full_text=header,
+        source_name="PakistanLawSite",
+    )
+    db.add(j1)
+    db.add(j2)
+    await db.flush()
+    db.add(Citation(judgment_id=j1.id, citation_string="2026 PLD 100", raw_string="2026 PLD 100", is_primary=True))
+    await db.commit()
+    counts = await backfill_pld_citations(db, limit=10, dry_run=False)
+    assert counts["collisions"] >= 1
+    assert counts["updated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_urdu_headnote_dry_run_writes_nothing(db):
+    from tests.test_pls_quality_guards import HEADNOTE_ONLY
+
+    j = Judgment(
+        canonical_citation="PLS flag dry",
+        full_text=HEADNOTE_ONLY,
+        full_text_hash=canonical_text_hash(HEADNOTE_ONLY),
+        source_name="PakistanLawSite",
+        quality_flag_urdu_headnote_mojibake=False,
+    )
+    db.add(j)
+    await db.commit()
+    counts = await backfill_flag_urdu_headnote_mojibake(db, limit=5, dry_run=True)
+    refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
+    assert counts["flagged"] == 1
+    assert refreshed.quality_flag_urdu_headnote_mojibake is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_flag_skips_body_damaged_text(db):
+    body = (
+        "IN THE LAHORE HIGH COURT, LAHORE\nBefore J\n"
+        "The applicant seeks bail in this matter.\n"
+        "???? ???? damaged line\n"
+        + "y" * 600
+    )
+    j = Judgment(
+        canonical_citation="PLS flag body",
+        full_text=body,
+        full_text_hash=canonical_text_hash(body),
+        source_name="PakistanLawSite",
+        quality_flag_urdu_headnote_mojibake=False,
+    )
+    db.add(j)
+    await db.commit()
+    counts = await backfill_flag_urdu_headnote_mojibake(db, limit=5, dry_run=False)
+    refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()
+    assert counts["flagged"] == 0
+    assert refreshed.quality_flag_urdu_headnote_mojibake is False
