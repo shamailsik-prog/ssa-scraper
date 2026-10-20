@@ -67,6 +67,7 @@ from scraper.models import ScraperSource  # noqa: E402
 from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
+_DB_SETUP_LOCK = asyncio.Lock()
 
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
@@ -96,12 +97,13 @@ def _initialised_database():
 async def clean_db():
     """Truncate every table except schema_migrations, then re-seed. Dispose the pool so asyncpg
     connections never cross event loops."""
-    await engine.dispose(close=False)
-    tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
-        await _ensure_judgment_case_hash_includes_unreported(conn)
-    await seed_data()
+    async with _DB_SETUP_LOCK:
+        await engine.dispose(close=False)
+        tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
+        async with engine.begin() as conn:
+            await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
+            await _ensure_judgment_case_hash_includes_unreported(conn)
+        await seed_data()
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache
 
@@ -113,9 +115,10 @@ async def clean_db():
 
 
 @pytest_asyncio.fixture
-async def db():
+async def db(clean_db):
     async with SessionLocal() as session:
         yield session
+        await session.rollback()
 
 
 @pytest_asyncio.fixture
