@@ -20,8 +20,17 @@ Then apply, in order:
 2. `019_judgment_identity_reconcile`
 3. `020_judgment_case_hash_unreported_scope`
 4. `021_repair_case_hash_unreported_scope`
+5. `022_statute_section_refetch_flags` (B3 quality/refetch flags on `statute`; no row deletion)
+6. `023_statute_name_lower_index` (functional index on `lower(name)`)
+7. `024_statute_canonical_name_key` (indexed `canonical_name_key` + backfill)
 
 Use the project’s normal migration runner (`run_migrations` / deploy script). Never downgrade 019 while `judgment_identity_link` or `judgment_identity_review` contain rows.
+
+**B3 statute migrations (022–024):**
+
+- **022 downgrade** is blocked while any `statute` row still has `needs_section_refetch`, `quality_flag_no_year`, or `quality_flag_duplicate_name` set. Clear those flags (or complete refetch/review) before downgrade.
+- **023** uses `CREATE INDEX` on `lower(name)` inside the migration transaction. That takes a **ShareLock** on `statute` and can block concurrent inserts until the build finishes. For large production tables, prefer running the index build **outside** a long transaction with `CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_statute_name_lower ON statute (lower(name));` (then record `023` in `schema_migrations` manually if you bypass the runner).
+- **024** adds `canonical_name_key` in the migration transaction (`ALTER TABLE … ADD COLUMN` — brief **ACCESS EXCLUSIVE** lock only). The batched backfill (**only rows where the key is NULL**) and **`CREATE INDEX CONCURRENTLY`** for `ix_statute_canonical_name_key` run in **`upgrade_post_commit`** on an autocommit connection (one commit per batch). `run_migrations` records `024` in `schema_migrations` only after that hook succeeds; on every run it also rebuilds the index if `pg_index.indisvalid` is false. Plan capacity for ~90k+ statute rows during backfill/index build; do not run the old one-row-at-a-time backfill pattern on production.
 
 ## 3. Run reconcile (manual Celery task)
 

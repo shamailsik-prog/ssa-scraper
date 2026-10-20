@@ -113,7 +113,7 @@ async def link_exact_identity(
     reported_id: UUID,
     *,
     source: str = "reconcile",
-) -> JudgmentIdentityLink:
+) -> Tuple[JudgmentIdentityLink, bool]:
     unrep = (await db.execute(select(Judgment).where(Judgment.id == unreported_id))).scalars().one()
     rep = (await db.execute(select(Judgment).where(Judgment.id == reported_id))).scalars().one()
     if not unrep.unreported or rep.unreported:
@@ -136,7 +136,7 @@ async def link_exact_identity(
         )
     ).scalars().first()
     if exists is not None:
-        return exists
+        return exists, False
     row = JudgmentIdentityLink(
         unreported_judgment_id=unreported_id,
         reported_judgment_id=reported_id,
@@ -144,7 +144,7 @@ async def link_exact_identity(
     )
     db.add(row)
     await db.flush()
-    return row
+    return row, True
 
 
 async def flag_identity_review(
@@ -221,8 +221,9 @@ async def reconcile_judgment_identity_pairs(db: AsyncSession, *, limit: Optional
 
         if len(hash_matches) == 1:
             try:
-                await link_exact_identity(db, u.id, hash_matches[0].id, source="reconcile")
-                counts["linked"] += 1
+                _, created = await link_exact_identity(db, u.id, hash_matches[0].id, source="reconcile")
+                if created:
+                    counts["linked"] += 1
                 linked_reported_id = hash_matches[0].id
             except ValueError:
                 _, created = await flag_identity_review(

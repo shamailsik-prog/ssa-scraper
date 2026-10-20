@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1236,6 +1237,7 @@ async def test_pakistancode_statute_promotion_accepts_real_name_and_operative_te
     st.status = "extracted"
     st.reconciled_json = {
         "statute_name": "Pakistan Penal Code, 1860",
+        "year_enacted": 1860,
         "jurisdiction": "Federal",
         "statute_type": "act",
         "field_evidence": {"contents_check": "verified (contents): 1 of 1 sections, title matches the document"},
@@ -1561,6 +1563,15 @@ async def test_instrument_promotion_persists_and_links_mentions(db):
             select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
         )
     ).scalars().first()
+    db.add(
+        Statute(
+            name="Pakistan Penal Code, 1860",
+            jurisdiction="Federal",
+            year_enacted=1860,
+            source_name="PakistanCode",
+        )
+    )
+    await db.flush()
     text = """
     THE GAZETTE OF PAKISTAN EXTRAORDINARY
     ACT No. XXI of 2017
@@ -1646,6 +1657,16 @@ async def test_instrument_relation_graph_persists_verified_edges_with_provenance
             select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
         )
     ).scalars().first()
+    read_with_canonical = "The substituted provision shall be read with Pakistan Penal Code, 1860"
+    db.add(
+        Statute(
+            name=read_with_canonical,
+            jurisdiction="Federal",
+            year_enacted=1860,
+            source_name="PakistanCode",
+        )
+    )
+    await db.flush()
 
     async def _promote(text: str, url: str) -> Instrument:
         prov = await record_provenance(
@@ -1753,6 +1774,18 @@ async def test_instrument_section_relation_graph_extracts_amendment_operations(d
             select(ScraperSource).where(ScraperSource.source_name == "GazetteOfPakistan"),
         )
     ).scalars().first()
+    ppc = Statute(
+        name="Pakistan Penal Code, 1860",
+        jurisdiction="Federal",
+        year_enacted=1860,
+        source_name="PakistanCode",
+    )
+    db.add(ppc)
+    await db.flush()
+    for num in ("299", "302", "304", "299A", "500"):
+        sec = StatuteSection(statute_id=ppc.id, section_number=num, section_title=num)
+        db.add(sec)
+    await db.flush()
     text = """
     THE GAZETTE OF PAKISTAN EXTRAORDINARY
     ACT No. XXVIII of 2025
@@ -1885,6 +1918,7 @@ async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_va
     assert source is not None
 
     async def _promote_statute(*, statute_name: str, section_number: str, section_text: str, url: str) -> tuple[Statute, StatuteSection]:
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", statute_name)
         prov = await record_provenance(
             db,
             source=source,
@@ -1904,6 +1938,7 @@ async def test_nasirlaw_promotion_canonicalizes_hyphenated_sections_and_links_va
         staging.status = "extracted"
         staging.reconciled_json = {
             "statute_name": statute_name,
+            "year_enacted": int(year_match.group(1)) if year_match else None,
             "jurisdiction": "Federal",
             "statute_type": "act",
             "sections": [
@@ -2227,6 +2262,23 @@ async def test_instrument_section_relation_reconcile_backfills_late_article_and_
         )
     ).scalars().first()
     assert source is not None
+    db.add_all(
+        [
+            Statute(
+                name="Constitution of the Islamic Republic of Pakistan, 1973",
+                jurisdiction="Federal",
+                year_enacted=1973,
+                source_name="NasirLawSite",
+            ),
+            Statute(
+                name="Sample Compliance Rules, 2025",
+                jurisdiction="Federal",
+                year_enacted=2025,
+                source_name="NasirLawSite",
+            ),
+        ]
+    )
+    await db.flush()
 
     async def _promote_instrument(text: str, url: str, *, affected_statute: str | None = None) -> Instrument:
         prov = await record_provenance(
@@ -2323,9 +2375,11 @@ async def test_instrument_section_relation_reconcile_backfills_late_article_and_
             url=url,
             kind="statute",
         )
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", statute_name)
         staging.status = "extracted"
         staging.reconciled_json = {
             "statute_name": statute_name,
+            "year_enacted": int(year_match.group(1)) if year_match else None,
             "jurisdiction": "Federal",
             "statute_type": "act",
             "sections": [

@@ -164,8 +164,62 @@ def discover_migrations() -> List[str]:
     return names
 
 
+async def ensure_statute_canonical_name_key_index_valid() -> None:
+    """Rebuild ix_statute_canonical_name_key when missing or INVALID; no-op if column absent."""
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        has_col = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'statute'
+                      AND column_name = 'canonical_name_key'
+                    LIMIT 1
+                    """
+                )
+            )
+        ).first()
+        if not has_col:
+            return
+        row = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT i.indisvalid
+                    FROM pg_class c
+                    JOIN pg_index i ON i.indexrelid = c.oid
+                    JOIN pg_class t ON t.oid = i.indrelid
+                    WHERE c.relname = 'ix_statute_canonical_name_key'
+                      AND t.relname = 'statute'
+                    LIMIT 1
+                    """
+                )
+            )
+        ).first()
+        if row is not None and not row.indisvalid:
+            await conn.execute(text("DROP INDEX CONCURRENTLY IF EXISTS ix_statute_canonical_name_key"))
+            await conn.execute(
+                text(
+                    "CREATE INDEX CONCURRENTLY ix_statute_canonical_name_key ON statute (canonical_name_key)"
+                )
+            )
+            return
+        if row is None:
+            await conn.execute(
+                text(
+                    """
+                    CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_statute_canonical_name_key
+                        ON statute (canonical_name_key)
+                    """
+                )
+            )
+
+
 async def run_migrations() -> List[str]:
     """Apply every migrations/NNN_*.py whose version is not yet recorded. Returns the list applied."""
+    await ensure_statute_canonical_name_key_index_valid()
     applied_now: List[str] = []
     async with engine.begin() as conn:
         done = await _applied_versions(conn)
@@ -173,9 +227,23 @@ async def run_migrations() -> List[str]:
         if name in done:
             continue
         module = importlib.import_module(f"migrations.{name}")
-        async with engine.begin() as conn:
-            await module.upgrade(conn)
-            await conn.execute(text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"), {"v": name})
+        post_commit = getattr(module, "upgrade_post_commit", None)
+        if post_commit is not None:
+            async with engine.begin() as conn:
+                await module.upgrade(conn)
+            await post_commit()
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
+                    {"v": name},
+                )
+        else:
+            async with engine.begin() as conn:
+                await module.upgrade(conn)
+                await conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
+                    {"v": name},
+                )
         applied_now.append(name)
         logger.info("migration applied: %s", name)
     return applied_now

@@ -63,7 +63,12 @@ from scraper.parsers.citation_extractor import (
     extract_citations,
     normalise_citation,
 )
-from scraper.parsers.statute_parser import is_short_title_clause, looks_like_fragment_name
+from scraper.parsers.statute_parser import (
+    is_short_title_clause,
+    looks_like_clause_fragment,
+    looks_like_fragment_name,
+    looks_like_garbage_name,
+)
 from scraper.unreported import SOURCE_COURT_CODE, find_case_number, proceeding_type, unreported_identity
 
 logger = logging.getLogger(__name__)
@@ -821,6 +826,97 @@ def _instrument_statute_shape(name: str) -> tuple[Optional[str], Optional[int]]:
     return stype, year
 
 
+def _parseable_statute_sections(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in sections or []:
+        num = _norm_section(s.get("section_number"))
+        txt = (s.get("section_text") or "").strip()
+        if num and txt:
+            out.append(s)
+    return out
+
+
+def _normalized_statute_name_key(name: str) -> str:
+    canonical = canonicalise_statute_name(name) or (name or "").strip()
+    return canonical.casefold()
+
+
+def _promotion_year_max() -> int:
+    return datetime.now(timezone.utc).year
+
+
+def _year_in_promotion_range(year: int) -> bool:
+    return 1800 <= year <= _promotion_year_max()
+
+
+def _parse_promotion_year_enacted(value: Any) -> Tuple[Optional[int], bool]:
+    """Return (year, invalid). Missing year is (None, False); garbage values are (None, True)."""
+    if value is None:
+        return None, False
+    if isinstance(value, bool):
+        return None, True
+    if isinstance(value, int):
+        return (value, False) if _year_in_promotion_range(value) else (None, True)
+    if isinstance(value, float):
+        if value.is_integer():
+            y = int(value)
+            return (y, False) if _year_in_promotion_range(y) else (None, True)
+        return None, True
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None, False
+        if re.fullmatch(r"\d{4}", s):
+            y = int(s)
+            return (y, False) if _year_in_promotion_range(y) else (None, True)
+        return None, True
+    return None, True
+
+
+def _statute_canonical_name_key_for_name(name: str) -> str:
+    return _normalized_statute_name_key(name)
+
+
+async def _find_statute_by_exact_or_normalized_name(db: AsyncSession, canonical_name: str) -> Optional[Statute]:
+    statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
+    if statute is not None:
+        return statute
+    key = _normalized_statute_name_key(canonical_name)
+    if not key:
+        return None
+    statute = (
+        await db.execute(select(Statute).where(Statute.canonical_name_key == key).limit(1))
+    ).scalars().first()
+    if statute is not None:
+        return statute
+    return (await db.execute(select(Statute).where(func.lower(Statute.name) == key).limit(1))).scalars().first()
+
+
+async def _statute_other_lower_name_exists(db: AsyncSession, *, statute_id: UUID, name: str) -> bool:
+    lowered = name.strip().lower()
+    if not lowered:
+        return False
+    other = (
+        await db.execute(
+            select(Statute.id).where(func.lower(Statute.name) == lowered, Statute.id != statute_id).limit(1)
+        )
+    ).first()
+    return other is not None
+
+
+async def _statute_duplicate_lower_name_exists(db: AsyncSession, name: str) -> bool:
+    lowered = name.strip().lower()
+    if not lowered:
+        return False
+    exact = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
+    if exact is not None:
+        return False
+    other = (
+        await db.execute(select(Statute.id).where(func.lower(Statute.name) == lowered).limit(1))
+    ).first()
+    return other is not None
+
+
 async def _resolve_statute_link(
     db: AsyncSession,
     *,
@@ -828,23 +924,34 @@ async def _resolve_statute_link(
     source_name: Optional[str],
     source_url: Optional[str],
     jurisdiction: Optional[str],
-) -> Statute:
-    statute = (await db.execute(select(Statute).where(Statute.name == canonical_name))).scalars().first()
-    if statute is None:
-        statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
-    if statute is None:
-        stype, year = _instrument_statute_shape(canonical_name)
-        statute = Statute(
-            name=canonical_name,
-            short_name=canonical_name[:100],
-            jurisdiction=jurisdiction or "Federal",
-            statute_type=stype,
-            year_enacted=year,
-            source_name=source_name,
-            source_url=source_url,
-        )
-        db.add(statute)
-        await db.flush()
+) -> Optional[Statute]:
+    """Resolve an instrument mention onto an existing statute row.
+
+    Historic behaviour created a sectionless stub when nothing matched. That is the root cause of
+    the 2026-10-18 auditor count (10,303 of 12,618 statutes have no sections). SSA_STATUTE_NO_MENTION_STUBS
+    refuses to insert those stubs; the mention stays unresolved until a real act is promoted.
+    """
+    statute = await _find_statute_by_exact_or_normalized_name(db, canonical_name)
+    if statute is not None:
+        return statute
+    if settings.SSA_STATUTE_NO_MENTION_STUBS:
+        return None
+    statute = (await db.execute(select(Statute).where(Statute.name.ilike(f"%{canonical_name[:80]}%")))).scalars().first()
+    if statute is not None:
+        return statute
+    stype, year = _instrument_statute_shape(canonical_name)
+    statute = Statute(
+        name=canonical_name,
+        canonical_name_key=_statute_canonical_name_key_for_name(canonical_name),
+        short_name=canonical_name[:100],
+        jurisdiction=jurisdiction or "Federal",
+        statute_type=stype,
+        year_enacted=year,
+        source_name=source_name,
+        source_url=source_url,
+    )
+    db.add(statute)
+    await db.flush()
     return statute
 
 
@@ -1878,6 +1985,9 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             )
             row = dict(mention)
             row["canonical_statute_name"] = canonical
+            if linked is None:
+                linked_statute_mentions.append(row)
+                continue
             row["linked_statute_id"] = str(linked.id)
             linked_statute_mentions.append(row)
             section_number = _normalized_section_identifier(row.get("section_number"))
@@ -1916,6 +2026,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     # statute
     name = (data.get("statute_name") or "").strip()
     sections = data.get("sections") or []
+    parseable_sections = _parseable_statute_sections(sections)
     evidence = data.get("field_evidence") or {}
     if st.source_name == "PakistanCode":
         # Every PakistanCode statute is read against its own table of contents (statute_contents.py);
@@ -1989,18 +2100,141 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
-    if not name or name == "Unknown Statute" or not sections:
+    if (
+        settings.SSA_STATUTE_NAME_QUALITY
+        and st.source_name != "PakistanCode"
+        and name
+        and (
+            looks_like_clause_fragment(name)
+            or looks_like_fragment_name(name)
+            or looks_like_garbage_name(name)
+        )
+    ):
+        await _quarantine(
+            db,
+            st,
+            "statute_name_quality: fragment, clause, or garbage name",
+            "statute",
+            {"reason_code": "statute_name_quality", "statute_name": name[:280]},
+        )
+        return "quarantined"
+    if evidence.get("listing_only"):
+        existing = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first() if name else None
+        if existing is not None:
+            existing.needs_section_refetch = True
+            await db.flush()
+        await _quarantine(
+            db,
+            st,
+            "listing_only_statute: listing page saved without PDF/section parse",
+            "statute",
+            {"reason_code": "listing_only_statute", "statute_name": name[:280]},
+        )
+        return "quarantined"
+    if not name or name == "Unknown Statute":
         await _quarantine(db, st, "statute name or sections missing", "statute")
+        return "quarantined"
+    if not parseable_sections:
+        if name and name != "Unknown Statute":
+            existing = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
+            if existing is not None:
+                existing.needs_section_refetch = True
+                await db.flush()
+        if sections:
+            await _quarantine(
+                db,
+                st,
+                "empty_statute_sections: no parseable section bodies",
+                "statute",
+                {
+                    "reason_code": "empty_statute_sections",
+                    "statute_name": name[:280],
+                    "validation_errors": st.validation_errors,
+                },
+            )
+            return "quarantined"
+        await _quarantine(db, st, "statute name or sections missing", "statute")
+        return "quarantined"
+    incoming_year, year_invalid = _parse_promotion_year_enacted(data.get("year_enacted"))
+    if settings.SSA_STATUTE_NAME_QUALITY and year_invalid:
+        await _quarantine(
+            db,
+            st,
+            "statute_no_year: year_enacted is required before promotion",
+            "statute",
+            {"reason_code": "statute_no_year", "statute_name": name[:280]},
+        )
+        return "quarantined"
+    if settings.SSA_STATUTE_NAME_QUALITY and incoming_year is None:
+        await _quarantine(
+            db,
+            st,
+            "statute_no_year: year_enacted is required before promotion",
+            "statute",
+            {"reason_code": "statute_no_year", "statute_name": name[:280]},
+        )
+        return "quarantined"
+    if settings.SSA_STATUTE_NAME_QUALITY and await _statute_duplicate_lower_name_exists(db, name):
+        await _quarantine(
+            db,
+            st,
+            "statute_duplicate_name: another statute already uses this name",
+            "statute",
+            {"reason_code": "statute_duplicate_name", "statute_name": name[:280]},
+        )
         return "quarantined"
     statute = (await db.execute(select(Statute).where(Statute.name == name))).scalars().first()
     created_new_statute = statute is None
+    if not created_new_statute and statute is not None and incoming_year is not None:
+        existing_year = statute.year_enacted
+        if existing_year is None:
+            await _quarantine(
+                db,
+                st,
+                "statute_existing_year_null: existing row has no year_enacted; backfill before re-promote",
+                "statute",
+                {
+                    "reason_code": "statute_existing_year_null",
+                    "statute_name": name[:280],
+                    "existing_year_enacted": existing_year,
+                    "incoming_year_enacted": incoming_year,
+                    "review_route": "year_backfill",
+                },
+            )
+            return "quarantined"
+        if incoming_year != existing_year:
+            await _quarantine(
+                db,
+                st,
+                "statute_duplicate_name: same name with a different year_enacted",
+                "statute",
+                {
+                    "reason_code": "statute_duplicate_name",
+                    "statute_name": name[:280],
+                    "existing_year_enacted": existing_year,
+                    "incoming_year_enacted": incoming_year,
+                },
+            )
+            return "quarantined"
     if created_new_statute:
-        statute = Statute(name=name, short_name=data.get("short_name"), jurisdiction=data.get("jurisdiction") or "Federal", statute_type=data.get("statute_type"), year_enacted=data.get("year_enacted"), source_name=st.source_name, source_url=st.source_url)
+        statute = Statute(
+            name=name,
+            canonical_name_key=_statute_canonical_name_key_for_name(name),
+            short_name=data.get("short_name"),
+            jurisdiction=data.get("jurisdiction") or "Federal",
+            statute_type=data.get("statute_type"),
+            year_enacted=incoming_year,
+            source_name=st.source_name,
+            source_url=st.source_url,
+        )
         db.add(statute)
+        await db.flush()
+    elif statute is not None and not statute.canonical_name_key:
+        statute.canonical_name_key = _statute_canonical_name_key_for_name(name)
         await db.flush()
     new_versions = 0
     order = 0
-    for s in sections:
+    for s in parseable_sections:
         num = _norm_section(s.get("section_number"))
         txt = (s.get("section_text") or "").strip()
         if not num or not txt:
@@ -2038,25 +2272,26 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                     prev.effective_to = ver.effective_from
         sec.current_version_id = ver.id
     if order == 0:
-        if created_new_statute:
-            await db.delete(statute)
+        if not created_new_statute:
+            statute.needs_section_refetch = True
             await db.flush()
-            await _quarantine(
-                db,
-                st,
-                "empty_statute_sections: no parseable section bodies",
-                "statute",
-                {
-                    "reason_code": "empty_statute_sections",
-                    "statute_name": name[:280],
-                    "validation_errors": st.validation_errors,
-                },
-            )
-            return "quarantined"
-        st.status = "duplicate"
-        st.promoted_to_id = statute.id
-        await db.flush()
-        return "duplicate"
+        await _quarantine(
+            db,
+            st,
+            "empty_statute_sections: no parseable section bodies",
+            "statute",
+            {
+                "reason_code": "empty_statute_sections",
+                "statute_name": name[:280],
+                "validation_errors": st.validation_errors,
+            },
+        )
+        return "quarantined"
+    statute.needs_section_refetch = False
+    statute.quality_flag_no_year = False
+    if not await _statute_other_lower_name_exists(db, statute_id=statute.id, name=name):
+        statute.quality_flag_duplicate_name = False
+    await db.flush()
     if prov is not None:
         prov.promoted_table, prov.promoted_id = "statute", statute.id
     st.status = "promoted" if new_versions else "duplicate"
