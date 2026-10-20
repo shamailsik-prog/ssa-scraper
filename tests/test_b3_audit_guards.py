@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from scraper.config import settings
 from scraper.database import engine
 from scraper.fetchers import FetchResult, PDF_MAGIC
 from scraper.models import QuarantineQueue, Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
-from sqlalchemy import event
-
-from scraper.database import engine
 from scraper.tasks.promotion import (
     _find_statute_by_exact_or_normalized_name,
     _normalized_statute_name_key,
@@ -420,34 +418,112 @@ async def test_resolve_statute_via_canonical_name_key_column(db):
     assert found.name == stored_title
 
 
+def _is_statute_select(statement: object) -> bool:
+    stmt = statement if isinstance(statement, str) else str(statement)
+    lowered = stmt.lower()
+    if not lowered.lstrip().startswith("select"):
+        return False
+    return re.search(r"\bfrom\s+\"?statute\"?\b", lowered) is not None
+
+
+def _statute_select_missing_where_clause(statement: object) -> bool:
+    if not _is_statute_select(statement):
+        return False
+    lowered = (statement if isinstance(statement, str) else str(statement)).lower()
+    return re.search(r"\bwhere\b", lowered) is None
+
+
+async def _assert_bare_limit_one_would_miss_target(db, target: Statute) -> None:
+    """Unfiltered LIMIT 1 must not return the lookup target (mutant would return the wrong row)."""
+    bare = (await db.execute(select(Statute).limit(1))).scalars().first()
+    assert bare is not None
+    assert bare.id != target.id
+
+
 @pytest.mark.asyncio
 async def test_find_statute_lookup_selects_on_statute_always_have_where(db):
-    stored_title = "This Act may be called the Court fees Act 1870"
-    key = _normalized_statute_name_key("Court fees Act, 1870")
-    db.add(
-        Statute(
-            name=stored_title,
-            canonical_name_key=key,
+    bind = db.get_bind()
+    sync_engine = bind.sync_engine if hasattr(bind, "sync_engine") else bind
+    assert sync_engine is engine.sync_engine
+    violations: list[str] = []
+    statute_select_count = 0
+
+    def _before_cursor_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal statute_select_count
+        stmt = statement if isinstance(statement, str) else str(statement)
+        if _is_statute_select(stmt):
+            statute_select_count += 1
+            if _statute_select_missing_where_clause(stmt):
+                violations.append(stmt)
+
+    event.listen(sync_engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        scenarios: list[tuple[str, Statute, str]] = []
+
+        decoy_exact = Statute(
+            name="B3 Where Guard decoy exact branch",
+            jurisdiction="Federal",
+            year_enacted=1800,
+        )
+        db.add(decoy_exact)
+        target_exact = Statute(
+            name="B3 Where Guard Exact Act, 2021",
+            jurisdiction="Federal",
+            year_enacted=2021,
+        )
+        db.add(target_exact)
+        await db.flush()
+        await _assert_bare_limit_one_would_miss_target(db, target_exact)
+        scenarios.append(("exact name", target_exact, "B3 Where Guard Exact Act, 2021"))
+
+        decoy_canonical = Statute(
+            name="B3 Where Guard decoy canonical branch",
+            jurisdiction="Federal",
+            year_enacted=1801,
+        )
+        db.add(decoy_canonical)
+        canonical_query = "B3 Where Guard Canonical Act, 1870"
+        stored_canonical = "This Act may be called the B3 Where Guard Canonical Act 1870"
+        canonical_key = _normalized_statute_name_key(canonical_query)
+        target_canonical = Statute(
+            name=stored_canonical,
+            canonical_name_key=canonical_key,
             jurisdiction="Federal",
             year_enacted=1870,
         )
-    )
-    await db.flush()
-    violations: list[str] = []
+        db.add(target_canonical)
+        await db.flush()
+        await _assert_bare_limit_one_would_miss_target(db, target_canonical)
+        scenarios.append(("canonical_name_key", target_canonical, canonical_query))
 
-    def _before_cursor_execute(_conn, _cursor, statement, _parameters, _context, _executemany):
-        stmt = statement if isinstance(statement, str) else str(statement)
-        lowered = stmt.lower()
-        if lowered.lstrip().startswith("select") and " from statute" in lowered and " where " not in lowered:
-            violations.append(stmt)
+        decoy_lower = Statute(
+            name="B3 Where Guard decoy lower branch",
+            jurisdiction="Federal",
+            year_enacted=1802,
+        )
+        db.add(decoy_lower)
+        lower_query = "B3 Where Guard Lower Act, 1885"
+        target_lower = Statute(
+            name="b3 where guard lower act, 1885",
+            canonical_name_key=None,
+            jurisdiction="Federal",
+            year_enacted=1885,
+        )
+        db.add(target_lower)
+        await db.flush()
+        await _assert_bare_limit_one_would_miss_target(db, target_lower)
+        scenarios.append(("lower(name)", target_lower, lower_query))
 
-    event.listen(engine.sync_engine, "before_cursor_execute", _before_cursor_execute)
-    try:
-        found = await _find_statute_by_exact_or_normalized_name(db, "Court fees Act, 1870")
-        assert found is not None
+        for branch_label, expected, query_name in scenarios:
+            statute_select_count = 0
+            violations.clear()
+            found = await _find_statute_by_exact_or_normalized_name(db, query_name)
+            assert found is not None, branch_label
+            assert found.id == expected.id, branch_label
+            assert statute_select_count > 0, f"no statute SELECT observed for {branch_label}"
+            assert violations == [], f"bare statute SELECT for {branch_label}: {violations!r}"
     finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", _before_cursor_execute)
-    assert violations == []
+        event.remove(sync_engine, "before_cursor_execute", _before_cursor_execute)
 
 
 @pytest.mark.asyncio
