@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import types
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from scraper.database import engine, run_migrations
 from scraper.models import QuarantineQueue, Statute
@@ -26,6 +29,11 @@ async def _drop_migration_024_schema() -> None:
 async def _delete_migration_024_version() -> None:
     async with engine.begin() as conn:
         await conn.execute(text("DELETE FROM schema_migrations WHERE version = :v"), {"v": _MIGRATION_024})
+
+
+def _assert_index_on_canonical_name_key(indexdef: str | None) -> None:
+    assert indexdef is not None
+    assert "(canonical_name_key)" in indexdef
 
 
 async def _canonical_index_row(conn):
@@ -103,8 +111,7 @@ async def test_migration_024_backfills_canonical_name_key(db):
         idx = await _canonical_index_row(conn)
     assert idx is not None
     assert idx.indisvalid is True
-    assert idx.indexdef is not None
-    assert "canonical_name_key" in idx.indexdef.lower()
+    _assert_index_on_canonical_name_key(idx.indexdef)
 
     async with engine.connect() as conn:
         key = (
@@ -114,14 +121,6 @@ async def test_migration_024_backfills_canonical_name_key(db):
             )
         ).scalar()
     assert key == _normalized_statute_name_key(irregular)
-
-
-def test_migration_024_backfill_update_keeps_null_guard_in_sql():
-    mig = importlib.import_module(f"migrations.{_MIGRATION_024}")
-    import inspect
-
-    source = inspect.getsource(mig._backfill_canonical_name_keys)
-    assert "WHERE s.id = v.id AND s.canonical_name_key IS NULL" in source
 
 
 @pytest.mark.asyncio
@@ -186,6 +185,7 @@ async def test_run_migrations_applies_024_when_version_row_missing(db):
         idx = await _canonical_index_row(conn)
     assert recorded is not None
     assert idx is not None and idx.indisvalid is True
+    _assert_index_on_canonical_name_key(idx.indexdef)
 
     async with engine.connect() as conn:
         key = (
@@ -264,7 +264,217 @@ async def test_run_migrations_rebuilds_invalid_canonical_name_key_index(db):
         after = await _canonical_index_row(conn)
     assert after is not None
     assert after.indisvalid is True
-    assert "canonical_name_key" in after.indexdef.lower()
+    _assert_index_on_canonical_name_key(after.indexdef)
+
+
+@pytest.mark.asyncio
+async def test_run_migrations_rebuilds_invalid_index_when_024_already_recorded(db):
+    mig = importlib.import_module(f"migrations.{_MIGRATION_024}")
+    await _drop_migration_024_schema()
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    await db.close()
+    await mig.upgrade_post_commit()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
+            {"v": _MIGRATION_024},
+        )
+
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        await conn.execute(
+            text(
+                """
+                UPDATE pg_index AS i
+                SET indisvalid = false
+                FROM pg_class c
+                WHERE i.indexrelid = c.oid
+                  AND c.relname = 'ix_statute_canonical_name_key'
+                """
+            )
+        )
+
+    await run_migrations()
+
+    async with engine.connect() as conn:
+        recorded = (
+            await conn.execute(
+                text("SELECT 1 FROM schema_migrations WHERE version = :v"),
+                {"v": _MIGRATION_024},
+            )
+        ).first()
+        after = await _canonical_index_row(conn)
+    assert recorded is not None
+    assert after is not None and after.indisvalid is True
+    _assert_index_on_canonical_name_key(after.indexdef)
+
+
+_PROBE_VERSION = "987_b3_hookless_migration_tx_probe"
+_PROBE_TABLE = "_b3_hookless_migration_tx_probe"
+
+
+@pytest.mark.asyncio
+async def test_run_migrations_no_hook_migration_rolls_back_when_version_insert_fails(monkeypatch):
+    async def upgrade(conn) -> None:
+        await conn.execute(
+            text(f"CREATE TABLE {_PROBE_TABLE} (id int PRIMARY KEY)")
+        )
+
+    fake_module = types.SimpleNamespace(upgrade=upgrade)
+    real_import_module = importlib.import_module
+
+    def import_module(name: str):
+        if name == f"migrations.{_PROBE_VERSION}":
+            return fake_module
+        return real_import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr("scraper.database.discover_migrations", lambda: [_PROBE_VERSION])
+
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {_PROBE_TABLE}"))
+        await conn.execute(
+            text("DELETE FROM schema_migrations WHERE version = :v"),
+            {"v": _PROBE_VERSION},
+        )
+
+    original_execute = AsyncConnection.execute
+
+    async def execute_fail_version_insert(self, statement, *args, **kwargs):
+        if "INSERT INTO schema_migrations" in str(statement):
+            raise RuntimeError("simulated schema_migrations insert failure")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", execute_fail_version_insert)
+
+    with pytest.raises(RuntimeError, match="simulated schema_migrations insert failure"):
+        await run_migrations()
+
+    async with engine.connect() as conn:
+        probe = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = :t"
+                ),
+                {"t": _PROBE_TABLE},
+            )
+        ).first()
+    assert probe is None
+
+
+@pytest.mark.asyncio
+async def test_migration_024_backfill_commits_per_batch_on_autocommit_connection(monkeypatch, db):
+    mig = importlib.import_module(f"migrations.{_MIGRATION_024}")
+    monkeypatch.setattr(mig, "_BATCH_SIZE", 2)
+    await _drop_migration_024_schema()
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    for i in range(4):
+        db.add(
+            Statute(
+                name=f"Batch Commit Act {i}, 1920",
+                jurisdiction="Federal",
+                year_enacted=1920,
+            )
+        )
+    await db.commit()
+    await db.close()
+
+    original_execute = AsyncConnection.execute
+    updates_done = 0
+
+    async def pause_after_first_batch_update(self, statement, *args, **kwargs):
+        nonlocal updates_done
+        result = await original_execute(self, statement, *args, **kwargs)
+        if "UPDATE statute AS s" in str(statement) and "canonical_name_key" in str(statement):
+            updates_done += 1
+            if updates_done == 1:
+                await asyncio.sleep(0.25)
+        return result
+
+    monkeypatch.setattr(AsyncConnection, "execute", pause_after_first_batch_update)
+
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        isolation = (await conn.execute(text("SHOW transaction_isolation"))).scalar()
+        assert isolation is not None and isolation.lower() == "read committed"
+
+        async def count_filled() -> int:
+            async with engine.connect() as other:
+                return (
+                    await other.execute(
+                        text(
+                            "SELECT count(*) FROM statute "
+                            "WHERE name LIKE 'Batch Commit Act %' AND canonical_name_key IS NOT NULL"
+                        )
+                    )
+                ).scalar_one()
+
+        task = asyncio.create_task(mig._backfill_canonical_name_keys(conn))
+        saw_partial = False
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            filled = await count_filled()
+            if 0 < filled < 4:
+                saw_partial = True
+                break
+        await task
+        assert saw_partial
+        assert await count_filled() == 4
+
+
+@pytest.mark.asyncio
+async def test_migration_024_backfill_preserves_preset_set_before_update_in_batch(monkeypatch, db):
+    mig = importlib.import_module(f"migrations.{_MIGRATION_024}")
+    monkeypatch.setattr(mig, "_BATCH_SIZE", 2)
+    await _drop_migration_024_schema()
+    async with engine.begin() as conn:
+        await mig.upgrade(conn)
+    row_one = Statute(name="Between Batch Row One, 1930", jurisdiction="Federal", year_enacted=1930)
+    row_two = Statute(name="Between Batch Row Two, 1930", jurisdiction="Federal", year_enacted=1930)
+    db.add(row_one)
+    db.add(row_two)
+    await db.commit()
+    preset = "preset-before-update-in-batch"
+    await db.close()
+
+    original_execute = AsyncConnection.execute
+    hooked = False
+
+    async def execute_preset_before_first_update(self, statement, *args, **kwargs):
+        nonlocal hooked
+        stmt = str(statement)
+        if "UPDATE statute AS s" in stmt and "canonical_name_key" in stmt and not hooked:
+            hooked = True
+            async with engine.begin() as hook_conn:
+                await hook_conn.execute(
+                    text(
+                        "UPDATE statute SET canonical_name_key = :k WHERE name = :n"
+                    ),
+                    {"k": preset, "n": "Between Batch Row Two, 1930"},
+                )
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", execute_preset_before_first_update)
+
+    async with engine.execution_options(isolation_level="AUTOCOMMIT").connect() as conn:
+        await mig._backfill_canonical_name_keys(conn)
+
+    async with engine.connect() as conn:
+        kept = (
+            await conn.execute(
+                text("SELECT canonical_name_key FROM statute WHERE name = :n"),
+                {"n": "Between Batch Row Two, 1930"},
+            )
+        ).scalar()
+        filled = (
+            await conn.execute(
+                text("SELECT canonical_name_key FROM statute WHERE name = :n"),
+                {"n": "Between Batch Row One, 1930"},
+            )
+        ).scalar()
+    assert kept == preset
+    assert filled is not None
 
 
 @pytest.mark.asyncio

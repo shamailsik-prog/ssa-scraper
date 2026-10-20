@@ -227,16 +227,23 @@ async def run_migrations() -> List[str]:
         if name in done:
             continue
         module = importlib.import_module(f"migrations.{name}")
-        async with engine.begin() as conn:
-            await module.upgrade(conn)
         post_commit = getattr(module, "upgrade_post_commit", None)
         if post_commit is not None:
+            async with engine.begin() as conn:
+                await module.upgrade(conn)
             await post_commit()
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
-                {"v": name},
-            )
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
+                    {"v": name},
+                )
+        else:
+            async with engine.begin() as conn:
+                await module.upgrade(conn)
+                await conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
+                    {"v": name},
+                )
         applied_now.append(name)
         logger.info("migration applied: %s", name)
     return applied_now

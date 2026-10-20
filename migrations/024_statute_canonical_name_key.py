@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from scraper.parsers.citation_extractor import canonicalise_statute_name
 
-_BATCH_SIZE = 500
+_BATCH_SIZE = 500  # tests may monkeypatch this module attribute
 
 
 def _canonical_key(name: str) -> str:
