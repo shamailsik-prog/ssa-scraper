@@ -88,7 +88,7 @@ async def _drop_database_best_effort(admin_url: str, db_name: str) -> None:
 async def test_reader_grants_after_init_on_isolated_rolecheck_database():
     """init_db + reader contract SELECT on a disposable rolecheck DB (never a live gwN worker DB)."""
     source_url = os.environ["DATABASE_URL"]
-    base = xdist_db.database_name_from_url(source_url)
+    base = os.environ.get("_CORPUS_TEST_DATABASE_BASE") or xdist_db.database_name_from_url(source_url)
     rolecheck_db = f"{base}_rolecheck_{uuid.uuid4().hex[:12]}"
     rolecheck_url = xdist_db._replace_url_database(source_url, rolecheck_db)
     admin_url = xdist_db.admin_database_url(source_url)
