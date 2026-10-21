@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import pkgutil
 from datetime import datetime, timezone
 from typing import AsyncIterator, List
@@ -56,15 +57,24 @@ def connect_args() -> dict:
     return {"server_settings": {"idle_in_transaction_session_timeout": str(timeout * 1000)}}
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args(),
-    echo=settings.DATABASE_ECHO,
-    pool_size=settings.DATABASE_POOL_SIZE,
-    max_overflow=settings.DATABASE_MAX_OVERFLOW,
-    pool_timeout=settings.DATABASE_POOL_TIMEOUT,
-    pool_pre_ping=True,
-)
+def _engine_kwargs() -> dict:
+    kwargs = {
+        "connect_args": connect_args(),
+        "echo": settings.DATABASE_ECHO,
+        "pool_pre_ping": True,
+    }
+    if os.environ.get("DATABASE_NULL_POOL", "").lower() in ("1", "true", "yes"):
+        from sqlalchemy.pool import NullPool
+
+        kwargs["poolclass"] = NullPool
+    else:
+        kwargs["pool_size"] = settings.DATABASE_POOL_SIZE
+        kwargs["max_overflow"] = settings.DATABASE_MAX_OVERFLOW
+        kwargs["pool_timeout"] = settings.DATABASE_POOL_TIMEOUT
+    return kwargs
+
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs())
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -470,7 +480,7 @@ SOURCE_SEED = [
 ]
 
 
-async def _seed_courts() -> None:
+async def _seed_courts(db_engine=None) -> None:
     """Insert court seed rows under a transaction advisory lock; conflicts on any unique key are ignored."""
     from sqlalchemy.dialects.postgresql import insert
 
@@ -478,7 +488,8 @@ async def _seed_courts() -> None:
 
     if not COURT_SEED:
         return
-    async with engine.begin() as conn:
+    eng = db_engine if db_engine is not None else engine
+    async with eng.begin() as conn:
         await _pg_advisory_xact_lock(conn, PG_ADVISORY_COURT_SEED_KEY1, PG_ADVISORY_COURT_SEED_KEY2)
         court_rows = (
             await conn.execute(text("SELECT short_code, name, court_level, city FROM court"))
@@ -519,13 +530,18 @@ async def _seed_courts() -> None:
         )
 
 
-async def seed_data() -> None:
+async def seed_data(db_engine=None) -> None:
     from sqlalchemy import select
 
     from scraper.models import ArchiveTarget, BrowserSessionSlot, Court, CorpusMetadata, ScraperSource
 
-    await _seed_courts()
-    async with SessionLocal() as db:
+    eng = db_engine if db_engine is not None else engine
+    await _seed_courts(eng)
+    if db_engine is None:
+        session_factory = SessionLocal
+    else:
+        session_factory = async_sessionmaker(eng, expire_on_commit=False, class_=AsyncSession)
+    async with session_factory() as db:
         existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:

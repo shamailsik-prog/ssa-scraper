@@ -20,6 +20,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="corpus-test-"))
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+# asyncpg connections are bound to the event loop that opened them; pytest-asyncio uses a
+# function-scoped loop, so pooled connections must not be reused across tests.
+os.environ.setdefault("DATABASE_NULL_POOL", "1")
 
 from tests.xdist_db import apply_worker_database_url  # noqa: E402
 
@@ -118,7 +121,6 @@ async def clean_db():
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
 
     async def _truncate_and_seed() -> None:
-        await engine.dispose(close=False)
         async with engine.begin() as conn:
             await conn.execute(truncate_sql)
             await _ensure_judgment_case_hash_includes_unreported(conn)
