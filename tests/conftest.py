@@ -18,15 +18,21 @@ from cryptography.fernet import Fernet
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="corpus-test-"))
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper")
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper_test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 # asyncpg connections are bound to the event loop that opened them; pytest-asyncio uses a
 # function-scoped loop, so pooled connections must not be reused across tests.
 os.environ.setdefault("DATABASE_NULL_POOL", "1")
 
-from tests.xdist_db import apply_worker_database_url  # noqa: E402
+from tests.xdist_db import (  # noqa: E402
+    apply_worker_database_url,
+    apply_worker_redis_url,
+    database_name_from_url,
+)
 
+os.environ["_CORPUS_TEST_DATABASE_BASE"] = database_name_from_url(os.environ["DATABASE_URL"])
 apply_worker_database_url()
+apply_worker_redis_url()
 os.environ["ENCRYPTION_KEY"] = os.environ.get("ENCRYPTION_KEY") or Fernet.generate_key().decode()
 os.environ["ADMIN_API_KEY"] = "test-admin-key"
 os.environ["SIKANDER_READER_PASSWORD"] = os.environ.get("SIKANDER_READER_PASSWORD") or "readerpw"
@@ -103,20 +109,22 @@ async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def _initialised_database():
-    from tests.xdist_db import ensure_worker_database_exists
+    from tests.xdist_db import (
+        drop_worker_databases_best_effort,
+        ensure_worker_database_exists,
+    )
 
     asyncio.run(ensure_worker_database_exists(os.environ["DATABASE_URL"]))
     asyncio.run(init_db())
     asyncio.run(engine.dispose())
     yield
+    asyncio.run(drop_worker_databases_best_effort(os.environ["DATABASE_URL"]))
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
     """Truncate every table except schema_migrations, then re-seed. Per-xdist-worker DB names avoid
     cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB."""
-    from tests.xdist_db import worker_database_name
-
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
 
@@ -126,7 +134,9 @@ async def clean_db():
             await _ensure_judgment_case_hash_includes_unreported(conn)
         await seed_data()
 
-    if worker_database_name() != "legal_scraper":
+    from tests.xdist_db import xdist_worker_id
+
+    if xdist_worker_id():
         await _truncate_and_seed()
     else:
         from tests.xdist_db import admin_database_url
