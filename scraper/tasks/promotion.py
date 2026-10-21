@@ -280,6 +280,18 @@ def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[s
     return None
 
 
+def _apply_pls_full_text_replacement(judgment: Judgment, new_full_text: str, data: Optional[Dict[str, Any]] = None) -> None:
+    """Whenever full_text changes on a PLS judgment, drop stale overlay and recompute the headnote flag."""
+    judgment.headnote_stripped_full_text = None
+    if (judgment.source_name or "") != "PakistanLawSite":
+        return
+    from scraper.parsers.pls_text_encoding import classify_mojibake
+
+    judgment.quality_flag_urdu_headnote_mojibake = classify_mojibake(new_full_text) == "headnote" or bool(
+        (data or {}).get("quality_flag_urdu_headnote_mojibake")
+    )
+
+
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
@@ -534,6 +546,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             existing.page_number = parts["page"] or existing.page_number
             existing.full_text = full_text
             existing.full_text_hash = text_hash
+            _apply_pls_full_text_replacement(existing, full_text, data)
             existing.headnotes = data.get("headnotes")
             if data.get("statutes_cited") is not None:
                 existing.statutes_cited = data.get("statutes_cited")
@@ -547,8 +560,6 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             existing.has_original_pdf = st.pdf_provenance_id is not None
             existing.confidence_score = st.confidence_score or existing.confidence_score
             existing.extraction_engine = st.extraction_engine
-            if data.get("quality_flag_urdu_headnote_mojibake"):
-                existing.quality_flag_urdu_headnote_mojibake = True
             if prov is not None:
                 prov.promoted_table = "judgment"
                 prov.promoted_id = existing.id
@@ -643,9 +654,10 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         original_document_id=st.pdf_provenance_id,
         has_original_pdf=st.pdf_provenance_id is not None,
         confidence_score=st.confidence_score or 0.0,
-        quality_flag_urdu_headnote_mojibake=bool(data.get("quality_flag_urdu_headnote_mojibake")),
+        quality_flag_urdu_headnote_mojibake=False,
         extraction_engine=st.extraction_engine,
     )
+    _apply_pls_full_text_replacement(j, full_text, data)
     db.add(j)
     await db.flush()
     for i, c in enumerate(cits):

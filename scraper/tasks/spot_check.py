@@ -65,9 +65,10 @@ def judgment_spot_check_stored_text(j: Judgment) -> str:
     """Text used for spot-check hash comparison.
 
     PakistanLawSite: compares via ``headnote_stripped_full_text`` or ``strip_mojibake_headnote_lines`` on
-    ``full_text``. Post-signature Urdu headnote / mojibake-only tail lines are intentionally ignored so
-    cosmetic headnote churn on the live site does not surface as corpus drift. Latin-plus-mojibake body
-    damage and pre-signature text still affect the hash. Other sources compare raw ``full_text`` verbatim.
+    ``full_text``. Genuine Urdu headnote lines after the judge's signature are intentionally ignored
+    (same per-line rule as strip/classify) so cosmetic headnote churn on the live site does not surface
+    as corpus drift. Latin-plus-mojibake body damage, substantive post-signature lines, and
+    pre-signature text still affect the hash. Other sources compare raw ``full_text`` verbatim.
     """
     from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
 

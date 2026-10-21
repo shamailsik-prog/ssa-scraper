@@ -383,7 +383,7 @@ async def strip_urdu_headnote_mojibake(
     dry_run: bool = True,
 ) -> Dict[str, int]:
     """Write stripped headnote text to headnote_stripped_full_text; never mutates full_text or full_text_hash."""
-    counts = {"scanned": 0, "stripped": 0}
+    counts = {"scanned": 0, "stripped": 0, "overlay_noop": 0}
     last_id = None
     while True:
         q = (
@@ -404,7 +404,10 @@ async def strip_urdu_headnote_mojibake(
                 continue
             raw = j.full_text or ""
             stripped = strip_mojibake_headnote_lines(raw)
-            counts["stripped"] += 1
+            if stripped == raw:
+                counts["overlay_noop"] += 1
+            else:
+                counts["stripped"] += 1
             if not dry_run:
                 j.headnote_stripped_full_text = stripped
                 j.quality_flag_urdu_headnote_mojibake = False

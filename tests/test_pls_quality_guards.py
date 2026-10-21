@@ -137,6 +137,32 @@ def test_classify_mojibake_between_english_lines_without_signature_is_body():
     assert classify_mojibake(text) == "body"
 
 
+def test_sixteen_char_plain_line_after_signature_is_body_damage():
+    """R4: substantive post-signature line (16+ non-? chars) with headnote tail is body, line kept."""
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "J.\n"
+        "abcdefghijklmnop\n"
+        "???? ????\n"
+    )
+    assert classify_mojibake(text) == "body"
+    stripped = strip_mojibake_headnote_lines(text)
+    assert "abcdefghijklmnop" in stripped
+
+
+def test_dismissed_mojibake_after_signature_is_body_damage():
+    """R5: short Latin word + mojibake after signature is body damage."""
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "J.\n"
+        "Dismissed ????\n"
+    )
+    assert classify_mojibake(text) == "body"
+    assert "Dismissed" in strip_mojibake_headnote_lines(text)
+
+
 def test_strip_keeps_latin_mojibake_line_after_signature():
     from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
 
