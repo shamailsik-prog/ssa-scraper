@@ -127,6 +127,43 @@ def test_classify_all_mojibake_line_before_signature_is_body():
     assert classify_mojibake(text) == "body"
 
 
+def test_classify_single_mojibake_run_line_before_signature_is_body():
+    """R6 M2: one line of only ???? before the signature is body damage (before-block guard)."""
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "????\n"
+        "The application is allowed.\n"
+        "J.\n"
+    )
+    assert classify_mojibake(text) == "body"
+
+
+def test_ref_prefix_post_signature_mojibake_line_is_body_and_survives_strip():
+    """R6 R4: post-signature Ref ???? + long Latin token is body damage; strip keeps the line."""
+    text = (
+        "IN THE HIGH COURT OF SINDH\n"
+        "The application is allowed.\n"
+        "J.\n"
+        "Ref ???? abcdefghijklmnop\n"
+    )
+    assert classify_mojibake(text) == "body"
+    stripped = strip_mojibake_headnote_lines(text)
+    assert "Ref ???? abcdefghijklmnop" in stripped
+
+
+def test_encoding_guard_off_body_damage_does_not_set_quality_flag(monkeypatch):
+    """R6 S6: with SSA_ENCODING_GUARD off, body mojibake is not flagged for promotion."""
+    monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", False)
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    text = "IN THE LAHORE HIGH COURT\nBefore X, J\n" + ("x" * 280) + " ???? " + ("y" * 280)
+    errors: list[str] = []
+    out: dict = {"full_text_candidate": text}
+    apply_pls_quality_guards(out, raw_text=text, source_name="PakistanLawSite", errors=errors)
+    assert errors == []
+    assert "quality_flag_urdu_headnote_mojibake" not in out
+    assert "encoding_flag" not in out
+
+
 def test_classify_mojibake_between_english_lines_without_signature_is_body():
     text = (
         "IN THE HIGH COURT OF SINDH\n"

@@ -68,6 +68,9 @@ from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
 
+# Serialize truncate+seed so parallel tests never double-insert courts (finding #238).
+_DB_SETUP_LOCK = asyncio.Lock()
+
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
     """Migration downgrade tests can leave a 4-column unique; B2/models require unreported in the key."""
@@ -94,14 +97,16 @@ def _initialised_database():
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
-    """Truncate every table except schema_migrations, then re-seed. Dispose the pool so asyncpg
-    connections never cross event loops."""
-    await engine.dispose(close=False)
-    tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
-        await _ensure_judgment_case_hash_includes_unreported(conn)
-    await seed_data()
+    """Truncate every table except schema_migrations, then re-seed. Dispose the pool at setup so
+    asyncpg connections never cross event loops; do not dispose on teardown (other fixtures may
+    still hold connections from this loop)."""
+    async with _DB_SETUP_LOCK:
+        await engine.dispose(close=False)
+        tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
+        async with engine.begin() as conn:
+            await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
+            await _ensure_judgment_case_hash_includes_unreported(conn)
+        await seed_data()
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache
 
@@ -109,7 +114,6 @@ async def clean_db():
     LOCAL_BREAKER.reset()
     reset_robots_cache()
     yield
-    await engine.dispose()
 
 
 @pytest_asyncio.fixture
