@@ -62,14 +62,18 @@ import pytest_asyncio  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
 from scraper.config import settings  # noqa: E402
-from scraper.database import Base, SessionLocal, engine, init_db, seed_data  # noqa: E402
+from scraper.database import (  # noqa: E402
+    TEST_DB_ADVISORY_LOCK_ID,
+    Base,
+    SessionLocal,
+    engine,
+    init_db,
+    seed_data,
+)
 from scraper.models import ScraperSource  # noqa: E402
 from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
-
-# Serialize truncate+seed so parallel tests never double-insert courts (finding #238).
-_DB_SETUP_LOCK = asyncio.Lock()
 
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
@@ -97,16 +101,25 @@ def _initialised_database():
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
-    """Truncate every table except schema_migrations, then re-seed. Dispose the pool at setup so
-    asyncpg connections never cross event loops; do not dispose on teardown (other fixtures may
-    still hold connections from this loop)."""
-    async with _DB_SETUP_LOCK:
-        await engine.dispose(close=False)
-        tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
-        async with engine.begin() as conn:
-            await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
-            await _ensure_judgment_case_hash_includes_unreported(conn)
-        await seed_data()
+    """Truncate every table except schema_migrations, then re-seed. Cross-process/xdist-safe via
+    a session-level Postgres advisory lock; dispose pool at setup and teardown in this event loop."""
+    async with engine.connect() as lock_conn:
+        await lock_conn.execute(
+            text("SELECT pg_advisory_lock(:k)"),
+            {"k": TEST_DB_ADVISORY_LOCK_ID},
+        )
+        try:
+            await engine.dispose(close=False)
+            tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
+            async with engine.begin() as conn:
+                await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
+                await _ensure_judgment_case_hash_includes_unreported(conn)
+            await seed_data()
+        finally:
+            await lock_conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"),
+                {"k": TEST_DB_ADVISORY_LOCK_ID},
+            )
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache
 
@@ -114,6 +127,7 @@ async def clean_db():
     LOCAL_BREAKER.reset()
     reset_robots_cache()
     yield
+    await engine.dispose(close=False)
 
 
 @pytest_asyncio.fixture

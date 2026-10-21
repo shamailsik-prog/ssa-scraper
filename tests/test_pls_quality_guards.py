@@ -128,27 +128,29 @@ def test_classify_all_mojibake_line_before_signature_is_body():
 
 
 def test_classify_single_mojibake_run_line_before_signature_is_body():
-    """R6 M2: one line of only ???? before the signature is body damage (before-block guard)."""
+    """R6 M2: lone ???? before signature is body even when post-signature headnote tail exists."""
     text = (
         "IN THE HIGH COURT OF SINDH\n"
         "????\n"
         "The application is allowed.\n"
-        "J.\n"
+        "Sd/-\n"
+        "????\n"
     )
     assert classify_mojibake(text) == "body"
 
 
 def test_ref_prefix_post_signature_mojibake_line_is_body_and_survives_strip():
-    """R6 R4: post-signature Ref ???? + long Latin token is body damage; strip keeps the line."""
+    """R6 R4: post-signature Ref ???? + short Latin tokens (no 7+ letter word) stays body; strip keeps line."""
+    line = "Ref ???? ab cd ef gh ij kl"  # no single token >= 7 letters; mixed Latin fragments => body
     text = (
         "IN THE HIGH COURT OF SINDH\n"
         "The application is allowed.\n"
         "J.\n"
-        "Ref ???? abcdefghijklmnop\n"
+        f"{line}\n"
     )
     assert classify_mojibake(text) == "body"
     stripped = strip_mojibake_headnote_lines(text)
-    assert "Ref ???? abcdefghijklmnop" in stripped
+    assert line in stripped
 
 
 def test_encoding_guard_off_body_damage_does_not_set_quality_flag(monkeypatch):
@@ -162,6 +164,24 @@ def test_encoding_guard_off_body_damage_does_not_set_quality_flag(monkeypatch):
     assert errors == []
     assert "quality_flag_urdu_headnote_mojibake" not in out
     assert "encoding_flag" not in out
+
+
+def test_apply_pls_full_text_replacement_body_damage_keeps_headnote_flag_false():
+    """R6 S6: body-damaged PLS text must not set quality_flag_urdu_headnote_mojibake on replacement."""
+    from scraper.models import Judgment
+    from scraper.tasks.promotion import _apply_pls_full_text_replacement
+
+    text = "IN THE LAHORE HIGH COURT\nBefore X, J\n" + ("x" * 280) + " ???? " + ("y" * 280)
+    judgment = Judgment(
+        source_name="PakistanLawSite",
+        canonical_citation="PLS body-flag test",
+        full_text="",
+        full_text_hash="a" * 64,
+        quality_flag_urdu_headnote_mojibake=True,
+    )
+    _apply_pls_full_text_replacement(judgment, text, {"quality_flag_urdu_headnote_mojibake": True})
+    assert classify_mojibake(text) == "body"
+    assert judgment.quality_flag_urdu_headnote_mojibake is False
 
 
 def test_classify_mojibake_between_english_lines_without_signature_is_body():

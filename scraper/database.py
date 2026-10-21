@@ -28,6 +28,17 @@ from scraper.keys import fit_key
 
 logger = logging.getLogger(__name__)
 
+# Postgres advisory locks for idempotent seed / role setup / test DB reset (finding #238).
+PG_ADVISORY_COURT_SEED_KEY1 = 0x5353
+PG_ADVISORY_COURT_SEED_KEY2 = 0x436F
+PG_ADVISORY_ROLE_SETUP_KEY1 = 0x5353
+PG_ADVISORY_ROLE_SETUP_KEY2 = 0x524F
+TEST_DB_ADVISORY_LOCK_ID = 738_238_001
+
+
+async def _pg_advisory_xact_lock(conn, key1: int, key2: int) -> None:
+    await conn.execute(text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": key1, "k2": key2})
+
 
 class Base(DeclarativeBase):
     pass
@@ -264,6 +275,7 @@ async def ensure_roles() -> dict:
     reader_pw = settings.SIKANDER_READER_PASSWORD.get_secret_value()
     writer_pw = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
     async with engine.begin() as conn:
+        await _pg_advisory_xact_lock(conn, PG_ADVISORY_ROLE_SETUP_KEY1, PG_ADVISORY_ROLE_SETUP_KEY2)
         dbname = (await conn.execute(text("SELECT current_database()"))).scalar()
         if writer_pw:
             role = _quote_ident(settings.CORPUS_WRITER_ROLE)
@@ -271,7 +283,14 @@ async def ensure_roles() -> dict:
             if not exists:
                 await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD :p".replace(":p", _pg_literal(writer_pw))))
             else:
-                await conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(writer_pw)}"))
+                writer_login = (
+                    await conn.execute(
+                        text("SELECT rolcanlogin FROM pg_roles WHERE rolname=:r"),
+                        {"r": settings.CORPUS_WRITER_ROLE},
+                    )
+                ).scalar()
+                if not writer_login:
+                    await conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(writer_pw)}"))
             await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
             await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
             await conn.execute(text(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}"))
@@ -283,7 +302,23 @@ async def ensure_roles() -> dict:
             if not exists:
                 await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"))
             else:
-                await conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} NOSUPERUSER NOCREATEDB NOCREATEROLE"))
+                reader_attrs = (
+                    await conn.execute(
+                        text(
+                            "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit "
+                            "FROM pg_roles WHERE rolname=:r"
+                        ),
+                        {"r": settings.SIKANDER_READER_ROLE},
+                    )
+                ).one()
+                desired = (True, False, False, False, False)
+                if tuple(reader_attrs) != desired:
+                    await conn.execute(
+                        text(
+                            f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} "
+                            "NOSUPERUSER NOCREATEDB NOCREATEROLE"
+                        )
+                    )
             await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
             await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
             # Start from nothing, then grant SELECT on the contract tables only.
@@ -425,31 +460,59 @@ SOURCE_SEED = [
 ]
 
 
-async def seed_data() -> None:
+async def _seed_courts(db) -> None:
+    """Insert court seed rows under a transaction advisory lock; conflicts on any unique key are ignored."""
     from sqlalchemy import select
     from sqlalchemy.dialects.postgresql import insert
+
+    from scraper.models import Court
+
+    if not COURT_SEED:
+        return
+    await _pg_advisory_xact_lock(db, PG_ADVISORY_COURT_SEED_KEY1, PG_ADVISORY_COURT_SEED_KEY2)
+    existing = {c.short_code: c for c in (await db.execute(select(Court))).scalars().all()}
+    for name, code, level, prov, city, aliases in COURT_SEED:
+        row = existing.get(code)
+        if row is None:
+            continue
+        if (row.name, row.court_level, row.city) != (name, level, city):
+            logger.warning(
+                "court seed short_code=%s already present as name=%r level=%r city=%r; "
+                "seed expects name=%r level=%r city=%r (insert skipped on conflict)",
+                code,
+                row.name,
+                row.court_level,
+                row.city,
+                name,
+                level,
+                city,
+            )
+    await db.execute(
+        insert(Court)
+        .values(
+            [
+                {
+                    "name": name,
+                    "short_code": code,
+                    "court_level": level,
+                    "jurisdiction_province": prov,
+                    "city": city,
+                    "aliases": aliases,
+                }
+                for name, code, level, prov, city, aliases in COURT_SEED
+            ]
+        )
+        .on_conflict_do_nothing()
+    )
+
+
+async def seed_data() -> None:
+    from sqlalchemy import select
 
     from scraper.models import ArchiveTarget, BrowserSessionSlot, Court, CorpusMetadata, ScraperSource
 
     async with SessionLocal() as db:
-        if COURT_SEED:
-            await db.execute(
-                insert(Court)
-                .values(
-                    [
-                        {
-                            "name": name,
-                            "short_code": code,
-                            "court_level": level,
-                            "jurisdiction_province": prov,
-                            "city": city,
-                            "aliases": aliases,
-                        }
-                        for name, code, level, prov, city, aliases in COURT_SEED
-                    ]
-                )
-                .on_conflict_do_nothing(index_elements=["short_code"])
-            )
+        await _seed_courts(db)
         existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:

@@ -287,9 +287,13 @@ def _apply_pls_full_text_replacement(judgment: Judgment, new_full_text: str, dat
         return
     from scraper.parsers.pls_text_encoding import classify_mojibake
 
-    judgment.quality_flag_urdu_headnote_mojibake = classify_mojibake(new_full_text) == "headnote" or bool(
-        (data or {}).get("quality_flag_urdu_headnote_mojibake")
-    )
+    kind = classify_mojibake(new_full_text)
+    if kind == "body":
+        judgment.quality_flag_urdu_headnote_mojibake = False
+    else:
+        judgment.quality_flag_urdu_headnote_mojibake = kind == "headnote" or bool(
+            (data or {}).get("quality_flag_urdu_headnote_mojibake")
+        )
 
 
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
