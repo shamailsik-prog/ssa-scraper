@@ -479,8 +479,10 @@ async def _seed_courts(db) -> None:
 
     if not COURT_SEED:
         return
-    conn = await db.connection()
-    await _pg_advisory_xact_lock(conn, PG_ADVISORY_COURT_SEED_KEY1, PG_ADVISORY_COURT_SEED_KEY2)
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+        {"k1": PG_ADVISORY_COURT_SEED_KEY1, "k2": PG_ADVISORY_COURT_SEED_KEY2},
+    )
     existing = {c.short_code: c for c in (await db.execute(select(Court))).scalars().all()}
     for name, code, level, prov, city, aliases in COURT_SEED:
         row = existing.get(code)

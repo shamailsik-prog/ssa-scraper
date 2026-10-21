@@ -66,34 +66,20 @@ import pytest_asyncio  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
 from scraper.config import settings  # noqa: E402
-import scraper.database as _database  # noqa: E402
 from scraper.database import (  # noqa: E402
     TEST_DB_ADVISORY_LOCK_ID,
     Base,
     SessionLocal,
-    connect_args,
     engine,
     init_db,
     seed_data,
 )
 from scraper.models import ScraperSource  # noqa: E402
-from tests.fixtures import FixtureServer  # noqa: E402
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
+from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
-
-# Avoid asyncpg pool connections bound to a different event loop (session init vs per-test loops).
-_test_engine = create_async_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args(),
-    poolclass=NullPool,
-    echo=settings.DATABASE_ECHO,
-)
-_database.engine = _test_engine
-_database.SessionLocal = async_sessionmaker(_test_engine, class_=AsyncSession, expire_on_commit=False)
-engine = _test_engine
-SessionLocal = _database.SessionLocal
 
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
@@ -131,13 +117,14 @@ async def clean_db():
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
 
     async def _truncate_and_seed() -> None:
+        await engine.dispose(close=False)
         async with engine.begin() as conn:
             await conn.execute(truncate_sql)
             await _ensure_judgment_case_hash_includes_unreported(conn)
         await seed_data()
 
     if worker_database_name() == "legal_scraper":
-        lock_engine = create_async_engine(admin_database_url(settings.DATABASE_URL), poolclass=NullPool)
+        lock_engine = create_async_engine(admin_database_url(settings.DATABASE_URL), poolclass=NullPool, pool_pre_ping=True)
         async with lock_engine.connect() as lock_conn:
             await lock_conn.execute(
                 text("SELECT pg_advisory_lock(:k)"),
@@ -160,11 +147,6 @@ async def clean_db():
     LOCAL_BREAKER.reset()
     reset_robots_cache()
     yield
-    try:
-        if not asyncio.get_running_loop().is_closed():
-            await engine.dispose(close=False)
-    except RuntimeError:
-        pass
 
 
 @pytest_asyncio.fixture
