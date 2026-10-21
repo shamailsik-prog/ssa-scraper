@@ -280,18 +280,25 @@ def _quote_ident(name: str) -> str:
     return '"' + name + '"'
 
 
+_ENSURE_ROLES_CONTENTION_RETRIES = 0
+
+
+def ensure_roles_contention_retry_count() -> int:
+    """Tests only: must stay 0 when cluster/xact role locks serialize concurrent callers."""
+    return _ENSURE_ROLES_CONTENTION_RETRIES
+
+
+def reset_ensure_roles_contention_retry_count_for_tests() -> None:
+    global _ENSURE_ROLES_CONTENTION_RETRIES
+    _ENSURE_ROLES_CONTENTION_RETRIES = 0
+
+
 async def ensure_roles() -> dict:
     """Create/refresh corpus_writer and sikander_reader. Idempotent; safe to call on every start."""
-    last_exc: Exception | None = None
-    for attempt in range(5):
-        try:
-            return await _ensure_roles_locked()
-        except Exception as exc:
-            if "concurrently updated" not in str(exc).lower() or attempt >= 4:
-                raise
-            last_exc = exc
-            await asyncio.sleep(0.05 * (attempt + 1))
-    raise last_exc  # pragma: no cover
+    return await _ensure_roles_locked()
+
+
+_run_ensure_roles = ensure_roles
 
 
 async def _ensure_roles_locked() -> dict:
@@ -700,9 +707,8 @@ async def embedding_identity_matches() -> bool:
     return rows.get("embedding_model") == settings.EMBEDDING_MODEL and rows.get("embedding_dim") == str(settings.EMBEDDING_DIM)
 
 
-async def init_db() -> dict:
+async def init_db(ensure_roles: bool = True) -> dict:
     """Extensions → migrations → roles → seed. Returns a status dictionary for /health."""
-    skip_roles = os.environ.get("CORPUS_INIT_SKIP_ENSURE_ROLES", "").lower() in ("1", "true", "yes")
     async with engine.connect() as lock_conn:
         await lock_conn.execute(
             text("SELECT pg_advisory_lock(:k1, :k2)"),
@@ -716,9 +722,9 @@ async def init_db() -> dict:
                 await lock_conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
             applied = await run_migrations()
             roles = (
-                {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
-                if skip_roles
-                else await ensure_roles()
+                await _run_ensure_roles()
+                if ensure_roles
+                else {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
             )
             await seed_data()
             logger.info("database initialised; migrations applied now: %s; roles: %s", applied, roles)

@@ -7,6 +7,8 @@ import re
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 CORPUS_TEST_ALLOW_UNSAFE_DATABASE = "CORPUS_TEST_ALLOW_UNSAFE_DATABASE"
+# Redis default installs expose logical databases 0–15.
+_MAX_REDIS_LOGICAL_DB = 15
 
 
 def xdist_worker_id() -> str | None:
@@ -21,7 +23,8 @@ def database_name_from_url(url: str) -> str:
 def is_safe_test_database_name(name: str) -> bool:
     if os.environ.get(CORPUS_TEST_ALLOW_UNSAFE_DATABASE, "").lower() in ("1", "true", "yes"):
         return True
-    return "test" in name.lower()
+    lower = name.lower()
+    return lower.endswith("_test") or lower.startswith("test_")
 
 
 def refuse_unsafe_database_url(url: str) -> None:
@@ -31,7 +34,7 @@ def refuse_unsafe_database_url(url: str) -> None:
     if not is_safe_test_database_name(name):
         raise RuntimeError(
             f"DATABASE_URL database {name!r} does not look like a test database "
-            f"(name must contain 'test' or set {CORPUS_TEST_ALLOW_UNSAFE_DATABASE}=1)"
+            f"(name must start with 'test_' or end with '_test', or set {CORPUS_TEST_ALLOW_UNSAFE_DATABASE}=1)"
         )
 
 
@@ -64,14 +67,27 @@ def apply_worker_database_url() -> str:
     return updated
 
 
+def redis_logical_db_index_for_worker(worker: str) -> int:
+    """Map gwN to Redis logical DB 1..15 (0 reserved for serial / controller)."""
+    m = re.match(r"gw(\d+)$", worker)
+    if not m:
+        return 0
+    index = int(m.group(1)) + 1
+    if index > _MAX_REDIS_LOGICAL_DB:
+        raise RuntimeError(
+            f"pytest-xdist worker {worker!r} needs Redis logical database {index}, "
+            f"but only 0–{_MAX_REDIS_LOGICAL_DB} are available; reduce -n or use fewer workers"
+        )
+    return index
+
+
 def apply_worker_redis_url() -> str:
     """Under xdist, use a dedicated Redis logical DB per worker to avoid cross-worker key clashes."""
     current = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     worker = xdist_worker_id()
     if not worker:
         return current
-    m = re.match(r"gw(\d+)$", worker)
-    db_index = int(m.group(1)) + 1 if m else 15
+    db_index = redis_logical_db_index_for_worker(worker)
     parsed = urlparse(current)
     updated = urlunparse(parsed._replace(path=f"/{db_index}"))
     os.environ["REDIS_URL"] = updated
@@ -150,10 +166,3 @@ async def drop_worker_databases_best_effort(database_url: str) -> None:
         pass
     finally:
         await admin_engine.dispose()
-
-
-async def drop_all_session_worker_databases_best_effort(database_url: str) -> None:
-    """Drop every worker DB recorded for this xdist worker process."""
-    for name in worker_database_names_created_this_session():
-        url = _replace_url_database(database_url, name)
-        await drop_worker_databases_best_effort(url)

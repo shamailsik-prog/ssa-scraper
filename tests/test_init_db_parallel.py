@@ -64,17 +64,15 @@ os.environ["DATABASE_URL"] = {database_url!r}
 os.environ.setdefault("DATABASE_NULL_POOL", "1")
 os.environ.setdefault("SIKANDER_READER_PASSWORD", "readerpw")
 os.environ.setdefault("CORPUS_WRITER_PASSWORD", "writerpw")
-os.environ["CORPUS_INIT_SKIP_ENSURE_ROLES"] = "1"
 from scraper.database import init_db, engine
 async def main():
-    await init_db()
+    await init_db(ensure_roles=False)
     await engine.dispose()
 asyncio.run(main())
 """
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
     env.setdefault("DATABASE_NULL_POOL", "1")
-    env["CORPUS_INIT_SKIP_ENSURE_ROLES"] = "1"
     return subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(_REPO_ROOT),
