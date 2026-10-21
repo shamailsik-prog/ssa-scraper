@@ -44,8 +44,11 @@ async def _gather_seed_data_parallel_engines(n: int) -> list[BaseException | Non
 @pytest.mark.asyncio
 async def test_concurrent_seed_data_no_unique_violations(clean_db):
     """Red on main 0580f94: parallel seed_data() after empty court table races on uq_court_*."""
-    for _ in range(_CONCURRENT_SEED_ROUNDS):
-        await _truncate_court_only()
-        results = await _gather_seed_data_parallel_engines(_PARALLEL_SEED_CALLS)
-        errors = [r for r in results if isinstance(r, BaseException)]
-        assert not errors, errors[0] if errors else None
+    try:
+        for _ in range(_CONCURRENT_SEED_ROUNDS):
+            await _truncate_court_only()
+            results = await _gather_seed_data_parallel_engines(_PARALLEL_SEED_CALLS)
+            errors = [r for r in results if isinstance(r, BaseException)]
+            assert not errors, errors[0] if errors else None
+    finally:
+        await engine.dispose(close=False)

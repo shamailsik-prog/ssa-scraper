@@ -75,7 +75,7 @@ from scraper.database import (  # noqa: E402
     seed_data,
 )
 from scraper.models import ScraperSource  # noqa: E402
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 from tests.fixtures import FixtureServer  # noqa: E402
 
@@ -104,14 +104,15 @@ def _initialised_database():
 
     asyncio.run(ensure_worker_database_exists(os.environ["DATABASE_URL"]))
     asyncio.run(init_db())
+    asyncio.run(engine.dispose())
     yield
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
-    """Truncate every table except schema_migrations, then re-seed. Per-xdist-worker databases isolate
-    parallel workers; a postgres-level advisory lock serialises truncate+seed on the shared default DB."""
-    from tests.xdist_db import admin_database_url, worker_database_name
+    """Truncate every table except schema_migrations, then re-seed. Per-xdist-worker DB names avoid
+    cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB."""
+    from tests.xdist_db import worker_database_name
 
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
@@ -123,8 +124,12 @@ async def clean_db():
             await _ensure_judgment_case_hash_includes_unreported(conn)
         await seed_data()
 
-    if worker_database_name() == "legal_scraper":
-        lock_engine = create_async_engine(admin_database_url(settings.DATABASE_URL), poolclass=NullPool, pool_pre_ping=True)
+    if worker_database_name() != "legal_scraper":
+        await _truncate_and_seed()
+    else:
+        from tests.xdist_db import admin_database_url
+
+        lock_engine = create_async_engine(admin_database_url(settings.DATABASE_URL), poolclass=NullPool)
         async with lock_engine.connect() as lock_conn:
             await lock_conn.execute(
                 text("SELECT pg_advisory_lock(:k)"),
@@ -138,8 +143,6 @@ async def clean_db():
                     {"k": TEST_DB_ADVISORY_LOCK_ID},
                 )
         await lock_engine.dispose()
-    else:
-        await _truncate_and_seed()
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache
 

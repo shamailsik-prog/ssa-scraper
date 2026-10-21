@@ -470,53 +470,53 @@ SOURCE_SEED = [
 ]
 
 
-async def _seed_courts(db) -> None:
+async def _seed_courts() -> None:
     """Insert court seed rows under a transaction advisory lock; conflicts on any unique key are ignored."""
-    from sqlalchemy import select
     from sqlalchemy.dialects.postgresql import insert
 
     from scraper.models import Court
 
     if not COURT_SEED:
         return
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
-        {"k1": PG_ADVISORY_COURT_SEED_KEY1, "k2": PG_ADVISORY_COURT_SEED_KEY2},
-    )
-    existing = {c.short_code: c for c in (await db.execute(select(Court))).scalars().all()}
-    for name, code, level, prov, city, aliases in COURT_SEED:
-        row = existing.get(code)
-        if row is None:
-            continue
-        if (row.name, row.court_level, row.city) != (name, level, city):
-            logger.warning(
-                "court seed short_code=%s already present as name=%r level=%r city=%r; "
-                "seed expects name=%r level=%r city=%r (insert skipped on conflict)",
-                code,
-                row.name,
-                row.court_level,
-                row.city,
-                name,
-                level,
-                city,
+    async with engine.begin() as conn:
+        await _pg_advisory_xact_lock(conn, PG_ADVISORY_COURT_SEED_KEY1, PG_ADVISORY_COURT_SEED_KEY2)
+        court_rows = (
+            await conn.execute(text("SELECT short_code, name, court_level, city FROM court"))
+        ).mappings().all()
+        existing = {row["short_code"]: row for row in court_rows}
+        for name, code, level, prov, city, aliases in COURT_SEED:
+            row = existing.get(code)
+            if row is None:
+                continue
+            if (row["name"], row["court_level"], row["city"]) != (name, level, city):
+                logger.warning(
+                    "court seed short_code=%s already present as name=%r level=%r city=%r; "
+                    "seed expects name=%r level=%r city=%r (insert skipped on conflict)",
+                    code,
+                    row["name"],
+                    row["court_level"],
+                    row["city"],
+                    name,
+                    level,
+                    city,
+                )
+        await conn.execute(
+            insert(Court)
+            .values(
+                [
+                    {
+                        "name": name,
+                        "short_code": code,
+                        "court_level": level,
+                        "jurisdiction_province": prov,
+                        "city": city,
+                        "aliases": aliases,
+                    }
+                    for name, code, level, prov, city, aliases in COURT_SEED
+                ]
             )
-    await db.execute(
-        insert(Court)
-        .values(
-            [
-                {
-                    "name": name,
-                    "short_code": code,
-                    "court_level": level,
-                    "jurisdiction_province": prov,
-                    "city": city,
-                    "aliases": aliases,
-                }
-                for name, code, level, prov, city, aliases in COURT_SEED
-            ]
+            .on_conflict_do_nothing()
         )
-        .on_conflict_do_nothing()
-    )
 
 
 async def seed_data() -> None:
@@ -524,8 +524,8 @@ async def seed_data() -> None:
 
     from scraper.models import ArchiveTarget, BrowserSessionSlot, Court, CorpusMetadata, ScraperSource
 
+    await _seed_courts()
     async with SessionLocal() as db:
-        await _seed_courts(db)
         existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:
