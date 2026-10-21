@@ -11,7 +11,6 @@ _SIGNATURE_LINE = re.compile(
     r".{0,60}\b(?:chief\s+justice)\s*\.?)\s*$"
 )
 _LATIN_WORD = re.compile(r"[A-Za-z]{3,}")
-_LATIN_FRAGMENT = re.compile(r"[A-Za-z]{2,}")
 _URDU_CHAR = re.compile(r"[\u0600-\u06FF]")
 AUDITOR_2026_10_18_MOJIBAKE_ROWS = 6708
 
@@ -53,8 +52,6 @@ def _line_is_strippable_headnote_tail(line: str) -> bool:
         return False
     if has_mojibake_run(line):
         words = _LATIN_WORD.findall(line)
-        if len(words) >= 1 and len(_LATIN_FRAGMENT.findall(line)) >= 2:
-            return False
         if any(len(w) >= 7 for w in words):
             return False
         if len(re.sub(r"[?\s]", "", line)) > 15:

@@ -140,8 +140,8 @@ def test_classify_single_mojibake_run_line_before_signature_is_body():
 
 
 def test_ref_prefix_post_signature_mojibake_line_is_body_and_survives_strip():
-    """R6 R4: post-signature Ref ???? + short Latin tokens (no 7+ letter word) stays body; strip keeps line."""
-    line = "Ref ???? ab cd ef gh ij kl"  # no single token >= 7 letters; mixed Latin fragments => body
+    """R6 R4: one Latin word + mojibake + 16+ other chars is body damage; strip keeps the line."""
+    line = "Ref ???? 1234567890123456"
     text = (
         "IN THE HIGH COURT OF SINDH\n"
         "The application is allowed.\n"

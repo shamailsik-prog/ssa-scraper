@@ -552,7 +552,7 @@ async def test_flag_strip_three_cycles_no_reflag(db):
     """R4 Q9: three flag→strip cycles; cycles 2–3 flag zero (red on 6790129 when flag cleared on no-op)."""
     cases = [
         "IN THE LAHORE HIGH COURT\nOrder body.\nSd/-\n?????, ????.\n",
-        "IN THE LAHORE HIGH COURT\nOrder body.\nJ.\n???? ????\n",
+        "IN THE LAHORE HIGH COURT\nOrder body.\nJ.\nRef ???? ab\n",
         "IN THE LAHORE HIGH COURT\nOrder body.\nJ.\nPage 2 ????\n",
     ]
     for idx, text in enumerate(cases):

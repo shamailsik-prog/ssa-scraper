@@ -53,6 +53,13 @@ jobs:
         run: bash scripts/guard_scan.sh
       - name: Validate auto-deploy script
         run: bash -n scripts/auto_deploy.sh
+      - name: xdist smoke (per-worker databases)
+        run: |
+          pytest -n 2 --dist loadfile -q \
+            tests/test_seed_idempotent.py \
+            tests/test_pls_quality_guards.py \
+            tests/test_pls_backfill_b4.py \
+            tests/test_unreported_promotion.py
       - name: Tests against PostgreSQL + Redis
         run: pytest -q
       - name: Validate compose file
