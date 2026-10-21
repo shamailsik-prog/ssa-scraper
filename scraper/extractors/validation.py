@@ -17,6 +17,7 @@ from scraper.extractors.deterministic import date_in_text
 from scraper.extractors.judgment_guards import detect_judgment_stub, guard_reason
 from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
+from scraper.config import settings
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
@@ -118,6 +119,7 @@ def reconcile_judgment(
     raw_html: Optional[str] = None,
     court_directory: Dict[str, str],
     min_confidence: float,
+    source_name: Optional[str] = None,
 ) -> ValidationOutcome:
     conflicts: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -247,6 +249,12 @@ def reconcile_judgment(
 
     # case title must be supported by heading / result row
     title = out.get("case_title")
+    if settings.SSA_ORDER_SHEET_TITLE and source_name == "PakistanLawSite":
+        from scraper.parsers.order_sheet_title import case_title_from_order_sheet, is_valid_order_sheet_case_title
+
+        order_title = case_title_from_order_sheet(raw_text)
+        if order_title and is_valid_order_sheet_case_title(order_title):
+            title = order_title
     if ai and ai.get("case_title") and not title:
         cand = str(ai["case_title"])
         if _norm_ws(cand)[:60] in _norm_ws(raw_text[:8000]) or _norm_ws(cand) in _norm_ws(str((deterministic.get("field_evidence") or {}).get("case_title", ""))):
@@ -254,6 +262,10 @@ def reconcile_judgment(
         else:
             conflicts.append({"field": "case_title", "ai": cand, "reason": "not supported by heading or result row"})
     out["case_title"] = title
+
+    from scraper.pls_quality_guards import apply_pls_quality_guards
+
+    apply_pls_quality_guards(out, raw_text=raw_text, source_name=source_name, errors=errors)
 
     # statutes must be found in raw text
     statutes = list(out.get("statutes_cited") or [])

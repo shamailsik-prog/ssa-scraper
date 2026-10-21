@@ -231,6 +231,14 @@ class Judgment(Base):
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(EMBEDDING_DIM))
     citation_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False, comment="Derived statistic only")
     confidence_score: Mapped[float] = mapped_column(Float, default=0.5, server_default=text("0.5"), nullable=False)
+    quality_flag_urdu_headnote_mojibake: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    headnote_stripped_full_text: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Urdu headnote ???? stripped for display/spot-check; preserved full_text bytes stay in full_text",
+    )
     extraction_engine: Mapped[Optional[str]] = mapped_column(String(40), comment="deterministic|hybrid|scrapegraph_managed|scrapegraph_local")
     promoted_at: Mapped[datetime] = _created()
     created_at: Mapped[datetime] = _created()

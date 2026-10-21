@@ -15,7 +15,13 @@ from scraper.extractors.judgment_guards import strip_leading_judgment_chrome
 from scraper.fetchers import canonical_text_hash
 from scraper.models import BrowserSessionSlot, Judgment, ScraperSource, SourceProvenance, SpotCheck, Statute, StatuteSection, StatuteSectionVersion
 from scraper.parsers.text_cleaner import clean_html
-from scraper.tasks.spot_check import check_judgments, check_statute_sections
+from scraper.tasks.spot_check import (
+    check_judgments,
+    check_statute_sections,
+    judgment_spot_check_hashes_match,
+    judgment_spot_check_live_text,
+    judgment_spot_check_stored_text,
+)
 from tests.fixtures import LOGIN_PAGE, BrowserScript, judgment_html
 from tests.test_auth_playwright import _activate, _nosleep
 
@@ -293,3 +299,85 @@ def test_status_spot_checks_carry_no_urls(client, admin_headers):
     data = client.get("/status.json").json()
     for row in data["spot_checks"]["recent"]:
         assert "source_url" not in row and "http" not in json.dumps(row).lower()
+
+
+_PLS_PAGE = (
+    "IN THE LAHORE HIGH COURT, LAHORE\nBefore J, J\n"
+    "Body text here for the spot check.\n"
+    "J.\n"
+)
+_PLS_PAGE_WITH_HEADNOTE = _PLS_PAGE + "???? ????\n"
+_PLS_PAGE_WITH_BODY_DAMAGE = _PLS_PAGE + "The court ???? holds otherwise.\n"
+
+
+def test_pls_spot_check_identical_fake_page_matches():
+    j = Judgment(
+        canonical_citation="PLS spot 1",
+        source_name="PakistanLawSite",
+        full_text=_PLS_PAGE_WITH_HEADNOTE,
+        full_text_hash=canonical_text_hash(_PLS_PAGE_WITH_HEADNOTE),
+    )
+    assert judgment_spot_check_hashes_match(j, _PLS_PAGE_WITH_HEADNOTE)
+
+
+def test_pls_spot_check_body_change_differs():
+    j = Judgment(
+        canonical_citation="PLS spot 2",
+        source_name="PakistanLawSite",
+        full_text=_PLS_PAGE_WITH_HEADNOTE,
+        full_text_hash=canonical_text_hash(_PLS_PAGE_WITH_HEADNOTE),
+    )
+    live = _PLS_PAGE_WITH_HEADNOTE.replace("Body text here", "Body text changed")
+    assert not judgment_spot_check_hashes_match(j, live)
+
+
+def test_pls_spot_check_new_latin_mojibake_after_signature_differs():
+    stored_page = _PLS_PAGE_WITH_HEADNOTE
+    j = Judgment(
+        canonical_citation="PLS spot 3",
+        source_name="PakistanLawSite",
+        full_text=stored_page,
+        full_text_hash=canonical_text_hash(stored_page),
+    )
+    assert judgment_spot_check_hashes_match(j, stored_page)
+    assert not judgment_spot_check_hashes_match(j, stored_page + "The court ???? holds otherwise.\n")
+
+
+def test_non_pls_spot_check_compares_raw_full_text():
+    raw = "Public source text with ???? runs kept verbatim.\n"
+    j = Judgment(
+        canonical_citation="Non-PLS spot",
+        source_name="PakistanCode",
+        full_text=raw,
+        full_text_hash=canonical_text_hash(raw),
+    )
+    assert judgment_spot_check_stored_text(j) == raw
+    assert judgment_spot_check_live_text(raw, j.source_name) == raw
+    assert judgment_spot_check_hashes_match(j, raw)
+
+
+def test_non_pls_spot_check_differs_when_only_mojibake_lines_change():
+    """R4 Q11: non-PLS compares raw text; ???? tail change must not match."""
+    raw = "Public source text.\nLine two.\n"
+    j = Judgment(
+        canonical_citation="Non-PLS mojibake drift",
+        source_name="PakistanCode",
+        full_text=raw,
+        full_text_hash=canonical_text_hash(raw),
+    )
+    live = raw + "???? ????\n"
+    assert judgment_spot_check_hashes_match(j, raw)
+    assert not judgment_spot_check_hashes_match(j, live)
+
+
+def test_pls_spot_check_ignores_post_signature_urdu_headnote_churn():
+    """R4 ruling: cosmetic Urdu/mojibake tail after signature still matches stored hash."""
+    stored = _PLS_PAGE_WITH_HEADNOTE
+    j = Judgment(
+        canonical_citation="PLS headnote churn",
+        source_name="PakistanLawSite",
+        full_text=stored,
+        full_text_hash=canonical_text_hash(stored),
+    )
+    live = _PLS_PAGE + "???? ???? ????\n???? ????????\n"
+    assert judgment_spot_check_hashes_match(j, live)

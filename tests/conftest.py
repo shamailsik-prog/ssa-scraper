@@ -113,9 +113,10 @@ async def clean_db():
 
 
 @pytest_asyncio.fixture
-async def db():
+async def db(clean_db):
     async with SessionLocal() as session:
         yield session
+        await session.rollback()
 
 
 @pytest_asyncio.fixture

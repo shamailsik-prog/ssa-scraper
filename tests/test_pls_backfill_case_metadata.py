@@ -33,7 +33,7 @@ The facts are these.
     )
     db.add(j)
     await db.commit()
-    counts = await backfill_case_metadata(db, batch=10, limit=1)
+    counts = await backfill_case_metadata(db, batch=10, limit=1, dry_run=False)
     await db.commit()
     assert counts["docket_number"] == 1
     refreshed = (await db.execute(select(Judgment).where(Judgment.id == j.id))).scalars().one()

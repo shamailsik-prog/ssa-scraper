@@ -46,11 +46,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     remap.add_argument("--dry-run", action="store_true")
     meta = sub.add_parser("backfill-metadata", help="Fill docket/petitioner/respondent/headnotes from the preserved text (only where empty)")
-    meta.add_argument("--dry-run", action="store_true")
+    meta.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     meta.add_argument("--limit", type=int, default=None)
+    titles = sub.add_parser(
+        "backfill-order-sheet-titles",
+        help="Rewrite PakistanLawSite case_title from order-sheet header parties (dry-run by default)",
+    )
+    titles.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    titles.add_argument("--limit", type=int, default=None)
+    pld = sub.add_parser("backfill-pld-citations", help="Relabel primary PLD citations missing a court token (dry-run by default)")
+    pld.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    pld.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
-    req.add_argument("--dry-run", action="store_true")
+    req.add_argument("--apply", action="store_true", help="Promote/write changes (default is dry-run)")
     req.add_argument("--limit", type=int, default=2000)
+    strip = sub.add_parser(
+        "strip-urdu-headnote-mojibake",
+        help="Strip flagged Urdu headnote ???? lines from preserved PLS text (dry-run by default)",
+    )
+    strip.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    strip.add_argument("--limit", type=int, default=None)
+    flag = sub.add_parser(
+        "backfill-flag-urdu-headnote-mojibake",
+        help="Set quality_flag_urdu_headnote_mojibake on PLS rows with headnote-only ???? (dry-run by default)",
+    )
+    flag.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    flag.add_argument("--limit", type=int, default=None)
     sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
     args = parser.parse_args(argv)
     if args.command == "reset-retired-frontier-no-reason":
@@ -73,12 +94,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-metadata":
         from scraper.tasks.pls_backfill import run_backfill_metadata
 
-        print(run_async(run_backfill_metadata(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_backfill_metadata(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "backfill-order-sheet-titles":
+        from scraper.tasks.pls_backfill import run_backfill_order_sheet_titles
+
+        print(run_async(run_backfill_order_sheet_titles(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "backfill-pld-citations":
+        from scraper.tasks.pls_backfill import run_backfill_pld_citations
+
+        print(run_async(run_backfill_pld_citations(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
 
-        print(run_async(run_requalify(dry_run=args.dry_run, limit=args.limit)))
+        print(run_async(run_requalify(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "strip-urdu-headnote-mojibake":
+        from scraper.tasks.pls_backfill import run_strip_urdu_headnote_mojibake
+
+        print(run_async(run_strip_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "backfill-flag-urdu-headnote-mojibake":
+        from scraper.tasks.pls_backfill import run_backfill_flag_urdu_headnote_mojibake
+
+        print(run_async(run_backfill_flag_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
         return 0
     if args.command == "grid-report":
         import json

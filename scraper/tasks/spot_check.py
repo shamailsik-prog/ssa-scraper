@@ -61,6 +61,36 @@ def _similarity(a: str, b: str, limit: int = 4000) -> float:
     return round(difflib.SequenceMatcher(None, a[:limit], b[:limit]).ratio(), 3)
 
 
+def judgment_spot_check_stored_text(j: Judgment) -> str:
+    """Text used for spot-check hash comparison.
+
+    PakistanLawSite: compares via ``headnote_stripped_full_text`` or ``strip_mojibake_headnote_lines`` on
+    ``full_text``. Genuine Urdu headnote lines after the judge's signature are intentionally ignored
+    (same per-line rule as strip/classify) so cosmetic headnote churn on the live site does not surface
+    as corpus drift. Latin-plus-mojibake body damage, substantive post-signature lines, and
+    pre-signature text still affect the hash. Other sources compare raw ``full_text`` verbatim.
+    """
+    from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
+
+    if (j.source_name or "") == "PakistanLawSite":
+        return j.headnote_stripped_full_text or strip_mojibake_headnote_lines(j.full_text or "")
+    return j.full_text or ""
+
+
+def judgment_spot_check_live_text(text: str, source_name: Optional[str]) -> str:
+    from scraper.parsers.pls_text_encoding import strip_mojibake_headnote_lines
+
+    if (source_name or "") == "PakistanLawSite":
+        return strip_mojibake_headnote_lines(text)
+    return text
+
+
+def judgment_spot_check_hashes_match(j: Judgment, live_text: str) -> bool:
+    stored = judgment_spot_check_stored_text(j)
+    live = judgment_spot_check_live_text(live_text, j.source_name)
+    return canonical_text_hash(live) == canonical_text_hash(stored)
+
+
 def _record(db, *, kind: str, label: str, url: Optional[str], result: str, detail: str, similarity: Optional[float] = None, record_id=None) -> SpotCheck:
     row = SpotCheck(kind=kind, label=label[:300], source_url=(url or "")[:1000] or None, result=result, detail=detail[:1000], similarity=similarity, record_id=record_id)
     db.add(row)
@@ -140,15 +170,17 @@ async def _check_judgments_on_browser(db, pipeline, browser, slot, rows) -> List
         if modal_text:
             text = modal_text
         text = strip_leading_judgment_chrome(text)
+        text = judgment_spot_check_live_text(text, j.source_name)
+        stored_body = judgment_spot_check_stored_text(j)
         live_hash = canonical_text_hash(text)
-        stored_hash = j.full_text_hash or canonical_text_hash(j.full_text or "")
+        stored_hash = canonical_text_hash(stored_body)
         citation_seen = _norm(j.canonical_citation).lower() in _norm(page.html).lower() or _norm(j.canonical_citation).lower() in _norm(text).lower()
         if live_hash == stored_hash and citation_seen:
             result, detail, sim = "match", "stored full text is exactly what the site shows and the citation is on the page", 1.0
         elif live_hash == stored_hash:
             result, detail, sim = "differs", "the text matches but the stored citation is not on the page (the URL may now serve another document)", 1.0
         else:
-            sim = _similarity(_norm(text), _norm(j.full_text or ""))
+            sim = _similarity(_norm(text), _norm(stored_body))
             result = "differs"
             detail = f"live text differs from the stored text (similarity {sim:.3f}; live {len(_norm(text))} chars, stored {len(_norm(j.full_text or ''))} chars)" + ("" if citation_seen else "; citation string not seen on the page")
         _record(db, kind="judgment", label=label, url=j.source_url, result=result, detail=detail, similarity=sim, record_id=j.id)

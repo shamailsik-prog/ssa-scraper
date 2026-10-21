@@ -23,6 +23,10 @@ Then apply, in order:
 5. `022_statute_section_refetch_flags` (B3 quality/refetch flags on `statute`; no row deletion)
 6. `023_statute_name_lower_index` (functional index on `lower(name)`)
 7. `024_statute_canonical_name_key` (indexed `canonical_name_key` + backfill)
+8. `025_judgment_urdu_headnote_quality_flag` (B4: `quality_flag_urdu_headnote_mojibake` on `judgment`)
+9. `026_judgment_headnote_stripped_text` (B4: `headnote_stripped_full_text` overlay column)
+
+Migrations **025** and **026** each run `SET LOCAL lock_timeout = '2s'` inside the migration body, which **overrides** the `30s` session `lock_timeout` shown above for those steps only. If DDL hits `lock_timeout`, retry after draining harvest (see `docs/HARDENING_LAYERS.md`, migrations 025–026 note).
 
 Use the project’s normal migration runner (`run_migrations` / deploy script). Never downgrade 019 while `judgment_identity_link` or `judgment_identity_review` contain rows.
 
