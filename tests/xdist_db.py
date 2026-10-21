@@ -38,6 +38,24 @@ def refuse_unsafe_database_url(url: str) -> None:
         )
 
 
+def refuse_unsafe_worker_database_name(base: str, worker_db: str) -> None:
+    """Refuse derived xdist DB names that would point at a non-test base (e.g. legal_scraper_gw0)."""
+    if not is_safe_test_database_name(base):
+        raise RuntimeError(
+            f"DATABASE_URL database {base!r} does not look like a test database "
+            f"(name must start with 'test_' or end with '_test', or set {CORPUS_TEST_ALLOW_UNSAFE_DATABASE}=1)"
+        )
+    if worker_db == base:
+        return
+    worker = xdist_worker_id()
+    expected = worker_database_name(base) if worker else base
+    if worker_db != expected:
+        raise RuntimeError(
+            f"Derived worker database {worker_db!r} does not match expected name {expected!r} "
+            f"for test base {base!r}"
+        )
+
+
 def worker_database_name(base: str) -> str:
     worker = xdist_worker_id()
     if not worker:
@@ -62,21 +80,33 @@ def apply_worker_database_url() -> str:
     base = database_name_from_url(current)
     if not xdist_worker_id():
         return current
-    updated = _replace_url_database(current, worker_database_name(base))
+    worker_db = worker_database_name(base)
+    refuse_unsafe_worker_database_name(base, worker_db)
+    updated = _replace_url_database(current, worker_db)
     os.environ["DATABASE_URL"] = updated
     return updated
 
 
-def redis_logical_db_index_for_worker(worker: str) -> int:
-    """Map gwN to Redis logical DB 1..15 (0 reserved for serial / controller)."""
-    m = re.match(r"gw(\d+)$", worker)
-    if not m:
+def redis_url_db_index(redis_url: str) -> int:
+    path = urlparse(redis_url).path
+    if not path or path == "/":
         return 0
-    index = int(m.group(1)) + 1
+    return int(path.lstrip("/"))
+
+
+def redis_logical_db_index_for_worker(worker: str, redis_url: str) -> int:
+    """Map gwN to base+1+N where base is the REDIS_URL logical DB index."""
+    m = re.match(r"^gw(\d+)$", worker)
+    if not m:
+        raise RuntimeError(
+            f"pytest-xdist worker id {worker!r} is not gwN; cannot assign an isolated Redis logical database"
+        )
+    n = int(m.group(1))
+    index = redis_url_db_index(redis_url) + 1 + n
     if index > _MAX_REDIS_LOGICAL_DB:
         raise RuntimeError(
-            f"pytest-xdist worker {worker!r} needs Redis logical database {index}, "
-            f"but only 0–{_MAX_REDIS_LOGICAL_DB} are available; reduce -n or use fewer workers"
+            f"pytest-xdist worker {worker!r} needs Redis logical database {index} "
+            f"(base {redis_url_db_index(redis_url)} + 1 + {n}), but only 0–{_MAX_REDIS_LOGICAL_DB} are available"
         )
     return index
 
@@ -87,7 +117,7 @@ def apply_worker_redis_url() -> str:
     worker = xdist_worker_id()
     if not worker:
         return current
-    db_index = redis_logical_db_index_for_worker(worker)
+    db_index = redis_logical_db_index_for_worker(worker, current)
     parsed = urlparse(current)
     updated = urlunparse(parsed._replace(path=f"/{db_index}"))
     os.environ["REDIS_URL"] = updated

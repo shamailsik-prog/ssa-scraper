@@ -38,6 +38,14 @@ def test_apply_worker_database_url_xdist_rewrites(monkeypatch):
     assert os.environ["DATABASE_URL"] == out
 
 
+def test_apply_worker_database_url_xdist_rejects_unsafe_base(monkeypatch):
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    monkeypatch.delenv(xdist_db.CORPUS_TEST_ALLOW_UNSAFE_DATABASE, raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper")
+    with pytest.raises(RuntimeError, match="does not look like a test database"):
+        xdist_db.apply_worker_database_url()
+
+
 def test_apply_worker_database_url_raises_for_production_db_name(monkeypatch):
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     monkeypatch.delenv(xdist_db.CORPUS_TEST_ALLOW_UNSAFE_DATABASE, raising=False)
@@ -77,6 +85,23 @@ def test_apply_worker_redis_url_xdist_uses_distinct_db(monkeypatch):
     assert out.endswith("/4")
 
 
-def test_redis_logical_db_rejects_overflow_worker(monkeypatch):
+def test_redis_logical_db_uses_base_plus_one_plus_worker_index():
+    assert xdist_db.redis_logical_db_index_for_worker("gw3", "redis://localhost:6379/0") == 4
+    assert xdist_db.redis_logical_db_index_for_worker("gw0", "redis://localhost:6379/2") == 3
+
+
+def test_redis_logical_db_rejects_non_gw_worker_id():
+    with pytest.raises(RuntimeError, match="not gwN"):
+        xdist_db.redis_logical_db_index_for_worker("worker_a", "redis://localhost:6379/0")
+
+
+def test_redis_logical_db_rejects_overflow_worker():
     with pytest.raises(RuntimeError, match="only 0–15"):
-        xdist_db.redis_logical_db_index_for_worker("gw15")
+        xdist_db.redis_logical_db_index_for_worker("gw15", "redis://localhost:6379/0")
+
+
+def test_apply_worker_redis_url_respects_redis_url_base(monkeypatch):
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/2")
+    out = xdist_db.apply_worker_redis_url()
+    assert out.endswith("/4")

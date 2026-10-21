@@ -1,4 +1,4 @@
-"""R4: concurrent ensure_roles must serialize via advisory locks (no contention retries)."""
+"""R4/R5: concurrent ensure_roles must serialize via advisory locks (no pg_authid contention)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from scraper.database import ensure_roles_contention_retry_count, reset_ensure_roles_contention_retry_count_for_tests
+from scraper.database import ensure_roles_contention_event_count, reset_ensure_roles_contention_event_count_for_tests
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _PARALLEL_ENSURE_ROLES = 8
@@ -23,11 +23,11 @@ import os
 os.environ.setdefault("DATABASE_NULL_POOL", "1")
 os.environ.setdefault("SIKANDER_READER_PASSWORD", "readerpw")
 os.environ.setdefault("CORPUS_WRITER_PASSWORD", "writerpw")
-from scraper.database import ensure_roles, engine, ensure_roles_contention_retry_count
+from scraper.database import ensure_roles, engine, ensure_roles_contention_event_count
 async def main():
     await ensure_roles()
     await engine.dispose()
-    print("RETRIES=" + str(ensure_roles_contention_retry_count()))
+    print("CONTENTION=" + str(ensure_roles_contention_event_count()))
 asyncio.run(main())
 """
     env = os.environ.copy()
@@ -43,13 +43,13 @@ asyncio.run(main())
 
 
 @pytest.mark.asyncio
-async def test_eight_parallel_ensure_roles_zero_contention_retries():
-    reset_ensure_roles_contention_retry_count_for_tests()
+async def test_eight_parallel_ensure_roles_zero_contention_events():
+    reset_ensure_roles_contention_event_count_for_tests()
     results = await asyncio.gather(
         *[asyncio.to_thread(_ensure_roles_subprocess) for _ in range(_PARALLEL_ENSURE_ROLES)]
     )
     codes = [code for code, _ in results]
     assert codes == [0] * _PARALLEL_ENSURE_ROLES
     for _, output in results:
-        assert "RETRIES=0" in output
-    assert ensure_roles_contention_retry_count() == 0
+        assert "CONTENTION=0" in output
+    assert ensure_roles_contention_event_count() == 0
