@@ -46,6 +46,17 @@ def test_apply_worker_database_url_xdist_rejects_unsafe_base(monkeypatch):
         xdist_db.apply_worker_database_url()
 
 
+def test_rolecheck_database_name_allowed_when_base_is_test_db():
+    xdist_db.refuse_unsafe_database_url("postgresql://localhost/legal_scraper_test_rolecheck_deadbeef0123")
+
+
+def test_refuse_unsafe_worker_database_rejects_tampered_derived_name(monkeypatch):
+    """Mutant E1: derived name must match worker_database_name(base), not an arbitrary suffix."""
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    with pytest.raises(RuntimeError, match="does not match expected"):
+        xdist_db.refuse_unsafe_worker_database_name("legal_scraper_test", "legal_scraper_test_gw0_evil")
+
+
 def test_apply_worker_database_url_raises_for_production_db_name(monkeypatch):
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     monkeypatch.delenv(xdist_db.CORPUS_TEST_ALLOW_UNSAFE_DATABASE, raising=False)

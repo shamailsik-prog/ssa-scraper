@@ -71,15 +71,12 @@ jobs:
           DROP ROLE IF EXISTS corpus_writer;
           DROP ROLE IF EXISTS sikander_reader;
           SQL
-          pytest -n 4 --dist loadfile -q \
-            tests/test_settings_and_roles.py \
-            tests/test_xdist_worker_roles.py \
-            tests/test_seed_idempotent.py
+          DB_LOCK_ON_CATALOG=1 pytest -n 4 --dist loadfile -q
       - name: Tests against PostgreSQL + Redis
         run: pytest -q
       - name: xdist smoke (per-worker databases)
         run: |
-          pytest -n 2 --dist loadfile -q \
+          DB_LOCK_ON_CATALOG=1 pytest -n 2 --dist loadfile -q \
             tests/test_seed_idempotent.py \
             tests/test_pls_quality_guards.py \
             tests/test_pls_backfill_b4.py \

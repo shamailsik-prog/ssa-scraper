@@ -23,6 +23,9 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 # asyncpg connections are bound to the event loop that opened them; pytest-asyncio uses a
 # function-scoped loop, so pooled connections must not be reused across tests.
 os.environ.setdefault("DATABASE_NULL_POOL", "1")
+# xdist workers use per-worker DBs; session advisory locks must serialize on postgres (see database.py).
+if os.environ.get("PYTEST_XDIST_WORKER"):
+    os.environ.setdefault("DB_LOCK_ON_CATALOG", "1")
 
 from tests.xdist_db import (  # noqa: E402
     apply_worker_database_url,

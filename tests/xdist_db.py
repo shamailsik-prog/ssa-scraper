@@ -24,7 +24,11 @@ def is_safe_test_database_name(name: str) -> bool:
     if os.environ.get(CORPUS_TEST_ALLOW_UNSAFE_DATABASE, "").lower() in ("1", "true", "yes"):
         return True
     lower = name.lower()
-    return lower.endswith("_test") or lower.startswith("test_")
+    if lower.endswith("_test") or lower.startswith("test_"):
+        return True
+    if "_rolecheck_" in lower:
+        return is_safe_test_database_name(lower.split("_rolecheck_", 1)[0])
+    return False
 
 
 def refuse_unsafe_database_url(url: str) -> None:
