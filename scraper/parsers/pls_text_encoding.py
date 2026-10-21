@@ -52,9 +52,9 @@ def _line_is_strippable_headnote_tail(line: str) -> bool:
     if _line_latin_plus_mojibake(line):
         return False
     if has_mojibake_run(line):
-        if len(_LATIN_FRAGMENT.findall(line)) >= 2:
-            return False
         words = _LATIN_WORD.findall(line)
+        if len(words) >= 1 and len(_LATIN_FRAGMENT.findall(line)) >= 2:
+            return False
         if any(len(w) >= 7 for w in words):
             return False
         if len(re.sub(r"[?\s]", "", line)) > 15:

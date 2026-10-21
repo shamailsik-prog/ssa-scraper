@@ -127,7 +127,11 @@ async def clean_db():
     LOCAL_BREAKER.reset()
     reset_robots_cache()
     yield
-    await engine.dispose(close=False)
+    try:
+        if not asyncio.get_running_loop().is_closed():
+            await engine.dispose(close=False)
+    except RuntimeError:
+        pass
 
 
 @pytest_asyncio.fixture
