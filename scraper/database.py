@@ -375,6 +375,24 @@ def _pg_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+async def _grant_roles_connect_on_current_database() -> dict:
+    """Grant CONNECT on the active database only (no password rotation). Used when cluster roles already exist."""
+    status = {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
+    reader_pw = settings.SIKANDER_READER_PASSWORD.get_secret_value()
+    writer_pw = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
+    async with engine.begin() as conn:
+        dbname = (await conn.execute(text("SELECT current_database()"))).scalar()
+        if writer_pw:
+            role = _quote_ident(settings.CORPUS_WRITER_ROLE)
+            await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
+            status["writer"] = "CONFIGURED"
+        if reader_pw:
+            role = _quote_ident(settings.SIKANDER_READER_ROLE)
+            await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
+            status["reader"] = "CONFIGURED"
+    return status
+
+
 # --------------------------------------------------------------------------- seed
 COURT_SEED = [
     ("Supreme Court of Pakistan", "SC", "supreme_court", "Federal", "Islamabad", ["Supreme Court", "S.C.", "SCP"]),
@@ -721,11 +739,10 @@ async def init_db(ensure_roles: bool = True) -> dict:
                 await lock_conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
                 await lock_conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
             applied = await run_migrations()
-            roles = (
-                await _run_ensure_roles()
-                if ensure_roles
-                else {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
-            )
+            if ensure_roles:
+                roles = await _run_ensure_roles()
+            else:
+                roles = await _grant_roles_connect_on_current_database()
             await seed_data()
             logger.info("database initialised; migrations applied now: %s; roles: %s", applied, roles)
             return {"migrations_applied": applied, "roles": roles}

@@ -115,7 +115,11 @@ def _initialised_database():
     )
 
     asyncio.run(ensure_worker_database_exists(os.environ["DATABASE_URL"]))
-    asyncio.run(init_db())
+    from tests.xdist_db import xdist_worker_id
+
+    # Cluster-wide role passwords are rotated once (gw0); other xdist workers only need CONNECT grants.
+    worker = xdist_worker_id()
+    asyncio.run(init_db(ensure_roles=worker is None or worker == "gw0"))
     asyncio.run(engine.dispose())
     yield
     asyncio.run(drop_worker_databases_best_effort(os.environ["DATABASE_URL"]))
