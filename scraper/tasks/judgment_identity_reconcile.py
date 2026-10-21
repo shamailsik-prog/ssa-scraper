@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import SessionLocal, run_async
+from scraper.fetchers import canonical_text_hash
 from scraper.models import Judgment, JudgmentIdentityLink, JudgmentIdentityReview
 from scraper.tasks.promotion import judgment_exact_identity_matches, normalize_docket_key
 
@@ -125,8 +126,15 @@ async def link_exact_identity(
         decision_date=rep.decision_date,
     ):
         raise ValueError("exact identity does not match")
-    if not unrep.full_text_hash or unrep.full_text_hash != rep.full_text_hash:
-        raise ValueError("full text hash must match for reported/unreported link")
+    if (
+        not unrep.full_text
+        or not rep.full_text
+        or not unrep.full_text_hash
+        or unrep.full_text_hash != rep.full_text_hash
+        or canonical_text_hash(unrep.full_text) != unrep.full_text_hash
+        or canonical_text_hash(rep.full_text) != rep.full_text_hash
+    ):
+        raise ValueError("full text hash must match persisted full text for reported/unreported link")
     exists = (
         await db.execute(
             select(JudgmentIdentityLink).where(
