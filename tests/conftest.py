@@ -131,7 +131,6 @@ async def clean_db():
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
 
     async def _truncate_and_seed() -> None:
-        await engine.dispose(close=False)
         async with engine.begin() as conn:
             await conn.execute(truncate_sql)
             await _ensure_judgment_case_hash_includes_unreported(conn)
