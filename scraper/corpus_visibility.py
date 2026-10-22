@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from sqlalchemy import ColumnElement, exists, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.models import DocumentQuarantine, Judgment, Statute
 
@@ -26,3 +29,15 @@ def statute_servable() -> ColumnElement[bool]:
             DocumentQuarantine.doc_id == Statute.id,
         )
     )
+
+
+async def is_document_quarantined(db: AsyncSession, doc_type: str, doc_id: UUID) -> bool:
+    row = (
+        await db.execute(
+            select(DocumentQuarantine.doc_id).where(
+                DocumentQuarantine.doc_type == doc_type,
+                DocumentQuarantine.doc_id == doc_id,
+            ).limit(1)
+        )
+    ).first()
+    return row is not None

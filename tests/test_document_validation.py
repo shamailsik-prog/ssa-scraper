@@ -29,6 +29,21 @@ def test_validate_statute_rejects_section_rows_without_text():
     assert reason == "empty_statute_sections"
 
 
+def test_validate_statute_rejects_mixed_parseable_and_blank_section_rows():
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "Foo Act",
+            "sections": [
+                {"section_number": "1", "section_text": "Body text here."},
+                {"section_number": "2", "section_text": "  "},
+            ],
+        },
+        raw_text="",
+    )
+    assert not ok
+    assert reason == "empty_statute_sections"
+
+
 def test_validate_statute_accepts_parseable_section():
     ok, reason = validate_statute_reconciled_json(
         {"statute_name": "Foo Act", "sections": [{"section_number": "1", "section_text": "Body text here."}]},

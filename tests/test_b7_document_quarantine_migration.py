@@ -86,6 +86,20 @@ async def test_migration_027_document_quarantine_on_prod_shaped_schema():
             )
         ).scalars().all()
         assert pk == ["doc_type", "doc_id"]
+        pk_name = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT c.conname
+                    FROM pg_constraint c
+                    JOIN pg_class t ON t.oid = c.conrelid
+                    WHERE t.relname = 'document_quarantine' AND c.contype = 'p'
+                    LIMIT 1
+                    """
+                )
+            )
+        ).scalar()
+        assert pk_name == "pk_document_quarantine"
 
         await mig.downgrade(conn)
         assert not await _table_exists(conn, "document_quarantine")

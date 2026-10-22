@@ -14,10 +14,9 @@ async def upgrade(conn) -> None:
                 doc_type VARCHAR(20) NOT NULL,
                 doc_id UUID NOT NULL,
                 reason VARCHAR(500) NOT NULL,
-                prior_reason VARCHAR(500),
                 run_id VARCHAR(64) NOT NULL,
                 quarantined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (doc_type, doc_id)
+                CONSTRAINT pk_document_quarantine PRIMARY KEY (doc_type, doc_id)
             )
             """
         )

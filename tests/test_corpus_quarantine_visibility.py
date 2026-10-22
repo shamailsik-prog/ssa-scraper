@@ -60,7 +60,6 @@ async def _seed_visible_and_quarantined(db):
             doc_type="judgment",
             doc_id=hidden.id,
             reason="b7_bad_document:empty_or_short_text",
-            prior_reason=None,
             run_id="seed-run",
         )
     )
@@ -74,7 +73,6 @@ async def _seed_visible_and_quarantined(db):
             doc_type="statute",
             doc_id=bad_statute.id,
             reason="b7_bad_document:no_parseable_sections",
-            prior_reason=None,
             run_id="seed-run",
         )
     )

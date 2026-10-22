@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from scraper.corpus_visibility import is_document_quarantined, judgment_servable, statute_servable
 from scraper.database import get_db
 from scraper.models import (
     Citation,
@@ -70,6 +71,7 @@ async def corpus_summary(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
     )
     sec_empty = sections - sec_with
 
+    # Staging status breakdowns intentionally include quarantined/failed rows (operator visibility).
     staging_j = {
         str(status): int(n)
         for status, n in (
@@ -253,6 +255,7 @@ async def list_judgments(
         filters.append(Judgment.full_text.isnot(None))
         filters.append(func.length(func.btrim(Judgment.full_text)) > 0)
 
+    filters.append(judgment_servable())
     count_q = select(func.count()).select_from(Judgment)
     list_q = select(Judgment)
     for f in filters:
@@ -325,6 +328,7 @@ async def get_judgment(judgment_id: UUID, db: AsyncSession = Depends(get_db)) ->
     j = (await db.execute(select(Judgment).where(Judgment.id == judgment_id))).scalars().first()
     if j is None:
         raise HTTPException(404, "judgment not found")
+    quarantined = await is_document_quarantined(db, "judgment", j.id)
     cites = (
         await db.execute(select(Citation).where(Citation.judgment_id == judgment_id).order_by(Citation.is_primary.desc()))
     ).scalars().all()
@@ -346,6 +350,7 @@ async def get_judgment(judgment_id: UUID, db: AsyncSession = Depends(get_db)) ->
         }
     return {
         "reading": reading,
+        "is_quarantined": quarantined,
         "id": str(j.id),
         "citation": j.canonical_citation,
         "title": j.case_title,
@@ -398,8 +403,13 @@ async def list_citations(
     if reporter:
         filters.append(Citation.reporter == reporter)
 
-    base = select(Citation, Judgment).join(Judgment, Judgment.id == Citation.judgment_id)
-    count_base = select(func.count()).select_from(Citation).join(Judgment, Judgment.id == Citation.judgment_id)
+    base = select(Citation, Judgment).join(Judgment, Judgment.id == Citation.judgment_id).where(judgment_servable())
+    count_base = (
+        select(func.count())
+        .select_from(Citation)
+        .join(Judgment, Judgment.id == Citation.judgment_id)
+        .where(judgment_servable())
+    )
     for f in filters:
         base = base.where(f)
         count_base = count_base.where(f)
@@ -437,6 +447,7 @@ async def get_citation(citation_id: UUID, db: AsyncSession = Depends(get_db)) ->
     if row is None:
         raise HTTPException(404, "citation not found")
     c, j = row
+    quarantined = await is_document_quarantined(db, "judgment", j.id)
     return {
         "id": str(c.id),
         "citation_string": c.citation_string,
@@ -448,6 +459,7 @@ async def get_citation(citation_id: UUID, db: AsyncSession = Depends(get_db)) ->
         "is_primary": c.is_primary,
         "source_evidence": c.source_evidence,
         "judgment": {
+            "is_quarantined": quarantined,
             "id": str(j.id),
             "citation": j.canonical_citation,
             "title": j.case_title,
@@ -492,6 +504,7 @@ async def list_statutes(
         filters.append(Statute.source_name == source)
     if with_sections_only:
         filters.append(func.coalesce(sec_stats.c.section_count, 0) > 0)
+    filters.append(statute_servable())
 
     list_q = select(Statute, sec_stats.c.section_count, sec_stats.c.sections_with_text).outerjoin(
         sec_stats, sec_stats.c.statute_id == Statute.id
@@ -529,6 +542,7 @@ async def get_statute(
     st = (await db.execute(select(Statute).where(Statute.id == statute_id))).scalars().first()
     if st is None:
         raise HTTPException(404, "statute not found")
+    quarantined = await is_document_quarantined(db, "statute", st.id)
     rows = (
         await db.execute(
             select(StatuteSection, StatuteSectionVersion)
@@ -563,6 +577,7 @@ async def get_statute(
         "is_repealed": st.is_repealed,
         "source_name": st.source_name,
         "source_url": st.source_url,
+        "is_quarantined": quarantined,
         "section_count": len(sections),
         "sections_with_text": sum(1 for s in sections if s["has_body"]),
         "sections": sections,

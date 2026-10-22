@@ -37,6 +37,28 @@ async def test_promotion_quarantines_short_judgment_with_document_validation(db)
 
 
 @pytest.mark.asyncio
+async def test_promotion_quarantines_statute_with_sections_but_no_parseable_text_at_gate(db):
+    """V4b: non-empty sections[] that fail validate_statute_reconciled_json at promotion.py ~2252."""
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Mixed Sections Act, 2024",
+            "year_enacted": 2024,
+            "jurisdiction": "Federal",
+            "sections": [
+                {"section_number": "1", "section_text": "Valid section body for promotion gate."},
+                {"section_number": "2", "section_text": "   "},
+            ],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "quarantined"
+    assert (st.quarantine_reason or "").startswith("document_validation:empty_statute_sections")
+    from scraper.models import Statute
+
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
+
+
+@pytest.mark.asyncio
 async def test_promotion_quarantines_sectionless_statute_with_document_validation(db):
     st = await _make_statute_staging(
         db,

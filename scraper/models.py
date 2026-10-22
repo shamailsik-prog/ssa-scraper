@@ -757,7 +757,6 @@ class DocumentQuarantine(Base):
     doc_type: Mapped[str] = mapped_column(String(20), nullable=False, comment="statute|judgment")
     doc_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
-    prior_reason: Mapped[Optional[str]] = mapped_column(String(500))
     run_id: Mapped[str] = mapped_column(String(64), nullable=False)
     quarantined_at: Mapped[datetime] = _created()
 

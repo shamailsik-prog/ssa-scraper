@@ -263,22 +263,6 @@ async def ensure_statute_canonical_name_key_index_valid() -> None:
             )
 
 
-async def ensure_document_quarantine_table() -> bool:
-    """Create document_quarantine when missing (e.g. test DB recorded legacy 027_corpus_quarantine_flags)."""
-    async with engine.begin() as conn:
-        reg = (await conn.execute(text("SELECT to_regclass('public.document_quarantine')"))).scalar()
-        if reg:
-            return False
-        module = importlib.import_module("migrations.027_document_quarantine")
-        await module.upgrade(conn)
-        await conn.execute(
-            text("INSERT INTO schema_migrations(version) VALUES (:v) ON CONFLICT DO NOTHING"),
-            {"v": "027_document_quarantine"},
-        )
-        logger.info("document_quarantine table ensured (legacy migration path)")
-        return True
-
-
 async def run_migrations() -> List[str]:
     """Apply every migrations/NNN_*.py whose version is not yet recorded. Returns the list applied."""
     await ensure_statute_canonical_name_key_index_valid()
@@ -829,8 +813,6 @@ async def _init_db_work(ensure_roles: bool) -> dict:
             await lock_conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
             await lock_conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
     applied = await run_migrations()
-    if await ensure_document_quarantine_table():
-        applied = list(applied) + ["027_document_quarantine"]
     roles = (
         await _run_ensure_roles()
         if ensure_roles

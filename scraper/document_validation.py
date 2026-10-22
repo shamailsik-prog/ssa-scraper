@@ -39,6 +39,7 @@ def validate_statute_reconciled_json(data: Optional[Dict[str, Any]], *, raw_text
     payload = data or {}
     name = (payload.get("statute_name") or "").strip()
     sections = payload.get("sections") or []
+    dict_sections = [s for s in sections if isinstance(s, dict)]
     parseable = _parseable_sections(sections)
     text = (raw_text or "").strip()
     if not parseable:
@@ -46,6 +47,8 @@ def validate_statute_reconciled_json(data: Optional[Dict[str, Any]], *, raw_text
             return False, "empty_statute_sections"
         if not text or len(text) < 80:
             return False, "empty_statute_text"
+        return False, "empty_statute_sections"
+    if dict_sections and len(parseable) < len(dict_sections):
         return False, "empty_statute_sections"
     return True, ""
 

@@ -25,6 +25,10 @@ JUDGMENT_QUARANTINE_REASON = "b7_bad_document:empty_or_short_text"
 MIN_JUDGMENT_TEXT_CHARS = 140
 LATEST_RUN_KEY = "b7_quarantine_latest_run_id"
 
+
+def _undo_prior_latest_key(run_id: str) -> str:
+    return f"b7_quarantine_undo:{run_id}:prior_latest"
+
 # Documented criteria for prod dry-run (read-only; no corpus_quarantined).
 BAD_STATUTE_COUNT_SQL = """
 SELECT COUNT(*)::bigint AS n
@@ -103,7 +107,6 @@ async def _table_snapshot(db: AsyncSession) -> List[Dict[str, Any]]:
             "doc_type": r.doc_type,
             "doc_id": str(r.doc_id),
             "reason": r.reason,
-            "prior_reason": r.prior_reason,
             "run_id": r.run_id,
         }
         for r in rows
@@ -135,12 +138,6 @@ async def bad_document_counts(db: AsyncSession) -> Dict[str, Any]:
             "judgment_by_reporter": BAD_JUDGMENT_BY_REPORTER_SQL.strip(),
         },
         "min_judgment_text_chars": MIN_JUDGMENT_TEXT_CHARS,
-        "prod_reference_baselines": {
-            "statutes_total": 12_618,
-            "statutes_without_sections": 10_303,
-            "judgments_total": 90_039,
-            "judgments_bad": 0,
-        },
     }
 
 
@@ -177,7 +174,6 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
                 doc_type="statute",
                 doc_id=sid,
                 reason=STATUTE_QUARANTINE_REASON,
-                prior_reason=None,
                 run_id=run_id,
                 quarantined_at=now,
             )
@@ -208,7 +204,6 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
                 doc_type="judgment",
                 doc_id=jid,
                 reason=JUDGMENT_QUARANTINE_REASON,
-                prior_reason=None,
                 run_id=run_id,
                 quarantined_at=now,
             )
@@ -216,6 +211,8 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
         judgments_inserted += 1
 
     latest = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
+    prior_latest = latest.value if latest is not None else ""
+    db.add(CorpusMetadata(key=_undo_prior_latest_key(run_id), value=prior_latest))
     if latest is None:
         db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
     else:
@@ -229,9 +226,21 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
 
 
 async def undo_quarantine(db: AsyncSession, run_id: str) -> Dict[str, int]:
+    prior_row = (
+        await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_prior_latest_key(run_id)))
+    ).scalars().first()
+    prior_latest = prior_row.value if prior_row is not None else None
     result = await db.execute(delete(DocumentQuarantine).where(DocumentQuarantine.run_id == run_id))
-    await db.commit()
     n = int(result.rowcount or 0)
+    latest = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
+    if latest is not None and latest.value == run_id:
+        if prior_latest:
+            latest.value = prior_latest
+        else:
+            await db.delete(latest)
+    if prior_row is not None:
+        await db.delete(prior_row)
+    await db.commit()
     return {"rows_removed": n}
 
 

@@ -114,6 +114,7 @@ async def check_viewer(staging_id: str, db: AsyncSession = Depends(get_db)) -> D
 
 @router.get("/check/judgment/{judgment_id}")
 async def check_judgment(judgment_id: str, db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    # Intentionally unfiltered by document_quarantine: operator QA may inspect quarantined rows.
     j = (await db.execute(select(Judgment).where(Judgment.id == judgment_id))).scalars().first()
     if j is None:
         raise HTTPException(404, "judgment not found")

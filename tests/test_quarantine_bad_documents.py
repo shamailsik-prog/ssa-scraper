@@ -5,8 +5,9 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from scraper.models import DocumentQuarantine, Judgment, Statute
+from scraper.models import CorpusMetadata, DocumentQuarantine, Judgment, Statute
 from scraper.tasks.quarantine_bad_documents import (
+    LATEST_RUN_KEY,
     JUDGMENT_QUARANTINE_REASON,
     STATUTE_QUARANTINE_REASON,
     _table_snapshot,
@@ -23,7 +24,7 @@ async def test_bad_document_counts_statute_without_sections(db):
     await db.commit()
     counts = await bad_document_counts(db)
     assert counts["statute_bad_rows"] >= 1
-    assert counts["prod_reference_baselines"]["statutes_without_sections"] == 10_303
+    assert "prod_reference_baselines" not in counts
 
 
 @pytest.mark.asyncio
@@ -43,7 +44,6 @@ async def test_quarantine_apply_undo_restores_exact_prior_state(db):
             doc_type="statute",
             doc_id=prior_st.id,
             reason="operator:manual_review",
-            prior_reason=None,
             run_id="prior-operator-run",
         )
     )
@@ -52,6 +52,8 @@ async def test_quarantine_apply_undo_restores_exact_prior_state(db):
     from scraper.database import SessionLocal
 
     async with SessionLocal() as session:
+        session.add(CorpusMetadata(key=LATEST_RUN_KEY, value="prior-latest-run"))
+        await session.commit()
         before = await _table_snapshot(session)
         applied = await apply_quarantine(session)
         run_id = applied["run_id"]
@@ -71,6 +73,9 @@ async def test_quarantine_apply_undo_restores_exact_prior_state(db):
 
         after = await _table_snapshot(session)
         assert after == before
+        latest = (await session.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
+        assert latest is not None
+        assert latest.value == "prior-latest-run"
 
 
 @pytest.mark.asyncio
