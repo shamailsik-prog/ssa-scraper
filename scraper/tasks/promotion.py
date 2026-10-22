@@ -2175,17 +2175,15 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             if existing is not None:
                 existing.needs_section_refetch = True
                 await db.flush()
-        if sections:
+        ok, val_reason = validate_statute_reconciled_json(data, raw_text=st.raw_text or "")
+        if not ok:
+            await record_validation_reject(db, kind="statute", reason_code=val_reason, source_name=st.source_name)
             await _quarantine(
                 db,
                 st,
-                "empty_statute_sections: no parseable section bodies",
+                f"document_validation:{val_reason}",
                 "statute",
-                {
-                    "reason_code": "empty_statute_sections",
-                    "statute_name": name[:280],
-                    "validation_errors": st.validation_errors,
-                },
+                {"reason_code": val_reason, "statute_name": name[:280], "validation_errors": st.validation_errors},
             )
             return "quarantined"
         await _quarantine(db, st, "statute name or sections missing", "statute")
