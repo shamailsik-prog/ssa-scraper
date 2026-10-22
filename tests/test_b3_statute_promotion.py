@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 from sqlalchemy import func, select
 
@@ -122,11 +120,23 @@ async def test_existing_statute_marked_needs_refetch_on_empty_repromote(db):
     assert statute.needs_section_refetch is True
 
 
-def test_mutant_b3_m1_promote_statute_staging_deletes_only_new_empty_orphan():
-    from scraper.tasks import promotion as promotion_mod
-
-    src = inspect.getsource(promotion_mod.promote_statute_staging)
-    assert "if created_new_statute and statute is not None:" in src
-    assert "await db.delete(statute)" in src
+@pytest.mark.asyncio
+async def test_new_statute_orphan_removed_when_promotion_quarantines_on_empty_sections(db):
+    """Behaviour: a brand-new statute row must not survive a failed promote with zero sections."""
+    before = (await db.execute(select(func.count()).select_from(Statute))).scalar()
+    st = await _make_statute_staging(
+        db,
+        {
+            "statute_name": "Orphan Prevention Act, 2026",
+            "year_enacted": 2026,
+            "jurisdiction": "Federal",
+            "sections": [{"section_number": "1", "section_title": "t", "section_text": ""}],
+        },
+    )
+    assert await promote_statute_staging(db, st) == "quarantined"
+    assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == before
+    assert (
+        await db.execute(select(Statute).where(Statute.name == "Orphan Prevention Act, 2026"))
+    ).scalars().first() is None
 
 

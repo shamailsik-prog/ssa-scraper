@@ -17,8 +17,9 @@ from celery import shared_task
 from sqlalchemy import select
 
 from scraper.config import settings
+from scraper.corpus_visibility import judgment_servable, statute_servable
 from scraper.database import SessionLocal, embedding_identity_matches, run_async
-from scraper.models import EmbeddingQueue, Judgment, StatuteSection, StatuteSectionVersion
+from scraper.models import EmbeddingQueue, Judgment, Statute, StatuteSection, StatuteSectionVersion
 from scraper.security import is_login_session
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ async def embed_texts(texts: List[str], *, client: Optional[httpx.AsyncClient] =
 
 
 async def process_embedding_queue(limit: Optional[int] = None, *, client: Optional[httpx.AsyncClient] = None) -> Dict[str, int]:
-    counts = {"embedded": 0, "skipped_login_session": 0, "failed": 0, "refused": 0}
+    counts = {"embedded": 0, "skipped_login_session": 0, "skipped_quarantined": 0, "failed": 0, "refused": 0}
     from scraper.heartbeat import beat
 
     await beat("embeddings")
@@ -73,12 +74,31 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
                 continue
             text = None
             if item.table_name == "judgment":
-                rec = (await db.execute(select(Judgment).where(Judgment.id == item.record_id))).scalars().first()
+                rec = (
+                    await db.execute(select(Judgment).where(Judgment.id == item.record_id, judgment_servable()))
+                ).scalars().first()
                 if rec:
                     text = f"{rec.canonical_citation} {rec.case_title or ''} {(rec.full_text or '')[:6000]}"
+                elif (
+                    await db.execute(select(Judgment.id).where(Judgment.id == item.record_id, Judgment.corpus_quarantined.is_(True)))
+                ).first():
+                    item.status = "skipped"
+                    item.error_message = "parent judgment is corpus_quarantined"
+                    counts["skipped_quarantined"] += 1
+                    continue
             elif item.table_name == "statute_section":
                 rec = (await db.execute(select(StatuteSection).where(StatuteSection.id == item.record_id))).scalars().first()
                 if rec:
+                    statute = (
+                        await db.execute(
+                            select(Statute).where(Statute.id == rec.statute_id, statute_servable())
+                        )
+                    ).scalars().first()
+                    if statute is None:
+                        item.status = "skipped"
+                        item.error_message = "parent statute is corpus_quarantined or missing"
+                        counts["skipped_quarantined"] += 1
+                        continue
                     ver = (await db.execute(select(StatuteSectionVersion).where(StatuteSectionVersion.id == rec.current_version_id))).scalars().first()
                     text = f"{rec.section_number} {rec.section_title or ''} {(ver.section_text if ver else '')[:6000]}"
             if not text:
