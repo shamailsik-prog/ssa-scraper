@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
 from scraper.config import settings
+from scraper.corpus_visibility import judgment_servable, statute_servable
 from scraper.models import Citation, Judgment, Statute, StatuteSection, StatuteSectionVersion, Treatment
 from scraper.parsers.citation_extractor import normalise_citation
 from scraper.routers.auth import _client_ip
@@ -118,11 +119,17 @@ def _citation_variants(citation: str) -> List[str]:
 
 async def _judgment_for(db: AsyncSession, citation: str) -> Optional[Judgment]:
     variants = _citation_variants(citation)
-    j = (await db.execute(select(Judgment).where(Judgment.canonical_citation.in_(variants)))).scalars().first()
+    j = (
+        await db.execute(select(Judgment).where(Judgment.canonical_citation.in_(variants), judgment_servable()))
+    ).scalars().first()
     if j is not None:
         return j
     return (
-        await db.execute(select(Judgment).join(Citation, Citation.judgment_id == Judgment.id).where(Citation.citation_string.in_(variants)))
+        await db.execute(
+            select(Judgment)
+            .join(Citation, Citation.judgment_id == Judgment.id)
+            .where(Citation.citation_string.in_(variants), judgment_servable())
+        )
     ).scalars().first()
 
 
@@ -150,7 +157,7 @@ async def search_judgments(
     rows = (
         await db.execute(
             select(Judgment)
-            .where(and_(*conditions))
+            .where(and_(*conditions, judgment_servable()))
             .order_by(Judgment.year.desc().nulls_last(), Judgment.decision_date.desc().nulls_last(), Judgment.canonical_citation)
             .limit(limit)
         )
@@ -235,7 +242,7 @@ async def citing_judgments(
         await db.execute(
             select(Treatment, Judgment)
             .join(Judgment, Judgment.id == Treatment.citing_judgment_id)
-            .where(match)
+            .where(match, judgment_servable())
             .order_by(Judgment.year.desc().nulls_last(), Judgment.canonical_citation, Treatment.label)
             .limit(limit)
         )
@@ -268,12 +275,17 @@ async def statute_section(
     """The current text of one section. The statute is matched by its short name exactly (case-insensitive),
     else by its name containing the words given; the section number must match exactly."""
     name = " ".join(statute.split())
-    s = (await db.execute(select(Statute).where(func.lower(Statute.short_name) == name.lower()))).scalars().first()
+    s = (
+        await db.execute(select(Statute).where(func.lower(Statute.short_name) == name.lower(), statute_servable()))
+    ).scalars().first()
     if s is None:
         words = [w for w in name.split() if w]
         candidates = (
             await db.execute(
-                select(Statute).where(and_(*[Statute.name.ilike(_like(w), escape="\\") for w in words])).order_by(func.length(Statute.name)).limit(1)
+                select(Statute)
+                .where(and_(*[Statute.name.ilike(_like(w), escape="\\") for w in words], statute_servable()))
+                .order_by(func.length(Statute.name))
+                .limit(1)
             )
         ).scalars().all()
         s = candidates[0] if candidates else None

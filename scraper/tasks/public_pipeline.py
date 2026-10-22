@@ -24,6 +24,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
+from scraper.document_validation import (
+    record_validation_reject,
+    validate_judgment_reconciled_json,
+    validate_statute_reconciled_json,
+)
 from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
@@ -395,6 +400,20 @@ class PublicPipeline:
         staging.extraction_engine = outcome.engine
         staging.confidence_score = outcome.confidence
         staging.validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
+        if not outcome.quarantine:
+            if kind == "statute":
+                val_ok, val_reason = validate_statute_reconciled_json(staging.reconciled_json, raw_text=text)
+            else:
+                val_ok, val_reason = validate_judgment_reconciled_json(staging.reconciled_json, raw_text=text)
+            if not val_ok:
+                await record_validation_reject(
+                    self.db,
+                    kind=kind,
+                    reason_code=val_reason,
+                    source_name=self.source.source_name,
+                )
+                outcome.quarantine = True
+                outcome.quarantine_reason = f"document_validation:{val_reason}"
         staging.status = "quarantined" if outcome.quarantine else "extracted"
         staging.quarantine_reason = outcome.quarantine_reason
         if outcome.quarantine:

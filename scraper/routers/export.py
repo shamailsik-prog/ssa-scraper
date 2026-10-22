@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
+from scraper.corpus_visibility import judgment_servable, statute_servable
 from scraper.database import get_db
 from scraper.models import Judgment, Statute, StatuteSection, StatuteSectionVersion
 from scraper.routers.auth import _ok, require_admin
@@ -67,7 +68,11 @@ async def export_judgments(
     db: AsyncSession = Depends(get_db),
 ):
     login_ok = _login_full_text_allowed(x_api_key, x_admin_confirm)
-    rows = (await db.execute(select(Judgment).order_by(Judgment.year.desc(), Judgment.canonical_citation).limit(limit))).scalars().all()
+    rows = (
+        await db.execute(
+            select(Judgment).where(judgment_servable()).order_by(Judgment.year.desc(), Judgment.canonical_citation).limit(limit)
+        )
+    ).scalars().all()
     records = [_judgment_row(j, include_full_text, login_ok) for j in rows]
     if format == "jsonl":
         def gen() -> Iterator[str]:
@@ -88,7 +93,15 @@ async def export_judgments(
 
 @router.get("/statutes")
 async def export_statutes(format: str = Query(default="jsonl", pattern="^(csv|jsonl)$"), limit: int = Query(default=50000, le=500000), db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(StatuteSection, Statute, StatuteSectionVersion).join(Statute, Statute.id == StatuteSection.statute_id).outerjoin(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id).limit(limit))).all()
+    rows = (
+        await db.execute(
+            select(StatuteSection, Statute, StatuteSectionVersion)
+            .join(Statute, Statute.id == StatuteSection.statute_id)
+            .where(statute_servable())
+            .outerjoin(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+            .limit(limit)
+        )
+    ).all()
     records = [
         {"statute": st.name, "short_name": st.short_name, "jurisdiction": st.jurisdiction, "section_number": sec.section_number, "section_title": sec.section_title, "version_no": ver.version_no if ver else None, "effective_from": ver.effective_from.isoformat() if ver and ver.effective_from else None, "effective_to": ver.effective_to.isoformat() if ver and ver.effective_to else None, "version_confidence": ver.version_confidence if ver else None, "section_text": ver.section_text if ver else None}
         for sec, st, ver in rows

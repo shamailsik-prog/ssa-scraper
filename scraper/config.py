@@ -403,6 +403,14 @@ class Settings(BaseSettings):
         default=True,
         description="Default on. Promotion quarantines fragment/garbage names, missing year_enacted, and duplicate statute names. Set SSA_STATUTE_NAME_QUALITY=0 or false to disable.",
     )
+    SSA_HARVEST_PG_LOCK: bool = Field(
+        default=True,
+        description="Default on. Search harvest holds a Postgres advisory lock per login slot for the whole tick. Set SSA_HARVEST_PG_LOCK=0 or false to disable.",
+    )
+    SSA_DOCUMENT_SAVE_VALIDATION: bool = Field(
+        default=True,
+        description="Default on. Ingest/promotion refuse statute/judgment saves with no sections or no text; log and count rejects. Set SSA_DOCUMENT_SAVE_VALIDATION=0 or false to disable.",
+    )
 
     # ----------------------------------------------------------- pdf/storage
     PDF_STORAGE_PATH: str = Field(default="/app/live")

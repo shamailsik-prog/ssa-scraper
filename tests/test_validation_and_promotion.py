@@ -1394,7 +1394,7 @@ async def test_pakistancode_statute_promotion_quarantines_empty_section_bodies(d
         await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == st.id))
     ).scalars().first()
     assert q is not None
-    assert (q.reason or "").startswith("empty_statute_sections:")
+    assert (q.reason or "").startswith("document_validation:empty_statute_sections")
     assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0
 
 

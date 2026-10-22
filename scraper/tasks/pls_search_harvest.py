@@ -25,6 +25,7 @@ from scraper.auth.session_manager import (
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
+from scraper.harvest_lock import harvest_run_pg_lock
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import (
     BrowserSessionSlot,
@@ -851,12 +852,50 @@ async def run_search_harvest(
         await db.commit()
         return {"skipped": True, "slot": slot, "reason": "; ".join(reasons) or "no login slot"}
 
+    async with harvest_run_pg_lock(chosen) as pg_harvest_held:
+        if not pg_harvest_held:
+            await harvest_lock.release()
+            await db.commit()
+            return {
+                "skipped": True,
+                "slot": chosen,
+                "reason": f"postgres harvest advisory lock held for slot {chosen}",
+            }
+
+        return await _run_search_harvest_locked(
+            db,
+            chosen=chosen,
+            harvest_lock=harvest_lock,
+            slot=slot,
+            query_key=query_key,
+            dry_run=dry_run,
+            max_pages=max_pages,
+            priority_gaps=priority_gaps,
+            redis_client=redis_client,
+            job_id=job_id,
+        )
+
+
+async def _run_search_harvest_locked(
+    db: AsyncSession,
+    *,
+    chosen: int,
+    harvest_lock: SessionLock,
+    slot: Optional[int],
+    query_key: Optional[str],
+    dry_run: bool,
+    max_pages: int,
+    priority_gaps: bool,
+    redis_client,
+    job_id,
+) -> Dict[str, Any]:
     query_lock: Optional[SessionLock] = None
     lock: Optional[SessionLock] = None
     slot_lock: Optional[SessionLock] = None
     runner: Optional[SearchHarvestRunner] = None
     query_row: Optional[PlsSearchHarvestQuery] = None
     took_over = False
+    source = await _source_row(db)
     try:
         if query_key:
             query_row = await pick_next_query(db, query_key=query_key)

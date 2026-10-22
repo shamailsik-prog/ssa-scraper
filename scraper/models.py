@@ -34,6 +34,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     SmallInteger,
     String,
     Text,
@@ -62,6 +63,8 @@ CONTRACT_TABLES = (
     "instrument",
     "source_provenance",
     "corpus_metadata",
+    # Reader SQL uses NOT EXISTS against quarantine rows when serving corpus/search surfaces.
+    "document_quarantine",
 )
 
 ACCESS_METHODS = ("public", "login_session", "licensed_api", "import_folder")
@@ -741,6 +744,21 @@ class JudgmentIdentityReview(Base):
     details: Mapped[Optional[dict]] = mapped_column(JSONB)
     reviewed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
     created_at: Mapped[datetime] = _created()
+
+
+class DocumentQuarantine(Base):
+    """Side-table quarantine flags for corpus statute/judgment rows (B7). Never alters contract tables."""
+
+    __tablename__ = "document_quarantine"
+    __table_args__ = (
+        PrimaryKeyConstraint("doc_type", "doc_id", name="pk_document_quarantine"),
+        Index("ix_document_quarantine_run_id", "run_id"),
+    )
+    doc_type: Mapped[str] = mapped_column(String(20), nullable=False, comment="statute|judgment")
+    doc_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    quarantined_at: Mapped[datetime] = _created()
 
 
 class QuarantineQueue(Base):
