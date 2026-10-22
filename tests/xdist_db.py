@@ -28,6 +28,9 @@ def is_safe_test_database_name(name: str) -> bool:
         return True
     if "_rolecheck_" in lower:
         return is_safe_test_database_name(lower.split("_rolecheck_", 1)[0])
+    for marker in ("_lockprobe_", "_rolesprobe_"):
+        if marker in lower:
+            return is_safe_test_database_name(lower.split(marker, 1)[0])
     return False
 
 
@@ -52,7 +55,11 @@ def refuse_unsafe_worker_database_name(base: str, worker_db: str) -> None:
     if worker_db == base:
         return
     worker = xdist_worker_id()
-    expected = worker_database_name(base) if worker else base
+    if worker:
+        safe = re.sub(r"[^\w]+", "_", worker).strip("_") or "worker"
+        expected = f"{base}_{safe}"
+    else:
+        expected = base
     if worker_db != expected:
         raise RuntimeError(
             f"Derived worker database {worker_db!r} does not match expected name {expected!r} "

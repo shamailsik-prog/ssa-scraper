@@ -22,7 +22,10 @@ import asyncio
 import os
 os.environ["DATABASE_URL"] = os.environ["ROLECHECK_DATABASE_URL"]
 os.environ.pop("PYTEST_XDIST_WORKER", None)
-os.environ.pop("DB_LOCK_ON_CATALOG", None)
+if os.environ.get("DB_LOCK_ON_CATALOG"):
+    os.environ["DB_LOCK_ON_CATALOG"] = os.environ["DB_LOCK_ON_CATALOG"]
+else:
+    os.environ.pop("DB_LOCK_ON_CATALOG", None)
 os.environ.setdefault("DATABASE_NULL_POOL", "1")
 os.environ.setdefault("SIKANDER_READER_PASSWORD", "readerpw")
 os.environ.setdefault("CORPUS_WRITER_PASSWORD", "writerpw")
@@ -53,7 +56,10 @@ asyncio.run(main())
     env["ROLECHECK_DATABASE_URL"] = database_url
     env["DATABASE_NULL_POOL"] = "1"
     env.pop("PYTEST_XDIST_WORKER", None)
-    env.pop("DB_LOCK_ON_CATALOG", None)
+    if os.environ.get("DB_LOCK_ON_CATALOG"):
+        env["DB_LOCK_ON_CATALOG"] = os.environ["DB_LOCK_ON_CATALOG"]
+    else:
+        env.pop("DB_LOCK_ON_CATALOG", None)
     proc = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(_REPO_ROOT),

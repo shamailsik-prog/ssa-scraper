@@ -40,6 +40,10 @@ TEST_DB_ADVISORY_LOCK_ID = 738_238_001
 PG_ADVISORY_ROLE_SETUP_CLUSTER_LOCK = 738_238_002
 
 
+class RoleAttributeChangeRequiresSuperuserError(RuntimeError):
+    """ensure_roles must demote SUPERUSER or CREATEROLE but the connected role is not a superuser."""
+
+
 async def _pg_advisory_xact_lock(conn, key1: int, key2: int) -> None:
     await conn.execute(text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": key1, "k2": key2})
 
@@ -298,6 +302,68 @@ def _quote_ident(name: str) -> str:
     return '"' + name + '"'
 
 
+_READER_ROLE_BOOL_COLS = (
+    "rolsuper",
+    "rolcreatedb",
+    "rolcreaterole",
+    "rolinherit",
+    "rolreplication",
+    "rolbypassrls",
+)
+_READER_ROLE_DESIRED = {
+    "rolsuper": False,
+    "rolcreatedb": False,
+    "rolcreaterole": False,
+    "rolinherit": False,
+    "rolreplication": False,
+    "rolbypassrls": False,
+}
+_SUPERUSER_ONLY_READER_DEMOTE_COLS = frozenset(
+    {"rolsuper", "rolcreaterole", "rolreplication", "rolbypassrls"}
+)
+
+
+async def _connection_is_superuser(conn) -> bool:
+    row = await conn.execute(text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"))
+    return bool(row.scalar())
+
+
+async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> None:
+    """Rotate password and align reader safety attributes; idempotent ALTER fragments only."""
+    row = (
+        await conn.execute(
+            text(
+                "SELECT rolsuper, rolcreatedb, rolcreaterole, rolinherit, "
+                "rolreplication, rolbypassrls "
+                "FROM pg_roles WHERE rolname = :r"
+            ),
+            {"r": settings.SIKANDER_READER_ROLE},
+        )
+    ).one()
+    current = {col: bool(row[i]) for i, col in enumerate(_READER_ROLE_BOOL_COLS)}
+    caller_super = await _connection_is_superuser(conn)
+    clauses = ["LOGIN", f"PASSWORD {_pg_literal(reader_pw)}"]
+    attr_tokens = {
+        "rolsuper": ("SUPERUSER", "NOSUPERUSER"),
+        "rolcreatedb": ("CREATEDB", "NOCREATEDB"),
+        "rolcreaterole": ("CREATEROLE", "NOCREATEROLE"),
+        "rolinherit": ("INHERIT", "NOINHERIT"),
+        "rolreplication": ("REPLICATION", "NOREPLICATION"),
+        "rolbypassrls": ("BYPASSRLS", "NOBYPASSRLS"),
+    }
+    for col in _READER_ROLE_BOOL_COLS:
+        want = _READER_ROLE_DESIRED[col]
+        if current[col] == want:
+            continue
+        if not want and col in _SUPERUSER_ONLY_READER_DEMOTE_COLS and not caller_super:
+            raise RoleAttributeChangeRequiresSuperuserError(
+                f"cannot set {attr_tokens[col][1]} on {settings.SIKANDER_READER_ROLE!r}: "
+                "connected role is not a superuser"
+            )
+        clauses.append(attr_tokens[col][0] if want else attr_tokens[col][1])
+    await conn.execute(text(f"ALTER ROLE {role_ident} WITH {' '.join(clauses)}"))
+
+
 async def ensure_roles() -> dict:
     """Create/refresh corpus_writer and sikander_reader. Idempotent; safe to call on every start."""
     return await _ensure_roles_locked()
@@ -332,16 +398,12 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
             await lock_conn.execute(
                 text(
                     f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} "
-                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
+                    "NOREPLICATION NOBYPASSRLS"
                 )
             )
         else:
-            await lock_conn.execute(
-                text(
-                    f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} "
-                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-                )
-            )
+            await _alter_reader_role_login(lock_conn, role, reader_pw)
         await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
         await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
         await lock_conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"))
@@ -772,11 +834,7 @@ async def init_db(ensure_roles: bool = True) -> dict:
             await _init_db_lock(init_lock_conn)
             try:
                 return await _init_db_work(ensure_roles)
-            except Exception:
-                await init_lock_conn.rollback()
-                raise
             finally:
-                await init_lock_conn.rollback()
                 await _init_db_unlock(init_lock_conn)
     finally:
         if dispose_lock_engine:

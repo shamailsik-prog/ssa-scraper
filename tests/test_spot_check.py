@@ -225,18 +225,15 @@ async def test_statute_spot_check_block_halts_the_source_and_partial_text_differ
     # 1. Only the first part of a long section is on the page: not a match.
     await add_section("500", long_text, url_partial)
     await db.commit()
-    results = await check_statute_sections(db, sample=5, allow_private_for_tests=True)
+    results = await check_statute_sections(db, sample=5, allow_private_for_tests=True, random_seed=42)
     await db.commit()
     assert {x["label"]: x["result"] for x in results if "label" in x} == {"TC s. 500": "differs"}
     # 2. A block halts the source, as the public pipeline would, and ends the run.
     await add_section("501", "Blocked section text.", url_blocked)
     await db.commit()
-    # sampling is random: run until the blocked row is drawn (two rows, at most a few tries)
-    for _ in range(12):
-        results = await check_statute_sections(db, sample=1, allow_private_for_tests=True)
-        await db.commit()
-        if source.state == "HALTED":
-            break
+    results = await check_statute_sections(db, sample=2, allow_private_for_tests=True, random_seed=42)
+    await db.commit()
+    await db.refresh(source)
     assert source.state == "HALTED" and source.requires_admin_review
     assert any(x.get("result") == "unreachable" and "block" in (x.get("detail") or "") for x in results)
     codes = (await db.execute(select(Notification.code))).scalars().all()

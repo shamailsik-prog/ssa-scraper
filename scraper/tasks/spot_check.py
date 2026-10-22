@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from celery import shared_task
-from sqlalchemy import func, select
+from sqlalchemy import String, func, select
 
 from scraper.auth.session_manager import (
     BrowserDisconnected,
@@ -310,6 +310,7 @@ async def check_statute_sections(
     allow_private_for_tests: bool = False,
     browser_factory: Callable = public_browser_factory,
     sleep: Callable = asyncio.sleep,
+    random_seed: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Open each sampled section's source page in a headless browser and look for the whole stored
     section text in what the browser shows. The comparison is against the rendered page (or the PDF
@@ -318,17 +319,20 @@ async def check_statute_sections(
     n = int(sample if sample is not None else settings.SPOT_CHECK_STATUTES)
     if n <= 0:
         return [{"skipped": "SPOT_CHECK_STATUTES=0"}]
-    rows = (
-        await db.execute(
-            select(StatuteSectionVersion, StatuteSection, Statute, SourceProvenance)
-            .join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id)
-            .join(Statute, Statute.id == StatuteSection.statute_id)
-            .join(SourceProvenance, SourceProvenance.id == StatuteSectionVersion.source_provenance_id)
-            .where(StatuteSection.current_version_id == StatuteSectionVersion.id, SourceProvenance.source_url.isnot(None))
-            .order_by(func.random())
-            .limit(n)
+    stmt = (
+        select(StatuteSectionVersion, StatuteSection, Statute, SourceProvenance)
+        .join(StatuteSection, StatuteSection.id == StatuteSectionVersion.section_id)
+        .join(Statute, Statute.id == StatuteSection.statute_id)
+        .join(SourceProvenance, SourceProvenance.id == StatuteSectionVersion.source_provenance_id)
+        .where(StatuteSection.current_version_id == StatuteSectionVersion.id, SourceProvenance.source_url.isnot(None))
+    )
+    if random_seed is not None:
+        stmt = stmt.order_by(
+            func.md5(func.concat(func.cast(StatuteSectionVersion.id, String), str(random_seed)))
         )
-    ).all()
+    else:
+        stmt = stmt.order_by(func.random())
+    rows = (await db.execute(stmt.limit(n))).all()
     if not rows:
         return [{"skipped": "no current statute section with a source URL"}]
     results: List[Dict[str, Any]] = []
