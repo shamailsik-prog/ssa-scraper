@@ -122,10 +122,11 @@ async def test_existing_statute_marked_needs_refetch_on_empty_repromote(db):
     assert statute.needs_section_refetch is True
 
 
-def test_mutant_b3_m1_promote_statute_staging_never_deletes_statute():
+def test_mutant_b3_m1_promote_statute_staging_deletes_only_new_empty_orphan():
     from scraper.tasks import promotion as promotion_mod
 
     src = inspect.getsource(promotion_mod.promote_statute_staging)
-    assert "db.delete(statute)" not in src
+    assert "if created_new_statute and statute is not None:" in src
+    assert "await db.delete(statute)" in src
 
 

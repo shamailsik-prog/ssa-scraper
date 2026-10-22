@@ -18,15 +18,25 @@ def test_ssa_flags_default_on_in_settings_singleton():
     assert settings.SSA_STATUTE_NO_MENTION_STUBS is True
     assert settings.SSA_STATUTE_PDF_FOLLOW is True
     assert settings.SSA_STATUTE_NAME_QUALITY is True
+    assert settings.SSA_HARVEST_PG_LOCK is True
+    assert settings.SSA_DOCUMENT_SAVE_VALIDATION is True
 
 
 def test_ssa_flags_default_on_fresh_settings_without_env(monkeypatch):
-    for key in ("SSA_STATUTE_NO_MENTION_STUBS", "SSA_STATUTE_PDF_FOLLOW", "SSA_STATUTE_NAME_QUALITY"):
+    for key in (
+        "SSA_STATUTE_NO_MENTION_STUBS",
+        "SSA_STATUTE_PDF_FOLLOW",
+        "SSA_STATUTE_NAME_QUALITY",
+        "SSA_HARVEST_PG_LOCK",
+        "SSA_DOCUMENT_SAVE_VALIDATION",
+    ):
         monkeypatch.delenv(key, raising=False)
     fresh = Settings()
     assert fresh.SSA_STATUTE_NO_MENTION_STUBS is True
     assert fresh.SSA_STATUTE_PDF_FOLLOW is True
     assert fresh.SSA_STATUTE_NAME_QUALITY is True
+    assert fresh.SSA_HARVEST_PG_LOCK is True
+    assert fresh.SSA_DOCUMENT_SAVE_VALIDATION is True
 
 
 @pytest.mark.parametrize(

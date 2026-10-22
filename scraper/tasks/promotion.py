@@ -26,6 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, engine, run_async
+from scraper.document_validation import (
+    record_validation_reject,
+    validate_judgment_reconciled_json,
+    validate_statute_reconciled_json,
+)
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
     detect_judgment_stub,
@@ -626,6 +631,17 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await db.flush()
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
+    ok, val_reason = validate_judgment_reconciled_json(data, raw_text=full_text)
+    if not ok:
+        await record_validation_reject(db, kind="judgment", reason_code=val_reason, source_name=st.source_name)
+        await _quarantine(
+            db,
+            st,
+            f"document_validation:{val_reason}",
+            "judgment",
+            {"reason_code": val_reason, "validation_errors": st.validation_errors},
+        )
+        return "quarantined"
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     final_docket = incoming_docket or (meta.docket_number if meta else case_number)
     j = Judgment(
@@ -2235,6 +2251,17 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
+    ok, val_reason = validate_statute_reconciled_json(data, raw_text=st.raw_text or "")
+    if not ok:
+        await record_validation_reject(db, kind="statute", reason_code=val_reason, source_name=st.source_name)
+        await _quarantine(
+            db,
+            st,
+            f"document_validation:{val_reason}",
+            "statute",
+            {"reason_code": val_reason, "statute_name": name[:280], "validation_errors": st.validation_errors},
+        )
+        return "quarantined"
     if created_new_statute:
         statute = Statute(
             name=name,
@@ -2291,7 +2318,10 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                     prev.effective_to = ver.effective_from
         sec.current_version_id = ver.id
     if order == 0:
-        if not created_new_statute:
+        if created_new_statute and statute is not None:
+            await db.delete(statute)
+            await db.flush()
+        elif not created_new_statute:
             statute.needs_section_refetch = True
             await db.flush()
         await _quarantine(

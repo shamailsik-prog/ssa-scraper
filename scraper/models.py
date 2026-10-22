@@ -231,6 +231,10 @@ class Judgment(Base):
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(EMBEDDING_DIM))
     citation_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False, comment="Derived statistic only")
     confidence_score: Mapped[float] = mapped_column(Float, default=0.5, server_default=text("0.5"), nullable=False)
+    corpus_quarantined: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    corpus_quarantine_reason: Mapped[Optional[str]] = mapped_column(String(500))
     quality_flag_urdu_headnote_mojibake: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
@@ -344,6 +348,10 @@ class Statute(Base):
     quality_flag_duplicate_name: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
+    corpus_quarantined: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    corpus_quarantine_reason: Mapped[Optional[str]] = mapped_column(String(500))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 
