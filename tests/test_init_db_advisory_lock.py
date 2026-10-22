@@ -15,6 +15,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from tests import xdist_db
+from tests.postgres_catalog_probe import (
+    drop_owned_role,
+    postgres_catalog_probe_cluster_lock,
+    subprocess_timeout_sec,
+)
+
+pytestmark = pytest.mark.xdist_group("postgres_catalog_probe")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -84,8 +91,14 @@ async def _provision_probe_db(
             )
             safe_db = probe_db.replace('"', "")
             await conn.execute(text(f'CREATE DATABASE "{safe_db}" OWNER "{probe_role}"'))
-            await conn.execute(text("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC"))
-            public_revoked = True
+            public_has_connect = (
+                await conn.execute(
+                    text("SELECT has_database_privilege('public', 'postgres', 'CONNECT')")
+                )
+            ).scalar()
+            if public_has_connect:
+                await conn.execute(text("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC"))
+                public_revoked = True
             await conn.execute(text(f'REVOKE CONNECT ON DATABASE postgres FROM "{probe_role}"'))
             await conn.execute(text(f'GRANT CONNECT ON DATABASE "{safe_db}" TO "{probe_role}"'))
     finally:
@@ -102,7 +115,15 @@ async def _provision_probe_db(
     return public_revoked
 
 
-async def _teardown_probe_db(admin_url: str, probe_role: str, probe_db: str, restore_public: bool) -> None:
+async def _teardown_probe_db(
+    admin_url: str,
+    probe_role: str,
+    probe_db: str,
+    restore_public: bool,
+    *,
+    corpus_writer_role: str | None = None,
+    corpus_reader_role: str | None = None,
+) -> None:
     admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
         async with admin_engine.connect() as conn:
@@ -115,7 +136,11 @@ async def _teardown_probe_db(admin_url: str, probe_role: str, probe_db: str, res
                 {"n": probe_db},
             )
             await conn.execute(text(f'DROP DATABASE IF EXISTS "{safe_db}"'))
-            await conn.execute(text(f'DROP ROLE IF EXISTS "{probe_role}"'))
+            if corpus_writer_role:
+                await drop_owned_role(conn, corpus_writer_role)
+            if corpus_reader_role:
+                await drop_owned_role(conn, corpus_reader_role)
+            await drop_owned_role(conn, probe_role)
             if restore_public:
                 await conn.execute(text("GRANT CONNECT ON DATABASE postgres TO PUBLIC"))
     finally:
@@ -133,18 +158,31 @@ async def test_init_db_without_connect_on_postgres_catalog():
     admin_url = xdist_db.admin_database_url(source_url)
     probe_url = _probe_database_url(source_url, probe_role, probe_pw, probe_db)
     suffix = uuid.uuid4().hex[:10]
+    writer_role = f"probe_writer_{suffix}"
+    reader_role = f"probe_reader_{suffix}"
 
-    public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
-    proc = await asyncio.to_thread(
-        subprocess.run,
-        [sys.executable, "-c", _INIT_DB_SCRIPT],
-        cwd=str(_REPO_ROOT),
-        env=_subprocess_env(probe_url, catalog_lock=False, role_suffix=suffix),
-        capture_output=True,
-        text=True,
-    )
-    await _teardown_probe_db(admin_url, probe_role, probe_db, public_revoked)
-    assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+    async with postgres_catalog_probe_cluster_lock(admin_url):
+        public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-c", _INIT_DB_SCRIPT],
+                cwd=str(_REPO_ROOT),
+                env=_subprocess_env(probe_url, catalog_lock=False, role_suffix=suffix),
+                capture_output=True,
+                text=True,
+                timeout=subprocess_timeout_sec(),
+            )
+            assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+        finally:
+            await _teardown_probe_db(
+                admin_url,
+                probe_role,
+                probe_db,
+                public_revoked,
+                corpus_writer_role=writer_role,
+                corpus_reader_role=reader_role,
+            )
 
 
 @pytest.mark.asyncio
@@ -159,18 +197,32 @@ async def test_init_db_with_catalog_lock_fails_without_postgres_connect():
     probe_url = _probe_database_url(source_url, probe_role, probe_pw, probe_db)
 
     suffix = uuid.uuid4().hex[:10]
-    public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
-    env = _subprocess_env(probe_url, catalog_lock=True, role_suffix=suffix)
-    env["FORCE_CATALOG_LOCK"] = "1"
-    proc = await asyncio.to_thread(
-        subprocess.run,
-        [sys.executable, "-c", _INIT_DB_SCRIPT],
-        cwd=str(_REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    await _teardown_probe_db(admin_url, probe_role, probe_db, public_revoked)
-    assert proc.returncode != 0
-    combined = (proc.stdout or "") + (proc.stderr or "")
-    assert "postgres" in combined.lower() or "permission" in combined.lower() or "connect" in combined.lower()
+    writer_role = f"probe_writer_{suffix}"
+    reader_role = f"probe_reader_{suffix}"
+
+    async with postgres_catalog_probe_cluster_lock(admin_url):
+        public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
+        env = _subprocess_env(probe_url, catalog_lock=True, role_suffix=suffix)
+        env["FORCE_CATALOG_LOCK"] = "1"
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-c", _INIT_DB_SCRIPT],
+                cwd=str(_REPO_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=subprocess_timeout_sec(),
+            )
+            assert proc.returncode != 0
+            combined = (proc.stdout or "") + (proc.stderr or "")
+            assert "postgres" in combined.lower() or "permission" in combined.lower() or "connect" in combined.lower()
+        finally:
+            await _teardown_probe_db(
+                admin_url,
+                probe_role,
+                probe_db,
+                public_revoked,
+                corpus_writer_role=writer_role,
+                corpus_reader_role=reader_role,
+            )
