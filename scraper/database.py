@@ -378,7 +378,11 @@ async def _ensure_roles_locked() -> dict:
                 else:
                     await _apply_role_grants(cluster_lock_conn, status)
                     await cluster_lock_conn.commit()
+            except Exception:
+                await cluster_lock_conn.rollback()
+                raise
             finally:
+                await cluster_lock_conn.rollback()
                 await cluster_lock_conn.execute(
                     text("SELECT pg_advisory_unlock(:k)"),
                     {"k": PG_ADVISORY_ROLE_SETUP_CLUSTER_LOCK},
@@ -768,7 +772,11 @@ async def init_db(ensure_roles: bool = True) -> dict:
             await _init_db_lock(init_lock_conn)
             try:
                 return await _init_db_work(ensure_roles)
+            except Exception:
+                await init_lock_conn.rollback()
+                raise
             finally:
+                await init_lock_conn.rollback()
                 await _init_db_unlock(init_lock_conn)
     finally:
         if dispose_lock_engine:

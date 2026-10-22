@@ -29,6 +29,8 @@ asyncio.run(main())
 """
     env = os.environ.copy()
     env.setdefault("DATABASE_NULL_POOL", "1")
+    if os.environ.get("DB_LOCK_ON_CATALOG"):
+        env["DB_LOCK_ON_CATALOG"] = os.environ["DB_LOCK_ON_CATALOG"]
     proc = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(_REPO_ROOT),
