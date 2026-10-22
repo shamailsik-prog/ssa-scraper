@@ -18,8 +18,24 @@ from cryptography.fernet import Fernet
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="corpus-test-"))
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper")
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://legal:legal@localhost:5432/legal_scraper_test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+# asyncpg connections are bound to the event loop that opened them; pytest-asyncio uses a
+# function-scoped loop, so pooled connections must not be reused across tests.
+os.environ.setdefault("DATABASE_NULL_POOL", "1")
+# xdist workers use per-worker DBs; session advisory locks must serialize on postgres (see database.py).
+if os.environ.get("PYTEST_XDIST_WORKER"):
+    os.environ.setdefault("DB_LOCK_ON_CATALOG", "1")
+
+from tests.xdist_db import (  # noqa: E402
+    apply_worker_database_url,
+    apply_worker_redis_url,
+    database_name_from_url,
+)
+
+os.environ["_CORPUS_TEST_DATABASE_BASE"] = database_name_from_url(os.environ["DATABASE_URL"])
+apply_worker_database_url()
+apply_worker_redis_url()
 os.environ["ENCRYPTION_KEY"] = os.environ.get("ENCRYPTION_KEY") or Fernet.generate_key().decode()
 os.environ["ADMIN_API_KEY"] = "test-admin-key"
 os.environ["SIKANDER_READER_PASSWORD"] = os.environ.get("SIKANDER_READER_PASSWORD") or "readerpw"
@@ -62,8 +78,17 @@ import pytest_asyncio  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
 from scraper.config import settings  # noqa: E402
-from scraper.database import Base, SessionLocal, engine, init_db, seed_data  # noqa: E402
+from scraper.database import (  # noqa: E402
+    TEST_DB_ADVISORY_LOCK_ID,
+    Base,
+    SessionLocal,
+    engine,
+    init_db,
+    seed_data,
+)
 from scraper.models import ScraperSource  # noqa: E402
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
 from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
@@ -87,21 +112,55 @@ async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def _initialised_database():
-    asyncio.run(init_db())
-    asyncio.run(engine.dispose())
-    yield
+    from tests.xdist_db import (
+        drop_worker_databases_best_effort,
+        ensure_worker_database_exists,
+    )
+
+    db_url = os.environ["DATABASE_URL"]
+    try:
+        asyncio.run(ensure_worker_database_exists(db_url))
+        asyncio.run(init_db())
+        asyncio.run(engine.dispose())
+        yield
+    finally:
+        asyncio.run(drop_worker_databases_best_effort(db_url))
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
-    """Truncate every table except schema_migrations, then re-seed. Dispose the pool so asyncpg
-    connections never cross event loops."""
-    await engine.dispose(close=False)
+    """Truncate every table except schema_migrations, then re-seed. Per-xdist-worker DB names avoid
+    cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB."""
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE"))
-        await _ensure_judgment_case_hash_includes_unreported(conn)
-    await seed_data()
+    truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
+
+    async def _truncate_and_seed() -> None:
+        async with engine.begin() as conn:
+            await conn.execute(truncate_sql)
+            await _ensure_judgment_case_hash_includes_unreported(conn)
+        await seed_data()
+
+    from tests.xdist_db import xdist_worker_id
+
+    if xdist_worker_id():
+        await _truncate_and_seed()
+    else:
+        from tests.xdist_db import admin_database_url
+
+        lock_engine = create_async_engine(admin_database_url(settings.DATABASE_URL), poolclass=NullPool)
+        async with lock_engine.connect() as lock_conn:
+            await lock_conn.execute(
+                text("SELECT pg_advisory_lock(:k)"),
+                {"k": TEST_DB_ADVISORY_LOCK_ID},
+            )
+            try:
+                await _truncate_and_seed()
+            finally:
+                await lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": TEST_DB_ADVISORY_LOCK_ID},
+                )
+        await lock_engine.dispose()
     from scraper.extractors.scrapegraph_base import LOCAL_BREAKER, MANAGED_BREAKER
     from scraper.security import reset_robots_cache
 
@@ -109,7 +168,6 @@ async def clean_db():
     LOCAL_BREAKER.reset()
     reset_robots_cache()
     yield
-    await engine.dispose()
 
 
 @pytest_asyncio.fixture

@@ -33,10 +33,16 @@ async def _run(db, source, fixture_server, paths, limit):
 async def test_run_that_stops_at_its_limit_with_work_left_is_due_again_at_once(db, source, fixture_server):
     for p in ("/l1", "/l2", "/l3"):
         fixture_server.add(p, "<html><body>no links</body></html>")
-    before = datetime.now(timezone.utc)
+    started = datetime.now(timezone.utc)
     stats = await _run(db, source, fixture_server, ["/l1", "/l2", "/l3"], limit=2)
+    finished = datetime.now(timezone.utc)
     assert stats["backlog_remaining"] is True
-    assert source.next_scrape_at <= before + timedelta(seconds=settings.PUBLIC_BACKLOG_CONTINUE_SECONDS + 5)
+    wait = timedelta(seconds=settings.PUBLIC_BACKLOG_CONTINUE_SECONDS)
+    slack = timedelta(seconds=5)
+    # next_scrape_at is set to now()+wait when the run ends, not at test start (slow CI).
+    assert source.next_scrape_at is not None
+    assert source.next_scrape_at < FAR
+    assert started + wait - slack <= source.next_scrape_at <= finished + wait + slack
 
 
 async def test_run_that_empties_its_frontier_keeps_the_cadence(db, source, fixture_server):

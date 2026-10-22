@@ -290,6 +290,32 @@ def test_backfill_functions_default_dry_run_true():
 
 
 @pytest.mark.asyncio
+async def test_promotion_non_pls_keeps_urdu_headnote_flag_false(db, source, monkeypatch):
+    """R6 S7: reconciled headnote flag on a non-PLS row must not persist on promotion."""
+    monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", True)
+    monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)
+    text = _pls_headnote_full_text()
+    url = "https://127.0.0.1/sc/unreported-headnote-flag"
+    prov = await record_provenance(db, source=source, url=url, content=text.encode(), content_kind="html")
+    st = await stage_judgment(db, source=source, prov=prov, raw_html=None, raw_text=text, url=url)
+    st.reconciled_json = {
+        "citations": ["2026 SCMR 1"],
+        "court": "Supreme Court of Pakistan",
+        "year": 2026,
+        "case_title": "Non-PLS headnote flag must not stick",
+        "judge_names": ["J"],
+        "quality_flag_urdu_headnote_mojibake": True,
+        "full_text_candidate": text,
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.95
+    assert await promote_judgment_staging(db, st) == "promoted"
+    judgment = (await db.execute(select(Judgment).where(Judgment.id == st.promoted_to_id))).scalars().one()
+    assert judgment.source_name == "SupremeCourt"
+    assert judgment.quality_flag_urdu_headnote_mojibake is False
+
+
+@pytest.mark.asyncio
 async def test_promotion_persists_urdu_headnote_quality_flag(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", True)
     monkeypatch.setattr(settings, "SSA_SHORT_TEXT_GUARD", False)

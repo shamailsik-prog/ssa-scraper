@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import pkgutil
 from datetime import datetime, timezone
 from typing import AsyncIterator, List
@@ -27,6 +28,20 @@ from scraper.config import settings
 from scraper.keys import fit_key
 
 logger = logging.getLogger(__name__)
+
+# Postgres advisory locks for idempotent seed / role setup / test DB reset (finding #238).
+PG_ADVISORY_COURT_SEED_KEY1 = 0x5353
+PG_ADVISORY_COURT_SEED_KEY2 = 0x436F
+PG_ADVISORY_ROLE_SETUP_KEY1 = 0x5353
+PG_ADVISORY_ROLE_SETUP_KEY2 = 0x524F
+PG_ADVISORY_INIT_DB_KEY1 = 0x5353
+PG_ADVISORY_INIT_DB_KEY2 = 0x494E
+TEST_DB_ADVISORY_LOCK_ID = 738_238_001
+PG_ADVISORY_ROLE_SETUP_CLUSTER_LOCK = 738_238_002
+
+
+async def _pg_advisory_xact_lock(conn, key1: int, key2: int) -> None:
+    await conn.execute(text("SELECT pg_advisory_xact_lock(:k1, :k2)"), {"k1": key1, "k2": key2})
 
 
 class Base(DeclarativeBase):
@@ -42,15 +57,42 @@ def connect_args() -> dict:
     return {"server_settings": {"idle_in_transaction_session_timeout": str(timeout * 1000)}}
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args(),
-    echo=settings.DATABASE_ECHO,
-    pool_size=settings.DATABASE_POOL_SIZE,
-    max_overflow=settings.DATABASE_MAX_OVERFLOW,
-    pool_timeout=settings.DATABASE_POOL_TIMEOUT,
-    pool_pre_ping=True,
-)
+def _postgres_catalog_database_url() -> str:
+    """``postgres`` catalog URL (tests/xdist only when ``DB_LOCK_ON_CATALOG=1``)."""
+    from urllib.parse import quote, urlparse, urlunparse
+
+    parsed = urlparse(str(settings.DATABASE_URL))
+    return urlunparse(parsed._replace(path="/" + quote("postgres", safe="")))
+
+
+def _use_catalog_for_advisory_locks() -> bool:
+    return os.environ.get("DB_LOCK_ON_CATALOG", "").lower() in ("1", "true", "yes")
+
+
+def _advisory_lock_database_url() -> str:
+    if _use_catalog_for_advisory_locks():
+        return _postgres_catalog_database_url()
+    return str(settings.DATABASE_URL)
+
+
+def _engine_kwargs() -> dict:
+    kwargs = {
+        "connect_args": connect_args(),
+        "echo": settings.DATABASE_ECHO,
+        "pool_pre_ping": True,
+    }
+    if os.environ.get("DATABASE_NULL_POOL", "").lower() in ("1", "true", "yes"):
+        from sqlalchemy.pool import NullPool
+
+        kwargs["poolclass"] = NullPool
+    else:
+        kwargs["pool_size"] = settings.DATABASE_POOL_SIZE
+        kwargs["max_overflow"] = settings.DATABASE_MAX_OVERFLOW
+        kwargs["pool_timeout"] = settings.DATABASE_POOL_TIMEOUT
+    return kwargs
+
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs())
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -258,47 +300,96 @@ def _quote_ident(name: str) -> str:
 
 async def ensure_roles() -> dict:
     """Create/refresh corpus_writer and sikander_reader. Idempotent; safe to call on every start."""
+    return await _ensure_roles_locked()
+
+
+_run_ensure_roles = ensure_roles
+
+
+async def _apply_role_grants(lock_conn, status: dict) -> None:
     from scraper.models import CONTRACT_TABLES, INTERNAL_TABLES
 
-    status = {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
     reader_pw = settings.SIKANDER_READER_PASSWORD.get_secret_value()
     writer_pw = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
-    async with engine.begin() as conn:
-        dbname = (await conn.execute(text("SELECT current_database()"))).scalar()
-        if writer_pw:
-            role = _quote_ident(settings.CORPUS_WRITER_ROLE)
-            exists = (await conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.CORPUS_WRITER_ROLE})).scalar()
-            if not exists:
-                await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD :p".replace(":p", _pg_literal(writer_pw))))
-            else:
-                await conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(writer_pw)}"))
-            await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
-            await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            await conn.execute(text(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}"))
-            await conn.execute(text(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role}"))
-            status["writer"] = "CONFIGURED"
-        if reader_pw:
-            role = _quote_ident(settings.SIKANDER_READER_ROLE)
-            exists = (await conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.SIKANDER_READER_ROLE})).scalar()
-            if not exists:
-                await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"))
-            else:
-                await conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} NOSUPERUSER NOCREATEDB NOCREATEROLE"))
-            await conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
-            await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            # Start from nothing, then grant SELECT on the contract tables only.
-            await conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"))
-            await conn.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}"))
-            await conn.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role}"))
-            await conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role}"))
-            for t in CONTRACT_TABLES:
-                await conn.execute(text(f"GRANT SELECT ON TABLE {_quote_ident(t)} TO {role}"))
-            for t in INTERNAL_TABLES:
-                await conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {role}"))
-            # PUBLIC must not leak internal tables to the reader either.
-            for t in INTERNAL_TABLES:
-                await conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM PUBLIC"))
-            status["reader"] = "CONFIGURED"
+    await _pg_advisory_xact_lock(lock_conn, PG_ADVISORY_ROLE_SETUP_KEY1, PG_ADVISORY_ROLE_SETUP_KEY2)
+    dbname = (await lock_conn.execute(text("SELECT current_database()"))).scalar()
+    if writer_pw:
+        role = _quote_ident(settings.CORPUS_WRITER_ROLE)
+        exists = (await lock_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.CORPUS_WRITER_ROLE})).scalar()
+        if not exists:
+            await lock_conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD :p".replace(":p", _pg_literal(writer_pw))))
+        else:
+            await lock_conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(writer_pw)}"))
+        await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
+        await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+        await lock_conn.execute(text(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}"))
+        await lock_conn.execute(text(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role}"))
+        status["writer"] = "CONFIGURED"
+    if reader_pw:
+        role = _quote_ident(settings.SIKANDER_READER_ROLE)
+        exists = (await lock_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.SIKANDER_READER_ROLE})).scalar()
+        if not exists:
+            await lock_conn.execute(
+                text(
+                    f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                )
+            )
+        else:
+            await lock_conn.execute(
+                text(
+                    f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                )
+            )
+        await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
+        await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+        await lock_conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"))
+        await lock_conn.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}"))
+        await lock_conn.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role}"))
+        await lock_conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role}"))
+        for t in CONTRACT_TABLES:
+            await lock_conn.execute(text(f"GRANT SELECT ON TABLE {_quote_ident(t)} TO {role}"))
+        for t in INTERNAL_TABLES:
+            await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {role}"))
+        for t in INTERNAL_TABLES:
+            await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM PUBLIC"))
+        status["reader"] = "CONFIGURED"
+
+
+async def _ensure_roles_locked() -> dict:
+    status = {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
+    lock_url = _advisory_lock_database_url()
+    use_catalog = lock_url != str(settings.DATABASE_URL)
+    lock_engine = create_async_engine(lock_url, **_engine_kwargs()) if use_catalog else engine
+    dispose_lock_engine = use_catalog
+    try:
+        async with lock_engine.connect() as cluster_lock_conn:
+            await cluster_lock_conn.execute(
+                text("SELECT pg_advisory_lock(:k)"),
+                {"k": PG_ADVISORY_ROLE_SETUP_CLUSTER_LOCK},
+            )
+            await cluster_lock_conn.commit()
+            try:
+                if use_catalog:
+                    async with engine.connect() as lock_conn:
+                        await _apply_role_grants(lock_conn, status)
+                        await lock_conn.commit()
+                else:
+                    await _apply_role_grants(cluster_lock_conn, status)
+                    await cluster_lock_conn.commit()
+            except Exception:
+                await cluster_lock_conn.rollback()
+                raise
+            finally:
+                await cluster_lock_conn.rollback()
+                await cluster_lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": PG_ADVISORY_ROLE_SETUP_CLUSTER_LOCK},
+                )
+    finally:
+        if dispose_lock_engine:
+            await lock_engine.dispose()
     return status
 
 
@@ -425,16 +516,68 @@ SOURCE_SEED = [
 ]
 
 
-async def seed_data() -> None:
+async def _seed_courts(db_engine=None) -> None:
+    """Insert court seed rows under a transaction advisory lock; conflicts on any unique key are ignored."""
+    from sqlalchemy.dialects.postgresql import insert
+
+    from scraper.models import Court
+
+    if not COURT_SEED:
+        return
+    eng = db_engine if db_engine is not None else engine
+    async with eng.begin() as conn:
+        await _pg_advisory_xact_lock(conn, PG_ADVISORY_COURT_SEED_KEY1, PG_ADVISORY_COURT_SEED_KEY2)
+        court_rows = (
+            await conn.execute(text("SELECT short_code, name, court_level, city FROM court"))
+        ).mappings().all()
+        existing = {row["short_code"]: row for row in court_rows}
+        for name, code, level, prov, city, aliases in COURT_SEED:
+            row = existing.get(code)
+            if row is None:
+                continue
+            if (row["name"], row["court_level"], row["city"]) != (name, level, city):
+                logger.warning(
+                    "court seed short_code=%s already present as name=%r level=%r city=%r; "
+                    "seed expects name=%r level=%r city=%r (insert skipped on conflict)",
+                    code,
+                    row["name"],
+                    row["court_level"],
+                    row["city"],
+                    name,
+                    level,
+                    city,
+                )
+        await conn.execute(
+            insert(Court)
+            .values(
+                [
+                    {
+                        "name": name,
+                        "short_code": code,
+                        "court_level": level,
+                        "jurisdiction_province": prov,
+                        "city": city,
+                        "aliases": aliases,
+                    }
+                    for name, code, level, prov, city, aliases in COURT_SEED
+                ]
+            )
+            .on_conflict_do_nothing()
+        )
+
+
+async def seed_data(db_engine=None) -> None:
     from sqlalchemy import select
 
     from scraper.models import ArchiveTarget, BrowserSessionSlot, Court, CorpusMetadata, ScraperSource
 
-    async with SessionLocal() as db:
-        existing_courts = {c.short_code for c in (await db.execute(select(Court))).scalars().all()}
-        for name, code, level, prov, city, aliases in COURT_SEED:
-            if code not in existing_courts:
-                db.add(Court(name=name, short_code=code, court_level=level, jurisdiction_province=prov, city=city, aliases=aliases))
+    eng = db_engine if db_engine is not None else engine
+    await _seed_courts(eng)
+    if db_engine is None:
+        session_factory = SessionLocal
+    else:
+        session_factory = async_sessionmaker(eng, expire_on_commit=False, class_=AsyncSession)
+    async with session_factory() as db:
         existing_source_rows = {s.source_name: s for s in (await db.execute(select(ScraperSource))).scalars().all()}
         for name, display, url, method, allow, case_law, statutes, instruments, freq, mode in SOURCE_SEED:
             if name in existing_source_rows:
@@ -586,14 +729,55 @@ async def embedding_identity_matches() -> bool:
     return rows.get("embedding_model") == settings.EMBEDDING_MODEL and rows.get("embedding_dim") == str(settings.EMBEDDING_DIM)
 
 
-async def init_db() -> dict:
-    """Extensions → migrations → roles → seed. Returns a status dictionary for /health."""
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+async def _init_db_unlock(conn) -> None:
+    await conn.execute(
+        text("SELECT pg_advisory_unlock(:k1, :k2)"),
+        {"k1": PG_ADVISORY_INIT_DB_KEY1, "k2": PG_ADVISORY_INIT_DB_KEY2},
+    )
+
+
+async def _init_db_lock(conn) -> None:
+    await conn.execute(
+        text("SELECT pg_advisory_lock(:k1, :k2)"),
+        {"k1": PG_ADVISORY_INIT_DB_KEY1, "k2": PG_ADVISORY_INIT_DB_KEY2},
+    )
+    await conn.commit()
+
+
+async def _init_db_work(ensure_roles: bool) -> dict:
+    async with engine.connect() as lock_conn:
+        async with lock_conn.begin():
+            await lock_conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await lock_conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await lock_conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
     applied = await run_migrations()
-    roles = await ensure_roles()
+    roles = (
+        await _run_ensure_roles()
+        if ensure_roles
+        else {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
+    )
     await seed_data()
     logger.info("database initialised; migrations applied now: %s; roles: %s", applied, roles)
     return {"migrations_applied": applied, "roles": roles}
+
+
+async def init_db(ensure_roles: bool = True) -> dict:
+    """Extensions → migrations → roles → seed. Returns a status dictionary for /health."""
+    lock_url = _advisory_lock_database_url()
+    use_catalog = lock_url != str(settings.DATABASE_URL)
+    lock_engine = create_async_engine(lock_url, **_engine_kwargs()) if use_catalog else engine
+    dispose_lock_engine = use_catalog
+    try:
+        async with lock_engine.connect() as init_lock_conn:
+            await _init_db_lock(init_lock_conn)
+            try:
+                return await _init_db_work(ensure_roles)
+            except Exception:
+                await init_lock_conn.rollback()
+                raise
+            finally:
+                await init_lock_conn.rollback()
+                await _init_db_unlock(init_lock_conn)
+    finally:
+        if dispose_lock_engine:
+            await lock_engine.dispose()
