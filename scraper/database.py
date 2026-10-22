@@ -336,12 +336,8 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
                 )
             )
         else:
-            await lock_conn.execute(
-                text(
-                    f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)} "
-                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-                )
-            )
+            # Non-superuser callers cannot re-assert NOSUPERUSER/NOCREATEROLE; password rotation is enough.
+            await lock_conn.execute(text(f"ALTER ROLE {role} WITH LOGIN PASSWORD {_pg_literal(reader_pw)}"))
         await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
         await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
         await lock_conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"))
