@@ -302,13 +302,25 @@ def _quote_ident(name: str) -> str:
     return '"' + name + '"'
 
 
-_READER_ROLE_BOOL_COLS = ("rolsuper", "rolcreatedb", "rolcreaterole", "rolinherit")
+_READER_ROLE_BOOL_COLS = (
+    "rolsuper",
+    "rolcreatedb",
+    "rolcreaterole",
+    "rolinherit",
+    "rolreplication",
+    "rolbypassrls",
+)
 _READER_ROLE_DESIRED = {
     "rolsuper": False,
     "rolcreatedb": False,
     "rolcreaterole": False,
     "rolinherit": False,
+    "rolreplication": False,
+    "rolbypassrls": False,
 }
+_SUPERUSER_ONLY_READER_DEMOTE_COLS = frozenset(
+    {"rolsuper", "rolcreaterole", "rolreplication", "rolbypassrls"}
+)
 
 
 async def _connection_is_superuser(conn) -> bool:
@@ -321,7 +333,8 @@ async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> Non
     row = (
         await conn.execute(
             text(
-                "SELECT rolsuper, rolcreatedb, rolcreaterole, rolinherit "
+                "SELECT rolsuper, rolcreatedb, rolcreaterole, rolinherit, "
+                "rolreplication, rolbypassrls "
                 "FROM pg_roles WHERE rolname = :r"
             ),
             {"r": settings.SIKANDER_READER_ROLE},
@@ -335,12 +348,14 @@ async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> Non
         "rolcreatedb": ("CREATEDB", "NOCREATEDB"),
         "rolcreaterole": ("CREATEROLE", "NOCREATEROLE"),
         "rolinherit": ("INHERIT", "NOINHERIT"),
+        "rolreplication": ("REPLICATION", "NOREPLICATION"),
+        "rolbypassrls": ("BYPASSRLS", "NOBYPASSRLS"),
     }
     for col in _READER_ROLE_BOOL_COLS:
         want = _READER_ROLE_DESIRED[col]
         if current[col] == want:
             continue
-        if not want and col in ("rolsuper", "rolcreaterole") and not caller_super:
+        if not want and col in _SUPERUSER_ONLY_READER_DEMOTE_COLS and not caller_super:
             raise RoleAttributeChangeRequiresSuperuserError(
                 f"cannot set {attr_tokens[col][1]} on {settings.SIKANDER_READER_ROLE!r}: "
                 "connected role is not a superuser"
@@ -383,7 +398,8 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
             await lock_conn.execute(
                 text(
                     f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} "
-                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
+                    "NOREPLICATION NOBYPASSRLS"
                 )
             )
         else:

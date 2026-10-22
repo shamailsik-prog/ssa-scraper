@@ -17,11 +17,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from tests import xdist_db
 from tests.postgres_catalog_probe import (
     drop_owned_role,
+    grant_public_connect_on_postgres,
     postgres_catalog_probe_cluster_lock,
     subprocess_timeout_sec,
 )
-
-pytestmark = pytest.mark.xdist_group("postgres_catalog_probe")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -81,37 +80,48 @@ async def _provision_probe_db(
     probe_db: str,
 ) -> bool:
     """Create probe role/DB and block postgres CONNECT. Returns whether PUBLIC was revoked."""
-    admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     public_revoked = False
+    admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
-        async with admin_engine.connect() as conn:
-            safe_pw = probe_pw.replace("'", "''")
-            await conn.execute(
-                text(f'CREATE ROLE "{probe_role}" LOGIN PASSWORD \'{safe_pw}\' NOSUPERUSER CREATEROLE')
-            )
-            safe_db = probe_db.replace('"', "")
-            await conn.execute(text(f'CREATE DATABASE "{safe_db}" OWNER "{probe_role}"'))
-            public_has_connect = (
+        try:
+            async with admin_engine.connect() as conn:
+                safe_pw = probe_pw.replace("'", "''")
                 await conn.execute(
-                    text("SELECT has_database_privilege('public', 'postgres', 'CONNECT')")
+                    text(f'CREATE ROLE "{probe_role}" LOGIN PASSWORD \'{safe_pw}\' NOSUPERUSER CREATEROLE')
                 )
-            ).scalar()
-            if public_has_connect:
-                await conn.execute(text("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC"))
-                public_revoked = True
-            await conn.execute(text(f'REVOKE CONNECT ON DATABASE postgres FROM "{probe_role}"'))
-            await conn.execute(text(f'GRANT CONNECT ON DATABASE "{safe_db}" TO "{probe_role}"'))
-    finally:
-        await admin_engine.dispose()
+                safe_db = probe_db.replace('"', "")
+                await conn.execute(text(f'CREATE DATABASE "{safe_db}" OWNER "{probe_role}"'))
+                public_has_connect = (
+                    await conn.execute(
+                        text("SELECT has_database_privilege('public', 'postgres', 'CONNECT')")
+                    )
+                ).scalar()
+                if public_has_connect:
+                    await conn.execute(text("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC"))
+                    public_revoked = True
+                await conn.execute(text(f'REVOKE CONNECT ON DATABASE postgres FROM "{probe_role}"'))
+                await conn.execute(text(f'GRANT CONNECT ON DATABASE "{safe_db}" TO "{probe_role}"'))
+        except Exception:
+            if public_revoked:
+                await grant_public_connect_on_postgres(admin_url)
+            raise
+        finally:
+            await admin_engine.dispose()
 
-    super_on_probe = create_async_engine(_admin_on_database_url(admin_url, probe_db), isolation_level="AUTOCOMMIT")
-    try:
-        async with super_on_probe.connect() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
-    finally:
-        await super_on_probe.dispose()
+        super_on_probe = create_async_engine(_admin_on_database_url(admin_url, probe_db), isolation_level="AUTOCOMMIT")
+        try:
+            async with super_on_probe.connect() as conn:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+                await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+        except Exception:
+            if public_revoked:
+                await grant_public_connect_on_postgres(admin_url)
+            raise
+        finally:
+            await super_on_probe.dispose()
+    except Exception:
+        raise
     return public_revoked
 
 
@@ -127,22 +137,24 @@ async def _teardown_probe_db(
     admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
         async with admin_engine.connect() as conn:
-            safe_db = probe_db.replace('"', "")
-            await conn.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = :n AND pid <> pg_backend_pid()"
-                ),
-                {"n": probe_db},
-            )
-            await conn.execute(text(f'DROP DATABASE IF EXISTS "{safe_db}"'))
-            if corpus_writer_role:
-                await drop_owned_role(conn, corpus_writer_role)
-            if corpus_reader_role:
-                await drop_owned_role(conn, corpus_reader_role)
-            await drop_owned_role(conn, probe_role)
-            if restore_public:
-                await conn.execute(text("GRANT CONNECT ON DATABASE postgres TO PUBLIC"))
+            try:
+                safe_db = probe_db.replace('"', "")
+                await conn.execute(
+                    text(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = :n AND pid <> pg_backend_pid()"
+                    ),
+                    {"n": probe_db},
+                )
+                await conn.execute(text(f'DROP DATABASE IF EXISTS "{safe_db}"'))
+                if corpus_writer_role:
+                    await drop_owned_role(conn, corpus_writer_role)
+                if corpus_reader_role:
+                    await drop_owned_role(conn, corpus_reader_role)
+                await drop_owned_role(conn, probe_role)
+            finally:
+                if restore_public:
+                    await conn.execute(text("GRANT CONNECT ON DATABASE postgres TO PUBLIC"))
     finally:
         await admin_engine.dispose()
 
@@ -161,9 +173,10 @@ async def test_init_db_without_connect_on_postgres_catalog():
     writer_role = f"probe_writer_{suffix}"
     reader_role = f"probe_reader_{suffix}"
 
+    public_revoked = False
     async with postgres_catalog_probe_cluster_lock(admin_url):
-        public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
         try:
+            public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
             proc = await asyncio.to_thread(
                 subprocess.run,
                 [sys.executable, "-c", _INIT_DB_SCRIPT],
@@ -174,6 +187,10 @@ async def test_init_db_without_connect_on_postgres_catalog():
                 timeout=subprocess_timeout_sec(),
             )
             assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+        except Exception:
+            if public_revoked:
+                await grant_public_connect_on_postgres(admin_url)
+            raise
         finally:
             await _teardown_probe_db(
                 admin_url,
@@ -200,11 +217,12 @@ async def test_init_db_with_catalog_lock_fails_without_postgres_connect():
     writer_role = f"probe_writer_{suffix}"
     reader_role = f"probe_reader_{suffix}"
 
+    public_revoked = False
     async with postgres_catalog_probe_cluster_lock(admin_url):
-        public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
-        env = _subprocess_env(probe_url, catalog_lock=True, role_suffix=suffix)
-        env["FORCE_CATALOG_LOCK"] = "1"
         try:
+            public_revoked = await _provision_probe_db(admin_url, probe_role, probe_pw, probe_db)
+            env = _subprocess_env(probe_url, catalog_lock=True, role_suffix=suffix)
+            env["FORCE_CATALOG_LOCK"] = "1"
             proc = await asyncio.to_thread(
                 subprocess.run,
                 [sys.executable, "-c", _INIT_DB_SCRIPT],
@@ -217,6 +235,10 @@ async def test_init_db_with_catalog_lock_fails_without_postgres_connect():
             assert proc.returncode != 0
             combined = (proc.stdout or "") + (proc.stderr or "")
             assert "postgres" in combined.lower() or "permission" in combined.lower() or "connect" in combined.lower()
+        except Exception:
+            if public_revoked:
+                await grant_public_connect_on_postgres(admin_url)
+            raise
         finally:
             await _teardown_probe_db(
                 admin_url,

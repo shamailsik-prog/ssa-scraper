@@ -38,6 +38,15 @@ async def postgres_catalog_probe_cluster_lock(admin_url: str):
         await lock_engine.dispose()
 
 
+async def grant_public_connect_on_postgres(admin_url: str) -> None:
+    engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("GRANT CONNECT ON DATABASE postgres TO PUBLIC"))
+    finally:
+        await engine.dispose()
+
+
 async def drop_owned_role(conn, role_name: str) -> None:
     safe = role_name.replace('"', "")
     exists = (

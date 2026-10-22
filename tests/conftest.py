@@ -219,3 +219,12 @@ def client():
 
     with TestClient(app) as c:
         yield c
+
+
+def pytest_collection_modifyitems(config, items):
+    """Default xdist_group per test file so --dist loadgroup matches loadfile distribution."""
+    for item in items:
+        if item.get_closest_marker("xdist_group") is not None:
+            continue
+        group = pathlib.Path(item.fspath).stem
+        item.add_marker(pytest.mark.xdist_group(group))

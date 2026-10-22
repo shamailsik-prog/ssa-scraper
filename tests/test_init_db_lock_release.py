@@ -1,4 +1,4 @@
-"""B6/R1: init_db must release session advisory locks after failures (mutant RB1)."""
+"""B6/R1/R2: init_db must release session advisory locks after failures (mutant RB1)."""
 
 from __future__ import annotations
 
@@ -12,9 +12,24 @@ from scraper.database import (
     init_db,
 )
 
+_INIT_DB_ADVISORY_LOCK_COUNT_SQL = text(
+    "SELECT count(*) FROM pg_locks "
+    "WHERE locktype = 'advisory' AND classid = :k1 AND objid = :k2 AND granted "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
 
 class _InitDbMigrationBoom(Exception):
     pass
+
+
+async def _init_db_advisory_locks_held(conn) -> int:
+    return (
+        await conn.execute(
+            _INIT_DB_ADVISORY_LOCK_COUNT_SQL,
+            {"k1": PG_ADVISORY_INIT_DB_KEY1, "k2": PG_ADVISORY_INIT_DB_KEY2},
+        )
+    ).scalar()
 
 
 @pytest.mark.asyncio
@@ -28,16 +43,7 @@ async def test_init_db_ddl_failure_preserves_error_and_releases_advisory_lock(mo
         await init_db()
 
     async with engine.connect() as conn:
-        held = (
-            await conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_locks "
-                    "WHERE locktype = 'advisory' AND classid = :k1 AND objid = :k2 AND granted"
-                ),
-                {"k1": PG_ADVISORY_INIT_DB_KEY1, "k2": PG_ADVISORY_INIT_DB_KEY2},
-            )
-        ).scalar()
-    assert held == 0
+        assert await _init_db_advisory_locks_held(conn) == 0
 
 
 @pytest.mark.asyncio
@@ -57,13 +63,4 @@ async def test_init_db_ensure_roles_failure_preserves_error_and_releases_advisor
     }
 
     async with engine.connect() as conn:
-        held = (
-            await conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_locks "
-                    "WHERE locktype = 'advisory' AND classid = :k1 AND objid = :k2 AND granted"
-                ),
-                {"k1": PG_ADVISORY_INIT_DB_KEY1, "k2": PG_ADVISORY_INIT_DB_KEY2},
-            )
-        ).scalar()
-    assert held == 0
+        assert await _init_db_advisory_locks_held(conn) == 0

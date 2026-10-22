@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import text
 
 from scraper.config import settings
 from scraper.database import engine, ensure_roles
+from tests.postgres_catalog_probe import drop_owned_role
 
 
 async def _role_password_hash(role_name: str) -> str | None:
@@ -31,3 +34,24 @@ async def test_ensure_roles_rotates_writer_password(monkeypatch):
     second = await _role_password_hash(settings.CORPUS_WRITER_ROLE)
     assert second
     assert first != second
+
+
+@pytest.mark.asyncio
+async def test_ensure_roles_rotates_reader_password(monkeypatch):
+    suffix = uuid.uuid4().hex[:10]
+    reader = f"probe_reader_{suffix}"
+    monkeypatch.setattr(settings, "SIKANDER_READER_ROLE", reader)
+    monkeypatch.setattr(settings, "CORPUS_WRITER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(settings, "SIKANDER_READER_PASSWORD", SecretStr("reader-rotate-a"))
+    await ensure_roles()
+    first = await _role_password_hash(reader)
+    assert first
+
+    monkeypatch.setattr(settings, "SIKANDER_READER_PASSWORD", SecretStr("reader-rotate-b"))
+    await ensure_roles()
+    second = await _role_password_hash(reader)
+    assert second
+    assert first != second
+
+    async with engine.begin() as conn:
+        await drop_owned_role(conn, reader)
