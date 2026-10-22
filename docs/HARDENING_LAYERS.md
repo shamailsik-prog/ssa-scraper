@@ -9,7 +9,7 @@ Judgment-content and PLS quality layers default to **on** (same policy as B3 sta
 | Encoding: strip Urdu headnote `????`, re-fetch only if body damaged | `SSA_ENCODING_GUARD` (refined) | `SSA_ENCODING_GUARD=0`; revert encoding commit |
 | Urdu headnote flag column + strip/flag CLIs | `quality_flag_urdu_headnote_mojibake`, `headnote_stripped_full_text` on `judgment` | `backfill-flag-urdu-headnote-mojibake` then `strip-urdu-headnote-mojibake` (`--apply` writes overlay only; `full_text` hash unchanged) |
 | Search harvest Postgres advisory lock (per slot) | `SSA_HARVEST_PG_LOCK` | Revert commit; `SSA_HARVEST_PG_LOCK=0` |
-| Document save validation + corpus quarantine CLI | `SSA_DOCUMENT_SAVE_VALIDATION`, migration **027**, `python -m scraper.tasks.quarantine_bad_documents` | Revert commit; `SSA_DOCUMENT_SAVE_VALIDATION=0`; `--undo` on quarantine CLI |
+| Document save validation + document_quarantine CLI | `SSA_DOCUMENT_SAVE_VALIDATION`, migration **027** (`document_quarantine` side table), `python -m scraper.tasks.quarantine_bad_documents` | Revert commit; `SSA_DOCUMENT_SAVE_VALIDATION=0`; `--undo RUN_ID` on quarantine CLI |
 
 **Deferred (out of scope for B4):** harvest lock clear on worker start (`SSA_CLEAR_HARVEST_LOCKS_ON_START`) and harvest lock heartbeat (`SSA_HARVEST_LOCK_HEARTBEAT`) — tracked separately; not shipped on this branch (no runtime code).
 

@@ -1,4 +1,4 @@
-"""Flag existing corpus rows with no sections or no text (B7). Dry-run by default; never deletes rows.
+"""Flag bad corpus rows in document_quarantine (B7). Dry-run by default; never alters statute/judgment.
 
 Prod: run without --apply for counts only (read-only). Test DB: use --apply in tests.
 """
@@ -8,22 +8,31 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
-from scraper.models import CorpusMetadata
+from scraper.models import CorpusMetadata, DocumentQuarantine, Judgment, Statute
 
 logger = logging.getLogger(__name__)
 
-# Documented criteria for prod dry-run (read-only SELECTs).
+STATUTE_QUARANTINE_REASON = "b7_bad_document:no_parseable_sections"
+JUDGMENT_QUARANTINE_REASON = "b7_bad_document:empty_or_short_text"
+MIN_JUDGMENT_TEXT_CHARS = 140
+LATEST_RUN_KEY = "b7_quarantine_latest_run_id"
+
+# Documented criteria for prod dry-run (read-only; no corpus_quarantined).
 BAD_STATUTE_COUNT_SQL = """
 SELECT COUNT(*)::bigint AS n
 FROM statute s
-WHERE COALESCE(s.corpus_quarantined, FALSE) IS NOT TRUE
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'statute' AND dq.doc_id = s.id
+  )
   AND NOT EXISTS (
     SELECT 1
     FROM statute_section ss
@@ -33,20 +42,26 @@ WHERE COALESCE(s.corpus_quarantined, FALSE) IS NOT TRUE
   )
 """
 
-BAD_JUDGMENT_COUNT_SQL = """
+BAD_JUDGMENT_COUNT_SQL = f"""
 SELECT COUNT(*)::bigint AS n
 FROM judgment j
-WHERE COALESCE(j.corpus_quarantined, FALSE) IS NOT TRUE
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'judgment' AND dq.doc_id = j.id
+  )
   AND (
     j.full_text IS NULL
-    OR length(btrim(j.full_text)) < 140
+    OR length(btrim(j.full_text)) < {MIN_JUDGMENT_TEXT_CHARS}
   )
 """
 
 BAD_STATUTE_BY_TYPE_SQL = """
 SELECT COALESCE(s.statute_type, '(null)') AS document_type, COUNT(*)::bigint AS n
 FROM statute s
-WHERE COALESCE(s.corpus_quarantined, FALSE) IS NOT TRUE
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'statute' AND dq.doc_id = s.id
+  )
   AND NOT EXISTS (
     SELECT 1
     FROM statute_section ss
@@ -58,52 +73,41 @@ GROUP BY COALESCE(s.statute_type, '(null)')
 ORDER BY n DESC
 """
 
-BAD_JUDGMENT_BY_REPORTER_SQL = """
+BAD_JUDGMENT_BY_REPORTER_SQL = f"""
 SELECT COALESCE(j.reporter, '(null)') AS document_type, COUNT(*)::bigint AS n
 FROM judgment j
-WHERE COALESCE(j.corpus_quarantined, FALSE) IS NOT TRUE
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'judgment' AND dq.doc_id = j.id
+  )
   AND (
     j.full_text IS NULL
-    OR length(btrim(j.full_text)) < 140
+    OR length(btrim(j.full_text)) < {MIN_JUDGMENT_TEXT_CHARS}
   )
 GROUP BY COALESCE(j.reporter, '(null)')
 ORDER BY n DESC
 """
 
-STATUTE_QUARANTINE_REASON = "b7_bad_document:no_parseable_sections"
-JUDGMENT_QUARANTINE_REASON = "b7_bad_document:empty_or_short_text"
-SNAPSHOT_KEY_PREFIX = "b7_quarantine_snapshot:"
-LATEST_RUN_KEY = "b7_quarantine_latest_run_id"
 
-_BAD_STATUTE_APPLY_WHERE = """
-NOT EXISTS (
-  SELECT 1
-  FROM statute_section ss
-  JOIN statute_section_version ssv ON ssv.id = ss.current_version_id
-  WHERE ss.statute_id = statute.id
-    AND length(btrim(ssv.section_text)) > 0
-)
-AND corpus_quarantine_reason IS NULL
-"""
-
-_BAD_JUDGMENT_APPLY_WHERE = """
-(
-  full_text IS NULL
-  OR length(btrim(full_text)) < 140
-)
-AND corpus_quarantine_reason IS NULL
-"""
-
-
-def _snapshot_key(run_id: str) -> str:
-    return f"{SNAPSHOT_KEY_PREFIX}{run_id}"
-
-
-async def _load_snapshot(db: AsyncSession, run_id: str) -> Dict[str, Any]:
-    row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _snapshot_key(run_id)))).scalars().first()
-    if row is None or not row.value:
-        raise ValueError(f"no quarantine snapshot for run_id={run_id}")
-    return json.loads(row.value)
+async def _table_snapshot(db: AsyncSession) -> List[Dict[str, Any]]:
+    rows = (
+        await db.execute(
+            select(DocumentQuarantine).order_by(
+                DocumentQuarantine.doc_type,
+                DocumentQuarantine.doc_id,
+            )
+        )
+    ).scalars().all()
+    return [
+        {
+            "doc_type": r.doc_type,
+            "doc_id": str(r.doc_id),
+            "reason": r.reason,
+            "prior_reason": r.prior_reason,
+            "run_id": r.run_id,
+        }
+        for r in rows
+    ]
 
 
 async def bad_document_counts(db: AsyncSession) -> Dict[str, Any]:
@@ -130,76 +134,87 @@ async def bad_document_counts(db: AsyncSession) -> Dict[str, Any]:
             "statute_by_type": BAD_STATUTE_BY_TYPE_SQL.strip(),
             "judgment_by_reporter": BAD_JUDGMENT_BY_REPORTER_SQL.strip(),
         },
-        "min_judgment_text_chars": 140,
+        "min_judgment_text_chars": MIN_JUDGMENT_TEXT_CHARS,
+        "prod_reference_baselines": {
+            "statutes_total": 12_618,
+            "statutes_without_sections": 10_303,
+            "judgments_total": 90_039,
+            "judgments_bad": 0,
+        },
     }
 
 
 async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
     run_id = uuid.uuid4().hex
-    snapshot: Dict[str, Any] = {"statutes": {}, "judgments": {}}
+    now = datetime.now(timezone.utc)
+    statutes_inserted = 0
+    judgments_inserted = 0
 
-    statute_rows = (
+    statute_ids = (
         await db.execute(
             text(
-                f"""
-                SELECT id::text, corpus_quarantined, corpus_quarantine_reason
-                FROM statute
-                WHERE {_BAD_STATUTE_APPLY_WHERE}
+                """
+                SELECT s.id
+                FROM statute s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_quarantine dq
+                    WHERE dq.doc_type = 'statute' AND dq.doc_id = s.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM statute_section ss
+                    JOIN statute_section_version ssv ON ssv.id = ss.current_version_id
+                    WHERE ss.statute_id = s.id
+                      AND length(btrim(ssv.section_text)) > 0
+                  )
                 """
             )
         )
-    ).all()
-    for row in statute_rows:
-        snapshot["statutes"][row.id] = {
-            "corpus_quarantined": bool(row.corpus_quarantined),
-            "corpus_quarantine_reason": row.corpus_quarantine_reason,
-        }
+    ).scalars().all()
+    for sid in statute_ids:
+        db.add(
+            DocumentQuarantine(
+                doc_type="statute",
+                doc_id=sid,
+                reason=STATUTE_QUARANTINE_REASON,
+                prior_reason=None,
+                run_id=run_id,
+                quarantined_at=now,
+            )
+        )
+        statutes_inserted += 1
 
-    judgment_rows = (
+    judgment_ids = (
         await db.execute(
             text(
                 f"""
-                SELECT id::text, corpus_quarantined, corpus_quarantine_reason
-                FROM judgment
-                WHERE {_BAD_JUDGMENT_APPLY_WHERE}
+                SELECT j.id
+                FROM judgment j
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_quarantine dq
+                    WHERE dq.doc_type = 'judgment' AND dq.doc_id = j.id
+                  )
+                  AND (
+                    j.full_text IS NULL
+                    OR length(btrim(j.full_text)) < {MIN_JUDGMENT_TEXT_CHARS}
+                  )
                 """
             )
         )
-    ).all()
-    for row in judgment_rows:
-        snapshot["judgments"][row.id] = {
-            "corpus_quarantined": bool(row.corpus_quarantined),
-            "corpus_quarantine_reason": row.corpus_quarantine_reason,
-        }
-
-    if snapshot["statutes"]:
-        ids = list(snapshot["statutes"].keys())
-        await db.execute(
-            text(
-                """
-                UPDATE statute
-                SET corpus_quarantined = TRUE,
-                    corpus_quarantine_reason = :reason
-                WHERE id::text = ANY(:ids)
-                """
-            ),
-            {"reason": STATUTE_QUARANTINE_REASON, "ids": ids},
+    ).scalars().all()
+    for jid in judgment_ids:
+        db.add(
+            DocumentQuarantine(
+                doc_type="judgment",
+                doc_id=jid,
+                reason=JUDGMENT_QUARANTINE_REASON,
+                prior_reason=None,
+                run_id=run_id,
+                quarantined_at=now,
+            )
         )
-    if snapshot["judgments"]:
-        ids = list(snapshot["judgments"].keys())
-        await db.execute(
-            text(
-                """
-                UPDATE judgment
-                SET corpus_quarantined = TRUE,
-                    corpus_quarantine_reason = :reason
-                WHERE id::text = ANY(:ids)
-                """
-            ),
-            {"reason": JUDGMENT_QUARANTINE_REASON, "ids": ids},
-        )
+        judgments_inserted += 1
 
-    db.add(CorpusMetadata(key=_snapshot_key(run_id), value=json.dumps(snapshot)))
     latest = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
     if latest is None:
         db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
@@ -208,51 +223,16 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
     await db.commit()
     return {
         "run_id": run_id,
-        "statutes_updated": len(snapshot["statutes"]),
-        "judgments_updated": len(snapshot["judgments"]),
+        "statutes_updated": statutes_inserted,
+        "judgments_updated": judgments_inserted,
     }
 
 
 async def undo_quarantine(db: AsyncSession, run_id: str) -> Dict[str, int]:
-    snapshot = await _load_snapshot(db, run_id)
-    statutes_restored = 0
-    judgments_restored = 0
-    for sid, prior in snapshot.get("statutes", {}).items():
-        await db.execute(
-            text(
-                """
-                UPDATE statute
-                SET corpus_quarantined = :q,
-                    corpus_quarantine_reason = :reason
-                WHERE id::text = :id
-                """
-            ),
-            {
-                "id": sid,
-                "q": prior["corpus_quarantined"],
-                "reason": prior["corpus_quarantine_reason"],
-            },
-        )
-        statutes_restored += 1
-    for jid, prior in snapshot.get("judgments", {}).items():
-        await db.execute(
-            text(
-                """
-                UPDATE judgment
-                SET corpus_quarantined = :q,
-                    corpus_quarantine_reason = :reason
-                WHERE id::text = :id
-                """
-            ),
-            {
-                "id": jid,
-                "q": prior["corpus_quarantined"],
-                "reason": prior["corpus_quarantine_reason"],
-            },
-        )
-        judgments_restored += 1
+    result = await db.execute(delete(DocumentQuarantine).where(DocumentQuarantine.run_id == run_id))
     await db.commit()
-    return {"statutes_restored": statutes_restored, "judgments_restored": judgments_restored}
+    n = int(result.rowcount or 0)
+    return {"rows_removed": n}
 
 
 async def run_quarantine_bad_documents(
@@ -280,9 +260,9 @@ async def run_quarantine_bad_documents(
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Dry-run or apply corpus quarantine for bad statute/judgment rows")
-    parser.add_argument("--apply", action="store_true", help="Set corpus_quarantined on matching rows (not prod default)")
-    parser.add_argument("--undo", metavar="RUN_ID", help="Restore rows touched by a prior --apply run_id")
+    parser = argparse.ArgumentParser(description="Dry-run or apply document_quarantine for bad statute/judgment rows")
+    parser.add_argument("--apply", action="store_true", help="Insert document_quarantine rows (not prod default)")
+    parser.add_argument("--undo", metavar="RUN_ID", help="Remove rows inserted by a prior --apply run_id")
     args = parser.parse_args(argv)
     out = run_async(run_quarantine_bad_documents(apply=args.apply, undo=args.undo))
     print(json.dumps(out, indent=2))

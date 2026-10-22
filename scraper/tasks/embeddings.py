@@ -19,7 +19,7 @@ from sqlalchemy import select
 from scraper.config import settings
 from scraper.corpus_visibility import judgment_servable, statute_servable
 from scraper.database import SessionLocal, embedding_identity_matches, run_async
-from scraper.models import EmbeddingQueue, Judgment, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import DocumentQuarantine, EmbeddingQueue, Judgment, Statute, StatuteSection, StatuteSectionVersion
 from scraper.security import is_login_session
 
 logger = logging.getLogger(__name__)
@@ -80,10 +80,15 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
                 if rec:
                     text = f"{rec.canonical_citation} {rec.case_title or ''} {(rec.full_text or '')[:6000]}"
                 elif (
-                    await db.execute(select(Judgment.id).where(Judgment.id == item.record_id, Judgment.corpus_quarantined.is_(True)))
+                    await db.execute(
+                        select(DocumentQuarantine.doc_id).where(
+                            DocumentQuarantine.doc_type == "judgment",
+                            DocumentQuarantine.doc_id == item.record_id,
+                        )
+                    )
                 ).first():
                     item.status = "skipped"
-                    item.error_message = "parent judgment is corpus_quarantined"
+                    item.error_message = "parent judgment is document_quarantined"
                     counts["skipped_quarantined"] += 1
                     continue
             elif item.table_name == "statute_section":
@@ -96,7 +101,7 @@ async def process_embedding_queue(limit: Optional[int] = None, *, client: Option
                     ).scalars().first()
                     if statute is None:
                         item.status = "skipped"
-                        item.error_message = "parent statute is corpus_quarantined or missing"
+                        item.error_message = "parent statute is document_quarantined or missing"
                         counts["skipped_quarantined"] += 1
                         continue
                     ver = (await db.execute(select(StatuteSectionVersion).where(StatuteSectionVersion.id == rec.current_version_id))).scalars().first()

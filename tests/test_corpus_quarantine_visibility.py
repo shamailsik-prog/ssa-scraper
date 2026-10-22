@@ -1,20 +1,18 @@
-"""B7/R1 K1: corpus_quarantined rows hidden from search, corpus API, export, embeddings."""
+"""B7/R1 K1: document_quarantine rows hidden from search, corpus API, export, embeddings."""
 
 from __future__ import annotations
 
 import json
-from datetime import date
 
 import pytest
 from sqlalchemy import select
 
 from scraper.config import settings
-from scraper.fetchers import record_provenance, stage_judgment
 from scraper.models import (
     Citation,
+    DocumentQuarantine,
     EmbeddingQueue,
     Judgment,
-    ScraperSource,
     Statute,
     StatuteSection,
     StatuteSectionVersion,
@@ -51,25 +49,35 @@ async def _seed_visible_and_quarantined(db):
         year=2020,
         full_text="Hidden judgment body text that should not appear in search or export.",
         access_method="public",
-        corpus_quarantined=True,
-        corpus_quarantine_reason="b7_bad_document:empty_or_short_text",
     )
     db.add_all([visible, hidden])
     await db.flush()
     db.add(Citation(judgment_id=visible.id, citation_string="PLD 2020 SC 1", is_primary=True))
     db.add(EmbeddingQueue(record_id=visible.id, table_name="judgment", access_method="public"))
     db.add(EmbeddingQueue(record_id=hidden.id, table_name="judgment", access_method="public"))
+    db.add(
+        DocumentQuarantine(
+            doc_type="judgment",
+            doc_id=hidden.id,
+            reason="b7_bad_document:empty_or_short_text",
+            prior_reason=None,
+            run_id="seed-run",
+        )
+    )
 
     crpc = Statute(name="Code of Criminal Procedure, 1898", short_name="CrPC", year_enacted=1898)
-    bad_statute = Statute(
-        name="Empty Quarantined Act",
-        short_name="EQA",
-        year_enacted=2020,
-        corpus_quarantined=True,
-        corpus_quarantine_reason="b7_bad_document:no_parseable_sections",
-    )
+    bad_statute = Statute(name="Empty Quarantined Act", short_name="EQA", year_enacted=2020)
     db.add_all([crpc, bad_statute])
     await db.flush()
+    db.add(
+        DocumentQuarantine(
+            doc_type="statute",
+            doc_id=bad_statute.id,
+            reason="b7_bad_document:no_parseable_sections",
+            prior_reason=None,
+            run_id="seed-run",
+        )
+    )
     sec = StatuteSection(statute_id=crpc.id, section_number="497", section_title="Bail")
     db.add(sec)
     await db.flush()

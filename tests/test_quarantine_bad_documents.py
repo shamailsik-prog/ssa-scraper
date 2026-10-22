@@ -1,14 +1,15 @@
-"""B7: quarantine_bad_documents CLI criteria, apply/undo snapshots on test DB."""
+"""B7: quarantine_bad_documents CLI criteria, apply/undo snapshots on document_quarantine."""
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import select
 
-from scraper.models import Judgment, Statute
+from scraper.models import DocumentQuarantine, Judgment, Statute
 from scraper.tasks.quarantine_bad_documents import (
     JUDGMENT_QUARANTINE_REASON,
     STATUTE_QUARANTINE_REASON,
+    _table_snapshot,
     apply_quarantine,
     bad_document_counts,
     run_quarantine_bad_documents,
@@ -22,78 +23,65 @@ async def test_bad_document_counts_statute_without_sections(db):
     await db.commit()
     counts = await bad_document_counts(db)
     assert counts["statute_bad_rows"] >= 1
+    assert counts["prod_reference_baselines"]["statutes_without_sections"] == 10_303
 
 
 @pytest.mark.asyncio
 async def test_quarantine_apply_undo_restores_exact_prior_state(db):
-    st = Statute(
-        name="Quarantine Me Act",
-        jurisdiction="Federal",
-        source_name="Test",
-        corpus_quarantined=False,
-        corpus_quarantine_reason=None,
-    )
+    st = Statute(name="Quarantine Me Act", jurisdiction="Federal", source_name="Test")
     jg = Judgment(
         canonical_citation="2020 TEST 1",
         access_method="public",
         full_text="x",
         source_name="Test",
-        corpus_quarantined=False,
-        corpus_quarantine_reason=None,
     )
-    prior_st = Statute(
-        name="Prior Reason Act",
-        jurisdiction="Federal",
-        source_name="Test",
-        corpus_quarantined=True,
-        corpus_quarantine_reason="operator:manual_review",
-    )
+    prior_st = Statute(name="Prior Reason Act", jurisdiction="Federal", source_name="Test")
     db.add_all([st, jg, prior_st])
+    await db.flush()
+    db.add(
+        DocumentQuarantine(
+            doc_type="statute",
+            doc_id=prior_st.id,
+            reason="operator:manual_review",
+            prior_reason=None,
+            run_id="prior-operator-run",
+        )
+    )
     await db.commit()
 
     from scraper.database import SessionLocal
 
     async with SessionLocal() as session:
+        before = await _table_snapshot(session)
         applied = await apply_quarantine(session)
         run_id = applied["run_id"]
         assert applied["statutes_updated"] >= 1
         assert applied["judgments_updated"] >= 1
 
-        st_row = (await session.execute(select(Statute).where(Statute.name == "Quarantine Me Act"))).scalars().first()
-        jg_row = (await session.execute(select(Judgment).where(Judgment.canonical_citation == "2020 TEST 1"))).scalars().first()
-        prior_row = (await session.execute(select(Statute).where(Statute.name == "Prior Reason Act"))).scalars().first()
-        assert st_row.corpus_quarantined is True
-        assert st_row.corpus_quarantine_reason == STATUTE_QUARANTINE_REASON
-        assert jg_row.corpus_quarantined is True
-        assert jg_row.corpus_quarantine_reason == JUDGMENT_QUARANTINE_REASON
-        assert prior_row.corpus_quarantine_reason == "operator:manual_review"
+        rows = (await session.execute(select(DocumentQuarantine))).scalars().all()
+        by_key = {(r.doc_type, str(r.doc_id)): r for r in rows}
+        assert by_key[("statute", str(st.id))].reason == STATUTE_QUARANTINE_REASON
+        assert by_key[("statute", str(st.id))].run_id == run_id
+        assert by_key[("judgment", str(jg.id))].reason == JUDGMENT_QUARANTINE_REASON
+        assert by_key[("statute", str(prior_st.id))].reason == "operator:manual_review"
+        assert by_key[("statute", str(prior_st.id))].run_id == "prior-operator-run"
 
         undone = await undo_quarantine(session, run_id)
-        assert undone["statutes_restored"] == applied["statutes_updated"]
-        assert undone["judgments_restored"] == applied["judgments_updated"]
+        assert undone["rows_removed"] == applied["statutes_updated"] + applied["judgments_updated"]
 
-        await session.refresh(st_row)
-        await session.refresh(jg_row)
-        await session.refresh(prior_row)
-        assert st_row.corpus_quarantined is False
-        assert st_row.corpus_quarantine_reason is None
-        assert jg_row.corpus_quarantined is False
-        assert jg_row.corpus_quarantine_reason is None
-        assert prior_row.corpus_quarantine_reason == "operator:manual_review"
+        after = await _table_snapshot(session)
+        assert after == before
 
 
 @pytest.mark.asyncio
 async def test_dry_run_does_not_update_rows(db):
     db.add(Statute(name="Dry Run Act", jurisdiction="Federal", source_name="Test"))
     await db.commit()
-    before = (await db.execute(select(Statute).where(Statute.name == "Dry Run Act"))).scalars().first()
-    assert before is not None
-    assert before.corpus_quarantined is False
+    before_count = len((await db.execute(select(DocumentQuarantine))).scalars().all())
 
     out = await run_quarantine_bad_documents(apply=False)
     assert out["dry_run"] is True
     assert out["statute_bad_rows"] >= 1
 
-    after = (await db.execute(select(Statute).where(Statute.name == "Dry Run Act"))).scalars().first()
-    assert after is not None
-    assert after.corpus_quarantined is False
+    after_count = len((await db.execute(select(DocumentQuarantine))).scalars().all())
+    assert after_count == before_count
