@@ -221,6 +221,7 @@ def client():
         yield c
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     """Default xdist_group per test file so --dist loadgroup matches loadfile distribution."""
     for item in items:

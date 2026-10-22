@@ -213,8 +213,7 @@ asyncio.run(main())
                 await admin_engine.dispose()
 
 
-@pytest.mark.asyncio
-async def test_ensure_roles_superuser_reader_raises_for_non_superuser_caller():
+async def _run_non_superuser_probe_expect_demotion_error(reader_create_sql: str) -> None:
     base = os.environ.get("_CORPUS_TEST_DATABASE_BASE") or xdist_db.database_name_from_url(os.environ["DATABASE_URL"])
     probe_role = f"ensure_roles_probe_{uuid.uuid4().hex[:10]}"
     probe_pw = "ensure-roles-probe-pw"
@@ -237,7 +236,7 @@ async def test_ensure_roles_superuser_reader_raises_for_non_superuser_caller():
                 )
                 safe_db = probe_db.replace('"', "")
                 await conn.execute(text(f'CREATE DATABASE "{safe_db}" OWNER "{probe_role}"'))
-                await conn.execute(text(f'CREATE ROLE "{reader_role}" LOGIN PASSWORD \'x\' SUPERUSER'))
+                await conn.execute(text(reader_create_sql.format(reader=reader_role)))
                 await conn.execute(text(f'GRANT CONNECT ON DATABASE "{safe_db}" TO "{reader_role}"'))
         finally:
             await admin_engine.dispose()
@@ -293,6 +292,27 @@ asyncio.run(main())
                     await drop_owned_role(conn, probe_role)
             finally:
                 await admin_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ensure_roles_superuser_reader_raises_for_non_superuser_caller():
+    await _run_non_superuser_probe_expect_demotion_error(
+        'CREATE ROLE "{reader}" LOGIN PASSWORD \'x\' SUPERUSER'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reader_create_sql",
+    [
+        'CREATE ROLE "{reader}" LOGIN PASSWORD \'x\' NOSUPERUSER CREATEROLE',
+        'CREATE ROLE "{reader}" LOGIN PASSWORD \'x\' NOSUPERUSER REPLICATION',
+        'CREATE ROLE "{reader}" LOGIN PASSWORD \'x\' NOSUPERUSER BYPASSRLS',
+    ],
+    ids=["createrole", "replication", "bypassrls"],
+)
+async def test_ensure_roles_privileged_reader_raises_for_non_superuser_caller(reader_create_sql: str):
+    await _run_non_superuser_probe_expect_demotion_error(reader_create_sql)
 
 
 async def _run_superuser_probe_reader_demotion(
@@ -408,4 +428,13 @@ async def test_ensure_roles_demotes_bypassrls_reader():
         elevate_sql='ALTER ROLE "{role}" BYPASSRLS',
         flag_column="rolbypassrls",
         fail_message="reader still bypassrls",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_roles_demotes_replication_reader():
+    await _run_superuser_probe_reader_demotion(
+        elevate_sql='ALTER ROLE "{role}" REPLICATION',
+        flag_column="rolreplication",
+        fail_message="reader still replication",
     )
