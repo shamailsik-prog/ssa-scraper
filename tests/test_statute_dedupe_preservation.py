@@ -5,7 +5,8 @@ from uuid import uuid4
 
 import pytest
 
-from scraper.models import Statute, StatuteSection
+from scraper.models import Statute, StatuteSection, StatuteSectionVersion
+from sqlalchemy import select
 from scraper.statute_quality.dedupe import can_quarantine_subsumed_statute_sections
 from scraper.tasks.statute_quality import _sections_map_for_statutes, find_duplicate_groups
 from tests.test_statute_quality_cli import _add_section
@@ -114,6 +115,48 @@ async def test_db_unreadable_unique_section_never_auto_quarantined(db, unreadabl
     assert len(mapped[candidate]) == 2, "unreadable sections must remain in comparison"
     assert any(s["section_number"] == "1A" and not s["section_text"] for s in mapped[candidate])
 
+    result = await find_duplicate_groups(db)
+    assert result["duplicate_groups"] == 1
+    assert result["statutes_to_quarantine"] == 0
+    assert result["review_required_ids"] == [candidate]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_on", ["keeper", "candidate"])
+async def test_db_historical_version_never_auto_quarantined(db, history_on):
+    """Matching current wording must not hide a distinct earlier statutory version."""
+    keeper, candidate = uuid4(), uuid4()
+    for sid, name in (
+        (keeper, "Historical Rights Act, 2024"),
+        (candidate, "Historical Rights Act,2024"),
+    ):
+        db.add(Statute(
+            id=sid, name=name, year_enacted=2024, jurisdiction="Federal",
+            source_name="Senate", source_url="https://example.test/statute",
+        ))
+    await db.commit()
+    await _add_section(db, keeper, "1", "Section 1. Current entitlement.")
+    await _add_section(db, keeper, "2", "Section 2. Additional entitlement.")
+    await _add_section(db, candidate, "1", "Section 1. Current entitlement.")
+    owner_id = keeper if history_on == "keeper" else candidate
+    section = (await db.execute(
+        select(StatuteSection).where(
+            StatuteSection.statute_id == owner_id,
+            StatuteSection.section_number == "1",
+        )
+    )).scalar_one()
+    db.add(StatuteSectionVersion(
+        section_id=section.id,
+        version_no=2,
+        section_text="Section 1. Former entitlement before amendment.",
+        text_hash="f" * 64,
+    ))
+    await db.commit()
+
+    # The current-only section map remains identical for section 1, proving that
+    # section text comparison alone cannot protect historical amendments.
+    mapped = await _sections_map_for_statutes(db, [keeper, candidate])
+    assert can_quarantine_subsumed_statute_sections(mapped[keeper], mapped[candidate])
     result = await find_duplicate_groups(db)
     assert result["duplicate_groups"] == 1
     assert result["statutes_to_quarantine"] == 0
