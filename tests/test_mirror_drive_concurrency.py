@@ -260,6 +260,31 @@ def test_mirror_drive_concurrency_capped_at_sixteen():
 
 
 @pytest.mark.asyncio
+async def test_drive_concurrency_time_budget_after_acquire_stops_inflight(db, source, monkeypatch):
+    """Deadline ~0.3s ahead with 0.4s uploads: workers must not run past budget (mutant M15)."""
+
+    class _SlowPutAdapter(_TrackingAdapter):
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            time.sleep(0.4)
+            return super().put(key, data, content_type)
+
+    adapter = _SlowPutAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 3)
+    await _drive_target(db)
+
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.3)
+    await mirror.mirror_pending(limit=3)
+    await db.commit()
+    assert mirror.out_of_time
+    assert len(adapter.put_keys) < 9
+
+
+@pytest.mark.asyncio
 async def test_drive_concurrency_respects_time_budget_before_acquire(db, source, tracking_drive, monkeypatch):
     adapter, factory = tracking_drive
     monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)

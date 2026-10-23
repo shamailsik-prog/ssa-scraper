@@ -480,6 +480,9 @@ class ArchiveMirror:
                 return
             await limiter.acquire()
             try:
+                if self._time_up():
+                    stop.set()
+                    return
                 async with SessionLocal() as session:
                     try:
                         status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
