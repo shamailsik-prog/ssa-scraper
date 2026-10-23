@@ -319,13 +319,13 @@ class SessionLock:
         if dead_holder_takeover and not _settings.PLS_LOCK_DEAD_HOLDER_TAKEOVER:
             dead_holder_takeover = False
         if dead_holder_takeover and self.max_holders == 1 and self._holder_identity:
-            from scraper.pls_lock_holder import lock_value_stale_for_takeover, touch_worker_alive
+            from scraper.pls_lock_holder import lock_value_holder_stale, touch_worker_alive
 
             r = await self._client()
             raw = await r.get(self.exclusive_key)
             if raw is not None:
                 current = raw.decode() if isinstance(raw, bytes) else str(raw)
-                if await lock_value_stale_for_takeover(r, self.exclusive_key, current):
+                if await lock_value_holder_stale(r, current):
                     if await self._clear_exclusive_if_value(current):
                         if await self._try_acquire_once():
                             self._held = True

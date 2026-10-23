@@ -162,9 +162,11 @@ def test_shutdown_registry_releases_tracked_lock(monkeypatch):
     client.close()
 
 
-def test_release_all_registered_sync_is_not_reentrant(monkeypatch):
+def test_release_all_registered_sync_blocks_until_guard_available(monkeypatch):
+    """Mutant S1: release must hold sigmask through Redis DEL (blocking guard, not fail-open skip)."""
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
     import redis
+    import threading
 
     client = redis.from_url(settings.REDIS_URL)
     key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:reentrant")
@@ -173,13 +175,23 @@ def test_release_all_registered_sync_is_not_reentrant(monkeypatch):
     register_lock(key, token)
     from scraper.pls_lock_registry import _guard
 
+    released: list[int] = []
+
+    def _second_release() -> None:
+        released.append(release_all_registered_sync())
+
     _guard.acquire()
     try:
-        assert release_all_registered_sync() == 0
-        assert client.get(key) is not None
-    finally:
+        t = threading.Thread(target=_second_release)
+        t.start()
+        time.sleep(0.15)
+        assert released == []
         _guard.release()
-        release_all_registered_sync()
+        t.join(timeout=5)
+    finally:
+        if _guard.locked():
+            _guard.release()
+    assert released == [1]
     assert client.get(key) is None
     client.close()
 
@@ -373,34 +385,13 @@ async def test_release_search_harvest_locks_respects_deploy_flag(r, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_dead_holder_takeover_clears_legacy_token_when_no_live_task(r, monkeypatch):
+async def test_dead_holder_takeover_never_steals_legacy_sha_lock_value(r, monkeypatch):
+    """Legacy pre-identity tokens are not taken over; wait for TTL or deploy release."""
     monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
     monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
-    monkeypatch.setattr("scraper.pls_lock_celery.celery_pls_lock_task_active", lambda: False)
     source = "PakistanLawSite:search_harvest:slot-legacy"
     key = LOCK_KEY.format(source=source)
-    await r.delete(key)
     legacy = "a" * 64
-    await r.set(key, legacy, ex=120)
-    lock = SessionLock(source, r, holder_identity=True)
-    await lock.acquire(dead_holder_takeover=True)
-    try:
-        raw = await r.get(key)
-        assert raw is not None
-        assert raw.decode() != legacy
-    finally:
-        await lock.release()
-    await r.delete(key)
-
-
-@pytest.mark.asyncio
-async def test_dead_holder_takeover_keeps_legacy_token_when_celery_task_active(r, monkeypatch):
-    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
-    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
-    monkeypatch.setattr("scraper.pls_lock_celery.celery_pls_lock_task_active", lambda: True)
-    source = "PakistanLawSite:search_harvest:slot-legacy-live"
-    key = LOCK_KEY.format(source=source)
-    legacy = "b" * 64
     await r.set(key, legacy, ex=120)
     lock = SessionLock(source, r, holder_identity=True)
     with pytest.raises(SessionLockHeld):

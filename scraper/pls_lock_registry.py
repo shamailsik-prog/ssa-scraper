@@ -41,55 +41,47 @@ def release_all_registered_sync() -> int:
         return 0
 
     prior_mask = None
-    if hasattr(signal, "pthread_sigmask"):
+    try:
+        if hasattr(signal, "pthread_sigmask"):
+            try:
+                prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _signals_to_block())
+            except (ValueError, OSError, AttributeError):
+                prior_mask = None
+
+        with _guard:
+            pairs = list(_held)
+            _held.clear()
+
+        if not pairs:
+            return 0
         try:
-            prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _signals_to_block())
-        except (ValueError, OSError, AttributeError):
-            prior_mask = None
-
-    if not _guard.acquire(blocking=False):
-        if prior_mask is not None:
-            try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-            except (ValueError, OSError, AttributeError):
-                pass
-        return 0
-
-    try:
-        pairs = list(_held)
-        _held.clear()
+            import redis
+        except ImportError:
+            return 0
+        released = 0
+        try:
+            client = redis.from_url(settings.REDIS_URL)
+            for key, token in pairs:
+                try:
+                    ok = client.eval(
+                        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                        1,
+                        key,
+                        token,
+                    )
+                    if int(ok or 0) == 1:
+                        released += 1
+                except Exception as exc:
+                    logger.warning("pls lock shutdown: could not release %s: %s", key, exc)
+            client.close()
+        except Exception as exc:
+            logger.warning("pls lock shutdown: redis unavailable: %s", exc)
+        if released:
+            logger.info("pls lock shutdown: released %s registered lock(s)", released)
+        return released
     finally:
-        _guard.release()
         if prior_mask is not None:
             try:
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
             except (ValueError, OSError, AttributeError):
                 pass
-
-    if not pairs:
-        return 0
-    try:
-        import redis
-    except ImportError:
-        return 0
-    released = 0
-    try:
-        client = redis.from_url(settings.REDIS_URL)
-        for key, token in pairs:
-            try:
-                ok = client.eval(
-                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-                    1,
-                    key,
-                    token,
-                )
-                if int(ok or 0) == 1:
-                    released += 1
-            except Exception as exc:
-                logger.warning("pls lock shutdown: could not release %s: %s", key, exc)
-        client.close()
-    except Exception as exc:
-        logger.warning("pls lock shutdown: redis unavailable: %s", exc)
-    if released:
-        logger.info("pls lock shutdown: released %s registered lock(s)", released)
-    return released

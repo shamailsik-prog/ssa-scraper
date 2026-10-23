@@ -467,10 +467,60 @@ class ArchiveMirror:
         *,
         concurrency: int,
     ) -> int:
-        """Parallel Drive uploads; each worker builds its own adapter (googleapiclient/httplib2 is not thread-safe)."""
+        """Parallel Drive uploads with a fixed pool of adapters (httplib2 is not thread-safe)."""
         from scraper.database import SessionLocal
 
-        limiter = _AdaptiveConcurrency(concurrency)
+        pool_size = max(1, int(concurrency))
+        drive_cfg = dict(target_cfg)
+        drive_cfg["_drive_folder_cache"] = drive_cfg.get("_drive_folder_cache") or {"": drive_cfg.get("folder_id") or drive_cfg.get("root_folder_id") or ""}
+
+        pending_work: List[_JudgmentUploadWork] = []
+        folder_keys: List[str] = []
+        for j in judgments:
+            if self._time_up():
+                break
+            if not self._policy_allows(t, j.access_method):
+                summary["skipped_policy"] += 1
+                continue
+            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+            if already >= JUDGMENT_OBJECT_COUNT:
+                continue
+            objs = await self.judgment_objects(j)
+            for obj in objs:
+                pending_work.append(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))
+                folder_keys.append(obj["key"])
+            index_rows.append(
+                [
+                    j.canonical_citation,
+                    j.case_title or "",
+                    j.court_name or "",
+                    str(j.year or ""),
+                    j.decision_date.isoformat() if j.decision_date else "",
+                    judgment_prefix(j),
+                    "original_pdf" if j.has_original_pdf else "rendered_copy",
+                    j.full_text_hash or "",
+                ]
+            )
+            await self._checkpoint()
+
+        adapter_pool: asyncio.Queue = asyncio.Queue()
+        for _ in range(pool_size):
+            adapter_pool.put_nowait(await asyncio.to_thread(self.adapter_factory, target_type, drive_cfg))
+
+        if folder_keys:
+            setup_adapter = await adapter_pool.get()
+            try:
+                seen_folders: set[str] = set()
+                for key in folder_keys:
+                    folder = key.rsplit("/", 1)[0]
+                    if folder in seen_folders:
+                        continue
+                    seen_folders.add(folder)
+                    await asyncio.to_thread(setup_adapter.ensure_tree, key)
+            finally:
+                await adapter_pool.put(setup_adapter)
+
+        limiter = _AdaptiveConcurrency(pool_size)
         failures = 0
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
@@ -481,11 +531,11 @@ class ArchiveMirror:
             if stop.is_set() or self._time_up():
                 return
             await limiter.acquire()
+            adapter = await adapter_pool.get()
             try:
                 if self._time_up():
                     stop.set()
                     return
-                adapter = await asyncio.to_thread(self.adapter_factory, target_type, target_cfg)
                 async with SessionLocal() as session:
                     try:
                         status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
@@ -503,36 +553,10 @@ class ArchiveMirror:
                         stop.set()
                 logger.warning("archive %s: %s failed: %s", t.name, work.obj["key"], exc)
             finally:
+                await adapter_pool.put(adapter)
                 await limiter.release()
 
-        tasks: List[asyncio.Task] = []
-        for j in judgments:
-            if self._time_up() or stop.is_set():
-                break
-            if not self._policy_allows(t, j.access_method):
-                summary["skipped_policy"] += 1
-                continue
-            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
-            if already >= JUDGMENT_OBJECT_COUNT:
-                continue
-            objs = await self.judgment_objects(j)
-            for obj in objs:
-                if self._time_up() or stop.is_set():
-                    break
-                tasks.append(asyncio.create_task(run_one(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))))
-            index_rows.append(
-                [
-                    j.canonical_citation,
-                    j.case_title or "",
-                    j.court_name or "",
-                    str(j.year or ""),
-                    j.decision_date.isoformat() if j.decision_date else "",
-                    judgment_prefix(j),
-                    "original_pdf" if j.has_original_pdf else "rendered_copy",
-                    j.full_text_hash or "",
-                ]
-            )
-            await self._checkpoint()
+        tasks = [asyncio.create_task(run_one(work)) for work in pending_work]
         if tasks:
             await asyncio.gather(*tasks)
         return failures

@@ -66,6 +66,9 @@ class _TrackingAdapter:
             with self._lock:
                 self.in_flight -= 1
 
+    def ensure_tree(self, key: str) -> None:
+        return None
+
     def exists(self, key: str) -> bool:
         return False
 
@@ -170,8 +173,49 @@ async def test_drive_concurrency_builds_distinct_http_client_per_worker(db, sour
     await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=4)
     await db.commit()
 
-    assert factory_calls >= 2, "each parallel worker should build its own Drive adapter"
+    assert factory_calls in (4, 5), "fixed upload pool (4) plus optional index writer"
     assert not shared_client_across_threads, "same http client must not be used from multiple threads at once"
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_creates_each_judgment_folder_once(db, source, monkeypatch):
+    """Pre-flight ensure_tree + shared folder cache: one mkdir per judgment prefix under concurrency."""
+
+    from collections import defaultdict
+
+    folder_ensures: Dict[str, int] = defaultdict(int)
+
+    class _FolderAdapter(_TrackingAdapter):
+        def __init__(self, folder_cache: Dict[str, str]) -> None:
+            super().__init__()
+            self._folder_cache = folder_cache
+
+        def ensure_tree(self, key: str) -> None:
+            folder = key.rsplit("/", 1)[0]
+            folder_ensures[folder] += 1
+            self._folder_cache.setdefault(folder, folder)
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            folder = key.rsplit("/", 1)[0]
+            if folder not in self._folder_cache:
+                folder_ensures[folder] += 1
+                self._folder_cache[folder] = folder
+            return super().put(key, data, content_type)
+
+    shared_cache: Dict[str, str] = {"": "root"}
+
+    def factory(_target_type, config):
+        assert config.get("_drive_folder_cache") is shared_cache
+        return _FolderAdapter(shared_cache)
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+
+    for prefix, count in folder_ensures.items():
+        assert count <= 1, f"duplicate folder ensure for {prefix}: {count}"
 
 
 @pytest.mark.asyncio

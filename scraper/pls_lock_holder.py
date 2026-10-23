@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 
 WORKER_ALIVE_KEY_PREFIX = "pls:worker_alive:"
 WORKER_ALIVE_TTL_SECONDS = 60
-LEGACY_LOCK_REFRESH_GRACE_SECONDS = 120
 
 _process_lock_host: Optional[str] = None
 
@@ -85,37 +84,6 @@ async def remote_worker_heartbeat_present(redis_client, host: str) -> bool:
     if host == lock_host_identity():
         return True
     return bool(await redis_client.exists(worker_alive_redis_key(host)))
-
-
-def is_legacy_lock_token(value: str) -> bool:
-    if not value or parse_lock_holder(value) is not None:
-        return False
-    if len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-async def lock_value_stale_for_takeover(redis_client, exclusive_key: str, value: str) -> bool:
-    """Whether a held lock may be taken over (identity holders, legacy tokens, live-task safety)."""
-    if await lock_value_holder_stale(redis_client, value):
-        return True
-    if not is_legacy_lock_token(value):
-        return False
-    from scraper.pls_lock_celery import celery_pls_lock_task_active
-
-    if celery_pls_lock_task_active():
-        return False
-    pttl = await redis_client.pttl(exclusive_key)
-    if pttl is None or int(pttl) < 0:
-        return True
-    from scraper.auth.session_manager import LOCK_TTL_SECONDS
-
-    recently_refreshed_ms = max(0, (LOCK_TTL_SECONDS - LEGACY_LOCK_REFRESH_GRACE_SECONDS) * 1000)
-    return int(pttl) < recently_refreshed_ms
 
 
 async def lock_value_holder_stale(redis_client, value: str) -> bool:
