@@ -100,8 +100,35 @@ sys.exit(0)
 }
 
 # Stop a zero-output PLS job and drop login locks so auto_deploy can roll out fixes during a stall.
+pls_host_env_flag_enabled() {
+  local key="$1"
+  local val
+  val="$(grep -E "^${key}=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' || true)"
+  case "${val,,}" in 1|true|yes|on) return 0 ;; esac
+  return 1
+}
+
+pls_host_release_search_harvest_locks() {
+  if ! pls_host_env_flag_enabled PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS; then
+    return 0
+  fi
+  if ! docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx redis; then
+    return 0
+  fi
+  local n=0 key
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    pls_host_redis_cli DEL "$key" >/dev/null 2>&1 || true
+    n=$((n + 1))
+  done < <(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null || true)
+  if [ "$n" -gt 0 ]; then
+    printf '[%s] pls_host: released %s search-harvest Redis lock(s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n"
+  fi
+}
+
 pls_host_force_release_stalled_harvest() {
   docker compose stop worker-scraper 2>/dev/null || true
+  pls_host_release_search_harvest_locks
   docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -v ON_ERROR_STOP=1 -c \
     "UPDATE scraper_jobs SET status = 'failed', finished_at = COALESCE(finished_at, NOW()), error_message = LEFT(COALESCE(error_message, '') || ' auto_deploy: released stalled zero-output job for deploy', 4000) WHERE source_name = 'PakistanLawSite' AND status = 'running';" \
     2>/dev/null || true

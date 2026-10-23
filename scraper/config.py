@@ -185,6 +185,12 @@ class Settings(BaseSettings):
     PLS_CITATION_GRID_SKIP_FLUSH_EVERY: int = Field(default=50, description="Commit the grid cursor every N rows that are only skipped (known, already staged, other shard); rows that fetch a detail page still commit every PLS_CITATION_GRID_FLUSH_EVERY.")
     MIRROR_BACKLOG_PER_RUN: int = Field(default=300, description="Oldest-first backlog judgments the archive mirror writes per target per run, in addition to the newest ones.")
     MIRROR_RUN_BUDGET_SECONDS: int = Field(default=900, description="An archive mirror run stops starting new objects after this many seconds, commits, and queues the next run.")
+    MIRROR_DRIVE_CONCURRENCY: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Within one mirror_pending run, upload up to this many Google Drive objects concurrently (1 = sequential, legacy behaviour).",
+    )
     RECONCILE_RUN_BUDGET_SECONDS: int = Field(default=600, description="A reconcile_storage run stops checking objects after this many seconds; the next run carries on from the least recently verified.")
     RECONCILE_BATCH_SIZE: int = Field(default=2000, description="At most this many stored objects per target are checked in one reconcile_storage run.")
     ARCHIVE_BATCH_BYTES: int = Field(
@@ -322,6 +328,34 @@ class Settings(BaseSettings):
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
+    )
+    PLS_LOCK_HOLDER_IDENTITY: bool = Field(
+        default=False,
+        description="When true, PLS search-harvest Redis locks store hostname:pid in the value (for dead-holder takeover and deploy diagnostics).",
+    )
+    PLS_WORKER_HEARTBEAT_INTERVAL_SECONDS: int = Field(
+        default=15,
+        description="When PLS_LOCK_HOLDER_IDENTITY is on, refresh pls:worker_alive:<host> this often (seconds) so long login waits do not look like a dead holder.",
+    )
+    PLS_LOCK_DEAD_HOLDER_TAKEOVER: bool = Field(
+        default=False,
+        description="When true, a search-harvest tick may take a slot/query Redis lock whose hostname:pid holder is no longer alive.",
+    )
+    PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN: bool = Field(
+        default=False,
+        description="When true, the login-session worker releases tracked PLS search-harvest Redis locks on process shutdown (SIGTERM).",
+    )
+    PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS: bool = Field(
+        default=False,
+        description="When true, auto_deploy/install releases search-harvest slot and query Redis locks before recreating worker-scraper.",
+    )
+    PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED: bool = Field(
+        default=False,
+        description="When true, compute_stalled may report stalled when search-harvest locks are held but no new PLS staging rows arrive.",
+    )
+    PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES: int = Field(
+        default=15,
+        description="Minutes without a new PakistanLawSite scraper_staging row while search-harvest locks are held before the orphan-lock stall alarm fires.",
     )
     PLS_CASEID_WALK_ENABLED: bool = Field(
         default=True,
