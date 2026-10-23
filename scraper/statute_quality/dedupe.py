@@ -10,6 +10,7 @@ from scraper.parsers.statute_parser import _parse_numeric_section_number
 _MAY_BE_CALLED_RE = re.compile(r"\bmay be called\b", re.IGNORECASE)
 _YEAR_LIKE_MIN = 1800
 _YEAR_LIKE_MAX = 2100
+KEEPER_MIN_CHAR_FRACTION = 0.7
 
 
 def dedupe_canonical_name_key(name: str) -> str:
@@ -35,6 +36,31 @@ def _real_section_ints(section_numbers: Sequence[str]) -> List[int]:
     return ints
 
 
+def max_real_section_run_end(*section_number_lists: Sequence[str]) -> int:
+    """Largest numeric section index seen in any duplicate-group member."""
+    end = 0
+    for nums in section_number_lists:
+        real = _real_section_ints(nums)
+        if real:
+            end = max(end, real[-1])
+    return end
+
+
+def _typical_max_excluding_candidate(all_numbers: Sequence[str], candidate: str) -> int:
+    real = sorted(set(_real_section_ints(all_numbers)))
+    n = _section_int(candidate)
+    if n is not None:
+        others = [x for x in real if x != n]
+    else:
+        others = real
+    if not others:
+        return 0
+    median = others[len(others) // 2]
+    if len(others) >= 2:
+        return max(median, others[-2])
+    return others[-1]
+
+
 def is_fake_section_number(section_number: str, *, all_numbers: Sequence[str]) -> bool:
     n = _section_int(section_number)
     if n is None:
@@ -44,7 +70,7 @@ def is_fake_section_number(section_number: str, *, all_numbers: Sequence[str]) -
     real = _real_section_ints(all_numbers)
     if not real:
         return n > 5000
-    typical_max = max(real)
+    typical_max = _typical_max_excluding_candidate(all_numbers, section_number)
     if n > 5000:
         return True
     if n > typical_max + 5 and n >= 100:
@@ -57,11 +83,13 @@ def count_fake_sections(section_numbers: Sequence[str]) -> int:
     return sum(1 for n in nums if is_fake_section_number(n, all_numbers=nums))
 
 
-def count_missing_from_section_run(section_numbers: Sequence[str]) -> int:
+def count_missing_from_section_run(section_numbers: Sequence[str], *, run_end: Optional[int] = None) -> int:
     real = sorted(set(_real_section_ints(section_numbers)))
     if not real:
         return 10_000
-    end = real[-1]
+    end = int(run_end) if run_end is not None else real[-1]
+    if end <= 0:
+        return 10_000
     present = set(real)
     return sum(1 for i in range(1, end + 1) if i not in present)
 
@@ -80,10 +108,11 @@ def dedupe_keeper_rank(
     sections: Sequence[Dict[str, str]],
     text_chars: int,
     has_source_url: bool,
+    group_run_end: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int]:
     """Sort key tuple: higher is better (use with ``reverse=True``)."""
     nums = [str(s.get("section_number") or "") for s in sections]
-    missing = count_missing_from_section_run(nums)
+    missing = count_missing_from_section_run(nums, run_end=group_run_end)
     fake = count_fake_sections(nums)
     may_called = 1 if section_1_has_may_be_called(sections) else 0
     prov = 1 if has_source_url else 0
@@ -94,6 +123,17 @@ def dedupe_keeper_rank(
         int(text_chars),
         prov,
     )
+
+
+def keeper_below_char_fraction(
+    keeper_chars: int,
+    *,
+    group_best_chars: int,
+    min_fraction: float = KEEPER_MIN_CHAR_FRACTION,
+) -> bool:
+    if group_best_chars <= 0:
+        return False
+    return keeper_chars < int(group_best_chars * min_fraction)
 
 
 def count_duplicate_groups_from_statute_rows(rows: Sequence[Dict[str, object]]) -> int:

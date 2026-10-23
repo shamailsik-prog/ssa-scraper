@@ -22,7 +22,12 @@ from scraper.parsers.assembly_pdf_sections import assembly_body_too_thin, is_ass
 from scraper.statute_quality.ocr_quality import statute_text_poor_ocr
 from scraper.statute_quality.section_noise import filter_statute_quality_sections, is_section_body_noise
 from scraper.statute_quality_jurisdiction import should_fix_federal_jurisdiction
-from scraper.statute_quality.dedupe import dedupe_canonical_name_key, dedupe_keeper_rank
+from scraper.statute_quality.dedupe import (
+    dedupe_canonical_name_key,
+    dedupe_keeper_rank,
+    keeper_below_char_fraction,
+    max_real_section_run_end,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,23 +127,45 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
     sections_map = await _sections_map_for_statutes(db, all_dup_ids)
     losers: List[UUID] = []
     winners: List[UUID] = []
-    for _key, members in dup_groups.items():
+    manual_review: List[Dict[str, Any]] = []
+    for group_key, members in dup_groups.items():
+        nums_lists = [
+            [str(s.get("section_number") or "") for s in sections_map.get(st.id, [])]
+            for st in members
+        ]
+        group_run_end = max_real_section_run_end(*nums_lists)
+        char_by_id = {st.id: metrics.get(st.id, (0, 0))[1] for st in members}
+        group_best_chars = max(char_by_id.values()) if char_by_id else 0
         ranked = sorted(
             members,
             key=lambda s: dedupe_keeper_rank(
                 sections=sections_map.get(s.id, []),
-                text_chars=metrics.get(s.id, (0, 0))[1],
+                text_chars=char_by_id.get(s.id, 0),
                 has_source_url=bool(s.source_name and s.source_url),
+                group_run_end=group_run_end or None,
             ),
             reverse=True,
         )
-        winners.append(ranked[0].id)
+        keeper = ranked[0]
+        if keeper_below_char_fraction(char_by_id.get(keeper.id, 0), group_best_chars=group_best_chars):
+            manual_review.append(
+                {
+                    "group": group_key,
+                    "statute_ids": [str(s.id) for s in members],
+                    "reason": "keeper_below_char_fraction",
+                    "keeper_chars": char_by_id.get(keeper.id, 0),
+                    "group_best_chars": group_best_chars,
+                }
+            )
+            continue
+        winners.append(keeper.id)
         losers.extend(s.id for s in ranked[1:])
     return {
         "duplicate_groups": len(dup_groups),
         "statutes_to_quarantine": len(losers),
         "losers": losers,
         "winners": winners,
+        "manual_review_groups": manual_review,
     }
 
 
