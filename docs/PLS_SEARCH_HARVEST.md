@@ -14,6 +14,7 @@ The citation-grid harvester walks `#archivedpatientGrid` with absolute row offse
 | `PLS_BROWSER_RSS_LIMIT_MB` | `900` | Soft RSS limit; recycle browser. |
 | `PLS_BROWSER_RSS_HARD_MB` | `1200` | Hard RSS limit; stop run cleanly. |
 | `PLS_BLOCK_HEAVY_RESOURCES` | `true` | Block image/font/media in Playwright. |
+| `PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM` | `0` | When `1`, a slot with no pending rows in its own reporter share may claim the other slot's pending rows while that login is still ACTIVE (own share is always tried first). Default off; logout takeover (`PLS_SEARCH_HARVEST_TAKEOVER_MINUTES`) is unchanged. |
 
 Requires the same human-login session, search form map, and `ALLOW_LOGIN_SCRAPING` / `ENVIRONMENT=chambers` rules as the main PLS harvest.
 
