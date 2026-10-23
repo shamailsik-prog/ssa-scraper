@@ -123,7 +123,7 @@ async def test_changed_header_invalidates_stale_court_proposal(db):
     """The court label may remain unchanged while the underlying judgment is corrected."""
     j = await _judgment(db)
     stale = _fix(j)
-    j.full_text = "1990 MLD 947\\n[Supreme Court of Bangladesh]\\n" + "x" * 600
+    j.full_text = "1990 MLD 947\n[Supreme Court of Bangladesh]\n" + "x" * 600
     await db.commit()
     run_id = uuid4().hex
     await _record_run(db, run_id)
@@ -142,7 +142,7 @@ async def test_removed_header_invalidates_stale_court_proposal(db):
     """Do not apply an old foreign-court label when current text lacks that evidence."""
     j = await _judgment(db)
     stale = _fix(j)
-    j.full_text = "1990 MLD 947\\nBefore X, J\\nNo court attribution.\\n" + "x" * 600
+    j.full_text = "1990 MLD 947\nBefore X, J\nNo court attribution.\n" + "x" * 600
     await db.commit()
     run_id = uuid4().hex
     await _record_run(db, run_id)
