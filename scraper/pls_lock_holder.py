@@ -71,8 +71,11 @@ def local_pid_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
+    except OSError:
+        # Permission denied or other ambiguous errors are not proof of death.
+        return True
     return True
 
 
@@ -87,11 +90,13 @@ async def remote_worker_heartbeat_present(redis_client, host: str) -> bool:
 
 
 async def lock_value_holder_stale(redis_client, value: str) -> bool:
-    """True when the holder is certainly gone (local dead pid, or remote host with no fresh heartbeat)."""
+    """Only a definitively missing local process proves a stale lock."""
     parsed = parse_lock_holder(value)
     if parsed is None:
         return False
     host, pid, _ = parsed
     if host == lock_host_identity():
         return not local_pid_alive(pid)
-    return not await remote_worker_heartbeat_present(redis_client, host)
+    # A heartbeat can expire while a remote worker is still harvesting.
+    # Missing heartbeat alone must not authorize stealing its live Redis lock.
+    return False
