@@ -157,13 +157,16 @@ def test_worker_process_init_registers_atexit_shutdown(monkeypatch):
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
     import redis
 
+    before = len(getattr(atexit, "_exithandlers", ()))
+    _install_pls_lock_shutdown_hooks()
+    assert len(atexit._exithandlers) > before
+
     client = redis.from_url(settings.REDIS_URL)
     key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:atexit-test")
     token = lock_holder_token()
     client.set(key, token, ex=120)
-    _install_pls_lock_shutdown_hooks()
     register_lock(key, token)
-    atexit._run_exitfuncs()
+    assert release_all_registered_sync() == 1
     assert client.get(key) is None
     client.delete(key)
     client.close()
