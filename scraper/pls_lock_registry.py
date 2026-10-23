@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 import signal
 import threading
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 _held: List[Tuple[str, str]] = []
 _guard = threading.Lock()
+_RELEASE_REDIS_SOCKET_TIMEOUT = 2.0
 
 
 def register_lock(redis_key: str, token: str) -> None:
@@ -33,6 +34,14 @@ def _signals_to_block() -> Set[int]:
     return sigs
 
 
+def _restore_signal_handlers(previous: List[Tuple[int, object]]) -> None:
+    for sig, handler in previous:
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError, AttributeError):
+            pass
+
+
 def release_all_registered_sync() -> int:
     """Best-effort compare-and-delete for every lock this process still tracks."""
     from scraper.config import settings
@@ -40,7 +49,16 @@ def release_all_registered_sync() -> int:
     if not settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
         return 0
 
+    ignored: List[Tuple[int, object]] = []
+    on_main = threading.current_thread() is threading.main_thread()
+    if on_main:
+        if hasattr(signal, "SIGTERM"):
+            ignored.append((signal.SIGTERM, signal.signal(signal.SIGTERM, signal.SIG_IGN)))
+        if hasattr(signal, "SIGINT"):
+            ignored.append((signal.SIGINT, signal.signal(signal.SIGINT, signal.SIG_IGN)))
+
     prior_mask = None
+    pending_exit: Optional[BaseException] = None
     try:
         if hasattr(signal, "pthread_sigmask"):
             try:
@@ -60,7 +78,7 @@ def release_all_registered_sync() -> int:
             return 0
         released = 0
         try:
-            client = redis.from_url(settings.REDIS_URL)
+            client = redis.from_url(settings.REDIS_URL, socket_timeout=_RELEASE_REDIS_SOCKET_TIMEOUT)
             for key, token in pairs:
                 try:
                     ok = client.eval(
@@ -71,6 +89,8 @@ def release_all_registered_sync() -> int:
                     )
                     if int(ok or 0) == 1:
                         released += 1
+                except SystemExit as exc:
+                    pending_exit = exc
                 except Exception as exc:
                     logger.warning("pls lock shutdown: could not release %s: %s", key, exc)
             client.close()
@@ -85,3 +105,6 @@ def release_all_registered_sync() -> int:
                 signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
             except (ValueError, OSError, AttributeError):
                 pass
+        _restore_signal_handlers(ignored)
+        if pending_exit is not None:
+            raise pending_exit

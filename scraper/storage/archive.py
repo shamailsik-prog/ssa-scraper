@@ -503,25 +503,45 @@ class ArchiveMirror:
             )
             await self._checkpoint()
 
+        failures = 0
+        limiter = _AdaptiveConcurrency(pool_size)
         adapter_pool: asyncio.Queue = asyncio.Queue()
         for _ in range(pool_size):
-            adapter_pool.put_nowait(await asyncio.to_thread(self.adapter_factory, target_type, drive_cfg))
+            try:
+                adapter_pool.put_nowait(await asyncio.to_thread(self.adapter_factory, target_type, drive_cfg))
+            except Exception as exc:
+                failures += 1
+                summary["failed"] += 1
+                t.consecutive_failures += 1
+                t.last_error = f"adapter init: {exc}"[:2000]
+                logger.warning("archive %s: drive adapter pool init failed: %s", t.name, exc)
+        if adapter_pool.empty():
+            return failures
 
+        failed_folders: set[str] = set()
         if folder_keys:
             setup_adapter = await adapter_pool.get()
             try:
                 seen_folders: set[str] = set()
                 for key in folder_keys:
+                    if self._time_up():
+                        break
                     folder = key.rsplit("/", 1)[0]
-                    if folder in seen_folders:
+                    if folder in seen_folders or folder in failed_folders:
                         continue
                     seen_folders.add(folder)
-                    await asyncio.to_thread(setup_adapter.ensure_tree, key)
+                    if not await self._drive_ensure_tree(setup_adapter, key, limiter=limiter):
+                        failed_folders.add(folder)
+                        failures += 1
+                        summary["failed"] += 1
+                        logger.warning("archive %s: ensure_tree failed for %s", t.name, folder)
             finally:
                 await adapter_pool.put(setup_adapter)
 
-        limiter = _AdaptiveConcurrency(pool_size)
-        failures = 0
+        if failed_folders:
+            pending_work = [
+                work for work in pending_work if work.obj["key"].rsplit("/", 1)[0] not in failed_folders
+            ]
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
         stop = asyncio.Event()
@@ -560,6 +580,29 @@ class ArchiveMirror:
         if tasks:
             await asyncio.gather(*tasks)
         return failures
+
+    async def _drive_ensure_tree(
+        self,
+        adapter: ArchiveAdapter,
+        key: str,
+        *,
+        limiter: _AdaptiveConcurrency,
+    ) -> bool:
+        """Create Drive folders with the same retry/backoff policy as uploads."""
+        attempts = 0
+        while True:
+            if self._time_up():
+                return False
+            try:
+                await _retry(asyncio.to_thread, adapter.ensure_tree, key, rate_limit_sensitive=True)
+                return True
+            except Exception as exc:
+                if is_drive_rate_limited(exc) and attempts < 5:
+                    attempts += 1
+                    limiter.halve()
+                    await drive_rate_limit_backoff()
+                    continue
+                return False
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
         if not is_login_session(access_method):

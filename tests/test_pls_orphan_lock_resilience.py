@@ -162,6 +162,73 @@ def test_shutdown_registry_releases_tracked_lock(monkeypatch):
     client.close()
 
 
+def test_shutdown_release_redis_client_uses_socket_timeout(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    import redis as redis_sync
+
+    captured: list[dict] = []
+    real_from_url = redis_sync.from_url
+
+    def _from_url(url, **kwargs):
+        captured.append(kwargs)
+        return real_from_url(url, **kwargs)
+
+    monkeypatch.setattr(redis_sync, "from_url", _from_url)
+    key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:socket-timeout")
+    token = lock_holder_token()
+    client = redis_sync.from_url(settings.REDIS_URL)
+    client.set(key, token, ex=120)
+    register_lock(key, token)
+    release_all_registered_sync()
+    assert client.get(key) is None
+    client.close()
+    assert any(c.get("socket_timeout") == 2.0 for c in captured)
+
+
+def test_release_all_registered_sync_finishes_remaining_locks_after_system_exit(monkeypatch):
+    """Pending SIGTERM/SystemExit during eval must not skip later lock releases."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    import redis as redis_sync
+
+    key1 = LOCK_KEY.format(source="PakistanLawSite:search_harvest:exit-a")
+    key2 = LOCK_KEY.format(source="PakistanLawSite:search_harvest:exit-b")
+    token1 = lock_holder_token()
+    token2 = lock_holder_token()
+    client = redis_sync.from_url(settings.REDIS_URL)
+    client.set(key1, token1, ex=120)
+    client.set(key2, token2, ex=120)
+    register_lock(key1, token1)
+    register_lock(key2, token2)
+
+    real_from_url = redis_sync.from_url
+    calls = 0
+
+    class _Client:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def eval(self, script, numkeys, key, token):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SystemExit(143)
+            return self._inner.eval(script, numkeys, key, token)
+
+        def close(self):
+            self._inner.close()
+
+    def _from_url(url, **kwargs):
+        return _Client(real_from_url(url, **kwargs))
+
+    monkeypatch.setattr(redis_sync, "from_url", _from_url)
+    with pytest.raises(SystemExit):
+        release_all_registered_sync()
+    assert client.get(key1) == token1.encode()
+    assert client.get(key2) is None
+    client.delete(key1)
+    client.close()
+
+
 def test_release_all_registered_sync_blocks_until_guard_available(monkeypatch):
     """Mutant S1: release must hold sigmask through Redis DEL (blocking guard, not fail-open skip)."""
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
@@ -269,6 +336,49 @@ def _billiard_pool_release_scenario(monkeypatch, *, use_close_join: bool) -> Non
 
 def test_billiard_pool_terminate_releases_only_registered_lock(monkeypatch):
     _billiard_pool_release_scenario(monkeypatch, use_close_join=False)
+
+
+def test_billiard_pool_sigterm_mid_task_releases_only_registered_lock(monkeypatch):
+    """on_process_exit release must run when the child gets SIGTERM during the hold loop."""
+    import os
+    import signal
+
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    uid = uuid.uuid4().hex[:10]
+    key = f"corpus:login_session_lock:PakistanLawSite:search_harvest:billiard-sig-{uid}"
+    foreign = f"corpus:login_session_lock:PakistanLawSite:search_harvest:foreign-sig-{uid}"
+    ready_key = f"pls:billiard-sig-ready-{uid}"
+    token = lock_holder_token()
+    foreign_val = lock_holder_token()
+    client = redis.from_url(settings.REDIS_URL)
+    client.delete(key, foreign, ready_key)
+    pool = BilliardPool(
+        1,
+        initializer=billiard_pool_worker_initializer,
+        on_process_exit=billiard_pool_process_destructor,
+    )
+    try:
+        pool.apply_async(
+            hold_registered_lock_in_pool_child,
+            (settings.REDIS_URL, key, token, foreign, foreign_val, ready_key, None),
+        )
+        assert _wait_redis_key(client, ready_key)
+        child_pid = int(client.get(ready_key).decode())
+        os.kill(child_pid, signal.SIGTERM)
+        for _ in range(40):
+            if client.get(key) is None:
+                break
+            time.sleep(0.1)
+    finally:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+        pool.join()
+    assert client.get(key) is None
+    assert client.get(foreign) is not None
+    client.delete(foreign, ready_key)
+    client.close()
 
 
 def test_billiard_pool_close_join_releases_only_registered_lock(monkeypatch):
