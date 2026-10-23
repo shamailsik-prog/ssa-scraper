@@ -335,7 +335,30 @@ def _billiard_pool_release_scenario(monkeypatch, *, use_close_join: bool) -> Non
 
 
 def test_billiard_pool_terminate_releases_only_registered_lock(monkeypatch):
+    """Billiard ``Pool.terminate()`` must run on_process_exit release and clear the Redis lock key."""
     _billiard_pool_release_scenario(monkeypatch, use_close_join=False)
+
+
+def test_worker_process_shutdown_handler_ignores_sigterm_before_release(monkeypatch):
+    import signal
+
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    calls: list[tuple] = []
+
+    def _signal(sig, handler):
+        calls.append((sig, handler))
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(signal, "signal", _signal)
+    monkeypatch.setattr(
+        "scraper.pls_lock_shutdown.release_on_worker_process_shutdown",
+        lambda: calls.append("release"),
+    )
+    from scraper.tasks.celery_app import _release_pls_locks_on_worker_process_shutdown
+
+    _release_pls_locks_on_worker_process_shutdown()
+    assert calls[0] == (signal.SIGTERM, signal.SIG_IGN)
+    assert calls[-1] == "release"
 
 
 def test_billiard_pool_sigterm_mid_task_releases_only_registered_lock(monkeypatch):

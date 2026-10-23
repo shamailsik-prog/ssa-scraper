@@ -29,7 +29,9 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+_DriveEnsureTreeResult = Literal["ok", "failed", "timed_out"]
 from uuid import UUID
 
 from sqlalchemy import func, select, update
@@ -512,7 +514,6 @@ class ArchiveMirror:
             except Exception as exc:
                 failures += 1
                 summary["failed"] += 1
-                t.consecutive_failures += 1
                 t.last_error = f"adapter init: {exc}"[:2000]
                 logger.warning("archive %s: drive adapter pool init failed: %s", t.name, exc)
         if adapter_pool.empty():
@@ -530,7 +531,10 @@ class ArchiveMirror:
                     if folder in seen_folders or folder in failed_folders:
                         continue
                     seen_folders.add(folder)
-                    if not await self._drive_ensure_tree(setup_adapter, key, limiter=limiter):
+                    ensure_status = await self._drive_ensure_tree(setup_adapter, key, limiter=limiter)
+                    if ensure_status == "timed_out":
+                        break
+                    if ensure_status == "failed":
                         failed_folders.add(folder)
                         failures += 1
                         summary["failed"] += 1
@@ -587,22 +591,22 @@ class ArchiveMirror:
         key: str,
         *,
         limiter: _AdaptiveConcurrency,
-    ) -> bool:
+    ) -> _DriveEnsureTreeResult:
         """Create Drive folders with the same retry/backoff policy as uploads."""
         attempts = 0
         while True:
             if self._time_up():
-                return False
+                return "timed_out"
             try:
                 await _retry(asyncio.to_thread, adapter.ensure_tree, key, rate_limit_sensitive=True)
-                return True
+                return "ok"
             except Exception as exc:
                 if is_drive_rate_limited(exc) and attempts < 5:
                     attempts += 1
                     limiter.halve()
                     await drive_rate_limit_backoff()
                     continue
-                return False
+                return "failed"
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
         if not is_login_session(access_method):

@@ -196,6 +196,10 @@ def _pls_lock_task_prerun(sender=None, task=None, **kwargs) -> None:
 
 @worker_process_shutdown.connect
 def _release_pls_locks_on_worker_process_shutdown(**_kwargs) -> None:
+    import signal
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
 
     release_on_worker_process_shutdown()
