@@ -418,16 +418,23 @@ async def claim_next_query(
     redis_client=None,
     take_over: bool = False,
     candidates: int = 25,
+    pending_only: bool = False,
+    other_share_only: bool = False,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
     """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
     tick. The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
     after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None)."""
+    # Active cross-slot borrowing must never seize the other login's resumable
+    # in_progress rows, even when their Redis lock has expired between ticks.
+    statuses = ("pending",) if pending_only else ("pending", "in_progress")
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+        PlsSearchHarvestQuery.status.in_(statuses),
     )
-    if not take_over:
+    if other_share_only:
+        stmt = stmt.where(_share_filter(2 if slot == 1 else 1))
+    elif not take_over:
         stmt = stmt.where(_share_filter(slot))
     rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
@@ -471,8 +478,11 @@ async def try_claim_harvest_query_for_slot(
     cross_slot_claim = False
     query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
     if query_row is None and await cross_slot_idle_claim_allowed(db, chosen):
-        cross_slot_claim = True
-        query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+        query_row, query_lock = await claim_next_query(
+            db, chosen, redis_client=redis_client, take_over=True,
+            pending_only=True, other_share_only=True,
+        )
+        cross_slot_claim = query_row is not None
     if query_row is None and await slot_takeover_due(db, chosen):
         took_over = True
         query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
