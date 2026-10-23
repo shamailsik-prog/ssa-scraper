@@ -298,11 +298,14 @@ class ArchiveMirror:
                 exists = await _retry(asyncio.to_thread, adapter.exists, key, rate_limit_sensitive=rate_sensitive)
                 if exists:
                     size = await _retry(asyncio.to_thread, adapter.size, key, rate_limit_sensitive=rate_sensitive)
-                    if obj["kind"] == "rendered_copy" and size:
-                        stored_size = size
-                        status = "written"
+                    stored_size = size
+                    if size != len(data):
+                        status = "mismatch"
                     else:
-                        status = "written" if size == len(data) else "mismatch"
+                        # Equal byte length does not prove equal content. Read and hash
+                        # before claiming an existing write-once archive object is valid.
+                        remote = await _retry(asyncio.to_thread, adapter.get, key, rate_limit_sensitive=rate_sensitive)
+                        status = "written" if hashlib.sha256(remote).hexdigest() == h else "mismatch"
                 else:
                     await _retry(
                         asyncio.to_thread,
@@ -315,7 +318,10 @@ class ArchiveMirror:
                     status = "written"
                 return _AdapterStoreOutcome(status=status, content_hash=h, byte_size=len(data), stored_size=stored_size)
             except ObjectExists:
-                return _AdapterStoreOutcome(status="written", content_hash=h, byte_size=len(data), stored_size=stored_size)
+                # Another writer won the race. Its bytes must still be verified.
+                remote = await _retry(asyncio.to_thread, adapter.get, key, rate_limit_sensitive=rate_sensitive)
+                status = "written" if hashlib.sha256(remote).hexdigest() == h else "mismatch"
+                return _AdapterStoreOutcome(status=status, content_hash=h, byte_size=len(data), stored_size=len(remote))
             except Exception as exc:
                 if rate_limiter is not None and is_drive_rate_limited(exc) and attempts < 5:
                     attempts += 1
