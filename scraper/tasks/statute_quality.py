@@ -22,7 +22,7 @@ from scraper.parsers.assembly_pdf_sections import assembly_body_too_thin, is_ass
 from scraper.statute_quality.ocr_quality import statute_text_poor_ocr
 from scraper.statute_quality.section_noise import filter_statute_quality_sections, is_section_body_noise
 from scraper.statute_quality_jurisdiction import should_fix_federal_jurisdiction
-from scraper.tasks.promotion import _normalized_statute_name_key
+from scraper.statute_quality.dedupe import dedupe_canonical_name_key, dedupe_keeper_rank
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ async def _statute_metrics(db: AsyncSession) -> Dict[UUID, Tuple[int, int]]:
 def _dedupe_group_key(st: Statute) -> Optional[Tuple[str, int, str]]:
     if st.year_enacted is None:
         return None
-    name_key = (st.canonical_name_key or "").strip() or _normalized_statute_name_key(st.name)
+    name_key = dedupe_canonical_name_key(st.name)
     if not name_key:
         return None
     return (
@@ -90,9 +90,21 @@ def _dedupe_group_key(st: Statute) -> Optional[Tuple[str, int, str]]:
     )
 
 
-def _score_row(st: Statute, section_count: int, text_chars: int) -> Tuple[int, int, int]:
-    prov = 1 if (st.source_name and st.source_url) else 0
-    return (section_count, text_chars, prov)
+async def _sections_map_for_statutes(db: AsyncSession, statute_ids: List[UUID]) -> Dict[UUID, List[Dict[str, str]]]:
+    if not statute_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(StatuteSection.statute_id, StatuteSection.section_number, StatuteSectionVersion.section_text)
+            .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+            .where(StatuteSection.statute_id.in_(statute_ids))
+        )
+    ).all()
+    out: Dict[UUID, List[Dict[str, str]]] = defaultdict(list)
+    for sid, num, txt in rows:
+        if (txt or "").strip():
+            out[sid].append({"section_number": str(num), "section_text": txt})
+    return out
 
 
 async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
@@ -106,12 +118,18 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
             continue
         groups[key].append(st)
     dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    all_dup_ids = [s.id for members in dup_groups.values() for s in members]
+    sections_map = await _sections_map_for_statutes(db, all_dup_ids)
     losers: List[UUID] = []
     winners: List[UUID] = []
     for _key, members in dup_groups.items():
         ranked = sorted(
             members,
-            key=lambda s: _score_row(s, *metrics.get(s.id, (0, 0))),
+            key=lambda s: dedupe_keeper_rank(
+                sections=sections_map.get(s.id, []),
+                text_chars=metrics.get(s.id, (0, 0))[1],
+                has_source_url=bool(s.source_name and s.source_url),
+            ),
             reverse=True,
         )
         winners.append(ranked[0].id)
