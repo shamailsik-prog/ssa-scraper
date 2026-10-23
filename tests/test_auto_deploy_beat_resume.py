@@ -164,7 +164,7 @@ def test_pause_longer_than_the_cap_refuses_unverified_shared_job_release(host):
     host.marker.write_text(str(int(time.time()) - 3000) + "\n")  # paused 50 minutes ago
     r = host.run(AUTO_DEPLOY_MAX_BEAT_PAUSE_SECONDS="2700")
     assert r.returncode != 0, r.stdout + r.stderr
-    assert "refusing unsafe deploy" in r.stdout
+    assert "refusing unsafe deploy" in (r.stdout + r.stderr)
     calls = host.calls()
     assert "release-job" not in calls and "release" not in calls
     assert not any(c.startswith("deploy ") for c in calls)
