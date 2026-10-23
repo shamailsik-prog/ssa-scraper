@@ -5,7 +5,7 @@ Judgment-content and PLS quality layers default to **on** (same policy as B3 sta
 | Layer | Flag(s) | Roll back |
 | --- | --- | --- |
 | Order-sheet case titles + backfill CLI | `SSA_ORDER_SHEET_TITLE` | Revert commit; `SSA_ORDER_SHEET_TITLE=0` |
-| PLS encoding/court/PLD/short-text guards + backfill CLIs | `SSA_ENCODING_GUARD`, `SSA_COURT_HEADER_GUARD`, `SSA_PLD_CITATION_RELABEL`, `SSA_SHORT_TEXT_GUARD` | Revert commit; set affected flags to `0` |
+| PLS encoding/court/PLD/short-text guards + backfill CLIs | `SSA_ENCODING_GUARD`, `SSA_COURT_HEADER_GUARD`, `SSA_PLD_CITATION_RELABEL`, `SSA_SHORT_TEXT_GUARD`, `SSA_PLS_COURT_RESOLUTION` | Revert commit; set affected flags to `0` |
 | Encoding: strip Urdu headnote `????`, re-fetch only if body damaged | `SSA_ENCODING_GUARD` (refined) | `SSA_ENCODING_GUARD=0`; revert encoding commit |
 | Urdu headnote flag column + strip/flag CLIs | `quality_flag_urdu_headnote_mojibake`, `headnote_stripped_full_text` on `judgment` | `backfill-flag-urdu-headnote-mojibake` then `strip-urdu-headnote-mojibake` (`--apply` writes overlay only; `full_text` hash unchanged) |
 | Search harvest Postgres advisory lock (per slot) | `SSA_HARVEST_PG_LOCK` | Revert commit; `SSA_HARVEST_PG_LOCK=0` |
@@ -13,7 +13,7 @@ Judgment-content and PLS quality layers default to **on** (same policy as B3 sta
 
 **Deferred (out of scope for B4):** harvest lock clear on worker start (`SSA_CLEAR_HARVEST_LOCKS_ON_START`) and harvest lock heartbeat (`SSA_HARVEST_LOCK_HEARTBEAT`) — tracked separately; not shipped on this branch (no runtime code).
 
-**Backfill / maintenance CLIs** (`pls_admin backfill-metadata`, `backfill-order-sheet-titles`, `backfill-pld-citations`, `strip-urdu-headnote-mojibake`, `requalify-quarantine`): default is **dry-run** (no writes). Pass **`--apply`** to commit changes. Manual operator runs only; not part of deploy.
+**Backfill / maintenance CLIs** (`pls_admin backfill-metadata`, `backfill-order-sheet-titles`, `backfill-pld-citations`, `backfill-judgment-courts`, `strip-urdu-headnote-mojibake`, `requalify-quarantine`): default is **dry-run** (no writes). Pass **`--apply`** to commit changes; `backfill-judgment-courts --undo RUN_ID` restores prior `court_name` only (no deletes). Manual operator runs only; not part of deploy.
 
 **Migrations 025–026 (B4):** each upgrade/downgrade sets `SET LOCAL lock_timeout = '2s'`. If DDL hits `lock_timeout`, retry the migration after harvest drain (same pattern as `docs/B2_IDENTITY_RECONCILE_DEPLOY.md` §2).
 

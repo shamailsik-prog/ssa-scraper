@@ -57,6 +57,13 @@ def main(argv: list[str] | None = None) -> int:
     pld = sub.add_parser("backfill-pld-citations", help="Relabel primary PLD citations missing a court token (dry-run by default)")
     pld.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     pld.add_argument("--limit", type=int, default=None)
+    court_bf = sub.add_parser(
+        "backfill-judgment-courts",
+        help="Fix PLS court_name from header (foreign SC/HC mislabel, SC vs HC swap; dry-run by default)",
+    )
+    court_bf.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
+    court_bf.add_argument("--undo", metavar="RUN_ID", help="Restore court_name values from a prior --apply run")
+    court_bf.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
     req.add_argument("--apply", action="store_true", help="Promote/write changes (default is dry-run)")
     req.add_argument("--limit", type=int, default=2000)
@@ -105,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_backfill import run_backfill_pld_citations
 
         print(run_async(run_backfill_pld_citations(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "backfill-judgment-courts":
+        from scraper.tasks.judgment_court_backfill import run_judgment_court_backfill
+
+        print(run_async(run_judgment_court_backfill(apply=args.apply, undo=args.undo, limit=args.limit)))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
