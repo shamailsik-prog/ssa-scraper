@@ -108,6 +108,20 @@ async def _sections_map_for_statutes(db: AsyncSession, statute_ids: List[UUID]) 
     return out
 
 
+async def _statutes_with_historical_versions(db: AsyncSession, statute_ids: List[UUID]) -> Set[UUID]:
+    """Do not auto-hide a statute carrying independently material earlier wording."""
+    if not statute_ids:
+        return set()
+    rows = await db.execute(
+        select(StatuteSection.statute_id)
+        .join(StatuteSectionVersion, StatuteSectionVersion.section_id == StatuteSection.id)
+        .where(StatuteSection.statute_id.in_(statute_ids))
+        .where(StatuteSectionVersion.id != StatuteSection.current_version_id)
+        .distinct()
+    )
+    return set(rows.scalars().all())
+
+
 async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
     metrics = await _statute_metrics(db)
     visible = await _visible_statute_ids(db)
@@ -121,6 +135,7 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
     dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
     all_dup_ids = [s.id for members in dup_groups.values() for s in members]
     sections_map = await _sections_map_for_statutes(db, all_dup_ids)
+    historical_ids = await _statutes_with_historical_versions(db, all_dup_ids)
     losers: List[UUID] = []
     review_required: List[UUID] = []
     winners: List[UUID] = []
@@ -137,8 +152,12 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
         keeper = ranked[0]
         winners.append(keeper.id)
         for candidate in ranked[1:]:
-            if can_quarantine_subsumed_statute_sections(
-                sections_map.get(keeper.id, []), sections_map.get(candidate.id, [])
+            if (
+                keeper.id not in historical_ids
+                and candidate.id not in historical_ids
+                and can_quarantine_subsumed_statute_sections(
+                    sections_map.get(keeper.id, []), sections_map.get(candidate.id, [])
+                )
             ):
                 losers.append(candidate.id)
             else:
