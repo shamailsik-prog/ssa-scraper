@@ -126,8 +126,29 @@ pls_host_release_search_harvest_locks() {
   fi
 }
 
+# Fail closed: Docker stop success alone does not prove the scraper is gone.
+pls_host_stop_scraper_safely() {
+  local running
+  if ! docker compose stop worker-scraper; then
+    printf 'pls_host: worker-scraper stop failed; refusing lock release\n' >&2
+    return 1
+  fi
+  if ! running="$(docker compose ps --status running --format '{{.Service}}')"; then
+    printf 'pls_host: cannot verify worker-scraper state; refusing lock release\n' >&2
+    return 1
+  fi
+  if printf '%s\n' "$running" | grep -qx 'worker-scraper'; then
+    printf 'pls_host: worker-scraper is still running; refusing lock release\n' >&2
+    return 1
+  fi
+  return 0
+}
+
 pls_host_force_release_stalled_harvest() {
-  docker compose stop worker-scraper 2>/dev/null || true
+  # Never release locks or mark jobs failed if the worker may still be active.
+  if ! pls_host_stop_scraper_safely; then
+    return 1
+  fi
   pls_host_release_search_harvest_locks
   docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -v ON_ERROR_STOP=1 -c \
     "UPDATE scraper_jobs SET status = 'failed', finished_at = COALESCE(finished_at, NOW()), error_message = LEFT(COALESCE(error_message, '') || ' auto_deploy: released stalled zero-output job for deploy', 4000) WHERE source_name = 'PakistanLawSite' AND status = 'running';" \
