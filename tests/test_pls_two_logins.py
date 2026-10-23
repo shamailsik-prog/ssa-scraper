@@ -115,34 +115,37 @@ def test_deploy_step_sets_both_logins_in_env(tmp_path):
 async def test_a_crashed_shared_holder_drops_out_on_its_own(monkeypatch):
     """Review on #192: one live holder refreshing the shared key kept a crashed holder's place for ever."""
     import asyncio
+    import uuid
 
     import scraper.auth.session_manager as sm
     from scraper.auth.session_manager import SessionLockHeld
 
     r = aioredis.from_url(settings.REDIS_URL)
-    key = "corpus:login_session_lock:PakistanLawSite:holders"
-    await r.delete(key, "corpus:login_session_lock:PakistanLawSite")
-    monkeypatch.setattr(sm, "LOCK_TTL_SECONDS", 1)
-    crashed = SessionLock("PakistanLawSite", r, max_holders=2)
-    alive = SessionLock("PakistanLawSite", r, max_holders=2)
+    source = f"PakistanLawSite:shared-zset-{uuid.uuid4().hex[:12]}"
+    key = f"corpus:login_session_lock:{source}:holders"
+    exclusive = f"corpus:login_session_lock:{source}"
+    await r.delete(key, exclusive)
+    monkeypatch.setattr(sm, "LOCK_TTL_SECONDS", 2)
+    crashed = SessionLock(source, r, max_holders=2)
+    alive = SessionLock(source, r, max_holders=2)
     try:
         await crashed.acquire()
         await alive.acquire()
-        third = SessionLock("PakistanLawSite", r, max_holders=2)
+        third = SessionLock(source, r, max_holders=2)
         try:
             await third.acquire()
             raise AssertionError("both places are taken")
         except SessionLockHeld:
             pass
-        for _ in range(3):  # the live holder keeps refreshing; the crashed one never does
-            await asyncio.sleep(0.45)
+        for _ in range(5):  # the live holder keeps refreshing; the crashed one never does
+            await asyncio.sleep(0.55)
             await alive.refresh()
-        newcomer = SessionLock("PakistanLawSite", r, max_holders=2)
+        newcomer = SessionLock(source, r, max_holders=2)
         await newcomer.acquire()  # the crashed holder's place is free again
         await newcomer.release()
         await alive.release()
     finally:
-        await r.delete(key)
+        await r.delete(key, exclusive)
         await r.aclose()
 
 

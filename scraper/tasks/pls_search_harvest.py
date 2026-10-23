@@ -396,8 +396,19 @@ async def pick_next_query(
     return (await db.execute(_pick_order(stmt).limit(1))).scalars().first()
 
 
+def _harvest_lock_options() -> Dict[str, bool]:
+    return {
+        "holder_identity": bool(settings.PLS_LOCK_HOLDER_IDENTITY),
+        "track_shutdown": bool(settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN),
+    }
+
+
+async def _acquire_harvest_lock(lock: SessionLock) -> None:
+    await lock.acquire(dead_holder_takeover=bool(settings.PLS_LOCK_DEAD_HOLDER_TAKEOVER))
+
+
 def _query_lock(row_id, redis_client) -> SessionLock:
-    return SessionLock(f"{SOURCE_NAME}:search_harvest:query:{row_id}", redis_client, max_holders=1)
+    return SessionLock(f"{SOURCE_NAME}:search_harvest:query:{row_id}", redis_client, max_holders=1, **_harvest_lock_options())
 
 
 async def claim_next_query(
@@ -422,7 +433,7 @@ async def claim_next_query(
     for row in rows:
         lock = _query_lock(row.id, redis_client)
         try:
-            await lock.acquire()
+            await _acquire_harvest_lock(lock)
         except SessionLockHeld:
             await lock.release()
             continue
@@ -839,9 +850,9 @@ async def run_search_harvest(
             reasons.append(f"slot {n} is {state or 'missing'}; the other slot takes over its share after {settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES} minutes")
             continue
         # one harvest per slot (R3.7): a second tick for the same slot exits at once
-        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1)
+        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1, **_harvest_lock_options())
         try:
-            await candidate.acquire()
+            await _acquire_harvest_lock(candidate)
         except SessionLockHeld:
             await candidate.release()
             reasons.append(f"a search harvest is already running on slot {n}")
@@ -902,7 +913,7 @@ async def _run_search_harvest_locked(
             if query_row is not None:
                 query_lock = _query_lock(query_row.id, redis_client)
                 try:
-                    await query_lock.acquire()
+                    await _acquire_harvest_lock(query_lock)
                 except SessionLockHeld:
                     return {"skipped": True, "slot": chosen, "reason": f"query {query_key} is being run by another tick"}
                 query_row.status, query_row.slot = "in_progress", chosen
@@ -1005,6 +1016,15 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
     if login_work_held():
         return {"skipped": True, "reason": "deploy_hold"}
 
+    try:
+        return _pls_search_harvest_tick_body(**kwargs)
+    finally:
+        from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+
+        release_on_worker_process_shutdown()
+
+
+def _pls_search_harvest_tick_body(**kwargs) -> Dict[str, Any]:
     async def _inner() -> Dict[str, Any]:
         from sqlalchemy import func, select
 
@@ -1012,7 +1032,7 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
             SOURCE_NAME,
             pls_last_judgment_at,
             pls_search_harvest_may_run,
-            pls_stall_verdict_for_config,
+            pls_stall_verdict_live,
         )
         from scraper.models import PlsSearchHarvestQuery, ScraperSource
 
@@ -1035,8 +1055,13 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
             stall_reason = None
             if pending > 0 and source is not None:
                 last_j = await pls_last_judgment_at(db)
-                stall_reason = pls_stall_verdict_for_config(
-                    cfg, last_promotion_at=last_j, source_state=source.state
+                stall_reason = (
+                    await pls_stall_verdict_live(
+                        db,
+                        cfg,
+                        last_promotion_at=last_j,
+                        source_state=source.state,
+                    )
                 ).get("stalled_reason")
             if not pls_search_harvest_may_run(cfg, pending_gaps=pending, stall_reason=stall_reason):
                 return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
@@ -1050,6 +1075,7 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
         queue_search_harvest_ticks(app, slots=(next_slot,))
         result["queued_next_tick"] = next_slot
     return result
+
 
 
 def cli_plan(argv: Optional[List[str]] = None) -> int:

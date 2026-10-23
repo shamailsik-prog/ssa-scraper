@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.signals import task_postrun, worker_process_init, worker_process_shutdown, worker_ready
 
 from scraper.config import settings
 
@@ -166,6 +166,33 @@ from scraper.deploy_role import beat_schedule_for_role, deploy_role  # noqa: E40
 
 app.conf.beat_schedule = beat_schedule_for_role(app.conf.beat_schedule)
 logger.info("Celery configured for deploy role %s: queues scraper/login_session/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
+
+
+@worker_process_init.connect
+def _pls_worker_child_init(**_kwargs) -> None:
+    """Prefork pool child: heartbeat daemon + SIGTERM release (billiard skips atexit)."""
+    from scraper.pls_lock_shutdown import install_pls_lock_shutdown_hooks
+    from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon
+
+    start_worker_heartbeat_daemon()
+    install_pls_lock_shutdown_hooks()
+
+
+@worker_process_shutdown.connect
+def _release_pls_locks_on_worker_process_shutdown(**_kwargs) -> None:
+    from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+
+    release_on_worker_process_shutdown()
+
+
+@task_postrun.connect
+def _release_pls_harvest_locks_after_task(sender=None, **kwargs) -> None:
+    name = getattr(sender, "name", None) if sender is not None else None
+    if name != "scraper.tasks.pls_search_harvest.pls_search_harvest_tick":
+        return
+    from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+
+    release_on_worker_process_shutdown()
 
 
 @worker_ready.connect
