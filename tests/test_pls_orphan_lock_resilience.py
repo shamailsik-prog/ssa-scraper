@@ -57,10 +57,10 @@ async def test_foreign_host_with_live_heartbeat_is_not_stale(r):
 
 
 @pytest.mark.asyncio
-async def test_foreign_host_without_heartbeat_is_stale(r):
+async def test_foreign_host_without_heartbeat_is_not_proof_of_stale(r):
     token = "gone-container:99999:abcabcabcabcabca"
     await r.delete(worker_alive_redis_key("gone-container"))
-    assert await lock_value_holder_stale(r, token) is True
+    assert await lock_value_holder_stale(r, token) is False
 
 
 @pytest.mark.asyncio
@@ -70,8 +70,10 @@ async def test_dead_holder_takeover_acquires_slot_lock(r, monkeypatch):
     source = "PakistanLawSite:search_harvest:slot9"
     key = LOCK_KEY.format(source=source)
     await r.delete(key)
-    stale = f"gone-host:{999999}:deadbeefdeadbeef"
-    await r.delete(worker_alive_redis_key("gone-host"))
+    # A missing local PID is verifiable; an expired remote heartbeat is not.
+    monkeypatch.setattr("scraper.pls_lock_holder.lock_host_identity", local_hostname)
+    monkeypatch.setattr("scraper.pls_lock_holder.local_pid_alive", lambda _pid: False)
+    stale = f"{local_hostname()}:{999999}:deadbeefdeadbeef"
     await r.set(key, stale, ex=60)
 
     lock = SessionLock(source, r, holder_identity=True)
