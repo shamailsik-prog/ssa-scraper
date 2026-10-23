@@ -129,3 +129,36 @@ async def test_concurrent_cross_slot_claimers_never_double_claim(db, r, monkeypa
     assert len(every) == 10 and len(set(every)) == 10
     for lock in locks:
         await lock.release()
+
+
+async def test_active_other_slot_in_progress_is_not_borrowed(db, r, monkeypatch):
+    """An active login's resumable in_progress row is not idle pending work."""
+    await _slots_active(db)
+    rows = await _seed(db, ["PLD"])
+    rows[0].status = "in_progress"
+    await db.commit()
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", True)
+    row, lock, took_over, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 2, redis_client=r)
+    assert row is None and lock is None
+    assert not took_over and not cross_slot
+    await db.refresh(rows[0])
+    assert rows[0].status == "in_progress"
+    assert rows[0].slot is None
+
+
+async def test_active_cross_slot_selects_pending_not_higher_priority_in_progress(db, r, monkeypatch):
+    """Pending other-share work must win even if an in_progress row sorts first."""
+    await _slots_active(db)
+    rows = await _seed(db, ["PLD", "SCMR"])
+    rows[0].status = "in_progress"
+    rows[0].priority = 1
+    rows[1].priority = 100
+    await db.commit()
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", True)
+    row, lock, took_over, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 2, redis_client=r)
+    assert row is not None and row.id == rows[1].id
+    assert cross_slot and not took_over
+    await lock.release()
+    await db.refresh(rows[0])
+    assert rows[0].status == "in_progress"
+    assert rows[0].slot is None
