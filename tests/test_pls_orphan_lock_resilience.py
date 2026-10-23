@@ -373,6 +373,65 @@ async def test_release_search_harvest_locks_respects_deploy_flag(r, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_dead_holder_takeover_clears_legacy_token_when_no_live_task(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    monkeypatch.setattr("scraper.pls_lock_celery.celery_pls_lock_task_active", lambda: False)
+    source = "PakistanLawSite:search_harvest:slot-legacy"
+    key = LOCK_KEY.format(source=source)
+    await r.delete(key)
+    legacy = "a" * 64
+    await r.set(key, legacy, ex=120)
+    lock = SessionLock(source, r, holder_identity=True)
+    await lock.acquire(dead_holder_takeover=True)
+    try:
+        raw = await r.get(key)
+        assert raw is not None
+        assert raw.decode() != legacy
+    finally:
+        await lock.release()
+    await r.delete(key)
+
+
+@pytest.mark.asyncio
+async def test_dead_holder_takeover_keeps_legacy_token_when_celery_task_active(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    monkeypatch.setattr("scraper.pls_lock_celery.celery_pls_lock_task_active", lambda: True)
+    source = "PakistanLawSite:search_harvest:slot-legacy-live"
+    key = LOCK_KEY.format(source=source)
+    legacy = "b" * 64
+    await r.set(key, legacy, ex=120)
+    lock = SessionLock(source, r, holder_identity=True)
+    with pytest.raises(SessionLockHeld):
+        await lock.acquire(dead_holder_takeover=True)
+    await r.delete(key)
+
+
+def test_pls_lock_task_prerun_starts_heartbeat_for_harvest_task(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    from scraper.pls_worker_heartbeat import stop_worker_heartbeat_daemon
+    import scraper.pls_worker_heartbeat as wh
+
+    stop_worker_heartbeat_daemon()
+    from scraper.tasks.celery_app import _pls_lock_task_prerun
+    from scraper.tasks.pls_search_harvest import pls_search_harvest_tick
+
+    class _Req:
+        hostname = "scraper-public@worker-public-host"
+
+    class _Task:
+        request = _Req()
+
+    _pls_lock_task_prerun(sender=pls_search_harvest_tick, task=_Task())
+    assert wh._daemon is not None and wh._daemon.is_alive()
+    from scraper.pls_lock_holder import lock_host_identity
+
+    assert lock_host_identity() == "worker-public-host"
+    stop_worker_heartbeat_daemon()
+
+
+@pytest.mark.asyncio
 async def test_harvest_lock_flags_off_use_legacy_token_and_no_takeover(monkeypatch):
     monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", False)
     monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", False)

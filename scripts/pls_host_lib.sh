@@ -116,11 +116,13 @@ pls_host_release_search_harvest_locks() {
     return 0
   fi
   local n=0 key
-  while IFS= read -r key; do
+  local keys=()
+  mapfile -t keys < <(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null || true)
+  for key in "${keys[@]}"; do
     [ -z "$key" ] && continue
-    pls_host_redis_cli DEL "$key" >/dev/null 2>&1 || true
+    pls_host_redis_cli DEL "$key" </dev/null >/dev/null 2>&1 || true
     n=$((n + 1))
-  done < <(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null || true)
+  done
   if [ "$n" -gt 0 ]; then
     printf '[%s] pls_host: released %s search-harvest Redis lock(s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n"
   fi

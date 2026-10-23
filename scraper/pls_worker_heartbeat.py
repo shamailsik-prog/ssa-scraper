@@ -28,14 +28,14 @@ def start_worker_heartbeat_daemon(*, heartbeat_host: Optional[str] = None) -> No
         import redis
 
         from scraper.config import settings as cfg
-        from scraper.pls_lock_holder import WORKER_ALIVE_TTL_SECONDS, local_hostname, worker_alive_redis_key
+        from scraper.pls_lock_holder import WORKER_ALIVE_TTL_SECONDS, lock_host_identity, worker_alive_redis_key
 
         interval = max(5, int(getattr(cfg, "PLS_WORKER_HEARTBEAT_INTERVAL_SECONDS", 15) or 15))
         client = redis.from_url(cfg.REDIS_URL)
         try:
             while True:
                 try:
-                    host = _heartbeat_host_override or local_hostname()
+                    host = _heartbeat_host_override or lock_host_identity()
                     client.set(worker_alive_redis_key(host), "1", ex=WORKER_ALIVE_TTL_SECONDS)
                 except Exception as exc:
                     logger.debug("pls worker heartbeat touch failed: %s", exc)
