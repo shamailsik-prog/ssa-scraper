@@ -175,7 +175,8 @@ async def test_dedupe_skips_null_year_and_groups_by_jurisdiction(db):
     assert _dedupe_group_key((await db.get(Statute, null_id))) is None
     dry = await find_duplicate_groups(db)
     assert dry["duplicate_groups"] == 1
-    assert dry["statutes_to_quarantine"] == 1
+    assert dry["statutes_to_quarantine"] == 0
+    assert dry["review_required"] == 1
 
 
 @pytest.mark.asyncio
@@ -220,8 +221,7 @@ async def test_dedupe_d5ba6a26_shape_apply_undo(db, monkeypatch):
             )
         )
     ).scalars().all()
-    assert len(q) == 1
-    assert q[0].doc_id == b_id
+    assert len(q) == 0, "distinct section text must remain visible for manual review"
     await run_statute_quality(undo=run_id)
 
 

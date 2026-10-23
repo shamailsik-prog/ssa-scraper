@@ -96,6 +96,35 @@ def dedupe_keeper_rank(
     )
 
 
+def can_quarantine_subsumed_statute_sections(
+    keeper_sections: Sequence[Dict[str, str]],
+    candidate_sections: Sequence[Dict[str, str]],
+) -> bool:
+    """Fail closed unless every candidate provision survives verbatim in the keeper.
+
+    Same title/year/jurisdiction and a higher quality score do NOT prove that
+    distinct amendments, sections, or versions can safely be hidden. Whitespace
+    differences are ignored; substantive wording is not.
+    """
+    def indexed(sections: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        out: Dict[str, str] = {}
+        for section in sections:
+            number = str(section.get("section_number") or "").strip().casefold()
+            body = " ".join((section.get("section_text") or "").split())
+            if not number or not body or number in out:
+                return None
+            out[number] = body
+        return out
+
+    keeper = indexed(keeper_sections)
+    candidate = indexed(candidate_sections)
+    return bool(
+        keeper
+        and candidate
+        and all(keeper.get(number) == body for number, body in candidate.items())
+    )
+
+
 def count_duplicate_groups_from_statute_rows(rows: Sequence[Dict[str, object]]) -> int:
     """Dry-run duplicate group count for visible-row fixtures (name/year/jurisdiction)."""
     groups: Dict[Tuple[str, int, str], int] = {}
