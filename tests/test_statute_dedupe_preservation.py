@@ -147,7 +147,7 @@ async def test_db_historical_version_never_auto_quarantined(db, history_on):
     )).scalar_one()
     db.add(StatuteSectionVersion(
         section_id=section.id,
-        version_no=0,
+        version_no=2,
         section_text="Section 1. Former entitlement before amendment.",
         text_hash="f" * 64,
     ))
