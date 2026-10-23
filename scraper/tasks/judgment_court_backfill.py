@@ -104,6 +104,10 @@ async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str,
             continue
         if (j.court_name or "") != fix["from"] or (j.court_name or "") == fix["to"]:
             continue  # stale proposal or already corrected; never overwrite
+        # The court label can be unchanged while the judgment body was corrected
+        # after the dry-run scan. Revalidate against the locked, current text.
+        if proposed_court_name(j.court_name, j.full_text) != fix["to"]:
+            continue  # stale or unsupported header evidence; never misattribute a court
         snapshot.append({
             "id": str(j.id),
             "court_name": j.court_name or "",
