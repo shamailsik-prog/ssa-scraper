@@ -48,10 +48,10 @@ async def test_foreign_host_with_live_heartbeat_is_not_stale(r):
 
 
 @pytest.mark.asyncio
-async def test_foreign_host_without_heartbeat_is_stale(r):
+async def test_foreign_host_without_heartbeat_is_not_proof_of_stale(r):
     token = "gone-container:99999:abcabcabcabcabca"
     await r.delete(worker_alive_redis_key("gone-container"))
-    assert await lock_value_holder_stale(r, token) is True
+    assert await lock_value_holder_stale(r, token) is False
 
 
 @pytest.mark.asyncio
@@ -61,8 +61,10 @@ async def test_dead_holder_takeover_acquires_slot_lock(r, monkeypatch):
     source = "PakistanLawSite:search_harvest:slot9"
     key = LOCK_KEY.format(source=source)
     await r.delete(key)
-    stale = f"gone-host:{999999}:deadbeefdeadbeef"
-    await r.delete(worker_alive_redis_key("gone-host"))
+    from scraper.pls_lock_holder import local_hostname
+
+    stale = f"{local_hostname()}:{999999}:deadbeefdeadbeef"
+    monkeypatch.setattr("scraper.pls_lock_holder.local_pid_alive", lambda _pid: False)
     await r.set(key, stale, ex=60)
 
     lock = SessionLock(source, r, holder_identity=True)
@@ -92,6 +94,36 @@ async def test_dead_holder_takeover_does_not_steal_live_foreign_lock(r, monkeypa
     with pytest.raises(SessionLockHeld):
         await other.acquire(dead_holder_takeover=True)
     await r.delete(key, worker_alive_redis_key(host))
+
+
+@pytest.mark.asyncio
+async def test_remote_expired_heartbeat_does_not_authorize_lock_theft(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    source = "PakistanLawSite:search_harvest:slot-remote-expired-heartbeat"
+    key = LOCK_KEY.format(source=source)
+    await r.delete(key)
+    foreign = "remote-worker:123:abcdefabcdefabcd"
+    await r.delete(worker_alive_redis_key("remote-worker"))
+    await r.set(key, foreign, ex=120)
+    other = SessionLock(source, r, holder_identity=True)
+    try:
+        with pytest.raises(SessionLockHeld):
+            await other.acquire(dead_holder_takeover=True)
+        assert (await r.get(key)).decode() == foreign
+    finally:
+        await other.release()
+        await r.delete(key)
+
+
+def test_permission_denied_does_not_prove_local_pid_dead(monkeypatch):
+    from scraper.pls_lock_holder import local_pid_alive
+
+    def denied(_pid, _sig):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(os, "kill", denied)
+    assert local_pid_alive(12345) is True
 
 
 @pytest.mark.asyncio
