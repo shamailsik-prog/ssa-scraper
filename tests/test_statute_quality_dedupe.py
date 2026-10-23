@@ -17,9 +17,11 @@ from scraper.statute_quality.dedupe import (
     count_missing_from_section_run,
     dedupe_canonical_name_key,
     dedupe_keeper_rank,
+    group_substantive_run_end,
     is_fake_section_number,
     keeper_below_char_fraction,
     max_real_section_run_end,
+    substantive_max_section_run_end,
 )
 from scraper.tasks.statute_quality import _dedupe_group_key, find_duplicate_groups
 from tests.test_statute_quality_cli import _add_section
@@ -53,7 +55,7 @@ def _sections_range(
 def _rank_winner(a: list[dict[str, str]], b: list[dict[str, str]], *, has_url_a: bool = True, has_url_b: bool = True) -> str:
     nums_a = [str(s["section_number"]) for s in a]
     nums_b = [str(s["section_number"]) for s in b]
-    group_end = max_real_section_run_end(nums_a, nums_b)
+    group_end = group_substantive_run_end([a, b])
     ra = dedupe_keeper_rank(
         sections=a,
         text_chars=sum(len(s["section_text"]) for s in a),
@@ -183,6 +185,36 @@ def test_keeper_kp_provincial_assembly_powers_2026_shape():
     assert _rank_winner(clean, noisy) == "a"
 
 
+def _stub_tail_sections(start: int, count: int) -> list[dict[str, str]]:
+    return [{"section_number": str(start + i), "section_text": f"Section {start + i}. Tr."} for i in range(count)]
+
+
+def test_keeper_ajk_government_act_1964_prefers_fuller_copy():
+    """Free-sites: 19-section stub tail must not beat 17-section fuller text (~6204 vs ~7887 chars)."""
+    thinner = _char_budget_sections(17, 6204, may_be_called=True) + _stub_tail_sections(18, 2)
+    fuller = _char_budget_sections(17, 7887, may_be_called=True)
+    assert substantive_max_section_run_end(thinner) == substantive_max_section_run_end(fuller) == 17
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_finance_act_2017_prefers_more_sections():
+    thinner = _char_budget_sections(3, 3411, may_be_called=True)
+    fuller = _char_budget_sections(4, 3428, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_finance_act_2014_prefers_more_sections():
+    thinner = _char_budget_sections(3, 3241, may_be_called=True)
+    fuller = _char_budget_sections(4, 3257, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_speakers_salary_act_1971_prefers_fuller_copy():
+    thinner = _char_budget_sections(3, 1498, may_be_called=True)
+    fuller = _char_budget_sections(4, 2024, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
 def test_rank_step_r1_missing_sections():
     a = _sections_range(10, may_be_called=True, omit=frozenset({5}))
     b = _sections_range(10, may_be_called=True)
@@ -210,7 +242,16 @@ def test_rank_step_r3_may_be_called():
     )
 
 
-def test_rank_step_r4_text_chars():
+def test_rank_step_r4_substantive_section_count():
+    a = _sections_range(4, may_be_called=True, truncate_section=4)
+    b = _sections_range(4, may_be_called=True)
+    end = 4
+    assert dedupe_keeper_rank(sections=b, text_chars=1000, has_source_url=True, group_run_end=end) > dedupe_keeper_rank(
+        sections=a, text_chars=1000, has_source_url=True, group_run_end=end
+    )
+
+
+def test_rank_step_r5_text_chars():
     a = _sections_range(4, may_be_called=True)
     b = _sections_range(4, may_be_called=True)
     end = 4
@@ -219,7 +260,7 @@ def test_rank_step_r4_text_chars():
     )
 
 
-def test_rank_step_r5_source_url():
+def test_rank_step_r6_source_url():
     a = _sections_range(4, may_be_called=True)
     end = 4
     assert dedupe_keeper_rank(sections=a, text_chars=1000, has_source_url=True, group_run_end=end) > dedupe_keeper_rank(
@@ -227,7 +268,7 @@ def test_rank_step_r5_source_url():
     )
 
 
-def test_rank_step_r6_char_fraction_guard():
+def test_rank_step_r7_char_fraction_guard():
     assert keeper_below_char_fraction(600, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
     assert not keeper_below_char_fraction(800, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
 

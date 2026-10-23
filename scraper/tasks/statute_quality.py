@@ -25,8 +25,8 @@ from scraper.statute_quality_jurisdiction import should_fix_federal_jurisdiction
 from scraper.statute_quality.dedupe import (
     dedupe_canonical_name_key,
     dedupe_keeper_rank,
+    group_substantive_run_end,
     keeper_below_char_fraction,
-    max_real_section_run_end,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,11 +129,9 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
     winners: List[UUID] = []
     manual_review: List[Dict[str, Any]] = []
     for group_key, members in dup_groups.items():
-        nums_lists = [
-            [str(s.get("section_number") or "") for s in sections_map.get(st.id, [])]
-            for st in members
-        ]
-        group_run_end = max_real_section_run_end(*nums_lists)
+        sect_lists = [sections_map.get(st.id, []) for st in members]
+        nums_lists = [[str(s.get("section_number") or "") for s in sl] for sl in sect_lists]
+        group_run_end = group_substantive_run_end(sect_lists)
         char_by_id = {st.id: metrics.get(st.id, (0, 0))[1] for st in members}
         group_best_chars = max(char_by_id.values()) if char_by_id else 0
         ranked = sorted(
