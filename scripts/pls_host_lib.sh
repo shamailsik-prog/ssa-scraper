@@ -183,9 +183,37 @@ pls_host_confirm_pls_idle_after_local_stop() {
     "corpus:login_session_lock:PakistanLawSite:holders" \
     "corpus:login_session_lock:PakistanLawSite:slot1" \
     "corpus:login_session_lock:PakistanLawSite:slot2"; do
-    if ! exists="$(pls_host_redis_cli EXISTS "$key" 2>/dev/null | tr -d '\r')"; then
+    if ! exists="$(pls_host_redis_cli EXISTS "$key" 2>/dev/null)"; then
       return 1
     fi
+    exists="${exists//
+  done
+  if ! remaining="$(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null)"; then
+    return 1
+  fi
+  [ -z "$remaining" ] || return 1
+  if ! jobs="$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -tAc \
+    "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null)"; then
+    return 1
+  fi
+  jobs="$(printf '%s' "$jobs" | tr -d ' \r\n')"
+  [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$jobs" -eq 0 ]
+}
+
+pls_host_force_release_stalled_harvest() {
+  if ! pls_host_stop_scraper_safely; then
+    return 1
+  fi
+  if ! pls_host_release_search_harvest_locks; then
+    return 1
+  fi
+  if ! pls_host_confirm_pls_idle_after_local_stop; then
+    printf 'pls_host: PLS lock/job ownership or idle state not verified; refusing global lock deletion and job failure marking\n' >&2
+    return 1
+  fi
+  return 0
+}
+\r'/}"
     [ "$exists" = 0 ] || return 1
   done
   if ! remaining="$(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null)"; then
