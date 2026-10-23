@@ -44,7 +44,10 @@ def test_parse_lock_holder_roundtrip():
     parsed = parse_lock_holder(token)
     assert parsed is not None
     host, pid, nonce = parsed
-    assert host and pid == os.getpid() and len(nonce) == 16
+    assert host and pid == os.getpid()
+    # Linux workers carry a namespace tag; restricted/non-Linux workers
+    # retain legacy nonce format and must wait for TTL instead of takeover.
+    assert len(nonce) == 16 or (nonce.startswith("ns-") and len(nonce) == 36)
 
 
 @pytest.mark.asyncio
@@ -73,7 +76,8 @@ async def test_dead_holder_takeover_acquires_slot_lock(r, monkeypatch):
     # A missing local PID is verifiable; an expired remote heartbeat is not.
     monkeypatch.setattr("scraper.pls_lock_holder.lock_host_identity", local_hostname)
     monkeypatch.setattr("scraper.pls_lock_holder.local_pid_alive", lambda _pid: False)
-    stale = f"{local_hostname()}:{999999}:deadbeefdeadbeef"
+    monkeypatch.setattr("scraper.pls_lock_holder.pid_namespace_identity", lambda: "aaaaaaaaaaaaaaaa")
+    stale = f"{local_hostname()}:{999999}:ns-aaaaaaaaaaaaaaaa-deadbeefdeadbeef"
     await r.set(key, stale, ex=60)
 
     lock = SessionLock(source, r, holder_identity=True)

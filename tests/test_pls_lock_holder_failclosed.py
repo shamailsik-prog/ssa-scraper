@@ -62,13 +62,18 @@ async def test_definitively_missing_local_holder_is_stale(monkeypatch):
     monkeypatch.setattr(
         "scraper.pls_lock_holder.lock_host_identity", lambda: "local-worker"
     )
+    monkeypatch.setattr(
+        "scraper.pls_lock_holder.pid_namespace_identity",
+        lambda: "aaaaaaaaaaaaaaaa",
+    )
 
     def _missing(_pid, _sig):
         raise ProcessLookupError("ESRCH")
 
     monkeypatch.setattr(os, "kill", _missing)
     assert await lock_value_holder_stale(
-        _HeartbeatRedis(False), "local-worker:123:0123456789abcdef"
+        _HeartbeatRedis(False),
+        "local-worker:123:ns-aaaaaaaaaaaaaaaa-0123456789abcdef",
     ) is True
 
 
@@ -78,3 +83,54 @@ async def test_invalid_lock_holder_fails_closed(monkeypatch):
         "scraper.pls_lock_holder.lock_host_identity", lambda: "local-worker"
     )
     assert await lock_value_holder_stale(_HeartbeatRedis(False), "legacy-token") is False
+
+
+@pytest.mark.asyncio
+async def test_same_celery_hostname_other_pid_namespace_is_not_local(monkeypatch):
+    """A live container's PID can be ESRCH in another container with the same worker hostname."""
+    monkeypatch.setattr("scraper.pls_lock_holder.lock_host_identity", lambda: "shared-worker")
+    monkeypatch.setattr("scraper.pls_lock_holder.pid_namespace_identity", lambda: "aaaaaaaaaaaaaaaa")
+
+    def _missing(_pid, _sig):
+        raise AssertionError("must not inspect a PID outside our namespace")
+
+    monkeypatch.setattr(os, "kill", _missing)
+    assert await lock_value_holder_stale(
+        _HeartbeatRedis(False),
+        "shared-worker:47:ns-bbbbbbbbbbbbbbbb-0123456789abcdef",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_untagged_same_host_token_cannot_be_taken_over(monkeypatch):
+    """Legacy hostname+PID tokens have no evidence of a shared PID namespace."""
+    monkeypatch.setattr("scraper.pls_lock_holder.lock_host_identity", lambda: "shared-worker")
+    monkeypatch.setattr("scraper.pls_lock_holder.pid_namespace_identity", lambda: "aaaaaaaaaaaaaaaa")
+
+    def _missing(_pid, _sig):
+        raise AssertionError("must not inspect a PID without namespace provenance")
+
+    monkeypatch.setattr(os, "kill", _missing)
+    assert await lock_value_holder_stale(
+        _HeartbeatRedis(False), "shared-worker:47:0123456789abcdef"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_unreadable_pid_namespace_fails_closed(monkeypatch):
+    monkeypatch.setattr("scraper.pls_lock_holder.lock_host_identity", lambda: "shared-worker")
+    monkeypatch.setattr("scraper.pls_lock_holder.pid_namespace_identity", lambda: None)
+    assert await lock_value_holder_stale(
+        _HeartbeatRedis(False),
+        "shared-worker:47:ns-aaaaaaaaaaaaaaaa-0123456789abcdef",
+    ) is False
+
+
+def test_generated_lock_token_carries_pid_namespace_provenance(monkeypatch):
+    from scraper.pls_lock_holder import lock_holder_token, parse_lock_holder
+    monkeypatch.setattr("scraper.pls_lock_holder.pid_namespace_identity", lambda: "aaaaaaaaaaaaaaaa")
+    token = lock_holder_token()
+    parsed = parse_lock_holder(token)
+    assert parsed is not None
+    assert parsed[2].startswith("ns-aaaaaaaaaaaaaaaa-")
+    assert len(parsed[2]) == 36

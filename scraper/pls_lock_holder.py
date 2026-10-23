@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 from typing import Optional, Tuple
@@ -43,11 +44,33 @@ def worker_alive_redis_key(host: str) -> str:
     return f"{WORKER_ALIVE_KEY_PREFIX}{host}"
 
 
+def pid_namespace_identity() -> Optional[str]:
+    """Fingerprint the OS PID namespace, not merely a Celery hostname.
+
+    A hostname may be reused by different containers whose PID 47 values refer
+    to unrelated processes. When provenance cannot be read, never infer death.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            boot_id = fh.read().strip()
+        ns_inode = os.stat("/proc/self/ns/pid").st_ino
+        if not boot_id or not ns_inode:
+            return None
+        return hashlib.sha256(f"{boot_id}:{ns_inode}".encode("ascii")).hexdigest()[:16]
+    except (OSError, UnicodeError):
+        return None
+
+
 def lock_holder_token() -> str:
     """Redis lock value: ``host:pid:nonce`` (nonce keeps compare-and-delete semantics)."""
     import secrets
 
-    return f"{lock_host_identity()}:{os.getpid()}:{secrets.token_hex(8)}"
+    # Legacy untagged tokens are never eligible for PID-based takeover.
+    namespace = pid_namespace_identity()
+    nonce = secrets.token_hex(8)
+    if namespace:
+        nonce = f"ns-{namespace}-{nonce}"
+    return f"{lock_host_identity()}:{os.getpid()}:{nonce}"
 
 
 def parse_lock_holder(value: str) -> Optional[Tuple[str, int, str]]:
@@ -94,7 +117,12 @@ async def lock_value_holder_stale(redis_client, value: str) -> bool:
     parsed = parse_lock_holder(value)
     if parsed is None:
         return False
-    host, pid, _ = parsed
+    host, pid, nonce = parsed
+    namespace = pid_namespace_identity()
+    # ESRCH is only authoritative within the same PID namespace. A Celery
+    # hostname alone is not a safe proof of shared process visibility.
+    if not namespace or not nonce.startswith(f"ns-{namespace}-"):
+        return False
     if host == lock_host_identity():
         return not local_pid_alive(pid)
     # A heartbeat can expire while a remote worker is still harvesting.
