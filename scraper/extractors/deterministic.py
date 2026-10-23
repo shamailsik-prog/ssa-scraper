@@ -288,6 +288,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     detected_name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
     official_title = source_meta.get("act_title") or source_meta.get("detail_title")
     name = prefer_official_statute_title(detected_name, official_title)
+    gazette_year: Optional[int] = None
     if source_meta.get("source_name") in ("Senate", "AJKAssembly"):
         from scraper.config import settings
 
@@ -296,9 +297,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
 
             gaz = extract_gazette_title_year(raw_text, source_name=source_meta.get("source_name"))
             if gaz:
-                name, gaz_year = gaz
-                if gaz_year is not None:
-                    source_meta = {**source_meta, "year_enacted": gaz_year}
+                name, gazette_year = gaz
     sections = split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -324,12 +323,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     name_norm = re.sub(r"\s+", " ", name or "").strip()
     if official and name_norm == official and not listed_title_supported_by_text(official, raw_text):
         evidence["listed_title_absent"] = official[:160]
-    year = source_meta.get("year_enacted")
-    if year is not None and not isinstance(year, int):
-        try:
-            year = int(year)
-        except (TypeError, ValueError):
-            year = None
+    year: Optional[int] = gazette_year
     if year is None:
         m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", name or "")
         if m:

@@ -77,11 +77,15 @@ async def _statute_metrics(db: AsyncSession) -> Dict[UUID, Tuple[int, int]]:
     return out
 
 
-def _dedupe_group_key(st: Statute) -> Tuple[str, int, str]:
+def _dedupe_group_key(st: Statute) -> Optional[Tuple[str, int, str]]:
+    if st.year_enacted is None:
+        return None
     name_key = (st.canonical_name_key or "").strip() or _normalized_statute_name_key(st.name)
+    if not name_key:
+        return None
     return (
         name_key,
-        int(st.year_enacted or 0),
+        int(st.year_enacted),
         (st.jurisdiction or "").strip(),
     )
 
@@ -98,7 +102,7 @@ async def find_duplicate_groups(db: AsyncSession) -> Dict[str, Any]:
     groups: Dict[Tuple[str, int, str], List[Statute]] = defaultdict(list)
     for st in statutes:
         key = _dedupe_group_key(st)
-        if not key[0]:
+        if key is None:
             continue
         groups[key].append(st)
     dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
@@ -154,18 +158,19 @@ async def classify_requarantine(db: AsyncSession) -> Dict[str, Any]:
         sections = await _sections_for_statute(db, st.id)
         texts = [s["section_text"] for s in sections]
         filtered = filter_statute_quality_sections(sections, statute_name=st.name)
-        if settings.SSA_STATUTE_QUALITY_OCR_GATE or settings.SSA_STATUTE_QUALITY_REQUARANTINE:
+        if settings.SSA_STATUTE_QUALITY_OCR_GATE:
             issues = statute_text_poor_ocr(name=st.name, section_texts=texts)
             if issues:
                 by_reason[REASON_POOR_OCR].append(str(st.id))
                 continue
-        if is_assembly_source(st.source_name):
-            if assembly_body_too_thin([{"section_text": t} for t in texts]):
-                by_reason[REASON_THIN_ASSEMBLY].append(str(st.id))
-                continue
-        if not filtered and texts:
-            if all(is_section_body_noise(t) for t in texts):
-                by_reason[REASON_NO_VALID_SECTIONS].append(str(st.id))
+        if settings.SSA_STATUTE_QUALITY_REQUARANTINE:
+            if is_assembly_source(st.source_name):
+                if assembly_body_too_thin([{"section_text": t} for t in texts]):
+                    by_reason[REASON_THIN_ASSEMBLY].append(str(st.id))
+                    continue
+            if texts and not filtered:
+                if all(is_section_body_noise(t) for t in texts):
+                    by_reason[REASON_NO_VALID_SECTIONS].append(str(st.id))
     counts = {k: len(v) for k, v in by_reason.items()}
     return {"by_reason": counts, "ids_by_reason": dict(by_reason), "total": sum(counts.values())}
 
@@ -217,7 +222,13 @@ async def apply_jurisdiction(db: AsyncSession, run_id: str) -> int:
         st = (await db.execute(select(Statute).where(Statute.id == sid))).scalars().first()
         if st is None:
             continue
-        snapshot.append({"id": str(st.id), "jurisdiction": st.jurisdiction})
+        snapshot.append(
+            {
+                "id": str(st.id),
+                "jurisdiction": st.jurisdiction,
+                "updated_at": st.updated_at.isoformat() if st.updated_at else None,
+            }
+        )
         st.jurisdiction = fix["to"]
         n += 1
     db.add(CorpusMetadata(key=_undo_jurisdiction_key(run_id), value=json.dumps(snapshot)))
@@ -263,6 +274,8 @@ async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
             st = (await db.execute(select(Statute).where(Statute.id == sid))).scalars().first()
             if st is not None:
                 st.jurisdiction = item["jurisdiction"]
+                if item.get("updated_at"):
+                    st.updated_at = datetime.fromisoformat(item["updated_at"])
         await db.delete(jur_row)
     prior_row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_prior_latest_key(run_id)))).scalars().first()
     prior_latest = prior_row.value if prior_row is not None else None
