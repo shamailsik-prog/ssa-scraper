@@ -505,7 +505,7 @@ async def test_drive_shared_folder_cache_same_dict_for_pool_adapters(db, source,
 
 @pytest.mark.asyncio
 async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch):
-    """Mutant F2: serial preflight ensure_tree must complete before upload workers run."""
+    """Each upload ensures its folder (on demand) before put."""
 
     events: List[tuple[str, str]] = []
 
@@ -517,8 +517,10 @@ async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch
             events.append(("put", key))
             return super().put(key, data, content_type)
 
+    shared = _OrderedAdapter()
+
     def factory(_target_type, _config):
-        return _OrderedAdapter()
+        return shared
 
     monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
     await _promote_many(db, source, 2)
@@ -526,9 +528,53 @@ async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch
     await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
     await db.commit()
 
-    first_put = next((i for i, ev in enumerate(events) if ev[0] == "put"), len(events))
-    assert all(ev[0] == "ensure" for ev in events[:first_put])
-    assert any(ev[0] == "put" for ev in events[first_put:])
+    assert any(e[0] == "ensure" for e in events)
+    assert any(e[0] == "put" for e in events)
+    first_put = next(i for i, e in enumerate(events) if e[0] == "put")
+    first_ensure = next(i for i, e in enumerate(events) if e[0] == "ensure")
+    assert first_ensure < first_put
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_large_batch_starts_uploads_within_budget(db, source, monkeypatch):
+    """At c=2, uploads must not wait for serial ensure_tree over the whole backlog slice."""
+
+    class _SlowEnsureAdapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_before_first_put = 0
+            self._saw_put = False
+            self.first_put_at: Optional[float] = None
+
+        def ensure_tree(self, key: str) -> None:
+            if not self._saw_put:
+                self.ensure_before_first_put += 1
+            time.sleep(0.02)
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            if self.first_put_at is None:
+                self.first_put_at = time.monotonic()
+            self._saw_put = True
+            return super().put(key, data, content_type)
+
+    adapter = _SlowEnsureAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS", 0)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    batch = 50
+    await _promote_many(db, source, batch)
+    await _drive_target(db)
+    started = time.monotonic()
+    await ArchiveMirror(db, adapter_factory=factory, deadline=started + 4.0).mirror_pending(limit=batch)
+    await db.commit()
+
+    assert adapter.first_put_at is not None
+    assert adapter.first_put_at - started < 0.35
+    assert adapter.ensure_before_first_put < batch // 2
+    assert adapter.put_keys
 
 
 @pytest.mark.asyncio
