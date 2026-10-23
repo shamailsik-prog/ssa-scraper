@@ -1016,6 +1016,15 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
     if login_work_held():
         return {"skipped": True, "reason": "deploy_hold"}
 
+    try:
+        return _pls_search_harvest_tick_body(**kwargs)
+    finally:
+        from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+
+        release_on_worker_process_shutdown()
+
+
+def _pls_search_harvest_tick_body(**kwargs) -> Dict[str, Any]:
     async def _inner() -> Dict[str, Any]:
         from sqlalchemy import func, select
 
@@ -1066,6 +1075,7 @@ def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
         queue_search_harvest_ticks(app, slots=(next_slot,))
         result["queued_next_tick"] = next_slot
     return result
+
 
 
 def cli_plan(argv: Optional[List[str]] = None) -> int:

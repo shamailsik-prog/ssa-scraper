@@ -2,25 +2,31 @@
 
 from __future__ import annotations
 
-import atexit
+import asyncio
 import os
+import signal
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
+import billiard
 import pytest
+import redis
 import redis.asyncio as aioredis
 
 from scraper.auth.session_manager import LOCK_KEY, SessionLock, SessionLockHeld
 from scraper.config import settings
 from scraper.pls_grid_health import compute_stalled, release_pls_search_harvest_redis_locks
 from scraper.pls_lock_holder import (
+    local_hostname,
     lock_holder_token,
     lock_value_holder_stale,
     parse_lock_holder,
-    touch_worker_alive,
     worker_alive_redis_key,
 )
 from scraper.pls_lock_registry import register_lock, release_all_registered_sync
-from scraper.tasks.celery_app import _install_pls_lock_shutdown_hooks
+from scraper.pls_lock_shutdown import install_pls_lock_shutdown_hooks
+from tests.pls_billiard_lock_worker import hold_registered_lock_until_killed
 
 
 @pytest.fixture
@@ -153,24 +159,115 @@ def test_shutdown_registry_releases_tracked_lock(monkeypatch):
     client.close()
 
 
-def test_worker_process_init_registers_atexit_shutdown(monkeypatch):
+def test_install_shutdown_registers_sigterm_handler(monkeypatch):
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
-    import redis
+    install_pls_lock_shutdown_hooks()
+    assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
 
-    registered: list = []
-    monkeypatch.setattr(atexit, "register", lambda fn: registered.append(fn))
-    _install_pls_lock_shutdown_hooks()
-    assert registered and registered[0] is release_all_registered_sync
 
-    client = redis.from_url(settings.REDIS_URL)
-    key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:atexit-test")
+@pytest.mark.asyncio
+async def test_acquire_with_holder_identity_refreshes_worker_alive(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    host = local_hostname()
+    await r.delete(worker_alive_redis_key(host))
+    source = "PakistanLawSite:search_harvest:slot-touch"
+    key = LOCK_KEY.format(source=source)
+    await r.delete(key)
+    lock = SessionLock(source, r, holder_identity=True)
+    await lock.acquire()
+    try:
+        assert await r.exists(worker_alive_redis_key(host))
+    finally:
+        await lock.release()
+    await r.delete(key)
+
+
+def _wait_redis_key(client: redis.Redis, key: str, timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if client.get(key):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _billiard_pool_release_scenario(monkeypatch, *, use_close_join: bool) -> None:
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    uid = uuid.uuid4().hex[:10]
+    key = f"corpus:login_session_lock:PakistanLawSite:search_harvest:billiard-{uid}"
+    foreign = f"corpus:login_session_lock:PakistanLawSite:search_harvest:foreign-{uid}"
+    ready_key = f"pls:billiard-test-ready-{uid}"
+    stop_key = f"pls:billiard-test-stop-{uid}"
     token = lock_holder_token()
-    client.set(key, token, ex=120)
-    register_lock(key, token)
-    assert release_all_registered_sync() == 1
+    foreign_val = lock_holder_token()
+    client = redis.from_url(settings.REDIS_URL)
+    client.delete(key, foreign, ready_key, stop_key)
+    pool = billiard.Pool(1)
+    try:
+        pool.apply_async(
+            hold_registered_lock_until_killed,
+            (settings.REDIS_URL, key, token, foreign, foreign_val, ready_key, stop_key if use_close_join else None),
+        )
+        assert _wait_redis_key(client, ready_key)
+        if use_close_join:
+            client.set(stop_key, "1", ex=60)
+            pool.close()
+            pool.join()
+        else:
+            pool.terminate()
+            pool.join()
+        for _ in range(40):
+            if client.get(key) is None:
+                break
+            time.sleep(0.1)
+    finally:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+        pool.join()
     assert client.get(key) is None
-    client.delete(key)
+    assert client.get(foreign) is not None
+    client.delete(foreign, ready_key, stop_key)
     client.close()
+
+
+def test_billiard_pool_terminate_releases_only_registered_lock(monkeypatch):
+    _billiard_pool_release_scenario(monkeypatch, use_close_join=False)
+
+
+def test_billiard_pool_close_join_releases_only_registered_lock(monkeypatch):
+    _billiard_pool_release_scenario(monkeypatch, use_close_join=True)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_daemon_prevents_takeover_during_long_idle(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    monkeypatch.setattr("scraper.pls_lock_holder.WORKER_ALIVE_TTL_SECONDS", 60)
+    monkeypatch.setattr(settings, "PLS_WORKER_HEARTBEAT_INTERVAL_SECONDS", 15)
+    peer_host = "holder-daemon-host"
+    from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon, stop_worker_heartbeat_daemon
+
+    source = "PakistanLawSite:search_harvest:slot-daemon"
+    key = LOCK_KEY.format(source=source)
+    await r.delete(key, worker_alive_redis_key(peer_host))
+    stop_worker_heartbeat_daemon()
+    start_worker_heartbeat_daemon(heartbeat_host=peer_host)
+    try:
+        live = f"{peer_host}:999:{'b' * 16}"
+        await r.set(key, live, ex=120)
+        await asyncio.sleep(1)
+        assert await r.exists(worker_alive_redis_key(peer_host))
+        # Lock holder is idle (no page refresh); daemon must keep heartbeat past 60s TTL.
+        await asyncio.sleep(65)
+        assert await r.exists(worker_alive_redis_key(peer_host))
+        other = SessionLock(source, r, holder_identity=True)
+        with pytest.raises(SessionLockHeld):
+            await other.acquire(dead_holder_takeover=True)
+    finally:
+        stop_worker_heartbeat_daemon()
+        await r.delete(key, worker_alive_redis_key(peer_host))
 
 
 @pytest.mark.asyncio
@@ -230,3 +327,13 @@ def test_compute_stalled_locks_held_no_staging_separate_field(monkeypatch):
     )
     assert ok["stalled"] is False
     assert ok.get("locks_held_no_staging") is False
+
+    young = compute_stalled(
+        last_promotion_at=now - timedelta(hours=8),
+        now=now,
+        threshold_hours=6,
+        search_harvest_locks_held=True,
+        last_staging_at=now - timedelta(minutes=20),
+        search_harvest_lock_held_minutes=5.0,
+    )
+    assert young["locks_held_no_staging"] is False

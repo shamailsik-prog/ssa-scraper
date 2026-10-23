@@ -333,6 +333,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, PLS search-harvest Redis locks store hostname:pid in the value (for dead-holder takeover and deploy diagnostics).",
     )
+    PLS_WORKER_HEARTBEAT_INTERVAL_SECONDS: int = Field(
+        default=15,
+        description="When PLS_LOCK_HOLDER_IDENTITY is on, refresh pls:worker_alive:<host> this often (seconds) so long login waits do not look like a dead holder.",
+    )
     PLS_LOCK_DEAD_HOLDER_TAKEOVER: bool = Field(
         default=False,
         description="When true, a search-harvest tick may take a slot/query Redis lock whose hostname:pid holder is no longer alive.",
