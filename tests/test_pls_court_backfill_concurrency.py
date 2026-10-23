@@ -24,7 +24,7 @@ async def _judgment(db, court="Supreme Court of Pakistan"):
         source_name="PakistanLawSite",
         court_name=court,
         canonical_citation=f"1990 MLD {str(jid.int)[-8:]}",
-        full_text="1990 MLD 947\\n[Supreme Court of India]\\n" + "x" * 600,
+        full_text="1990 MLD 947\n[Supreme Court of India]\n" + "x" * 600,
         full_text_hash=jid.hex,
         access_method="rendered_copy",
     )
@@ -114,5 +114,39 @@ async def test_unchanged_latest_run_can_be_undone(db):
     assert await apply_court_fixes(db, run_id, [_fix(j)]) == 1
     await db.commit()
     assert await undo_run(db, run_id) == {"court_names_restored": 1}
+    await db.refresh(j)
+    assert j.court_name == "Supreme Court of Pakistan"
+
+
+@pytest.mark.asyncio
+async def test_changed_header_invalidates_stale_court_proposal(db):
+    """The court label may remain unchanged while the underlying judgment is corrected."""
+    j = await _judgment(db)
+    stale = _fix(j)
+    j.full_text = "1990 MLD 947\n[Supreme Court of Bangladesh]\n" + "x" * 600
+    await db.commit()
+    run_id = uuid4().hex
+    await _record_run(db, run_id)
+    assert await apply_court_fixes(db, run_id, [stale]) == 0
+    await db.commit()
+    await db.refresh(j)
+    assert j.court_name == "Supreme Court of Pakistan"
+    snap = (await db.execute(select(CorpusMetadata).where(
+        CorpusMetadata.key == _undo_snapshot_key(run_id)
+    ))).scalars().one()
+    assert snap.value == "[]"
+
+
+@pytest.mark.asyncio
+async def test_removed_header_invalidates_stale_court_proposal(db):
+    """Do not apply an old foreign-court label when current text lacks that evidence."""
+    j = await _judgment(db)
+    stale = _fix(j)
+    j.full_text = "1990 MLD 947\nBefore X, J\nNo court attribution.\n" + "x" * 600
+    await db.commit()
+    run_id = uuid4().hex
+    await _record_run(db, run_id)
+    assert await apply_court_fixes(db, run_id, [stale]) == 0
+    await db.commit()
     await db.refresh(j)
     assert j.court_name == "Supreme Court of Pakistan"
