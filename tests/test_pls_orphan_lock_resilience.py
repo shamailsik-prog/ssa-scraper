@@ -157,9 +157,10 @@ def test_worker_process_init_registers_atexit_shutdown(monkeypatch):
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
     import redis
 
-    before = len(getattr(atexit, "_exithandlers", ()))
+    registered: list = []
+    monkeypatch.setattr(atexit, "register", lambda fn: registered.append(fn))
     _install_pls_lock_shutdown_hooks()
-    assert len(atexit._exithandlers) > before
+    assert registered and registered[0] is release_all_registered_sync
 
     client = redis.from_url(settings.REDIS_URL)
     key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:atexit-test")
