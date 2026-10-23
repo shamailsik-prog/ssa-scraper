@@ -94,6 +94,11 @@ if [ "$DEPLOY_ONLY" = 1 ]; then
     die "deploy-only: docker compose build failed (existing containers unchanged)"
   fi
   log "deploy-only: starting ${services[*]}"
+  # shellcheck source=scripts/pls_host_lib.sh
+  source "$(dirname "$0")/../scripts/pls_host_lib.sh"
+  case " ${services[*]} " in
+    *" worker-scraper "*) pls_host_release_search_harvest_locks || true ;;
+  esac
   if ! docker compose up -d --no-build "${services[@]}"; then
     die "deploy-only: docker compose up failed"
   fi

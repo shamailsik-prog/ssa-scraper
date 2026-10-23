@@ -228,11 +228,14 @@ async def status_payload(db: AsyncSession) -> Dict[str, Any]:
     saturation = grid_saturation_view(pls_cfg, now=now)
     pls_last = (await db.execute(select(func.max(Judgment.promoted_at)).where(Judgment.source_name == "PakistanLawSite"))).scalar()
     pls_source_row = next((s for s in sources if s["source"] == "PakistanLawSite"), None)
-    stall = compute_stalled(
+    from scraper.pls_grid_health import pls_stall_verdict_live
+
+    stall = await pls_stall_verdict_live(
+        db,
+        pls_cfg,
         last_promotion_at=pls_last,
+        source_state=pls_source_row["state"] if pls_source_row is not None else "ACTIVE",
         now=now,
-        saturation=saturation,
-        harvest_paused=bool(pls_cfg.get("paused_by_admin")) or (pls_source_row is not None and pls_source_row["state"] != "ACTIVE"),
     )
     from scraper.tasks.embedding_health import embedding_health
     from scraper.pls_accounting import grid_accounting

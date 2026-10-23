@@ -84,17 +84,17 @@ async def health(x_api_key: str | None = Header(default=None)) -> Dict[str, Any]
             pls_cfg = await pls_source_config(db)
             total_j, by_source = await pls_judgment_counts(db)
             last_j = await pls_last_judgment_at(db)
-            from scraper.pls_grid_health import compute_stalled, grid_saturation_view
+            from scraper.pls_grid_health import grid_saturation_view, pls_stall_verdict_live
 
             from scraper.models import ScraperSource as _Src
 
             _pls_state = (await db.execute(select(_Src.state).where(_Src.source_name == "PakistanLawSite"))).scalar()
             saturation = grid_saturation_view(pls_cfg)
-            stall = compute_stalled(
+            stall = await pls_stall_verdict_live(
+                db,
+                pls_cfg,
                 last_promotion_at=last_j,
-                saturation=saturation,
-                # same rule as /status and the watchdog: an operator pause or any non-ACTIVE source is "paused"
-                harvest_paused=bool(pls_cfg.get("paused_by_admin")) or (_pls_state is not None and _pls_state != "ACTIVE"),
+                source_state=_pls_state or "ACTIVE",
             )
             out["judgments"] = total_j
             out["judgments_by_source"] = by_source

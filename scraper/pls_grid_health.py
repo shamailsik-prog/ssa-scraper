@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
-from scraper.models import Judgment, ScraperJob, ScraperSource
+from scraper.models import Judgment, ScraperJob, ScraperSource, ScraperStaging
 
 SOURCE_NAME = "PakistanLawSite"
 PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
@@ -369,6 +369,8 @@ def compute_stalled(
     threshold_hours: Optional[float] = None,
     saturation: Optional[Dict[str, Any]] = None,
     harvest_paused: bool = False,
+    search_harvest_locks_held: bool = False,
+    last_staging_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """The alarm the audit asked for: stalled == no new judgment for `threshold_hours`, computed from the
     corpus itself (never from cursors, which advance while nothing is produced).
@@ -385,6 +387,23 @@ def compute_stalled(
         return {"stalled": False, "stalled_reason": "not_harvested_on_this_server", "hours_since_last_judgment": None, "threshold_hours": threshold, "last_judgment_at": None}
     if last_promotion_at is not None and last_promotion_at.tzinfo is None:
         last_promotion_at = last_promotion_at.replace(tzinfo=timezone.utc)
+    if last_staging_at is not None and last_staging_at.tzinfo is None:
+        last_staging_at = last_staging_at.replace(tzinfo=timezone.utc)
+    orphan_minutes = float(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES", 15) or 15)
+    if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)) and search_harvest_locks_held:
+        staging_idle_min = None if last_staging_at is None else max(0.0, (now - last_staging_at).total_seconds() / 60.0)
+        if staging_idle_min is None or staging_idle_min >= orphan_minutes:
+            return {
+                "stalled": True,
+                "stalled_reason": "locks_held_no_staging",
+                "hours_since_last_judgment": None
+                if last_promotion_at is None
+                else round(max(0.0, (now - last_promotion_at).total_seconds() / 3600.0), 2),
+                "threshold_hours": threshold,
+                "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
+                "minutes_since_last_staging": None if staging_idle_min is None else round(staging_idle_min, 2),
+                "lock_orphan_stall_minutes": orphan_minutes,
+            }
     idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)
     stalled = idle_hours is None or idle_hours >= threshold
     reason = None
@@ -438,6 +457,8 @@ def pls_stall_verdict_for_config(
     last_promotion_at: Optional[datetime],
     source_state: str,
     now: Optional[datetime] = None,
+    search_harvest_locks_held: bool = False,
+    last_staging_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Live promotion stall verdict from corpus + grid saturation (not the cached pls_stall_watchdog blob)."""
     now = now or datetime.now(timezone.utc)
@@ -448,6 +469,31 @@ def pls_stall_verdict_for_config(
         now=now,
         saturation=saturation,
         harvest_paused=paused,
+        search_harvest_locks_held=search_harvest_locks_held,
+        last_staging_at=last_staging_at,
+    )
+
+
+async def pls_stall_verdict_live(
+    db: AsyncSession,
+    cfg: Dict[str, Any],
+    *,
+    last_promotion_at: Optional[datetime],
+    source_state: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    locks_held = False
+    last_staging = None
+    if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)):
+        locks_held = await pls_search_harvest_redis_locks_held()
+        last_staging = await pls_last_staging_at(db)
+    return pls_stall_verdict_for_config(
+        cfg,
+        last_promotion_at=last_promotion_at,
+        source_state=source_state,
+        now=now,
+        search_harvest_locks_held=locks_held,
+        last_staging_at=last_staging,
     )
 
 
@@ -470,6 +516,49 @@ _PLS_LOCK_KEYS = (
     "corpus:login_session_lock:PakistanLawSite:slot1",
     "corpus:login_session_lock:PakistanLawSite:slot2",
 )
+
+SEARCH_HARVEST_LOCK_PREFIX = "corpus:login_session_lock:PakistanLawSite:search_harvest:"
+
+
+async def pls_search_harvest_redis_locks_held() -> bool:
+    import redis.asyncio as aioredis
+
+    try:
+        r = aioredis.from_url(settings.REDIS_URL)
+        try:
+            async for key in r.scan_iter(match=f"{SEARCH_HARVEST_LOCK_PREFIX}*"):
+                if await r.exists(key):
+                    return True
+        finally:
+            await r.aclose()
+    except Exception:
+        return False
+    return False
+
+
+async def release_pls_search_harvest_redis_locks() -> int:
+    """Drop search-harvest slot/query Redis locks (deploy recovery). No-op unless PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS."""
+    if not bool(getattr(settings, "PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS", False)):
+        return 0
+    import redis.asyncio as aioredis
+
+    deleted = 0
+    r = aioredis.from_url(settings.REDIS_URL)
+    try:
+        async for key in r.scan_iter(match=f"{SEARCH_HARVEST_LOCK_PREFIX}*"):
+            if int(await r.delete(key) or 0):
+                deleted += 1
+    finally:
+        await r.aclose()
+    return deleted
+
+
+async def pls_last_staging_at(db: AsyncSession) -> Optional[datetime]:
+    return (
+        await db.execute(
+            select(func.max(ScraperStaging.created_at)).where(ScraperStaging.source_name == SOURCE_NAME)
+        )
+    ).scalar()
 
 
 async def pls_harvest_in_progress(db: AsyncSession) -> Optional[str]:

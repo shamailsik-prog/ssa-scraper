@@ -23,7 +23,6 @@ from scraper.models import (
 from scraper.notify import notify
 from scraper.pls_grid_health import (
     SOURCE_NAME,
-    compute_stalled,
     defer_pls_grid_for_search_harvest,
     grid_harvest_incomplete,
     grid_saturation_view,
@@ -101,7 +100,15 @@ async def evaluate_pls_stall(db, source: ScraperSource, *, now: Optional[datetim
     last_at = await pls_last_judgment_at(db)
     saturation = grid_saturation_view(cfg, now=now)
     paused = source.state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
-    verdict = compute_stalled(last_promotion_at=last_at, now=now, saturation=saturation, harvest_paused=paused)
+    from scraper.pls_grid_health import pls_stall_verdict_live
+
+    verdict = await pls_stall_verdict_live(
+        db,
+        cfg,
+        last_promotion_at=last_at,
+        source_state=source.state,
+        now=now,
+    )
     watch = dict(cfg.get(WATCHDOG_META_KEY) or {})
     was_stalled = bool(watch.get("stalled"))
     watch.update({k: verdict[k] for k in ("stalled", "stalled_reason", "hours_since_last_judgment", "threshold_hours")})

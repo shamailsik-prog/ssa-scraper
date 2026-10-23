@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.signals import worker_process_shutdown, worker_ready
 
 from scraper.config import settings
 
@@ -166,6 +166,20 @@ from scraper.deploy_role import beat_schedule_for_role, deploy_role  # noqa: E40
 
 app.conf.beat_schedule = beat_schedule_for_role(app.conf.beat_schedule)
 logger.info("Celery configured for deploy role %s: queues scraper/login_session/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
+
+
+@worker_process_shutdown.connect
+def _release_pls_harvest_locks_on_shutdown(sender=None, **_kwargs) -> None:
+    """SIGTERM during deploy must not leave search-harvest Redis locks until TTL expires."""
+    hostname = str(getattr(sender, "hostname", "") or "")
+    if not hostname.startswith("scraper-login@"):
+        return
+    from scraper.pls_lock_registry import release_all_registered_sync
+
+    try:
+        release_all_registered_sync()
+    except Exception as exc:
+        logger.warning("could not release PLS harvest locks at shutdown: %s", exc)
 
 
 @worker_ready.connect

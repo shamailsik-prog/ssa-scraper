@@ -222,14 +222,29 @@ def cookie_summary(storage_state: Optional[Dict[str, Any]]) -> List[str]:
 
 # --------------------------------------------------------------------------- lock
 class SessionLock:
-    def __init__(self, source_name: str, redis_client=None, *, max_holders: int = 1):
+    def __init__(
+        self,
+        source_name: str,
+        redis_client=None,
+        *,
+        max_holders: int = 1,
+        holder_identity: bool = False,
+        track_shutdown: bool = False,
+    ):
         holders = 1 if int(max_holders or 1) <= 1 else 2
         self.max_holders = holders
         self.exclusive_key = LOCK_KEY.format(source=source_name)
         self.key = self.exclusive_key if holders == 1 else f"{self.exclusive_key}:holders"
         self._redis = redis_client
         self._own_client = redis_client is None
-        self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
+        self._holder_identity = bool(holder_identity)
+        self._track_shutdown = bool(track_shutdown)
+        if self._holder_identity:
+            from scraper.pls_lock_holder import lock_holder_token
+
+            self._token = lock_holder_token()
+        else:
+            self._token = hashlib.sha256(f"{source_name}{datetime.now(timezone.utc).timestamp()}".encode()).hexdigest()
         self._held = False
 
     async def _client(self):
@@ -253,11 +268,9 @@ class SessionLock:
         redis.call('zremrangebyscore', KEYS[2], '-inf', now)
     """
 
-    async def acquire(self) -> None:
+    async def _try_acquire_once(self) -> bool:
         r = await self._client()
         shared_key = f"{self.exclusive_key}:holders"
-        # The exclusive and shared forms protect the same login. Check and acquire both keys in
-        # one script so a recovery browser cannot overlap a dual-shard harvest browser.
         ok = await r.eval(
             self._SHARED_PRELUDE
             + """
@@ -278,9 +291,57 @@ class SessionLock:
             str(self.max_holders),
             str(LOCK_TTL_SECONDS),
         )
-        if not ok:
-            raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
-        self._held = True
+        return bool(ok)
+
+    async def _clear_exclusive_if_value(self, value: str) -> bool:
+        r = await self._client()
+        ok = await r.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            self.exclusive_key,
+            value,
+        )
+        return int(ok or 0) == 1
+
+    async def acquire(self, *, dead_holder_takeover: bool = False) -> None:
+        # The exclusive and shared forms protect the same login. Check and acquire both keys in
+        # one script so a recovery browser cannot overlap a dual-shard harvest browser.
+        if await self._try_acquire_once():
+            self._held = True
+            self._register_shutdown_track()
+            return
+        if dead_holder_takeover and self.max_holders == 1:
+            from scraper.pls_lock_holder import lock_value_holder_dead
+
+            r = await self._client()
+            raw = await r.get(self.exclusive_key)
+            if raw is not None:
+                current = raw.decode() if isinstance(raw, bytes) else str(raw)
+                if lock_value_holder_dead(current):
+                    await self._clear_exclusive_if_value(current)
+                    if await self._try_acquire_once():
+                        self._held = True
+                        self._register_shutdown_track()
+                        return
+        raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
+
+    def _register_shutdown_track(self) -> None:
+        if not self._track_shutdown or self.max_holders != 1:
+            return
+        from scraper.config import settings
+
+        if not settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
+            return
+        from scraper.pls_lock_registry import register_lock
+
+        register_lock(self.exclusive_key, self._token)
+
+    def _unregister_shutdown_track(self) -> None:
+        if not self._track_shutdown or self.max_holders != 1:
+            return
+        from scraper.pls_lock_registry import unregister_lock
+
+        unregister_lock(self.exclusive_key, self._token)
 
     async def refresh(self) -> None:
         if self._held:
@@ -310,12 +371,14 @@ class SessionLock:
                 )
             if int(ok or 0) != 1:
                 self._held = False
+                self._unregister_shutdown_track()
                 raise SessionLockHeld(f"login-session lock {self.key} is no longer held by this worker")
 
     async def release(self) -> None:
         try:
             if not self._held:
                 return
+            self._unregister_shutdown_track()
             r = await self._client()
             # Compare-and-delete in one step: a lock that expired and was taken by another worker
             # between a read and a delete would otherwise be deleted from under that worker.

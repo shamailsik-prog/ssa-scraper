@@ -329,6 +329,30 @@ class Settings(BaseSettings):
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
     )
+    PLS_LOCK_HOLDER_IDENTITY: bool = Field(
+        default=False,
+        description="When true, PLS search-harvest Redis locks store hostname:pid in the value (for dead-holder takeover and deploy diagnostics).",
+    )
+    PLS_LOCK_DEAD_HOLDER_TAKEOVER: bool = Field(
+        default=False,
+        description="When true, a search-harvest tick may take a slot/query Redis lock whose hostname:pid holder is no longer alive.",
+    )
+    PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN: bool = Field(
+        default=False,
+        description="When true, the login-session worker releases tracked PLS search-harvest Redis locks on process shutdown (SIGTERM).",
+    )
+    PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS: bool = Field(
+        default=False,
+        description="When true, auto_deploy/install releases search-harvest slot and query Redis locks before recreating worker-scraper.",
+    )
+    PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED: bool = Field(
+        default=False,
+        description="When true, compute_stalled may report stalled when search-harvest locks are held but no new PLS staging rows arrive.",
+    )
+    PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES: int = Field(
+        default=15,
+        description="Minutes without a new PakistanLawSite scraper_staging row while search-harvest locks are held before the orphan-lock stall alarm fires.",
+    )
     PLS_CASEID_WALK_ENABLED: bool = Field(
         default=True,
         description="Walk PakistanLawSite judgments by the site's own case serial (year + court letter + serial, e.g. 2026S701); see scraper/pls_caseid.py.",
