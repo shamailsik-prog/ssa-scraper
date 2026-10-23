@@ -475,6 +475,7 @@ class ArchiveMirror:
         drive_cfg["_drive_folder_cache"] = drive_cfg.get("_drive_folder_cache") or {"": drive_cfg.get("folder_id") or drive_cfg.get("root_folder_id") or ""}
 
         pending_work: List[_JudgmentUploadWork] = []
+        index_candidates: Dict[UUID, Tuple[List[str], set[str]]] = {}
         folder_keys: List[str] = []
         for j in judgments:
             if self._time_up():
@@ -489,7 +490,7 @@ class ArchiveMirror:
             for obj in objs:
                 pending_work.append(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))
                 folder_keys.append(obj["key"])
-            index_rows.append(
+            index_candidates[j.id] = (
                 [
                     j.canonical_citation,
                     j.case_title or "",
@@ -499,7 +500,8 @@ class ArchiveMirror:
                     judgment_prefix(j),
                     "original_pdf" if j.has_original_pdf else "rendered_copy",
                     j.full_text_hash or "",
-                ]
+                ],
+                {obj["key"] for obj in objs},
             )
             await self._checkpoint()
 
@@ -524,6 +526,7 @@ class ArchiveMirror:
         failures = 0
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
+        completed_keys: Dict[UUID, set[str]] = {}
         stop = asyncio.Event()
 
         async def run_one(work: _JudgmentUploadWork) -> None:
@@ -533,7 +536,7 @@ class ArchiveMirror:
             await limiter.acquire()
             adapter = await adapter_pool.get()
             try:
-                if self._time_up():
+                if stop.is_set() or self._time_up():
                     stop.set()
                     return
                 async with SessionLocal() as session:
@@ -545,6 +548,8 @@ class ArchiveMirror:
                     await session.commit()
                 async with summary_lock:
                     summary[status if status in summary else "written"] += 1
+                    if status in ("written", "exists"):
+                        completed_keys.setdefault(work.judgment_id, set()).add(work.obj["key"])
             except Exception as exc:
                 async with failure_lock:
                     failures += 1
@@ -559,6 +564,11 @@ class ArchiveMirror:
         tasks = [asyncio.create_task(run_one(work)) for work in pending_work]
         if tasks:
             await asyncio.gather(*tasks)
+        # An index row is evidence of a complete three-object mirror, not merely
+        # an attempted upload. Never index failed, mismatched, or skipped work.
+        for judgment_id, (row, expected_keys) in index_candidates.items():
+            if len(expected_keys) == JUDGMENT_OBJECT_COUNT and expected_keys.issubset(completed_keys.get(judgment_id, set())):
+                index_rows.append(row)
         return failures
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
@@ -797,11 +807,15 @@ class ArchiveMirror:
                     if already >= JUDGMENT_OBJECT_COUNT:
                         continue  # complete on this target: skip the PDF render entirely
                     objs = await self.judgment_objects(j)
+                    complete = len(objs) == JUDGMENT_OBJECT_COUNT
                     for obj in objs:
                         try:
                             status = await self._write(t, adapter, obj, judgment_id=j.id, prov_id=j.source_provenance_id, access_method=j.access_method)
                             summary[status if status in summary else "written"] += 1
+                            if status not in ("written", "exists"):
+                                complete = False
                         except Exception as exc:
+                            complete = False
                             failures += 1
                             summary["failed"] += 1
                             logger.warning("archive %s: %s failed: %s", t.name, obj["key"], exc)
@@ -809,7 +823,8 @@ class ArchiveMirror:
                                 break
                     if failures >= 5:
                         break
-                    index_rows.append([j.canonical_citation, j.case_title or "", j.court_name or "", str(j.year or ""), j.decision_date.isoformat() if j.decision_date else "", judgment_prefix(j), "original_pdf" if j.has_original_pdf else "rendered_copy", j.full_text_hash or ""])
+                    if complete:
+                        index_rows.append([j.canonical_citation, j.case_title or "", j.court_name or "", str(j.year or ""), j.decision_date.isoformat() if j.decision_date else "", judgment_prefix(j), "original_pdf" if j.has_original_pdf else "rendered_copy", j.full_text_hash or ""])
                     await self._checkpoint()
             # _index CSV snapshot (write-once: timestamped file name)
             if index_rows:
