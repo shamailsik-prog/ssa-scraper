@@ -137,6 +137,34 @@ def test_fake_section_typical_max_excludes_candidate():
     assert not is_fake_section_number("16", all_numbers=nums)
 
 
+def test_year_shaped_section_1963_is_fake_not_missing():
+    """R5: enactment year as a section number is fake, not a gap in the section run."""
+    nums = [str(i) for i in range(1, 17)] + ["1963"]
+    assert is_fake_section_number("1963", all_numbers=nums)
+    assert count_fake_sections(nums) >= 1
+    assert count_missing_from_section_run(nums, run_end=16) == 0
+
+
+def test_missing_vs_fake_conflict_prefers_penalizing_fake_and_missing():
+    """R1/R6: high missing from group run and fake year noise — full copy still wins."""
+    group_end = 16
+    trunc = _char_budget_sections(3, 741, may_be_called=False) + [
+        {"section_number": "1963", "section_text": "Section 1963. Gazette year noise."}
+    ]
+    full = _char_budget_sections(16, 7076, may_be_called=True)
+    assert dedupe_keeper_rank(
+        sections=full,
+        text_chars=7076,
+        has_source_url=True,
+        group_run_end=group_end,
+    ) > dedupe_keeper_rank(
+        sections=trunc,
+        text_chars=741,
+        has_source_url=True,
+        group_run_end=group_end,
+    )
+
+
 def test_keeper_kp_aasan_karobar_2025_shape():
     clean = _sections_range(24, may_be_called=True)
     noisy = _sections_range(23, may_be_called=False, fake_years=frozenset({661}))
@@ -242,6 +270,43 @@ async def test_find_duplicate_groups_manual_review_when_keeper_too_short(db):
     assert dry["winners"] == []
     assert dry["losers"] == []
     assert len(dry["manual_review_groups"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_groups_gratuity_truncated_loses_to_full_copy(db):
+    """N6: DB path must pick the 16-section Gratuity-shaped keeper, not the 3-section trunc."""
+    full_id, trunc_id = uuid4(), uuid4()
+    act_name = "The President's Gratuity Act, 1963"
+    db.add(
+        Statute(
+            id=full_id,
+            name=act_name,
+            jurisdiction="Federal",
+            year_enacted=1963,
+            source_name="PakistanCode",
+            source_url="https://example.test/gratuity-full",
+        )
+    )
+    db.add(
+        Statute(
+            id=trunc_id,
+            name="The President's Gratuity Act,1963",
+            jurisdiction="Federal",
+            year_enacted=1963,
+            source_name="PakistanCode",
+        )
+    )
+    await db.commit()
+    for s in _char_budget_sections(16, 7076, may_be_called=True):
+        await _add_section(db, full_id, s["section_number"], s["section_text"])
+    for s in _char_budget_sections(3, 741, may_be_called=False):
+        await _add_section(db, trunc_id, s["section_number"], s["section_text"])
+    await db.commit()
+
+    dry = await find_duplicate_groups(db)
+    assert dry["duplicate_groups"] == 1
+    assert dry["winners"] == [full_id]
+    assert trunc_id in dry["losers"]
 
 
 @pytest.mark.asyncio

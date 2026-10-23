@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import logging
+import posixpath
 import random
 import re
 import time
@@ -53,11 +54,21 @@ def _drive_folder_path_for_key(key: str) -> str:
     return key.rsplit("/", 1)[0]
 
 
+def _drive_folder_cache_lookup_keys(drive_cfg: Dict[str, Any], folder: str) -> List[str]:
+    folder = folder.strip("/")
+    keys = [folder]
+    root = (drive_cfg.get("root") or drive_cfg.get("root_path") or "").strip("/")
+    if root:
+        prefixed = posixpath.join(root, folder)
+        keys.append(prefixed)
+    return keys
+
+
 def _drive_folder_cached(drive_cfg: Dict[str, Any], folder: str) -> bool:
     cache = drive_cfg.get("_drive_folder_cache")
     if not isinstance(cache, dict):
         return False
-    return folder.strip("/") in cache
+    return any(k in cache for k in _drive_folder_cache_lookup_keys(drive_cfg, folder))
 
 
 def _distinct_folder_keys(folder_keys: List[str]) -> List[str]:
@@ -544,7 +555,17 @@ class ArchiveMirror:
             return failures
 
         failed_folders: set[str] = set()
-        folder_ensure_lock = asyncio.Lock()
+        folder_locks: Dict[str, asyncio.Lock] = {}
+        folder_locks_guard = asyncio.Lock()
+
+        async def _folder_ensure_lock(folder: str) -> asyncio.Lock:
+            async with folder_locks_guard:
+                lock = folder_locks.get(folder)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    folder_locks[folder] = lock
+                return lock
+
         preflight_cap = int(settings.MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS)
         if preflight_cap > 0 and folder_keys:
             distinct_keys = _distinct_folder_keys(folder_keys)
@@ -586,7 +607,7 @@ class ArchiveMirror:
                 return False
             if _drive_folder_cached(drive_cfg, folder):
                 return True
-            async with folder_ensure_lock:
+            async with await _folder_ensure_lock(folder):
                 if folder in failed_folders:
                     return False
                 if _drive_folder_cached(drive_cfg, folder):
