@@ -186,7 +186,7 @@ pls_host_confirm_pls_idle_after_local_stop() {
     if ! exists="$(pls_host_redis_cli EXISTS "$key" 2>/dev/null)"; then
       return 1
     fi
-    exists="$(printf '%s' "$exists" | tr -d ' \\r\\n')"
+    exists="$(printf '%s' "$exists" | tr -d ' \r\n')"
     [ "$exists" = 0 ] || return 1
   done
   if ! remaining="$(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null)"; then
@@ -197,7 +197,7 @@ pls_host_confirm_pls_idle_after_local_stop() {
     "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null)"; then
     return 1
   fi
-  jobs="$(printf '%s' "$jobs" | tr -d ' \\r\\n')"
+  jobs="$(printf '%s' "$jobs" | tr -d ' \r\n')"
   [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$jobs" -eq 0 ]
 }
 
@@ -209,7 +209,7 @@ pls_host_force_release_stalled_harvest() {
     return 1
   fi
   if ! pls_host_confirm_pls_idle_after_local_stop; then
-    printf 'pls_host: PLS lock/job ownership or idle state not verified; refusing global lock deletion and job failure marking\\n' >&2
+    printf 'pls_host: PLS lock/job ownership or idle state not verified; refusing global lock deletion and job failure marking\n' >&2
     return 1
   fi
   return 0
