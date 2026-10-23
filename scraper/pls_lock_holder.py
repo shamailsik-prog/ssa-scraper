@@ -6,9 +6,16 @@ import os
 import socket
 from typing import Optional, Tuple
 
+WORKER_ALIVE_KEY_PREFIX = "pls:worker_alive:"
+WORKER_ALIVE_TTL_SECONDS = 60
+
 
 def local_hostname() -> str:
     return socket.gethostname() or "unknown"
+
+
+def worker_alive_redis_key(host: str) -> str:
+    return f"{WORKER_ALIVE_KEY_PREFIX}{host}"
 
 
 def lock_holder_token() -> str:
@@ -34,11 +41,7 @@ def parse_lock_holder(value: str) -> Optional[Tuple[str, int, str]]:
     return host, pid, nonce
 
 
-def holder_process_alive(host: str, pid: int, *, local_host: Optional[str] = None) -> bool:
-    """False when the holder is certainly gone (dead pid on this host, or a different host)."""
-    local = local_host or local_hostname()
-    if host != local:
-        return False
+def local_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
@@ -48,9 +51,22 @@ def holder_process_alive(host: str, pid: int, *, local_host: Optional[str] = Non
     return True
 
 
-def lock_value_holder_dead(value: str, *, local_host: Optional[str] = None) -> bool:
+async def touch_worker_alive(redis_client) -> None:
+    await redis_client.set(worker_alive_redis_key(local_hostname()), "1", ex=WORKER_ALIVE_TTL_SECONDS)
+
+
+async def remote_worker_heartbeat_present(redis_client, host: str) -> bool:
+    if host == local_hostname():
+        return True
+    return bool(await redis_client.exists(worker_alive_redis_key(host)))
+
+
+async def lock_value_holder_stale(redis_client, value: str) -> bool:
+    """True when the holder is certainly gone (local dead pid, or remote host with no fresh heartbeat)."""
     parsed = parse_lock_holder(value)
     if parsed is None:
         return False
     host, pid, _ = parsed
-    return not holder_process_alive(host, pid, local_host=local_host)
+    if host == local_hostname():
+        return not local_pid_alive(pid)
+    return not await remote_worker_heartbeat_present(redis_client, host)

@@ -408,12 +408,7 @@ async def _acquire_harvest_lock(lock: SessionLock) -> None:
 
 
 def _query_lock(row_id, redis_client) -> SessionLock:
-    return SessionLock(
-        f"{SOURCE_NAME}:search_harvest:query:{row_id}",
-        redis_client,
-        max_holders=1,
-        **_harvest_lock_options(),
-    )
+    return SessionLock(f"{SOURCE_NAME}:search_harvest:query:{row_id}", redis_client, max_holders=1, **_harvest_lock_options())
 
 
 async def claim_next_query(
@@ -855,12 +850,7 @@ async def run_search_harvest(
             reasons.append(f"slot {n} is {state or 'missing'}; the other slot takes over its share after {settings.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES} minutes")
             continue
         # one harvest per slot (R3.7): a second tick for the same slot exits at once
-        candidate = SessionLock(
-            f"{SOURCE_NAME}:search_harvest:slot{n}",
-            redis_client,
-            max_holders=1,
-            **_harvest_lock_options(),
-        )
+        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1, **_harvest_lock_options())
         try:
             await _acquire_harvest_lock(candidate)
         except SessionLockHeld:

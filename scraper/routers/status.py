@@ -23,7 +23,6 @@ from scraper.config import settings
 from scraper.database import get_db
 from scraper.pls_grid_health import (
     citation_grid_progress_view,
-    compute_stalled,
     grid_harvest_incomplete,
     grid_rows_remaining,
     grid_saturation_view,

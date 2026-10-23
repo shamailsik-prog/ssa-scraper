@@ -308,21 +308,30 @@ class SessionLock:
         # one script so a recovery browser cannot overlap a dual-shard harvest browser.
         if await self._try_acquire_once():
             self._held = True
+            if self._holder_identity:
+                from scraper.pls_lock_holder import touch_worker_alive
+
+                await touch_worker_alive(await self._client())
             self._register_shutdown_track()
             return
-        if dead_holder_takeover and self.max_holders == 1:
-            from scraper.pls_lock_holder import lock_value_holder_dead
+        from scraper.config import settings as _settings
+
+        if dead_holder_takeover and not _settings.PLS_LOCK_DEAD_HOLDER_TAKEOVER:
+            dead_holder_takeover = False
+        if dead_holder_takeover and self.max_holders == 1 and self._holder_identity:
+            from scraper.pls_lock_holder import lock_value_holder_stale, touch_worker_alive
 
             r = await self._client()
             raw = await r.get(self.exclusive_key)
             if raw is not None:
                 current = raw.decode() if isinstance(raw, bytes) else str(raw)
-                if lock_value_holder_dead(current):
-                    await self._clear_exclusive_if_value(current)
-                    if await self._try_acquire_once():
-                        self._held = True
-                        self._register_shutdown_track()
-                        return
+                if await lock_value_holder_stale(r, current):
+                    if await self._clear_exclusive_if_value(current):
+                        if await self._try_acquire_once():
+                            self._held = True
+                            await touch_worker_alive(r)
+                            self._register_shutdown_track()
+                            return
         raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
 
     def _register_shutdown_track(self) -> None:
@@ -346,6 +355,10 @@ class SessionLock:
     async def refresh(self) -> None:
         if self._held:
             r = await self._client()
+            if self._holder_identity:
+                from scraper.pls_lock_holder import touch_worker_alive
+
+                await touch_worker_alive(r)
             if self.max_holders == 1:
                 ok = await r.eval(
                     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",

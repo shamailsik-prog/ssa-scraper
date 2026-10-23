@@ -371,6 +371,7 @@ def compute_stalled(
     harvest_paused: bool = False,
     search_harvest_locks_held: bool = False,
     last_staging_at: Optional[datetime] = None,
+    search_harvest_lock_held_minutes: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The alarm the audit asked for: stalled == no new judgment for `threshold_hours`, computed from the
     corpus itself (never from cursors, which advance while nothing is produced).
@@ -389,21 +390,6 @@ def compute_stalled(
         last_promotion_at = last_promotion_at.replace(tzinfo=timezone.utc)
     if last_staging_at is not None and last_staging_at.tzinfo is None:
         last_staging_at = last_staging_at.replace(tzinfo=timezone.utc)
-    orphan_minutes = float(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES", 15) or 15)
-    if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)) and search_harvest_locks_held:
-        staging_idle_min = None if last_staging_at is None else max(0.0, (now - last_staging_at).total_seconds() / 60.0)
-        if staging_idle_min is None or staging_idle_min >= orphan_minutes:
-            return {
-                "stalled": True,
-                "stalled_reason": "locks_held_no_staging",
-                "hours_since_last_judgment": None
-                if last_promotion_at is None
-                else round(max(0.0, (now - last_promotion_at).total_seconds() / 3600.0), 2),
-                "threshold_hours": threshold,
-                "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
-                "minutes_since_last_staging": None if staging_idle_min is None else round(staging_idle_min, 2),
-                "lock_orphan_stall_minutes": orphan_minutes,
-            }
     idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)
     stalled = idle_hours is None or idle_hours >= threshold
     reason = None
@@ -414,12 +400,26 @@ def compute_stalled(
             reason = "grid_saturated"
         else:
             reason = "no_output_while_harvesting"
+    orphan_minutes = float(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES", 15) or 15)
+    locks_held_no_staging = False
+    staging_idle_min = None
+    lock_held_minutes = None
+    if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)) and search_harvest_locks_held:
+        staging_idle_min = None if last_staging_at is None else max(0.0, (now - last_staging_at).total_seconds() / 60.0)
+        lock_held_minutes = search_harvest_lock_held_minutes
+        lock_old_enough = lock_held_minutes is not None and lock_held_minutes >= orphan_minutes
+        staging_stale = staging_idle_min is None or staging_idle_min >= orphan_minutes
+        locks_held_no_staging = bool(lock_old_enough and staging_stale)
     return {
         "stalled": bool(stalled),
         "stalled_reason": reason,
         "hours_since_last_judgment": None if idle_hours is None else round(idle_hours, 2),
         "threshold_hours": threshold,
         "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
+        "locks_held_no_staging": locks_held_no_staging,
+        "minutes_since_last_staging": None if staging_idle_min is None else round(staging_idle_min, 2),
+        "search_harvest_lock_held_minutes": None if lock_held_minutes is None else round(lock_held_minutes, 2),
+        "lock_orphan_stall_minutes": orphan_minutes,
     }
 
 
@@ -459,6 +459,7 @@ def pls_stall_verdict_for_config(
     now: Optional[datetime] = None,
     search_harvest_locks_held: bool = False,
     last_staging_at: Optional[datetime] = None,
+    search_harvest_lock_held_minutes: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Live promotion stall verdict from corpus + grid saturation (not the cached pls_stall_watchdog blob)."""
     now = now or datetime.now(timezone.utc)
@@ -471,6 +472,7 @@ def pls_stall_verdict_for_config(
         harvest_paused=paused,
         search_harvest_locks_held=search_harvest_locks_held,
         last_staging_at=last_staging_at,
+        search_harvest_lock_held_minutes=search_harvest_lock_held_minutes,
     )
 
 
@@ -484,8 +486,9 @@ async def pls_stall_verdict_live(
 ) -> Dict[str, Any]:
     locks_held = False
     last_staging = None
+    lock_held_minutes = None
     if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)):
-        locks_held = await pls_search_harvest_redis_locks_held()
+        locks_held, lock_held_minutes = await _search_harvest_lock_scan()
         last_staging = await pls_last_staging_at(db)
     return pls_stall_verdict_for_config(
         cfg,
@@ -494,6 +497,7 @@ async def pls_stall_verdict_live(
         now=now,
         search_harvest_locks_held=locks_held,
         last_staging_at=last_staging,
+        search_harvest_lock_held_minutes=lock_held_minutes,
     )
 
 
@@ -520,20 +524,35 @@ _PLS_LOCK_KEYS = (
 SEARCH_HARVEST_LOCK_PREFIX = "corpus:login_session_lock:PakistanLawSite:search_harvest:"
 
 
-async def pls_search_harvest_redis_locks_held() -> bool:
+async def _search_harvest_lock_scan():
     import redis.asyncio as aioredis
 
+    from scraper.auth.session_manager import LOCK_TTL_SECONDS
+
+    r = aioredis.from_url(settings.REDIS_URL)
+    held = False
+    max_age_min: Optional[float] = None
     try:
-        r = aioredis.from_url(settings.REDIS_URL)
-        try:
-            async for key in r.scan_iter(match=f"{SEARCH_HARVEST_LOCK_PREFIX}*"):
-                if await r.exists(key):
-                    return True
-        finally:
-            await r.aclose()
+        async for key in r.scan_iter(match=f"{SEARCH_HARVEST_LOCK_PREFIX}*"):
+            if not await r.exists(key):
+                continue
+            held = True
+            pttl = int(await r.pttl(key))
+            if pttl > 0:
+                age_sec = max(0.0, (LOCK_TTL_SECONDS * 1000 - pttl) / 1000.0)
+                age_min = age_sec / 60.0
+                max_age_min = age_min if max_age_min is None else max(max_age_min, age_min)
+    finally:
+        await r.aclose()
+    return held, max_age_min
+
+
+async def pls_search_harvest_redis_locks_held() -> bool:
+    try:
+        held, _ = await _search_harvest_lock_scan()
+        return held
     except Exception:
         return False
-    return False
 
 
 async def release_pls_search_harvest_redis_locks() -> int:

@@ -127,8 +127,8 @@ pls_host_release_search_harvest_locks() {
 }
 
 pls_host_force_release_stalled_harvest() {
-  pls_host_release_search_harvest_locks
   docker compose stop worker-scraper 2>/dev/null || true
+  pls_host_release_search_harvest_locks
   docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -v ON_ERROR_STOP=1 -c \
     "UPDATE scraper_jobs SET status = 'failed', finished_at = COALESCE(finished_at, NOW()), error_message = LEFT(COALESCE(error_message, '') || ' auto_deploy: released stalled zero-output job for deploy', 4000) WHERE source_name = 'PakistanLawSite' AND status = 'running';" \
     2>/dev/null || true
