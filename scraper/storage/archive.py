@@ -576,12 +576,16 @@ class ArchiveMirror:
             return True
         return bool(settings.MIRROR_LOGIN_SESSION_ROWS and target.mirror_login_session_rows)
 
-    def _have_subquery(self, t: ArchiveTarget):
-        """Per judgment, how many of its objects target `t` holds. A 'mismatch' object counts as present (it
-        needs a human or the reconcile, not a retry); 'failed' and 'missing' are retried."""
+    def _have_subquery(self, t: ArchiveTarget, *, include_mismatch: bool = True):
+        """Count ledger objects for a judgment on this target.
+
+        Mismatches block automatic write-once retries but are NOT completed
+        mirrors. Completeness and batch reporting must count only 'written'.
+        """
+        statuses = ["written", "mismatch"] if include_mismatch else ["written"]
         return (
             select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
-            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(["written", "mismatch"]), ArchiveObject.judgment_id.isnot(None))
+            .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(statuses), ArchiveObject.judgment_id.isnot(None))
             .group_by(ArchiveObject.judgment_id)
             .subquery()
         )
@@ -612,7 +616,7 @@ class ArchiveMirror:
         """How far behind the corpus this target is (judgments it may hold)."""
         policy = self._policy_clause(t)
         total_q = select(func.count()).select_from(Judgment)
-        have = self._have_subquery(t)
+        have = self._have_subquery(t, include_mismatch=False)
         unmirrored_q = select(func.count()).select_from(Judgment).outerjoin(have, have.c.jid == Judgment.id).where(func.coalesce(have.c.c, 0) < JUDGMENT_OBJECT_COUNT)
         if policy is not None:
             total_q, unmirrored_q = total_q.where(policy), unmirrored_q.where(policy)
@@ -702,7 +706,7 @@ class ArchiveMirror:
         """Judgments the target still lacks: how many, roughly how many bytes, and how long the oldest has waited."""
         from scraper.models import SourceProvenance as Prov
 
-        have = self._have_subquery(t)
+        have = self._have_subquery(t, include_mismatch=False)
         size = func.coalesce(Prov.byte_size, 0) + 2 * func.coalesce(func.octet_length(Judgment.full_text), 0)  # PDF (or rendered copy) + text
         q = (
             select(func.count(), func.coalesce(func.sum(size), 0), func.min(Judgment.promoted_at))
