@@ -413,6 +413,65 @@ async def test_drive_preflight_429_counts_failure_and_continues_other_folders(db
 
 
 @pytest.mark.asyncio
+async def test_drive_preflight_429_then_success_on_retry(db, source, monkeypatch):
+    class _Retry429Adapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self._rate_limit_hits = 1
+
+        def ensure_tree(self, key: str) -> None:
+            if self._rate_limit_hits > 0:
+                self._rate_limit_hits -= 1
+                raise _HttpishError(429, "Too Many Requests", reason="rateLimitExceeded")
+            return None
+
+    adapter = _Retry429Adapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    async def _fast_backoff():
+        return None
+
+    monkeypatch.setattr("scraper.storage.archive.drive_rate_limit_backoff", _fast_backoff)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_one(db, source, "PLD 2024 SC 755")
+    await _drive_target(db)
+    result = await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=1)
+    await db.commit()
+    assert result["summary"]["drive"]["failed"] == 0
+    assert adapter.put_keys
+
+
+@pytest.mark.asyncio
+async def test_drive_preflight_budget_stop_not_counted_as_failure(db, source, monkeypatch):
+    class _SlowSecondFolderAdapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self._folder_count = 0
+
+        def ensure_tree(self, key: str) -> None:
+            self._folder_count += 1
+            if self._folder_count > 1:
+                time.sleep(0.4)
+            return None
+
+    adapter = _SlowSecondFolderAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.08)
+    result = await mirror.mirror_pending(limit=2)
+    await db.commit()
+    assert mirror.out_of_time
+    assert result["summary"]["drive"]["failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_drive_shared_folder_cache_same_dict_for_pool_adapters(db, source, monkeypatch):
     """Mutant F1: every pool adapter must share one _drive_folder_cache dict."""
 
@@ -446,7 +505,7 @@ async def test_drive_shared_folder_cache_same_dict_for_pool_adapters(db, source,
 
 @pytest.mark.asyncio
 async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch):
-    """Mutant F2: serial preflight ensure_tree must complete before upload workers run."""
+    """Each upload ensures its folder (on demand) before put."""
 
     events: List[tuple[str, str]] = []
 
@@ -458,8 +517,10 @@ async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch
             events.append(("put", key))
             return super().put(key, data, content_type)
 
+    shared = _OrderedAdapter()
+
     def factory(_target_type, _config):
-        return _OrderedAdapter()
+        return shared
 
     monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
     await _promote_many(db, source, 2)
@@ -467,9 +528,54 @@ async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch
     await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
     await db.commit()
 
-    first_put = next((i for i, ev in enumerate(events) if ev[0] == "put"), len(events))
-    assert all(ev[0] == "ensure" for ev in events[:first_put])
-    assert any(ev[0] == "put" for ev in events[first_put:])
+    assert any(e[0] == "ensure" for e in events)
+    assert any(e[0] == "put" for e in events)
+    first_put = next(i for i, e in enumerate(events) if e[0] == "put")
+    first_ensure = next(i for i, e in enumerate(events) if e[0] == "ensure")
+    assert first_ensure < first_put
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_large_batch_starts_uploads_within_budget(db, source, monkeypatch):
+    """At c=2, uploads must not wait for serial ensure_tree over the whole backlog slice."""
+
+    class _SlowEnsureAdapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ensure_before_first_put = 0
+            self._saw_put = False
+            self.first_put_at: Optional[float] = None
+
+        def ensure_tree(self, key: str) -> None:
+            if not self._saw_put:
+                self.ensure_before_first_put += 1
+            time.sleep(0.02)
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            if self.first_put_at is None:
+                self.first_put_at = time.monotonic()
+            self._saw_put = True
+            return super().put(key, data, content_type)
+
+    adapter = _SlowEnsureAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS", 0)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    batch = 50
+    await _promote_many(db, source, batch)
+    await _drive_target(db)
+    started = time.monotonic()
+    await ArchiveMirror(db, adapter_factory=factory, deadline=started + 4.0).mirror_pending(limit=batch)
+    await db.commit()
+
+    assert adapter.first_put_at is not None
+    # Serial preflight over 50 folders at 20ms each would be ~1s before any put; on-demand must be much sooner.
+    assert adapter.first_put_at - started < 1.0
+    assert adapter.ensure_before_first_put < batch // 2
+    assert adapter.put_keys
 
 
 @pytest.mark.asyncio
@@ -494,7 +600,7 @@ async def test_drive_adapter_pool_init_failure_records_target_and_continues(db, 
     await db.refresh(t)
     assert upload_adapter.put_keys
     assert result["summary"]["drive"]["failed"] >= 1
-    assert int(t.consecutive_failures or 0) >= 1
+    assert int(t.consecutive_failures or 0) == 1
     assert t.last_error
 
 

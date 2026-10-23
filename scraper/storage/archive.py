@@ -29,7 +29,9 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+_DriveEnsureTreeResult = Literal["ok", "failed", "timed_out"]
 from uuid import UUID
 
 from sqlalchemy import func, select, update
@@ -45,6 +47,30 @@ from scraper.security import is_login_session
 from scraper.storage.adapters import ArchiveAdapter, ArchiveError, ObjectExists, build_adapter
 
 logger = logging.getLogger(__name__)
+
+
+def _drive_folder_path_for_key(key: str) -> str:
+    return key.rsplit("/", 1)[0]
+
+
+def _drive_folder_cached(drive_cfg: Dict[str, Any], folder: str) -> bool:
+    cache = drive_cfg.get("_drive_folder_cache")
+    if not isinstance(cache, dict):
+        return False
+    return folder.strip("/") in cache
+
+
+def _distinct_folder_keys(folder_keys: List[str]) -> List[str]:
+    """One object key per distinct Drive folder path, preserving first-seen order."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for key in folder_keys:
+        folder = _drive_folder_path_for_key(key)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        out.append(key)
+    return out
 
 
 def _aware(d: Optional[datetime]) -> datetime:
@@ -512,25 +538,36 @@ class ArchiveMirror:
             except Exception as exc:
                 failures += 1
                 summary["failed"] += 1
-                t.consecutive_failures += 1
                 t.last_error = f"adapter init: {exc}"[:2000]
                 logger.warning("archive %s: drive adapter pool init failed: %s", t.name, exc)
         if adapter_pool.empty():
             return failures
 
         failed_folders: set[str] = set()
-        if folder_keys:
+        folder_ensure_lock = asyncio.Lock()
+        preflight_cap = int(settings.MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS)
+        if preflight_cap > 0 and folder_keys:
+            distinct_keys = _distinct_folder_keys(folder_keys)
+            preflight_deadline: Optional[float] = None
+            if self.deadline is not None:
+                remaining = max(0.0, self.deadline - time.monotonic())
+                frac = float(settings.MIRROR_DRIVE_PREFLIGHT_BUDGET_FRACTION)
+                if frac > 0 and remaining > 0:
+                    preflight_deadline = time.monotonic() + remaining * frac
             setup_adapter = await adapter_pool.get()
             try:
-                seen_folders: set[str] = set()
-                for key in folder_keys:
+                for key in distinct_keys[:preflight_cap]:
                     if self._time_up():
                         break
-                    folder = key.rsplit("/", 1)[0]
-                    if folder in seen_folders or folder in failed_folders:
+                    if preflight_deadline is not None and time.monotonic() >= preflight_deadline:
+                        break
+                    folder = _drive_folder_path_for_key(key)
+                    if folder in failed_folders or _drive_folder_cached(drive_cfg, folder):
                         continue
-                    seen_folders.add(folder)
-                    if not await self._drive_ensure_tree(setup_adapter, key, limiter=limiter):
+                    ensure_status = await self._drive_ensure_tree(setup_adapter, key, limiter=limiter)
+                    if ensure_status == "timed_out":
+                        break
+                    if ensure_status == "failed":
                         failed_folders.add(folder)
                         failures += 1
                         summary["failed"] += 1
@@ -538,13 +575,33 @@ class ArchiveMirror:
             finally:
                 await adapter_pool.put(setup_adapter)
 
-        if failed_folders:
-            pending_work = [
-                work for work in pending_work if work.obj["key"].rsplit("/", 1)[0] not in failed_folders
-            ]
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
         stop = asyncio.Event()
+
+        async def _ensure_folder_for_upload(adapter: ArchiveAdapter, work: _JudgmentUploadWork) -> bool:
+            nonlocal failures
+            folder = _drive_folder_path_for_key(work.obj["key"])
+            if folder in failed_folders:
+                return False
+            if _drive_folder_cached(drive_cfg, folder):
+                return True
+            async with folder_ensure_lock:
+                if folder in failed_folders:
+                    return False
+                if _drive_folder_cached(drive_cfg, folder):
+                    return True
+                ensure_status = await self._drive_ensure_tree(adapter, work.obj["key"], limiter=limiter)
+                if ensure_status == "timed_out":
+                    return False
+                if ensure_status == "failed":
+                    failed_folders.add(folder)
+                    async with failure_lock:
+                        failures += 1
+                        summary["failed"] += 1
+                    logger.warning("archive %s: ensure_tree failed for %s", t.name, folder)
+                    return False
+            return True
 
         async def run_one(work: _JudgmentUploadWork) -> None:
             nonlocal failures
@@ -555,6 +612,8 @@ class ArchiveMirror:
             try:
                 if self._time_up():
                     stop.set()
+                    return
+                if not await _ensure_folder_for_upload(adapter, work):
                     return
                 async with SessionLocal() as session:
                     try:
@@ -587,22 +646,22 @@ class ArchiveMirror:
         key: str,
         *,
         limiter: _AdaptiveConcurrency,
-    ) -> bool:
+    ) -> _DriveEnsureTreeResult:
         """Create Drive folders with the same retry/backoff policy as uploads."""
         attempts = 0
         while True:
             if self._time_up():
-                return False
+                return "timed_out"
             try:
                 await _retry(asyncio.to_thread, adapter.ensure_tree, key, rate_limit_sensitive=True)
-                return True
+                return "ok"
             except Exception as exc:
                 if is_drive_rate_limited(exc) and attempts < 5:
                     attempts += 1
                     limiter.halve()
                     await drive_rate_limit_backoff()
                     continue
-                return False
+                return "failed"
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
         if not is_login_session(access_method):
