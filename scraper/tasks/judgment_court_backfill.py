@@ -54,12 +54,12 @@ async def find_court_fixes(db: AsyncSession, *, limit: Optional[int] = None) -> 
       AND (
         ({foreign_court_mislabel_sql_predicate()})
         OR (
-          j.court_name ILIKE '%Supreme Court of Pakistan%'
-          AND left(j.full_text, 8000) ~* '(?i)in\\s+the\\s+high\\s+court'
+          j.court_name ILIKE 'Supreme Court of Pakistan'
+          AND left(j.full_text, 400) ~* '(?m)^\\s*IN\\s+THE\\s+HIGH\\s+COURT'
         )
         OR (
           j.court_name ILIKE '%high court%'
-          AND left(j.full_text, 8000) ~* '(?i)in\\s+the\\s+supreme\\s+court\\s+of\\s+pakistan'
+          AND left(j.full_text, 400) ~* '(?m)^\\s*IN\\s+THE\\s+SUPREME\\s+COURT\\s+OF\\s+PAKISTAN'
         )
       )
     ORDER BY j.canonical_citation NULLS LAST
@@ -74,7 +74,7 @@ async def find_court_fixes(db: AsyncSession, *, limit: Optional[int] = None) -> 
         j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
         if j is None:
             continue
-        proposed = proposed_court_name(stored, j.full_text)
+        proposed = proposed_court_name(stored, j.full_text, citation=j.canonical_citation)
         if proposed and proposed != stored:
             fixes.append(
                 {
@@ -95,7 +95,13 @@ async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str,
         j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
         if j is None:
             continue
-        snapshot.append({"id": str(j.id), "court_name": j.court_name or ""})
+        snapshot.append(
+            {
+                "id": str(j.id),
+                "court_name": j.court_name or "",
+                "applied_to": fix["to"],
+            }
+        )
         j.court_name = fix["to"]
         n += 1
     db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
@@ -109,7 +115,7 @@ async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
         for item in json.loads(snap_row.value):
             jid = UUID(item["id"])
             j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
-            if j is not None:
+            if j is not None and (j.court_name or "") == (item.get("applied_to") or ""):
                 j.court_name = item["court_name"] or None
                 restored += 1
         await db.delete(snap_row)

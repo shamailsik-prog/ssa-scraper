@@ -5,9 +5,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from scraper.parsers.case_metadata import judgment_header_slice, parse_pls_header_court
-from scraper.parsers.citation_extractor import court_from_bracket, canonical_court
-from scraper.parsers.judgment_header_court import court_from_judgment_header
+from scraper.parsers.case_metadata import judgment_header_slice
+from scraper.parsers.citation_extractor import canonical_court, court_from_bracket, normalise_citation
 
 _FOREIGN_COUNTRY = re.compile(
     r"(?i)\b(?:india|bangladesh|england|u\.?k\.?|united\s+kingdom|sri\s+lanka)\b",
@@ -20,58 +19,88 @@ _HEADER_FOREIGN_INLINE = re.compile(
     r"india|bangladesh|england|u\.?k|sri\s+lanka)[^\]]*)\s*\]",
 )
 _SC_PAKISTAN = re.compile(r"(?i)^supreme\s+court\s+of\s+pakistan$")
-_PLS_COURT_LINE = re.compile(
-    r"(?im)\b(?:IN\s+THE\s+)?(SUPREME\s+COURT\s+OF\s+PAKISTAN|"
-    r"LAHORE\s+HIGH\s+COURT|SINDH\s+HIGH\s+COURT|PESHAWAR\s+HIGH\s+COURT|"
-    r"BALOCHISTAN\s+HIGH\s+COURT|ISLAMABAD\s+HIGH\s+COURT|"
-    r"FEDERAL\s+SHARIAT\s+COURT|FEDERAL\s+CONSTITUTIONAL\s+COURT)\b",
+_HEADER_TOP_HC_BRACKET = re.compile(
+    r"(?im)^\s*\[\s*((?:high\s+court|lahore|peshawar|sindh|balochistan|islamabad)[^\]]*)\s*\]\s*$",
 )
+_HEADER_TOP_IN_THE_HC = re.compile(
+    r"(?im)^\s*IN\s+THE\s+(HIGH\s+COURT[^\n,]{0,100})",
+)
+_HEADER_TOP_IN_THE_SC_PAK = re.compile(
+    r"(?im)^\s*IN\s+THE\s+SUPREME\s+COURT\s+OF\s+PAKISTAN\b",
+)
+_PLD_SC_SCMR = re.compile(
+    r"(?i)^(?:PLD\s+\d{4}\s+SC\b|SCMR\s+\d{4}|\d{4}\s+SCMR\b)",
+)
+
+
 def is_default_supreme_court_of_pakistan(court: Optional[str]) -> bool:
     return bool(court and _SC_PAKISTAN.match(re.sub(r"\s+", " ", court.strip())))
 
 
-def _title_case_court(label: str) -> str:
+def citation_is_pld_sc_or_scmr(citation: Optional[str]) -> bool:
+    norm = normalise_citation(citation or "") or (citation or "").strip()
+    return bool(norm and _PLD_SC_SCMR.match(norm))
+
+
+def _header_top_block(text: str, *, max_lines: int = 3) -> str:
+    header = judgment_header_slice(text)
+    return "\n".join(header.splitlines()[:max_lines])
+
+
+def _normalize_foreign_display(label: str) -> str:
     cleaned = re.sub(r"\s+", " ", label.strip(" .,-"))
-    if not cleaned:
-        return cleaned
-    if _FOREIGN_COUNTRY.search(cleaned):
-        return cleaned[:255]
-    known = canonical_court(cleaned)
-    return known or cleaned[:255]
+    low = cleaned.lower()
+    if "supreme" in low and "india" in low:
+        return "Supreme Court of India"
+    if "supreme" in low and re.search(r"(?:u\.?k|england|united\s+kingdom)", low):
+        return "Supreme Court of UK"
+    if "supreme" in low and re.search(r"azad|jammu|kashmir", low):
+        return "Azad Jammu and Kashmir Supreme Court"
+    cleaned = re.sub(r"\s*\([^)]*\)\s*", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()[:255]
+
+
+def _accepted_court_name(label: str) -> Optional[str]:
+    if not label or not label.strip():
+        return None
+    low = label.lower()
+    if "supreme" in low and re.search(r"aj&?k|azad|jammu|kashmir", low):
+        return "Azad Jammu and Kashmir Supreme Court"
+    normalized = _normalize_foreign_display(label)
+    if _FOREIGN_COUNTRY.search(normalized):
+        return normalized
+    known = canonical_court(normalized)
+    if known:
+        return known
+    if re.search(r"(?i)\bhigh\s+court\b", normalized):
+        known_hc = canonical_court(normalized)
+        return known_hc
+    if _SC_PAKISTAN.match(normalized):
+        return "Supreme Court of Pakistan"
+    return None
+
+
+def foreign_court_from_first_300_chars(text: Optional[str]) -> Optional[str]:
+    """Foreign Supreme/High Court named in the first 300 characters only."""
+    if not text:
+        return None
+    head300 = text[:300]
+    m = _HEADER_FOREIGN_INLINE.search(head300)
+    if m and _FOREIGN_COUNTRY.search(m.group(1)):
+        return _accepted_court_name(m.group(1))
+    for line in head300.splitlines()[:8]:
+        bm = _HEADER_FOREIGN_BRACKET.match(line)
+        if bm and (
+            _FOREIGN_COUNTRY.search(bm.group(1))
+            or re.search(r"(?i)aj&?k|azad|jammu|kashmir", bm.group(1))
+        ):
+            return _accepted_court_name(bm.group(1))
+    return None
 
 
 def court_from_pls_header_block(text: Optional[str]) -> Optional[str]:
-    """Court from the judgment header (bracket line, IN THE line, or foreign bracket in first ~300 chars)."""
-    if not text:
-        return None
-    head300 = (text or "")[:300]
-    m = _HEADER_FOREIGN_INLINE.search(head300)
-    if m and _FOREIGN_COUNTRY.search(m.group(1)):
-        return _title_case_court(m.group(1))
-    header = judgment_header_slice(text)
-    for line in header.splitlines()[:8]:
-        bm = _HEADER_FOREIGN_BRACKET.match(line)
-        if bm and _FOREIGN_COUNTRY.search(bm.group(1)):
-            return _title_case_court(bm.group(1))
-    pak_line = _PLS_COURT_LINE.search(header)
-    if pak_line:
-        name = re.sub(r"\s+", " ", pak_line.group(1)).strip()
-        if name.upper() == "SUPREME COURT OF PAKISTAN":
-            return "Supreme Court of Pakistan"
-        return name.title()
-    in_the = court_from_judgment_header(text)
-    if in_the and _FOREIGN_COUNTRY.search(in_the):
-        return _title_case_court(in_the)
-    if in_the and re.search(r"(?i)\bhigh\s+court\b", in_the):
-        return _title_case_court(in_the)
-    parsed = parse_pls_header_court(text)
-    if parsed and _FOREIGN_COUNTRY.search(parsed):
-        return _title_case_court(parsed)
-    if in_the:
-        return _title_case_court(in_the)
-    if parsed:
-        return _title_case_court(parsed)
-    return None
+    """Foreign heading court only (no Pakistani court-line or body-text fallbacks)."""
+    return foreign_court_from_first_300_chars(text)
 
 
 def court_from_pls_bracket_after_citation(text: str, citation_end: Optional[int]) -> Optional[str]:
@@ -79,7 +108,7 @@ def court_from_pls_bracket_after_citation(text: str, citation_end: Optional[int]
         return None
     bracket = court_from_bracket(text, citation_end)
     if bracket and _FOREIGN_COUNTRY.search(bracket):
-        return _title_case_court(bracket)
+        return _accepted_court_name(bracket)
     return None
 
 
@@ -89,50 +118,69 @@ def resolve_pls_court(
     *,
     citation_end: Optional[int] = None,
 ) -> Optional[str]:
-    """Prefer header/bracket foreign court over a grid default of Supreme Court of Pakistan."""
-    header_court = court_from_pls_header_block(text)
-    bracket_court = court_from_pls_bracket_after_citation(text or "", citation_end) if text else None
-    text_court = bracket_court or header_court
-    if text_court and is_default_supreme_court_of_pakistan(row_court):
-        if _FOREIGN_COUNTRY.search(text_court) or (
-            header_court and not is_default_supreme_court_of_pakistan(header_court)
-        ):
-            return text_court
-    if text_court and row_court and not is_default_supreme_court_of_pakistan(row_court):
+    """Override grid SC Pakistan only when a foreign court is named in the heading window."""
+    if not is_default_supreme_court_of_pakistan(row_court):
         return row_court
-    if row_court:
-        return row_court
-    return text_court
+    foreign = foreign_court_from_first_300_chars(text)
+    if foreign:
+        return foreign
+    bracket = court_from_pls_bracket_after_citation(text or "", citation_end) if text else None
+    if bracket:
+        return bracket
+    return row_court
 
 
-def sc_hc_mislabel_fix(stored_court: Optional[str], text: Optional[str]) -> Optional[str]:
-    """When stored court is SC Pakistan but the header names a High Court (or vice versa), return header court."""
-    if not text or not stored_court:
-        return None
-    header = court_from_judgment_header(text) or court_from_pls_header_block(text)
-    if not header:
-        return None
-    stored_low = stored_court.lower()
-    header_low = header.lower()
-    if "supreme court" in stored_low and "high court" in header_low and "pakistan" in stored_low:
-        return _title_case_court(header)
-    if "high court" in stored_low and "supreme court" in header_low and "pakistan" in header_low:
-        return _title_case_court(header)
+def _header_sc_hc_swap_court(text: str) -> Optional[str]:
+    """SC↔HC swap signal from the first three header lines only (not appeal-from or body text)."""
+    block = _header_top_block(text, max_lines=3)
+    for line in block.splitlines():
+        bm = _HEADER_TOP_HC_BRACKET.match(line)
+        if bm:
+            accepted = _accepted_court_name(bm.group(1))
+            if accepted and re.search(r"(?i)\bhigh\s+court\b", accepted):
+                return accepted
+    m = _HEADER_TOP_IN_THE_HC.search(block)
+    if m:
+        return _accepted_court_name(m.group(1))
+    if _HEADER_TOP_IN_THE_SC_PAK.search(block):
+        return "Supreme Court of Pakistan"
     return None
 
 
-def proposed_court_name(stored_court: Optional[str], text: Optional[str], *, citation_end: Optional[int] = None) -> Optional[str]:
-    """Single proposed court_name for backfill (foreign mislabel + SC/HC swap)."""
-    swap = sc_hc_mislabel_fix(stored_court, text)
+def sc_hc_mislabel_fix(
+    stored_court: Optional[str],
+    text: Optional[str],
+    *,
+    citation: Optional[str] = None,
+) -> Optional[str]:
+    if not text or not stored_court or citation_is_pld_sc_or_scmr(citation):
+        return None
+    header_court = _header_sc_hc_swap_court(text)
+    if not header_court:
+        return None
+    stored_low = stored_court.lower()
+    header_low = header_court.lower()
+    if "supreme court" in stored_low and "pakistan" in stored_low:
+        return header_court
+    if "high court" in stored_low and header_court == "Supreme Court of Pakistan":
+        return header_court
+    return None
+
+
+def proposed_court_name(
+    stored_court: Optional[str],
+    text: Optional[str],
+    *,
+    citation: Optional[str] = None,
+    citation_end: Optional[int] = None,
+) -> Optional[str]:
+    swap = sc_hc_mislabel_fix(stored_court, text, citation=citation)
     if swap and swap != stored_court:
         return swap
-    resolved = resolve_pls_court(stored_court, text, citation_end=citation_end)
-    if resolved and resolved != stored_court:
-        return resolved
     if is_default_supreme_court_of_pakistan(stored_court):
-        header = court_from_pls_header_block(text)
-        if header and header != stored_court and not is_default_supreme_court_of_pakistan(header):
-            return header
+        resolved = resolve_pls_court(stored_court, text, citation_end=citation_end)
+        if resolved and resolved != stored_court:
+            return resolved
     return None
 
 

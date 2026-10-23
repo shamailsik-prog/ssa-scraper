@@ -388,8 +388,8 @@ class Settings(BaseSettings):
         description="Default on. Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header). Set SSA_COURT_HEADER_GUARD=0 or false to disable.",
     )
     SSA_PLS_COURT_RESOLUTION: bool = Field(
-        default=True,
-        description="Default on. Prefer foreign or header bracket court over grid default Supreme Court of Pakistan on PLS pages. Set SSA_PLS_COURT_RESOLUTION=0 or false to disable.",
+        default=False,
+        description="When on, prefer foreign heading court over grid default Supreme Court of Pakistan on PLS pages. Set SSA_PLS_COURT_RESOLUTION=1 or true to enable.",
     )
     SSA_PLD_CITATION_RELABEL: bool = Field(
         default=True,
