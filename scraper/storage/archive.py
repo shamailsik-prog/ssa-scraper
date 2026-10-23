@@ -773,8 +773,11 @@ class ArchiveMirror:
         if not targets:
             return {"targets": 0, "note": "no archive targets configured"}
         newest = (await self.db.execute(select(Judgment).order_by(Judgment.promoted_at.desc()).limit(limit))).scalars().all()
-        index_rows: List[List[str]] = []
         for t in targets:
+            # An index is evidence for this target only. Reusing a prior target's
+            # rows can disclose login-session metadata to a target whose policy
+            # forbids those judgments and falsely advertise successful mirrors.
+            index_rows: List[List[str]] = []
             summary = self.summary.setdefault(t.name, {"written": 0, "exists": 0, "failed": 0, "skipped_policy": 0, "mismatch": 0, "backlog": 0})
             go, cutoff = await self.batch_gate(t)
             self._gate[t.id] = go
