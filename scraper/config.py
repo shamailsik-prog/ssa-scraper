@@ -188,6 +188,7 @@ class Settings(BaseSettings):
     MIRROR_DRIVE_CONCURRENCY: int = Field(
         default=1,
         ge=1,
+        le=16,
         description="Within one mirror_pending run, upload up to this many Google Drive objects concurrently (1 = sequential, legacy behaviour).",
     )
     RECONCILE_RUN_BUDGET_SECONDS: int = Field(default=600, description="A reconcile_storage run stops checking objects after this many seconds; the next run carries on from the least recently verified.")

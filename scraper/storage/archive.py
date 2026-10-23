@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -102,18 +102,27 @@ JUDGMENT_OBJECT_COUNT = 3  # document (original or rendered copy) + judgment.txt
 OBJECTS_CACHE_MAX = 600  # judgments whose built objects one run keeps for the next target (a slice is 500)
 
 
-def is_drive_rate_limited(exc: BaseException) -> bool:
-    """True for HTTP 429 or Drive 403 rateLimitExceeded."""
-    msg = str(exc).lower()
-    if "429" in msg or "ratelimitexceeded" in msg.replace(" ", "").replace("_", ""):
-        return True
-    if "403" in msg and "ratelimit" in msg:
-        return True
+def _http_status_from_exc(exc: BaseException) -> Optional[int]:
     resp = getattr(exc, "resp", None)
     status = getattr(resp, "status", None)
+    if status is not None:
+        return int(status)
+    code = getattr(exc, "status_code", None)
+    if code is not None:
+        return int(code)
+    return None
+
+
+def is_drive_rate_limited(exc: BaseException) -> bool:
+    """True for HTTP 429 or Drive 403 with rateLimitExceeded (not arbitrary '429' in text)."""
+    status = _http_status_from_exc(exc)
     if status == 429:
         return True
-    if status == 403 and "ratelimitexceeded" in msg.replace(" ", "").lower():
+    reason = str(getattr(exc, "reason", "") or "").lower().replace(" ", "").replace("_", "")
+    if reason == "ratelimitexceeded":
+        return True
+    msg_norm = str(exc).lower().replace(" ", "").replace("_", "")
+    if status == 403 and "ratelimitexceeded" in msg_norm:
         return True
     return False
 
@@ -353,8 +362,14 @@ class ArchiveMirror:
             ledger.content_hash = h
             ledger.byte_size = stored_size or len(data)
         if status == "written" and stored_size is None:
-            target.objects_written += 1
-            target.bytes_written += len(data)
+            await db.execute(
+                update(ArchiveTarget)
+                .where(ArchiveTarget.id == target.id)
+                .values(
+                    objects_written=ArchiveTarget.objects_written + 1,
+                    bytes_written=ArchiveTarget.bytes_written + len(data),
+                )
+            )
         await db.flush()
         return status
 
@@ -461,12 +476,16 @@ class ArchiveMirror:
 
         async def run_one(work: _JudgmentUploadWork) -> None:
             nonlocal failures
-            if stop.is_set():
+            if stop.is_set() or self._time_up():
                 return
             await limiter.acquire()
             try:
                 async with SessionLocal() as session:
-                    status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
+                    try:
+                        status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
+                    except Exception:
+                        await session.commit()
+                        raise
                     await session.commit()
                 async with summary_lock:
                     summary[status if status in summary else "written"] += 1
@@ -721,10 +740,11 @@ class ArchiveMirror:
             failures = 0
             target_timed_out = False
             touched = False
-            drive_concurrency = int(settings.MIRROR_DRIVE_CONCURRENCY) if t.target_type == "google_drive" else 1
+            drive_concurrency = min(16, max(1, int(settings.MIRROR_DRIVE_CONCURRENCY))) if t.target_type == "google_drive" else 1
             if t.target_type == "google_drive" and drive_concurrency > 1:
                 touched = bool(judgments)
                 failures = await self._mirror_drive_uploads(t, adapter, judgments, summary, index_rows, concurrency=drive_concurrency)
+                await self.db.refresh(t)
                 target_timed_out = self.out_of_time
             else:
                 for j in judgments:
