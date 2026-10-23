@@ -17,9 +17,11 @@ from scraper.statute_quality.dedupe import (
     count_missing_from_section_run,
     dedupe_canonical_name_key,
     dedupe_keeper_rank,
+    group_substantive_run_end,
     is_fake_section_number,
     keeper_below_char_fraction,
     max_real_section_run_end,
+    substantive_max_section_run_end,
 )
 from scraper.tasks.statute_quality import _dedupe_group_key, find_duplicate_groups
 from tests.test_statute_quality_cli import _add_section
@@ -53,7 +55,7 @@ def _sections_range(
 def _rank_winner(a: list[dict[str, str]], b: list[dict[str, str]], *, has_url_a: bool = True, has_url_b: bool = True) -> str:
     nums_a = [str(s["section_number"]) for s in a]
     nums_b = [str(s["section_number"]) for s in b]
-    group_end = max_real_section_run_end(nums_a, nums_b)
+    group_end = group_substantive_run_end([a, b])
     ra = dedupe_keeper_rank(
         sections=a,
         text_chars=sum(len(s["section_text"]) for s in a),
@@ -137,6 +139,34 @@ def test_fake_section_typical_max_excludes_candidate():
     assert not is_fake_section_number("16", all_numbers=nums)
 
 
+def test_year_shaped_section_1963_is_fake_not_missing():
+    """R5: enactment year as a section number is fake, not a gap in the section run."""
+    nums = [str(i) for i in range(1, 17)] + ["1963"]
+    assert is_fake_section_number("1963", all_numbers=nums)
+    assert count_fake_sections(nums) >= 1
+    assert count_missing_from_section_run(nums, run_end=16) == 0
+
+
+def test_missing_vs_fake_conflict_prefers_penalizing_fake_and_missing():
+    """R1/R6: high missing from group run and fake year noise — full copy still wins."""
+    group_end = 16
+    trunc = _char_budget_sections(3, 741, may_be_called=False) + [
+        {"section_number": "1963", "section_text": "Section 1963. Gazette year noise."}
+    ]
+    full = _char_budget_sections(16, 7076, may_be_called=True)
+    assert dedupe_keeper_rank(
+        sections=full,
+        text_chars=7076,
+        has_source_url=True,
+        group_run_end=group_end,
+    ) > dedupe_keeper_rank(
+        sections=trunc,
+        text_chars=741,
+        has_source_url=True,
+        group_run_end=group_end,
+    )
+
+
 def test_keeper_kp_aasan_karobar_2025_shape():
     clean = _sections_range(24, may_be_called=True)
     noisy = _sections_range(23, may_be_called=False, fake_years=frozenset({661}))
@@ -152,6 +182,49 @@ def test_keeper_kp_judicial_officers_welfare_fund_shape():
 def test_keeper_kp_provincial_assembly_powers_2026_shape():
     clean = _sections_range(8, may_be_called=True)
     noisy = _sections_range(7, may_be_called=False, fake_years=frozenset({2026}))
+    assert _rank_winner(clean, noisy) == "a"
+
+
+def _stub_tail_sections(start: int, count: int) -> list[dict[str, str]]:
+    return [{"section_number": str(start + i), "section_text": f"Section {start + i}. Tr."} for i in range(count)]
+
+
+def test_keeper_ajk_government_act_1964_prefers_fuller_copy():
+    """Free-sites: 19-section stub tail must not beat 17-section fuller text (~6204 vs ~7887 chars)."""
+    thinner = _char_budget_sections(17, 6204, may_be_called=True) + _stub_tail_sections(18, 2)
+    fuller = _char_budget_sections(17, 7887, may_be_called=True)
+    assert substantive_max_section_run_end(thinner) == substantive_max_section_run_end(fuller) == 17
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_finance_act_2017_prefers_more_sections():
+    thinner = _char_budget_sections(3, 3411, may_be_called=True)
+    fuller = _char_budget_sections(4, 3428, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_finance_act_2014_prefers_more_sections():
+    thinner = _char_budget_sections(3, 3241, may_be_called=True)
+    fuller = _char_budget_sections(4, 3257, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_keeper_ajk_speakers_salary_act_1971_prefers_fuller_copy():
+    thinner = _char_budget_sections(3, 1498, may_be_called=True)
+    fuller = _char_budget_sections(4, 2024, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_r5_r6_substantive_run_end_ignores_fake_year_section_1122():
+    """AJK Rescue 1122 / Industrial Relations 2017 shape: long s.1122 must not set group run end."""
+    clean = _sections_range(12, may_be_called=True)
+    noisy = _sections_range(12, may_be_called=True) + [
+        {
+            "section_number": "1122",
+            "section_text": "Section 1122. " + ("x" * 80),
+        }
+    ]
+    assert substantive_max_section_run_end(noisy) == substantive_max_section_run_end(clean) == 12
     assert _rank_winner(clean, noisy) == "a"
 
 
@@ -182,7 +255,16 @@ def test_rank_step_r3_may_be_called():
     )
 
 
-def test_rank_step_r4_text_chars():
+def test_rank_step_r4_substantive_section_count():
+    a = _sections_range(4, may_be_called=True, truncate_section=4)
+    b = _sections_range(4, may_be_called=True)
+    end = 4
+    assert dedupe_keeper_rank(sections=b, text_chars=1000, has_source_url=True, group_run_end=end) > dedupe_keeper_rank(
+        sections=a, text_chars=1000, has_source_url=True, group_run_end=end
+    )
+
+
+def test_rank_step_r5_text_chars():
     a = _sections_range(4, may_be_called=True)
     b = _sections_range(4, may_be_called=True)
     end = 4
@@ -191,7 +273,7 @@ def test_rank_step_r4_text_chars():
     )
 
 
-def test_rank_step_r5_source_url():
+def test_rank_step_r6_source_url():
     a = _sections_range(4, may_be_called=True)
     end = 4
     assert dedupe_keeper_rank(sections=a, text_chars=1000, has_source_url=True, group_run_end=end) > dedupe_keeper_rank(
@@ -199,9 +281,41 @@ def test_rank_step_r5_source_url():
     )
 
 
-def test_rank_step_r6_char_fraction_guard():
+def test_rank_step_r7_char_fraction_guard():
     assert keeper_below_char_fraction(600, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
     assert not keeper_below_char_fraction(800, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
+
+
+@pytest.mark.asyncio
+async def test_n6_find_duplicate_groups_group_run_end_when_substantive_count_tied(db):
+    """Truncated copy with equal substantive sections still loses when group run end exposes gaps."""
+    trunc_id, full_id = uuid4(), uuid4()
+    for sid, name in (
+        (trunc_id, "The Group Run End Act, 2017"),
+        (full_id, "The Group Run End Act,2017"),
+    ):
+        db.add(
+            Statute(
+                id=sid,
+                name=name,
+                jurisdiction="AJ&K",
+                year_enacted=2017,
+                source_name="PakistanCode",
+                source_url="https://example.test/full" if sid == full_id else None,
+            )
+        )
+    await db.commit()
+    trunc_secs = _char_budget_sections(8, 4000, may_be_called=False)
+    full_secs = _char_budget_sections(12, 8000, may_be_called=True)
+    for s in trunc_secs:
+        await _add_section(db, trunc_id, s["section_number"], s["section_text"])
+    for s in full_secs:
+        await _add_section(db, full_id, s["section_number"], s["section_text"])
+    await db.commit()
+    dry = await find_duplicate_groups(db)
+    assert dry["duplicate_groups"] == 1
+    assert dry["winners"] == [full_id]
+    assert trunc_id in dry["losers"]
 
 
 @pytest.mark.asyncio
@@ -242,6 +356,43 @@ async def test_find_duplicate_groups_manual_review_when_keeper_too_short(db):
     assert dry["winners"] == []
     assert dry["losers"] == []
     assert len(dry["manual_review_groups"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_groups_gratuity_truncated_loses_to_full_copy(db):
+    """N6: DB path must pick the 16-section Gratuity-shaped keeper, not the 3-section trunc."""
+    full_id, trunc_id = uuid4(), uuid4()
+    act_name = "The President's Gratuity Act, 1963"
+    db.add(
+        Statute(
+            id=full_id,
+            name=act_name,
+            jurisdiction="Federal",
+            year_enacted=1963,
+            source_name="PakistanCode",
+            source_url="https://example.test/gratuity-full",
+        )
+    )
+    db.add(
+        Statute(
+            id=trunc_id,
+            name="The President's Gratuity Act,1963",
+            jurisdiction="Federal",
+            year_enacted=1963,
+            source_name="PakistanCode",
+        )
+    )
+    await db.commit()
+    for s in _char_budget_sections(16, 7076, may_be_called=True):
+        await _add_section(db, full_id, s["section_number"], s["section_text"])
+    for s in _char_budget_sections(3, 741, may_be_called=False):
+        await _add_section(db, trunc_id, s["section_number"], s["section_text"])
+    await db.commit()
+
+    dry = await find_duplicate_groups(db)
+    assert dry["duplicate_groups"] == 1
+    assert dry["winners"] == [full_id]
+    assert trunc_id in dry["losers"]
 
 
 @pytest.mark.asyncio

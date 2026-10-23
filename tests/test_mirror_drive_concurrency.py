@@ -14,6 +14,8 @@ from scraper.models import ArchiveObject, ArchiveTarget, Judgment
 from scraper.storage.archive import (
     ArchiveMirror,
     _AdaptiveConcurrency,
+    _drive_folder_cache_lookup_keys,
+    _drive_folder_cached,
     is_drive_rate_limited,
 )
 from tests.test_public_security_pdf_archive import _promote_one
@@ -573,7 +575,7 @@ async def test_drive_concurrency_large_batch_starts_uploads_within_budget(db, so
 
     assert adapter.first_put_at is not None
     # Serial preflight over 50 folders at 20ms each would be ~1s before any put; on-demand must be much sooner.
-    assert adapter.first_put_at - started < 1.0
+    assert adapter.first_put_at - started < 0.5
     assert adapter.ensure_before_first_put < batch // 2
     assert adapter.put_keys
 
@@ -602,6 +604,161 @@ async def test_drive_adapter_pool_init_failure_records_target_and_continues(db, 
     assert result["summary"]["drive"]["failed"] >= 1
     assert int(t.consecutive_failures or 0) == 1
     assert t.last_error
+
+
+def test_drive_folder_cached_honors_archive_root_prefix():
+    cache = {"SSA/Citations/PLD/2024/SC_700": "folder-id"}
+    cfg = {"root_path": "SSA", "_drive_folder_cache": cache}
+    assert _drive_folder_cached(cfg, "Citations/PLD/2024/SC_700")
+    assert not _drive_folder_cached(cfg, "Citations/PLD/2024/SC_701")
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_c4_no_duplicate_folder_ensure_non_atomic(db, source, monkeypatch):
+    """L1: per-folder locks must prevent double ensure_tree for the same folder at c=4."""
+    from collections import defaultdict
+
+    pool_adapter: Dict[str, _TrackingAdapter] = {}
+
+    class _NonAtomicDriveAdapter(_TrackingAdapter):
+        def __init__(self, folder_cache: Dict[str, str], drive_cfg: Dict[str, Any]) -> None:
+            super().__init__()
+            self._folder_cache = folder_cache
+            self._drive_cfg = drive_cfg
+            self.folder_ensure_starts: Dict[str, int] = defaultdict(int)
+            self._ensure_active: Dict[str, int] = defaultdict(int)
+            self.max_parallel_ensure_folders = 0
+            self._meta = threading.Lock()
+
+        def ensure_tree(self, key: str) -> None:
+            folder = key.rsplit("/", 1)[0]
+            with self._meta:
+                self.folder_ensure_starts[folder] += 1
+                self._ensure_active[folder] += 1
+                parallel = sum(1 for n in self._ensure_active.values() if n > 0)
+                self.max_parallel_ensure_folders = max(self.max_parallel_ensure_folders, parallel)
+            try:
+                time.sleep(0.025)
+                for ck in _drive_folder_cache_lookup_keys(self._drive_cfg, folder):
+                    self._folder_cache.setdefault(ck, f"id-{ck}")
+            finally:
+                with self._meta:
+                    self._ensure_active[folder] -= 1
+
+    def factory(_target_type, config):
+        cache = config.get("_drive_folder_cache")
+        if not isinstance(cache, dict):
+            return _TrackingAdapter()
+        if "ad" not in pool_adapter:
+            pool_adapter["ad"] = _NonAtomicDriveAdapter(cache, config)
+        return pool_adapter["ad"]
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS", 0)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 8)
+    await _drive_target(db)
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=8)
+    await db.commit()
+
+    ad = pool_adapter["ad"]
+    assert ad.folder_ensure_starts
+    assert all(n == 1 for n in ad.folder_ensure_starts.values())
+    assert ad.max_parallel_ensure_folders >= 2
+
+
+@pytest.mark.asyncio
+async def test_drive_per_upload_ensure_budget_stop_not_failure(db, source, monkeypatch):
+    class _SlowEnsureAdapter(_TrackingAdapter):
+        def ensure_tree(self, key: str) -> None:
+            time.sleep(0.15)
+
+    adapter = _SlowEnsureAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS", 0)
+    await _promote_many(db, source, 4)
+    await _drive_target(db)
+    result = await ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.12).mirror_pending(limit=4)
+    await db.commit()
+    assert result["summary"]["drive"]["failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_drive_warmup_preflight_respects_folder_and_time_caps(db, source, monkeypatch):
+    events: List[tuple[str, float]] = []
+
+    class _CountEnsureAdapter(_TrackingAdapter):
+        def __init__(self, folder_cache: Dict[str, str], drive_cfg: Dict[str, Any]) -> None:
+            super().__init__()
+            self._folder_cache = folder_cache
+            self._drive_cfg = drive_cfg
+
+        def ensure_tree(self, key: str) -> None:
+            events.append(("ensure", time.monotonic()))
+            time.sleep(0.05)
+            folder = key.rsplit("/", 1)[0]
+            for ck in _drive_folder_cache_lookup_keys(self._drive_cfg, folder):
+                self._folder_cache.setdefault(ck, f"id-{ck}")
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            events.append(("put", time.monotonic()))
+            return super().put(key, data, content_type)
+
+    holder: Dict[str, _CountEnsureAdapter] = {}
+
+    def factory(_target_type, config):
+        cache = config.get("_drive_folder_cache")
+        if not isinstance(cache, dict):
+            return _TrackingAdapter()
+        if "ad" not in holder:
+            holder["ad"] = _CountEnsureAdapter(cache, config)
+        return holder["ad"]
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS", 3)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_PREFLIGHT_BUDGET_FRACTION", 0.15)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_many(db, source, 12)
+    await _drive_target(db)
+    started = time.monotonic()
+    await ArchiveMirror(db, adapter_factory=factory, deadline=started + 2.0).mirror_pending(limit=12)
+    await db.commit()
+    first_put = next((i for i, ev in enumerate(events) if ev[0] == "put"), len(events))
+    preflight_ensures = sum(1 for ev in events[:first_put] if ev[0] == "ensure")
+    assert preflight_ensures <= 3
+    assert holder["ad"].put_keys
+
+
+@pytest.mark.asyncio
+async def test_drive_failed_folder_skipped_but_other_folders_upload(db, source, monkeypatch):
+    fail_marker = "PLD_2024_SC_800"
+
+    class _PreflightAdapter(_TrackingAdapter):
+        def ensure_tree(self, key: str) -> None:
+            if fail_marker in key:
+                raise _HttpishError(429, "Too Many Requests", reason="rateLimitExceeded")
+            return None
+
+    adapter = _PreflightAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    async def _fast_backoff():
+        return None
+
+    monkeypatch.setattr("scraper.storage.archive.drive_rate_limit_backoff", _fast_backoff)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_one(db, source, "PLD 2024 SC 800")
+    await _promote_one(db, source, "PLD 2024 SC 801")
+    await _drive_target(db)
+    result = await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+    assert result["summary"]["drive"]["failed"] >= 1
+    assert any("PLD_2024_SC_801" in k for k in adapter.put_keys)
+    assert not any(fail_marker in k for k in adapter.put_keys)
 
 
 @pytest.mark.asyncio
