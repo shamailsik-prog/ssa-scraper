@@ -170,22 +170,74 @@ pls_host_stop_scraper_safely() {
   return 0
 }
 
+# Force-recovery is allowed to stop the local worker and release only locks proven
+# to belong to that stopped worker. It must NEVER fail another host's jobs or
+# delete shared login locks merely because the local worker stopped.
+pls_host_confirm_pls_idle_after_local_stop() {
+  local key exists remaining jobs
+  if ! docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx redis; then
+    return 1
+  fi
+  for key in \
+    "corpus:login_session_lock:PakistanLawSite" \
+    "corpus:login_session_lock:PakistanLawSite:holders" \
+    "corpus:login_session_lock:PakistanLawSite:slot1" \
+    "corpus:login_session_lock:PakistanLawSite:slot2"; do
+    if ! exists="$(pls_host_redis_cli EXISTS "$key" 2>/dev/null)"; then
+      return 1
+    fi
+    exists="${exists//
+  done
+  if ! remaining="$(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null)"; then
+    return 1
+  fi
+  [ -z "$remaining" ] || return 1
+  if ! jobs="$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -tAc \
+    "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null)"; then
+    return 1
+  fi
+  jobs="$(printf '%s' "$jobs" | tr -d ' \r\n')"
+  [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$jobs" -eq 0 ]
+}
+
 pls_host_force_release_stalled_harvest() {
-  # Never release locks or mark jobs failed if the worker may still be active.
   if ! pls_host_stop_scraper_safely; then
     return 1
   fi
-  pls_host_release_search_harvest_locks
-  docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -v ON_ERROR_STOP=1 -c \
-    "UPDATE scraper_jobs SET status = 'failed', finished_at = COALESCE(finished_at, NOW()), error_message = LEFT(COALESCE(error_message, '') || ' auto_deploy: released stalled zero-output job for deploy', 4000) WHERE source_name = 'PakistanLawSite' AND status = 'running';" \
-    2>/dev/null || true
-  if docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx redis; then
-    for key in \
-      "corpus:login_session_lock:PakistanLawSite" \
-      "corpus:login_session_lock:PakistanLawSite:holders" \
-      "corpus:login_session_lock:PakistanLawSite:slot1" \
-      "corpus:login_session_lock:PakistanLawSite:slot2"; do
-      pls_host_redis_cli DEL "$key" >/dev/null 2>&1 || true
-    done
+  if ! pls_host_release_search_harvest_locks; then
+    return 1
   fi
+  if ! pls_host_confirm_pls_idle_after_local_stop; then
+    printf 'pls_host: PLS lock/job ownership or idle state not verified; refusing global lock deletion and job failure marking\n' >&2
+    return 1
+  fi
+  return 0
+}
+\r'/}"
+    [ "$exists" = 0 ] || return 1
+  done
+  if ! remaining="$(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null)"; then
+    return 1
+  fi
+  [ -z "$remaining" ] || return 1
+  if ! jobs="$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-legal}" -d "${POSTGRES_DB:-legal_scraper}" -tAc \
+    "SELECT COUNT(*) FROM scraper_jobs WHERE source_name = 'PakistanLawSite' AND status = 'running';" 2>/dev/null)"; then
+    return 1
+  fi
+  jobs="$(printf '%s' "$jobs" | tr -d ' \r\n')"
+  [[ "$jobs" =~ ^[0-9]+$ ]] && [ "$jobs" -eq 0 ]
+}
+
+pls_host_force_release_stalled_harvest() {
+  if ! pls_host_stop_scraper_safely; then
+    return 1
+  fi
+  if ! pls_host_release_search_harvest_locks; then
+    return 1
+  fi
+  if ! pls_host_confirm_pls_idle_after_local_stop; then
+    printf 'pls_host: PLS lock/job ownership or idle state not verified; refusing global lock deletion and job failure marking\n' >&2
+    return 1
+  fi
+  return 0
 }

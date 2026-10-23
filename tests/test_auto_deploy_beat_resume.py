@@ -27,6 +27,7 @@ case "$1" in
   start) grep -qx "$2" "$FAKE/running" || echo "$2" >> "$FAKE/running"; echo "start $2" >> "$FAKE/calls" ;;
   exec)
     case "$*" in
+      *worker-scraper\ hostname*) echo local-host ;;
       *scraper.tasks.deploy_hold*HOLD_GUARDS_VERSION*) [ -f "$FAKE/old_workers" ] && exit 1; exit 0 ;;
       *redis-cli\ SET\ deploy_hold_login*) [ -f "$FAKE/redis_down" ] && exit 1; touch "$FAKE/hold"; echo "hold" >> "$FAKE/calls" ;;
       *redis-cli\ DEL\ deploy_hold_login*) rm -f "$FAKE/hold"; echo "unhold" >> "$FAKE/calls" ;;
@@ -156,16 +157,18 @@ def test_beat_left_stopped_by_an_old_deploy_is_started_again(host):
     assert "nothing to do" in r.stdout and "celery-beat" in host.running()
 
 
-def test_pause_longer_than_the_cap_releases_the_job_and_deploys(host):
+def test_pause_longer_than_the_cap_refuses_unverified_shared_job_release(host):
+    """Elapsed time cannot authorize failing remote jobs or deleting shared PLS locks."""
     host.push_change()
     (host.fake / "busy").touch()
     host.marker.write_text(str(int(time.time()) - 3000) + "\n")  # paused 50 minutes ago
     r = host.run(AUTO_DEPLOY_MAX_BEAT_PAUSE_SECONDS="2700")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "releasing the PLS job" in r.stdout
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "refusing unsafe deploy" in r.stdout
     calls = host.calls()
-    assert "release-job" in calls and any(c.startswith("deploy ") for c in calls)
-    assert "celery-beat" in host.running() and not host.marker.exists()
+    assert "release-job" not in calls and "release" not in calls
+    assert not any(c.startswith("deploy ") for c in calls)
+    assert "celery-beat" in host.running() and host.marker.exists()
 
 
 def test_operator_switch_keeps_beat_off(host):

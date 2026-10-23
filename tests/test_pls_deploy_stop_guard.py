@@ -24,7 +24,8 @@ docker() {
   fi
   if [ "$1" = compose ] && [ "$2" = exec ]; then
     if [ "$3" = -T ] && [ "$4" = worker-scraper ] && [ "$5" = hostname ]; then echo local-host; return 0; fi
-    echo PSQL_CALLED; return 0
+    if [ "$3" = -T ] && [ "$4" = postgres ]; then echo "${JOBS_OUTPUT:-0}"; return "${JOBS_RC:-0}"; fi
+    echo UNEXPECTED_EXEC >&2; return 1
   fi
   echo UNEXPECTED_DOCKER >&2
   return 3
@@ -56,13 +57,21 @@ if pls_host_stop_scraper_safely; then echo SAFE; else echo REFUSED; fi
 def test_force_release_never_proceeds_after_unverified_stop(settings, allowed):
     script = "source scripts/pls_host_lib.sh\n" + MOCK_DOCKER + """
 pls_host_release_search_harvest_locks() { echo RELEASE_CALLED; }
-pls_host_redis_cli() { :; }
+pls_host_redis_cli() {
+  case "$1" in
+    EXISTS) echo "${LOCK_EXISTS:-0}" ;;
+    --scan) printf '%s' "${SCAN_OUTPUT:-}" ;;
+    DEL) echo UNSAFE_DEL ;;
+    *) return 1 ;;
+  esac
+}
 if pls_host_force_release_stalled_harvest; then echo DONE; else echo REFUSED; fi
 """
     result = _run(script, **settings)
     assert result.returncode == 0
     assert ("RELEASE_CALLED" in result.stdout) is allowed
-    assert ("PSQL_CALLED" in result.stdout) is allowed
+    assert ("DONE" in result.stdout) is allowed
+    assert "UNSAFE_DEL" not in result.stdout
 
 
 @pytest.mark.parametrize("stop_rc,allowed", [(1, False), (0, True)])

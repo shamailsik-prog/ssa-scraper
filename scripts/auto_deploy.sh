@@ -155,21 +155,25 @@ wait_for_pls_idle() {
     if [ "$waited" -ge "$WAIT_MAX_SECONDS" ]; then
       paused="$(beat_pause_seconds)"
       if [ -f "$DIR/$BEAT_PAUSE_MARKER" ] && [ "$paused" -ge "$MAX_BEAT_PAUSE_SECONDS" ]; then
-        log "celery-beat paused ${paused}s (max ${MAX_BEAT_PAUSE_SECONDS}s) and PLS still busy; releasing the PLS job and deploying"
+        log "celery-beat paused ${paused}s (max ${MAX_BEAT_PAUSE_SECONDS}s) and PLS still busy; attempting verified local-worker stop (shared jobs/locks will not be deleted)"
         if [ "$DRY_RUN" = 1 ]; then
           log "dry-run: would release the PLS job and continue deploy"
         else
-          pls_host_force_release_stalled_harvest
+          if ! pls_host_force_release_stalled_harvest; then
+            die "PLS work is not independently verified idle after local worker stop; refusing unsafe deploy"
+          fi
           PLS_FORCE_RELEASED=1
         fi
         return 0
       fi
       if pls_host_promotion_stalled; then
-        log "PLS busy but /status reports no_output_while_harvesting; releasing lock for pending deploy"
+        log "PLS busy but /status reports no_output_while_harvesting; attempting verified local-worker stop"
         if [ "$DRY_RUN" = 1 ]; then
           log "dry-run: would force-release stalled PLS harvest and continue deploy"
         else
-          pls_host_force_release_stalled_harvest
+          if ! pls_host_force_release_stalled_harvest; then
+            die "PLS work is not independently verified idle after local worker stop; refusing unsafe deploy"
+          fi
           PLS_FORCE_RELEASED=1
         fi
         return 0
