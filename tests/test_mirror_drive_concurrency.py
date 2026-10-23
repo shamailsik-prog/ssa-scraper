@@ -413,6 +413,65 @@ async def test_drive_preflight_429_counts_failure_and_continues_other_folders(db
 
 
 @pytest.mark.asyncio
+async def test_drive_preflight_429_then_success_on_retry(db, source, monkeypatch):
+    class _Retry429Adapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self._rate_limit_hits = 1
+
+        def ensure_tree(self, key: str) -> None:
+            if self._rate_limit_hits > 0:
+                self._rate_limit_hits -= 1
+                raise _HttpishError(429, "Too Many Requests", reason="rateLimitExceeded")
+            return None
+
+    adapter = _Retry429Adapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    async def _fast_backoff():
+        return None
+
+    monkeypatch.setattr("scraper.storage.archive.drive_rate_limit_backoff", _fast_backoff)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_one(db, source, "PLD 2024 SC 755")
+    await _drive_target(db)
+    result = await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=1)
+    await db.commit()
+    assert result["summary"]["drive"]["failed"] == 0
+    assert adapter.put_keys
+
+
+@pytest.mark.asyncio
+async def test_drive_preflight_budget_stop_not_counted_as_failure(db, source, monkeypatch):
+    class _SlowSecondFolderAdapter(_TrackingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self._folder_count = 0
+
+        def ensure_tree(self, key: str) -> None:
+            self._folder_count += 1
+            if self._folder_count > 1:
+                time.sleep(0.4)
+            return None
+
+    adapter = _SlowSecondFolderAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.08)
+    result = await mirror.mirror_pending(limit=2)
+    await db.commit()
+    assert mirror.out_of_time
+    assert result["summary"]["drive"]["failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_drive_shared_folder_cache_same_dict_for_pool_adapters(db, source, monkeypatch):
     """Mutant F1: every pool adapter must share one _drive_folder_cache dict."""
 
@@ -494,7 +553,7 @@ async def test_drive_adapter_pool_init_failure_records_target_and_continues(db, 
     await db.refresh(t)
     assert upload_adapter.put_keys
     assert result["summary"]["drive"]["failed"] >= 1
-    assert int(t.consecutive_failures or 0) >= 1
+    assert int(t.consecutive_failures or 0) == 1
     assert t.last_error
 
 
