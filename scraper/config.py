@@ -411,6 +411,34 @@ class Settings(BaseSettings):
         default=True,
         description="Default on. Ingest/promotion refuse statute/judgment saves with no sections or no text; log and count rejects. Set SSA_DOCUMENT_SAVE_VALIDATION=0 or false to disable.",
     )
+    SSA_STATUTE_QUALITY_DEDUPE: bool = Field(
+        default=False,
+        description="Statute quality CLI: quarantine duplicate visible statutes (normalized title + year + jurisdiction).",
+    )
+    SSA_STATUTE_QUALITY_JURISDICTION: bool = Field(
+        default=False,
+        description="Statute quality CLI: fix Federal jurisdiction on provincial assembly sources.",
+    )
+    SSA_STATUTE_QUALITY_ASSEMBLY_PARSER: bool = Field(
+        default=False,
+        description="Ingest: filter assembly PDF TOC/bogus sections and thin bodies.",
+    )
+    SSA_STATUTE_QUALITY_SECTION_FILTER: bool = Field(
+        default=False,
+        description="Ingest: reject digit-only sections, page numbers, 1N splits, and imprint/gazette noise.",
+    )
+    SSA_STATUTE_QUALITY_OCR_GATE: bool = Field(
+        default=False,
+        description="Statute quality CLI: quarantine visible statutes with poor OCR / garbled text.",
+    )
+    SSA_STATUTE_QUALITY_GAZETTE_HEADER: bool = Field(
+        default=False,
+        description="Ingest: re-extract Senate/AJK act title and year from gazette PDF headers.",
+    )
+    SSA_STATUTE_QUALITY_REQUARANTINE: bool = Field(
+        default=False,
+        description="Statute quality CLI: quarantine statutes failing OCR/section/thin-body checks.",
+    )
 
     # ----------------------------------------------------------- pdf/storage
     PDF_STORAGE_PATH: str = Field(default="/app/live")
