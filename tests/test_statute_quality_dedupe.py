@@ -215,6 +215,19 @@ def test_keeper_ajk_speakers_salary_act_1971_prefers_fuller_copy():
     assert _rank_winner(fuller, thinner) == "a"
 
 
+def test_r5_r6_substantive_run_end_ignores_fake_year_section_1122():
+    """AJK Rescue 1122 / Industrial Relations 2017 shape: long s.1122 must not set group run end."""
+    clean = _sections_range(12, may_be_called=True)
+    noisy = _sections_range(12, may_be_called=True) + [
+        {
+            "section_number": "1122",
+            "section_text": "Section 1122. " + ("x" * 80),
+        }
+    ]
+    assert substantive_max_section_run_end(noisy) == substantive_max_section_run_end(clean) == 12
+    assert _rank_winner(clean, noisy) == "a"
+
+
 def test_rank_step_r1_missing_sections():
     a = _sections_range(10, may_be_called=True, omit=frozenset({5}))
     b = _sections_range(10, may_be_called=True)
@@ -271,6 +284,38 @@ def test_rank_step_r6_source_url():
 def test_rank_step_r7_char_fraction_guard():
     assert keeper_below_char_fraction(600, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
     assert not keeper_below_char_fraction(800, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
+
+
+@pytest.mark.asyncio
+async def test_n6_find_duplicate_groups_group_run_end_when_substantive_count_tied(db):
+    """Truncated copy with equal substantive sections still loses when group run end exposes gaps."""
+    trunc_id, full_id = uuid4(), uuid4()
+    for sid, name in (
+        (trunc_id, "The Group Run End Act, 2017"),
+        (full_id, "The Group Run End Act,2017"),
+    ):
+        db.add(
+            Statute(
+                id=sid,
+                name=name,
+                jurisdiction="AJ&K",
+                year_enacted=2017,
+                source_name="PakistanCode",
+                source_url="https://example.test/full" if sid == full_id else None,
+            )
+        )
+    await db.commit()
+    trunc_secs = _char_budget_sections(8, 4000, may_be_called=False)
+    full_secs = _char_budget_sections(12, 8000, may_be_called=True)
+    for s in trunc_secs:
+        await _add_section(db, trunc_id, s["section_number"], s["section_text"])
+    for s in full_secs:
+        await _add_section(db, full_id, s["section_number"], s["section_text"])
+    await db.commit()
+    dry = await find_duplicate_groups(db)
+    assert dry["duplicate_groups"] == 1
+    assert dry["winners"] == [full_id]
+    assert trunc_id in dry["losers"]
 
 
 @pytest.mark.asyncio

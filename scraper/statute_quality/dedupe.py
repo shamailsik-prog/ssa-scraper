@@ -53,17 +53,22 @@ def substantive_max_section_run_end(
     min_chars: int = SUBSTANTIVE_SECTION_MIN_CHARS,
 ) -> int:
     """Last section number with a substantive body (ignores one-line stubs that inflate missing counts)."""
+    nums = [str(s.get("section_number") or "") for s in sections]
     end = 0
     for s in sections:
-        n = _section_int(str(s.get("section_number") or ""))
+        num = str(s.get("section_number") or "")
+        n = _section_int(num)
         if n is None:
+            continue
+        if _YEAR_LIKE_MIN <= n <= _YEAR_LIKE_MAX:
+            continue
+        if is_fake_section_number(num, all_numbers=nums):
             continue
         if len((s.get("section_text") or "").strip()) < min_chars:
             continue
         end = max(end, n)
     if end:
         return end
-    nums = [str(s.get("section_number") or "") for s in sections]
     real = _real_section_ints(nums)
     return real[-1] if real else 0
 
@@ -142,7 +147,7 @@ def dedupe_keeper_rank(
     text_chars: int,
     has_source_url: bool,
     group_run_end: Optional[int] = None,
-) -> Tuple[int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int]:
     """Sort key tuple: higher is better (use with ``reverse=True``)."""
     nums = [str(s.get("section_number") or "") for s in sections]
     missing = count_missing_from_section_run(nums, run_end=group_run_end)
