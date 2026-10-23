@@ -452,6 +452,33 @@ def _slot_known_good_at(slot_row: BrowserSessionSlot) -> Optional[datetime]:
     return max(seen) if seen else slot_row.updated_at
 
 
+async def cross_slot_idle_claim_allowed(db: AsyncSession, slot: int) -> bool:
+    """True when this slot may claim the other slot's pending ledger rows while the other login is ACTIVE."""
+    if not settings.PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM:
+        return False
+    other = 2 if slot == 1 else 1
+    return await _slot_state(db, other) == "ACTIVE"
+
+
+async def try_claim_harvest_query_for_slot(
+    db: AsyncSession,
+    chosen: int,
+    *,
+    redis_client=None,
+) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock], bool, bool]:
+    """Claim order: own share, optional cross-slot (flag + other ACTIVE), then logout takeover."""
+    took_over = False
+    cross_slot_claim = False
+    query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
+    if query_row is None and await cross_slot_idle_claim_allowed(db, chosen):
+        cross_slot_claim = True
+        query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+    if query_row is None and await slot_takeover_due(db, chosen):
+        took_over = True
+        query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+    return query_row, query_lock, took_over, cross_slot_claim
+
+
 async def slot_takeover_due(db: AsyncSession, slot: int, *, now: Optional[datetime] = None) -> bool:
     """True when the other login has been logged out (not ACTIVE) for PLS_SEARCH_HARVEST_TAKEOVER_MINUTES, counted
     from the last time it was known to work, so `slot` may also work the other slot's share."""
@@ -906,6 +933,7 @@ async def _run_search_harvest_locked(
     runner: Optional[SearchHarvestRunner] = None
     query_row: Optional[PlsSearchHarvestQuery] = None
     took_over = False
+    cross_slot_claim = False
     source = await _source_row(db)
     try:
         if query_key:
@@ -919,10 +947,9 @@ async def _run_search_harvest_locked(
                 query_row.status, query_row.slot = "in_progress", chosen
                 await db.commit()
         else:
-            query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
-            if query_row is None and await slot_takeover_due(db, chosen):
-                took_over = True
-                query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+            query_row, query_lock, took_over, cross_slot_claim = await try_claim_harvest_query_for_slot(
+                db, chosen, redis_client=redis_client
+            )
         if query_row is None:
             return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
         m = await active_map(db, SOURCE_NAME)
@@ -969,7 +996,7 @@ async def _run_search_harvest_locked(
             search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
-        return {**result, "slot": chosen, "took_over": took_over}
+        return {**result, "slot": chosen, "took_over": took_over, "cross_slot_claim": cross_slot_claim}
     except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit, LoginRequired) as exc:
         if query_row is not None:
             query_row.status = "pending"
