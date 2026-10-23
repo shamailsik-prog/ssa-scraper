@@ -266,8 +266,9 @@ async def test_drive_concurrency_respects_time_budget_before_acquire(db, source,
     await _promote_many(db, source, 5)
     await _drive_target(db)
 
-    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.05)
+    # Budget already expired: parallel path must not start new uploads.
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() - 1.0)
     await mirror.mirror_pending(limit=5)
     await db.commit()
     assert mirror.out_of_time
-    assert len(adapter.put_keys) < 15
+    assert adapter.put_keys == []
