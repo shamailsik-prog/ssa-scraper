@@ -49,6 +49,30 @@ from scraper.storage.adapters import ArchiveAdapter, ArchiveError, ObjectExists,
 logger = logging.getLogger(__name__)
 
 
+def _drive_folder_path_for_key(key: str) -> str:
+    return key.rsplit("/", 1)[0]
+
+
+def _drive_folder_cached(drive_cfg: Dict[str, Any], folder: str) -> bool:
+    cache = drive_cfg.get("_drive_folder_cache")
+    if not isinstance(cache, dict):
+        return False
+    return folder.strip("/") in cache
+
+
+def _distinct_folder_keys(folder_keys: List[str]) -> List[str]:
+    """One object key per distinct Drive folder path, preserving first-seen order."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for key in folder_keys:
+        folder = _drive_folder_path_for_key(key)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        out.append(key)
+    return out
+
+
 def _aware(d: Optional[datetime]) -> datetime:
     if d is None:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -520,17 +544,26 @@ class ArchiveMirror:
             return failures
 
         failed_folders: set[str] = set()
-        if folder_keys:
+        folder_ensure_lock = asyncio.Lock()
+        preflight_cap = int(settings.MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS)
+        if preflight_cap > 0 and folder_keys:
+            distinct_keys = _distinct_folder_keys(folder_keys)
+            preflight_deadline: Optional[float] = None
+            if self.deadline is not None:
+                remaining = max(0.0, self.deadline - time.monotonic())
+                frac = float(settings.MIRROR_DRIVE_PREFLIGHT_BUDGET_FRACTION)
+                if frac > 0 and remaining > 0:
+                    preflight_deadline = time.monotonic() + remaining * frac
             setup_adapter = await adapter_pool.get()
             try:
-                seen_folders: set[str] = set()
-                for key in folder_keys:
+                for key in distinct_keys[:preflight_cap]:
                     if self._time_up():
                         break
-                    folder = key.rsplit("/", 1)[0]
-                    if folder in seen_folders or folder in failed_folders:
+                    if preflight_deadline is not None and time.monotonic() >= preflight_deadline:
+                        break
+                    folder = _drive_folder_path_for_key(key)
+                    if folder in failed_folders or _drive_folder_cached(drive_cfg, folder):
                         continue
-                    seen_folders.add(folder)
                     ensure_status = await self._drive_ensure_tree(setup_adapter, key, limiter=limiter)
                     if ensure_status == "timed_out":
                         break
@@ -542,13 +575,33 @@ class ArchiveMirror:
             finally:
                 await adapter_pool.put(setup_adapter)
 
-        if failed_folders:
-            pending_work = [
-                work for work in pending_work if work.obj["key"].rsplit("/", 1)[0] not in failed_folders
-            ]
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
         stop = asyncio.Event()
+
+        async def _ensure_folder_for_upload(adapter: ArchiveAdapter, work: _JudgmentUploadWork) -> bool:
+            nonlocal failures
+            folder = _drive_folder_path_for_key(work.obj["key"])
+            if folder in failed_folders:
+                return False
+            if _drive_folder_cached(drive_cfg, folder):
+                return True
+            async with folder_ensure_lock:
+                if folder in failed_folders:
+                    return False
+                if _drive_folder_cached(drive_cfg, folder):
+                    return True
+                ensure_status = await self._drive_ensure_tree(adapter, work.obj["key"], limiter=limiter)
+                if ensure_status == "timed_out":
+                    return False
+                if ensure_status == "failed":
+                    failed_folders.add(folder)
+                    async with failure_lock:
+                        failures += 1
+                        summary["failed"] += 1
+                    logger.warning("archive %s: ensure_tree failed for %s", t.name, folder)
+                    return False
+            return True
 
         async def run_one(work: _JudgmentUploadWork) -> None:
             nonlocal failures
@@ -559,6 +612,8 @@ class ArchiveMirror:
             try:
                 if self._time_up():
                     stop.set()
+                    return
+                if not await _ensure_folder_for_upload(adapter, work):
                     return
                 async with SessionLocal() as session:
                     try:

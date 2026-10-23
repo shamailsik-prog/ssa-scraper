@@ -191,6 +191,17 @@ class Settings(BaseSettings):
         le=16,
         description="Within one mirror_pending run, upload up to this many Google Drive objects concurrently (1 = sequential, legacy behaviour).",
     )
+    MIRROR_DRIVE_SERIAL_PREFLIGHT_MAX_FOLDERS: int = Field(
+        default=0,
+        ge=0,
+        description="Optional cap on upfront serial Drive folder ensure_tree calls before parallel uploads (0 = ensure on demand as each upload starts).",
+    )
+    MIRROR_DRIVE_PREFLIGHT_BUDGET_FRACTION: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        description="When deadline is set, spend at most this fraction of remaining run time on upfront folder preflight (only if SERIAL_PREFLIGHT_MAX_FOLDERS > 0).",
+    )
     RECONCILE_RUN_BUDGET_SECONDS: int = Field(default=600, description="A reconcile_storage run stops checking objects after this many seconds; the next run carries on from the least recently verified.")
     RECONCILE_BATCH_SIZE: int = Field(default=2000, description="At most this many stored objects per target are checked in one reconcile_storage run.")
     ARCHIVE_BATCH_BYTES: int = Field(
