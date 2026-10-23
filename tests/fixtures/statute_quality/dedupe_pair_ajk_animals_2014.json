@@ -1,0 +1,24 @@
+{
+  "name": "AJK Prevention of Cruelty to Animals Act 2014",
+  "year_enacted": 2014,
+  "jurisdiction": "AJK",
+  "winner_label": "f190ea6a_clean",
+  "loser_label": "ca0b36f9_fake1860",
+  "candidates": {
+    "f190ea6a_clean": {
+      "sections": [
+        {"section_number": "1", "section_text": "Section 1. This Act may be called the Prevention of Cruelty to Animals Act, 2014."},
+        {"section_number": "2", "section_text": "Section 2. Definitions.—In this Act, unless the context otherwise requires."}
+      ],
+      "extra_sections": 29
+    },
+    "ca0b36f9_fake1860": {
+      "sections": [
+        {"section_number": "1", "section_text": "Section 1. Short title."},
+        {"section_number": "1860", "section_text": "Section 1860. Printer imprint only."},
+        {"section_number": "2", "section_text": "Section 2. Definitions."}
+      ],
+      "extra_sections": 28
+    }
+  }
+}
