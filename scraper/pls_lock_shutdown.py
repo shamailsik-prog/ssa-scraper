@@ -10,12 +10,17 @@ logger = logging.getLogger(__name__)
 def release_on_worker_process_shutdown() -> None:
     import signal
 
+    prev_term = None
     if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        prev_term = signal.signal(signal.SIGTERM, signal.SIG_IGN)
     from scraper.config import settings
 
-    if not settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
-        return
-    from scraper.pls_lock_registry import release_all_registered_sync
+    try:
+        if not settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
+            return
+        from scraper.pls_lock_registry import release_all_registered_sync
 
-    release_all_registered_sync()
+        release_all_registered_sync()
+    finally:
+        if prev_term is not None:
+            signal.signal(signal.SIGTERM, prev_term)
