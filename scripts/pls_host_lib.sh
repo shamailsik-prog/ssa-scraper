@@ -112,23 +112,48 @@ pls_host_release_search_harvest_locks() {
   if ! pls_host_env_flag_enabled PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS; then
     return 0
   fi
+  # Only a positively identified, stopped local worker may release its own locks.
+  # Never DEL by pattern: Redis may be shared with a live worker on another host.
+  local expected_host="${PLS_HOST_STOPPED_WORKER_HOSTNAME:-}"
+  if [ -z "$expected_host" ]; then
+    printf 'pls_host: refusing search-harvest lock release without verified stopped worker identity\n' >&2
+    return 1
+  fi
   if ! docker compose ps --status running --format '{{.Service}}' 2>/dev/null | grep -qx redis; then
     return 0
   fi
-  local n=0 key
+  local n=0 key token rest pid nonce result
   while IFS= read -r key; do
     [ -z "$key" ] && continue
-    pls_host_redis_cli DEL "$key" >/dev/null 2>&1 || true
-    n=$((n + 1))
+    token="$(pls_host_redis_cli --raw GET "$key" 2>/dev/null)" || continue
+    case "$token" in "$expected_host":*:*) ;; *) continue ;; esac
+    rest="${token#*:}"
+    pid="${rest%%:*}"
+    nonce="${rest#*:}"
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ -n "$nonce" ] || continue
+    # Compare-and-delete protects against an owner change between GET and EVAL.
+    result="$(pls_host_redis_cli EVAL "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end" 1 "$key" "$token" 2>/dev/null)" || continue
+    [ "$result" = 1 ] && n=$((n + 1))
   done < <(pls_host_redis_cli --scan --pattern 'corpus:login_session_lock:PakistanLawSite:search_harvest:*' 2>/dev/null || true)
   if [ "$n" -gt 0 ]; then
-    printf '[%s] pls_host: released %s search-harvest Redis lock(s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n"
+    printf '[%s] pls_host: released %s verified local search-harvest Redis lock(s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n"
   fi
 }
 
 # Fail closed: Docker stop success alone does not prove the scraper is gone.
 pls_host_stop_scraper_safely() {
-  local running
+  local running stopped_host
+  PLS_HOST_STOPPED_WORKER_HOSTNAME=""
+  # Capture the actual container hostname before stopping; the lock token
+  # uses socket.gethostname() inside this same worker container.
+  if ! stopped_host="$(docker compose exec -T worker-scraper hostname 2>/dev/null)"; then
+    printf 'pls_host: cannot identify local worker; refusing lock release\n' >&2
+    return 1
+  fi
+  if ! [[ "$stopped_host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    printf 'pls_host: invalid local worker identity; refusing lock release\n' >&2
+    return 1
+  fi
   if ! docker compose stop worker-scraper; then
     printf 'pls_host: worker-scraper stop failed; refusing lock release\n' >&2
     return 1
@@ -141,6 +166,7 @@ pls_host_stop_scraper_safely() {
     printf 'pls_host: worker-scraper is still running; refusing lock release\n' >&2
     return 1
   fi
+  PLS_HOST_STOPPED_WORKER_HOSTNAME="$stopped_host"
   return 0
 }
 
