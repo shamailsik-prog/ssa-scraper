@@ -185,6 +185,12 @@ class Settings(BaseSettings):
     PLS_CITATION_GRID_SKIP_FLUSH_EVERY: int = Field(default=50, description="Commit the grid cursor every N rows that are only skipped (known, already staged, other shard); rows that fetch a detail page still commit every PLS_CITATION_GRID_FLUSH_EVERY.")
     MIRROR_BACKLOG_PER_RUN: int = Field(default=300, description="Oldest-first backlog judgments the archive mirror writes per target per run, in addition to the newest ones.")
     MIRROR_RUN_BUDGET_SECONDS: int = Field(default=900, description="An archive mirror run stops starting new objects after this many seconds, commits, and queues the next run.")
+    MIRROR_DRIVE_CONCURRENCY: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Within one mirror_pending run, upload up to this many Google Drive objects concurrently (1 = sequential, legacy behaviour).",
+    )
     RECONCILE_RUN_BUDGET_SECONDS: int = Field(default=600, description="A reconcile_storage run stops checking objects after this many seconds; the next run carries on from the least recently verified.")
     RECONCILE_BATCH_SIZE: int = Field(default=2000, description="At most this many stored objects per target are checked in one reconcile_storage run.")
     ARCHIVE_BATCH_BYTES: int = Field(
