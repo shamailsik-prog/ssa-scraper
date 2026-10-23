@@ -22,7 +22,10 @@ docker() {
     printf '%s\n' "${PS_OUTPUT:-}"
     return "${PS_RC:-0}"
   fi
-  if [ "$1" = compose ] && [ "$2" = exec ]; then echo PSQL_CALLED; return 0; fi
+  if [ "$1" = compose ] && [ "$2" = exec ]; then
+    if [ "$3" = -T ] && [ "$4" = worker-scraper ] && [ "$5" = hostname ]; then echo local-host; return 0; fi
+    echo PSQL_CALLED; return 0
+  fi
   echo UNEXPECTED_DOCKER >&2
   return 3
 }
