@@ -66,6 +66,9 @@ class _TrackingAdapter:
             with self._lock:
                 self.in_flight -= 1
 
+    def ensure_tree(self, key: str) -> None:
+        return None
+
     def exists(self, key: str) -> bool:
         return False
 
@@ -127,6 +130,92 @@ def test_adaptive_concurrency_halve_floor_is_one():
     lim = _AdaptiveConcurrency(1)
     assert lim.halve() == 1
     assert lim.limit == 1
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_builds_distinct_http_client_per_worker(db, source, monkeypatch):
+    """Parallel uploads must not share one httplib2-backed Drive service across threads."""
+
+    overlap_lock = threading.Lock()
+    clients_in_flight: Dict[int, int] = {}
+    shared_client_across_threads = False
+    factory_calls = 0
+
+    class _ClientBoundAdapter(_TrackingAdapter):
+        def __init__(self, http_client: object) -> None:
+            super().__init__()
+            self.http_client = http_client
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            nonlocal shared_client_across_threads
+            tid = threading.get_ident()
+            cid = id(self.http_client)
+            with overlap_lock:
+                for other_tid, other_cid in clients_in_flight.items():
+                    if other_tid != tid and other_cid == cid:
+                        shared_client_across_threads = True
+                clients_in_flight[tid] = cid
+            try:
+                return super().put(key, data, content_type)
+            finally:
+                with overlap_lock:
+                    clients_in_flight.pop(tid, None)
+
+    def factory(_target_type, _config):
+        nonlocal factory_calls
+        factory_calls += 1
+        return _ClientBoundAdapter(object())
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 4)
+    await _drive_target(db)
+
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=4)
+    await db.commit()
+
+    assert factory_calls in (4, 5), "fixed upload pool (4) plus optional index writer"
+    assert not shared_client_across_threads, "same http client must not be used from multiple threads at once"
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_creates_each_judgment_folder_once(db, source, monkeypatch):
+    """Pre-flight ensure_tree + shared folder cache: one mkdir per judgment prefix under concurrency."""
+
+    from collections import defaultdict
+
+    folder_ensures: Dict[str, int] = defaultdict(int)
+
+    class _FolderAdapter(_TrackingAdapter):
+        def __init__(self, folder_cache: Dict[str, str]) -> None:
+            super().__init__()
+            self._folder_cache = folder_cache
+
+        def ensure_tree(self, key: str) -> None:
+            folder = key.rsplit("/", 1)[0]
+            folder_ensures[folder] += 1
+            self._folder_cache.setdefault(folder, folder)
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            folder = key.rsplit("/", 1)[0]
+            if folder not in self._folder_cache:
+                folder_ensures[folder] += 1
+                self._folder_cache[folder] = folder
+            return super().put(key, data, content_type)
+
+    shared_cache: Dict[str, str] = {"": "root"}
+
+    def factory(_target_type, config):
+        assert config.get("_drive_folder_cache") is shared_cache
+        return _FolderAdapter(shared_cache)
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+
+    for prefix, count in folder_ensures.items():
+        assert count <= 1, f"duplicate folder ensure for {prefix}: {count}"
 
 
 @pytest.mark.asyncio
@@ -257,6 +346,156 @@ async def test_drive_concurrency_failed_upload_persists_failed_ledger_row(db, so
 def test_mirror_drive_concurrency_capped_at_sixteen():
     with pytest.raises(Exception):
         settings.model_validate({**settings.model_dump(), "MIRROR_DRIVE_CONCURRENCY": 17})
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_time_budget_after_acquire_stops_inflight(db, source, monkeypatch):
+    """Deadline ~0.3s ahead with 0.4s uploads: workers must not run past budget (mutant M15)."""
+
+    class _SlowPutAdapter(_TrackingAdapter):
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            time.sleep(0.4)
+            return super().put(key, data, content_type)
+
+    adapter = _SlowPutAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 3)
+    await _drive_target(db)
+
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.3)
+    await mirror.mirror_pending(limit=3)
+    await db.commit()
+    assert mirror.out_of_time
+    assert len(adapter.put_keys) < 9
+
+
+@pytest.mark.asyncio
+async def test_drive_preflight_429_counts_failure_and_continues_other_folders(db, source, monkeypatch):
+    """Preflight ensure_tree rate limits must not abort mirror_pending; other folders still upload."""
+
+    fail_folder_marker = "PLD_2024_SC_700"
+
+    class _PreflightAdapter(_TrackingAdapter):
+        def ensure_tree(self, key: str) -> None:
+            folder = key.rsplit("/", 1)[0]
+            if fail_folder_marker in folder:
+                raise _HttpishError(429, "Too Many Requests", reason="rateLimitExceeded")
+            return None
+
+    adapters: List[_PreflightAdapter] = []
+
+    def factory(_target_type, _config):
+        ad = _PreflightAdapter()
+        adapters.append(ad)
+        return ad
+
+    async def _fast_backoff():
+        return None
+
+    monkeypatch.setattr("scraper.storage.archive.drive_rate_limit_backoff", _fast_backoff)
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_many(db, source, 2)
+    t = await _drive_target(db)
+
+    result = await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+
+    summary = result["summary"]["drive"]
+    assert summary["failed"] >= 1
+    all_puts = [k for ad in adapters for k in ad.put_keys]
+    assert all_puts, "non-doomed judgment folder should still upload"
+    assert not any(fail_folder_marker in k for k in all_puts)
+    assert any("PLD_2024_SC_701" in k for k in all_puts)
+
+
+@pytest.mark.asyncio
+async def test_drive_shared_folder_cache_same_dict_for_pool_adapters(db, source, monkeypatch):
+    """Mutant F1: every pool adapter must share one _drive_folder_cache dict."""
+
+    seen_caches: List[Dict[str, str]] = []
+
+    class _CacheProbeAdapter(_TrackingAdapter):
+        def __init__(self, folder_cache: Dict[str, str]) -> None:
+            super().__init__()
+            self._folder_cache = folder_cache
+
+        def ensure_tree(self, key: str) -> None:
+            folder = key.rsplit("/", 1)[0]
+            self._folder_cache.setdefault(folder, folder)
+
+    def factory(_target_type, config):
+        cache = config.get("_drive_folder_cache")
+        if isinstance(cache, dict):
+            seen_caches.append(cache)
+            return _CacheProbeAdapter(cache)
+        return _CacheProbeAdapter({"": "root"})
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+
+    assert len(seen_caches) >= 4
+    assert len({id(c) for c in seen_caches}) == 1
+
+
+@pytest.mark.asyncio
+async def test_drive_preflight_runs_before_parallel_puts(db, source, monkeypatch):
+    """Mutant F2: serial preflight ensure_tree must complete before upload workers run."""
+
+    events: List[tuple[str, str]] = []
+
+    class _OrderedAdapter(_TrackingAdapter):
+        def ensure_tree(self, key: str) -> None:
+            events.append(("ensure", key.rsplit("/", 1)[0]))
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            events.append(("put", key))
+            return super().put(key, data, content_type)
+
+    def factory(_target_type, _config):
+        return _OrderedAdapter()
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 2)
+    await _drive_target(db)
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=2)
+    await db.commit()
+
+    first_put = next((i for i, ev in enumerate(events) if ev[0] == "put"), len(events))
+    assert all(ev[0] == "ensure" for ev in events[:first_put])
+    assert any(ev[0] == "put" for ev in events[first_put:])
+
+
+@pytest.mark.asyncio
+async def test_drive_adapter_pool_init_failure_records_target_and_continues(db, source, monkeypatch):
+    pool_init_calls = 0
+    upload_adapter = _TrackingAdapter()
+
+    def factory(_target_type, config):
+        nonlocal pool_init_calls
+        if isinstance(config.get("_drive_folder_cache"), dict):
+            pool_init_calls += 1
+            if pool_init_calls == 1:
+                raise RuntimeError("adapter init boom")
+            return upload_adapter
+        return _TrackingAdapter()
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 2)
+    await _promote_one(db, source, "PLD 2024 SC 760")
+    t = await _drive_target(db)
+    result = await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=1)
+    await db.commit()
+    await db.refresh(t)
+    assert upload_adapter.put_keys
+    assert result["summary"]["drive"]["failed"] >= 1
+    assert int(t.consecutive_failures or 0) >= 1
+    assert t.last_error
 
 
 @pytest.mark.asyncio

@@ -9,9 +9,34 @@ from typing import Optional, Tuple
 WORKER_ALIVE_KEY_PREFIX = "pls:worker_alive:"
 WORKER_ALIVE_TTL_SECONDS = 60
 
+_process_lock_host: Optional[str] = None
+
 
 def local_hostname() -> str:
     return socket.gethostname() or "unknown"
+
+
+def set_process_lock_host(host: str) -> None:
+    global _process_lock_host
+    host = (host or "").strip()
+    if host:
+        _process_lock_host = host
+
+
+def lock_host_identity() -> str:
+    """Host segment used in lock tokens and ``pls:worker_alive`` (must match)."""
+    if _process_lock_host:
+        return _process_lock_host
+    return local_hostname()
+
+
+def configure_lock_host_from_task_hostname(hostname: str) -> None:
+    """Use the Celery worker ``name@host`` host part (``%h``) for lock/heartbeat identity."""
+    full = (hostname or "").strip()
+    if "@" in full:
+        set_process_lock_host(full.split("@", 1)[1])
+    elif full:
+        set_process_lock_host(full)
 
 
 def worker_alive_redis_key(host: str) -> str:
@@ -22,7 +47,7 @@ def lock_holder_token() -> str:
     """Redis lock value: ``host:pid:nonce`` (nonce keeps compare-and-delete semantics)."""
     import secrets
 
-    return f"{local_hostname()}:{os.getpid()}:{secrets.token_hex(8)}"
+    return f"{lock_host_identity()}:{os.getpid()}:{secrets.token_hex(8)}"
 
 
 def parse_lock_holder(value: str) -> Optional[Tuple[str, int, str]]:
@@ -52,11 +77,11 @@ def local_pid_alive(pid: int) -> bool:
 
 
 async def touch_worker_alive(redis_client) -> None:
-    await redis_client.set(worker_alive_redis_key(local_hostname()), "1", ex=WORKER_ALIVE_TTL_SECONDS)
+    await redis_client.set(worker_alive_redis_key(lock_host_identity()), "1", ex=WORKER_ALIVE_TTL_SECONDS)
 
 
 async def remote_worker_heartbeat_present(redis_client, host: str) -> bool:
-    if host == local_hostname():
+    if host == lock_host_identity():
         return True
     return bool(await redis_client.exists(worker_alive_redis_key(host)))
 
@@ -67,6 +92,6 @@ async def lock_value_holder_stale(redis_client, value: str) -> bool:
     if parsed is None:
         return False
     host, pid, _ = parsed
-    if host == local_hostname():
+    if host == lock_host_identity():
         return not local_pid_alive(pid)
     return not await remote_worker_heartbeat_present(redis_client, host)

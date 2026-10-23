@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
-from celery.signals import task_postrun, worker_process_init, worker_process_shutdown, worker_ready
+from celery.signals import task_postrun, task_prerun, worker_process_init, worker_process_shutdown, worker_ready
 
 from scraper.config import settings
 
@@ -170,12 +170,28 @@ logger.info("Celery configured for deploy role %s: queues scraper/login_session/
 
 @worker_process_init.connect
 def _pls_worker_child_init(**_kwargs) -> None:
-    """Prefork pool child: heartbeat daemon + SIGTERM release (billiard skips atexit)."""
-    from scraper.pls_lock_shutdown import install_pls_lock_shutdown_hooks
+    """Prefork pool child: heartbeat daemon (lock release is worker_process_shutdown / task finally)."""
     from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon
 
     start_worker_heartbeat_daemon()
-    install_pls_lock_shutdown_hooks()
+
+
+@task_prerun.connect
+def _pls_lock_task_prerun(sender=None, task=None, **kwargs) -> None:
+    """Any task that may hold a PLS Redis lock must refresh ``pls:worker_alive`` for its worker host."""
+    from scraper.config import settings
+    from scraper.pls_lock_celery import PLS_HEARTBEAT_TASKS
+    from scraper.pls_lock_holder import configure_lock_host_from_task_hostname
+    from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon
+
+    if not settings.PLS_LOCK_HOLDER_IDENTITY:
+        return
+    name = getattr(sender, "name", None) if sender is not None else None
+    if name not in PLS_HEARTBEAT_TASKS:
+        return
+    req = getattr(task, "request", None) if task is not None else None
+    configure_lock_host_from_task_hostname(str(getattr(req, "hostname", "") or ""))
+    start_worker_heartbeat_daemon()
 
 
 @worker_process_shutdown.connect

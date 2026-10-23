@@ -399,7 +399,12 @@ class GoogleDriveAdapter(ArchiveAdapter):
         if not self.root_folder_id:
             raise ArchiveError("google_drive target requires folder_id")
         self.service = service if service is not None else self._build_service(config)
-        self._folder_cache: Dict[str, str] = {"": self.root_folder_id}
+        shared = config.get("_drive_folder_cache")
+        if isinstance(shared, dict):
+            self._folder_cache = shared
+            self._folder_cache.setdefault("", self.root_folder_id)
+        else:
+            self._folder_cache: Dict[str, str] = {"": self.root_folder_id}
 
     @classmethod
     def _build_service(cls, config: Dict[str, Any]):

@@ -459,17 +459,89 @@ class ArchiveMirror:
     async def _mirror_drive_uploads(
         self,
         t: ArchiveTarget,
-        adapter: ArchiveAdapter,
+        target_type: str,
+        target_cfg: Dict[str, Any],
         judgments: List[Judgment],
         summary: Dict[str, int],
         index_rows: List[List[str]],
         *,
         concurrency: int,
     ) -> int:
+        """Parallel Drive uploads with a fixed pool of adapters (httplib2 is not thread-safe)."""
         from scraper.database import SessionLocal
 
-        limiter = _AdaptiveConcurrency(concurrency)
+        pool_size = max(1, int(concurrency))
+        drive_cfg = dict(target_cfg)
+        drive_cfg["_drive_folder_cache"] = drive_cfg.get("_drive_folder_cache") or {"": drive_cfg.get("folder_id") or drive_cfg.get("root_folder_id") or ""}
+
+        pending_work: List[_JudgmentUploadWork] = []
+        folder_keys: List[str] = []
+        for j in judgments:
+            if self._time_up():
+                break
+            if not self._policy_allows(t, j.access_method):
+                summary["skipped_policy"] += 1
+                continue
+            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+            if already >= JUDGMENT_OBJECT_COUNT:
+                continue
+            objs = await self.judgment_objects(j)
+            for obj in objs:
+                pending_work.append(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))
+                folder_keys.append(obj["key"])
+            index_rows.append(
+                [
+                    j.canonical_citation,
+                    j.case_title or "",
+                    j.court_name or "",
+                    str(j.year or ""),
+                    j.decision_date.isoformat() if j.decision_date else "",
+                    judgment_prefix(j),
+                    "original_pdf" if j.has_original_pdf else "rendered_copy",
+                    j.full_text_hash or "",
+                ]
+            )
+            await self._checkpoint()
+
         failures = 0
+        limiter = _AdaptiveConcurrency(pool_size)
+        adapter_pool: asyncio.Queue = asyncio.Queue()
+        for _ in range(pool_size):
+            try:
+                adapter_pool.put_nowait(await asyncio.to_thread(self.adapter_factory, target_type, drive_cfg))
+            except Exception as exc:
+                failures += 1
+                summary["failed"] += 1
+                t.consecutive_failures += 1
+                t.last_error = f"adapter init: {exc}"[:2000]
+                logger.warning("archive %s: drive adapter pool init failed: %s", t.name, exc)
+        if adapter_pool.empty():
+            return failures
+
+        failed_folders: set[str] = set()
+        if folder_keys:
+            setup_adapter = await adapter_pool.get()
+            try:
+                seen_folders: set[str] = set()
+                for key in folder_keys:
+                    if self._time_up():
+                        break
+                    folder = key.rsplit("/", 1)[0]
+                    if folder in seen_folders or folder in failed_folders:
+                        continue
+                    seen_folders.add(folder)
+                    if not await self._drive_ensure_tree(setup_adapter, key, limiter=limiter):
+                        failed_folders.add(folder)
+                        failures += 1
+                        summary["failed"] += 1
+                        logger.warning("archive %s: ensure_tree failed for %s", t.name, folder)
+            finally:
+                await adapter_pool.put(setup_adapter)
+
+        if failed_folders:
+            pending_work = [
+                work for work in pending_work if work.obj["key"].rsplit("/", 1)[0] not in failed_folders
+            ]
         failure_lock = asyncio.Lock()
         summary_lock = asyncio.Lock()
         stop = asyncio.Event()
@@ -479,7 +551,11 @@ class ArchiveMirror:
             if stop.is_set() or self._time_up():
                 return
             await limiter.acquire()
+            adapter = await adapter_pool.get()
             try:
+                if self._time_up():
+                    stop.set()
+                    return
                 async with SessionLocal() as session:
                     try:
                         status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
@@ -497,39 +573,36 @@ class ArchiveMirror:
                         stop.set()
                 logger.warning("archive %s: %s failed: %s", t.name, work.obj["key"], exc)
             finally:
+                await adapter_pool.put(adapter)
                 await limiter.release()
 
-        tasks: List[asyncio.Task] = []
-        for j in judgments:
-            if self._time_up() or stop.is_set():
-                break
-            if not self._policy_allows(t, j.access_method):
-                summary["skipped_policy"] += 1
-                continue
-            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
-            if already >= JUDGMENT_OBJECT_COUNT:
-                continue
-            objs = await self.judgment_objects(j)
-            for obj in objs:
-                if self._time_up() or stop.is_set():
-                    break
-                tasks.append(asyncio.create_task(run_one(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))))
-            index_rows.append(
-                [
-                    j.canonical_citation,
-                    j.case_title or "",
-                    j.court_name or "",
-                    str(j.year or ""),
-                    j.decision_date.isoformat() if j.decision_date else "",
-                    judgment_prefix(j),
-                    "original_pdf" if j.has_original_pdf else "rendered_copy",
-                    j.full_text_hash or "",
-                ]
-            )
-            await self._checkpoint()
+        tasks = [asyncio.create_task(run_one(work)) for work in pending_work]
         if tasks:
             await asyncio.gather(*tasks)
         return failures
+
+    async def _drive_ensure_tree(
+        self,
+        adapter: ArchiveAdapter,
+        key: str,
+        *,
+        limiter: _AdaptiveConcurrency,
+    ) -> bool:
+        """Create Drive folders with the same retry/backoff policy as uploads."""
+        attempts = 0
+        while True:
+            if self._time_up():
+                return False
+            try:
+                await _retry(asyncio.to_thread, adapter.ensure_tree, key, rate_limit_sensitive=True)
+                return True
+            except Exception as exc:
+                if is_drive_rate_limited(exc) and attempts < 5:
+                    attempts += 1
+                    limiter.halve()
+                    await drive_rate_limit_backoff()
+                    continue
+                return False
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
         if not is_login_session(access_method):
@@ -743,7 +816,15 @@ class ArchiveMirror:
             drive_concurrency = min(16, max(1, int(settings.MIRROR_DRIVE_CONCURRENCY))) if t.target_type == "google_drive" else 1
             if t.target_type == "google_drive" and drive_concurrency > 1:
                 touched = bool(judgments)
-                failures = await self._mirror_drive_uploads(t, adapter, judgments, summary, index_rows, concurrency=drive_concurrency)
+                failures = await self._mirror_drive_uploads(
+                    t,
+                    t.target_type,
+                    target_config(t),
+                    judgments,
+                    summary,
+                    index_rows,
+                    concurrency=drive_concurrency,
+                )
                 await self.db.refresh(t)
                 target_timed_out = self.out_of_time
             else:

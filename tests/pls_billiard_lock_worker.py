@@ -1,9 +1,24 @@
-"""Billiard pool child entrypoint for PLS lock shutdown tests (importable module path)."""
+"""Billiard pool child entrypoints mirroring Celery prefork (initializer + on_process_exit)."""
 
 from __future__ import annotations
 
 
-def hold_registered_lock_until_killed(
+def billiard_pool_worker_initializer() -> None:
+    from scraper.config import settings
+    from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon
+
+    settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN = True
+    settings.PLS_LOCK_HOLDER_IDENTITY = True
+    start_worker_heartbeat_daemon()
+
+
+def billiard_pool_process_destructor(pid: int, exitcode: int) -> None:
+    from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+
+    release_on_worker_process_shutdown()
+
+
+def hold_registered_lock_in_pool_child(
     redis_url: str,
     key: str,
     token: str,
@@ -12,29 +27,20 @@ def hold_registered_lock_until_killed(
     ready_key: str,
     stop_key: str | None = None,
 ) -> None:
+    """Hold a registered lock until stop_key is set or the pool worker is terminated (no task-finally release)."""
     import os
     import time
 
     import redis
 
-    from scraper.config import settings
     from scraper.pls_lock_registry import register_lock
-    from scraper.pls_lock_shutdown import install_pls_lock_shutdown_hooks, release_on_worker_process_shutdown
 
-    # Parent pytest monkeypatch does not apply in forked pool children.
-    settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN = True
-
-    install_pls_lock_shutdown_hooks()
     client = redis.from_url(redis_url)
     client.set(key, token, ex=600)
     client.set(foreign_key, foreign_val, ex=600)
     register_lock(key, token)
     client.set(ready_key, str(os.getpid()), ex=60)
-    try:
-        while True:
-            if stop_key and client.get(stop_key):
-                break
-            time.sleep(0.2)
-    finally:
-        release_on_worker_process_shutdown()
-
+    while True:
+        if stop_key and client.get(stop_key):
+            return
+        time.sleep(0.2)

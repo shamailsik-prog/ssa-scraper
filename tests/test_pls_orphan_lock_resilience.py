@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import billiard
+from billiard.pool import Pool as BilliardPool
 import pytest
 import redis
 import redis.asyncio as aioredis
@@ -25,8 +24,12 @@ from scraper.pls_lock_holder import (
     worker_alive_redis_key,
 )
 from scraper.pls_lock_registry import register_lock, release_all_registered_sync
-from scraper.pls_lock_shutdown import install_pls_lock_shutdown_hooks
-from tests.pls_billiard_lock_worker import hold_registered_lock_until_killed
+from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
+from tests.pls_billiard_lock_worker import (
+    billiard_pool_process_destructor,
+    billiard_pool_worker_initializer,
+    hold_registered_lock_in_pool_child,
+)
 
 
 @pytest.fixture
@@ -159,10 +162,105 @@ def test_shutdown_registry_releases_tracked_lock(monkeypatch):
     client.close()
 
 
-def test_install_shutdown_registers_sigterm_handler(monkeypatch):
+def test_shutdown_release_redis_client_uses_socket_timeout(monkeypatch):
     monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
-    install_pls_lock_shutdown_hooks()
-    assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
+    import redis as redis_sync
+
+    captured: list[dict] = []
+    real_from_url = redis_sync.from_url
+
+    def _from_url(url, **kwargs):
+        captured.append(kwargs)
+        return real_from_url(url, **kwargs)
+
+    monkeypatch.setattr(redis_sync, "from_url", _from_url)
+    key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:socket-timeout")
+    token = lock_holder_token()
+    client = redis_sync.from_url(settings.REDIS_URL)
+    client.set(key, token, ex=120)
+    register_lock(key, token)
+    release_all_registered_sync()
+    assert client.get(key) is None
+    client.close()
+    assert any(c.get("socket_timeout") == 2.0 for c in captured)
+
+
+def test_release_all_registered_sync_finishes_remaining_locks_after_system_exit(monkeypatch):
+    """Pending SIGTERM/SystemExit during eval must not skip later lock releases."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    import redis as redis_sync
+
+    key1 = LOCK_KEY.format(source="PakistanLawSite:search_harvest:exit-a")
+    key2 = LOCK_KEY.format(source="PakistanLawSite:search_harvest:exit-b")
+    token1 = lock_holder_token()
+    token2 = lock_holder_token()
+    client = redis_sync.from_url(settings.REDIS_URL)
+    client.set(key1, token1, ex=120)
+    client.set(key2, token2, ex=120)
+    register_lock(key1, token1)
+    register_lock(key2, token2)
+
+    real_from_url = redis_sync.from_url
+    calls = 0
+
+    class _Client:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def eval(self, script, numkeys, key, token):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SystemExit(143)
+            return self._inner.eval(script, numkeys, key, token)
+
+        def close(self):
+            self._inner.close()
+
+    def _from_url(url, **kwargs):
+        return _Client(real_from_url(url, **kwargs))
+
+    monkeypatch.setattr(redis_sync, "from_url", _from_url)
+    with pytest.raises(SystemExit):
+        release_all_registered_sync()
+    assert client.get(key1) == token1.encode()
+    assert client.get(key2) is None
+    client.delete(key1)
+    client.close()
+
+
+def test_release_all_registered_sync_blocks_until_guard_available(monkeypatch):
+    """Mutant S1: release must hold sigmask through Redis DEL (blocking guard, not fail-open skip)."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    import redis
+    import threading
+
+    client = redis.from_url(settings.REDIS_URL)
+    key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:reentrant")
+    token = lock_holder_token()
+    client.set(key, token, ex=120)
+    register_lock(key, token)
+    from scraper.pls_lock_registry import _guard
+
+    released: list[int] = []
+
+    def _second_release() -> None:
+        released.append(release_all_registered_sync())
+
+    _guard.acquire()
+    try:
+        t = threading.Thread(target=_second_release)
+        t.start()
+        time.sleep(0.15)
+        assert released == []
+        _guard.release()
+        t.join(timeout=5)
+    finally:
+        if _guard.locked():
+            _guard.release()
+    assert released == [1]
+    assert client.get(key) is None
+    client.close()
 
 
 @pytest.mark.asyncio
@@ -202,10 +300,14 @@ def _billiard_pool_release_scenario(monkeypatch, *, use_close_join: bool) -> Non
     foreign_val = lock_holder_token()
     client = redis.from_url(settings.REDIS_URL)
     client.delete(key, foreign, ready_key, stop_key)
-    pool = billiard.Pool(1)
+    pool = BilliardPool(
+        1,
+        initializer=billiard_pool_worker_initializer,
+        on_process_exit=billiard_pool_process_destructor,
+    )
     try:
         pool.apply_async(
-            hold_registered_lock_until_killed,
+            hold_registered_lock_in_pool_child,
             (settings.REDIS_URL, key, token, foreign, foreign_val, ready_key, stop_key if use_close_join else None),
         )
         assert _wait_redis_key(client, ready_key)
@@ -236,8 +338,117 @@ def test_billiard_pool_terminate_releases_only_registered_lock(monkeypatch):
     _billiard_pool_release_scenario(monkeypatch, use_close_join=False)
 
 
+def test_billiard_pool_sigterm_mid_task_releases_only_registered_lock(monkeypatch):
+    """on_process_exit release must run when the child gets SIGTERM during the hold loop."""
+    import os
+    import signal
+
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    uid = uuid.uuid4().hex[:10]
+    key = f"corpus:login_session_lock:PakistanLawSite:search_harvest:billiard-sig-{uid}"
+    foreign = f"corpus:login_session_lock:PakistanLawSite:search_harvest:foreign-sig-{uid}"
+    ready_key = f"pls:billiard-sig-ready-{uid}"
+    token = lock_holder_token()
+    foreign_val = lock_holder_token()
+    client = redis.from_url(settings.REDIS_URL)
+    client.delete(key, foreign, ready_key)
+    pool = BilliardPool(
+        1,
+        initializer=billiard_pool_worker_initializer,
+        on_process_exit=billiard_pool_process_destructor,
+    )
+    try:
+        pool.apply_async(
+            hold_registered_lock_in_pool_child,
+            (settings.REDIS_URL, key, token, foreign, foreign_val, ready_key, None),
+        )
+        assert _wait_redis_key(client, ready_key)
+        child_pid = int(client.get(ready_key).decode())
+        os.kill(child_pid, signal.SIGTERM)
+        for _ in range(40):
+            if client.get(key) is None:
+                break
+            time.sleep(0.1)
+    finally:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+        pool.join()
+    assert client.get(key) is None
+    assert client.get(foreign) is not None
+    client.delete(foreign, ready_key)
+    client.close()
+
+
 def test_billiard_pool_close_join_releases_only_registered_lock(monkeypatch):
     _billiard_pool_release_scenario(monkeypatch, use_close_join=True)
+
+
+def test_billiard_initializer_starts_worker_heartbeat(monkeypatch):
+    """Mutant H6: heartbeat daemon must start in pool initializer (not only on lock acquire)."""
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    uid = uuid.uuid4().hex[:10]
+    ready_key = f"pls:billiard-hb-ready-{uid}"
+    client = redis.from_url(settings.REDIS_URL)
+    for k in client.scan_iter("pls:worker_alive:*"):
+        client.delete(k)
+    pool = BilliardPool(
+        1,
+        initializer=billiard_pool_worker_initializer,
+        on_process_exit=billiard_pool_process_destructor,
+    )
+    try:
+        pool.apply_async(
+            hold_registered_lock_in_pool_child,
+            (settings.REDIS_URL, "k", "t", "fk", "fv", ready_key, None),
+        )
+        assert _wait_redis_key(client, ready_key)
+        assert list(client.scan_iter("pls:worker_alive:*"))
+        pool.terminate()
+        pool.join()
+    finally:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+        pool.join()
+        client.delete(ready_key)
+        for k in client.scan_iter("pls:worker_alive:*"):
+            client.delete(k)
+        client.close()
+
+
+def test_harvest_tick_finally_releases_registered_locks(monkeypatch):
+    """Mutant H7: pls_search_harvest_tick must release tracked locks in finally."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    calls: list[str] = []
+
+    def _track_release() -> None:
+        calls.append("release")
+        release_on_worker_process_shutdown()
+
+    monkeypatch.setattr("scraper.pls_lock_shutdown.release_on_worker_process_shutdown", _track_release)
+    monkeypatch.setattr("scraper.tasks.deploy_hold.login_work_held", lambda: True)
+    from scraper.tasks import pls_search_harvest
+
+    pls_search_harvest.pls_search_harvest_tick()
+    assert calls == ["release"]
+
+
+def test_worker_process_shutdown_handler_releases(monkeypatch):
+    """Mutant H8: worker_process_shutdown path must call release_all_registered_sync."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    import redis
+
+    client = redis.from_url(settings.REDIS_URL)
+    key = LOCK_KEY.format(source="PakistanLawSite:search_harvest:shutdown-hook")
+    token = lock_holder_token()
+    client.set(key, token, ex=120)
+    register_lock(key, token)
+    release_on_worker_process_shutdown()
+    assert client.get(key) is None
+    client.close()
 
 
 @pytest.mark.asyncio
@@ -281,6 +492,44 @@ async def test_release_search_harvest_locks_respects_deploy_flag(r, monkeypatch)
     n = await release_pls_search_harvest_redis_locks()
     assert n >= 1
     assert not await r.exists(prefix_key)
+
+
+@pytest.mark.asyncio
+async def test_dead_holder_takeover_never_steals_legacy_sha_lock_value(r, monkeypatch):
+    """Legacy pre-identity tokens are not taken over; wait for TTL or deploy release."""
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    source = "PakistanLawSite:search_harvest:slot-legacy"
+    key = LOCK_KEY.format(source=source)
+    legacy = "a" * 64
+    await r.set(key, legacy, ex=120)
+    lock = SessionLock(source, r, holder_identity=True)
+    with pytest.raises(SessionLockHeld):
+        await lock.acquire(dead_holder_takeover=True)
+    await r.delete(key)
+
+
+def test_pls_lock_task_prerun_starts_heartbeat_for_harvest_task(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    from scraper.pls_worker_heartbeat import stop_worker_heartbeat_daemon
+    import scraper.pls_worker_heartbeat as wh
+
+    stop_worker_heartbeat_daemon()
+    from scraper.tasks.celery_app import _pls_lock_task_prerun
+    from scraper.tasks.pls_search_harvest import pls_search_harvest_tick
+
+    class _Req:
+        hostname = "scraper-public@worker-public-host"
+
+    class _Task:
+        request = _Req()
+
+    _pls_lock_task_prerun(sender=pls_search_harvest_tick, task=_Task())
+    assert wh._daemon is not None and wh._daemon.is_alive()
+    from scraper.pls_lock_holder import lock_host_identity
+
+    assert lock_host_identity() == "worker-public-host"
+    stop_worker_heartbeat_daemon()
 
 
 @pytest.mark.asyncio

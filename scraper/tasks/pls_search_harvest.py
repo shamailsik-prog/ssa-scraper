@@ -1011,12 +1011,11 @@ def queue_search_harvest_ticks(app, *, slots=SEARCH_HARVEST_SLOTS) -> List[int]:
 
 @shared_task(name="scraper.tasks.pls_search_harvest.pls_search_harvest_tick")
 def pls_search_harvest_tick(**kwargs) -> Dict[str, Any]:
-    from scraper.tasks.deploy_hold import login_work_held
-
-    if login_work_held():
-        return {"skipped": True, "reason": "deploy_hold"}
-
     try:
+        from scraper.tasks.deploy_hold import login_work_held
+
+        if login_work_held():
+            return {"skipped": True, "reason": "deploy_hold"}
         return _pls_search_harvest_tick_body(**kwargs)
     finally:
         from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
