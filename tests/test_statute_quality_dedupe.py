@@ -118,4 +118,5 @@ async def test_find_duplicate_groups_punctuation_merge_and_keeper(db):
     dry = await find_duplicate_groups(db)
     assert dry["duplicate_groups"] == 1
     assert dry["winners"] == [good_id]
-    assert bad_id in dry["losers"]
+    assert dry["losers"] == [], "differing statutory wording must not be auto-quarantined"
+    assert dry["review_required_ids"] == [bad_id]
