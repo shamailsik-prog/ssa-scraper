@@ -90,3 +90,12 @@ def test_unknown_or_busy_shared_state_aborts_without_mutation(tmp_path: Path, co
     assert result.returncode != 0, result.stdout + result.stderr
     assert "UPDATE scraper_jobs" not in operations
     assert "UNSAFE_REDIS_WRITE" not in operations
+
+
+def test_idle_guard_has_single_definition_and_valid_shell_syntax() -> None:
+    script = ROOT / "scripts/pls_host_lib.sh"
+    body = script.read_text(encoding="utf-8")
+    assert body.count("pls_host_force_release_stalled_harvest()") == 1
+    assert body.count("pls_host_confirm_pls_idle_after_local_stop()") == 1
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
