@@ -13,13 +13,9 @@ def billiard_pool_worker_initializer() -> None:
 
 
 def billiard_pool_process_destructor(pid: int, exitcode: int) -> None:
-    import signal
+    from scraper.pls_billiard_process_exit import billiard_worker_process_exit
 
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    from scraper.pls_lock_shutdown import release_on_worker_process_shutdown
-
-    release_on_worker_process_shutdown()
+    billiard_worker_process_exit(pid, exitcode)
 
 
 def hold_registered_lock_in_pool_child(

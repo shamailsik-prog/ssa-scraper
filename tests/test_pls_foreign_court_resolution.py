@@ -5,6 +5,7 @@ import pytest
 from scraper.config import Settings, settings
 from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.parsers.pls_court_resolution import (
+    citation_is_pld_sc_or_scmr,
     court_from_pls_header_block,
     foreign_court_from_first_300_chars,
     proposed_court_name,
@@ -87,6 +88,7 @@ def test_w1_hc_stored_body_sc_mention_does_not_swap_to_sc():
     [
         ("[Supreme Court of India (India)]", "Supreme Court of India"),
         ("[Supreme Court of U.K.]", "Supreme Court of UK"),
+        ("[High Court of Justice (England)]", "High Court of Justice (England)"),
         ("[Supreme Court (AJ&K)]", "Azad Jammu and Kashmir Supreme Court"),
     ],
 )
@@ -179,3 +181,105 @@ async def test_u2_undo_restores_only_when_apply_value_unchanged(db, monkeypatch)
 
 def test_mutant_b4_config_pls_court_resolution_default_off():
     assert Settings.model_fields["SSA_PLS_COURT_RESOLUTION"].default is False
+
+
+def test_foreign_heading_inside_first_300_chars_positive():
+    pad = "x" * 250
+    text = f"{pad}\n[High Court of Justice (England)]\nBefore X, J\nA versus B\n"
+    assert len(text[:300]) >= len(pad)
+    assert foreign_court_from_first_300_chars(text) == "High Court of Justice (England)"
+
+
+def test_foreign_heading_beyond_300_chars_not_used():
+    pad = "x" * 320
+    text = f"{pad}\n[Supreme Court of India]\nBefore X, J\n"
+    assert foreign_court_from_first_300_chars(text) is None
+
+
+def test_pld_scmr_guard_blocks_sc_hc_swap():
+    assert citation_is_pld_sc_or_scmr("PLD 2024 SC 1")
+    assert citation_is_pld_sc_or_scmr("SCMR 2024 100")
+    text = "2021 MLD 1\nIN THE HIGH COURT OF LAHORE\nBefore X\nA versus B\n"
+    assert sc_hc_mislabel_fix("Supreme Court of Pakistan", text, citation="PLD 2024 SC 1") is None
+
+
+def test_top_three_header_rule_ignores_hc_on_fourth_line():
+    text = (
+        "2021 MLD 2\n"
+        "Line two\n"
+        "Line three\n"
+        "IN THE HIGH COURT OF LAHORE\n"
+        "Before X, J\n"
+        "A versus B\n"
+    )
+    assert sc_hc_mislabel_fix("Supreme Court of Pakistan", text, citation="2021 MLD 2") is None
+
+
+def test_hc_to_sc_swap_from_top_three_header_lines():
+    text = (
+        "2021 MLD 3\n"
+        "IN THE SUPREME COURT OF PAKISTAN\n"
+        "Before X, J\n"
+        "A versus B\n"
+    )
+    assert sc_hc_mislabel_fix("Lahore High Court", text, citation="2021 MLD 3") == "Supreme Court of Pakistan"
+
+
+def test_sc_row_maps_sindh_at_karachi_header_to_canonical_hc():
+    text = (
+        "2022 MLD 10\n"
+        "IN THE HIGH COURT OF SINDH AT KARACHI\n"
+        "Before X, J\n"
+        "A versus B\n"
+    )
+    prop = proposed_court_name("Supreme Court of Pakistan", text, citation="2022 MLD 10")
+    assert prop == "Sindh"
+
+
+@pytest.mark.asyncio
+async def test_backfill_skipped_when_resolution_flag_off(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_COURT_RESOLUTION", False)
+    out = await find_court_fixes(db)
+    assert out.get("disabled") is True
+    assert out["fixes"] == []
+
+
+@pytest.mark.asyncio
+async def test_undo_deletes_snapshot_metadata_after_restore(db, monkeypatch):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from scraper.models import CorpusMetadata, Judgment
+    from scraper.tasks.judgment_court_backfill import (
+        _record_run,
+        _undo_snapshot_key,
+        apply_court_fixes,
+        undo_run,
+    )
+
+    monkeypatch.setattr(settings, "SSA_PLS_COURT_RESOLUTION", True)
+    jid = uuid4()
+    db.add(
+        Judgment(
+            id=jid,
+            source_name="PakistanLawSite",
+            court_name="Supreme Court of Pakistan",
+            canonical_citation="1992 MLD 950",
+            full_text=FOREIGN_MLD.replace("947", "950") + ("z" * 600),
+            full_text_hash="abc123foreign3",
+            access_method="rendered_copy",
+        )
+    )
+    await db.commit()
+    fixes = (await find_court_fixes(db))["fixes"]
+    fixes = [f for f in fixes if f["id"] == str(jid)]
+    run_id = "testrun003"
+    await _record_run(db, run_id)
+    await apply_court_fixes(db, run_id, fixes)
+    await db.commit()
+    await undo_run(db, run_id)
+    snap = (
+        await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_snapshot_key(run_id)))
+    ).scalars().first()
+    assert snap is None

@@ -91,6 +91,7 @@ async def test_idle_slot_claims_other_share_while_both_active(db, r, monkeypatch
     row, lock, took_over, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 2, redis_client=r)
     assert row is not None
     assert row.query_json["reporter"] == "PLD"
+    assert row.slot == 2
     assert cross_slot is True
     assert took_over is False
     await lock.release()
@@ -103,6 +104,43 @@ async def test_own_share_always_claimed_before_cross_slot(db, r, monkeypatch):
     row, lock, _, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 1, redis_client=r)
     assert row is not None and row.query_json["reporter"] == "PLD"
     assert cross_slot is False
+    await lock.release()
+
+
+async def test_m2_logged_out_under_30_minutes_not_stolen_via_cross_slot_or_takeover(db, r, monkeypatch):
+    """Slot 1 must not take slot 2's share while slot 2 has been down for less than TAKEOVER_MINUTES."""
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from scraper.models import BrowserSessionSlot, ScraperSource
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", True)
+    now = datetime.now(timezone.utc)
+    source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))).scalars().first()
+    source.state = "ACTIVE"
+    for row in (await db.execute(select(BrowserSessionSlot).where(BrowserSessionSlot.source_name == "PakistanLawSite"))).scalars().all():
+        if row.slot_number == 1:
+            row.state = "ACTIVE"
+            row.storage_state_encrypted = settings.encrypt_value("{}")
+        elif row.slot_number == 2:
+            row.state = "NEEDS_HUMAN_LOGIN"
+            row.last_used_at = row.last_verified_at = now - timedelta(minutes=10)
+    await db.commit()
+    await _seed(db, ["PLC"])
+    row, lock, took_over, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 1, redis_client=r)
+    assert row is None and not took_over and not cross_slot
+    if lock:
+        await lock.release()
+
+
+async def test_cross_slot_exclude_reporters_skips_listed_journals(db, r, monkeypatch):
+    await _slots_active(db)
+    await _seed(db, ["PLD", "SCMR"])
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", True)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS", "PLD")
+    row, lock, _, cross_slot = await harvest.try_claim_harvest_query_for_slot(db, 2, redis_client=r)
+    assert row is not None and row.query_json["reporter"] == "SCMR" and cross_slot is True
     await lock.release()
 
 

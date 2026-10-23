@@ -6,7 +6,13 @@ import re
 from typing import Optional
 
 from scraper.parsers.case_metadata import judgment_header_slice
-from scraper.parsers.citation_extractor import canonical_court, court_from_bracket, normalise_citation
+from scraper.parsers.citation_extractor import PLD_COURT_CANONICAL, canonical_court, court_from_bracket, normalise_citation
+
+_PAK_HC_CANONICAL = frozenset(
+    v
+    for k, v in PLD_COURT_CANONICAL.items()
+    if "HIGH COURT" in k or v in ("Lahore", "Sindh", "Peshawar", "Balochistan", "Islamabad", "Karachi")
+)
 
 _FOREIGN_COUNTRY = re.compile(
     r"(?i)\b(?:india|bangladesh|england|u\.?k\.?|united\s+kingdom|sri\s+lanka)\b",
@@ -47,6 +53,12 @@ def _header_top_block(text: str, *, max_lines: int = 3) -> str:
     return "\n".join(header.splitlines()[:max_lines])
 
 
+_GEOGRAPHIC_PAREN = re.compile(
+    r"\((?:england|bangladesh|sri\s+lanka|india|u\.?k\.?|united\s+kingdom)\)",
+    re.I,
+)
+
+
 def _normalize_foreign_display(label: str) -> str:
     cleaned = re.sub(r"\s+", " ", label.strip(" .,-"))
     low = cleaned.lower()
@@ -56,6 +68,8 @@ def _normalize_foreign_display(label: str) -> str:
         return "Supreme Court of UK"
     if "supreme" in low and re.search(r"azad|jammu|kashmir", low):
         return "Azad Jammu and Kashmir Supreme Court"
+    if re.search(r"(?i)\bhigh\s+court\b", cleaned) and _GEOGRAPHIC_PAREN.search(cleaned):
+        return cleaned[:255]
     cleaned = re.sub(r"\s*\([^)]*\)\s*", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:255]
 
@@ -130,18 +144,35 @@ def resolve_pls_court(
     return row_court
 
 
+def _accepted_high_court_label(label: str) -> Optional[str]:
+    raw = re.sub(r"\s+", " ", label.strip())
+    if re.search(r"(?i)\bhigh\s+court\b", raw) and re.search(r"(?i)\bsindh\b", raw):
+        return "Sindh"
+    accepted = _accepted_court_name(label)
+    if not accepted:
+        return None
+    if re.search(r"(?i)\bhigh\s+court\b", accepted):
+        return accepted
+    canon = canonical_court(accepted) or accepted
+    if canon in _PAK_HC_CANONICAL:
+        return canon
+    return None
+
+
 def _header_sc_hc_swap_court(text: str) -> Optional[str]:
     """SC↔HC swap signal from the first three header lines only (not appeal-from or body text)."""
     block = _header_top_block(text, max_lines=3)
     for line in block.splitlines():
         bm = _HEADER_TOP_HC_BRACKET.match(line)
         if bm:
-            accepted = _accepted_court_name(bm.group(1))
-            if accepted and re.search(r"(?i)\bhigh\s+court\b", accepted):
-                return accepted
+            hc = _accepted_high_court_label(bm.group(1))
+            if hc:
+                return hc
     m = _HEADER_TOP_IN_THE_HC.search(block)
     if m:
-        return _accepted_court_name(m.group(1))
+        hc = _accepted_high_court_label(m.group(1))
+        if hc:
+            return hc
     if _HEADER_TOP_IN_THE_SC_PAK.search(block):
         return "Supreme Court of Pakistan"
     return None
@@ -186,5 +217,10 @@ def proposed_court_name(
 
 def foreign_court_mislabel_sql_predicate() -> str:
     """SQL fragment: heading names a foreign SC/HC but court_name is SC Pakistan."""
-    return r"""left(j.full_text, 300) ~* '\[(Supreme Court|High Court)[^\]]*(India|Bangladesh|England|U\.?K|Sri Lanka)'
+    return r"""(
+        left(j.full_text, 300) ~* '\[(Supreme Court|High Court)[^\]]*(India|Bangladesh|England|U\.?K|Sri Lanka)'
+        OR left(j.full_text, 300) ~* '\[Supreme Court \(AJ&K\)\]'
+        OR left(j.full_text, 300) ~* '\[Supreme Court \(AJ&amp;K\)\]'
+        OR left(j.full_text, 300) ~* 'Azad Jammu[^\n]{0,40}Supreme Court'
+      )
       AND j.court_name ILIKE 'Supreme Court of Pakistan'"""

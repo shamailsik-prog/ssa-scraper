@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import false, func, select, true
+from sqlalchemy import and_, false, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -367,6 +367,20 @@ def _share_filter(slot: int):
     return _reporter_sql().notin_(share) if share else true()
 
 
+def _other_harvest_slot(slot: int) -> int:
+    return 2 if slot == 1 else 1
+
+
+def _cross_slot_steal_filter(slot: int):
+    """Other slot's reporter share, minus PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS."""
+    other = _other_harvest_slot(slot)
+    base = _share_filter(other)
+    excluded = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS))
+    if excluded:
+        return and_(base, _reporter_sql().notin_(excluded))
+    return base
+
+
 async def pick_next_query(
     db: AsyncSession,
     *,
@@ -417,6 +431,7 @@ async def claim_next_query(
     *,
     redis_client=None,
     take_over: bool = False,
+    other_share_only: bool = False,
     candidates: int = 25,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
     """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
@@ -427,7 +442,9 @@ async def claim_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if not take_over:
+    if other_share_only:
+        stmt = stmt.where(_cross_slot_steal_filter(slot))
+    elif not take_over:
         stmt = stmt.where(_share_filter(slot))
     rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
@@ -471,8 +488,11 @@ async def try_claim_harvest_query_for_slot(
     cross_slot_claim = False
     query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
     if query_row is None and await cross_slot_idle_claim_allowed(db, chosen):
-        cross_slot_claim = True
-        query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+        query_row, query_lock = await claim_next_query(
+            db, chosen, redis_client=redis_client, other_share_only=True
+        )
+        if query_row is not None:
+            cross_slot_claim = True
     if query_row is None and await slot_takeover_due(db, chosen):
         took_over = True
         query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
@@ -950,6 +970,8 @@ async def _run_search_harvest_locked(
             query_row, query_lock, took_over, cross_slot_claim = await try_claim_harvest_query_for_slot(
                 db, chosen, redis_client=redis_client
             )
+            if query_row is not None:
+                assert query_row.slot == chosen
         if query_row is None:
             return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
         m = await active_map(db, SOURCE_NAME)
