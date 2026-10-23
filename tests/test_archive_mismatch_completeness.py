@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from scraper.models import ArchiveObject
-from scraper.storage.archive import ArchiveMirror
+from scraper.storage.archive import ArchiveMirror, judgment_prefix
 from tests.test_mirror_drive_concurrency import _drive_target
 from tests.test_public_security_pdf_archive import _promote_one
 
@@ -27,11 +27,13 @@ from tests.test_public_security_pdf_archive import _promote_one
 async def test_mismatch_never_claimed_complete(db, source, statuses, expected_incomplete, expected_backlog):
     j = await _promote_one(db, source, "PLD 2024 SC 991")
     t = await _drive_target(db)
+    prefix = judgment_prefix(j)
+    suffixes = ("original.pdf", "judgment.txt", "metadata.json")
     db.add_all([
         ArchiveObject(
             target_id=t.id,
             judgment_id=j.id,
-            object_key=f"test/{j.id}/{index}",
+            object_key=f"{prefix}/{suffixes[index]}",
             content_hash="a" * 64,
             byte_size=5,
             document_kind="text",
