@@ -459,13 +459,15 @@ class ArchiveMirror:
     async def _mirror_drive_uploads(
         self,
         t: ArchiveTarget,
-        adapter: ArchiveAdapter,
+        target_type: str,
+        target_cfg: Dict[str, Any],
         judgments: List[Judgment],
         summary: Dict[str, int],
         index_rows: List[List[str]],
         *,
         concurrency: int,
     ) -> int:
+        """Parallel Drive uploads; each worker builds its own adapter (googleapiclient/httplib2 is not thread-safe)."""
         from scraper.database import SessionLocal
 
         limiter = _AdaptiveConcurrency(concurrency)
@@ -480,6 +482,10 @@ class ArchiveMirror:
                 return
             await limiter.acquire()
             try:
+                if self._time_up():
+                    stop.set()
+                    return
+                adapter = await asyncio.to_thread(self.adapter_factory, target_type, target_cfg)
                 async with SessionLocal() as session:
                     try:
                         status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
@@ -743,7 +749,15 @@ class ArchiveMirror:
             drive_concurrency = min(16, max(1, int(settings.MIRROR_DRIVE_CONCURRENCY))) if t.target_type == "google_drive" else 1
             if t.target_type == "google_drive" and drive_concurrency > 1:
                 touched = bool(judgments)
-                failures = await self._mirror_drive_uploads(t, adapter, judgments, summary, index_rows, concurrency=drive_concurrency)
+                failures = await self._mirror_drive_uploads(
+                    t,
+                    t.target_type,
+                    target_config(t),
+                    judgments,
+                    summary,
+                    index_rows,
+                    concurrency=drive_concurrency,
+                )
                 await self.db.refresh(t)
                 target_timed_out = self.out_of_time
             else:

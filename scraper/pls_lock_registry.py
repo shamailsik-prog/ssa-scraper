@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import signal
 import threading
-from typing import List, Tuple
+from typing import List, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +26,46 @@ def unregister_lock(redis_key: str, token: str) -> None:
             pass
 
 
+def _signals_to_block() -> Set[int]:
+    sigs: Set[int] = {signal.SIGTERM}
+    if hasattr(signal, "SIGINT"):
+        sigs.add(signal.SIGINT)
+    return sigs
+
+
 def release_all_registered_sync() -> int:
     """Best-effort compare-and-delete for every lock this process still tracks."""
     from scraper.config import settings
 
     if not settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
         return 0
-    with _guard:
+
+    prior_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        try:
+            prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _signals_to_block())
+        except (ValueError, OSError, AttributeError):
+            prior_mask = None
+
+    if not _guard.acquire(blocking=False):
+        if prior_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+            except (ValueError, OSError, AttributeError):
+                pass
+        return 0
+
+    try:
         pairs = list(_held)
         _held.clear()
+    finally:
+        _guard.release()
+        if prior_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+            except (ValueError, OSError, AttributeError):
+                pass
+
     if not pairs:
         return 0
     try:

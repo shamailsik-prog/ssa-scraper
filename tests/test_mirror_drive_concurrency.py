@@ -130,6 +130,51 @@ def test_adaptive_concurrency_halve_floor_is_one():
 
 
 @pytest.mark.asyncio
+async def test_drive_concurrency_builds_distinct_http_client_per_worker(db, source, monkeypatch):
+    """Parallel uploads must not share one httplib2-backed Drive service across threads."""
+
+    overlap_lock = threading.Lock()
+    clients_in_flight: Dict[int, int] = {}
+    shared_client_across_threads = False
+    factory_calls = 0
+
+    class _ClientBoundAdapter(_TrackingAdapter):
+        def __init__(self, http_client: object) -> None:
+            super().__init__()
+            self.http_client = http_client
+
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            nonlocal shared_client_across_threads
+            tid = threading.get_ident()
+            cid = id(self.http_client)
+            with overlap_lock:
+                for other_tid, other_cid in clients_in_flight.items():
+                    if other_tid != tid and other_cid == cid:
+                        shared_client_across_threads = True
+                clients_in_flight[tid] = cid
+            try:
+                return super().put(key, data, content_type)
+            finally:
+                with overlap_lock:
+                    clients_in_flight.pop(tid, None)
+
+    def factory(_target_type, _config):
+        nonlocal factory_calls
+        factory_calls += 1
+        return _ClientBoundAdapter(object())
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 4)
+    await _drive_target(db)
+
+    await ArchiveMirror(db, adapter_factory=factory).mirror_pending(limit=4)
+    await db.commit()
+
+    assert factory_calls >= 2, "each parallel worker should build its own Drive adapter"
+    assert not shared_client_across_threads, "same http client must not be used from multiple threads at once"
+
+
+@pytest.mark.asyncio
 async def test_drive_concurrency_uploads_in_parallel_without_duplicate_ledger_rows(db, source, tracking_drive, monkeypatch):
     adapter, factory = tracking_drive
     concurrency = 4
@@ -257,6 +302,31 @@ async def test_drive_concurrency_failed_upload_persists_failed_ledger_row(db, so
 def test_mirror_drive_concurrency_capped_at_sixteen():
     with pytest.raises(Exception):
         settings.model_validate({**settings.model_dump(), "MIRROR_DRIVE_CONCURRENCY": 17})
+
+
+@pytest.mark.asyncio
+async def test_drive_concurrency_time_budget_after_acquire_stops_inflight(db, source, monkeypatch):
+    """Deadline ~0.3s ahead with 0.4s uploads: workers must not run past budget (mutant M15)."""
+
+    class _SlowPutAdapter(_TrackingAdapter):
+        def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+            time.sleep(0.4)
+            return super().put(key, data, content_type)
+
+    adapter = _SlowPutAdapter()
+
+    def factory(_target_type, _config):
+        return adapter
+
+    monkeypatch.setattr(settings, "MIRROR_DRIVE_CONCURRENCY", 4)
+    await _promote_many(db, source, 3)
+    await _drive_target(db)
+
+    mirror = ArchiveMirror(db, adapter_factory=factory, deadline=time.monotonic() + 0.3)
+    await mirror.mirror_pending(limit=3)
+    await db.commit()
+    assert mirror.out_of_time
+    assert len(adapter.put_keys) < 9
 
 
 @pytest.mark.asyncio
