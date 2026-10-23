@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -99,6 +99,25 @@ def target_config(t: ArchiveTarget) -> Dict[str, Any]:
 
 RETRY_DELAYS = (1.0, 3.0)
 JUDGMENT_OBJECT_COUNT = 3  # document (original or rendered copy) + judgment.txt + metadata.json
+
+
+def _judgment_archive_slot(object_key):
+    """Identify required judgment artifact slots, ignoring duplicate PDFs and unrelated keys.
+
+    A raw count of three ledger rows is not evidence that all three distinct
+    artifacts exist. Both original and rendered PDFs occupy the same PDF slot.
+    """
+    return case(
+        (object_key.like("%/judgment.txt"), "text"),
+        (object_key.like("%/metadata.json"), "metadata"),
+        (object_key.like("%/original.pdf"), "pdf"),
+        (object_key.like("%/rendered_copy.pdf"), "pdf"),
+        else_=None,
+    )
+
+
+def _judgment_archive_slot_count():
+    return func.count(func.distinct(_judgment_archive_slot(ArchiveObject.object_key)))
 OBJECTS_CACHE_MAX = 600  # judgments whose built objects one run keeps for the next target (a slice is 500)
 
 
@@ -483,7 +502,7 @@ class ArchiveMirror:
             if not self._policy_allows(t, j.access_method):
                 summary["skipped_policy"] += 1
                 continue
-            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+            already = (await self.db.execute(select(_judgment_archive_slot_count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
             if already >= JUDGMENT_OBJECT_COUNT:
                 continue
             objs = await self.judgment_objects(j)
@@ -584,7 +603,7 @@ class ArchiveMirror:
         """
         statuses = ["written", "mismatch"] if include_mismatch else ["written"]
         return (
-            select(ArchiveObject.judgment_id.label("jid"), func.count().label("c"))
+            select(ArchiveObject.judgment_id.label("jid"), _judgment_archive_slot_count().label("c"))
             .where(ArchiveObject.target_id == t.id, ArchiveObject.status.in_(statuses), ArchiveObject.judgment_id.isnot(None))
             .group_by(ArchiveObject.judgment_id)
             .subquery()
@@ -807,7 +826,7 @@ class ArchiveMirror:
                     if not self._policy_allows(t, j.access_method):
                         summary["skipped_policy"] += 1
                         continue
-                    already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+                    already = (await self.db.execute(select(_judgment_archive_slot_count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
                     if already >= JUDGMENT_OBJECT_COUNT:
                         continue  # complete on this target: skip the PDF render entirely
                     objs = await self.judgment_objects(j)
