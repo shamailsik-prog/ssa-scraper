@@ -1,0 +1,10 @@
+SCHEDULE I — CUSTOMS DUTY
+Serial No. | Description of goods | Rate of duty
+1 | Wheat grain | 10%
+2 | Rice Â basmati | 15%
+3 | Cotton | 5%
+4 | Machinery parts | 20%
+5 | Textiles | 12%
+6 | Chemicals | 8%
+7 | Plastics | 6%
+8 | Metals | 9%
