@@ -32,7 +32,7 @@ def _undo_prior_latest_key(run_id: str) -> str:
 
 
 async def _record_run(db: AsyncSession, run_id: str) -> None:
-    prior = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
+    prior = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY).with_for_update())).scalars().first()
     prior_val = prior.value if prior is not None else None
     db.add(CorpusMetadata(key=_undo_prior_latest_key(run_id), value=prior_val or ""))
     row = prior
@@ -88,14 +88,27 @@ async def find_court_fixes(db: AsyncSession, *, limit: Optional[int] = None) -> 
 
 
 async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str, str]]) -> int:
+    """Apply only proposals whose original court is still unchanged.
+
+    Lock each row so a backfill cannot overwrite a concurrent curator's edit.
+    Snapshot the *applied* value as well, for conditional, non-destructive undo.
+    """
     snapshot: List[Dict[str, str]] = []
     n = 0
     for fix in fixes:
         jid = UUID(fix["id"])
-        j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
-        if j is None:
+        j = (await db.execute(
+            select(Judgment).where(Judgment.id == jid).with_for_update()
+        )).scalars().first()
+        if j is None or j.source_name != "PakistanLawSite":
             continue
-        snapshot.append({"id": str(j.id), "court_name": j.court_name or ""})
+        if (j.court_name or "") != fix["from"] or (j.court_name or "") == fix["to"]:
+            continue  # stale proposal or already corrected; never overwrite
+        snapshot.append({
+            "id": str(j.id),
+            "court_name": j.court_name or "",
+            "applied_court_name": fix["to"],
+        })
         j.court_name = fix["to"]
         n += 1
     db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
@@ -103,28 +116,46 @@ async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str,
 
 
 async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
-    snap_row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_snapshot_key(run_id)))).scalars().first()
-    restored = 0
-    if snap_row is not None and snap_row.value:
-        for item in json.loads(snap_row.value):
-            jid = UUID(item["id"])
-            j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
-            if j is not None:
-                j.court_name = item["court_name"] or None
-                restored += 1
-        await db.delete(snap_row)
-    prior_row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_prior_latest_key(run_id)))).scalars().first()
-    prior_latest = prior_row.value if prior_row is not None else None
-    latest = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
-    if latest is not None and latest.value == run_id:
-        if prior_latest:
-            latest.value = prior_latest
-        else:
-            await db.delete(latest)
-    if prior_row is not None:
-        await db.delete(prior_row)
+    """Undo only the latest run, and only if no court was edited afterwards.
+
+    Validate the entire snapshot under row locks before changing anything:
+    one conflicting or missing judgment must not cause a partial rollback.
+    """
+    latest = (await db.execute(
+        select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY).with_for_update()
+    )).scalars().first()
+    if latest is None or latest.value != run_id:
+        raise ValueError("court backfill undo refused: run is not the latest applied run")
+    snap_row = (await db.execute(
+        select(CorpusMetadata).where(CorpusMetadata.key == _undo_snapshot_key(run_id)).with_for_update()
+    )).scalars().first()
+    prior_row = (await db.execute(
+        select(CorpusMetadata).where(CorpusMetadata.key == _undo_prior_latest_key(run_id)).with_for_update()
+    )).scalars().first()
+    if snap_row is None or not snap_row.value or prior_row is None:
+        raise ValueError("court backfill undo refused: complete run snapshot is unavailable")
+    snapshot = json.loads(snap_row.value)
+    to_restore = []
+    for item in snapshot:
+        if "applied_court_name" not in item:
+            raise ValueError("court backfill undo refused: snapshot lacks applied-value provenance")
+        jid = UUID(item["id"])
+        j = (await db.execute(
+            select(Judgment).where(Judgment.id == jid).with_for_update()
+        )).scalars().first()
+        if j is None or j.court_name != item["applied_court_name"]:
+            raise ValueError(f"court backfill undo refused: judgment {jid} changed or disappeared")
+        to_restore.append((j, item["court_name"] or None))
+    for j, old_court in to_restore:
+        j.court_name = old_court
+    await db.delete(snap_row)
+    if prior_row.value:
+        latest.value = prior_row.value
+    else:
+        await db.delete(latest)
+    await db.delete(prior_row)
     await db.commit()
-    return {"court_names_restored": restored}
+    return {"court_names_restored": len(to_restore)}
 
 
 async def run_judgment_court_backfill(*, apply: bool = False, undo: Optional[str] = None, limit: Optional[int] = None) -> Dict[str, Any]:
