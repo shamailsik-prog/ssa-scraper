@@ -46,8 +46,11 @@ def local_pid_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
+    except OSError:
+        # EPERM and other ambiguous errors are not evidence that a worker died.
+        return True
     return True
 
 
@@ -62,11 +65,13 @@ async def remote_worker_heartbeat_present(redis_client, host: str) -> bool:
 
 
 async def lock_value_holder_stale(redis_client, value: str) -> bool:
-    """True when the holder is certainly gone (local dead pid, or remote host with no fresh heartbeat)."""
+    """Only a definitively missing local process proves a stale lock."""
     parsed = parse_lock_holder(value)
     if parsed is None:
         return False
     host, pid, _ = parsed
     if host == local_hostname():
         return not local_pid_alive(pid)
-    return not await remote_worker_heartbeat_present(redis_client, host)
+    # A remote heartbeat can expire during a slow page while its Redis lock is still live.
+    # Missing heartbeat alone is not proof of death: fail closed until lock TTL expires.
+    return False
