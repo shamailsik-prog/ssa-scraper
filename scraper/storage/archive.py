@@ -24,10 +24,13 @@ import hashlib
 import io
 import json
 import logging
+import random
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,14 +102,78 @@ JUDGMENT_OBJECT_COUNT = 3  # document (original or rendered copy) + judgment.txt
 OBJECTS_CACHE_MAX = 600  # judgments whose built objects one run keeps for the next target (a slice is 500)
 
 
-async def _retry(fn, *args):
+def is_drive_rate_limited(exc: BaseException) -> bool:
+    """True for HTTP 429 or Drive 403 rateLimitExceeded."""
+    msg = str(exc).lower()
+    if "429" in msg or "ratelimitexceeded" in msg.replace(" ", "").replace("_", ""):
+        return True
+    if "403" in msg and "ratelimit" in msg:
+        return True
+    resp = getattr(exc, "resp", None)
+    status = getattr(resp, "status", None)
+    if status == 429:
+        return True
+    if status == 403 and "ratelimitexceeded" in msg.replace(" ", "").lower():
+        return True
+    return False
+
+
+async def drive_rate_limit_backoff() -> None:
+    await asyncio.sleep(random.uniform(0.5, 2.5))
+
+
+class _AdaptiveConcurrency:
+    """Caps concurrent Drive uploads; halving reduces the cap for the rest of the run."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self._in_flight = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                if self._in_flight < self.limit:
+                    self._in_flight += 1
+                    return
+            await asyncio.sleep(0.01)
+
+    async def release(self) -> None:
+        async with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+
+    def halve(self) -> int:
+        self.limit = max(1, self.limit // 2)
+        return self.limit
+
+
+@dataclass(frozen=True)
+class _JudgmentUploadWork:
+    target_id: UUID
+    judgment_id: UUID
+    prov_id: Optional[UUID]
+    access_method: str
+    obj: Dict[str, Any]
+
+
+@dataclass
+class _AdapterStoreOutcome:
+    status: str
+    content_hash: str
+    byte_size: int
+    stored_size: Optional[int] = None
+
+
+async def _retry(fn, *args, rate_limit_sensitive: bool = False):
     """Run an adapter call, retrying transient failures ('The read operation timed out' from Drive)."""
     for delay in (*RETRY_DELAYS, None):
         try:
             return await fn(*args)
         except ObjectExists:
             raise
-        except Exception:
+        except Exception as exc:
+            if rate_limit_sensitive and is_drive_rate_limited(exc):
+                raise
             if delay is None:
                 raise
             await asyncio.sleep(delay)
@@ -193,52 +260,92 @@ class ArchiveMirror:
         return objs
 
     # ------------------------------------------------------------------ write-once put
-    async def _write(self, target: ArchiveTarget, adapter: ArchiveAdapter, obj: Dict[str, Any], *, judgment_id=None, prov_id=None, access_method: str = "public") -> str:
+    async def _ledger_precheck(self, db: AsyncSession, target_id: UUID, obj: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        """If the ledger already records this key, return (status, content_hash) without touching the adapter."""
+        key = obj["key"]
+        data: bytes = obj["data"]
+        h = hashlib.sha256(data).hexdigest()
+        ledger = (await db.execute(select(ArchiveObject).where(ArchiveObject.target_id == target_id, ArchiveObject.object_key == key))).scalars().first()
+        if ledger is not None and ledger.status == "written":
+            if obj["kind"] == "rendered_copy":
+                return "exists", h
+            if ledger.content_hash != h:
+                ledger.status = "mismatch"
+                ledger.error = "new content differs from the write-once object"
+                await db.flush()
+                return "mismatch", h
+            return "exists", h
+        return None, h
+
+    async def _adapter_store(self, adapter: ArchiveAdapter, obj: Dict[str, Any], *, rate_limiter: Optional[_AdaptiveConcurrency] = None) -> _AdapterStoreOutcome:
         key = obj["key"]
         data: bytes = obj["data"]
         h = hashlib.sha256(data).hexdigest()
         stored_size: Optional[int] = None
-        ledger = (await self.db.execute(select(ArchiveObject).where(ArchiveObject.target_id == target.id, ArchiveObject.object_key == key))).scalars().first()
-        if ledger is not None and ledger.status == "written":
-            if obj["kind"] == "rendered_copy":
-                # A rendered copy is derived from the preserved text and, before the render was made
-                # deterministic, embedded its render time: the same judgment hashed differently on every run
-                # and 7,000 healthy objects were flagged 'mismatch'. The key is the identity; reconcile
-                # verifies the stored size.
-                return "exists"
-            if ledger.content_hash != h:
-                ledger.status = "mismatch"
-                ledger.error = "new content differs from the write-once object"
-                return "mismatch"
-            return "exists"
-        try:
-            exists = await _retry(asyncio.to_thread, adapter.exists, key)
-            if exists:
-                size = await _retry(asyncio.to_thread, adapter.size, key)
-                if obj["kind"] == "rendered_copy" and size:
-                    # derived copy already stored: adopt the stored object, never compare it with a re-render
-                    stored_size = size
-                    status = "written"
+        attempts = 0
+        rate_sensitive = rate_limiter is not None
+        while True:
+            try:
+                exists = await _retry(asyncio.to_thread, adapter.exists, key, rate_limit_sensitive=rate_sensitive)
+                if exists:
+                    size = await _retry(asyncio.to_thread, adapter.size, key, rate_limit_sensitive=rate_sensitive)
+                    if obj["kind"] == "rendered_copy" and size:
+                        stored_size = size
+                        status = "written"
+                    else:
+                        status = "written" if size == len(data) else "mismatch"
                 else:
-                    status = "written" if size == len(data) else "mismatch"
-            else:
-                await _retry(asyncio.to_thread, adapter.put, key, data, obj.get("content_type", "application/octet-stream"))
-                status = "written"
-        except ObjectExists:
-            status = "written"
-        except Exception as exc:
-            status = "failed"
-            err = str(exc)[:2000]
-            if ledger is None:
-                ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status="failed", error=err)
-                self.db.add(ledger)
-            else:
-                ledger.status, ledger.error = "failed", err
-            await self.db.flush()
-            raise
+                    await _retry(
+                        asyncio.to_thread,
+                        adapter.put,
+                        key,
+                        data,
+                        obj.get("content_type", "application/octet-stream"),
+                        rate_limit_sensitive=rate_sensitive,
+                    )
+                    status = "written"
+                return _AdapterStoreOutcome(status=status, content_hash=h, byte_size=len(data), stored_size=stored_size)
+            except ObjectExists:
+                return _AdapterStoreOutcome(status="written", content_hash=h, byte_size=len(data), stored_size=stored_size)
+            except Exception as exc:
+                if rate_limiter is not None and is_drive_rate_limited(exc) and attempts < 5:
+                    attempts += 1
+                    rate_limiter.halve()
+                    await drive_rate_limit_backoff()
+                    continue
+                raise
+
+    async def _persist_write(
+        self,
+        db: AsyncSession,
+        target: ArchiveTarget,
+        obj: Dict[str, Any],
+        outcome: _AdapterStoreOutcome,
+        *,
+        judgment_id=None,
+        prov_id=None,
+        access_method: str = "public",
+    ) -> str:
+        key = obj["key"]
+        data: bytes = obj["data"]
+        h = outcome.content_hash
+        ledger = (await db.execute(select(ArchiveObject).where(ArchiveObject.target_id == target.id, ArchiveObject.object_key == key))).scalars().first()
+        status = outcome.status
+        stored_size = outcome.stored_size
         if ledger is None:
-            ledger = ArchiveObject(target_id=target.id, object_key=key, content_hash=h, byte_size=stored_size or len(data), document_kind=obj["kind"], judgment_id=judgment_id, source_provenance_id=prov_id, access_method=access_method, status=status, written_at=datetime.now(timezone.utc))
-            self.db.add(ledger)
+            ledger = ArchiveObject(
+                target_id=target.id,
+                object_key=key,
+                content_hash=h,
+                byte_size=stored_size or len(data),
+                document_kind=obj["kind"],
+                judgment_id=judgment_id,
+                source_provenance_id=prov_id,
+                access_method=access_method,
+                status=status,
+                written_at=datetime.now(timezone.utc),
+            )
+            db.add(ledger)
         else:
             ledger.status = status
             ledger.error = None
@@ -248,8 +355,162 @@ class ArchiveMirror:
         if status == "written" and stored_size is None:
             target.objects_written += 1
             target.bytes_written += len(data)
-        await self.db.flush()
+        await db.flush()
         return status
+
+    async def _write(self, target: ArchiveTarget, adapter: ArchiveAdapter, obj: Dict[str, Any], *, judgment_id=None, prov_id=None, access_method: str = "public") -> str:
+        pre, h = await self._ledger_precheck(self.db, target.id, obj)
+        if pre is not None:
+            return pre
+        try:
+            outcome = await self._adapter_store(adapter, obj)
+        except Exception as exc:
+            err = str(exc)[:2000]
+            key = obj["key"]
+            data: bytes = obj["data"]
+            ledger = (await self.db.execute(select(ArchiveObject).where(ArchiveObject.target_id == target.id, ArchiveObject.object_key == key))).scalars().first()
+            if ledger is None:
+                ledger = ArchiveObject(
+                    target_id=target.id,
+                    object_key=key,
+                    content_hash=h,
+                    byte_size=len(data),
+                    document_kind=obj["kind"],
+                    judgment_id=judgment_id,
+                    source_provenance_id=prov_id,
+                    access_method=access_method,
+                    status="failed",
+                    error=err,
+                )
+                self.db.add(ledger)
+            else:
+                ledger.status, ledger.error = "failed", err
+            await self.db.flush()
+            raise
+        return await self._persist_write(self.db, target, obj, outcome, judgment_id=judgment_id, prov_id=prov_id, access_method=access_method)
+
+    async def _write_with_session(
+        self,
+        session: AsyncSession,
+        target_id: UUID,
+        adapter: ArchiveAdapter,
+        work: _JudgmentUploadWork,
+        *,
+        rate_limiter: Optional[_AdaptiveConcurrency] = None,
+    ) -> str:
+        target = (await session.execute(select(ArchiveTarget).where(ArchiveTarget.id == target_id))).scalars().first()
+        if target is None:
+            raise ArchiveError(f"archive target {target_id} missing")
+        pre, _ = await self._ledger_precheck(session, target_id, work.obj)
+        if pre is not None:
+            return pre
+        try:
+            outcome = await self._adapter_store(adapter, work.obj, rate_limiter=rate_limiter)
+        except Exception as exc:
+            err = str(exc)[:2000]
+            key = work.obj["key"]
+            data: bytes = work.obj["data"]
+            h = hashlib.sha256(data).hexdigest()
+            ledger = (await session.execute(select(ArchiveObject).where(ArchiveObject.target_id == target_id, ArchiveObject.object_key == key))).scalars().first()
+            if ledger is None:
+                session.add(
+                    ArchiveObject(
+                        target_id=target_id,
+                        object_key=key,
+                        content_hash=h,
+                        byte_size=len(data),
+                        document_kind=work.obj["kind"],
+                        judgment_id=work.judgment_id,
+                        source_provenance_id=work.prov_id,
+                        access_method=work.access_method,
+                        status="failed",
+                        error=err,
+                    )
+                )
+            else:
+                ledger.status, ledger.error = "failed", err
+            await session.flush()
+            raise
+        return await self._persist_write(
+            session,
+            target,
+            work.obj,
+            outcome,
+            judgment_id=work.judgment_id,
+            prov_id=work.prov_id,
+            access_method=work.access_method,
+        )
+
+    async def _mirror_drive_uploads(
+        self,
+        t: ArchiveTarget,
+        adapter: ArchiveAdapter,
+        judgments: List[Judgment],
+        summary: Dict[str, int],
+        index_rows: List[List[str]],
+        *,
+        concurrency: int,
+    ) -> int:
+        from scraper.database import SessionLocal
+
+        limiter = _AdaptiveConcurrency(concurrency)
+        failures = 0
+        failure_lock = asyncio.Lock()
+        summary_lock = asyncio.Lock()
+        stop = asyncio.Event()
+
+        async def run_one(work: _JudgmentUploadWork) -> None:
+            nonlocal failures
+            if stop.is_set():
+                return
+            await limiter.acquire()
+            try:
+                async with SessionLocal() as session:
+                    status = await self._write_with_session(session, t.id, adapter, work, rate_limiter=limiter)
+                    await session.commit()
+                async with summary_lock:
+                    summary[status if status in summary else "written"] += 1
+            except Exception as exc:
+                async with failure_lock:
+                    failures += 1
+                    summary["failed"] += 1
+                    if failures >= 5:
+                        stop.set()
+                logger.warning("archive %s: %s failed: %s", t.name, work.obj["key"], exc)
+            finally:
+                await limiter.release()
+
+        tasks: List[asyncio.Task] = []
+        for j in judgments:
+            if self._time_up() or stop.is_set():
+                break
+            if not self._policy_allows(t, j.access_method):
+                summary["skipped_policy"] += 1
+                continue
+            already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+            if already >= JUDGMENT_OBJECT_COUNT:
+                continue
+            objs = await self.judgment_objects(j)
+            for obj in objs:
+                if self._time_up() or stop.is_set():
+                    break
+                tasks.append(asyncio.create_task(run_one(_JudgmentUploadWork(t.id, j.id, j.source_provenance_id, j.access_method, obj))))
+            index_rows.append(
+                [
+                    j.canonical_citation,
+                    j.case_title or "",
+                    j.court_name or "",
+                    str(j.year or ""),
+                    j.decision_date.isoformat() if j.decision_date else "",
+                    judgment_prefix(j),
+                    "original_pdf" if j.has_original_pdf else "rendered_copy",
+                    j.full_text_hash or "",
+                ]
+            )
+            await self._checkpoint()
+        if tasks:
+            await asyncio.gather(*tasks)
+        return failures
 
     def _policy_allows(self, target: ArchiveTarget, access_method: str) -> bool:
         if not is_login_session(access_method):
@@ -460,32 +721,38 @@ class ArchiveMirror:
             failures = 0
             target_timed_out = False
             touched = False
-            for j in judgments:
-                if self._time_up():
-                    target_timed_out = True
-                    break
-                touched = True
-                if not self._policy_allows(t, j.access_method):
-                    summary["skipped_policy"] += 1
-                    continue
-                already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
-                if already >= JUDGMENT_OBJECT_COUNT:
-                    continue  # complete on this target: skip the PDF render entirely
-                objs = await self.judgment_objects(j)
-                for obj in objs:
-                    try:
-                        status = await self._write(t, adapter, obj, judgment_id=j.id, prov_id=j.source_provenance_id, access_method=j.access_method)
-                        summary[status if status in summary else "written"] += 1
-                    except Exception as exc:
-                        failures += 1
-                        summary["failed"] += 1
-                        logger.warning("archive %s: %s failed: %s", t.name, obj["key"], exc)
-                        if failures >= 5:
-                            break
-                if failures >= 5:
-                    break
-                index_rows.append([j.canonical_citation, j.case_title or "", j.court_name or "", str(j.year or ""), j.decision_date.isoformat() if j.decision_date else "", judgment_prefix(j), "original_pdf" if j.has_original_pdf else "rendered_copy", j.full_text_hash or ""])
-                await self._checkpoint()
+            drive_concurrency = int(settings.MIRROR_DRIVE_CONCURRENCY) if t.target_type == "google_drive" else 1
+            if t.target_type == "google_drive" and drive_concurrency > 1:
+                touched = bool(judgments)
+                failures = await self._mirror_drive_uploads(t, adapter, judgments, summary, index_rows, concurrency=drive_concurrency)
+                target_timed_out = self.out_of_time
+            else:
+                for j in judgments:
+                    if self._time_up():
+                        target_timed_out = True
+                        break
+                    touched = True
+                    if not self._policy_allows(t, j.access_method):
+                        summary["skipped_policy"] += 1
+                        continue
+                    already = (await self.db.execute(select(func.count()).select_from(ArchiveObject).where(ArchiveObject.target_id == t.id, ArchiveObject.judgment_id == j.id, ArchiveObject.status == "written"))).scalar() or 0
+                    if already >= JUDGMENT_OBJECT_COUNT:
+                        continue  # complete on this target: skip the PDF render entirely
+                    objs = await self.judgment_objects(j)
+                    for obj in objs:
+                        try:
+                            status = await self._write(t, adapter, obj, judgment_id=j.id, prov_id=j.source_provenance_id, access_method=j.access_method)
+                            summary[status if status in summary else "written"] += 1
+                        except Exception as exc:
+                            failures += 1
+                            summary["failed"] += 1
+                            logger.warning("archive %s: %s failed: %s", t.name, obj["key"], exc)
+                            if failures >= 5:
+                                break
+                    if failures >= 5:
+                        break
+                    index_rows.append([j.canonical_citation, j.case_title or "", j.court_name or "", str(j.year or ""), j.decision_date.isoformat() if j.decision_date else "", judgment_prefix(j), "original_pdf" if j.has_original_pdf else "rendered_copy", j.full_text_hash or ""])
+                    await self._checkpoint()
             # _index CSV snapshot (write-once: timestamped file name)
             if index_rows:
                 buf = io.StringIO()
