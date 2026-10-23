@@ -96,14 +96,15 @@ async def _sections_map_for_statutes(db: AsyncSession, statute_ids: List[UUID]) 
     rows = (
         await db.execute(
             select(StatuteSection.statute_id, StatuteSection.section_number, StatuteSectionVersion.section_text)
-            .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+            .outerjoin(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
             .where(StatuteSection.statute_id.in_(statute_ids))
         )
     ).all()
     out: Dict[UUID, List[Dict[str, str]]] = defaultdict(list)
     for sid, num, txt in rows:
-        if (txt or "").strip():
-            out[sid].append({"section_number": str(num), "section_text": txt})
+        # Retain unreadable/empty sections: omitting them would make an incomplete
+        # statute look like an exact subset and allow unsafe auto-quarantine.
+        out[sid].append({"section_number": str(num), "section_text": txt or ""})
     return out
 
 
