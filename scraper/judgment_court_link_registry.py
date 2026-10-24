@@ -47,6 +47,8 @@ SEEDED_COURT_BY_KEY: Dict[str, str] = {
     "shariat appellate bench": "SC-SAB",
     "shariat appellate bench of supreme court": "SC-SAB",
     "shariat appellate bench sc": "SC-SAB",
+    "shariat appellate jurisdiction": "SC-SAB",
+    "shariat appellate jurisdiction supreme court": "SC-SAB",
     "supreme appellate court gilgit baltistan": "SAC-GB",
     "supreme appellate court gilgit-baltistan": "SAC-GB",
     "supreme appellate court gb": "SAC-GB",
@@ -61,16 +63,21 @@ SEEDED_COURT_BY_KEY: Dict[str, str] = {
 
 _AJK_SC_LABEL_KEYS = frozenset(k for k, code in SEEDED_COURT_BY_KEY.items() if code == "AJK-SC")
 
-_AJK_HC_BRACKET = re.compile(r"(?im)^\s*\[\s*azad\s+j\s*&\s*k\s*\]\s*$")
+_AJK_HEADER_LIMIT = 300
+_FIRST_BRACKET_RE = re.compile(r"\[([^\]]+)\]")
 _BEFORE_BENCH_RE = re.compile(
     r"(?im)^\s*before\s+.+?(?:,\s*)?(?:j\.?|jj\.?|c\.?\s*j\.?|cj)\.?\s*$",
 )
-_AJK_SHARIAT_RE = re.compile(
-    r"(?im)shariat\s+court.*(?:azad|aj&?k|jammu|kashmir)|(?:azad|aj&?k|jammu|kashmir).*shariat\s+court",
+_PRESENT_SC_RE = re.compile(r"(?im)^\s*present\b\s*[:.]?")
+_AJK_SC_IN_HEADING_RE = re.compile(
+    r"(?i)(?:\bsupreme\s+court\b|\bs\.?\s*c\.?(?:\s*\([^)]*\))?|\bsc\s*(?:\([^)]*\))?|\bs\s+c\s*(?:\([^)]*\))?)",
 )
-_PRESENT_CORAM_RE = re.compile(r"(?im)^\s*present\s*:")
-_AJK_HC_HEADING_RE = re.compile(r"(?im)\bhigh\s+court\b|\bh\.?\s*c\.?\b")
-_AJK_SC_HEADING_RE = re.compile(r"(?im)\bsupreme\s+court\b|\bs\.?\s*c\.?\b")
+_AJK_HC_IN_HEADING_RE = re.compile(
+    r"(?i)(?:\bhigh\s+court\b|\bh\.?\s*c\.?(?:\s*\([^)]*\))?|\bhc\s*(?:\([^)]*\))?)",
+)
+_AJK_PLAIN_BRACKET_RE = re.compile(
+    r"(?i)^(?:\s*azad\s+j\s*&\s*k\s*|\s*azad\s+jammu\s*(?:and|&)\s*kashmir\s*|\s*aj\s*&\s*k\s*)$",
+)
 
 # Specialty bodies created idempotently when missing (not in ``COURT_SEED``).
 ADDITIONAL_COURT_SEEDS: List[Dict[str, Any]] = [
@@ -179,32 +186,76 @@ def pls_court_label_key(court_name: Optional[str]) -> str:
 def normalize_link_label_key(key: str) -> str:
     key = re.sub(r"\bappelant\b", "appellate", key)
     key = re.sub(r"\bappelate\b", "appellate", key)
+    key = re.sub(r"\bappellant\b", "appellate", key)
+    key = re.sub(r"\btribanal\b", "tribunal", key)
     key = re.sub(r"\bnorthern\s+areas\b", "gilgit baltistan", key)
     return key
+
+
+def _maps_to_sac_gb(key: str) -> bool:
+    if "court of appeals" in key or "court of appeal" in key:
+        if "northern areas" in key or "gilgit baltistan" in key:
+            return True
+    if "supreme appellate court" not in key:
+        return False
+    return any(tok in key for tok in ("gilgit", "baltistan", "northern areas")) or bool(re.search(r"\bgb\b", key))
 
 
 def _title_from_label_key(key: str) -> str:
     return re.sub(r"\s+", " ", key.strip()).title()
 
 
-def _header_block(full_text: Optional[str], limit: int = 1200) -> str:
-    return (full_text or "")[:limit]
+def _ajk_header_window(full_text: Optional[str]) -> str:
+    return (full_text or "")[:_AJK_HEADER_LIMIT]
+
+
+def _first_bracket_heading(head: str) -> Optional[str]:
+    match = _FIRST_BRACKET_RE.search(head)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _bracket_heading_is_shariat(heading: str) -> bool:
+    return bool(re.search(r"(?i)shariat", heading))
+
+
+def _bracket_heading_is_sc(heading: str) -> bool:
+    if _bracket_heading_is_shariat(heading):
+        return False
+    if _AJK_HC_IN_HEADING_RE.search(heading):
+        return False
+    return bool(_AJK_SC_IN_HEADING_RE.search(heading))
+
+
+def _bracket_heading_is_hc(heading: str) -> bool:
+    if _bracket_heading_is_shariat(heading):
+        return False
+    return bool(_AJK_HC_IN_HEADING_RE.search(heading))
+
+
+def _bracket_heading_is_plain_azad_jk(heading: str) -> bool:
+    return bool(_AJK_PLAIN_BRACKET_RE.match(heading.strip()))
 
 
 def resolve_ajk_court_from_header(full_text: Optional[str]) -> Optional[LinkResolution]:
-    """Heading-based AJK SC vs HC split for SUPREME-COURT-AZAD-KASHMIR grid labels."""
-    head = _header_block(full_text)
+    """AJK SC vs HC from the first ``[...]`` heading (and ``Present``) within 300 characters."""
+    head = _ajk_header_window(full_text)
     if not head.strip():
         return LinkResolution(target_court_name="", reason="ajk_header_missing", manual_review=True)
-    if _AJK_SHARIAT_RE.search(head):
-        return LinkResolution(target_court_name="", reason="ajk_shariat_court", manual_review=True)
-    if _PRESENT_CORAM_RE.search(head):
+    if _PRESENT_SC_RE.search(head):
         return LinkResolution(target_court_name=AJK_SC_NAME, reason="ajk_present_coram_sc")
-    if _AJK_HC_HEADING_RE.search(head):
-        return LinkResolution(target_court_name=AJK_HC_NAME, reason="ajk_header_high_court")
-    if _AJK_SC_HEADING_RE.search(head) and not re.search(r"(?i)shariat", head):
+
+    heading = _first_bracket_heading(head)
+    if heading is None:
+        return LinkResolution(target_court_name="", reason="ajk_no_bracket_heading", manual_review=True)
+    if _bracket_heading_is_shariat(heading):
+        return LinkResolution(target_court_name="", reason="ajk_shariat_court", manual_review=True)
+    if _bracket_heading_is_sc(heading):
         return LinkResolution(target_court_name=AJK_SC_NAME, reason="ajk_header_supreme_court")
-    if _AJK_HC_BRACKET.search(head) and _BEFORE_BENCH_RE.search(head):
+    if _bracket_heading_is_hc(heading):
+        return LinkResolution(target_court_name=AJK_HC_NAME, reason="ajk_header_high_court")
+    if _bracket_heading_is_plain_azad_jk(heading) and _BEFORE_BENCH_RE.search(head):
         return LinkResolution(target_court_name=AJK_HC_NAME, reason="ajk_bracket_azad_jk_before_bench")
     return LinkResolution(target_court_name="", reason="ajk_header_ambiguous", manual_review=True)
 
@@ -272,10 +323,16 @@ def reserved_short_codes() -> Set[str]:
     return _RESERVED_SHORT_CODES
 
 
-def election_tribunal_seed_spec(display_name: str) -> Dict[str, Any]:
+def election_tribunal_seed_spec(
+    display_name: str,
+    *,
+    extra_reserved: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     base = re.sub(r"[^A-Z0-9]+", "_", display_name.upper()).strip("_")[:36] or "ELECTION_TRIBUNAL"
     slug = base
-    taken = reserved_short_codes()
+    taken = set(reserved_short_codes())
+    if extra_reserved:
+        taken |= extra_reserved
     n = 2
     while slug in taken:
         suffix = f"_{n}"
@@ -309,6 +366,11 @@ def resolve_null_court_id_link(court_name: str, full_text: Optional[str]) -> Opt
         name = _seeded_court_name(short)
         if name:
             return LinkResolution(target_court_name=name, reason="seeded_court_label")
+
+    if _maps_to_sac_gb(key):
+        name = _seeded_court_name("SAC-GB")
+        if name:
+            return LinkResolution(target_court_name=name, reason="sac_gb_label_pattern")
 
     spec = _match_seed_key(key)
     if spec is not None:

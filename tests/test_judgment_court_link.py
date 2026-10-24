@@ -26,18 +26,44 @@ from scraper.tasks.judgment_court_link import apply_court_id_links, find_court_i
     "citation,header,expected",
     [
         (
-            "1990 CLC 148",
-            "1990 CLC 148\nIN THE SUPREME COURT OF AZAD JAMMU & KASHMIR\nBefore A and B, JJ\n",
+            "1984 CLC 526",
+            "1984 CLC 526\n[S.C. (AJ&K)]\nBefore A and B, JJ\n"
+            + ("mention High Court elsewhere " * 20),
+            AJK_SC_NAME,
+        ),
+        (
+            "1992 CLC 1861",
+            "1992 CLC 1861\n[H.C. (AJ&K)]\nBefore X, J\n",
+            AJK_HC_NAME,
+        ),
+        (
+            "1989 CLC 411",
+            "1989 CLC 411\n[SC (AJ&K)]\nBefore Coram, JJ\n",
+            AJK_SC_NAME,
+        ),
+        (
+            "1992 CLC 1844",
+            "1992 CLC 1844\n[S C(AJ&K)]\nBefore Y, J\n",
+            AJK_SC_NAME,
+        ),
+        (
+            "1992 CLC 1966",
+            "1992 CLC 1966\n[Supreme Court (AJ&K)]\nBefore Z, JJ\n",
+            AJK_SC_NAME,
+        ),
+        (
+            "1997 CLC 366",
+            "1997 CLC 366\n[Azad J & K]\nBefore Bench, J\n",
+            AJK_HC_NAME,
+        ),
+        (
+            "1980 CLC 30",
+            "1980 CLC 30\nPresent.\nJustice A\n",
             AJK_SC_NAME,
         ),
         (
             "1993 CLC 1042",
             "1993 CLC 1042\n[Azad J & K]\nBefore Khawaja Muhammad Sharif J\n",
-            AJK_HC_NAME,
-        ),
-        (
-            "1997 CLC 380",
-            "1997 CLC 380\nIN THE HIGH COURT OF AZAD JAMMU AND KASHMIR\nBefore X, J\n",
             AJK_HC_NAME,
         ),
         (
@@ -61,8 +87,20 @@ def test_ajk_header_split_clc_fixtures(citation, header, expected):
 
 
 def test_ajk_shariat_court_manual_review():
-    text = "1995 CLC 1\nIN THE SHARIAT COURT OF AZAD JAMMU AND KASHMIR\n"
+    text = "1995 CLC 1\n[Shariat Court of Azad Jammu and Kashmir]\n"
     res = resolve_null_court_id_link("SUPREME-COURT-AZAD-KASHMIR", text)
+    assert res is not None and res.manual_review
+
+
+def test_ajk_karachi_bracket_manual_review():
+    text = "2001 CLC 9\n[Karachi]\nBefore someone, J\n"
+    res = resolve_ajk_court_from_header(text)
+    assert res is not None and res.manual_review
+
+
+def test_ajk_no_bracket_heading_manual_review():
+    text = "1990 CLC 148\nIN THE SUPREME COURT OF AZAD JAMMU & KASHMIR\nBefore A, JJ\n"
+    res = resolve_ajk_court_from_header(text)
     assert res is not None and res.manual_review
 
 
@@ -73,7 +111,27 @@ def test_manual_review_supreme_court_slug():
 
 def test_label_normalization_appellate_and_northern_areas():
     assert "appellate" in normalize_link_label_key("labour appelant tribunal nwfp")
+    assert "appellate" in normalize_link_label_key("labour appellant tribunal sindh")
+    assert "tribunal" in normalize_link_label_key("election tribanal punjab")
     assert "gilgit baltistan" in pls_court_label_key("CHIEF-COURT-NORTHERN-AREAS")
+
+
+def test_sac_gb_northern_areas_court_of_appeals():
+    res = resolve_null_court_id_link("NORTHERN-AREAS-COURT-OF-APPEALS", "x" * 50)
+    assert res is not None
+    assert res.target_court_name == "Supreme Appellate Court Gilgit-Baltistan"
+
+
+def test_constitutional_court_south_africa_alias():
+    res = resolve_null_court_id_link("CONSTITUTIONAL-COURT-OF-SOUTH-AFRICA", "x" * 50)
+    assert res is not None
+    assert res.target_court_name == "Constitutional Court of South Africa"
+
+
+def test_shariat_appellate_jurisdiction_maps_to_sc_sab():
+    res = resolve_null_court_id_link("SHARIAT-APPELLATE-JURISDICTION", "x" * 50)
+    assert res is not None
+    assert res.target_court_name == "Shariat Appellate Bench, Supreme Court"
 
 
 def test_labour_nwfp_resolves_to_kpk_seed():
@@ -94,6 +152,11 @@ def test_election_tribunal_short_code_avoids_clash():
     assert a["short_code"] == b["short_code"]
     c = election_tribunal_seed_spec("Election Tribunal Sindh")
     assert c["short_code"] != a["short_code"]
+    taken = election_tribunal_seed_spec(
+        "Election Tribunal Punjab",
+        extra_reserved={"ELECTION_TRIBUNAL_PUNJAB"},
+    )
+    assert taken["short_code"] != "ELECTION_TRIBUNAL_PUNJAB"
 
 
 @pytest.mark.asyncio

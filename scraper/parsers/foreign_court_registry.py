@@ -51,6 +51,12 @@ FOREIGN_COURT_SEEDS: List[Dict[str, Any]] = [
         "aliases": ["SOUTH-AFRICA-SUPREME-COURT", "South Africa Supreme Court"],
     },
     {
+        "name": "Constitutional Court of South Africa",
+        "short_code": "CC_SOUTH_AFRICA",
+        "court_level": "constitutional",
+        "aliases": ["CONSTITUTIONAL-COURT-OF-SOUTH-AFRICA", "Constitutional Court South Africa"],
+    },
+    {
         "name": "High Court of Australia",
         "short_code": "HC_AUSTRALIA",
         "court_level": "high",
@@ -167,7 +173,8 @@ async def ensure_link_court_row(db: AsyncSession, court_name: str) -> Optional[C
             seed = spec
             break
     if seed is None and key.startswith("election tribunal"):
-        seed = election_tribunal_seed_spec(canonical)
+        existing_codes = set((await db.execute(select(Court.short_code))).scalars().all())
+        seed = election_tribunal_seed_spec(canonical, extra_reserved=existing_codes)
     if seed is None:
         return None
     row = Court(
