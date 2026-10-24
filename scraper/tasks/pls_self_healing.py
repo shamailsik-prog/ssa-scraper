@@ -113,6 +113,9 @@ async def evaluate_pls_stall(db, source: ScraperSource, *, now: Optional[datetim
     was_stalled = bool(watch.get("stalled"))
     watch.update({k: verdict[k] for k in ("stalled", "stalled_reason", "hours_since_last_judgment", "threshold_hours")})
     watch["checked_at"] = now.isoformat()
+    if watch.get("search_harvest_yield_reason"):
+        verdict["search_harvest_yield_reason"] = watch["search_harvest_yield_reason"]
+        verdict["search_harvest_yield_at"] = watch.get("search_harvest_yield_at")
     if verdict["stalled"] and not was_stalled:
         watch["stalled_at"] = now.isoformat()
         open_alarm = (

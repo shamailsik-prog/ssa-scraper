@@ -769,9 +769,13 @@ class PakistanLawSitePipeline:
         return cursor_key, cursor, max(0, row_offset)
 
     async def _maybe_yield_citation_grid_for_search_harvest(self) -> bool:
-        from scraper.pls_grid_health import pls_pending_search_harvest_count, pls_yield_citation_grid_to_search_harvest
+        from scraper.pls_grid_health import (
+            pls_note_search_harvest_grid_yield,
+            pls_pending_search_harvest_count,
+            pls_yield_citation_grid_to_search_harvest,
+        )
 
-        pending = await pls_pending_search_harvest_count(self.db)
+        pending = await pls_pending_search_harvest_count(self.db, reporter_shard=self.reporter_shard)
         reason = pls_yield_citation_grid_to_search_harvest(
             dict(self.source.config_json or {}),
             self.reporter_shard,
@@ -779,6 +783,7 @@ class PakistanLawSitePipeline:
         )
         if not reason:
             return False
+        await pls_note_search_harvest_grid_yield(self.db, self.source, reason)
         self.stats["yielded_for_search_harvest"] = reason
         logger.info("PakistanLawSite citation-grid: %s (yielding session for search-harvest)", reason)
         return True
@@ -1801,6 +1806,9 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
+                from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+                await pls_clear_grid_yield_marker(self.db, self.source)
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,
@@ -1855,6 +1863,9 @@ class PakistanLawSitePipeline:
                             exc,
                         )
                         break
+                if self.stats.get("yielded_for_search_harvest") and self._slot_lock is not None:
+                    await self._slot_lock.release()
+                    self._slot_lock = None
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 if stopped_clean:
                     self.source.last_success_at = self.source.last_scraped_at

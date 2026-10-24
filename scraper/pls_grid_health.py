@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -13,6 +13,7 @@ from scraper.models import Judgment, ScraperJob, ScraperSource, ScraperStaging
 
 SOURCE_NAME = "PakistanLawSite"
 PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
+GRID_YIELD_SINCE_KEY = "grid_yield_since"
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -233,6 +234,20 @@ SEARCH_HARVEST_PRIORITY_STALL_REASONS = frozenset({"no_output_while_harvesting",
 # - routers.sources manual scrape kick
 
 
+def pls_grid_max_yield_minutes() -> int:
+    return int(getattr(settings, "PLS_GRID_MAX_YIELD_MINUTES", 120) or 120)
+
+
+def pls_grid_yield_cap_reached(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    since = parse_iso(cfg.get(GRID_YIELD_SINCE_KEY))
+    if since is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return (now - since).total_seconds() >= pls_grid_max_yield_minutes() * 60
+
+
 def pls_yield_citation_grid_to_search_harvest(
     cfg: Dict[str, Any],
     reporter_shard: Optional[int],
@@ -242,6 +257,9 @@ def pls_yield_citation_grid_to_search_harvest(
     now: Optional[datetime] = None,
 ) -> Optional[str]:
     """When the ledger has work, prefer search-harvest over a saturated citation-grid lap."""
+    now = now or datetime.now(timezone.utc)
+    if pls_grid_yield_cap_reached(cfg, now=now):
+        return None
     if pending_harvest <= 0:
         return None
     if defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
@@ -253,21 +271,111 @@ def pls_yield_citation_grid_to_search_harvest(
     return None
 
 
-async def pls_pending_search_harvest_count(db: AsyncSession) -> int:
+def _search_harvest_tick_seconds() -> int:
+    return max(1, int(getattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0) or 0) or 1200)
+
+
+def _pending_harvest_filters(
+    *,
+    stall_reason: Optional[str],
+    now: datetime,
+):
     from scraper.models import PlsSearchHarvestQuery
 
-    return int(
-        (
-            await db.execute(
-                select(func.count())
-                .select_from(PlsSearchHarvestQuery)
-                .where(
-                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-                )
-            )
-        ).scalar()
-        or 0
+    if stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS:
+        cutoff = now - timedelta(seconds=2 * _search_harvest_tick_seconds())
+        return (
+            PlsSearchHarvestQuery.status == "in_progress",
+            PlsSearchHarvestQuery.last_run_at.is_not(None),
+            PlsSearchHarvestQuery.last_run_at >= cutoff,
+            or_(PlsSearchHarvestQuery.last_error.is_(None), PlsSearchHarvestQuery.last_error == ""),
+        )
+    return (
+        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+        or_(
+            PlsSearchHarvestQuery.status == "pending",
+            PlsSearchHarvestQuery.last_error.is_(None),
+            PlsSearchHarvestQuery.last_error == "",
+        ),
+    )
+
+
+async def pls_pending_search_harvest_count(
+    db: AsyncSession,
+    *,
+    slot: Optional[int] = None,
+    reporter_shard: Optional[int] = None,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Rows this login slot may claim: own reporter share, plus the other share when cross-slot claim is on."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.pls_search_harvest import _share_filter
+
+    if reporter_shard in (0, 1):
+        slot = reporter_shard + 1
+    now = now or datetime.now(timezone.utc)
+    stmt = (
+        select(func.count())
+        .select_from(PlsSearchHarvestQuery)
+        .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, *_pending_harvest_filters(stall_reason=stall_reason, now=now))
+    )
+    if slot in (1, 2):
+        own = _share_filter(slot)
+        if getattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False):
+            other = _share_filter(2 if slot == 1 else 1)
+            stmt = stmt.where(or_(own, other))
+        else:
+            stmt = stmt.where(own)
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
+async def pls_unsharded_enqueue_pending_counts(
+    db: AsyncSession,
+    *,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[int, int]:
+    """Pending counts per slot share for an unsharded login-session enqueue decision."""
+    slot1 = await pls_pending_search_harvest_count(db, slot=1, stall_reason=stall_reason, now=now)
+    slot2 = await pls_pending_search_harvest_count(db, slot=2, stall_reason=stall_reason, now=now)
+    return slot1, slot2
+
+
+async def pls_note_search_harvest_grid_yield(
+    db: AsyncSession,
+    source: ScraperSource,
+    reason: str,
+    *,
+    now: Optional[datetime] = None,
+) -> None:
+    from scraper.auth.session_manager import merge_source_config
+
+    now = now or datetime.now(timezone.utc)
+    cfg = dict(source.config_json or {})
+    patch: Dict[str, Any] = {}
+    if not cfg.get(GRID_YIELD_SINCE_KEY):
+        patch[GRID_YIELD_SINCE_KEY] = now.isoformat()
+    watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
+    watch["search_harvest_yield_reason"] = reason
+    watch["search_harvest_yield_at"] = now.isoformat()
+    patch[PLS_STALL_WATCHDOG_KEY] = watch
+    await merge_source_config(db, source, patch)
+
+
+async def pls_clear_grid_yield_marker(db: AsyncSession, source: ScraperSource) -> None:
+    from scraper.auth.session_manager import merge_source_config
+
+    cfg = dict(source.config_json or {})
+    if not cfg.get(GRID_YIELD_SINCE_KEY):
+        return
+    watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
+    watch.pop("search_harvest_yield_reason", None)
+    watch.pop("search_harvest_yield_at", None)
+    await merge_source_config(
+        db,
+        source,
+        {GRID_YIELD_SINCE_KEY: None, PLS_STALL_WATCHDOG_KEY: watch},
     )
 
 

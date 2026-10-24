@@ -36,10 +36,13 @@ from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
     pls_last_judgment_at,
+    pls_note_search_harvest_grid_yield,
     pls_pending_search_harvest_count,
     pls_preempt_running_job_for_search_harvest,
     pls_stall_verdict_for_config,
+    pls_unsharded_enqueue_pending_counts,
     pls_yield_citation_grid_to_search_harvest,
+    SEARCH_HARVEST_PRIORITY_STALL_REASONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -327,8 +330,12 @@ async def run_source(
         if reporter_shard not in (0, 1):
             reporter_shard = None
         if source_name == PLS_SOURCE_NAME and source.access_method == "login_session":
-            pending_harvest = await pls_pending_search_harvest_count(db)
             cfg = dict(source.config_json or {})
+            if reporter_shard is None:
+                slot1, slot2 = await pls_unsharded_enqueue_pending_counts(db)
+                pending_harvest = slot1 + slot2 if slot1 > 0 and slot2 > 0 else 0
+            else:
+                pending_harvest = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
             yield_reason = pls_yield_citation_grid_to_search_harvest(
                 cfg,
                 reporter_shard,
@@ -336,6 +343,7 @@ async def run_source(
             )
             if yield_reason:
                 logger.info("%s: %s; skipping login-session job at start", source_name, yield_reason)
+                await pls_note_search_harvest_grid_yield(db, source, yield_reason)
                 source.next_scrape_at = datetime.now(timezone.utc) + timedelta(
                     minutes=cadence_for_source(source, await get_harvest_mode(db))
                 )
@@ -580,19 +588,25 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue
             if s.access_method == "login_session":
                 cfg = dict(s.config_json or {})
-                yield_reason = (
-                    pls_yield_citation_grid_to_search_harvest(
+                yield_reason = None
+                if s.source_name == PLS_SOURCE_NAME:
+                    if pls_stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS:
+                        pending_top = await pls_pending_search_harvest_count(
+                            db, stall_reason=pls_stall_reason, now=now
+                        )
+                    else:
+                        slot1, slot2 = await pls_unsharded_enqueue_pending_counts(db, now=now)
+                        pending_top = slot1 + slot2 if slot1 > 0 and slot2 > 0 else 0
+                    yield_reason = pls_yield_citation_grid_to_search_harvest(
                         cfg,
                         None,
-                        pending_search_gaps,
+                        pending_top,
                         stall_reason=pls_stall_reason,
                         now=now,
                     )
-                    if s.source_name == PLS_SOURCE_NAME
-                    else None
-                )
                 if yield_reason:
                     logger.info("%s: %s; deferring citation-grid enqueue", s.source_name, yield_reason)
+                    await pls_note_search_harvest_grid_yield(db, s, yield_reason, now=now)
                     skipped_saturated.append(f"{s.source_name}:search_harvest_priority")
                     # one tick per login, each on its own reporter share; a slot whose harvest already runs
                     # drops its tick at once
@@ -617,10 +631,15 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     for shard in (0, 1):
                         if shard in running_shards or (shard + 1) not in active_slots:
                             continue
+                        shard_pending = await pls_pending_search_harvest_count(
+                            db,
+                            reporter_shard=shard,
+                            now=now,
+                        )
                         shard_yield = pls_yield_citation_grid_to_search_harvest(
                             cfg,
                             shard,
-                            pending_search_gaps,
+                            shard_pending,
                             stall_reason=pls_stall_reason,
                             now=now,
                         )
@@ -628,6 +647,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                             logger.info("skip enqueue %s shard %s: %s", s.source_name, shard, shard_yield)
                             skipped_saturated.append(f"{s.source_name}:shard{shard}")
                             this_source_saturated = True
+                            from scraper.tasks.pls_search_harvest import queue_search_harvest_ticks
+
+                            queue_search_harvest_ticks(app)
+                            queued.append(f"{s.source_name}:search_harvest_tick")
                             continue
                         if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
                             logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
