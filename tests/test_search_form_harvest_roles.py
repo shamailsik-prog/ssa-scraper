@@ -1,5 +1,8 @@
 """Dashboard search-form harvest role aliases (party box → keyword splits)."""
 
+import pytest
+
+from scraper.config import settings
 from scraper.extractors.deterministic import introspect_search_form
 from scraper.pls_search_harvest_core import build_harvest_form_values, unmapped_harvest_reason
 from scraper.search_form_roles import verify_harvest_role_samples
@@ -14,7 +17,8 @@ def _dashboard_map():
     return record
 
 
-def test_party_field_aliased_to_keyword_for_harvest():
+def test_party_field_aliased_to_keyword_for_harvest(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", True)
     smap = _dashboard_map()
     proof = verify_harvest_role_samples(smap)
     assert proof["court_mapped"] is True
@@ -49,3 +53,21 @@ def test_plain_journal_year_query_fills_only_reporter_and_year():
     proof = verify_harvest_role_samples(smap)
     ylr = next(c for c in proof["samples"] if c["query"] == q)
     assert ylr["value_roles"] == ["reporter", "year"]
+
+
+def test_v203_plain_and_court_queries_never_fill_party_without_keyword_flag(monkeypatch):
+    """v203 dashboard map: journal-year and court children must not write the party box by default."""
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False)
+    smap = _dashboard_map()
+    smap["fields"] = {k: v for k, v in smap["fields"].items() if k != "keyword"}
+    for q in (
+        {"reporter": "SCMR", "year": 2025},
+        {"reporter": "SCMR", "year": 2025, "court": "SC"},
+    ):
+        values = build_harvest_form_values(smap, q, {"page": 1})
+        assert "party" not in values
+        assert "keyword" not in values
+        assert values.get("reporter") == q["reporter"]
+        assert values.get("year") == str(q["year"])
+        if q.get("court"):
+            assert values.get("court") == q["court"]

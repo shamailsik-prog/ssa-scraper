@@ -383,8 +383,24 @@ class Settings(BaseSettings):
     PLS_CASEID_WALK_CEILING_PAD: int = Field(default=1000, description="How far past the highest held or found serial a group keeps probing block starts.")
     PLS_CASEID_WALK_RECHECK_HOURS: float = Field(default=12.0, description="After a failed calibration on held judgments, wait this long before trying again.")
     PLS_SEARCH_RESULT_CAP: int = Field(
+        default=500,
+        description="Legacy CitationSearch result cap for split/done heuristics when PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP is off.",
+    )
+    PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP: bool = Field(
+        default=False,
+        description="When true, use PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP (~400) instead of PLS_SEARCH_RESULT_CAP for harvest split/done logic.",
+    )
+    PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP: int = Field(
         default=400,
-        description="PakistanLawSite CitationSearch result cap observed in production (~400 rows per page); queries at or above this are split by court/keyword.",
+        description="Observed PakistanLawSite CitationSearch page cap when USE_OBSERVED_400_CAP is enabled.",
+    )
+    PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS: bool = Field(
+        default=False,
+        description="When true, map harvest keyword splits onto the dashboard party text box via harvest_role_aliases.",
+    )
+    PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK: bool = Field(
+        default=False,
+        description="When true and the search map court field has no dropdown options, use PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS for oversized-query splits.",
     )
     PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS: int = Field(
         default=380,

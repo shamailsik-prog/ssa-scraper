@@ -143,9 +143,11 @@ def build_harvest_form_values(
         if role in fields and query_json.get(role):
             values[role] = str(query_json[role])
     if query_json.get("keyword"):
+        from scraper.search_form_roles import harvest_keyword_party_alias_enabled
+
         if "keyword" in fields:
             values["keyword"] = str(query_json["keyword"])
-        elif "party" in fields:
+        elif harvest_keyword_party_alias_enabled() and "party" in fields:
             values["party"] = str(query_json["keyword"])
     if "year" in fields and query_json.get("year") and "year" not in values:
         # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
@@ -339,6 +341,15 @@ def journal_year_truncation_rows(result_cap: int) -> int:
     return result_cap
 
 
+def harvest_result_cap() -> int:
+    from scraper.config import settings
+
+    legacy = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+    if getattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", False):
+        return int(getattr(settings, "PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP", 400) or 400)
+    return legacy
+
+
 def should_auto_split_journal_year(
     query_json: Dict[str, Any],
     *,
@@ -353,10 +364,40 @@ def should_auto_split_journal_year(
         return False
     if has_next_page or not is_journal_year_query(query_json):
         return False
+    if site_total is not None and rows_seen >= int(site_total):
+        return False
     trunc = journal_year_truncation_rows(result_cap)
     if site_total is not None and int(site_total) < trunc:
         return False
     return rows_seen >= trunc
+
+
+def split_dimension_added(parent: Dict[str, Any], child: Dict[str, Any]) -> Optional[str]:
+    p = normalize_query_json(parent)
+    c = normalize_query_json(child)
+    for dim in SPLIT_ORDER:
+        if dim in c and dim not in p:
+            return dim
+    return None
+
+
+def split_children_cover_rows(
+    parent: Dict[str, Any],
+    children: Sequence[Dict[str, Any]],
+    *,
+    rows_seen: int,
+    result_cap: int,
+) -> bool:
+    """True when child queries can account for every row the parent saw (no silent loss on partial court lists)."""
+    if not children:
+        return False
+    dim = split_dimension_added(parent, children[0])
+    if dim is None:
+        return True
+    n = len(children)
+    if dim == "month":
+        return n >= len(_MONTHS)
+    return n * result_cap >= rows_seen
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:

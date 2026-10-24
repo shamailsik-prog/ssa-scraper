@@ -11,7 +11,9 @@ from scraper.pls_search_harvest_core import (
     iter_extended_plan_queries,
     make_query_key,
     page_continuity_gaps,
+    harvest_result_cap,
     should_auto_split_journal_year,
+    split_children_cover_rows,
     split_oversized_query,
     unmapped_harvest_reason,
 )
@@ -88,6 +90,27 @@ def test_journal_year_auto_split_flag(monkeypatch):
     assert not should_auto_split_journal_year(
         {**q, "court": "SC"}, rows_seen=400, site_total=None, result_cap=400, has_next_page=False
     )
+    assert not should_auto_split_journal_year(
+        q, rows_seen=390, site_total=390, result_cap=400, has_next_page=False
+    )
+
+
+def test_split_children_cover_rows_requires_enough_court_children():
+    parent = {"reporter": "PLD", "year": 2020}
+    courts = [{"reporter": "PLD", "year": 2020, "court": f"C{i}"} for i in range(3)]
+    assert not split_children_cover_rows(parent, courts, rows_seen=1500, result_cap=400)
+    courts = [{"reporter": "PLD", "year": 2020, "court": f"C{i}"} for i in range(10)]
+    assert split_children_cover_rows(parent, courts, rows_seen=390, result_cap=400)
+
+
+def test_harvest_result_cap_defaults_to_legacy_500(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_RESULT_CAP", 500)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", False)
+    assert harvest_result_cap() == 500
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", True)
+    assert harvest_result_cap() == 400
 
 
 def test_year_only_seed_submits_the_year():

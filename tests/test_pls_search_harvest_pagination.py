@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from sqlalchemy import select
+
+from scraper.config import settings
 from scraper.models import PlsSearchHarvestQuery
 from scraper.pls_search_harvest_core import search_harvest_may_mark_done
 from scraper.tasks import pls_search_harvest as harvest
@@ -19,7 +22,7 @@ def test_search_harvest_may_mark_done_rules():
     assert search_harvest_may_mark_done(site_total=None, rows_seen=0, rows_on_page=0) == (True, "")
 
 
-def _runner_factory(monkeypatch, db, pages, *, total=None, fail_url=None):
+def _runner_factory(monkeypatch, db, pages, *, total=None, fail_url=None, dry_run=True, search_map=None):
     clock = [0.0]
 
     class FakePipeline:
@@ -63,7 +66,7 @@ def _runner_factory(monkeypatch, db, pages, *, total=None, fail_url=None):
     monkeypatch.setattr(harvest.settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
 
     runner = harvest.SearchHarvestRunner.__new__(harvest.SearchHarvestRunner)
-    runner.db, runner.source, runner.dry_run = db, None, True
+    runner.db, runner.source, runner.dry_run = db, None, dry_run
     runner.probe_mode = False
     runner._probe_rows = []
     runner._probe_form_values = {}
@@ -75,6 +78,7 @@ def _runner_factory(monkeypatch, db, pages, *, total=None, fail_url=None):
         return None
 
     runner._maybe_recycle_browser = no_recycle
+    runner._search_map = search_map or {}
     return runner
 
 
@@ -97,7 +101,7 @@ async def test_unknown_total_without_next_stays_in_progress(db, monkeypatch):
     db.add(q)
     await db.flush()
 
-    result = await runner.run_query(q, {})
+    result = await runner.run_query(q, runner._search_map)
     assert result["status"] == "in_progress"
     assert q.status == "in_progress"
     assert q.pages_enumerated == 1
@@ -121,7 +125,7 @@ async def test_interrupted_next_page_fetch_stays_in_progress(db, monkeypatch):
     db.add(q)
     await db.flush()
 
-    result = await runner.run_query(q, {})
+    result = await runner.run_query(q, runner._search_map)
     assert result["status"] == "in_progress"
     assert q.status == "in_progress"
     assert "pagination interrupted" in (q.last_error or "")
@@ -145,7 +149,7 @@ async def test_known_total_last_page_marks_done(db, monkeypatch):
     db.add(q)
     await db.flush()
 
-    result = await runner.run_query(q, {})
+    result = await runner.run_query(q, runner._search_map)
     assert result["status"] == "done"
     assert q.status == "done"
     assert q.pages_enumerated == 2
@@ -221,9 +225,9 @@ async def test_unknown_total_last_page_is_confirmed_by_one_reread_then_done(db, 
     db.add(q)
     await db.flush()
 
-    first = await runner.run_query(q, {})
+    first = await runner.run_query(q, runner._search_map)
     assert first["status"] == "in_progress" and q.rows_seen == 4
-    second = await runner.run_query(q, {})
+    second = await runner.run_query(q, runner._search_map)
     assert second["status"] == "done" and q.status == "done"
     # the re-read is not counted again
     assert q.rows_seen == 4 and q.pages_enumerated == 1
@@ -245,7 +249,7 @@ async def test_rereading_a_large_last_page_never_trips_the_cap_split(db, monkeyp
     await db.flush()
 
     for _ in range(3):
-        await runner.run_query(q, {})
+        await runner.run_query(q, runner._search_map)
     assert q.status == "done"
     assert q.rows_seen == 300
     await db.rollback()
@@ -277,10 +281,70 @@ async def test_a_reread_that_finds_a_next_link_carries_on(db, monkeypatch):
     db.add(q)
     await db.flush()
 
-    first = await runner.run_query(q, {})
+    first = await runner.run_query(q, runner._search_map)
     assert first["status"] == "in_progress" and q.rows_seen == 2
-    second = await runner.run_query(q, {})
+    second = await runner.run_query(q, runner._search_map)
     # page 1 is not counted twice; page 2 is new and, with no next link and no total, waits for its own re-read
     assert second["status"] == "in_progress"
     assert q.rows_seen == 3 and q.pages_enumerated == 2
+    await db.rollback()
+
+
+def _court_search_map():
+    courts = [f"C{i}" for i in range(1, 11)]
+    return {"fields": {"court": {"options": courts, "selector": "#court"}}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_rows", [380, 390, 399])
+async def test_journal_year_auto_split_at_truncation_rows_enqueues_children(db, monkeypatch, n_rows):
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR", True)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS", 380)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", True)
+    pages = {"page1": ([_row(i) for i in range(1, n_rows + 1)], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=None, dry_run=False, search_map=_court_search_map())
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key=f"journal-split-{n_rows}",
+        query_json={"reporter": "SCMR", "year": 2019},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    result = await runner.run_query(q, runner._search_map)
+    assert result["status"] == "split"
+    assert q.status == "split"
+    kids = (
+        await db.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.parent_id == q.id))
+    ).scalars().all()
+    assert len(kids) >= 1
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_journal_year_known_total_equal_rows_seen_does_not_split(db, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR", True)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS", 380)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", True)
+    n_rows = 390
+    pages = {"page1": ([_row(i) for i in range(1, n_rows + 1)], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=n_rows, dry_run=False, search_map=_court_search_map())
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="journal-complete-390",
+        query_json={"reporter": "SCMR", "year": 2019},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    await runner.run_query(q, runner._search_map)
+    if q.status != "done":
+        await runner.run_query(q, runner._search_map)
+    assert q.status == "done"
+    kids = (
+        await db.execute(select(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.parent_id == q.id))
+    ).scalars().all()
+    assert kids == []
     await db.rollback()

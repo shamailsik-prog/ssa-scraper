@@ -56,7 +56,9 @@ from scraper.pls_search_harvest_core import (
     is_capped,
     iter_extended_plan_queries,
     page_continuity_gaps,
+    harvest_result_cap,
     should_auto_split_journal_year,
+    split_children_cover_rows,
     split_oversized_query,
     unmapped_harvest_reason,
     years_for_plan,
@@ -118,14 +120,11 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
 
 
 def _court_options_from_map(search_map: Dict[str, Any]) -> List[str]:
-    from scraper.search_form_roles import resolve_harvest_fields
-
-    fields = resolve_harvest_fields(search_map)
-    court = fields.get("court") or {}
-    opts = [str(o).strip() for o in (court.get("options") or []) if str(o).strip()]
+    stored = (search_map.get("fields") or {}).get("court") or {}
+    opts = [str(o).strip() for o in (stored.get("options") or []) if str(o).strip()]
     if opts:
         return opts
-    if "court" in fields:
+    if stored and getattr(settings, "PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK", False):
         return [t.strip() for t in str(settings.PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS or "").split(",") if t.strip()]
     return []
 
@@ -267,7 +266,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     from scraper.models import Citation, Judgment
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
-    cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+    cap = harvest_result_cap()
     capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
     exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
     totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
@@ -592,7 +591,7 @@ class SearchHarvestRunner:
                 query_row.last_error = reason[:1000]
             return {"status": "failed", "reason": reason, "form_values": build_harvest_form_values(search_map, query_json, cursor)}
         self._probe_form_values = build_harvest_form_values(search_map, query_json, cursor)
-        cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+        cap = harvest_result_cap()
         pages_done = int(query_row.pages_enumerated or 0)
         page_limit = max_pages if max_pages > 0 else int(getattr(settings, "PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY", 0) or 0)
         rows_seen = int(query_row.rows_seen or 0)
@@ -780,7 +779,10 @@ class SearchHarvestRunner:
                         rows_seen=rows_seen,
                         cap=cap,
                     )
-                    if children and not self.probe_mode:
+                    covers = children and split_children_cover_rows(
+                        query_json, children, rows_seen=rows_seen, result_cap=cap
+                    )
+                    if children and covers and not self.probe_mode:
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
                         query_row.split_reason = (
@@ -790,8 +792,14 @@ class SearchHarvestRunner:
                         )
                         break
                     if not self.probe_mode:
-                        query_row.status = "failed"
-                        query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                        if children and not covers:
+                            query_row.status = "failed"
+                            query_row.last_error = (
+                                f"proposed {len(children)} split children cannot cover {rows_seen} rows at cap={cap}; NOT split"
+                            )[:1000]
+                        else:
+                            query_row.status = "failed"
+                            query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
                     break
                 may_done, incomplete_reason = search_harvest_may_mark_done(
                     site_total=site_total,
@@ -890,6 +898,18 @@ class SearchHarvestRunner:
         from scraper.search_form_roles import harvest_expressible_roles
 
         effective_total = int(site_total if site_total is not None else rows_seen)
+        journal_trunc = (
+            site_total is None
+            and should_auto_split_journal_year(
+                query_json,
+                rows_seen=rows_seen,
+                site_total=site_total,
+                result_cap=cap,
+                has_next_page=False,
+            )
+        )
+        if effective_total < cap and (journal_trunc or is_capped(site_total, rows_seen, cap)):
+            effective_total = max(effective_total, cap)
         return split_oversized_query(
             query_json,
             effective_total,

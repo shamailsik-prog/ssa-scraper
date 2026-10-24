@@ -11,12 +11,20 @@ DEFAULT_HARVEST_ROLE_ALIASES: Dict[str, str] = {
 }
 
 
+def harvest_keyword_party_alias_enabled() -> bool:
+    from scraper.config import settings
+
+    return bool(getattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False))
+
+
 def harvest_role_aliases(search_map: Dict[str, Any]) -> Dict[str, str]:
     limits = search_map.get("limits") or {}
     raw = limits.get("harvest_role_aliases")
     if isinstance(raw, dict) and raw:
         return {str(k): str(v) for k, v in raw.items()}
-    return dict(DEFAULT_HARVEST_ROLE_ALIASES)
+    if harvest_keyword_party_alias_enabled():
+        return dict(DEFAULT_HARVEST_ROLE_ALIASES)
+    return {}
 
 
 def resolve_harvest_fields(search_map: Dict[str, Any]) -> Dict[str, Any]:
@@ -39,6 +47,8 @@ def harvest_expressible_roles(search_map: Dict[str, Any]) -> Set[str]:
 
 def enrich_fields_with_harvest_aliases(fields: Dict[str, Any]) -> Dict[str, str]:
     """Record harvest role aliases in limits only; do not duplicate controls in the stored map."""
+    if not harvest_keyword_party_alias_enabled():
+        return {}
     aliases: Dict[str, str] = {}
     if "party" in fields and "keyword" not in fields:
         aliases["keyword"] = "party"
