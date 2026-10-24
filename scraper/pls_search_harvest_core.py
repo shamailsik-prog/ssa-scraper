@@ -222,15 +222,56 @@ def partition_rows_by_known(
     return known, new_rows
 
 
+GAP_SAMPLES_LIMIT = 50
+
+
+def row_gap_diagnostics(row: Dict[str, Any]) -> Dict[str, Any]:
+    keys = sorted(citation_keys_for_row(row))
+    return {
+        "citation": row.get("citation"),
+        "title": row.get("title"),
+        "detail_url": row.get("detail_url"),
+        "pdf_url": row.get("pdf_url"),
+        "keys": keys,
+    }
+
+
+def append_gap_sample(cursor: Dict[str, Any], row: Dict[str, Any]) -> None:
+    samples = list(cursor.get("gap_samples") or [])
+    if len(samples) >= GAP_SAMPLES_LIMIT:
+        return
+    samples.append(row_gap_diagnostics(row))
+    cursor["gap_samples"] = samples
+
+
+def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
+    if not cursor:
+        return 0
+    return int(cursor.get("rows_unlinked") or 0)
+
+
+def cursor_reset_for_done(cursor: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve gap diagnostics when a query finishes."""
+    out: Dict[str, Any] = {"page": 1, "row_index": 0}
+    if cursor.get("gap_samples"):
+        out["gap_samples"] = cursor["gap_samples"]
+    if cursor.get("rows_unlinked"):
+        out["rows_unlinked"] = cursor["rows_unlinked"]
+    return out
+
+
 def compute_gap_size(
     site_total: Optional[int],
     rows_known: int,
     rows_seen: int,
+    *,
+    rows_unlinked: int = 0,
 ) -> int:
+    unlinked = max(0, int(rows_unlinked or 0))
     if site_total is not None and site_total > rows_known:
-        return int(site_total - rows_known)
+        return max(0, int(site_total - rows_known - unlinked))
     if rows_seen > rows_known:
-        return int(rows_seen - rows_known)
+        return max(0, int(rows_seen - rows_known - unlinked))
     return 0
 
 
@@ -296,16 +337,26 @@ def search_harvest_may_mark_done(
     site_total: Optional[int],
     rows_seen: int,
     rows_on_page: int,
+    rows_unlinked: int = 0,
 ) -> Tuple[bool, str]:
     """When the extractor reports no next-page link, decide if the query may be marked done.
 
     Done only for a genuinely empty page, or when the site total is known and every row was seen.
+    Rows without a detail link are counted separately and do not block completion when they explain
+    the shortfall versus site_total.
     """
     if rows_on_page == 0:
         return True, ""
     if site_total is None:
         return False, "pagination ended without next link and site total unknown"
     if rows_seen < int(site_total):
+        shortfall = int(site_total) - int(rows_seen)
+        unlinked = max(0, int(rows_unlinked or 0))
+        if unlinked and shortfall <= unlinked:
+            return (
+                True,
+                f"pagination ended; {unlinked} unmatched row(s) had no detail_url (shortfall {shortfall})",
+            )
         return (
             False,
             f"pagination ended without next link with rows_seen={rows_seen}<site_total={site_total}",

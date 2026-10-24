@@ -42,8 +42,12 @@ from scraper.pls_search_harvest_core import (
     CASE_KEY_PREFIX,
     CASE_NAME_URL_SUBSTRING_PATTERN,
     citation_keys_for_row,
+    append_gap_sample,
     compute_gap_size,
     gap_report_sort_key,
+    row_gap_diagnostics,
+    cursor_reset_for_done,
+    rows_unlinked_from_cursor,
     iter_base_plan_queries,
     make_query_key,
     normalize_query_json,
@@ -327,7 +331,13 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
     ).scalars().all()
     out: List[Dict[str, Any]] = []
     for row in rows:
-        gap = compute_gap_size(row.site_total_results, row.rows_known, row.rows_seen)
+        unlinked = rows_unlinked_from_cursor(row.cursor_json or {})
+        gap = compute_gap_size(
+            row.site_total_results,
+            row.rows_known,
+            row.rows_seen,
+            rows_unlinked=unlinked,
+        )
         out.append(
             {
                 "query_key": row.query_key,
@@ -338,6 +348,7 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
                 "rows_seen": row.rows_seen,
                 "rows_known": row.rows_known,
                 "rows_new": row.rows_new,
+                "rows_unlinked": unlinked,
                 "gap_size": gap,
                 "last_error": row.last_error,
                 "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
@@ -578,6 +589,7 @@ class SearchHarvestRunner:
         rows_seen = int(query_row.rows_seen or 0)
         rows_known = int(query_row.rows_known or 0)
         rows_new = int(query_row.rows_new or 0)
+        rows_unlinked = rows_unlinked_from_cursor(cursor)
         site_total = query_row.site_total_results
         start_row_index = int(cursor.get("row_index") or 0)
         page_idx = int(cursor.get("page") or 1)
@@ -632,6 +644,15 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
+            for row in new_rows:
+                diag = row_gap_diagnostics(row)
+                logger.info(
+                    "PLS search harvest %s page %s unmatched row: %s",
+                    query_row.query_key,
+                    page_idx,
+                    diag,
+                )
+                append_gap_sample(cursor, row)
             if rereading:
                 rows_counted, known_counted = 0, 0
             else:
@@ -649,9 +670,12 @@ class SearchHarvestRunner:
                     if idx < start_row_index:
                         continue
                     detail_url = row.get("detail_url") or row.get("pdf_url")
-                    if not detail_url:
-                        continue
                     keys = citation_keys_for_row(row)
+                    if not detail_url:
+                        if id(row) in fresh_ids and not (keys & known_set):
+                            rows_unlinked += 1
+                            cursor["rows_unlinked"] = rows_unlinked
+                        continue
                     if keys & known_set:
                         continue
                     if id(row) not in fresh_ids:
@@ -710,13 +734,15 @@ class SearchHarvestRunner:
             except Exception:
                 pass
 
-            gap = compute_gap_size(site_total, rows_known, rows_seen)
+            gap = compute_gap_size(site_total, rows_known, rows_seen, rows_unlinked=rows_unlinked)
             query_row.site_total_results = site_total
             query_row.pages_enumerated = pages_done
             query_row.rows_seen = rows_seen
             query_row.rows_known = rows_known
             query_row.rows_new = rows_new
             query_row.gap_size = gap
+            cursor["rows_unlinked"] = rows_unlinked
+            query_row.cursor_json = dict(cursor)
             if site_total is not None:
                 # Only a known site total measures the gap. With the total unknown the gap reads 0, and 1000 - 0
                 # sent the row to the back of the ledger, behind every row that had one (13 October 2026); it keeps
@@ -754,17 +780,18 @@ class SearchHarvestRunner:
                     site_total=site_total,
                     rows_seen=rows_seen,
                     rows_on_page=len(rows),
+                    rows_unlinked=rows_unlinked,
                 )
                 if not may_done and confirmed_last and site_total is None:
                     may_done = True
                 if may_done:
                     query_row.status = "done"
                     query_row.last_error = None if confirmed_last else query_row.last_error
-                    query_row.cursor_json = {"page": 1, "row_index": 0}
+                    query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
                     query_row.status = "in_progress"
                     query_row.last_error = incomplete_reason[:1000]
-                    if site_total is not None and rows_seen < int(site_total):
+                    if site_total is not None and rows_seen < int(site_total) - rows_unlinked:
                         cursor = {"page": page_idx + 1, "row_index": 0}
                     else:
                         cursor = {"page": page_idx, "row_index": 0}
