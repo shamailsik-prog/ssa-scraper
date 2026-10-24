@@ -41,7 +41,13 @@ from scraper.auth.session_manager import playwright_browser_factory
 logger = logging.getLogger(__name__)
 
 WATCHDOG_META_KEY = "pls_stall_watchdog"
-STALL_AFTER = timedelta(hours=2)
+
+
+def pls_stall_signature_wait() -> timedelta:
+    minutes = float(getattr(settings, "PLS_STALL_WATCHDOG_SIGNATURE_MINUTES", 30) or 30)
+    return timedelta(minutes=max(1.0, minutes))
+
+
 
 
 async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
@@ -173,13 +179,14 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
             await merge_source_config(db, source, {WATCHDOG_META_KEY: watch})
             await db.commit()
             return result
-        if prev_dt is None or now - prev_dt < STALL_AFTER:
+        stall_after = pls_stall_signature_wait()
+        if prev_dt is None or now - prev_dt < stall_after:
             return result
         # Real hang: harvest "running" with cursors AND judgments frozen. Probe the slots and requeue.
         logger.warning(
-            "PLS STALL WATCHDOG: %s grid rows remaining but cursors and judgments unchanged for %s hours",
+            "PLS STALL WATCHDOG: %s grid rows remaining but cursors and judgments unchanged for %s minutes",
             grid_rows_remaining(cfg),
-            int(STALL_AFTER.total_seconds() // 3600),
+            int(stall_after.total_seconds() // 60),
         )
         manager = SessionManager(db, source)
         recovery: list = []

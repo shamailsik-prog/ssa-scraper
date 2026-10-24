@@ -63,6 +63,23 @@ class BrowserDisconnected(RuntimeError):
     """Ordinary transport/browser failure — eligible for the 30-second same-slot reconnect."""
 
 
+_PLAYWRIGHT_HARVEST_FATAL_MARKERS = (
+    "target closed",
+    "page crashed",
+    "page crash",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+)
+
+
+def is_playwright_harvest_browser_fatal(exc: BaseException) -> bool:
+    """True for Playwright page/browser death that should release a search-harvest query back to pending."""
+    if isinstance(exc, BrowserDisconnected):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _PLAYWRIGHT_HARVEST_FATAL_MARKERS)
+
+
 class NoActiveSlot(RuntimeError):
     pass
 
@@ -786,7 +803,20 @@ class PlaywrightBrowser:
             return await coro
         except PWError as exc:
             msg = str(exc)
-            if any(k in msg for k in ("Target closed", "Browser has been closed", "net::ERR_", "Navigation failed", "Timeout", "disconnected", "Connection closed", "Download is starting")):
+            if any(
+                k in msg
+                for k in (
+                    "Target closed",
+                    "Page crashed",
+                    "Browser has been closed",
+                    "net::ERR_",
+                    "Navigation failed",
+                    "Timeout",
+                    "disconnected",
+                    "Connection closed",
+                    "Download is starting",
+                )
+            ):
                 raise BrowserDisconnected(msg) from exc
             raise
 

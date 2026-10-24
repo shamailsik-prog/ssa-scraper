@@ -358,7 +358,15 @@ def grid_saturation_view(cfg: Dict[str, Any], *, now: Optional[datetime] = None)
 
 
 # --------------------------------------------------------------------------- stalled alarm
-def stall_threshold_hours() -> float:
+def stall_threshold_hours(
+    *,
+    source_state: Optional[str] = None,
+    harvest_paused: bool = False,
+) -> float:
+    if source_state == "ACTIVE" and not harvest_paused:
+        minutes = float(getattr(settings, "PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE", 30) or 30)
+        if minutes > 0:
+            return minutes / 60.0
     return float(getattr(settings, "PLS_STALL_NO_PROMOTION_HOURS", 6) or 6)
 
 
@@ -465,9 +473,11 @@ def pls_stall_verdict_for_config(
     now = now or datetime.now(timezone.utc)
     saturation = grid_saturation_view(cfg, now=now)
     paused = source_state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
+    threshold = stall_threshold_hours(source_state=source_state, harvest_paused=paused)
     return compute_stalled(
         last_promotion_at=last_promotion_at,
         now=now,
+        threshold_hours=threshold,
         saturation=saturation,
         harvest_paused=paused,
         search_harvest_locks_held=search_harvest_locks_held,

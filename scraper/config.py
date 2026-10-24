@@ -177,7 +177,15 @@ class Settings(BaseSettings):
     LOGIN_RECOVERY_SUBMIT_WAIT_SECONDS: float = Field(default=3.0, description="Seconds to let the site answer a submitted sign-in before the session is checked.")
     PLS_KEEPALIVE_SCHEDULE_SECONDS: int = Field(default=3600, description="Celery Beat cadence for PLS slot keepalive (probe ACTIVE slots; recover unhealthy only).")
     PLS_STALL_WATCHDOG_SECONDS: int = Field(default=1800, description="Celery Beat cadence for citation-grid stall watchdog.")
-    PLS_STALL_NO_PROMOTION_HOURS: float = Field(default=6.0, description="/status stalled=true (and a PLS_NO_NEW_JUDGMENTS notification) when no PakistanLawSite judgment was promoted for this many hours.")
+    PLS_STALL_NO_PROMOTION_HOURS: float = Field(default=6.0, description="/status stalled=true (and a PLS_NO_NEW_JUDGMENTS notification) when no PakistanLawSite judgment was promoted for this many hours (non-ACTIVE sources and when PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE is 0).")
+    PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE: float = Field(
+        default=30.0,
+        description="When PakistanLawSite is ACTIVE, treat promotion as stalled after this many minutes without a new judgment (overrides PLS_STALL_NO_PROMOTION_HOURS for /status and the stall watchdog alarm).",
+    )
+    PLS_STALL_WATCHDOG_SIGNATURE_MINUTES: float = Field(
+        default=30.0,
+        description="After a promotion stall is detected, wait this long with an unchanged citation-grid signature and judgment count before the stall watchdog probes slots and requeues harvest.",
+    )
     PLS_SATURATED_RECHECK_HOURS: float = Field(default=12.0, description="A citation-grid shard whose last full lap staged nothing new is not scheduled again for this many hours.")
     PLS_GRID_JOURNAL_ROTATION: bool = Field(default=True, description="Walk the citation grid once per journal: select each journal in the site's citation-search form and give it its own cursor. Off, or when the form offers no journal choice, the default grid (the site's last or default search) is walked.")
     PLS_GRID_JOURNALS: str = Field(default="", description="Comma-separated journals for the per-journal grid walk, in order; blank = PLS_SUBSCRIBED_REPORTERS.")
@@ -749,6 +757,8 @@ class Settings(BaseSettings):
             raise ValueError("PLS_SEARCH_HARVEST_TAKEOVER_MINUTES must be >= 0")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
+        if self.PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE < 0 or self.PLS_STALL_WATCHDOG_SIGNATURE_MINUTES <= 0:
+            raise ValueError("PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE must be >= 0 and PLS_STALL_WATCHDOG_SIGNATURE_MINUTES positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
             raise ValueError("PLS_ARCHIVED_GRID_MAX_ROWS must be positive")
         if self.PLS_ARCHIVED_GRID_SNAPSHOT_TIMEOUT_SECONDS <= 0:
