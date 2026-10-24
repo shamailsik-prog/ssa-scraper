@@ -48,7 +48,12 @@ def test_grid_yield_cap_allows_saturated_lap():
 
 @pytest.mark.asyncio
 async def test_consume_grid_yield_cap_bypass_resets_shard_timers(db, login_source):
-    from scraper.pls_grid_health import pls_consume_grid_yield_cap_bypass, pls_grid_yield_cap_reached
+    from scraper.pls_grid_health import (
+        pls_consume_grid_yield_cap_bypass,
+        pls_grid_cap_lap_grace_active,
+        pls_grid_yield_cap_reached,
+        pls_yield_citation_grid_to_search_harvest,
+    )
 
     now = datetime.now(timezone.utc)
     login_source.config_json = {
@@ -60,7 +65,35 @@ async def test_consume_grid_yield_cap_bypass_resets_shard_timers(db, login_sourc
     assert await pls_consume_grid_yield_cap_bypass(db, login_source, reporter_shard=0, now=now) is True
     cfg = dict(login_source.config_json or {})
     assert pls_grid_yield_cap_reached(cfg, 0, now=now) is False
+    assert pls_grid_cap_lap_grace_active(cfg, 0) is True
+    assert pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now) is None
     await db.rollback()
+
+
+def test_grid_cap_lap_grace_ends_after_window_recorded():
+    from scraper.pls_grid_health import (
+        GRID_CAP_LAP_WINDOW_AT_KEY,
+        pls_grid_cap_lap_grace_active,
+        pls_yield_citation_grid_to_search_harvest,
+    )
+
+    now = datetime.now(timezone.utc)
+    lap = now.isoformat()
+    cfg = {
+        "grid_cap_lap_at": lap,
+        "grid_yield_since_shard_0": lap,
+        "citation_grid_cursor_shard_0": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 1,
+            "last_total_rows": 500,
+        },
+    }
+    assert pls_grid_cap_lap_grace_active(cfg, 0) is True
+    assert pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now) is None
+    cfg[GRID_CAP_LAP_WINDOW_AT_KEY] = (now + timedelta(seconds=2)).isoformat()
+    assert pls_grid_cap_lap_grace_active(cfg, 0) is False
+    reason = pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now)
+    assert reason and "30" in reason
 
 
 def test_unsharded_grid_yield_cap_when_either_shard_past_limit():
