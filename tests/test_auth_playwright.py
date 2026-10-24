@@ -686,9 +686,8 @@ async def test_capture_case_description_modal_waits_for_full_text_ready_markers(
     script = modal_eval_call[1]
     assert "for (let i = 0; i < 80; i += 1)" in script
     assert "await sleep(150)" in script
-    assert "text.length >= 2000" in script
-    assert "/Before.+/i.test(text)" in script
-    assert "/CLC|SCMR|PLD/i.test(text)" in script
+    assert "hasBeforeMarker" in script
+    assert "waitForBody" not in script
 
 
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():

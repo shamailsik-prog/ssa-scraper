@@ -32,6 +32,7 @@ from scraper.document_validation import (
     validate_statute_reconciled_json,
 )
 from scraper.extractors.judgment_guards import (
+    detect_headnote_only_no_body,
     detect_headnotes_only,
     detect_judgment_stub,
     guard_reason,
@@ -334,6 +335,22 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
                 },
             )
             return "quarantined"
+        if bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False)):
+            body_signal = detect_headnote_only_no_body(st.raw_text)
+            if body_signal is not None:
+                await _quarantine(
+                    db,
+                    st,
+                    guard_reason(body_signal),
+                    "judgment",
+                    {
+                        "reason_code": body_signal.reason_code,
+                        "signal": body_signal.signal,
+                        "matched_value": body_signal.matched_value,
+                        "validation_errors": st.validation_errors,
+                    },
+                )
+                return "quarantined"
     stub_signal = detect_judgment_stub(
         source_url=st.source_url or data.get("source_url"),
         raw_text=st.raw_text,
