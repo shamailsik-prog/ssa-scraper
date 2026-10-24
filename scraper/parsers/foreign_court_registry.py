@@ -44,6 +44,18 @@ FOREIGN_COURT_SEEDS: List[Dict[str, Any]] = [
         "court_level": "high",
         "aliases": ["ANDHRA-PRADESH-HIGH-COURT-INDIA", "Andhra Pradesh High Court"],
     },
+    {
+        "name": "Supreme Court of South Africa",
+        "short_code": "SC_SOUTH_AFRICA",
+        "court_level": "supreme",
+        "aliases": ["SOUTH-AFRICA-SUPREME-COURT", "South Africa Supreme Court"],
+    },
+    {
+        "name": "High Court of Australia",
+        "short_code": "HC_AUSTRALIA",
+        "court_level": "high",
+        "aliases": ["AUSTRALIA-HIGH-COURT", "High Court Australia"],
+    },
 ]
 
 
@@ -138,7 +150,7 @@ async def ensure_foreign_court_row(db: AsyncSession, court_name: str) -> Optiona
 async def ensure_link_court_row(db: AsyncSession, court_name: str) -> Optional[Court]:
     """Create specialty / election-tribunal rows from ``judgment_court_link_registry`` seeds."""
     from scraper.judgment_court_link_registry import (
-        ADDITIONAL_COURT_SEEDS,
+        all_linkable_seed_specs,
         election_tribunal_seed_spec,
         pls_court_label_key,
     )
@@ -149,7 +161,7 @@ async def ensure_link_court_row(db: AsyncSession, court_name: str) -> Optional[C
         return existing
     key = pls_court_label_key(court_name)
     seed = None
-    for spec in ADDITIONAL_COURT_SEEDS:
+    for spec in all_linkable_seed_specs():
         labels = {spec["name"], spec["short_code"], *(spec.get("aliases") or [])}
         if any(pls_court_label_key(lbl) == key for lbl in labels):
             seed = spec

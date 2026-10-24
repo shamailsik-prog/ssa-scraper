@@ -83,6 +83,7 @@ async def find_court_id_links(db: AsyncSession, *, limit: Optional[int] = None, 
     links: List[Dict[str, str]] = []
     manual_review: List[Dict[str, str]] = []
     would_create: List[Dict[str, str]] = []
+    uncreatable: List[Dict[str, str]] = []
     skipped = 0
     for jid in ids:
         j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
@@ -99,6 +100,18 @@ async def find_court_id_links(db: AsyncSession, *, limit: Optional[int] = None, 
                     "citation": j.canonical_citation or "",
                     "court_name": j.court_name or "",
                     "label_key": pls_court_label_key(j.court_name),
+                    "reason": resolution.reason,
+                }
+            )
+            continue
+        if resolution.uncreatable:
+            uncreatable.append(
+                {
+                    "id": str(j.id),
+                    "citation": j.canonical_citation or "",
+                    "court_name": j.court_name or "",
+                    "target_court_name": resolution.target_court_name,
+                    "reason": resolution.reason,
                 }
             )
             continue
@@ -125,13 +138,17 @@ async def find_court_id_links(db: AsyncSession, *, limit: Optional[int] = None, 
                 "reason": resolution.reason,
             }
         )
+    apply_would_update = len(links) + len(would_create)
     return {
         "links": links,
-        "count": len(links),
+        "count": apply_would_update,
+        "links_ready": len(links),
         "manual_review": manual_review,
         "manual_review_count": len(manual_review),
         "would_create": would_create,
         "would_create_count": len(would_create),
+        "uncreatable": uncreatable,
+        "uncreatable_count": len(uncreatable),
         "unresolved_skipped": skipped,
     }
 
@@ -156,7 +173,8 @@ async def apply_court_id_links(db: AsyncSession, run_id: str, links: List[Dict[s
         )
         j.court_id = new_id
         updated += 1
-    db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
+    if snapshot:
+        db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
     return {"court_ids_updated": updated}
 
 
@@ -216,9 +234,28 @@ async def run_judgment_court_link(
             if not settings.SSA_JUDGMENT_COURT_ID_BACKFILL:
                 out["applied"] = {"skipped": "enable SSA_JUDGMENT_COURT_ID_BACKFILL"}
                 return out
+            info = await find_court_id_links(db, limit=limit, create=True)
+            out.update(
+                {
+                    "links": info["links"],
+                    "count": info["count"],
+                    "links_ready": info.get("links_ready", len(info["links"])),
+                    "would_create": info["would_create"],
+                    "would_create_count": info["would_create_count"],
+                    "uncreatable": info.get("uncreatable", []),
+                    "uncreatable_count": info.get("uncreatable_count", 0),
+                }
+            )
+            if info.get("count", 0) == 0:
+                out["applied"] = {"skipped": "nothing to link"}
+                return out
             run_id = uuid.uuid4().hex
-            await _record_run(db, run_id)
             applied = await apply_court_id_links(db, run_id, info["links"])
+            if applied["court_ids_updated"] == 0:
+                await db.rollback()
+                out["applied"] = {"skipped": "no-op; court_id already set"}
+                return out
+            await _record_run(db, run_id)
             await db.commit()
             out["applied"] = {"run_id": run_id, **applied}
         return out
