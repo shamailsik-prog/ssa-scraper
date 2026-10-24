@@ -372,6 +372,16 @@ async def ensure_roles() -> dict:
 _run_ensure_roles = ensure_roles
 
 
+async def _verification_schema_exists(conn) -> bool:
+    return bool(
+        (
+            await conn.execute(
+                text("SELECT 1 FROM information_schema.schemata WHERE schema_name = 'verification'")
+            )
+        ).scalar()
+    )
+
+
 async def _apply_role_grants(lock_conn, status: dict) -> None:
     from scraper.models import CONTRACT_TABLES, INTERNAL_TABLES
 
@@ -390,6 +400,9 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
         await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
         await lock_conn.execute(text(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}"))
         await lock_conn.execute(text(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role}"))
+        if await _verification_schema_exists(lock_conn):
+            await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA verification TO {role}"))
+            await lock_conn.execute(text(f"GRANT ALL ON ALL TABLES IN SCHEMA verification TO {role}"))
         status["writer"] = "CONFIGURED"
     if reader_pw:
         role = _quote_ident(settings.SIKANDER_READER_ROLE)
@@ -417,6 +430,32 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
         for t in INTERNAL_TABLES:
             await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM PUBLIC"))
         status["reader"] = "CONFIGURED"
+    verifier_pw = settings.CORPUS_VERIFIER_PASSWORD.get_secret_value()
+    if verifier_pw and await _verification_schema_exists(lock_conn):
+        vrole = _quote_ident(settings.CORPUS_VERIFIER_ROLE)
+        exists = (
+            await lock_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.CORPUS_VERIFIER_ROLE})
+        ).scalar()
+        if not exists:
+            await lock_conn.execute(
+                text(
+                    f"CREATE ROLE {vrole} LOGIN PASSWORD {_pg_literal(verifier_pw)} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
+                    "NOREPLICATION NOBYPASSRLS"
+                )
+            )
+        else:
+            await lock_conn.execute(text(f"ALTER ROLE {vrole} WITH LOGIN PASSWORD {_pg_literal(verifier_pw)}"))
+        await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {vrole}"))
+        await lock_conn.execute(text(f"REVOKE ALL ON SCHEMA public FROM {vrole}"))
+        await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA verification TO {vrole}"))
+        await lock_conn.execute(text(f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA verification TO {vrole}"))
+        await lock_conn.execute(
+            text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA verification GRANT SELECT, INSERT, UPDATE ON TABLES TO {vrole}")
+        )
+        for t in CONTRACT_TABLES:
+            await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {vrole}"))
+        status["verifier"] = "CONFIGURED"
 
 
 async def _ensure_roles_locked() -> dict:
