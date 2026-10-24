@@ -414,6 +414,23 @@ class Settings(BaseSettings):
         default=False,
         description="When on, promotion quarantines judgments whose court_id row name disagrees with court_name.",
     )
+    SSA_CORPUS_RECORD_VERIFIER: bool = Field(
+        default=False,
+        description="When on, low-priority Celery batches verify every judgment/statute (read-only on corpus; results in verification schema).",
+    )
+    CORPUS_VERIFIER_ROLE: str = Field(default="corpus_verifier")
+    CORPUS_VERIFIER_PASSWORD: SecretStr = Field(
+        default=SecretStr(""),
+        description="Login for verification schema writes only. Blank in dev/tests falls back to corpus_writer for verification tables.",
+    )
+    CORPUS_VERIFIER_BATCH_SIZE: int = Field(default=150, description="Records per verifier tick per stream.")
+    CORPUS_VERIFIER_PASS_SAMPLE_RATE: float = Field(
+        default=0.015,
+        description="Random fraction of PASS rows queued for source fingerprint compare (0.01–0.02).",
+    )
+    CORPUS_VERIFIER_STATEMENT_TIMEOUT_MS: int = Field(default=120_000)
+    CORPUS_VERIFIER_REPORT_DIR: str = Field(default="/tmp/corpus_verification_reports")
+    CORPUS_VERIFIER_SCHEDULE_SECONDS: int = Field(default=900, description="Low-priority verifier tick interval when enabled.")
     SSA_PLD_CITATION_RELABEL: bool = Field(
         default=True,
         description="Default on. Relabel PLD citations missing a court token using the judgment header. Set SSA_PLD_CITATION_RELABEL=0 or false to disable.",
