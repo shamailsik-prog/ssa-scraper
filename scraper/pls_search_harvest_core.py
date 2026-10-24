@@ -301,15 +301,19 @@ def search_harvest_may_mark_done(
 
     Done only for a genuinely empty page, or when the site total is known and every row was seen.
     """
-    if rows_on_page == 0:
-        return True, ""
-    if site_total is None:
-        return False, "pagination ended without next link and site total unknown"
-    if rows_seen < int(site_total):
+    # An empty last page is not evidence of completeness when the site reports
+    # more results than we have enumerated. Never turn a pagination gap into "done".
+    if site_total is not None and rows_seen < int(site_total):
         return (
             False,
             f"pagination ended without next link with rows_seen={rows_seen}<site_total={site_total}",
         )
+    # Only a genuinely empty query can finish without an independently known total.
+    # An empty page after prior rows can be a transient pagination/access failure.
+    if rows_on_page == 0 and rows_seen == 0:
+        return True, ""
+    if site_total is None:
+        return False, "pagination ended without next link and site total unknown"
     return True, ""
 
 
