@@ -55,6 +55,18 @@ def test_plain_journal_year_query_fills_only_reporter_and_year():
     assert ylr["value_roles"] == ["reporter", "year"]
 
 
+def test_keyword_split_applies_to_party_box_without_alias_flag(monkeypatch):
+    """PLD 2017 letter splits must submit the keyword token even when KEYWORD_PARTY_ALIAS is off."""
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False)
+    smap = _dashboard_map()
+    smap["fields"] = {k: v for k, v in smap["fields"].items() if k != "keyword"}
+    q = {"reporter": "PLD", "year": 2017, "keyword": "i"}
+    values = build_harvest_form_values(smap, q, {"page": 1})
+    assert values.get("party") == "i"
+    assert values.get("reporter") == "PLD"
+    assert values.get("year") == "2017"
+
+
 def test_v203_plain_and_court_queries_never_fill_party_without_keyword_flag(monkeypatch):
     """v203 dashboard map: journal-year and court children must not write the party box by default."""
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False)

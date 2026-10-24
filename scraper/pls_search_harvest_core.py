@@ -142,13 +142,9 @@ def build_harvest_form_values(
     for role in ("court", "category"):
         if role in fields and query_json.get(role):
             values[role] = str(query_json[role])
-    if query_json.get("keyword"):
-        from scraper.search_form_roles import harvest_keyword_party_alias_enabled
+    from scraper.search_form_roles import apply_harvest_query_keyword
 
-        if "keyword" in fields:
-            values["keyword"] = str(query_json["keyword"])
-        elif harvest_keyword_party_alias_enabled() and "party" in fields:
-            values["party"] = str(query_json["keyword"])
+    apply_harvest_query_keyword(values, search_map, query_json)
     if "year" in fields and query_json.get("year") and "year" not in values:
         # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
         values["year"] = str(query_json["year"])
@@ -217,6 +213,21 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
 
 
 CASE_KEY_PREFIX = "case:"
+
+
+def harvest_result_fingerprint_from_keys(keys: Set[str]) -> str:
+    """Stable hash of a result row-set (citation / case-name keys) for split-effectiveness checks."""
+    if not keys:
+        return ""
+    payload = "\n".join(sorted(keys))
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def harvest_result_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
+    keys: Set[str] = set()
+    for row in rows:
+        keys.update(citation_keys_for_row(row))
+    return harvest_result_fingerprint_from_keys(keys)
 
 
 def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:

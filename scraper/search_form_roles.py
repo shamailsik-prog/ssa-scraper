@@ -3,12 +3,37 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Iterable, Set
+from typing import Any, Dict, Iterable, Optional, Set
 
 # Harvest query roles that may be satisfied by another mapped control (party text box → keyword splits).
 DEFAULT_HARVEST_ROLE_ALIASES: Dict[str, str] = {
     "keyword": "party",
 }
+
+
+def keyword_text_submit_role(search_map: Dict[str, Any]) -> Optional[str]:
+    """The form control that receives harvest ``keyword`` split tokens (keyword or party text box)."""
+    stored = dict(search_map.get("fields") or {})
+    if "keyword" in stored:
+        return "keyword"
+    if "party" in stored:
+        return "party"
+    resolved = resolve_harvest_fields(search_map)
+    if "keyword" in resolved:
+        return "keyword"
+    if "party" in resolved:
+        return "party"
+    return None
+
+
+def apply_harvest_query_keyword(values: Dict[str, str], search_map: Dict[str, Any], query_json: Dict[str, Any]) -> None:
+    """Ensure split keyword letters are submitted to the live search form (party or keyword box)."""
+    kw = query_json.get("keyword")
+    if not kw:
+        return
+    role = keyword_text_submit_role(search_map)
+    if role:
+        values[role] = str(kw)
 
 
 def harvest_keyword_party_alias_enabled() -> bool:

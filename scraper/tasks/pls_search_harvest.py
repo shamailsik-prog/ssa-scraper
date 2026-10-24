@@ -57,6 +57,7 @@ from scraper.pls_search_harvest_core import (
     iter_extended_plan_queries,
     page_continuity_gaps,
     harvest_result_cap,
+    harvest_result_fingerprint_from_keys,
     should_auto_split_journal_year,
     split_children_cover_rows,
     split_oversized_query,
@@ -569,6 +570,70 @@ class SearchHarvestRunner:
         except Exception as exc:  # a spot check never ends the harvest
             logger.warning("PLS search harvest: spot check between pages failed: %s", exc)
 
+    async def _stop_pending_split_children(self, parent_id: Any, reason: str) -> int:
+        rows = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent_id,
+                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                )
+            )
+        ).scalars().all()
+        n = 0
+        for row in rows:
+            row.status = "split_ineffective"
+            row.last_error = reason[:1000]
+            n += 1
+        return n
+
+    async def _maybe_abort_ineffective_split_child(
+        self,
+        query_row: PlsSearchHarvestQuery,
+        fingerprint: str,
+        rows_seen: int,
+    ) -> bool:
+        """When a split child returns the same row set as its parent or a sibling, stop the split wave."""
+        if not fingerprint or not query_row.parent_id:
+            return False
+        parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
+        if parent is None:
+            return False
+        parent_fp = (parent.cursor_json or {}).get("split_source_fingerprint")
+        reason = None
+        if parent_fp and fingerprint == parent_fp and rows_seen >= int(parent.rows_seen or 0):
+            reason = (
+                f"split ineffective: child {query_row.query_key} returned the same {rows_seen} rows as parent "
+                f"(keyword split not applied to the search form)"
+            )
+        if reason is None:
+            siblings = (
+                await self.db.execute(
+                    select(PlsSearchHarvestQuery).where(
+                        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                        PlsSearchHarvestQuery.parent_id == parent.id,
+                        PlsSearchHarvestQuery.id != query_row.id,
+                    )
+                )
+            ).scalars().all()
+            for sib in siblings:
+                sib_fp = (sib.cursor_json or {}).get("result_fingerprint")
+                if sib_fp and sib_fp == fingerprint and int(sib.rows_seen or 0) == rows_seen:
+                    reason = (
+                        f"split ineffective: {query_row.query_key} matches sibling {sib.query_key} "
+                        f"({rows_seen} rows, 0 new)"
+                    )
+                    break
+        if reason is None:
+            cj = dict(query_row.cursor_json or {})
+            cj["result_fingerprint"] = fingerprint
+            query_row.cursor_json = cj
+            return False
+        query_row.status = "split_ineffective"
+        query_row.last_error = reason[:1000]
+        await self._stop_pending_split_children(parent.id, reason)
+        return True
+
     async def run_query(
         self,
         query_row: PlsSearchHarvestQuery,
@@ -779,6 +844,9 @@ class SearchHarvestRunner:
                         query_json, children, rows_seen=rows_seen, result_cap=cap
                     )
                     if children and covers and not self.probe_mode:
+                        cj = dict(query_row.cursor_json or {})
+                        cj["split_source_fingerprint"] = harvest_result_fingerprint_from_keys(seen_keys)
+                        query_row.cursor_json = cj
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
                         query_row.split_reason = (
@@ -880,6 +948,11 @@ class SearchHarvestRunner:
                     "probe_rows": self._probe_rows,
                 }
             )
+        elif query_row.parent_id and rows_new == 0 and seen_keys:
+            fp = harvest_result_fingerprint_from_keys(seen_keys)
+            if await self._maybe_abort_ineffective_split_child(query_row, fp, rows_seen):
+                result["status"] = query_row.status
+                result["split_ineffective"] = True
         return result
 
     def _split_children_for_truncation(
