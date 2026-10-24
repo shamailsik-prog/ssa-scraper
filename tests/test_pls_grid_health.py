@@ -7,6 +7,7 @@ from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
     grid_rows_remaining,
     pls_preempt_running_job_for_search_harvest,
+    pls_yield_citation_grid_to_search_harvest,
     pls_zero_query_grid_failure,
 )
 
@@ -25,6 +26,21 @@ def test_zero_query_grid_failure_when_rows_remain():
     cfg = {"citation_grid_cursor": {"row_offset": 100, "last_total_rows": 500}}
     msg = pls_zero_query_grid_failure(stats, cfg)
     assert msg and "zero citation-grid progress" in msg
+
+
+def test_yield_saturated_grid_when_search_harvest_pending():
+    now = datetime.now(timezone.utc)
+    cfg = {
+        "citation_grid_cursor": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 200,
+            "last_total_rows": 500,
+        }
+    }
+    reason = pls_yield_citation_grid_to_search_harvest(cfg, None, 30, now=now)
+    assert reason and "30 pending" in reason
+    assert pls_yield_citation_grid_to_search_harvest(cfg, None, 0, now=now) is None
+    assert pls_yield_citation_grid_to_search_harvest(cfg, None, 5, now=now + timedelta(hours=20)) is None
 
 
 def test_defer_pls_grid_when_stalled_for_search_harvest():

@@ -428,6 +428,101 @@ async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monke
     assert "PakistanLawSite:search_harvest_priority" in result["skipped_saturated"]
 
 
+async def test_run_source_skips_saturated_grid_when_search_harvest_pending(db, monkeypatch):
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+
+    now = datetime.now(timezone.utc)
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "PakistanLawSite"))
+    ).scalars().first()
+    source.state = "ACTIVE"
+    source.is_active = True
+    source.config_json = {
+        **dict(source.config_json or {}),
+        "citation_grid_cursor": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 271,
+            "last_total_rows": 500,
+        },
+    }
+    await _activate_pls_slots(db, (1,))
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=CLD|year=2020",
+            query_json={"reporter": "CLD", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    await set_harvest_mode(db, "updates", changed_by="qa", reason="grid yield")
+    await db.commit()
+
+    called = {"n": 0}
+
+    async def fake_connector_for(_source):
+        async def fake_connector(_source_obj, _db, **_kwargs):
+            called["n"] += 1
+            return {"pages": 1, "staged": 1}
+
+        return fake_connector
+
+    monkeypatch.setattr(dispatcher, "_connector_for", fake_connector_for)
+    result = await run_source(source.source_name)
+    assert result["skipped"] == "search_harvest_priority"
+    assert called["n"] == 0
+    running = (
+        await db.execute(
+            select(func.count()).select_from(ScraperJob).where(
+                ScraperJob.source_name == source.source_name,
+                ScraperJob.status == "running",
+            )
+        )
+    ).scalar()
+    assert running == 0
+
+
+async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_watchdog(db, monkeypatch):
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    target = await _prepare_pls_due(db, (1, 2))
+    target.config_json = {
+        **dict(target.config_json or {}),
+        "citation_grid_cursor": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 100,
+            "last_total_rows": 500,
+        },
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=CLD|year=2020",
+            query_json={"reporter": "CLD", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "updates", changed_by="qa", reason="saturated defer")
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, args, kwargs or {}, queue)),
+    )
+    result = await dispatch_due_sources()
+    assert "PakistanLawSite:search_harvest_tick" in result["queued"]
+    assert not any(item[0] == "scraper.tasks.dispatcher.run_login_session_job" for item in sent)
+
+
 async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harvest(db, monkeypatch):
     from scraper.harvest_mode import set_harvest_mode
     from scraper.models import PlsSearchHarvestQuery
