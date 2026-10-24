@@ -39,6 +39,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--max-pages", type=int, default=0)
     run.add_argument("--priority-gaps", action="store_true")
+    probe = sub.add_parser(
+        "search-harvest-probe",
+        help="Read-only live search harvest probe (login lock; no DB writes)",
+    )
+    probe.add_argument("--query-key", required=True)
+    probe.add_argument("--max-pages", type=int, default=1)
     sub.add_parser("reset-retired-frontier-no-reason", help="Reset never-run frontier rows that were retired with no last_error").add_argument("--dry-run", action="store_true")
     remap = sub.add_parser(
         "remap-search-form",
@@ -205,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.priority_gaps:
             argv_run.append("--priority-gaps")
         return cli_run(argv_run or None)
+    if args.command == "search-harvest-probe":
+        from scraper.tasks.pls_search_harvest import cli_search_harvest_probe
+
+        return cli_search_harvest_probe(["--query-key", args.query_key, "--max-pages", str(args.max_pages)])
     return 1
 
 

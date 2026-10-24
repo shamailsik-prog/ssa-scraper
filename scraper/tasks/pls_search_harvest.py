@@ -10,6 +10,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
@@ -522,11 +523,15 @@ class SearchHarvestRunner:
         redis_client=None,
         job_id=None,
         dry_run: bool = False,
+        probe_mode: bool = False,
     ):
         self.db = db
         self.source = source
         self.pipeline = PakistanLawSitePipeline(db, source, redis_client=redis_client, job_id=job_id)
-        self.dry_run = dry_run
+        self.dry_run = dry_run or probe_mode
+        self.probe_mode = probe_mode
+        self._probe_rows: List[Dict[str, Any]] = []
+        self._probe_form_values: Dict[str, str] = {}
         self.memory = PlsBrowserMemoryState()
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
@@ -582,9 +587,11 @@ class SearchHarvestRunner:
             cursor = {"page": 1, "row_index": 0}
         reason = unmapped_harvest_reason(search_map, query_json, cursor)
         if reason:
-            query_row.status = "failed"
-            query_row.last_error = reason[:1000]
-            return {"status": "failed", "reason": reason}
+            if not self.probe_mode:
+                query_row.status = "failed"
+                query_row.last_error = reason[:1000]
+            return {"status": "failed", "reason": reason, "form_values": build_harvest_form_values(search_map, query_json, cursor)}
+        self._probe_form_values = build_harvest_form_values(search_map, query_json, cursor)
         cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
         pages_done = int(query_row.pages_enumerated or 0)
         page_limit = max_pages if max_pages > 0 else int(getattr(settings, "PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY", 0) or 0)
@@ -645,6 +652,17 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
+            if self.probe_mode:
+                for row in fresh_rows:
+                    keys = citation_keys_for_row(row)
+                    self._probe_rows.append(
+                        {
+                            "citation": row.get("citation"),
+                            "detail_url": row.get("detail_url") or row.get("pdf_url"),
+                            "case_name": case_name_from_url(row.get("detail_url") or row.get("pdf_url")),
+                            "known": bool(keys and keys & known_set),
+                        }
+                    )
             if rereading:
                 rows_counted, known_counted = 0, 0
             else:
@@ -682,9 +700,10 @@ class SearchHarvestRunner:
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change
                     # after the first flush, so the stored row_index stayed at 1-9 while ticks reached row 67+. Commit
                     # per row so a killed or redeployed tick keeps its place and its staged rows.
-                    query_row.cursor_json = dict(cursor)
-                    query_row.rows_new = rows_new
-                    await self.db.commit()
+                    if not self.probe_mode:
+                        query_row.cursor_json = dict(cursor)
+                        query_row.rows_new = rows_new
+                        await self.db.commit()
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
                     if deadline is not None and time.monotonic() >= deadline and idx + 1 < len(rows):
@@ -699,13 +718,14 @@ class SearchHarvestRunner:
                 rows_seen -= rows_counted
                 rows_known -= known_counted
                 release_page_result(page)
-                query_row.rows_seen = rows_seen
-                query_row.rows_known = rows_known
-                query_row.rows_new = rows_new
-                query_row.site_total_results = site_total
-                query_row.last_run_at = datetime.now(timezone.utc)
-                query_row.status = "in_progress"
-                await self.db.flush()
+                if not self.probe_mode:
+                    query_row.rows_seen = rows_seen
+                    query_row.rows_known = rows_known
+                    query_row.rows_new = rows_new
+                    query_row.site_total_results = site_total
+                    query_row.last_run_at = datetime.now(timezone.utc)
+                    query_row.status = "in_progress"
+                    await self.db.flush()
                 break
 
             confirmed_last = rereading and not outcome.data.get("next_page")
@@ -724,24 +744,23 @@ class SearchHarvestRunner:
                 pass
 
             gap = compute_gap_size(site_total, rows_known, rows_seen)
-            query_row.site_total_results = site_total
-            query_row.pages_enumerated = pages_done
-            query_row.rows_seen = rows_seen
-            query_row.rows_known = rows_known
-            query_row.rows_new = rows_new
-            query_row.gap_size = gap
-            if site_total is not None:
-                # Only a known site total measures the gap. With the total unknown the gap reads 0, and 1000 - 0
-                # sent the row to the back of the ledger, behind every row that had one (13 October 2026); it keeps
-                # its planned priority instead.
-                query_row.priority = max(1, 1000 - gap)
-            query_row.last_run_at = datetime.now(timezone.utc)
-            await self.db.flush()
+            if not self.probe_mode:
+                query_row.site_total_results = site_total
+                query_row.pages_enumerated = pages_done
+                query_row.rows_seen = rows_seen
+                query_row.rows_known = rows_known
+                query_row.rows_new = rows_new
+                query_row.gap_size = gap
+                if site_total is not None:
+                    query_row.priority = max(1, 1000 - gap)
+                query_row.last_run_at = datetime.now(timezone.utc)
+                await self.db.flush()
 
             if page_limit and pages_done >= page_limit:
-                cursor["page"] = page_idx
-                query_row.cursor_json = dict(cursor)
-                query_row.status = "in_progress"
+                if not self.probe_mode:
+                    cursor["page"] = page_idx
+                    query_row.cursor_json = dict(cursor)
+                    query_row.status = "in_progress"
                 break
             if not nxt:
                 truncated = is_capped(site_total, rows_seen, cap) or should_auto_split_journal_year(
@@ -761,7 +780,7 @@ class SearchHarvestRunner:
                         rows_seen=rows_seen,
                         cap=cap,
                     )
-                    if children:
+                    if children and not self.probe_mode:
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
                         query_row.split_reason = (
@@ -770,8 +789,9 @@ class SearchHarvestRunner:
                             else f"journal_year_truncation rows_seen={rows_seen} cap={cap} site_total={site_total}"
                         )
                         break
-                    query_row.status = "failed"
-                    query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                    if not self.probe_mode:
+                        query_row.status = "failed"
+                        query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
                     break
                 may_done, incomplete_reason = search_harvest_may_mark_done(
                     site_total=site_total,
@@ -791,45 +811,49 @@ class SearchHarvestRunner:
                     )
                 ):
                     may_done = True
-                if may_done:
-                    query_row.status = "done"
-                    query_row.last_error = None if confirmed_last else query_row.last_error
-                    query_row.cursor_json = {"page": 1, "row_index": 0}
-                else:
-                    query_row.status = "in_progress"
-                    query_row.last_error = incomplete_reason[:1000]
-                    if site_total is not None and rows_seen < int(site_total):
-                        cursor = {"page": page_idx + 1, "row_index": 0}
+                if not self.probe_mode:
+                    if may_done:
+                        query_row.status = "done"
+                        query_row.last_error = None if confirmed_last else query_row.last_error
+                        query_row.cursor_json = {"page": 1, "row_index": 0}
                     else:
-                        cursor = {"page": page_idx, "row_index": 0}
-                    query_row.cursor_json = dict(cursor)
+                        query_row.status = "in_progress"
+                        query_row.last_error = incomplete_reason[:1000]
+                        if site_total is not None and rows_seen < int(site_total):
+                            cursor = {"page": page_idx + 1, "row_index": 0}
+                        else:
+                            cursor = {"page": page_idx, "row_index": 0}
+                        query_row.cursor_json = dict(cursor)
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
-            query_row.cursor_json = dict(cursor)
+            if not self.probe_mode:
+                query_row.cursor_json = dict(cursor)
             if repeat_pages >= 2:
-                # Two pages in a row brought nothing new: the next link leads back over pages already read. Stop
-                # here, keep the place, and say why, instead of walking the same rows until the time runs out.
-                query_row.status = "in_progress"
-                query_row.last_error = f"pages {page_idx - 2} and {page_idx - 1} repeated rows of earlier pages; pagination stopped for this run"[:1000]
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
+                    query_row.last_error = f"pages {page_idx - 2} and {page_idx - 1} repeated rows of earlier pages; pagination stopped for this run"[:1000]
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 out_of_time = True
-                query_row.status = "in_progress"
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
                 break
-            await self.db.commit()
+            if not self.probe_mode:
+                await self.db.commit()
             await self._maybe_spot_check()
             await self._pace_sleep()
             try:
                 page = await self.pipeline.fetch_detail(nxt)
             except Exception as exc:
-                query_row.status = "in_progress"
-                query_row.last_error = f"pagination interrupted: {exc}"[:1000]
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
+                    query_row.last_error = f"pagination interrupted: {exc}"[:1000]
                 break
             self.memory.note_window()
             await self._maybe_recycle_browser()
 
-        return {
+        result: Dict[str, Any] = {
             "query_key": query_row.query_key,
             "status": query_row.status,
             "site_total_results": site_total,
@@ -837,10 +861,22 @@ class SearchHarvestRunner:
             "rows_seen": rows_seen,
             "rows_known": rows_known,
             "rows_new": rows_new,
-            "gap_size": query_row.gap_size,
+            "gap_size": compute_gap_size(site_total, rows_known, rows_seen)
+            if self.probe_mode
+            else query_row.gap_size,
             "dry_run": self.dry_run,
             "out_of_time": out_of_time,
         }
+        if self.probe_mode:
+            result.update(
+                {
+                    "read_only_probe": True,
+                    "form_values": self._probe_form_values,
+                    "rows_on_page": len(self._probe_rows),
+                    "probe_rows": self._probe_rows,
+                }
+            )
+        return result
 
     def _split_children_for_truncation(
         self,
@@ -971,6 +1007,109 @@ async def run_search_harvest(
             redis_client=redis_client,
             job_id=job_id,
         )
+
+
+async def run_search_harvest_probe(
+    db: AsyncSession,
+    *,
+    query_key: str,
+    max_pages: int = 1,
+    redis_client=None,
+) -> Dict[str, Any]:
+    """Read-only live search: one login-locked page fetch with no harvest ledger or slot writes."""
+    if not query_key:
+        return {"error": "query_key is required"}
+    if not settings.login_scraping_effective:
+        return {"skipped": True, "reason": "login scraping not permitted in this environment"}
+    source = await _source_row(db)
+    if source.state in ("HALTED", "DISABLED", "PAUSED"):
+        return {"skipped": True, "reason": f"source state {source.state}"}
+    ledger_row = (
+        await db.execute(
+            select(PlsSearchHarvestQuery).where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.query_key == query_key,
+            )
+        )
+    ).scalars().first()
+    if ledger_row is None:
+        return {"error": f"unknown query_key {query_key}"}
+    probe_query = SimpleNamespace(
+        id=ledger_row.id,
+        query_key=ledger_row.query_key,
+        query_json=dict(ledger_row.query_json or {}),
+        cursor_json={"page": 1, "row_index": 0},
+        pages_enumerated=0,
+        rows_seen=0,
+        rows_known=0,
+        rows_new=0,
+        site_total_results=None,
+        status=ledger_row.status,
+        gap_size=0,
+        slot=ledger_row.slot,
+    )
+    harvest_lock: Optional[SessionLock] = None
+    chosen: Optional[int] = None
+    for n in SEARCH_HARVEST_SLOTS:
+        state = await _slot_state(db, n)
+        if state != "ACTIVE":
+            continue
+        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1, **_harvest_lock_options())
+        try:
+            await _acquire_harvest_lock(candidate)
+        except SessionLockHeld:
+            await candidate.release()
+            continue
+        harvest_lock, chosen = candidate, n
+        break
+    if harvest_lock is None or chosen is None:
+        return {"skipped": True, "reason": "no ACTIVE login slot with a free search-harvest lock"}
+    try:
+        async with harvest_run_pg_lock(chosen) as pg_harvest_held:
+            if not pg_harvest_held:
+                await harvest_lock.release()
+                return {"skipped": True, "reason": f"postgres harvest advisory lock held for slot {chosen}"}
+            m = await active_map(db, SOURCE_NAME)
+            if m is None:
+                return {"skipped": True, "reason": "no active search form map"}
+            search_map = map_as_dict(m)
+            runner = SearchHarvestRunner(db, source, redis_client=redis_client, probe_mode=True)
+            runner.harvest_mode = await get_harvest_mode(db)
+            runner.pacing_profile = login_pacing_profile(runner.harvest_mode)
+            runner.pipeline.harvest_mode = runner.harvest_mode
+            runner.pipeline.pacing_profile = runner.pacing_profile
+            runner.spot_check_between_pages = False
+            lock = SessionLock(SOURCE_NAME, redis_client, max_holders=1)
+            try:
+                await lock.acquire()
+            except SessionLockHeld:
+                return {"skipped": True, "reason": "login session lock held"}
+            slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1)
+            try:
+                await slot_lock.acquire()
+            except SessionLockHeld:
+                await lock.release()
+                return {"skipped": True, "reason": f"login slot {chosen} is in use"}
+            runner.pipeline._session_lock = lock
+            runner.pipeline._slot_lock = slot_lock
+            runner.pipeline.runner.preferred_slot_number = chosen
+            runner.pipeline.runner.exclusive_slot = True
+            runner.pipeline._run_locks.append(harvest_lock)
+            runner.pipeline._assert_permitted()
+            try:
+                result = await runner.run_query(probe_query, search_map, max_pages=max(1, int(max_pages or 1)))
+            finally:
+                try:
+                    await runner.pipeline.runner.close()
+                except Exception:
+                    pass
+                await slot_lock.release()
+                await lock.release()
+            await db.rollback()
+            return {**result, "slot": chosen, "read_only_probe": True}
+    finally:
+        if harvest_lock is not None:
+            await harvest_lock.release()
 
 
 async def _run_search_harvest_locked(
@@ -1190,6 +1329,26 @@ def cli_gap_report(argv: Optional[List[str]] = None) -> int:
             return await gap_report_rows(db, limit=args.limit)
 
     print(json.dumps(run_async(_run()), indent=2))
+    return 0
+
+
+def cli_search_harvest_probe(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--query-key", required=True)
+    parser.add_argument("--max-pages", type=int, default=1)
+    args = parser.parse_args(argv)
+
+    async def _run():
+        async with SessionLocal() as db:
+            return await run_search_harvest_probe(
+                db,
+                query_key=args.query_key,
+                max_pages=args.max_pages,
+            )
+
+    print(json.dumps(run_async(_run()), indent=2, default=str))
     return 0
 
 

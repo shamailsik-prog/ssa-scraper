@@ -38,10 +38,9 @@ def harvest_expressible_roles(search_map: Dict[str, Any]) -> Set[str]:
 
 
 def enrich_fields_with_harvest_aliases(fields: Dict[str, Any]) -> Dict[str, str]:
-    """Mutate fields in place for persistence; return the alias map written to limits."""
+    """Record harvest role aliases in limits only; do not duplicate controls in the stored map."""
     aliases: Dict[str, str] = {}
     if "party" in fields and "keyword" not in fields:
-        fields["keyword"] = deepcopy(fields["party"])
         aliases["keyword"] = "party"
     elif "keyword" in fields and "party" not in fields:
         aliases.setdefault("party", "keyword")
@@ -62,7 +61,6 @@ def verify_harvest_role_samples(search_map: Dict[str, Any]) -> Dict[str, Any]:
     """Live/dry-run proof that SCMR-style journal-year court and keyword children map to form values."""
     from scraper.pls_search_harvest_core import build_harvest_form_values, unmapped_harvest_reason
 
-    smap = with_resolved_harvest_map(search_map)
     cursor = {"page": 1}
     samples = [
         {"reporter": "SCMR", "year": 2025, "keyword": "a"},
@@ -71,14 +69,17 @@ def verify_harvest_role_samples(search_map: Dict[str, Any]) -> Dict[str, Any]:
     ]
     checks = []
     for query in samples:
-        reason = unmapped_harvest_reason(smap, query, cursor)
-        values = build_harvest_form_values(smap, query, cursor)
+        reason = unmapped_harvest_reason(search_map, query, cursor)
+        values = build_harvest_form_values(search_map, query, cursor)
+        roles = sorted(values.keys())
+        spill = not query.get("keyword") and any(r in roles for r in ("keyword", "party"))
         checks.append(
             {
                 "query": query,
-                "ok": reason is None and bool(values),
+                "ok": reason is None and bool(values) and not spill,
                 "reason": reason,
-                "value_roles": sorted(values.keys()),
+                "value_roles": roles,
+                "unexpected_party_or_keyword_fill": spill,
             }
         )
     roles = sorted(harvest_expressible_roles(search_map))

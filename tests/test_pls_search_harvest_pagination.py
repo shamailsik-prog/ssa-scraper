@@ -64,6 +64,9 @@ def _runner_factory(monkeypatch, db, pages, *, total=None, fail_url=None):
 
     runner = harvest.SearchHarvestRunner.__new__(harvest.SearchHarvestRunner)
     runner.db, runner.source, runner.dry_run = db, None, True
+    runner.probe_mode = False
+    runner._probe_rows = []
+    runner._probe_form_values = {}
     runner.pipeline = FakePipeline()
     runner.memory = SimpleNamespace(note_window=lambda: None)
     runner.pacing_profile = {"login_delay_min": 0, "login_delay_max": 0}
