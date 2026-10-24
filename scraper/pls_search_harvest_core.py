@@ -10,6 +10,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set
 from scraper.config import KNOWN_REPORTERS
 from scraper.keys import fit_key
 from scraper.parsers.citation_extractor import normalise_citation
+from scraper.parsers.harvest_citation_match import citation_harvest_equivalent_keys
 
 _QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
 
@@ -185,10 +186,7 @@ def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
     keys: Set[str] = set()
     raw = str(row.get("citation") or "").strip()
     if raw:
-        keys.add(raw)
-        normalized = normalise_citation(raw)
-        if normalized:
-            keys.add(normalized)
+        keys |= citation_harvest_equivalent_keys(raw)
     name = case_name_from_url(row.get("detail_url") or row.get("pdf_url"))
     if name:
         keys.add(CASE_KEY_PREFIX + name)
