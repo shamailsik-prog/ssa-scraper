@@ -336,6 +336,13 @@ async def run_source(
             )
             if yield_reason:
                 logger.info("%s: %s; skipping login-session job at start", source_name, yield_reason)
+                # A manual or already-queued grid kick must hand off actual work,
+                # not merely postpone the next dispatcher pass.
+                from scraper.tasks.celery_app import app
+                from scraper.tasks.pls_search_harvest import queue_search_harvest_ticks
+
+                slots = (reporter_shard + 1,) if reporter_shard in (0, 1) else (1, 2)
+                queue_search_harvest_ticks(app, slots=slots)
                 source.next_scrape_at = datetime.now(timezone.utc) + timedelta(
                     minutes=cadence_for_source(source, await get_harvest_mode(db))
                 )
@@ -627,6 +634,13 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         if shard_yield:
                             logger.info("skip enqueue %s shard %s: %s", s.source_name, shard, shard_yield)
                             skipped_saturated.append(f"{s.source_name}:shard{shard}")
+                            # The source-wide cursor may not be saturated even when
+                            # an individual shard is. Enqueue the corresponding
+                            # search-harvest slot instead of silently dropping work.
+                            from scraper.tasks.pls_search_harvest import queue_search_harvest_ticks
+
+                            queue_search_harvest_ticks(app, slots=(shard + 1,))
+                            queued.append(f"{s.source_name}:search_harvest_tick:slot{shard + 1}")
                             this_source_saturated = True
                             continue
                         if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
