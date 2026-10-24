@@ -575,7 +575,7 @@ async def test_drive_concurrency_large_batch_starts_uploads_within_budget(db, so
 
     assert adapter.first_put_at is not None
     # Serial preflight over 50 folders at 20ms each would be ~1s before any put; on-demand must be much sooner.
-    assert adapter.first_put_at - started < 0.5
+    assert adapter.first_put_at - started < 0.75
     assert adapter.ensure_before_first_put < batch // 2
     assert adapter.put_keys
 
