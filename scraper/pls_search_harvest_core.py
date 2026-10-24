@@ -309,11 +309,12 @@ def compute_gap_size(
     *,
     rows_unlinked: int = 0,
 ) -> int:
-    credited = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
+    # A linkless result is still a missing judgment. It is included in rows_seen
+    # already and must not reduce the unresolved corpus gap.
     if site_total is not None and site_total > rows_known:
-        return max(0, int(site_total - rows_known - credited))
+        return max(0, int(site_total - rows_known))
     if rows_seen > rows_known:
-        return max(0, int(rows_seen - rows_known - credited))
+        return max(0, int(rows_seen - rows_known))
     return 0
 
 
@@ -336,17 +337,18 @@ def search_harvest_may_mark_done_unlinked(
     rows_known: int,
     rows_unlinked: int,
 ) -> Tuple[bool, str]:
-    """When pagination ends short of site_total, allow done_unlinked only if unlinked explains the shortfall
-    within the rows_seen-rows_known budget (no site_total credit in search_harvest_may_mark_done)."""
+    """Never certify an enumeration shortfall using rows already counted as seen.
+
+    The caller retains the helper for compatibility with existing search-harvest
+    workflows, but linkless rows are not evidence of unseen site results.
+    """
     if site_total is None or rows_seen >= int(site_total):
         return False, ""
     shortfall = int(site_total) - int(rows_seen)
-    credit = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
-    if shortfall > credit or credit <= 0:
-        return False, ""
     return (
-        True,
-        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url explain shortfall {shortfall}",
+        False,
+        f"pagination incomplete: {shortfall} site result(s) not enumerated; "
+        f"{rows_unlinked} linkless row(s) are already included in rows_seen",
     )
 
 
@@ -415,18 +417,18 @@ def search_harvest_may_mark_done(
 ) -> Tuple[bool, str]:
     """When the extractor reports no next-page link, decide if the query may be marked done.
 
-    Done only for a genuinely empty page, or when the site total is known and every row was seen.
-    Unlinkable rows use status done_unlinked via search_harvest_may_mark_done_unlinked instead.
+    Done only for an empty query or when the known site total has been
+    enumerated. A blank later page cannot prove missing results do not exist.
     """
-    if rows_on_page == 0:
-        return True, ""
-    if site_total is None:
-        return False, "pagination ended without next link and site total unknown"
-    if rows_seen < int(site_total):
+    if site_total is not None and rows_seen < int(site_total):
         return (
             False,
             f"pagination ended without next link with rows_seen={rows_seen}<site_total={site_total}",
         )
+    if rows_on_page == 0 and rows_seen == 0:
+        return True, ""
+    if site_total is None:
+        return False, "pagination ended without next link and site total unknown"
     return True, ""
 
 

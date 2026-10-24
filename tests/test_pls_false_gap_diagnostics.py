@@ -40,11 +40,13 @@ def test_row_gap_diagnostics_and_sample_cap():
     assert len(cursor["gap_samples"]) == GAP_SAMPLES_LIMIT
 
 
-def test_gap_size_credits_unlinked_only_within_seen_unknown():
-    assert unlinked_gap_credit(90, 70, 10) == 10
-    assert unlinked_gap_credit(90, 70, 30) == 20
-    assert compute_gap_size(100, 70, 90, rows_unlinked=10) == 20
-    assert compute_gap_size(100, 70, 90, rows_unlinked=30) == 10
+def test_gap_size_never_credits_unharvested_linkless_judgments():
+    assert unlinked_gap_credit(90, 70, 10) == 10  # diagnostic only
+    assert unlinked_gap_credit(90, 70, 30) == 20  # not a completeness credit
+    assert compute_gap_size(100, 70, 90, rows_unlinked=10) == 30
+    assert compute_gap_size(100, 70, 90, rows_unlinked=30) == 30
+    assert compute_gap_size(100, 90, 100, rows_unlinked=10) == 10
+    assert compute_gap_size(None, 90, 100, rows_unlinked=10) == 10
 
 
 def test_may_mark_done_ignores_unlinked():
@@ -53,20 +55,34 @@ def test_may_mark_done_ignores_unlinked():
     assert search_harvest_may_mark_done(site_total=100, rows_seen=100, rows_on_page=5)[0] is True
 
 
-def test_done_unlinked_requires_shortfall_within_credit():
+def test_done_unlinked_never_explains_missing_site_rows():
     ok, reason = search_harvest_may_mark_done_unlinked(
         site_total=100,
         rows_seen=90,
         rows_known=70,
         rows_unlinked=10,
     )
-    assert ok is True and "shortfall" in reason
+    assert ok is False and "already included" in reason
     assert search_harvest_may_mark_done_unlinked(
         site_total=100,
-        rows_seen=90,
-        rows_known=70,
-        rows_unlinked=5,
+        rows_seen=99,
+        rows_known=90,
+        rows_unlinked=1,
     )[0] is False
+
+
+def test_blank_final_page_does_not_certify_missing_site_rows():
+    for seen in (0, 3):
+        ok, reason = search_harvest_may_mark_done(
+            site_total=9, rows_seen=seen, rows_on_page=0
+        )
+        assert ok is False and "site_total=9" in reason
+    assert search_harvest_may_mark_done(
+        site_total=None, rows_seen=3, rows_on_page=0
+    )[0] is False
+    assert search_harvest_may_mark_done(
+        site_total=3, rows_seen=3, rows_on_page=0
+    )[0] is True
 
 
 @pytest.mark.asyncio
@@ -216,7 +232,8 @@ async def test_run_query_logs_unmatched_and_done_unlinked(db, monkeypatch, caplo
     assert len(samples) == 2
     assert any(s["citation"] == "PLD 2018 SC 99" for s in samples)
     assert any("unmatched row" in r.message for r in caplog.records)
-    assert q.gap_size == 1
-    assert q.status == "done"
+    assert q.gap_size == 2
+    assert q.status == "in_progress"
+    assert "unresolved result row" in (q.last_error or "")
     assert q.rows_new == 1
     await db.rollback()

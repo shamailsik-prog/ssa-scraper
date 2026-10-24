@@ -802,6 +802,14 @@ class SearchHarvestRunner:
                 )
                 if not may_done and confirmed_last and site_total is None:
                     may_done = True
+                # Enumerating a linkless row does not mean its judgment was
+                # harvested. Keep the query unresolved even if every site row
+                # was enumerated; never report a complete corpus from row counts.
+                if may_done and rows_unlinked:
+                    may_done = False
+                    incomplete_reason = (
+                        f"{rows_unlinked} unresolved result row(s) have no detail/PDF link"
+                    )
                 done_unlinked = False
                 unlinked_reason = ""
                 if not may_done:
