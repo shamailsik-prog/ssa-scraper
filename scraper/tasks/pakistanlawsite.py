@@ -813,6 +813,26 @@ class PakistanLawSitePipeline:
         self.stats["surface_mode"] = "citation_grid"
         self.stats["citation_grid_run_minutes"] = limits["run_minutes"]
         journals = self._journal_candidates()
+        # A single journal ending does not complete a multi-journal recovery lap.
+        # Keep a durable, marker-scoped ledger so separate short jobs can each
+        # finish one journal without either clearing the cap early or starving
+        # search-harvest indefinitely.
+        from scraper.pls_grid_health import grid_yield_since_key
+        cap_shards = (0, 1) if self.reporter_shard is None else (int(self.reporter_shard),)
+        saved_markers = self.stats.get("grid_cap_prior_yield_markers") or {}
+        current_cfg = dict(self.source.config_json or {})
+        marker_pairs = [
+            (grid_yield_since_key(shard), saved_markers.get(grid_yield_since_key(shard))
+             if self.stats.get("grid_yield_cap_bypass_consumed") and saved_markers
+             else current_cfg.get(grid_yield_since_key(shard)))
+            for shard in cap_shards
+        ]
+        journal_recovery = bool(journals and any(value for _, value in marker_pairs))
+        marker_token = repr(marker_pairs)
+        journal_progress_key = (
+            f"grid_cap_journals_completed_shard_{self.reporter_shard}"
+            if self.reporter_shard in (0, 1) else "grid_cap_journals_completed_all"
+        )
         if journals:
             first = self._pick_grid_journal()
             if first is None:
@@ -869,11 +889,32 @@ class PakistanLawSitePipeline:
                 break
             # A successful partial window is not a full grid lap. Keep the
             # expired yield cap until the shard has actually reached the end.
-            if (
+            verified_end = (
                 not outcome.get("cursor_unconfirmed")
+                and not outcome.get("citation_grid_stub_stop")
                 and int(outcome.get("processed") or 0) > 0
                 and (outcome.get("wrapped") or outcome.get("reached_end"))
-            ):
+            )
+            if verified_end and journal_recovery and self.grid_journal:
+                cfg = dict(self.source.config_json or {})
+                prior = cfg.get(journal_progress_key)
+                if not isinstance(prior, dict) or (
+                    prior.get("marker") != marker_token or prior.get("journals") != journals
+                ):
+                    prior = {"marker": marker_token, "journals": list(journals), "done": []}
+                done = set(prior.get("done") or []) & set(journals)
+                done.add(self.grid_journal)
+                await merge_source_config(
+                    self.db, self.source,
+                    {journal_progress_key: {**prior, "done": sorted(done)}},
+                )
+                cfg = dict(self.source.config_json or {})
+                required = {
+                    journal for journal in journals
+                    if not journal_unsupported(cfg.get(journal_cursor_key(journal)))
+                }
+                completed_lap = bool(required and required.issubset(done))
+            elif verified_end and not journals:
                 completed_lap = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
@@ -917,6 +958,8 @@ class PakistanLawSitePipeline:
             await pls_clear_grid_yield_marker(
                 self.db, self.source, reporter_shard=self.reporter_shard
             )
+            if journal_recovery:
+                await merge_source_config(self.db, self.source, {journal_progress_key: None})
 
     async def _run_citation_grid_window(self, search_map: Dict[str, Any], limits: Dict[str, int]) -> Dict[str, Any]:
         await self._charge_page()
