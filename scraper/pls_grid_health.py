@@ -415,9 +415,12 @@ def compute_stalled(
         if harvest_paused:
             reason = "harvest_paused"
         elif saturation and saturation.get("all_saturated"):
+            stalled = False
             reason = "grid_saturated"
         else:
             reason = "no_output_while_harvesting"
+    elif saturation and saturation.get("all_saturated"):
+        reason = "grid_saturated"
     orphan_minutes = float(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_MINUTES", 15) or 15)
     locks_held_no_staging = False
     staging_idle_min = None

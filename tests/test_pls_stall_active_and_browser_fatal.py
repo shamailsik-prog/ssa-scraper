@@ -6,7 +6,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scraper.auth.session_manager import BrowserDisconnected, is_playwright_harvest_browser_fatal
+from scraper.auth.session_manager import (
+    BrowserDisconnected,
+    is_playwright_harvest_browser_fatal,
+    is_playwright_harvest_target_closed,
+)
 from scraper.config import settings
 from scraper.pls_grid_health import pls_stall_verdict_for_config, stall_threshold_hours
 from scraper.tasks import pls_search_harvest as harvest
@@ -61,7 +65,9 @@ def test_stall_verdict_active_not_stalled_at_20_min(monkeypatch):
 
 def test_playwright_harvest_fatal_markers():
     assert not is_playwright_harvest_browser_fatal(BrowserDisconnected("Target closed"))
+    assert is_playwright_harvest_browser_fatal(BrowserDisconnected("Page crashed"))
     assert is_playwright_harvest_browser_fatal(RuntimeError("Page crashed"))
+    assert is_playwright_harvest_target_closed(BrowserDisconnected("Target closed"))
     assert not is_playwright_harvest_browser_fatal(RuntimeError("selector not found"))
 
 
@@ -85,7 +91,7 @@ async def test_release_harvest_query_keeps_counters(db):
         db,
         row,
         1,
-        RuntimeError("Page crashed"),
+        BrowserDisconnected("Page crashed"),
     )
     await db.refresh(row)
     assert out["browser_fatal"] is True

@@ -70,13 +70,17 @@ _PLAYWRIGHT_HARVEST_PAGE_CRASH_MARKERS = (
 
 
 def is_playwright_harvest_browser_fatal(exc: BaseException) -> bool:
-    """True only for an in-tick Playwright page crash (not routine browser close / Target closed at tick end)."""
+    """True for an in-tick Playwright page crash, including when session_manager wrapped it as BrowserDisconnected."""
     msg = str(exc).lower()
-    if "target closed" in msg or "browser has been closed" in msg:
-        return False
-    if isinstance(exc, BrowserDisconnected):
-        return False
     return any(marker in msg for marker in _PLAYWRIGHT_HARVEST_PAGE_CRASH_MARKERS)
+
+
+def is_playwright_harvest_target_closed(exc: BaseException) -> bool:
+    """Routine browser/tab close mid-tick: return the harvest row to pending without counting a fatal failure."""
+    if not isinstance(exc, BrowserDisconnected):
+        return False
+    msg = str(exc).lower()
+    return "target closed" in msg or "browser has been closed" in msg
 
 
 class NoActiveSlot(RuntimeError):

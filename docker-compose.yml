@@ -2,6 +2,8 @@ x-app: &app
   image: corpus-service:local
   build: .
   env_file: .env
+  environment:
+    SSA_PROMOTE_DEDICATED_QUEUE_ENABLED: "true"
   volumes:
     - ./live:/app/live
     - ./raw:/app/raw

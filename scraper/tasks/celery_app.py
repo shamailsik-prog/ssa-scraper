@@ -59,7 +59,7 @@ app.conf.update(
         "scraper.tasks.pls_backfill.requalify_quarantined": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
-        "scraper.tasks.promotion_health.promotion_stale_alert": {"queue": "maintenance"},
+        "scraper.tasks.promotion_health.promotion_stale_alert": {"queue": _PROMOTE_QUEUE},
         "scraper.tasks.unreported_reader.read_unreported_batch": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_judgment_citation_relations": {"queue": "maintenance"},

@@ -51,7 +51,7 @@ async def _ready_slot(db):
 
 
 @pytest.mark.asyncio
-async def test_run_search_harvest_browser_disconnect_pending_and_lock_released(db, r, monkeypatch):
+async def test_run_search_harvest_page_crash_pending_and_lock_released(db, r, monkeypatch):
     async with SessionLocal() as db:
         query = await _ready_slot(db)
         qid = query.id
@@ -60,7 +60,7 @@ async def test_run_search_harvest_browser_disconnect_pending_and_lock_released(d
         return object()
 
     async def run_query(self, query_row, search_map, *, max_pages=0):
-        raise RuntimeError("Page crashed")
+        raise BrowserDisconnected("Page crashed")
 
     monkeypatch.setattr(harvest, "active_map", active_map)
     monkeypatch.setattr(harvest, "map_as_dict", lambda m: {})
@@ -82,3 +82,31 @@ async def test_run_search_harvest_browser_disconnect_pending_and_lock_released(d
     probe = SessionLock("PakistanLawSite:search_harvest:slot1", r, max_holders=1)
     await probe.acquire()
     await probe.release()
+
+
+@pytest.mark.asyncio
+async def test_run_search_harvest_target_closed_pending_without_fatal(db, r, monkeypatch):
+    async with SessionLocal() as db:
+        query = await _ready_slot(db)
+        qid = query.id
+
+    async def active_map(db, source_name):
+        return object()
+
+    async def run_query(self, query_row, search_map, *, max_pages=0):
+        raise BrowserDisconnected("Target closed")
+
+    monkeypatch.setattr(harvest, "active_map", active_map)
+    monkeypatch.setattr(harvest, "map_as_dict", lambda m: {})
+    monkeypatch.setattr(harvest.PakistanLawSitePipeline, "_is_dashboard_citation_fields", classmethod(lambda cls, m: True))
+    monkeypatch.setattr(harvest.SearchHarvestRunner, "run_query", run_query)
+
+    async with SessionLocal() as db:
+        result = await harvest.run_search_harvest(db, slot=1, redis_client=r)
+    assert result.get("browser_fatal") is not True
+    assert result.get("paused") is True
+
+    async with SessionLocal() as db:
+        row = await db.get(PlsSearchHarvestQuery, qid)
+        assert row.status == "pending"
+        assert row.rows_seen == 7
