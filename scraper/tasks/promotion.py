@@ -648,6 +648,19 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await db.flush()
         await _supersede_quarantine(db, st, existing)
         return "duplicate"
+    if settings.SSA_HEADER_CITATION_KEY_GUARD and st.source_name == "PakistanLawSite":
+        from scraper.parsers.header_citation import citation_key, leading_header_citation_judgment
+
+        header = leading_header_citation_judgment(full_text)
+        if header and citation_key(canonical) != citation_key(header):
+            await _quarantine(
+                db,
+                st,
+                "header_key_mismatch",
+                "judgment",
+                {"stored": canonical, "header": header},
+            )
+            return "quarantined"
     ok, val_reason = validate_judgment_reconciled_json(data, raw_text=full_text)
     if not ok:
         await record_validation_reject(db, kind="judgment", reason_code=val_reason, source_name=st.source_name)
