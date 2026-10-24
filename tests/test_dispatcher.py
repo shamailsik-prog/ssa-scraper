@@ -469,9 +469,18 @@ async def test_run_source_skips_saturated_grid_when_search_harvest_pending(db, m
         return fake_connector
 
     monkeypatch.setattr(dispatcher, "_connector_for", fake_connector_for)
+    from scraper.tasks.celery_app import app
+
+    sent = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {}, queue)),
+    )
     result = await run_source(source.source_name)
     assert result["skipped"] == "search_harvest_priority"
     assert called["n"] == 0
+    assert [x[1]["slot"] for x in sent if x[0].endswith("pls_search_harvest_tick")] == [1, 2]
     running = (
         await db.execute(
             select(func.count()).select_from(ScraperJob).where(
@@ -521,6 +530,51 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
     result = await dispatch_due_sources()
     assert "PakistanLawSite:search_harvest_tick" in result["queued"]
     assert not any(item[0] == "scraper.tasks.dispatcher.run_login_session_job" for item in sent)
+
+
+async def test_dispatch_saturated_single_shard_queues_its_harvest_tick(db, monkeypatch):
+    """A shard-only saturation must hand its login slot to search harvest."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    source = await _prepare_pls_due(db, (1, 2))
+    source.config_json = {
+        **dict(source.config_json or {}),
+        "citation_grid_cursor_shard_0": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 500,
+            "last_total_rows": 500,
+        },
+        "citation_grid_cursor_shard_1": {},
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=CLD|year=2021",
+            query_json={"reporter": "CLD", "year": 2021},
+            status="pending",
+            priority=100,
+        )
+    )
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNAL_ROTATION", False)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_ENABLED", True)
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "updates", changed_by="qa", reason="shard handoff")
+    await db.commit()
+
+    sent = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {}, queue)),
+    )
+    result = await dispatch_due_sources()
+    assert any(name.endswith("pls_search_harvest_tick") and kw.get("slot") == 1 for name, kw, _ in sent)
+    assert any(name.endswith("run_login_session_job") and kw.get("reporter_shard") == 1 for name, kw, _ in sent)
+    assert "PakistanLawSite:search_harvest_tick:slot1" in result["queued"]
 
 
 async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harvest(db, monkeypatch):
