@@ -306,6 +306,14 @@ class SessionLock:
     async def acquire(self, *, dead_holder_takeover: bool = False) -> None:
         # The exclusive and shared forms protect the same login. Check and acquire both keys in
         # one script so a recovery browser cannot overlap a dual-shard harvest browser.
+        from scraper.config import settings as _settings
+
+        if dead_holder_takeover and not _settings.PLS_LOCK_DEAD_HOLDER_TAKEOVER:
+            dead_holder_takeover = False
+        if dead_holder_takeover and self.max_holders > 1 and self._holder_identity:
+            from scraper.pls_lock_shared import prune_stale_shared_holders
+
+            await prune_stale_shared_holders(await self._client(), self.exclusive_key)
         if await self._try_acquire_once():
             self._held = True
             if self._holder_identity:
@@ -314,10 +322,6 @@ class SessionLock:
                 await touch_worker_alive(await self._client())
             self._register_shutdown_track()
             return
-        from scraper.config import settings as _settings
-
-        if dead_holder_takeover and not _settings.PLS_LOCK_DEAD_HOLDER_TAKEOVER:
-            dead_holder_takeover = False
         if dead_holder_takeover and self.max_holders == 1 and self._holder_identity:
             from scraper.pls_lock_holder import lock_value_holder_stale, touch_worker_alive
 
@@ -335,7 +339,7 @@ class SessionLock:
         raise SessionLockHeld(f"login-session lock {self.key} is held by another worker")
 
     def _register_shutdown_track(self) -> None:
-        if not self._track_shutdown or self.max_holders != 1:
+        if not self._track_shutdown:
             return
         from scraper.config import settings
 
@@ -343,14 +347,20 @@ class SessionLock:
             return
         from scraper.pls_lock_registry import register_lock
 
-        register_lock(self.exclusive_key, self._token)
+        if self.max_holders == 1:
+            register_lock(self.exclusive_key, self._token, kind="exclusive")
+        else:
+            register_lock(self.key, self._token, kind="shared")
 
     def _unregister_shutdown_track(self) -> None:
-        if not self._track_shutdown or self.max_holders != 1:
+        if not self._track_shutdown:
             return
         from scraper.pls_lock_registry import unregister_lock
 
-        unregister_lock(self.exclusive_key, self._token)
+        if self.max_holders == 1:
+            unregister_lock(self.exclusive_key, self._token, kind="exclusive")
+        else:
+            unregister_lock(self.key, self._token, kind="shared")
 
     async def refresh(self) -> None:
         if self._held:

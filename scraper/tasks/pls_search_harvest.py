@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import false, func, select, true
+from sqlalchemy import and_, false, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -367,6 +367,20 @@ def _share_filter(slot: int):
     return _reporter_sql().notin_(share) if share else true()
 
 
+def _other_harvest_slot(slot: int) -> int:
+    return 2 if slot == 1 else 1
+
+
+def _cross_slot_steal_filter(slot: int):
+    """Other slot's reporter share, minus PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS."""
+    other = _other_harvest_slot(slot)
+    base = _share_filter(other)
+    excluded = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS))
+    if excluded:
+        return and_(base, _reporter_sql().notin_(excluded))
+    return base
+
+
 async def pick_next_query(
     db: AsyncSession,
     *,
@@ -397,10 +411,9 @@ async def pick_next_query(
 
 
 def _harvest_lock_options() -> Dict[str, bool]:
-    return {
-        "holder_identity": bool(settings.PLS_LOCK_HOLDER_IDENTITY),
-        "track_shutdown": bool(settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN),
-    }
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    return pls_session_lock_kwargs()
 
 
 async def _acquire_harvest_lock(lock: SessionLock) -> None:
@@ -417,6 +430,7 @@ async def claim_next_query(
     *,
     redis_client=None,
     take_over: bool = False,
+    other_share_only: bool = False,
     candidates: int = 25,
 ) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock]]:
     """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
@@ -427,7 +441,9 @@ async def claim_next_query(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
     )
-    if not take_over:
+    if other_share_only:
+        stmt = stmt.where(_cross_slot_steal_filter(slot))
+    elif not take_over:
         stmt = stmt.where(_share_filter(slot))
     rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
@@ -450,6 +466,36 @@ async def claim_next_query(
 def _slot_known_good_at(slot_row: BrowserSessionSlot) -> Optional[datetime]:
     seen = [t for t in (slot_row.last_used_at, slot_row.last_verified_at, slot_row.logged_in_at) if t is not None]
     return max(seen) if seen else slot_row.updated_at
+
+
+async def cross_slot_idle_claim_allowed(db: AsyncSession, slot: int) -> bool:
+    """True when this slot may claim the other slot's pending ledger rows while the other login is ACTIVE."""
+    if not settings.PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM:
+        return False
+    other = 2 if slot == 1 else 1
+    return await _slot_state(db, other) == "ACTIVE"
+
+
+async def try_claim_harvest_query_for_slot(
+    db: AsyncSession,
+    chosen: int,
+    *,
+    redis_client=None,
+) -> Tuple[Optional[PlsSearchHarvestQuery], Optional[SessionLock], bool, bool]:
+    """Claim order: own share, optional cross-slot (flag + other ACTIVE), then logout takeover."""
+    took_over = False
+    cross_slot_claim = False
+    query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
+    if query_row is None and await cross_slot_idle_claim_allowed(db, chosen):
+        query_row, query_lock = await claim_next_query(
+            db, chosen, redis_client=redis_client, other_share_only=True
+        )
+        if query_row is not None:
+            cross_slot_claim = True
+    if query_row is None and await slot_takeover_due(db, chosen):
+        took_over = True
+        query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+    return query_row, query_lock, took_over, cross_slot_claim
 
 
 async def slot_takeover_due(db: AsyncSession, slot: int, *, now: Optional[datetime] = None) -> bool:
@@ -906,6 +952,7 @@ async def _run_search_harvest_locked(
     runner: Optional[SearchHarvestRunner] = None
     query_row: Optional[PlsSearchHarvestQuery] = None
     took_over = False
+    cross_slot_claim = False
     source = await _source_row(db)
     try:
         if query_key:
@@ -919,10 +966,11 @@ async def _run_search_harvest_locked(
                 query_row.status, query_row.slot = "in_progress", chosen
                 await db.commit()
         else:
-            query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client)
-            if query_row is None and await slot_takeover_due(db, chosen):
-                took_over = True
-                query_row, query_lock = await claim_next_query(db, chosen, redis_client=redis_client, take_over=True)
+            query_row, query_lock, took_over, cross_slot_claim = await try_claim_harvest_query_for_slot(
+                db, chosen, redis_client=redis_client
+            )
+            if query_row is not None:
+                assert query_row.slot == chosen
         if query_row is None:
             return {"skipped": True, "slot": chosen, "reason": f"no pending search harvest query in slot {chosen}'s share"}
         m = await active_map(db, SOURCE_NAME)
@@ -942,7 +990,7 @@ async def _run_search_harvest_locked(
 
         active_slot_count = len([s for s in await runner.pipeline.manager.slots() if s.state == "ACTIVE"])
         max_holders = max(1, min(int(runner.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
-        lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders)
+        lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders, **_harvest_lock_options())
         try:
             await lock.acquire()
         except SessionLockHeld:
@@ -950,7 +998,7 @@ async def _run_search_harvest_locked(
             await db.commit()
             return {"skipped": True, "slot": chosen, "reason": "login session lock held"}
         # This tick's own login only, never the other (two browsers on one login end each other, R3.5).
-        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1)
+        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1, **_harvest_lock_options())
         try:
             await slot_lock.acquire()
         except SessionLockHeld:
@@ -969,7 +1017,7 @@ async def _run_search_harvest_locked(
             search_map = map_as_dict(m) if m else search_map
         result = await runner.run_query(query_row, search_map, max_pages=max_pages)
         await db.commit()
-        return {**result, "slot": chosen, "took_over": took_over}
+        return {**result, "slot": chosen, "took_over": took_over, "cross_slot_claim": cross_slot_claim}
     except (PacingBudgetExceeded, PlsBrowserMemoryHardLimit, LoginRequired) as exc:
         if query_row is not None:
             query_row.status = "pending"

@@ -1710,7 +1710,9 @@ class PakistanLawSitePipeline:
         # slots, whatever the pacing profile targets (two browsers on one login end each other).
         active_slot_count = len([s for s in await self.manager.slots() if s.state == "ACTIVE"])
         max_holders = max(1, min(int(self.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
-        lock = SessionLock(SOURCE_NAME, self.redis_client, max_holders=max_holders)
+        from scraper.pls_lock_session import pls_session_lock_kwargs
+
+        lock = SessionLock(SOURCE_NAME, self.redis_client, max_holders=max_holders, **pls_session_lock_kwargs())
         try:
             await lock.acquire()
         except SessionLockHeld:
@@ -1749,7 +1751,12 @@ class PakistanLawSitePipeline:
                 self.stats["paused"] = True
                 return self.stats
             # One browser per login, enforced where it matters: an exclusive lock on the slot itself.
-            slot_lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", self.redis_client, max_holders=1)
+            slot_lock = SessionLock(
+                f"{SOURCE_NAME}:slot{slot.slot_number}",
+                self.redis_client,
+                max_holders=1,
+                **pls_session_lock_kwargs(),
+            )
             try:
                 await slot_lock.acquire()
             except SessionLockHeld:
@@ -1927,7 +1934,14 @@ async def claim_free_slot(pipeline: "PakistanLawSitePipeline"):
 
     active.sort(key=lambda s: (pages_this_hour(s), current is None or s.slot_number != current.slot_number, s.slot_number))
     for slot in active:
-        lock = SessionLock(f"{SOURCE_NAME}:slot{slot.slot_number}", pipeline.redis_client, max_holders=1)
+        from scraper.pls_lock_session import pls_session_lock_kwargs
+
+        lock = SessionLock(
+            f"{SOURCE_NAME}:slot{slot.slot_number}",
+            pipeline.redis_client,
+            max_holders=1,
+            **pls_session_lock_kwargs(),
+        )
         try:
             await lock.acquire()
         except SessionLockHeld:

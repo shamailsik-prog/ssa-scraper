@@ -111,7 +111,7 @@ def is_fake_section_number(section_number: str, *, all_numbers: Sequence[str]) -
     typical_max = _typical_max_excluding_candidate(all_numbers, section_number)
     if n > 5000:
         return True
-    if n > typical_max + 5 and n >= 100:
+    if n > typical_max + 5:
         return True
     return False
 
@@ -130,6 +130,18 @@ def count_missing_from_section_run(section_numbers: Sequence[str], *, run_end: O
         return 10_000
     present = set(real)
     return sum(1 for i in range(1, end + 1) if i not in present)
+
+
+def _is_substantive_section(section: Dict[str, str], all_numbers: Sequence[str]) -> bool:
+    num = str(section.get("section_number") or "")
+    n = _section_int(num)
+    if n is None:
+        return False
+    if _YEAR_LIKE_MIN <= n <= _YEAR_LIKE_MAX:
+        return False
+    if is_fake_section_number(num, all_numbers=all_numbers):
+        return False
+    return len((section.get("section_text") or "").strip()) >= SUBSTANTIVE_SECTION_MIN_CHARS
 
 
 def section_1_has_may_be_called(sections: Sequence[Dict[str, str]]) -> bool:
@@ -153,12 +165,7 @@ def dedupe_keeper_rank(
     missing = count_missing_from_section_run(nums, run_end=group_run_end)
     fake = count_fake_sections(nums)
     may_called = 1 if section_1_has_may_be_called(sections) else 0
-    substantive_sections = sum(
-        1
-        for s in sections
-        if len((s.get("section_text") or "").strip()) >= SUBSTANTIVE_SECTION_MIN_CHARS
-        and _section_int(str(s.get("section_number") or "")) is not None
-    )
+    substantive_sections = sum(1 for s in sections if _is_substantive_section(s, nums))
     prov = 1 if has_source_url else 0
     return (
         -missing,

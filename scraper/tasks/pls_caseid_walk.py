@@ -244,9 +244,22 @@ async def run_caseid_walk(db, *, probes: Optional[int] = None, redis_client=None
     walker.pipeline.harvest_mode = mode
     walker.pipeline.pacing_profile = walker.pacing_profile
     active = len([s for s in await walker.pipeline.manager.slots() if s.state == "ACTIVE"])
-    lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max(1, min(int(walker.pacing_profile.get("login_session_concurrency") or 1), active)))
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    _lock_kw = pls_session_lock_kwargs()
+    lock = SessionLock(
+        SOURCE_NAME,
+        redis_client,
+        max_holders=max(1, min(int(walker.pacing_profile.get("login_session_concurrency") or 1), active)),
+        **_lock_kw,
+    )
     # one walk per partition at a time: each partition's cursor is one state key in the source config
-    walk_lock = SessionLock(f"{SOURCE_NAME}:caseid_walk" if not partition else f"{SOURCE_NAME}:caseid_walk:p{partition}", redis_client, max_holders=1)
+    walk_lock = SessionLock(
+        f"{SOURCE_NAME}:caseid_walk" if not partition else f"{SOURCE_NAME}:caseid_walk:p{partition}",
+        redis_client,
+        max_holders=1,
+        **_lock_kw,
+    )
     try:
         await walk_lock.acquire()
     except SessionLockHeld:

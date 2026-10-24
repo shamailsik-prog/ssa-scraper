@@ -62,6 +62,10 @@ def test_mutant_b4_config_order_sheet_title_default_on():
     assert Settings.model_fields["SSA_ORDER_SHEET_TITLE"].default is True
 
 
+def test_mutant_b4_config_pls_court_resolution_default_off():
+    assert Settings.model_fields["SSA_PLS_COURT_RESOLUTION"].default is False
+
+
 def test_encoding_body_mojibake_quarantines_with_defaults_on(monkeypatch):
     monkeypatch.delenv("SSA_ENCODING_GUARD", raising=False)
     monkeypatch.setattr(settings, "SSA_ENCODING_GUARD", True)

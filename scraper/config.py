@@ -336,6 +336,14 @@ class Settings(BaseSettings):
         default=30,
         description="A login slot that has been logged out (not ACTIVE) this long has its share of the search-harvest ledger taken over by the other slot, which keeps its own share as well.",
     )
+    PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM: bool = Field(
+        default=False,
+        description="When true, a slot with no pending rows in its own reporter share may claim the other slot's pending rows while that slot is still ACTIVE. Own share is always tried first. Set to 1 or true to enable.",
+    )
+    PLS_SEARCH_HARVEST_CROSS_SLOT_EXCLUDE_REPORTERS: str = Field(
+        default="",
+        description="Comma list of reporters (normalised like PLS_SEARCH_HARVEST_SLOT1_REPORTERS) that must not be claimed via cross-slot idle steal.",
+    )
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
@@ -397,6 +405,10 @@ class Settings(BaseSettings):
     SSA_COURT_HEADER_GUARD: bool = Field(
         default=True,
         description="Default on. Fail closed when stored court disagrees with the judgment header (e.g. SC default vs HC header). Set SSA_COURT_HEADER_GUARD=0 or false to disable.",
+    )
+    SSA_PLS_COURT_RESOLUTION: bool = Field(
+        default=False,
+        description="When on, prefer foreign heading court over grid default Supreme Court of Pakistan on PLS pages. Set SSA_PLS_COURT_RESOLUTION=1 or true to enable.",
     )
     SSA_PLD_CITATION_RELABEL: bool = Field(
         default=True,

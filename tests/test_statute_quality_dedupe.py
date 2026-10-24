@@ -215,6 +215,32 @@ def test_keeper_ajk_speakers_salary_act_1971_prefers_fuller_copy():
     assert _rank_winner(fuller, thinner) == "a"
 
 
+def test_keeper_ajk_speakers_salary_1971_stray_section_21_not_preferred():
+    thinner = _char_budget_sections(3, 1498, may_be_called=True) + [
+        {"section_number": "21", "section_text": "Section 21. " + ("q" * 80)}
+    ]
+    fuller = _char_budget_sections(4, 2024, may_be_called=False)
+    assert _rank_winner(fuller, thinner) == "a"
+
+
+def test_r5_r6_substantive_count_ignores_year_shaped_section_numbers():
+    nums = [str(i) for i in range(1, 5)] + ["1990"]
+    sections = _char_budget_sections(4, 3000, may_be_called=True) + [
+        {"section_number": "1990", "section_text": "Section 1990. " + ("y" * 80)}
+    ]
+    assert dedupe_keeper_rank(
+        sections=sections,
+        text_chars=4000,
+        has_source_url=True,
+        group_run_end=4,
+    ) < dedupe_keeper_rank(
+        sections=_char_budget_sections(4, 4000, may_be_called=True),
+        text_chars=4000,
+        has_source_url=True,
+        group_run_end=4,
+    )
+
+
 def test_r5_r6_substantive_run_end_ignores_fake_year_section_1122():
     """AJK Rescue 1122 / Industrial Relations 2017 shape: long s.1122 must not set group run end."""
     clean = _sections_range(12, may_be_called=True)
@@ -284,6 +310,36 @@ def test_rank_step_r6_source_url():
 def test_rank_step_r7_char_fraction_guard():
     assert keeper_below_char_fraction(600, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
     assert not keeper_below_char_fraction(800, group_best_chars=1000, min_fraction=KEEPER_MIN_CHAR_FRACTION)
+
+
+@pytest.mark.asyncio
+async def test_n6_find_duplicate_groups_equal_substantive_sections_group_run_end_decides(db):
+    """Equal substantive section counts: fuller run still wins via group_run_end missing gaps."""
+    trunc_id, full_id = uuid4(), uuid4()
+    for sid, name in (
+        (trunc_id, "The Equal Substantive Act, 2018"),
+        (full_id, "The Equal Substantive Act,2018"),
+    ):
+        db.add(
+            Statute(
+                id=sid,
+                name=name,
+                jurisdiction="AJ&K",
+                year_enacted=2018,
+                source_name="PakistanCode",
+                source_url="https://example.test/full" if sid == full_id else None,
+            )
+        )
+    await db.commit()
+    trunc_secs = _char_budget_sections(8, 4000, may_be_called=False)
+    full_secs = _char_budget_sections(12, 8000, may_be_called=True)
+    for s in trunc_secs:
+        await _add_section(db, trunc_id, s["section_number"], s["section_text"])
+    for s in full_secs:
+        await _add_section(db, full_id, s["section_number"], s["section_text"])
+    await db.commit()
+    dry = await find_duplicate_groups(db)
+    assert dry["winners"] == [full_id]
 
 
 @pytest.mark.asyncio
