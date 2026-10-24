@@ -40,6 +40,7 @@ from scraper.pls_search_harvest_core import (
     SEARCH_HARVEST_SLOTS,
     build_harvest_form_values,
     CASE_KEY_PREFIX,
+    CASE_NAME_URL_SUBSTRING_PATTERN,
     citation_keys_for_row,
     compute_gap_size,
     gap_report_sort_key,
@@ -84,7 +85,7 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
     if case_names:
         # a judgment page's CaseName in a promoted or staged (any status) capture: already held
         for model in (Judgment, ScraperStaging):
-            name_col = func.upper(func.substring(model.source_url, r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])"))
+            name_col = func.upper(func.substring(model.source_url, CASE_NAME_URL_SUBSTRING_PATTERN))
             q = select(name_col).where(model.source_name == SOURCE_NAME, name_col.in_(list(case_names)))
             for (name,) in (await db.execute(q)).all():
                 if name:
