@@ -42,8 +42,17 @@ from scraper.pls_search_harvest_core import (
     CASE_KEY_PREFIX,
     CASE_NAME_URL_SUBSTRING_PATTERN,
     citation_keys_for_row,
+    append_gap_sample,
     compute_gap_size,
     gap_report_sort_key,
+    row_gap_diagnostics,
+    cursor_reset_for_done,
+    gap_diagnostics_slice,
+    note_unlinked_row,
+    reset_lap_gap_diagnostics,
+    rows_unlinked_from_cursor,
+    search_harvest_may_mark_done_unlinked,
+    unlinked_done_safety_error,
     iter_base_plan_queries,
     make_query_key,
     normalize_query_json,
@@ -327,7 +336,13 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
     ).scalars().all()
     out: List[Dict[str, Any]] = []
     for row in rows:
-        gap = compute_gap_size(row.site_total_results, row.rows_known, row.rows_seen)
+        unlinked = rows_unlinked_from_cursor(row.cursor_json or {})
+        gap = compute_gap_size(
+            row.site_total_results,
+            row.rows_known,
+            row.rows_seen,
+            rows_unlinked=unlinked,
+        )
         out.append(
             {
                 "query_key": row.query_key,
@@ -338,6 +353,7 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
                 "rows_seen": row.rows_seen,
                 "rows_known": row.rows_known,
                 "rows_new": row.rows_new,
+                "rows_unlinked": unlinked,
                 "gap_size": gap,
                 "last_error": row.last_error,
                 "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
@@ -578,6 +594,7 @@ class SearchHarvestRunner:
         rows_seen = int(query_row.rows_seen or 0)
         rows_known = int(query_row.rows_known or 0)
         rows_new = int(query_row.rows_new or 0)
+        rows_unlinked = rows_unlinked_from_cursor(cursor)
         site_total = query_row.site_total_results
         start_row_index = int(cursor.get("row_index") or 0)
         page_idx = int(cursor.get("page") or 1)
@@ -606,6 +623,10 @@ class SearchHarvestRunner:
         await self._maybe_recycle_browser()
 
         while True:
+            if page_idx == 1 and start_row_index == 0 and not rereading:
+                reset_lap_gap_diagnostics(cursor)
+            unlinked_keys_snapshot = list(cursor.get("unlinked_keys") or [])
+
             from scraper.extractors.hybrid_extractor import HybridExtractor
 
             extractor = HybridExtractor(self.db, self.source, local=self.pipeline.local_engine)
@@ -632,12 +653,30 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
+            for row in new_rows:
+                diag = row_gap_diagnostics(row)
+                logger.info(
+                    "PLS search harvest %s page %s unmatched row: %s",
+                    query_row.query_key,
+                    page_idx,
+                    diag,
+                )
+                append_gap_sample(cursor, row)
             if rereading:
                 rows_counted, known_counted = 0, 0
             else:
                 rows_counted, known_counted = len(fresh_rows), known_on_page
             rows_seen += rows_counted
             rows_known += known_counted
+
+            for row in fresh_rows:
+                if row.get("detail_url") or row.get("pdf_url"):
+                    continue
+                keys = citation_keys_for_row(row)
+                if keys & known_set:
+                    continue
+                note_unlinked_row(cursor, row)
+            rows_unlinked = rows_unlinked_from_cursor(cursor)
 
             if not self.dry_run:
                 route_base = {
@@ -649,9 +688,9 @@ class SearchHarvestRunner:
                     if idx < start_row_index:
                         continue
                     detail_url = row.get("detail_url") or row.get("pdf_url")
+                    keys = citation_keys_for_row(row)
                     if not detail_url:
                         continue
-                    keys = citation_keys_for_row(row)
                     if keys & known_set:
                         continue
                     if id(row) not in fresh_ids:
@@ -685,11 +724,15 @@ class SearchHarvestRunner:
                 # query on the next tick, which counts this page's rows again, so they are not counted now.
                 rows_seen -= rows_counted
                 rows_known -= known_counted
+                cursor["unlinked_keys"] = unlinked_keys_snapshot
+                cursor["rows_unlinked"] = len(unlinked_keys_snapshot)
+                rows_unlinked = rows_unlinked_from_cursor(cursor)
                 release_page_result(page)
                 query_row.rows_seen = rows_seen
                 query_row.rows_known = rows_known
                 query_row.rows_new = rows_new
                 query_row.site_total_results = site_total
+                query_row.cursor_json = dict(cursor)
                 query_row.last_run_at = datetime.now(timezone.utc)
                 query_row.status = "in_progress"
                 await self.db.flush()
@@ -710,13 +753,15 @@ class SearchHarvestRunner:
             except Exception:
                 pass
 
-            gap = compute_gap_size(site_total, rows_known, rows_seen)
+            gap = compute_gap_size(site_total, rows_known, rows_seen, rows_unlinked=rows_unlinked)
             query_row.site_total_results = site_total
             query_row.pages_enumerated = pages_done
             query_row.rows_seen = rows_seen
             query_row.rows_known = rows_known
             query_row.rows_new = rows_new
             query_row.gap_size = gap
+            cursor["rows_unlinked"] = rows_unlinked
+            query_row.cursor_json = dict(cursor)
             if site_total is not None:
                 # Only a known site total measures the gap. With the total unknown the gap reads 0, and 1000 - 0
                 # sent the row to the back of the ledger, behind every row that had one (13 October 2026); it keeps
@@ -757,21 +802,45 @@ class SearchHarvestRunner:
                 )
                 if not may_done and confirmed_last and site_total is None:
                     may_done = True
+                done_unlinked = False
+                unlinked_reason = ""
+                if not may_done:
+                    done_unlinked, unlinked_reason = search_harvest_may_mark_done_unlinked(
+                        site_total=site_total,
+                        rows_seen=rows_seen,
+                        rows_known=rows_known,
+                        rows_unlinked=rows_unlinked,
+                    )
+                if done_unlinked:
+                    safety = unlinked_done_safety_error(rows_seen, rows_unlinked)
+                    if safety:
+                        logger.warning(
+                            "PLS search harvest %s: %s",
+                            query_row.query_key,
+                            safety,
+                        )
+                        done_unlinked = False
+                        incomplete_reason = safety
                 if may_done:
                     query_row.status = "done"
                     query_row.last_error = None if confirmed_last else query_row.last_error
-                    query_row.cursor_json = {"page": 1, "row_index": 0}
+                    query_row.cursor_json = cursor_reset_for_done(cursor)
+                elif done_unlinked:
+                    query_row.status = "done_unlinked"
+                    query_row.last_error = None
+                    query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
                     query_row.status = "in_progress"
-                    query_row.last_error = incomplete_reason[:1000]
+                    query_row.last_error = (unlinked_reason or incomplete_reason)[:1000]
                     if site_total is not None and rows_seen < int(site_total):
-                        cursor = {"page": page_idx + 1, "row_index": 0}
+                        cursor["page"] = page_idx + 1
                     else:
-                        cursor = {"page": page_idx, "row_index": 0}
+                        cursor["page"] = page_idx
+                    cursor["row_index"] = 0
                     query_row.cursor_json = dict(cursor)
                 break
             page_idx += 1
-            cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
+            cursor = {"page": page_idx, "row_index": 0, "next_url": nxt, **gap_diagnostics_slice(cursor)}
             query_row.cursor_json = dict(cursor)
             if repeat_pages >= 2:
                 # Two pages in a row brought nothing new: the next link leads back over pages already read. Stop
