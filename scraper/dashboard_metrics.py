@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.models import ArchiveObject, ArchiveTarget, CrawlFrontier, Instrument, Judgment, ScraperSource, SourceProvenance, Statute, StatuteSection
+from scraper.pls_caseid import group_eligible_for_walk
 from scraper.tasks.pls_caseid_walk import WALK_PARTITIONS, partition_of, state_key
 
 # How long a heartbeat may be old before its light turns red (the job's own cadence plus slack).
@@ -213,7 +214,7 @@ def _caseid_walk_progress(pls_cfg: Dict[str, Any]) -> Dict[str, Any]:
         if calibration is None and walk.get("calibration") is not None:
             calibration = walk.get("calibration")
         for key, g in (walk.get("groups") or {}).items():
-            if partition_of(key) == p:
+            if partition_of(key) == p and group_eligible_for_walk(key):
                 groups[key] = g
         lp = walk.get("last_probe_at")
         if not lp:
@@ -225,7 +226,8 @@ def _caseid_walk_progress(pls_cfg: Dict[str, Any]) -> Dict[str, Any]:
         if best_probe is None or at > best_probe:
             best_probe = at
             last_probe_at = lp
-            current_group = walk.get("current")
+            cg = walk.get("current")
+            current_group = cg if isinstance(cg, str) and group_eligible_for_walk(cg) else current_group
     return {
         "calibrated": calibrated,
         "calibration": calibration,

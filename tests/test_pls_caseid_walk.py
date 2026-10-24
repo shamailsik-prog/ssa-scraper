@@ -81,10 +81,12 @@ def test_group_order_skips_extended_courts_for_empty_years_by_default(monkeypatc
         [
             f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2026S701",
             f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH12",
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024HCAJK3",
         ]
     )
     order = group_order(known, first_year=2025, last_year=2026)
-    assert "2024LAT-SINDH" in order
+    assert "2024LAT-SINDH" not in order
+    assert "2024HCAJK" not in order
     assert "2026LAT-SINDH" not in order
     assert "2025LAT-SINDH" not in order
     assert "2025S" in order
@@ -97,11 +99,31 @@ def test_group_order_empty_years_for_extended_courts_when_flag_on(monkeypatch):
         [
             f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2026S701",
             f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH12",
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024HCAJK3",
         ]
     )
     order = group_order(known, first_year=2025, last_year=2026)
+    assert "2024LAT-SINDH" in order
+    assert "2024HCAJK" in order
     assert "2026LAT-SINDH" in order
     assert "2025LAT-SINDH" in order
+
+
+def test_caseid_walk_status_counts_exclude_extended_groups_when_flag_off(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", False)
+    from scraper.dashboard_metrics import _caseid_walk_progress
+    from scraper.tasks.pls_caseid_walk import state_key
+
+    keys = ["2026S", "2025L", "2024LAT-SINDH", "2024HCAJK"]
+    legacy = {"calibrated_at": "x", "groups": {k: {"hits": 2, "misses": 1} for k in keys}}
+    off = _caseid_walk_progress({state_key(0): legacy})
+    assert off["groups_started"] == 2
+    assert off["found"] == 4
+
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", True)
+    on = _caseid_walk_progress({state_key(0): legacy})
+    assert on["groups_started"] == 4
+    assert on["found"] == 8
 
 
 def test_walk_skips_held_serials_and_jumps_to_block_starts_after_a_miss_streak():
