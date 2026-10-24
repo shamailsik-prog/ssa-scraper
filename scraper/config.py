@@ -383,8 +383,24 @@ class Settings(BaseSettings):
     PLS_CASEID_WALK_CEILING_PAD: int = Field(default=1000, description="How far past the highest held or found serial a group keeps probing block starts.")
     PLS_CASEID_WALK_RECHECK_HOURS: float = Field(default=12.0, description="After a failed calibration on held judgments, wait this long before trying again.")
     PLS_SEARCH_RESULT_CAP: int = Field(
-        default=500,
-        description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
+        default=400,
+        description="PakistanLawSite CitationSearch result cap observed in production (~400 rows per page); queries at or above this are split by court/keyword.",
+    )
+    PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS: int = Field(
+        default=380,
+        description="When site_total is blank, treat a journal-year query with at least this many rows_seen and no next page as truncated for auto-split (0 = use PLS_SEARCH_RESULT_CAP only).",
+    )
+    PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR: bool = Field(
+        default=False,
+        description="When true, auto-split reporter×year queries that end on one page at the truncation row count even when site_total is null.",
+    )
+    PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS: str = Field(
+        default="SC,HC,LHC,SHC,PHC,BHC,FSC,FST",
+        description="Court tokens used when splitting oversized queries if the search map court field has no dropdown options.",
+    )
+    PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE: bool = Field(
+        default=False,
+        description="When true, re-queue done harvest rows that stopped after one page while rows_seen < site_total_results. Never reopens when site_total is null/blank.",
     )
     PLS_SEARCH_HARVEST_TICK_SECONDS: int = Field(
         default=1200,

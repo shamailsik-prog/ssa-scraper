@@ -55,6 +55,7 @@ from scraper.pls_search_harvest_core import (
     is_capped,
     iter_extended_plan_queries,
     page_continuity_gaps,
+    should_auto_split_journal_year,
     split_oversized_query,
     unmapped_harvest_reason,
     years_for_plan,
@@ -116,10 +117,16 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
 
 
 def _court_options_from_map(search_map: Dict[str, Any]) -> List[str]:
-    fields = search_map.get("fields") or {}
+    from scraper.search_form_roles import resolve_harvest_fields
+
+    fields = resolve_harvest_fields(search_map)
     court = fields.get("court") or {}
     opts = [str(o).strip() for o in (court.get("options") or []) if str(o).strip()]
-    return opts
+    if opts:
+        return opts
+    if "court" in fields:
+        return [t.strip() for t in str(settings.PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS or "").split(",") if t.strip()]
+    return []
 
 
 def _reporter_options_from_map(search_map: Dict[str, Any]) -> List[str]:
@@ -288,12 +295,19 @@ async def reopen_premature_done_queries(
     *,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Re-queue search harvest jobs marked done after only page 1 with no parsed site total."""
-    reopen_reason = "reopened: marked done without known site total and at most one page enumerated"
+    """Re-queue jobs marked done too early when a known site total was not fully enumerated.
+
+    Never acts on null/blank site_total_results (PLS no longer prints totals on every row).
+    """
+    if not getattr(settings, "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE", False):
+        return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE is off", "would_reopen": 0}
+    reopen_reason = "reopened: marked done after one page while rows_seen < site_total_results"
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status == "done",
-        PlsSearchHarvestQuery.site_total_results.is_(None),
+        PlsSearchHarvestQuery.site_total_results.isnot(None),
+        PlsSearchHarvestQuery.site_total_results > 0,
+        PlsSearchHarvestQuery.rows_seen < PlsSearchHarvestQuery.site_total_results,
         func.coalesce(PlsSearchHarvestQuery.pages_enumerated, 0) <= 1,
     )
     rows = (await db.execute(stmt)).scalars().all()
@@ -730,21 +744,31 @@ class SearchHarvestRunner:
                 query_row.status = "in_progress"
                 break
             if not nxt:
-                if is_capped(site_total, rows_seen, cap):
+                truncated = is_capped(site_total, rows_seen, cap) or should_auto_split_journal_year(
+                    query_json,
+                    rows_seen=rows_seen,
+                    site_total=site_total,
+                    result_cap=cap,
+                    has_next_page=False,
+                )
+                if truncated:
                     # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
                     # loudly when nothing narrower can be expressed.
-                    children = split_oversized_query(
+                    children = self._split_children_for_truncation(
+                        search_map,
                         query_json,
-                        int(site_total if site_total is not None else rows_seen),
-                        result_cap=cap,
-                        court_options=_court_options_from_map(search_map),
-                        available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword"},
-                        bench_options=[str(o) for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []],
+                        site_total=site_total,
+                        rows_seen=rows_seen,
+                        cap=cap,
                     )
                     if children:
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
-                        query_row.split_reason = f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
+                        query_row.split_reason = (
+                            f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
+                            if is_capped(site_total, rows_seen, cap)
+                            else f"journal_year_truncation rows_seen={rows_seen} cap={cap} site_total={site_total}"
+                        )
                         break
                     query_row.status = "failed"
                     query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
@@ -754,7 +778,18 @@ class SearchHarvestRunner:
                     rows_seen=rows_seen,
                     rows_on_page=len(rows),
                 )
-                if not may_done and confirmed_last and site_total is None:
+                if (
+                    not may_done
+                    and confirmed_last
+                    and site_total is None
+                    and not should_auto_split_journal_year(
+                        query_json,
+                        rows_seen=rows_seen,
+                        site_total=site_total,
+                        result_cap=cap,
+                        has_next_page=False,
+                    )
+                ):
                     may_done = True
                 if may_done:
                     query_row.status = "done"
@@ -806,6 +841,30 @@ class SearchHarvestRunner:
             "dry_run": self.dry_run,
             "out_of_time": out_of_time,
         }
+
+    def _split_children_for_truncation(
+        self,
+        search_map: Dict[str, Any],
+        query_json: Dict[str, Any],
+        *,
+        site_total: Optional[int],
+        rows_seen: int,
+        cap: int,
+    ) -> List[Dict[str, Any]]:
+        from scraper.search_form_roles import harvest_expressible_roles
+
+        effective_total = int(site_total if site_total is not None else rows_seen)
+        return split_oversized_query(
+            query_json,
+            effective_total,
+            result_cap=cap,
+            court_options=_court_options_from_map(search_map),
+            available_roles=harvest_expressible_roles(search_map) | {"court", "keyword"},
+            bench_options=[
+                str(o)
+                for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []
+            ],
+        )
 
     async def _enqueue_split_children(
         self,
