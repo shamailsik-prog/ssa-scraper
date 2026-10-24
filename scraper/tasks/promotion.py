@@ -321,7 +321,11 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         return "quarantined"
     if st.source_name == "PakistanLawSite":
         headnote_signal = detect_headnotes_only(raw_text=st.raw_text, raw_html=st.raw_html)
-        if headnote_signal is not None and headnote_signal.signal == "notes_on_cases_only":
+        full_headnote_guard = bool(getattr(settings, "SSA_PROMOTION_FULL_HEADNOTE_DETECTOR", False))
+        headnote_block = headnote_signal is not None and (
+            headnote_signal.signal == "notes_on_cases_only" or full_headnote_guard
+        )
+        if headnote_block:
             await _quarantine(
                 db,
                 st,
@@ -396,6 +400,19 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             },
         )
         return "quarantined"
+    if bool(getattr(settings, "SSA_RECONCILE_ERROR_QUARANTINE", False)):
+        from scraper.reconcile_quality import first_blocking_reconcile_error
+
+        blocking = first_blocking_reconcile_error(st.validation_errors or [])
+        if blocking:
+            await _quarantine(
+                db,
+                st,
+                f"reconcile error: {blocking}",
+                "judgment",
+                {"reason_code": "reconcile_error", "validation_errors": st.validation_errors},
+            )
+            return "quarantined"
     if st.status == "quarantined" and not force:
         await _quarantine(db, st, st.quarantine_reason or "below confidence threshold", "judgment")
         return "quarantined"

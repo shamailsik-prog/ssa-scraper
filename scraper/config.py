@@ -430,6 +430,18 @@ class Settings(BaseSettings):
         default=False,
         description="When true, quarantine PakistanLawSite captures with counsel/hearing metadata but no JUDGMENT/ORDER body (long headnote-only modal text). Also treats such promoted rows as incomplete for grid refetch.",
     )
+    SSA_RECONCILE_ERROR_QUARANTINE: bool = Field(
+        default=False,
+        description="When true, reconcile and promotion hard-quarantine on deny-listed validation_errors (mojibake body, court mismatch, short text, unknown court) instead of only lowering confidence.",
+    )
+    SSA_PROMOTION_FULL_HEADNOTE_DETECTOR: bool = Field(
+        default=False,
+        description="When true, promotion re-runs detect_headnotes_only and quarantines on any signal (not only notes_on_cases_only).",
+    )
+    SSA_UNIFIED_JUDGMENT_MIN_BODY: bool = Field(
+        default=False,
+        description="When true, document_validation, B7 quarantine CLI, and promotion use SHORT_TEXT_MIN_CHARS (500) as the minimum judgment body floor everywhere.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",

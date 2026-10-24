@@ -59,8 +59,9 @@ def validate_judgment_reconciled_json(data: Optional[Dict[str, Any]], *, raw_tex
     body = (raw_text or "").strip()
     if data:
         body = (data.get("full_text") or data.get("judgment_text") or body or "").strip()
-    # Floor below SSA_SHORT_TEXT_GUARD (500); after strip_leading_judgment_chrome corpus_chain fixtures ~148 chars.
-    if len(body) < 140:
+    from scraper.judgment_min_body import judgment_min_body_chars
+
+    if len(body) < judgment_min_body_chars():
         return False, "empty_judgment_text"
     return True, ""
 
