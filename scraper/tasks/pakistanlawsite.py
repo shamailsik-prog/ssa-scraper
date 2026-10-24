@@ -816,7 +816,7 @@ class PakistanLawSitePipeline:
             else:
                 await self._set_grid_journal(first)
         windows = 0
-        confirmed_window = False
+        completed_lap = False
         while True:
             if await self._maybe_yield_citation_grid_for_search_harvest():
                 break
@@ -841,10 +841,14 @@ class PakistanLawSitePipeline:
                 )
                 self.stats["citation_grid_stub_stop"] = True
                 break
-            if not outcome.get("cursor_unconfirmed") and (
-                outcome.get("rows", 0) > 0 or outcome.get("wrapped") or outcome.get("reached_end")
+            # A successful partial window is not a full grid lap. Keep the
+            # expired yield cap until the shard has actually reached the end.
+            if (
+                not outcome.get("cursor_unconfirmed")
+                and int(outcome.get("processed") or 0) > 0
+                and (outcome.get("wrapped") or outcome.get("reached_end"))
             ):
-                confirmed_window = True
+                completed_lap = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
             ):
@@ -877,10 +881,11 @@ class PakistanLawSitePipeline:
                 break
             if windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
                 break
-        # Only a confirmed grid window ends the capped recovery attempt. A stub,
-        # unconfirmed cursor, or immediate yield must preserve the original marker.
-        # Clearing the other login shard's marker would re-block its recovery.
-        if confirmed_window and not self.stats.get("yielded_for_search_harvest"):
+        # The capped recovery promises a grid lap, not just one page/window.
+        # Partial progress, a stub, an unconfirmed cursor, or immediate yield
+        # must preserve the marker for the next job's resumable continuation.
+        # Never clear another login shard's independent recovery marker.
+        if completed_lap and not self.stats.get("yielded_for_search_harvest"):
             from scraper.pls_grid_health import pls_clear_grid_yield_marker
 
             await pls_clear_grid_yield_marker(
