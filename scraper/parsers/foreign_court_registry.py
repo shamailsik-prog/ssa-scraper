@@ -10,6 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.models import Court
 
+
+def foreign_seed_canonical_names() -> frozenset[str]:
+    return frozenset(spec["name"] for spec in FOREIGN_COURT_SEEDS)
+
 # Slug / legacy names from prior court_name-only backfill runs.
 COURT_NAME_ALIASES: Dict[str, str] = {
     "andhra-pradesh-high-court-india": "Andhra Pradesh High Court, India",
@@ -77,8 +81,13 @@ async def _court_by_any_label(db: AsyncSession, label: str) -> Optional[Court]:
     return None
 
 
-async def resolve_court_row_for_name(db: AsyncSession, court_name: str) -> Optional[Court]:
-    """Match an existing ``court`` row; create only seeded foreign courts when missing."""
+async def resolve_court_row_for_name(
+    db: AsyncSession,
+    court_name: str,
+    *,
+    create: bool = True,
+) -> Optional[Court]:
+    """Match an existing ``court`` row; optionally create seeded foreign courts when missing."""
     canonical = normalize_judgment_court_name(court_name)
     if not canonical:
         return None
@@ -88,6 +97,8 @@ async def resolve_court_row_for_name(db: AsyncSession, court_name: str) -> Optio
     existing = await _court_by_any_label(db, court_name)
     if existing is not None:
         return existing
+    if not create:
+        return None
     return await ensure_foreign_court_row(db, court_name)
 
 
@@ -111,6 +122,40 @@ async def ensure_foreign_court_row(db: AsyncSession, court_name: str) -> Optiona
         if any(_name_keys(lbl) & _name_keys(court_name) for lbl in labels):
             seed = spec
             break
+    if seed is None:
+        return await ensure_link_court_row(db, court_name)
+    row = Court(
+        name=seed["name"],
+        short_code=seed["short_code"],
+        court_level=seed["court_level"],
+        aliases=list(dict.fromkeys([*(seed.get("aliases") or []), court_name])) if court_name != seed["name"] else (seed.get("aliases") or None),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def ensure_link_court_row(db: AsyncSession, court_name: str) -> Optional[Court]:
+    """Create specialty / election-tribunal rows from ``judgment_court_link_registry`` seeds."""
+    from scraper.judgment_court_link_registry import (
+        ADDITIONAL_COURT_SEEDS,
+        election_tribunal_seed_spec,
+        pls_court_label_key,
+    )
+
+    canonical = normalize_judgment_court_name(court_name) or court_name
+    existing = await _court_by_any_label(db, canonical)
+    if existing is not None:
+        return existing
+    key = pls_court_label_key(court_name)
+    seed = None
+    for spec in ADDITIONAL_COURT_SEEDS:
+        labels = {spec["name"], spec["short_code"], *(spec.get("aliases") or [])}
+        if any(pls_court_label_key(lbl) == key for lbl in labels):
+            seed = spec
+            break
+    if seed is None and key.startswith("election tribunal"):
+        seed = election_tribunal_seed_spec(canonical)
     if seed is None:
         return None
     row = Court(

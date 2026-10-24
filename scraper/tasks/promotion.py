@@ -660,22 +660,31 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         )
         return "quarantined"
     if bool(getattr(settings, "SSA_JUDGMENT_COURT_ID_NAME_GUARD", False)):
-        from scraper.judgment_court_consistency import judgment_court_fields_consistent
+        from scraper.judgment_court_consistency import court_labels_match
 
-        court_name_for_row = court.name if court else data.get("court")
-        if not judgment_court_fields_consistent(
-            court_name=court_name_for_row,
-            court_id=court.id if court else None,
-            court_row=court,
-        ):
+        reconciled_court = data.get("court_canonical") or data.get("court")
+        expected_court = reconciled_court
+        if st.source_name == "PakistanLawSite":
+            from scraper.parsers.pls_court_resolution import foreign_court_from_first_300_chars, proposed_court_name
+
+            prop = proposed_court_name(reconciled_court, full_text, citation=(cits[0] if cits else None))
+            if prop:
+                expected_court = prop
+            else:
+                foreign = foreign_court_from_first_300_chars(full_text)
+                if foreign:
+                    expected_court = foreign
+        if court is not None and expected_court and not court_labels_match(expected_court, court.name):
             await _quarantine(
                 db,
                 st,
                 "court_id/court_name mismatch at promotion",
                 "judgment",
                 {
-                    "court_name": court_name_for_row,
-                    "court_id": str(court.id) if court else None,
+                    "court_name": reconciled_court,
+                    "expected_court": expected_court,
+                    "court_row_name": court.name,
+                    "court_id": str(court.id),
                 },
             )
             return "quarantined"

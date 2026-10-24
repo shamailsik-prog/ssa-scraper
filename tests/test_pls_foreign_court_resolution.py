@@ -181,3 +181,8 @@ async def test_u2_undo_restores_only_when_apply_value_unchanged(db, monkeypatch)
 
 def test_mutant_b4_config_pls_court_resolution_default_off():
     assert Settings.model_fields["SSA_PLS_COURT_RESOLUTION"].default is False
+
+
+def test_foreign_country_regex_does_not_match_inside_farrukh():
+    text = "1984 CLC 1\n[FARRUKH]\nBefore X, J\nA versus B\n"
+    assert foreign_court_from_first_300_chars(text) is None

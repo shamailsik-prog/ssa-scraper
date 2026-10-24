@@ -74,6 +74,7 @@ async def test_court_id_repoint_when_name_already_fixed(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_andhra_rows_repoint_court_id(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_COURT_RESOLUTION", True)
     monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_BACKFILL", True)
     sc_pak = await _sc_pakistan(db)
     jid = uuid4()
@@ -105,6 +106,32 @@ async def test_andhra_rows_repoint_court_id(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dry_run_does_not_insert_foreign_court_rows(db, monkeypatch):
+    from sqlalchemy import func
+
+    monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_BACKFILL", True)
+    sc_pak = await _sc_pakistan(db)
+    before = (await db.execute(select(func.count()).select_from(Court))).scalar()
+    jid = uuid4()
+    db.add(
+        Judgment(
+            id=jid,
+            source_name="PakistanLawSite",
+            court_name="Supreme Court of India",
+            court_id=sc_pak.id,
+            canonical_citation="1993 MLD 1",
+            full_text="1993 MLD 1\n[Supreme Court of India]\nBefore X\nA versus B\n" + ("z" * 600),
+            full_text_hash="india_dry_run",
+            access_method="rendered_copy",
+        )
+    )
+    await db.commit()
+    await find_court_fixes(db, create=False)
+    after = (await db.execute(select(func.count()).select_from(Court))).scalar()
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_consistency_report_lists_mismatch(db):
     sc = await _sc_pakistan(db)
     db.add(
@@ -125,17 +152,56 @@ async def test_consistency_report_lists_mismatch(db):
 
 
 @pytest.mark.asyncio
-async def test_promotion_guard_quarantines_mismatch(db, login_source, monkeypatch):
+async def test_promotion_guard_quarantines_foreign_header_with_sc_row(db, login_source, monkeypatch):
+    from scraper.fetchers import record_provenance, stage_judgment
+    from scraper.tasks.promotion import promote_judgment_staging
+    from tests.test_pls_foreign_court_resolution import FOREIGN_MLD
+
+    monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_NAME_GUARD", True)
+    await _sc_pakistan(db)
+    prov = await record_provenance(
+        db,
+        source=login_source,
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=court-guard-india",
+        content=FOREIGN_MLD.encode("utf-8"),
+        content_kind="html",
+    )
+    st = await stage_judgment(
+        db,
+        source=login_source,
+        prov=prov,
+        raw_html="<html></html>",
+        raw_text=FOREIGN_MLD + ("z" * 600),
+        url=prov.source_url,
+    )
+    st.extracted_citation = "1990 MLD 947"
+    st.reconciled_json = {
+        "citations": ["1990 MLD 947"],
+        "court": "Supreme Court of Pakistan",
+        "court_canonical": "Supreme Court of Pakistan",
+        "year": 1990,
+        "full_text": FOREIGN_MLD + ("z" * 600),
+        "judge_names": ["X"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.95
+    await db.flush()
+    assert await promote_judgment_staging(db, st) == "quarantined"
+
+
+@pytest.mark.asyncio
+async def test_promotion_guard_allows_normal_sc_pakistan(db, login_source, monkeypatch):
     from scraper.fetchers import record_provenance, stage_judgment
     from scraper.tasks.promotion import promote_judgment_staging
     from tests.fixtures import JUDGMENT_TEXT
 
     monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_NAME_GUARD", True)
-    sc = await _sc_pakistan(db)
+    await _sc_pakistan(db)
     prov = await record_provenance(
         db,
         source=login_source,
-        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=court-guard",
+        url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=court-guard-sc",
         content=JUDGMENT_TEXT.encode("utf-8"),
         content_kind="html",
     )
@@ -147,10 +213,11 @@ async def test_promotion_guard_quarantines_mismatch(db, login_source, monkeypatc
         raw_text=JUDGMENT_TEXT,
         url=prov.source_url,
     )
+    st.extracted_citation = "PLD 2024 SC 101"
     st.reconciled_json = {
         "citations": ["PLD 2024 SC 101"],
-        "court": "Supreme Court of India",
-        "court_canonical": "Supreme Court of India",
+        "court": "Supreme Court of Pakistan",
+        "court_canonical": "Supreme Court of Pakistan",
         "year": 2024,
         "full_text": JUDGMENT_TEXT,
         "judge_names": ["Qazi Faez Isa"],
@@ -159,7 +226,4 @@ async def test_promotion_guard_quarantines_mismatch(db, login_source, monkeypatc
     st.status = "extracted"
     st.confidence_score = 0.95
     await db.flush()
-    india = await resolve_court_row_for_name(db, "Supreme Court of India")
-    assert india is not None
-    # Promotion resolves court by name; guard fires if reconciled court_name disagrees with court row used.
-    assert await promote_judgment_staging(db, st) in ("quarantined", "promoted")
+    assert await promote_judgment_staging(db, st) == "promoted"

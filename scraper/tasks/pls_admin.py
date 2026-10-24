@@ -69,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Report court_id vs court_name mismatches (read-only)",
     )
+    court_link = sub.add_parser(
+        "link-judgment-court-ids",
+        help="Set court_id on PLS rows where court_id is NULL (dry-run by default)",
+    )
+    court_link.add_argument("--apply", action="store_true", help="Write court_id links (requires SSA_JUDGMENT_COURT_ID_BACKFILL)")
+    court_link.add_argument("--undo", metavar="RUN_ID", help="Restore court_id from a prior --apply run")
+    court_link.add_argument("--limit", type=int, default=None)
     jcc = sub.add_parser(
         "judgment-court-consistency-report",
         help="Report PLS judgments whose court_id row disagrees with court_name",
@@ -148,6 +155,19 @@ def main(argv: list[str] | None = None) -> int:
                     undo=args.undo,
                     limit=args.limit,
                     consistency_report_only=args.consistency_report,
+                )
+            )
+        )
+        return 0
+    if args.command == "link-judgment-court-ids":
+        from scraper.tasks.judgment_court_link import run_judgment_court_link
+
+        print(
+            run_async(
+                run_judgment_court_link(
+                    apply=args.apply,
+                    undo=args.undo,
+                    limit=args.limit,
                 )
             )
         )

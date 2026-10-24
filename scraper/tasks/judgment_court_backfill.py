@@ -20,7 +20,11 @@ from scraper.judgment_court_consistency import (
     find_judgment_court_mismatches,
 )
 from scraper.models import CorpusMetadata, Judgment
-from scraper.parsers.foreign_court_registry import normalize_judgment_court_name, resolve_court_row_for_name
+from scraper.parsers.foreign_court_registry import (
+    foreign_seed_canonical_names,
+    normalize_judgment_court_name,
+    resolve_court_row_for_name,
+)
 from scraper.parsers.pls_court_resolution import foreign_court_mislabel_sql_predicate, proposed_court_name
 
 logger = logging.getLogger(__name__)
@@ -85,7 +89,7 @@ async def _candidate_judgment_ids(db: AsyncSession, *, limit: Optional[int] = No
     return [row.id for row in (await db.execute(text(q))).all()]
 
 
-async def _build_fix_for_judgment(db: AsyncSession, j: Judgment) -> Optional[Dict[str, str]]:
+async def _build_fix_for_judgment(db: AsyncSession, j: Judgment, *, create: bool) -> Optional[Dict[str, str]]:
     stored = j.court_name or ""
     proposed_name = proposed_court_name(stored, j.full_text, citation=j.canonical_citation)
     if proposed_name and proposed_name != stored:
@@ -94,8 +98,21 @@ async def _build_fix_for_judgment(db: AsyncSession, j: Judgment) -> Optional[Dic
         target_label = normalize_judgment_court_name(stored) or stored
     if not target_label:
         return None
-    court_row = await resolve_court_row_for_name(db, target_label)
+    court_row = await resolve_court_row_for_name(db, target_label, create=create)
+    would_create = court_row is None and not create
+    if court_row is None and create:
+        court_row = await resolve_court_row_for_name(db, stored, create=create)
     if court_row is None:
+        if would_create:
+            return {
+                "id": str(j.id),
+                "citation": j.canonical_citation or "",
+                "court_name_from": stored,
+                "court_name_to": target_label,
+                "court_id_from": str(j.court_id) if j.court_id else "",
+                "court_id_to": "",
+                "would_create_court": "1",
+            }
         return None
     final_name = court_row.name
     name_change = final_name != stored
@@ -104,27 +121,34 @@ async def _build_fix_for_judgment(db: AsyncSession, j: Judgment) -> Optional[Dic
         return None
     if not name_change and id_change and not court_labels_match(stored, final_name):
         return None
+    foreign_targets = foreign_seed_canonical_names()
+    if name_change and final_name not in foreign_targets:
+        name_change = False
     return {
         "id": str(j.id),
         "citation": j.canonical_citation or "",
         "court_name_from": stored,
-        "court_name_to": final_name,
+        "court_name_to": final_name if name_change else stored,
         "court_id_from": str(j.court_id) if j.court_id else "",
         "court_id_to": str(court_row.id),
     }
 
 
-async def find_court_fixes(db: AsyncSession, *, limit: Optional[int] = None) -> Dict[str, Any]:
+async def find_court_fixes(db: AsyncSession, *, limit: Optional[int] = None, create: bool = False) -> Dict[str, Any]:
     ids = await _candidate_judgment_ids(db, limit=limit)
     fixes: List[Dict[str, str]] = []
+    would_create: List[Dict[str, str]] = []
     for jid in ids:
         j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
         if j is None:
             continue
-        fix = await _build_fix_for_judgment(db, j)
-        if fix:
-            fixes.append(fix)
-    return {"fixes": fixes, "count": len(fixes)}
+        fix = await _build_fix_for_judgment(db, j, create=create)
+        if not fix:
+            continue
+        if fix.get("would_create_court"):
+            would_create.append(fix)
+        fixes.append(fix)
+    return {"fixes": fixes, "count": len(fixes), "would_create": would_create, "would_create_count": len(would_create)}
 
 
 async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str, str]]) -> Dict[str, int]:
@@ -132,29 +156,47 @@ async def apply_court_fixes(db: AsyncSession, run_id: str, fixes: List[Dict[str,
     names = 0
     ids = 0
     for fix in fixes:
+        if not fix.get("court_id_to") and settings.SSA_JUDGMENT_COURT_ID_BACKFILL:
+            target = fix.get("court_name_to") or fix.get("court_name_from") or ""
+            row = await resolve_court_row_for_name(db, target, create=True)
+            if row is not None:
+                fix = {**fix, "court_id_to": str(row.id)}
+        if not fix.get("court_id_to"):
+            continue
         jid = UUID(fix["id"])
         j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
         if j is None:
             continue
-        snapshot.append(
-            {
-                "id": str(j.id),
-                "court_name": j.court_name or "",
-                "court_id": str(j.court_id) if j.court_id else "",
-                "applied_court_name": fix["court_name_to"],
-                "applied_court_id": fix["court_id_to"],
-            }
-        )
-        if fix.get("court_name_to") and (j.court_name or "") != fix["court_name_to"] and (
-            settings.SSA_PLS_COURT_RESOLUTION
-            or (settings.SSA_JUDGMENT_COURT_ID_BACKFILL and fix.get("court_id_to"))
+        prior_name = j.court_name or ""
+        prior_id = str(j.court_id) if j.court_id else ""
+        applied_name = False
+        applied_id = False
+        foreign_targets = foreign_seed_canonical_names()
+        if (
+            fix.get("court_name_to")
+            and prior_name != fix["court_name_to"]
+            and settings.SSA_PLS_COURT_RESOLUTION
+            and fix["court_name_to"] in foreign_targets
         ):
             j.court_name = fix["court_name_to"]
             names += 1
+            applied_name = True
         new_id = UUID(fix["court_id_to"]) if fix.get("court_id_to") else None
         if settings.SSA_JUDGMENT_COURT_ID_BACKFILL and new_id and j.court_id != new_id:
             j.court_id = new_id
             ids += 1
+            applied_id = True
+        if not applied_name and not applied_id:
+            continue
+        snapshot.append(
+            {
+                "id": str(j.id),
+                "court_name": prior_name,
+                "court_id": prior_id,
+                "applied_court_name": fix["court_name_to"] if applied_name else "",
+                "applied_court_id": fix["court_id_to"] if applied_id else "",
+            }
+        )
     db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
     return {"court_names_updated": names, "court_ids_updated": ids}
 
@@ -174,7 +216,7 @@ async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
             if applied_name and (j.court_name or "") == applied_name:
                 j.court_name = item.get("court_name") or None
                 restored_names += 1
-            if applied_id and str(j.court_id or "") == applied_id:
+            if applied_id and applied_id.strip() and str(j.court_id or "") == applied_id:
                 old_id = item.get("court_id") or ""
                 j.court_id = UUID(old_id) if old_id else None
                 restored_ids += 1
@@ -214,15 +256,19 @@ async def run_judgment_court_backfill(
         if undo:
             out["undone"] = await undo_run(db, undo)
             return out
-        info = await find_court_fixes(db, limit=limit)
+        info = await find_court_fixes(db, limit=limit, create=apply and settings.SSA_JUDGMENT_COURT_ID_BACKFILL)
         out.update(info)
-        out["consistency_mismatch_count"] = len(await find_judgment_court_mismatches(db, limit=limit))
+        report = await consistency_report(db, limit=limit)
+        out["null_court_id_count"] = report["null_court_id_count"]
+        out["real_mismatch_count"] = report["real_mismatch_count"]
         if apply:
             if not settings.SSA_PLS_COURT_RESOLUTION and not settings.SSA_JUDGMENT_COURT_ID_BACKFILL:
                 out["applied"] = {"skipped": "enable SSA_PLS_COURT_RESOLUTION or SSA_JUDGMENT_COURT_ID_BACKFILL"}
                 return out
             run_id = uuid.uuid4().hex
             await _record_run(db, run_id)
+            if settings.SSA_JUDGMENT_COURT_ID_BACKFILL:
+                info = await find_court_fixes(db, limit=limit, create=True)
             applied = await apply_court_fixes(db, run_id, info["fixes"])
             await db.commit()
             out["applied"] = {"run_id": run_id, **applied}

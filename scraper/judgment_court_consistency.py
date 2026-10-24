@@ -36,6 +36,18 @@ def judgment_court_fields_consistent(
     return court_labels_match(court_name, court_row.name)
 
 
+async def count_null_court_id_pls(db: AsyncSession) -> int:
+    q = """
+    SELECT count(*)::int
+    FROM judgment j
+    WHERE j.source_name = 'PakistanLawSite'
+      AND j.court_id IS NULL
+      AND j.court_name IS NOT NULL
+      AND btrim(j.court_name) <> ''
+    """
+    return int((await db.execute(text(q))).scalar() or 0)
+
+
 async def find_judgment_court_mismatches(db: AsyncSession, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     q = """
     SELECT j.id, j.canonical_citation, j.court_name, j.court_id, c.name AS court_row_name
@@ -73,4 +85,11 @@ async def find_judgment_court_mismatches(db: AsyncSession, *, limit: Optional[in
 
 async def consistency_report(db: AsyncSession, *, limit: Optional[int] = None) -> Dict[str, Any]:
     mismatches = await find_judgment_court_mismatches(db, limit=limit)
-    return {"count": len(mismatches), "mismatches": mismatches}
+    null_count = await count_null_court_id_pls(db)
+    real_count = len(mismatches)
+    return {
+        "null_court_id_count": null_count,
+        "real_mismatch_count": real_count,
+        "count": real_count,
+        "mismatches": mismatches,
+    }

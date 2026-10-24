@@ -9,7 +9,7 @@ from scraper.parsers.case_metadata import judgment_header_slice
 from scraper.parsers.citation_extractor import canonical_court, court_from_bracket, normalise_citation
 
 _FOREIGN_COUNTRY = re.compile(
-    r"(?i)\b(?:india|bangladesh|england|u\.?k\.?|united\s+kingdom|sri\s+lanka)\b",
+    r"(?i)(?<![A-Za-z])(?:india|bangladesh|england|u\.?k\.?|united\s+kingdom|sri\s+lanka)(?![A-Za-z])",
 )
 _HEADER_FOREIGN_BRACKET = re.compile(
     r"(?im)^\s*\[\s*((?:Supreme|High)\s+Court[^\]]*)\s*\]\s*$",
@@ -186,5 +186,5 @@ def proposed_court_name(
 
 def foreign_court_mislabel_sql_predicate() -> str:
     """SQL fragment: heading names a foreign SC/HC but court_name is SC Pakistan."""
-    return r"""left(j.full_text, 300) ~* '\[(Supreme Court|High Court)[^\]]*(India|Bangladesh|England|U\.?K|Sri Lanka)'
+    return r"""left(j.full_text, 300) ~* '\[(Supreme Court|High Court)[^\]]*\m(India|Bangladesh|England|U\.?K\.?|Sri Lanka)\M'
       AND j.court_name ILIKE 'Supreme Court of Pakistan'"""
