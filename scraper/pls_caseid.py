@@ -19,8 +19,11 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from scraper.extractors.judgment_guards import _has_case_content
 from scraper.parsers.citation_extractor import extract_citations
+from scraper.pls_search_harvest_core import CASE_ID_URL_PATTERN
 
-CASE_ID_RE = re.compile(r"CaseName=(\d{4})([A-Za-z]{1,3})(\d{1,6})(?![0-9A-Za-z])")
+CASE_ID_RE = re.compile(CASE_ID_URL_PATTERN)
+# Court tokens the pre-2026 CaseName regex could represent (1–3 letters, no hyphen).
+_LEGACY_CASEID_COURT_RE = re.compile(r"^[A-Za-z]{1,3}$")
 BLOCK = 100
 MIN_CASE_PAGE_CHARS = 300
 
@@ -60,11 +63,34 @@ def known_by_group(urls: Iterable[Optional[str]]) -> Dict[str, Set[int]]:
     return out
 
 
+def courts_for_empty_year_groups(courts: Iterable[str]) -> List[str]:
+    """Court letters eligible for empty-year expansion (legacy set unless extended courts are enabled)."""
+    from scraper.config import settings
+
+    unique = sorted({c for c in courts if c})
+    if getattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", False):
+        return unique
+    return [c for c in unique if _LEGACY_CASEID_COURT_RE.fullmatch(c)]
+
+
+def group_eligible_for_walk(group: str) -> bool:
+    """Whether a (year, court) group is walked and counted on /status."""
+    _, court = split_group_key(group)
+    from scraper.config import settings
+
+    if getattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", False):
+        return True
+    return bool(_LEGACY_CASEID_COURT_RE.fullmatch(court))
+
+
 def group_order(known: Dict[str, Set[int]], *, first_year: int, last_year: int) -> List[str]:
     """Groups the corpus already touches, densest first (their gaps hold the surest finds); then every
     other year for the court letters seen, newest year first."""
-    held = sorted(known, key=lambda k: (-len(known[k]), -split_group_key(k)[0], k))
-    courts = sorted({split_group_key(k)[1] for k in known})
+    held = sorted(
+        [k for k in known if group_eligible_for_walk(k)],
+        key=lambda k: (-len(known[k]), -split_group_key(k)[0], k),
+    )
+    courts = courts_for_empty_year_groups(split_group_key(k)[1] for k in known)
     empty = [group_key(y, c) for y in range(last_year, first_year - 1, -1) for c in courts if group_key(y, c) not in known]
     return held + empty
 
