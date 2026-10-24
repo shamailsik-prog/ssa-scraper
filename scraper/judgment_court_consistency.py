@@ -56,9 +56,9 @@ async def find_judgment_court_mismatches(db: AsyncSession, *, limit: Optional[in
     WHERE j.source_name = 'PakistanLawSite'
       AND j.court_name IS NOT NULL
       AND btrim(j.court_name) <> ''
+      AND j.court_id IS NOT NULL
       AND (
-        j.court_id IS NULL
-        OR c.name IS NULL
+        c.name IS NULL
         OR lower(regexp_replace(btrim(j.court_name), '\\s+', ' ', 'g'))
            <> lower(regexp_replace(btrim(c.name), '\\s+', ' ', 'g'))
       )
