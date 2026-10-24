@@ -96,6 +96,22 @@ DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "C
 CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
 
 
+def _citation_grid_total_verified(raw_total: Any) -> bool:
+    """Only a positive, parseable total from the current page verifies the grid size.
+
+    A stale last_total_rows cursor or malformed page metadata must not certify a lap.
+    """
+    try:
+        return raw_total is not None and int(raw_total) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _citation_grid_verified_wrap(start_offset: int, next_offset: int, *, total_verified: bool) -> bool:
+    """A decreasing cursor is not a verified wrap when the total is only cached."""
+    return bool(total_verified and next_offset < start_offset)
+
+
 _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
 _REPORTER_BY_UPPER: Dict[str, str] = {}
 for _reporter in KNOWN_REPORTERS:
@@ -1064,7 +1080,7 @@ class PakistanLawSitePipeline:
             except Exception:
                 total_rows = None
         # A lap is judged against the grid's real size only; a one-window fallback must never read as a full lap.
-        total_rows_known = total_rows is not None and total_rows > 0 and total_rows_meta is not None
+        total_rows_known = _citation_grid_total_verified(total_rows_meta)
         if total_rows is None or total_rows <= 0:
             total_rows = row_count
         if row_offset >= total_rows:
@@ -1468,7 +1484,7 @@ class PakistanLawSitePipeline:
             processed_rows=processed_rows_total,
             count_wrap=last_committed_offset != next_offset,
         )
-        wrapped = bool(total_rows > 0 and next_offset < start_offset)
+        wrapped = _citation_grid_verified_wrap(start_offset, next_offset, total_verified=total_rows_known)
         # the window read up to the grid's last row (a whole-grid window from row 0 ends a lap without "wrapping")
         max_snapshot_rows = int(getattr(settings, "PLS_ARCHIVED_GRID_MAX_ROWS", 400) or 400)
         compact_window_is_full_grid = (
