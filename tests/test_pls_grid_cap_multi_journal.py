@@ -107,3 +107,42 @@ async def test_unconfirmed_journal_cannot_claim_full_recovery(db, login_source, 
     assert cfg.get("grid_cap_journals_completed_shard_0") is None
     assert cfg.get("grid_yield_since_shard_0") is not None
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_journal_dropdown_falls_back_to_verified_default_grid(
+    db, login_source, monkeypatch
+):
+    marker = (datetime.now(timezone.utc) - timedelta(minutes=121)).isoformat()
+    await merge_source_config(db, login_source, {"grid_yield_since_shard_0": marker})
+    await db.commit()
+    assert await pls_consume_grid_yield_cap_bypass(db, login_source, reporter_shard=0)
+    pipeline = PakistanLawSitePipeline(db, login_source, reporter_shard=0)
+    pipeline.stats["grid_yield_cap_bypass_consumed"] = True
+    pipeline.stats["grid_cap_prior_yield_markers"] = {
+        "grid_yield_since_shard_0": marker
+    }
+    pipeline._cap_lap = True
+    monkeypatch.setattr(pipeline, "_journal_candidates", lambda: ["PLD", "SCMR"])
+    monkeypatch.setattr(pipeline, "_citation_grid_limits", lambda: {
+        "max_detail": 10, "scan_window": 50, "run_minutes": 0,
+    })
+
+    async def fallback_window(*args, **kwargs):
+        pipeline._journal_rotation_disabled = True
+        pipeline.grid_journal = None
+        return {
+            "rows": 1, "processed": 1, "wrapped": True,
+            "reached_end": True, "cursor_unconfirmed": False,
+        }
+
+    async def no_persist():
+        return None
+
+    monkeypatch.setattr(pipeline, "_run_citation_grid_window", fallback_window)
+    monkeypatch.setattr(pipeline, "_persist_live_session", no_persist)
+    await pipeline.run_citation_grid_surface({})
+    cfg = dict(login_source.config_json or {})
+    assert cfg.get("grid_yield_since_shard_0") is None
+    assert cfg.get("grid_cap_journals_completed_shard_0") is None
+    await db.rollback()
