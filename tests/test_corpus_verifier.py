@@ -94,3 +94,45 @@ async def test_verifier_batch_writes_results_only_in_verification_schema(db, mon
     after = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().one()
     assert after.full_text == before.full_text
     assert after.court_name == before.court_name
+
+
+@pytest.mark.asyncio
+async def test_verifier_writer_fails_closed_without_dedicated_password_in_production(monkeypatch):
+    from pydantic import SecretStr
+    from scraper.verification import sessions
+
+    monkeypatch.setattr(settings, "APP_ENV", "production")
+    monkeypatch.setattr(settings, "CORPUS_VERIFIER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(sessions, "_writer_engine", None)
+    with pytest.raises(RuntimeError, match="CORPUS_VERIFIER_PASSWORD"):
+        sessions.verifier_writer_engine()
+
+
+@pytest.mark.asyncio
+async def test_verifier_writer_uses_dedicated_role_in_production(monkeypatch):
+    from pydantic import SecretStr
+    from scraper.verification import sessions
+
+    monkeypatch.setattr(settings, "APP_ENV", "production")
+    monkeypatch.setattr(settings, "CORPUS_VERIFIER_PASSWORD", SecretStr("verifier-test-password"))
+    monkeypatch.setattr(sessions, "_writer_engine", None)
+    engine = sessions.verifier_writer_engine()
+    try:
+        assert engine.url.username == settings.CORPUS_VERIFIER_ROLE
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_verifier_writer_dev_only_fallback_preserved(monkeypatch):
+    from pydantic import SecretStr
+    from scraper.verification import sessions
+
+    monkeypatch.setattr(settings, "APP_ENV", "development")
+    monkeypatch.setattr(settings, "CORPUS_VERIFIER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(sessions, "_writer_engine", None)
+    engine = sessions.verifier_writer_engine()
+    try:
+        assert engine.url.username == settings.CORPUS_WRITER_ROLE
+    finally:
+        await engine.dispose()
