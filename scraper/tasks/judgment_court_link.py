@@ -12,13 +12,14 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
+from scraper.judgment_court_consistency import court_labels_match
 from scraper.database import SessionLocal, run_async
 from scraper.judgment_court_link_registry import (
     MANUAL_REVIEW_LABEL_KEYS,
     pls_court_label_key,
     resolve_null_court_id_link,
 )
-from scraper.models import CorpusMetadata, Judgment
+from scraper.models import CorpusMetadata, Court, Judgment
 from scraper.parsers.foreign_court_registry import ensure_foreign_court_row, ensure_link_court_row, resolve_court_row_for_name
 
 logger = logging.getLogger(__name__)
@@ -158,11 +159,24 @@ async def apply_court_id_links(db: AsyncSession, run_id: str, links: List[Dict[s
     updated = 0
     for item in links:
         jid = UUID(item["id"])
-        j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
-        if j is None:
+        # The discovery plan is only a proposal. Revalidate the locked, current
+        # row before applying it; another worker may have corrected the court.
+        j = (
+            await db.execute(select(Judgment).where(Judgment.id == jid).with_for_update())
+        ).scalars().first()
+        if (
+            j is None
+            or j.source_name != "PakistanLawSite"
+            or j.court_id is not None
+            or j.court_name != item.get("court_name")
+        ):
+            continue
+        resolution = resolve_null_court_id_link(j.court_name or "", j.full_text)
+        if resolution is None or resolution.manual_review:
             continue
         new_id = UUID(item["court_id_to"])
-        if j.court_id == new_id:
+        target = (await db.execute(select(Court).where(Court.id == new_id))).scalars().first()
+        if target is None or not court_labels_match(resolution.target_court_name, target.name):
             continue
         snapshot.append(
             {
@@ -186,7 +200,9 @@ async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     if snap_row is not None and snap_row.value:
         for item in json.loads(snap_row.value):
             jid = UUID(item["id"])
-            j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
+            j = (
+                await db.execute(select(Judgment).where(Judgment.id == jid).with_for_update())
+            ).scalars().first()
             if j is None:
                 continue
             applied_id = item.get("applied_court_id") or ""
