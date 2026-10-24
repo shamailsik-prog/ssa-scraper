@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import false, func, select, true
+from sqlalchemy import false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -263,6 +263,22 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
     capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
     exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
+    # A done flag is not proof that every source result was enumerated.
+    # In particular, a confirmed last page with no published site total may
+    # legitimately be marked done for scheduling but remains unverified.
+    unverified_done = int((await db.execute(
+        select(func.count()).select_from(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            PlsSearchHarvestQuery.status == "done",
+            or_(
+                PlsSearchHarvestQuery.site_total_results.is_(None),
+                PlsSearchHarvestQuery.pages_enumerated <= 0,
+                PlsSearchHarvestQuery.rows_seen < PlsSearchHarvestQuery.site_total_results,
+            ),
+        )
+    )).scalar() or 0)
+    # Split parents, skipped jobs and any unexpected state cannot certify coverage.
+    unfinished_statuses = {status: count for status, count in status_counts.items() if status != "done"}
     totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
     page_rows = (await db.execute(select(Citation.reporter, Citation.year, Citation.page).join(Judgment, Judgment.id == Citation.judgment_id).where(Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True), Citation.page.isnot(None)))).all()
     by_ry: Dict[Any, List[int]] = {}
@@ -279,8 +295,21 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
         "site_total_done_queries": int(totals[0]),
         "rows_known_done_queries": int(totals[1]),
         "page_continuity_holes": {"reporter_years_with_holes": len(holes), "examples": dict(list(holes.items())[:20])},
-        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample))},
-        "complete": bool(status_counts.get("pending", 0) + status_counts.get("in_progress", 0) + status_counts.get("failed", 0) + capped_open == 0 and not holes),
+        "known_citation_test": {"sampled": len(sample), "found": len(known & set(sample)), "independent": False},
+        "unverified_done_queries": unverified_done,
+        "unfinished_statuses": unfinished_statuses,
+        "verification_scope": "search_harvest_queue_only",
+        "independent_source_verified": False,
+        # Fail closed on unseeded plans, missing source totals, incomplete page
+        # enumeration, and unresolved split/skipped rows. This is only a queue
+        # verdict, never independent proof of corpus completeness.
+        "complete": bool(
+            status_counts.get("done", 0) > 0
+            and not unfinished_statuses
+            and capped_open == 0
+            and unverified_done == 0
+            and not holes
+        ),
     }
 
 
