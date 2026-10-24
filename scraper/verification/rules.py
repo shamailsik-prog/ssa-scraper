@@ -129,6 +129,9 @@ def verify_statute_row(
     else:
         for sec in sections:
             body = (sec.get("section_text") or "").strip()
+            # Missing current versions must not disappear behind other long sections.
+            if not body:
+                reasons.append("statute_section_current_text_missing")
             if is_table_of_contents_chunk(body):
                 reasons.append("statute_section_toc_noise")
         if total_section_body_chars(sections) < 80:
