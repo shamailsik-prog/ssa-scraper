@@ -789,6 +789,10 @@ class SearchHarvestRunner:
             try:
                 page = await self.pipeline.fetch_detail(nxt)
             except Exception as exc:
+                # Do not swallow a fatal page crash: the outer handler must
+                # restore this query to pending, preserving its next-page cursor.
+                if is_playwright_harvest_browser_fatal(exc):
+                    raise
                 query_row.status = "in_progress"
                 query_row.last_error = f"pagination interrupted: {exc}"[:1000]
                 break
