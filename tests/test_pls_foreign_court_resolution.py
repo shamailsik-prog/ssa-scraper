@@ -115,6 +115,7 @@ async def test_backfill_dry_run_and_apply_undo(db, monkeypatch):
     from scraper.tasks.judgment_court_backfill import _record_run, apply_court_fixes, undo_run
 
     monkeypatch.setattr(settings, "SSA_PLS_COURT_RESOLUTION", True)
+    monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_BACKFILL", True)
     jid = uuid4()
     db.add(
         Judgment(
@@ -153,6 +154,7 @@ async def test_u2_undo_restores_only_when_apply_value_unchanged(db, monkeypatch)
     from scraper.tasks.judgment_court_backfill import _record_run, apply_court_fixes, undo_run
 
     monkeypatch.setattr(settings, "SSA_PLS_COURT_RESOLUTION", True)
+    monkeypatch.setattr(settings, "SSA_JUDGMENT_COURT_ID_BACKFILL", True)
     jid = uuid4()
     db.add(
         Judgment(
