@@ -270,7 +270,20 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
-    capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
+    capped_open = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(PlsSearchHarvestQuery)
+                .where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
+                    PlsSearchHarvestQuery.site_total_results >= cap,
+                )
+            )
+        ).scalar()
+        or 0
+    )
     exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
     totals = (
         await db.execute(
@@ -312,7 +325,7 @@ async def reopen_premature_done_queries(
     reopen_reason = "reopened: marked done without known site total and at most one page enumerated"
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-        PlsSearchHarvestQuery.status == "done",
+        PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
         PlsSearchHarvestQuery.site_total_results.is_(None),
         func.coalesce(PlsSearchHarvestQuery.pages_enumerated, 0) <= 1,
     )
@@ -624,6 +637,8 @@ class SearchHarvestRunner:
         # so the confirming read can neither inflate rows_seen into a false cap split nor loop for ever
         # (12 October 2026: SCMR, CLC and PCrLJ 2017 re-read page 1 every tick).
         rereading = not resume_url and pages_done > 0 and pages_done >= page_idx
+        if page_idx == 1 and start_row_index == 0:
+            reset_lap_gap_diagnostics(cursor)
         if resume_url:
             page = await self.pipeline.fetch_detail(str(resume_url))
         else:
@@ -633,8 +648,6 @@ class SearchHarvestRunner:
         await self._maybe_recycle_browser()
 
         while True:
-            if page_idx == 1 and start_row_index == 0 and not rereading:
-                reset_lap_gap_diagnostics(cursor)
             unlinked_keys_snapshot = list(cursor.get("unlinked_keys") or [])
 
             from scraper.extractors.hybrid_extractor import HybridExtractor
@@ -820,18 +833,8 @@ class SearchHarvestRunner:
                         rows_seen=rows_seen,
                         rows_known=rows_known,
                         rows_unlinked=rows_unlinked,
-                        pagination_confirmed=confirmed_last or pages_done > 0,
+                        pagination_confirmed=confirmed_last,
                     )
-                if done_unlinked:
-                    safety = unlinked_done_safety_error(rows_seen, rows_unlinked)
-                    if safety:
-                        logger.warning(
-                            "PLS search harvest %s: %s",
-                            query_row.query_key,
-                            safety,
-                        )
-                        done_unlinked = False
-                        incomplete_reason = safety
                 if may_done:
                     query_row.status = "done"
                     query_row.last_error = None if confirmed_last else query_row.last_error

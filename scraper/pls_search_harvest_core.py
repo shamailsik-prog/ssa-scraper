@@ -337,28 +337,19 @@ def search_harvest_may_mark_done_unlinked(
     rows_unlinked: int,
     pagination_confirmed: bool = False,
 ) -> Tuple[bool, str]:
-    """Mark done_unlinked only after confirmed last page when every seen row is known or linkless and the
-    site shortfall equals the linkless count (within the 5%/25 safety cap)."""
+    """Mark done_unlinked only after a confirmed last page when enumeration is complete (rows_seen meets or
+    exceeds the site total, or the site showed no total) and every unseen row on the page is linkless."""
     if not pagination_confirmed or rows_unlinked <= 0:
         return False, ""
     if unlinked_done_safety_error(rows_seen, rows_unlinked):
         return False, ""
-    seen_unknown = int(rows_seen) - int(rows_known)
-    if seen_unknown != int(rows_unlinked):
+    if int(rows_seen) - int(rows_known) != int(rows_unlinked):
         return False, ""
-    if site_total is not None:
-        if rows_seen >= int(site_total):
-            return False, ""
-        shortfall = int(site_total) - int(rows_seen)
-        if shortfall != int(rows_unlinked):
-            return False, ""
-    else:
-        gap = compute_gap_size(None, rows_known, rows_seen, rows_unlinked=rows_unlinked)
-        if gap != int(rows_unlinked):
-            return False, ""
+    if site_total is not None and rows_seen < int(site_total):
+        return False, ""
     return (
         True,
-        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url explain the remaining gap",
+        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url on the last page",
     )
 
 

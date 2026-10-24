@@ -53,29 +53,66 @@ def test_may_mark_done_ignores_unlinked():
     assert search_harvest_may_mark_done(site_total=100, rows_seen=100, rows_on_page=5)[0] is True
 
 
-def test_done_unlinked_requires_shortfall_within_credit():
-    ok, reason = search_harvest_may_mark_done_unlinked(
-        site_total=200,
-        rows_seen=195,
-        rows_known=190,
-        rows_unlinked=5,
-        pagination_confirmed=True,
-    )
-    assert ok is True and "unmatched" in reason
-    assert search_harvest_may_mark_done_unlinked(
+def _unlinked_ok(**kwargs):
+    return search_harvest_may_mark_done_unlinked(pagination_confirmed=True, **kwargs)[0]
+
+
+def test_done_unlinked_probe_cases():
+    assert not _unlinked_ok(site_total=200, rows_seen=195, rows_known=190, rows_unlinked=5)
+    assert not _unlinked_ok(site_total=300, rows_seen=290, rows_known=280, rows_unlinked=10)
+    assert not _unlinked_ok(site_total=500, rows_seen=480, rows_known=460, rows_unlinked=20)
+    assert _unlinked_ok(site_total=300, rows_seen=300, rows_known=290, rows_unlinked=10)
+    assert _unlinked_ok(site_total=None, rows_seen=290, rows_known=280, rows_unlinked=10)
+    assert not search_harvest_may_mark_done_unlinked(
         site_total=300,
-        rows_seen=290,
-        rows_known=0,
+        rows_seen=300,
+        rows_known=290,
         rows_unlinked=10,
-        pagination_confirmed=True,
-    )[0] is False
-    assert search_harvest_may_mark_done_unlinked(
-        site_total=200,
-        rows_seen=195,
-        rows_known=190,
-        rows_unlinked=3,
-        pagination_confirmed=True,
-    )[0] is False
+        pagination_confirmed=False,
+    )[0]
+
+
+@pytest.mark.asyncio
+async def test_page1_reread_three_laps_resets_unlinked_each_tick(db, monkeypatch):
+    """Re-read ticks keep pages_enumerated; lap reset must not accumulate linkless rows across laps."""
+    counts = [10, 7, 4]
+    call = {"n": 0}
+
+    pages = {"page1": ([], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=100)
+    runner.dry_run = True
+
+    async def extract_varying(self, *, html, search_map, base_url):
+        n = counts[min(call["n"], len(counts) - 1)]
+        call["n"] += 1
+        rows = [_linkless(i) for i in range(n)]
+        return SimpleNamespace(
+            data={"result_rows": rows, "next_page": None, "total_results_if_shown": 100},
+        )
+
+    monkeypatch.setattr(
+        "scraper.extractors.hybrid_extractor.HybridExtractor.extract_result_rows",
+        extract_varying,
+    )
+
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=PLD|year=2018",
+        query_json={"reporter": "PLD", "year": 2018},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=10,
+        rows_known=0,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    for expected in counts:
+        q.cursor_json = {"page": 1, "row_index": 0}
+        await runner.run_query(q, {})
+        assert q.cursor_json.get("rows_unlinked") == expected
+    await db.rollback()
 
 
 @pytest.mark.asyncio
