@@ -286,7 +286,7 @@ async def test_scan_apply_revalidates_corrected_judgment_and_source(db):
     report = await find_headnote_only_promoted(db)
     stale = next(row for row in report["fixes"] if row["id"] == str(jid))
     judgment = await db.get(Judgment, jid)
-    completed = text + "\\nJUDGMENT\\n" + ("This is the complete court judgment text. " * 20)
+    completed = text + "\nJUDGMENT\n" + ("This is the complete court judgment text. " * 20)
     judgment.full_text = completed
     judgment.full_text_hash = canonical_text_hash(completed)
     await db.commit()
