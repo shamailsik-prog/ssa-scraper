@@ -55,7 +55,9 @@ from scraper.pls_navigation import (
 )
 from scraper.extractors.judgment_guards import (
     detect_headnotes_only,
+    detect_pls_case_description_chrome_stub,
     extract_before_jj_judge_names,
+    guard_reason,
     judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
@@ -569,6 +571,9 @@ class PakistanLawSitePipeline:
                 return "headnote", "case_description_selector_missing"
             if not (modal_text or "").strip():
                 return "headnote", "case_description_modal_empty"
+            chrome_stub = detect_pls_case_description_chrome_stub(modal_text or selected_text)
+            if chrome_stub is not None:
+                return "headnote", guard_reason(chrome_stub)
         signal = detect_headnotes_only(raw_text=selected_text, raw_html=page.html)
         if signal is not None:
             return "headnote", f"{signal.reason_code}:{signal.signal}"
