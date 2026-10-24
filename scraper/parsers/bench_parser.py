@@ -123,8 +123,12 @@ def parse_bench(text: str) -> BenchInfo:
         if mb:
             blob = mb.group(1)
     if blob:
+        blob = re.sub(r"(?i)^(?:coram|present)\s*:?\s*", "", blob.strip())
         info.evidence = blob.strip()[:400]
         info.judge_names = _split_names(blob)
+        if not info.judge_names and re.search(r"(?i)\b(?:jj?\.?|c\.j\.)\b", blob):
+            trimmed = re.sub(r"(?i)^present\.?\s*", "", blob.strip())
+            info.judge_names = _split_names(trimmed)
     # explicit phrases anywhere in the head
     explicit_size = None
     mm = MEMBER_BENCH.search(head)

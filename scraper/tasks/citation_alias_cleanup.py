@@ -16,12 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import SessionLocal, run_async
 from scraper.extractors import deterministic as det
-from scraper.extractors.deterministic import referred_after_citation
+from scraper.extractors.deterministic import citation_referred_in_text
 from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
 from scraper.config import settings
 from scraper.models import Citation, CorpusMetadata, Judgment, QuarantineQueue, ScraperStaging
-from scraper.parsers.case_metadata import judgment_caption_slice, judgment_header_slice
+from scraper.parsers.case_metadata import also_reported_citation_strings, judgment_caption_slice
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.tasks.promotion import promote_judgment_staging
 
@@ -29,9 +29,14 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "PakistanLawSite"
 BACKUP_KEY = "false_citation_alias_cleanup_backup_{run_id}"
+REQUALIFY_BACKUP_KEY = "false_citation_alias_cleanup_requalify_{run_id}"
 UNDO_PRIOR_KEY = "false_citation_alias_cleanup_undo_prior_{run_id}"
 LATEST_RUN_KEY = "false_citation_alias_cleanup_latest_run"
-ALREADY_BELONGS = re.compile(r"citation .+ already belongs to judgment", re.I)
+ALREADY_BELONGS_SQL = "%already belongs to judgment%"
+
+
+def _already_belongs_reason_clause():
+    return func.coalesce(ScraperStaging.quarantine_reason, "").ilike(ALREADY_BELONGS_SQL)
 
 
 def _citation_strings_before(text: str, end: int) -> Set[str]:
@@ -41,7 +46,7 @@ def _citation_strings_before(text: str, end: int) -> Set[str]:
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if not norm:
             continue
-        if c["span"][0] < end and referred_after_citation.match(raw, c["span"][1]) is None:
+        if c["span"][0] < end and not citation_referred_in_text(raw, c["span"][0], c["span"][1]):
             out.add(norm)
     return out
 
@@ -50,21 +55,12 @@ def caption_citation_strings(text: str) -> Set[str]:
     return _citation_strings_before(text, len(judgment_caption_slice(text or "")))
 
 
-def head_citation_citation_strings(text: str) -> Set[str]:
-    """Citations in the PLS head block before rel./ref. (wider than caption; keeps true parallels)."""
-    return _citation_strings_before(text, len(judgment_header_slice(text or "")))
-
-
 def legitimate_parallel_alias(alias: str, full_text: str, *, primary: Optional[str] = None) -> bool:
-    """Same judgment under another reporter, or any cite in caption / head-citation block."""
+    """Genuine parallel: caption / also-reported line only (never headnote citation lists)."""
     raw = full_text or ""
     if not alias or not raw:
         return False
-    if alias in caption_citation_strings(raw) or alias in head_citation_citation_strings(raw):
-        return True
-    meta = {"citation": primary} if primary else {}
-    own = det.extract_judgment_deterministic(html=None, text=raw, source_meta=meta).get("citations") or []
-    return alias in own
+    return alias in caption_citation_strings(raw) or alias in also_reported_citation_strings(raw)
 
 
 def alias_suspicion_reason(alias: str, full_text: str, *, primary: Optional[str] = None) -> Optional[str]:
@@ -72,19 +68,17 @@ def alias_suspicion_reason(alias: str, full_text: str, *, primary: Optional[str]
     if legitimate_parallel_alias(alias, full_text, primary=primary):
         return None
     raw = full_text or ""
-    head_end = len(judgment_header_slice(raw))
-    mentions: List[Tuple[bool, bool]] = []
+    mentions: List[bool] = []
     for c in extract_citations(raw):
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if norm != alias:
             continue
-        is_ref = referred_after_citation.match(raw, c["span"][1]) is not None
-        in_head = c["span"][0] < head_end and not is_ref
-        mentions.append((in_head, is_ref))
+        mentions.append(citation_referred_in_text(raw, c["span"][0], c["span"][1]))
     if not mentions:
         return "not in target text"
-    if any(in_head for in_head, _ in mentions):
-        return None
+    if any(not is_ref for is_ref in mentions):
+        # Body cite without list ref marker — still a false alias if not in caption
+        return "ref-only mention"
     return "ref-only mention"
 
 
@@ -93,13 +87,12 @@ _alias_suspicion_reason = alias_suspicion_reason
 
 
 async def _quarantined_staging_for_alias(db: AsyncSession, alias: str) -> List[str]:
-    pattern = f"%{alias}%already belongs to%"
     rows = (
         await db.execute(
             select(ScraperStaging.id).where(
                 ScraperStaging.status == "quarantined",
                 ScraperStaging.extracted_citation == alias,
-                func.coalesce(ScraperStaging.quarantine_reason, "").ilike(pattern),
+                _already_belongs_reason_clause(),
             )
         )
     ).scalars().all()
@@ -170,18 +163,20 @@ async def _backup_citations(db: AsyncSession, run_id: str, citation_ids: List[st
     db.add(CorpusMetadata(key=BACKUP_KEY.format(run_id=run_id), value=json.dumps(payload)))
 
 
-async def _restore_backup(db: AsyncSession, run_id: str) -> int:
+async def _restore_backup(db: AsyncSession, run_id: str) -> Dict[str, Any]:
     row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == BACKUP_KEY.format(run_id=run_id)))).scalars().first()
     if row is None or not row.value:
-        return 0
+        return {"citations_restored": 0, "skipped_reclaimed": []}
     from uuid import UUID
 
     restored = 0
+    skipped_reclaimed: List[str] = []
     for item in json.loads(row.value):
         exists = (
             await db.execute(select(Citation).where(Citation.citation_string == item["citation_string"]))
         ).scalars().first()
         if exists is not None:
+            skipped_reclaimed.append(item["citation_string"])
             continue
         db.add(
             Citation(
@@ -198,15 +193,47 @@ async def _restore_backup(db: AsyncSession, run_id: str) -> int:
         )
         restored += 1
     await db.delete(row)
-    return restored
+    return {"citations_restored": restored, "skipped_reclaimed": skipped_reclaimed}
 
 
-async def requalify_already_belongs(db: AsyncSession, *, dry_run: bool, alias_strings: Set[str]) -> Dict[str, int]:
+async def _undo_requalify(db: AsyncSession, run_id: str) -> Dict[str, int]:
+    from uuid import UUID
+
+    row = (
+        await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == REQUALIFY_BACKUP_KEY.format(run_id=run_id)))
+    ).scalars().first()
+    if row is None or not row.value:
+        return {"staging_rows_reverted": 0}
+    reverted = 0
+    for item in json.loads(row.value):
+        st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == UUID(item["staging_id"])))).scalars().first()
+        if st is None:
+            continue
+        st.status = item.get("prior_status") or "quarantined"
+        st.quarantine_reason = item.get("prior_quarantine_reason")
+        st.promoted_to_id = UUID(item["prior_promoted_to_id"]) if item.get("prior_promoted_to_id") else None
+        reverted += 1
+    await db.delete(row)
+    return {"staging_rows_reverted": reverted}
+
+
+async def requalify_already_belongs(
+    db: AsyncSession, *, dry_run: bool, alias_strings: Set[str]
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     from scraper.models import ScraperSource
 
-    counts = {"scanned": 0, "promoted": 0, "duplicate": 0, "still_quarantined": 0}
+    counts: Dict[str, int] = {
+        "scanned": 0,
+        "promoted": 0,
+        "duplicate": 0,
+        "still_quarantined": 0,
+        "would_promote": 0,
+        "would_duplicate": 0,
+        "would_still_quarantine": 0,
+    }
+    records: List[Dict[str, Any]] = []
     if not alias_strings:
-        return counts
+        return counts, records
     directory = await load_court_directory(db)
     source = (await db.execute(select(ScraperSource).where(ScraperSource.source_name == SOURCE_NAME))).scalars().first()
     min_confidence = float((source.extraction_min_confidence if source else None) or settings.SGAI_DEFAULT_MIN_CONFIDENCE)
@@ -215,15 +242,15 @@ async def requalify_already_belongs(db: AsyncSession, *, dry_run: bool, alias_st
             select(ScraperStaging).where(
                 ScraperStaging.status == "quarantined",
                 ScraperStaging.extracted_citation.in_(list(alias_strings)),
-                func.coalesce(ScraperStaging.quarantine_reason, "").ilike("%already belongs to judgment%"),
+                _already_belongs_reason_clause(),
             )
         )
     ).scalars().all()
     for st in rows:
         counts["scanned"] += 1
-        if dry_run:
-            counts["promoted"] += 1
-            continue
+        prior_status = st.status
+        prior_quarantine_reason = st.quarantine_reason
+        prior_promoted_to_id = st.promoted_to_id
         text = st.raw_text or ""
         meta = {"citation": st.extracted_citation, "title": st.extracted_title, "court": st.extracted_court, "url": st.source_url}
         dj = det.extract_judgment_deterministic(html=None, text=text, source_meta=meta)
@@ -235,6 +262,12 @@ async def requalify_already_belongs(db: AsyncSession, *, dry_run: bool, alias_st
             min_confidence=min_confidence,
             source_name=st.source_name,
         )
+        if dry_run:
+            if out.quarantine:
+                counts["would_still_quarantine"] += 1
+            else:
+                counts["would_promote"] += 1
+            continue
         if out.quarantine:
             counts["still_quarantined"] += 1
             continue
@@ -249,6 +282,16 @@ async def requalify_already_belongs(db: AsyncSession, *, dry_run: bool, alias_st
         await db.commit()
         if result in ("promoted", "duplicate"):
             counts[result] += 1
+            records.append(
+                {
+                    "staging_id": str(st.id),
+                    "prior_status": prior_status,
+                    "prior_quarantine_reason": prior_quarantine_reason,
+                    "prior_promoted_to_id": str(prior_promoted_to_id) if prior_promoted_to_id else None,
+                    "result": result,
+                    "promoted_to_id": str(st.promoted_to_id) if st.promoted_to_id else None,
+                }
+            )
             items = (
                 await db.execute(
                     select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False))
@@ -264,7 +307,7 @@ async def requalify_already_belongs(db: AsyncSession, *, dry_run: bool, alias_st
                 await db.commit()
         else:
             counts["still_quarantined"] += 1
-    return counts
+    return counts, records
 
 
 async def run_citation_alias_cleanup(
@@ -278,6 +321,7 @@ async def run_citation_alias_cleanup(
     async with SessionLocal() as db:
         if undo:
             restored = await _restore_backup(db, undo)
+            reverted = await _undo_requalify(db, undo)
             prior = (
                 await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == UNDO_PRIOR_KEY.format(run_id=undo)))
             ).scalars().first()
@@ -290,7 +334,7 @@ async def run_citation_alias_cleanup(
             if prior is not None:
                 await db.delete(prior)
             await db.commit()
-            return {"undone": {"citations_restored": restored, "run_id": undo}}
+            return {"undone": {**restored, **reverted, "run_id": undo}}
 
         suspicious, n_suspicious, total_non_primary = await scan_false_aliases(db)
         out: Dict[str, Any] = {
@@ -303,7 +347,7 @@ async def run_citation_alias_cleanup(
         with path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(
                 fh,
-                fieldnames=["alias", "target", "reason", "quarantined_staging_id", "citation_id", "target_judgment_id"],
+                fieldnames=["alias", "target", "reason", "quarantined_staging_ids", "citation_id", "target_judgment_id"],
             )
             writer.writeheader()
             for row in suspicious:
@@ -313,12 +357,15 @@ async def run_citation_alias_cleanup(
                         "alias": row["alias"],
                         "target": row["target"],
                         "reason": row["reason"],
-                        "quarantined_staging_id": staging[0] if staging else "",
+                        "quarantined_staging_ids": ";".join(staging),
                         "citation_id": row["citation_id"],
                         "target_judgment_id": row["target_judgment_id"],
                     }
                 )
         out["csv_path"] = str(path)
+        alias_strings = {r["alias"] for r in suspicious}
+        requal_preview, _ = await requalify_already_belongs(db, dry_run=True, alias_strings=alias_strings)
+        out["requalify_preview"] = requal_preview
 
         if not apply:
             return out
@@ -326,7 +373,6 @@ async def run_citation_alias_cleanup(
         run_id = uuid.uuid4().hex
         citation_ids = [r["citation_id"] for r in suspicious]
         await _backup_citations(db, run_id, citation_ids)
-        alias_strings = {r["alias"] for r in suspicious}
         if citation_ids:
             from uuid import UUID
 
@@ -345,7 +391,10 @@ async def run_citation_alias_cleanup(
         else:
             prior_latest.value = run_id
         await db.commit()
-        requal = await requalify_already_belongs(db, dry_run=False, alias_strings=alias_strings)
+        requal, requal_records = await requalify_already_belongs(db, dry_run=False, alias_strings=alias_strings)
+        if requal_records:
+            db.add(CorpusMetadata(key=REQUALIFY_BACKUP_KEY.format(run_id=run_id), value=json.dumps(requal_records)))
+            await db.commit()
         out["applied"] = {"run_id": run_id, "aliases_removed": len(citation_ids), "requalify": requal}
         return out
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from scraper.extractors.deterministic import extract_judgment_deterministic
+from scraper.extractors.deterministic import citation_referred_in_text, extract_judgment_deterministic
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import score_confidence
 from scraper.parsers.case_metadata import judgment_caption_slice
@@ -72,24 +72,29 @@ def test_present_dot_bench_line_parses_judges():
     assert any("Zullah" in n for n in bench.judge_names)
 
 
-def test_pld_1990_sc_1_present_scores_at_least_0_8():
+def test_pld_1990_sc_1_present_scores_at_least_0_85_real_layout():
     text = (
-        "PLD 1990 SC 1\nSUPREME COURT OF PAKISTAN\n"
-        "Present: Muhammad Afzal Zullah and Usman Ali Shah, JJ\n"
-        "Federation---Petitioner\nversus\nProvince---Respondent\n"
+        "PLD 1990 SC 1\n"
+        "IN THE SUPREME COURT OF PAKISTAN\n"
+        "Present. Muhammad Afzal Zullah and Usman Ali Shah, JJ\n"
+        "Federation of Pakistan---Petitioner\n"
+        "versus\n"
+        "Province of Punjab---Respondent\n"
         "Constitution Petition No. 1 of 1990, decided on 1st March, 1990.\n"
         + _pad(80)
     )
     out = extract_judgment_deterministic(html=None, text=text, source_meta={"citation": "PLD 1990 SC 1"})
+    title = out.get("case_title") or out.get("title")
+    assert title and "versus" in title.lower()
     fields = {
         "citation": out["citations"][0],
         "court": "Supreme Court of Pakistan",
         "year": 1990,
-        "case_title": out.get("title") or "Federation versus Province",
+        "case_title": title,
         "judges": out.get("judge_names") or [],
         "content": text,
     }
-    assert score_confidence(fields) >= 0.8
+    assert score_confidence(fields) >= 0.85
 
 
 def test_score_confidence_missing_judges_penalty():
@@ -142,6 +147,79 @@ def test_cleanup_flags_clc_956_pld_lahore_body_mention():
     )
     assert alias_suspicion_reason("PLD 1990 Lahore 4", body, primary="1992 CLC 956") == "ref-only mention"
     assert not legitimate_parallel_alias("PLD 1990 Lahore 4", body, primary="1992 CLC 956")
+
+
+def test_caption_v_dot_cut_excludes_party_line_citations():
+    """2017 CLD 1737-style SHC caption: party 'v.' must not widen the caption block."""
+    body = (
+        "2017 CLD 1737\n[Lahore]\n"
+        "IN THE SINDH HIGH COURT\n"
+        "Khalid Mehmood & others v. M/s. Multi Plus\n"
+        "Before A Judge, J\n"
+        "X---Petitioner\nversus\nY---Respondent\n"
+        "Suit No. 1 of 2017, decided on 1st January, 2017.\n"
+        "(a) Topic---\n"
+        + _pad(15)
+        + "\n2016 SCMR 213 discussed.\n"
+    )
+    cap = judgment_caption_slice(body)
+    assert "2016 SCMR" not in cap
+    assert "Multi Plus" not in cap or " v. " in cap
+    out = extract_judgment_deterministic(html=None, text=body, source_meta={"citation": "2017 CLD 1737"})
+    assert "2016 SCMR 213" not in out["citations"]
+
+
+def test_headnote_ref_list_flags_every_cite_before_marker():
+    from scraper.parsers.citation_extractor import extract_citations
+
+    line = (
+        "2003 CLC 1\n[Peshawar]\nBefore J, J\nA versus B\n"
+        "decided on 1st January, 2003.\n"
+        "(a) Topic---\n"
+        "X 2003 SCMR 74; Y 2003 SCMR 774 and Z 2003 SCMR 1915 ref."
+    )
+    hits = [c for c in extract_citations(line) if "SCMR" in (c.get("normalized") or "")]
+    assert len(hits) == 3
+    for c in hits:
+        assert citation_referred_in_text(line, c["span"][0], c["span"][1])
+
+
+def test_caption_parallel_scmr_plc_slash_kept():
+    body = (
+        "1991 SCMR 100 / 1991 PLC 200\n[Lahore]\nBefore J, J\n"
+        "A---Petitioner\nversus\nB---Respondent\n"
+        "decided on 1st January, 1991.\n"
+        + _pad(40)
+    )
+    assert legitimate_parallel_alias("1991 PLC 200", body, primary="1991 SCMR 100")
+    assert alias_suspicion_reason("1991 PLC 200", body, primary="1991 SCMR 100") is None
+
+
+def test_clc_1587_headnote_list_rel_flags_all_cites():
+    headnote = (
+        "1984 CLC 1587\n[Lahore]\nBefore J, J\nA versus B\n"
+        "decided on 1st January, 1984.\n"
+        "(a) Topic---\n"
+        "1981 SCMR 829 and PLD 1980 Karachi 99 rel."
+    )
+    from scraper.parsers.citation_extractor import extract_citations, normalise_citation
+
+    for c in extract_citations(headnote):
+        norm = c.get("normalized") or normalise_citation(c["raw"])
+        if norm == "1984 CLC 1587":
+            continue
+        assert citation_referred_in_text(headnote, c["span"][0], c["span"][1])
+
+
+def test_also_reported_parallel_after_versus_kept():
+    body = (
+        "1990 PLD SC 1\n[Peshawar]\nBefore J, J\n"
+        "A---Petitioner\nversus\nB---Respondent\n"
+        "Also reported as 1990 SCMR 999\n"
+        "decided on 1st March, 1990.\n"
+        + _pad(40)
+    )
+    assert legitimate_parallel_alias("1990 SCMR 999", body, primary="PLD 1990 SC 1")
 
 
 def test_alias_suspicion_reason_ref_only_in_body():

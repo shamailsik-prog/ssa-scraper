@@ -60,7 +60,7 @@ from scraper.models import (
     StatutesStaging,
 )
 from scraper.parsers.bench_parser import normalise_judge_name
-from scraper.extractors.deterministic import decision_date_from_text, referred_after_citation
+from scraper.extractors.deterministic import citation_referred_in_text, decision_date_from_text, referred_after_citation
 from scraper.parsers.case_metadata import judgment_caption_slice, judgment_header_slice, parse_case_metadata, parse_pls_header_court
 from scraper.parsers.citation_extractor import (
     canonical_court,
@@ -198,7 +198,7 @@ def _header_citation_set(page_text: str) -> set[str]:
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if not norm:
             continue
-        referred = referred_after_citation.match(raw_text, c["span"][1]) is not None
+        referred = citation_referred_in_text(raw_text, c["span"][0], c["span"][1])
         if c["span"][0] < header_end and not referred:
             header.add(norm)
     return header
