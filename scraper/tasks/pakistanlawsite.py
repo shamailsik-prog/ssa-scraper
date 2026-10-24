@@ -357,6 +357,7 @@ class PakistanLawSitePipeline:
         # Per-journal grid walk: the journal whose grid the current window reads (None = the default grid).
         self.grid_journal: Optional[str] = None
         self._journal_rotation_disabled: bool = False
+        self._cap_lap: bool = False
         self.stats = {"queries": 0, "pages": 0, "rows": 0, "staged": 0, "duplicates": 0, "misses": 0, "url_less_skips": 0, "known_citation_skips": 0, "staged_citation_skips": 0, "reporter_skips": 0, "volumes_closed": 0, "halted": False, "paused": False, "pacing_paused": False, "pages_charged": 0, "citation_grid_windows": 0}
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
@@ -707,7 +708,12 @@ class PakistanLawSitePipeline:
 
     def _journal_available(self, journal: str) -> bool:
         cur = (self.source.config_json or {}).get(journal_cursor_key(journal))
-        return not (cursor_saturated(cur) or journal_unsupported(cur))
+        # A capped recovery job must be allowed to revisit saturated journals.
+        # Unsupported journals still require their normal recheck; never bypass
+        # a journal that the licensed source did not actually offer.
+        if journal_unsupported(cur):
+            return False
+        return not cursor_saturated(cur) or bool(self.stats.get("grid_yield_cap_bypass_consumed"))
 
     def _pick_grid_journal(self, *, after: Optional[str] = None) -> Optional[str]:
         """The next journal with grid work left, round-robin from `after` (or from the one last walked)."""
@@ -769,15 +775,21 @@ class PakistanLawSitePipeline:
         return cursor_key, cursor, max(0, row_offset)
 
     async def _maybe_yield_citation_grid_for_search_harvest(self) -> bool:
+        if self._cap_lap and int(self.stats.get("citation_grid_windows") or 0) < 1:
+            return False
         from scraper.pls_grid_health import (
+            pls_grid_cap_lap_grace_active,
             pls_note_search_harvest_grid_yield,
             pls_pending_search_harvest_count,
             pls_yield_citation_grid_to_search_harvest,
         )
 
+        cfg = dict(self.source.config_json or {})
+        if pls_grid_cap_lap_grace_active(cfg, self.reporter_shard):
+            return False
         pending = await pls_pending_search_harvest_count(self.db, reporter_shard=self.reporter_shard)
         reason = pls_yield_citation_grid_to_search_harvest(
-            dict(self.source.config_json or {}),
+            cfg,
             self.reporter_shard,
             pending,
         )
@@ -816,6 +828,7 @@ class PakistanLawSitePipeline:
             else:
                 await self._set_grid_journal(first)
         windows = 0
+        completed_lap = False
         while True:
             if await self._maybe_yield_citation_grid_for_search_harvest():
                 break
@@ -833,11 +846,14 @@ class PakistanLawSitePipeline:
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
-            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+            if self._cap_lap or self.stats.get("grid_yield_cap_bypass_consumed"):
+                if windows == 1:
+                    from scraper.pls_grid_health import pls_note_grid_cap_lap_window_complete
 
-            await pls_clear_grid_yield_marker(
-                self.db, self.source, reporter_shard=self.reporter_shard
-            )
+                    await pls_note_grid_cap_lap_window_complete(
+                        self.db, self.source, reporter_shard=self.reporter_shard
+                    )
+                    self._cap_lap = False
             if outcome.get("citation_grid_stub_stop"):
                 logger.info(
                     "PakistanLawSite citation-grid: intermittent no-results stub; "
@@ -845,6 +861,14 @@ class PakistanLawSitePipeline:
                 )
                 self.stats["citation_grid_stub_stop"] = True
                 break
+            # A successful partial window is not a full grid lap. Keep the
+            # expired yield cap until the shard has actually reached the end.
+            if (
+                not outcome.get("cursor_unconfirmed")
+                and int(outcome.get("processed") or 0) > 0
+                and (outcome.get("wrapped") or outcome.get("reached_end"))
+            ):
+                completed_lap = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
             ):
@@ -877,6 +901,16 @@ class PakistanLawSitePipeline:
                 break
             if windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
                 break
+        # The capped recovery promises a grid lap, not just one page/window.
+        # Partial progress, a stub, an unconfirmed cursor, or immediate yield
+        # must preserve the marker for the next job's resumable continuation.
+        # Never clear another login shard's independent recovery marker.
+        if completed_lap and not self.stats.get("yielded_for_search_harvest"):
+            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+            await pls_clear_grid_yield_marker(
+                self.db, self.source, reporter_shard=self.reporter_shard
+            )
 
     async def _run_citation_grid_window(self, search_map: Dict[str, Any], limits: Dict[str, int]) -> Dict[str, Any]:
         await self._charge_page()
@@ -1813,6 +1847,13 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
+                from scraper.pls_grid_health import pls_consume_grid_yield_cap_bypass
+
+                if await pls_consume_grid_yield_cap_bypass(
+                    self.db, self.source, reporter_shard=self.reporter_shard
+                ):
+                    self.stats["grid_yield_cap_bypass_consumed"] = True
+                    self._cap_lap = True
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,

@@ -57,6 +57,45 @@ def _unlinked_ok(**kwargs):
     return search_harvest_may_mark_done_unlinked(pagination_confirmed=True, **kwargs)[0]
 
 
+def test_done_unlinked_safety_returns_reason():
+    ok, reason = search_harvest_may_mark_done_unlinked(
+        site_total=100,
+        rows_seen=100,
+        rows_known=94,
+        rows_unlinked=6,
+        pagination_confirmed=True,
+    )
+    assert ok is False
+    assert "exceeds 5%" in reason
+
+
+@pytest.mark.asyncio
+async def test_done_unlinked_safety_logged_and_stored(db, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    rows = [_linkless(i) for i in range(6)]
+    pages = {"page1": (rows, None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=100)
+    runner.dry_run = True
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:safety-cap",
+        query_json={"reporter": "PLD", "year": 2018},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=94,
+        rows_known=94,
+    )
+    db.add(q)
+    await db.flush()
+    await runner.run_query(q, {})
+    assert q.status == "in_progress"
+    assert q.last_error and "exceeds 5%" in q.last_error
+    assert any("safety-cap" in r.message and "exceeds 5%" in r.message for r in caplog.records)
+    await db.rollback()
+
+
 def test_done_unlinked_probe_cases():
     assert not _unlinked_ok(site_total=200, rows_seen=195, rows_known=190, rows_unlinked=5)
     assert not _unlinked_ok(site_total=300, rows_seen=290, rows_known=280, rows_unlinked=10)

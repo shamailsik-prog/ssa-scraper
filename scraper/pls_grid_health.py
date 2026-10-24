@@ -14,6 +14,8 @@ from scraper.models import Judgment, ScraperJob, ScraperSource, ScraperStaging
 SOURCE_NAME = "PakistanLawSite"
 PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
 GRID_YIELD_SINCE_KEY = "grid_yield_since"
+GRID_CAP_LAP_AT_KEY = "grid_cap_lap_at"
+GRID_CAP_LAP_WINDOW_AT_KEY = "grid_cap_lap_window_at"
 
 
 def grid_yield_since_key(reporter_shard: Optional[int]) -> str:
@@ -244,6 +246,28 @@ def pls_grid_max_yield_minutes() -> int:
     return int(getattr(settings, "PLS_GRID_MAX_YIELD_MINUTES", 120) or 120)
 
 
+def pls_grid_cap_lap_grace_active(cfg: Dict[str, Any], reporter_shard: Optional[int]) -> bool:
+    """Cap-bypass consume resets yield timers; block yield until the first grid window completes."""
+    lap_at = parse_iso(cfg.get(GRID_CAP_LAP_AT_KEY))
+    if lap_at is None:
+        return False
+    window_at = parse_iso(cfg.get(GRID_CAP_LAP_WINDOW_AT_KEY))
+    if window_at is not None and window_at >= lap_at:
+        return False
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    if lap_at.tzinfo is None:
+        lap_at = lap_at.replace(tzinfo=timezone.utc)
+    for shard in shards:
+        since = parse_iso(cfg.get(grid_yield_since_key(shard)))
+        if since is None:
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        if abs((since - lap_at).total_seconds()) <= 5:
+            return True
+    return False
+
+
 def pls_grid_yield_cap_reached(
     cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None
 ) -> bool:
@@ -272,9 +296,11 @@ def pls_yield_citation_grid_to_search_harvest(
 ) -> Optional[str]:
     """When the ledger has work, prefer search-harvest over a saturated citation-grid lap."""
     now = now or datetime.now(timezone.utc)
-    if pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
-        return None
     if pending_harvest <= 0:
+        return None
+    if pls_grid_cap_lap_grace_active(cfg, reporter_shard):
+        return None
+    if pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
         return None
     if defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
         return "search-harvest gaps while promotion stalled or grid saturated (watchdog)"
@@ -382,6 +408,44 @@ async def pls_note_search_harvest_grid_yield(
     watch["search_harvest_yield_at"] = now.isoformat()
     patch[PLS_STALL_WATCHDOG_KEY] = watch
     await merge_source_config(db, source, patch)
+
+
+async def pls_consume_grid_yield_cap_bypass(
+    db: AsyncSession,
+    source: ScraperSource,
+    *,
+    reporter_shard: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Restart yield timers when a cap-expired grid job begins so a lap that never finishes a window cannot bypass every dispatch."""
+    from scraper.auth.session_manager import merge_source_config
+
+    now = now or datetime.now(timezone.utc)
+    cfg = dict(source.config_json or {})
+    if not pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
+        return False
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    patch: Dict[str, Any] = {
+        GRID_CAP_LAP_AT_KEY: now.isoformat(),
+        GRID_CAP_LAP_WINDOW_AT_KEY: None,
+    }
+    for shard in shards:
+        patch[grid_yield_since_key(shard)] = now.isoformat()
+    await merge_source_config(db, source, patch)
+    return True
+
+
+async def pls_note_grid_cap_lap_window_complete(
+    db: AsyncSession,
+    source: ScraperSource,
+    *,
+    reporter_shard: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    from scraper.auth.session_manager import merge_source_config
+
+    now = now or datetime.now(timezone.utc)
+    await merge_source_config(db, source, {GRID_CAP_LAP_WINDOW_AT_KEY: now.isoformat()})
 
 
 async def pls_clear_grid_yield_marker(
