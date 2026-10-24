@@ -13,10 +13,20 @@ from scraper.parsers.bench_parser import normalise_judge_name
 # body is long enough to be a judgment and the bench is populated. Headnotes and
 # thin first-pass rows stay eligible for modal refetch.
 FULL_READY_JUDGMENT_CHARS = 5000
+HEADNOTE_BODY_MIN_TAIL_AFTER_HEARING_CHARS = 300
+HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER = 40
 
 
-def judgment_is_full_ready(full_text: Optional[str], judge_names: Any) -> bool:
-    return len(full_text or "") >= FULL_READY_JUDGMENT_CHARS and bool(judge_names)
+def judgment_is_full_ready(full_text: Optional[str], judge_names: Any, *, body_guard: Optional[bool] = None) -> bool:
+    if not bool(judge_names) or len(full_text or "") < FULL_READY_JUDGMENT_CHARS:
+        return False
+    if body_guard is None:
+        from scraper.config import settings
+
+        body_guard = bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False))
+    if body_guard and detect_headnote_only_no_body(full_text) is not None:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -90,6 +100,14 @@ _MODAL_CHROME_LINE_MARKERS: tuple[re.Pattern[str], ...] = (
 _MODAL_CHROME_INLINE_PREFIX_RE = re.compile(
     r"(?is)^\s*(?:\u00d7+\s*)?(?:case\s+description\s*)?(?:bookmark\s+this\s+case\s*)?(?:citation\s*name\s*:[^\n]*\n*)?(?:notes?\s+on\s+cases?\s*)?"
 )
+_BODY_ORDER_MARKER_RE = re.compile(r"(?im)^\s*(?:JUDGMENT|JUDGEMENT|ORDER)\b")
+_HEARING_DATE_LINE_RE = re.compile(
+    r"(?im)^[^\n]*\bdate\s*(?:\(\s*s\s*\)|s)?\s+of\s+hearing\s*:[^\n]*$"
+)
+_COUNSEL_LINE_RE = re.compile(
+    r"(?im)^[^\n]*\b(?:for\s+the\s+)?(?:petitioner|respondent|appellant|plaintiff|defendant|accused|complainant)\b[^\n]*$"
+)
+
 _JUDGMENT_CONTENT_ANCHORS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?im)^\s*(?:before|coram)\b"),
     re.compile(r"(?im)^\s*in\s+the\s+[A-Z][^\n]{0,120}\bcourt\b"),
@@ -313,6 +331,57 @@ def extract_before_jj_judge_names(raw_text: Optional[str]) -> list[str]:
             seen.add(key)
             names.append(normalized)
     return names
+
+
+def _tail_after_hearing_or_counsel_block(text: str) -> Optional[int]:
+    """Characters after the last hearing-date line, else after the last counsel-for line."""
+    hearing = list(_HEARING_DATE_LINE_RE.finditer(text))
+    if hearing:
+        return len(text[hearing[-1].end() :].strip())
+    counsel = list(_COUNSEL_LINE_RE.finditer(text))
+    if counsel:
+        return len(text[counsel[-1].end() :].strip())
+    return None
+
+
+def detect_headnote_only_no_body(raw_text: Optional[str]) -> Optional[JudgmentGuardSignal]:
+    """Long PLS modal captures that stop after counsel/hearing metadata with no judgment body."""
+    blob = strip_leading_judgment_chrome(raw_text or "")
+    if not blob.strip():
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="no_body_empty",
+            matched_value="",
+        )
+    marker = _BODY_ORDER_MARKER_RE.search(blob)
+    if marker is not None:
+        after = blob[marker.end() :].strip()
+        if len(after) >= HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER:
+            return None
+        if len(re.sub(r"\s+", "", after)) >= 25:
+            return None
+    tail = _tail_after_hearing_or_counsel_block(blob)
+    if tail is not None and tail < HEADNOTE_BODY_MIN_TAIL_AFTER_HEARING_CHARS:
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="no_body_after_hearing_or_counsel",
+            matched_value=blob[-400:],
+        )
+    if marker is None and tail is None:
+        compact = len(re.sub(r"\s+", "", blob))
+        if compact >= 1200 and not _JUDGMENT_STRUCTURE_RE.search(blob):
+            return JudgmentGuardSignal(
+                reason_code="headnote_only",
+                signal="no_body_no_judgment_marker",
+                matched_value=blob[:500],
+            )
+    if marker is not None and len(blob[marker.end() :].strip()) < HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER:
+        return JudgmentGuardSignal(
+            reason_code="headnote_only",
+            signal="no_body_after_judgment_marker",
+            matched_value=blob[marker.start() : marker.start() + 500],
+        )
+    return None
 
 
 def detect_headnotes_only(

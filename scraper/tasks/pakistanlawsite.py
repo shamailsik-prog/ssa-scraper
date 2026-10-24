@@ -54,7 +54,9 @@ from scraper.pls_navigation import (
     open_citation_search_for_harvest,
 )
 from scraper.extractors.judgment_guards import (
+    detect_headnote_only_no_body,
     detect_headnotes_only,
+    guard_reason,
     extract_before_jj_judge_names,
     judgment_is_full_ready,
     strip_leading_judgment_chrome,
@@ -105,7 +107,7 @@ PLS_STUB_PAGE_MAX_BYTES = 3000  # a capture smaller than this (octet_length) is 
 # quarantined on the merits (a real citation conflict or a human decision): never fetched again
 _FINAL_QUARANTINE = re.compile(r"(?i)already belongs|citation conflict|reviewed|rejected")
 _RETRYABLE_QUARANTINE = re.compile(
-    r"(?i)headnote_only|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
+    r"(?i)headnote_only|no_body_after_hearing|no_body_after_judgment|no_body_no_judgment|body_missing|body_short|subscription_chrome|login_stub|promotion error|full_text hash changed"
 )
 _ERROR_PAGE = re.compile(r"(?i)error code\s*:?\s*\d+|sorry,?\s+something went wrong|service unavailable|access denied|session (?:has )?expired")
 
@@ -572,6 +574,10 @@ class PakistanLawSitePipeline:
         signal = detect_headnotes_only(raw_text=selected_text, raw_html=page.html)
         if signal is not None:
             return "headnote", f"{signal.reason_code}:{signal.signal}"
+        if bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False)):
+            body_signal = detect_headnote_only_no_body(selected_text)
+            if body_signal is not None:
+                return "headnote", guard_reason(body_signal)
         return "full_judgment", None
 
     # ---------------------------------------------------------------- search map
@@ -1510,6 +1516,13 @@ class PakistanLawSitePipeline:
         validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
         if document_type == "headnote":
             validation_errors.append("headnote_only: not eligible for full_judgment promotion")
+        headnote_body_quarantine = False
+        body_signal = None
+        if bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False)) and document_type != "headnote":
+            body_signal = detect_headnote_only_no_body(text)
+            if body_signal is not None:
+                headnote_body_quarantine = True
+                validation_errors.append(guard_reason(body_signal))
         staging.validation_errors = validation_errors
         staging.extracted_citation = (reconciled.get("citations") or [None])[0]
         row_cit = normalise_citation(str(row.get("citation") or "")) if row.get("citation") else ""
@@ -1518,8 +1531,12 @@ class PakistanLawSitePipeline:
         staging.extracted_title = reconciled.get("case_title")
         staging.extracted_court = reconciled.get("court")
         staging.extracted_year = reconciled.get("year")
-        staging.status = "quarantined" if outcome.quarantine else "extracted"
-        staging.quarantine_reason = outcome.quarantine_reason
+        staging.status = "quarantined" if (outcome.quarantine or headnote_body_quarantine) else "extracted"
+        staging.quarantine_reason = (
+            guard_reason(body_signal)
+            if headnote_body_quarantine
+            else outcome.quarantine_reason
+        )
         await self.db.flush()
         if staging.status == "extracted":
             # Save it into the corpus as soon as the batch commits, not on the next Beat promote pass.

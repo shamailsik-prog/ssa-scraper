@@ -1193,14 +1193,24 @@ class PlaywrightBrowser:
                 }
                 let modal = null;
                 let text = '';
-                for (let i = 0; i < 80; i += 1) {
+                const bodyMarker = /(?:^|\\n)\\s*(?:JUDGMENT|JUDGEMENT|ORDER)\\b/i;
+                let lastLen = 0;
+                let stableReads = 0;
+                for (let i = 0; i < 120; i += 1) {
                     modal = document.querySelector('#ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
-                    const hasBeforeMarker = /Before.+/i.test(text);
-                    const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
-                    if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
+                    if (bodyMarker.test(text)) {
                         break;
                     }
+                    if (text.length >= 2000 && text.length === lastLen) {
+                        stableReads += 1;
+                        if (stableReads >= 3) {
+                            break;
+                        }
+                    } else {
+                        stableReads = 0;
+                    }
+                    lastLen = text.length;
                     await sleep(150);
                 }
                 return {

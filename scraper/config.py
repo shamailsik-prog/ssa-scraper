@@ -406,6 +406,10 @@ class Settings(BaseSettings):
         default=True,
         description="Default on. Quarantine PLS judgments shorter than 500 characters of preserved text. Set SSA_SHORT_TEXT_GUARD=0 or false to disable.",
     )
+    SSA_PLS_HEADNOTE_BODY_GUARD: bool = Field(
+        default=False,
+        description="When true, quarantine PakistanLawSite captures with counsel/hearing metadata but no JUDGMENT/ORDER body (long headnote-only modal text). Also treats such promoted rows as incomplete for grid refetch.",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
