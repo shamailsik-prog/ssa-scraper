@@ -16,6 +16,12 @@ PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
 GRID_YIELD_SINCE_KEY = "grid_yield_since"
 
 
+def grid_yield_since_key(reporter_shard: Optional[int]) -> str:
+    if reporter_shard in (0, 1):
+        return f"grid_yield_since_shard_{reporter_shard}"
+    return GRID_YIELD_SINCE_KEY
+
+
 def _to_int(value: Any) -> Optional[int]:
     try:
         return int(value) if value is not None else None
@@ -238,8 +244,10 @@ def pls_grid_max_yield_minutes() -> int:
     return int(getattr(settings, "PLS_GRID_MAX_YIELD_MINUTES", 120) or 120)
 
 
-def pls_grid_yield_cap_reached(cfg: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
-    since = parse_iso(cfg.get(GRID_YIELD_SINCE_KEY))
+def pls_grid_yield_cap_reached(
+    cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None
+) -> bool:
+    since = parse_iso(cfg.get(grid_yield_since_key(reporter_shard)))
     if since is None:
         return False
     now = now or datetime.now(timezone.utc)
@@ -258,7 +266,7 @@ def pls_yield_citation_grid_to_search_harvest(
 ) -> Optional[str]:
     """When the ledger has work, prefer search-harvest over a saturated citation-grid lap."""
     now = now or datetime.now(timezone.utc)
-    if pls_grid_yield_cap_reached(cfg, now=now):
+    if pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
         return None
     if pending_harvest <= 0:
         return None
@@ -347,6 +355,7 @@ async def pls_note_search_harvest_grid_yield(
     source: ScraperSource,
     reason: str,
     *,
+    reporter_shard: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> None:
     from scraper.auth.session_manager import merge_source_config
@@ -354,8 +363,14 @@ async def pls_note_search_harvest_grid_yield(
     now = now or datetime.now(timezone.utc)
     cfg = dict(source.config_json or {})
     patch: Dict[str, Any] = {}
-    if not cfg.get(GRID_YIELD_SINCE_KEY):
-        patch[GRID_YIELD_SINCE_KEY] = now.isoformat()
+    yield_key = grid_yield_since_key(reporter_shard)
+    if reporter_shard is None:
+        for shard in (0, 1):
+            sk = grid_yield_since_key(shard)
+            if not cfg.get(sk):
+                patch[sk] = now.isoformat()
+    elif not cfg.get(yield_key):
+        patch[yield_key] = now.isoformat()
     watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
     watch["search_harvest_yield_reason"] = reason
     watch["search_harvest_yield_at"] = now.isoformat()
@@ -363,11 +378,17 @@ async def pls_note_search_harvest_grid_yield(
     await merge_source_config(db, source, patch)
 
 
-async def pls_clear_grid_yield_marker(db: AsyncSession, source: ScraperSource) -> None:
+async def pls_clear_grid_yield_marker(
+    db: AsyncSession,
+    source: ScraperSource,
+    *,
+    reporter_shard: Optional[int] = None,
+) -> None:
     from scraper.auth.session_manager import merge_source_config
 
     cfg = dict(source.config_json or {})
-    if not cfg.get(GRID_YIELD_SINCE_KEY):
+    yield_key = grid_yield_since_key(reporter_shard)
+    if not cfg.get(yield_key):
         return
     watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
     watch.pop("search_harvest_yield_reason", None)
@@ -375,7 +396,7 @@ async def pls_clear_grid_yield_marker(db: AsyncSession, source: ScraperSource) -
     await merge_source_config(
         db,
         source,
-        {GRID_YIELD_SINCE_KEY: None, PLS_STALL_WATCHDOG_KEY: watch},
+        {yield_key: None, PLS_STALL_WATCHDOG_KEY: watch},
     )
 
 

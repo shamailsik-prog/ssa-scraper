@@ -783,7 +783,9 @@ class PakistanLawSitePipeline:
         )
         if not reason:
             return False
-        await pls_note_search_harvest_grid_yield(self.db, self.source, reason)
+        await pls_note_search_harvest_grid_yield(
+            self.db, self.source, reason, reporter_shard=self.reporter_shard
+        )
         self.stats["yielded_for_search_harvest"] = reason
         logger.info("PakistanLawSite citation-grid: %s (yielding session for search-harvest)", reason)
         return True
@@ -831,6 +833,11 @@ class PakistanLawSitePipeline:
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
+            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+            await pls_clear_grid_yield_marker(
+                self.db, self.source, reporter_shard=self.reporter_shard
+            )
             if outcome.get("citation_grid_stub_stop"):
                 logger.info(
                     "PakistanLawSite citation-grid: intermittent no-results stub; "
@@ -1806,9 +1813,6 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
-                from scraper.pls_grid_health import pls_clear_grid_yield_marker
-
-                await pls_clear_grid_yield_marker(self.db, self.source)
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,

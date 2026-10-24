@@ -394,16 +394,27 @@ async def test_dispatch_enqueues_search_harvest_when_stalled_with_gaps(db, monke
     from scraper.tasks.celery_app import app
 
     target = await _prepare_pls_due(db, (1, 2))
+    now = datetime.now(timezone.utc)
     target.config_json = {
         **dict(target.config_json or {}),
         "pls_stall_watchdog": {"stalled": True, "stalled_reason": "no_output_while_harvesting"},
     }
-    now = datetime.now(timezone.utc)
     db.add(
         PlsSearchHarvestQuery(
             source_name="PakistanLawSite",
             query_key="search:reporter=PLD|year=2026",
             query_json={"reporter": "PLD", "year": "2026"},
+            status="in_progress",
+            priority=100,
+            gap_size=9,
+            last_run_at=now,
+        )
+    )
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLC|year=2026",
+            query_json={"reporter": "PLC", "year": "2026"},
             status="in_progress",
             priority=100,
             gap_size=9,
@@ -544,7 +555,15 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
 
     now = datetime.now(timezone.utc)
     target = await _prepare_pls_due(db, (1, 2))
-    await merge_source_config(db, target, {"grid_yield_since": None})
+    await merge_source_config(
+        db,
+        target,
+        {
+            "grid_yield_since": None,
+            "grid_yield_since_shard_0": None,
+            "grid_yield_since_shard_1": None,
+        },
+    )
     target.config_json = {
         **dict(target.config_json or {}),
         "citation_grid_cursor_shard_0": {
@@ -579,6 +598,11 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
     monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
     monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
     monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+
+    async def _recent_promotion(_db):
+        return now
+
+    monkeypatch.setattr(dispatcher, "pls_last_judgment_at", _recent_promotion)
     await set_harvest_mode(db, "updates", changed_by="qa", reason="saturated defer")
     await db.commit()
 
@@ -591,6 +615,51 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
     result = await dispatch_due_sources()
     assert "PakistanLawSite:search_harvest_tick" in result["queued"]
     assert not any(item[0] == "scraper.tasks.dispatcher.run_login_session_job" for item in sent)
+
+
+async def test_dispatch_stall_path_slot2_in_progress_only_still_enqueues_shard0(db, monkeypatch):
+    """Stall-path unsharded yield needs both shares; slot-2-only in_progress work must not skip shard 0."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    target = await _prepare_pls_due(db, (1, 2))
+    target.config_json = {
+        **dict(target.config_json or {}),
+        "pls_stall_watchdog": {"stalled": True, "stalled_reason": "grid_saturated"},
+        "citation_grid_cursor_shard_0": {"row_offset": 10, "last_total_rows": 500},
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLC|year=2020",
+            query_json={"reporter": "PLC", "year": 2020},
+            status="in_progress",
+            priority=100,
+            last_run_at=now,
+        )
+    )
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "updates", changed_by="qa", reason="stall shard0")
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, args, kwargs or {}, queue)),
+    )
+    result = await dispatch_due_sources()
+    assert "PakistanLawSite:shard0" in result["queued"]
+    assert (
+        "scraper.tasks.dispatcher.run_login_session_job",
+        ("PakistanLawSite",),
+        {"reporter_shard": 0},
+        "login_session",
+    ) in sent
 
 
 async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harvest(db, monkeypatch):
@@ -609,6 +678,17 @@ async def test_dispatch_preempts_zero_output_grid_job_and_enqueues_search_harves
             source_name="PakistanLawSite",
             query_key="search:reporter=PLD|year=2026",
             query_json={"reporter": "PLD", "year": "2026"},
+            status="in_progress",
+            priority=100,
+            gap_size=9,
+            last_run_at=now,
+        )
+    )
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLC|year=2026",
+            query_json={"reporter": "PLC", "year": "2026"},
             status="in_progress",
             priority=100,
             gap_size=9,

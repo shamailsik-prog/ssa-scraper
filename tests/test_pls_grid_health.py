@@ -35,14 +35,14 @@ def test_zero_query_grid_failure_when_rows_remain():
 def test_grid_yield_cap_allows_saturated_lap():
     now = datetime.now(timezone.utc)
     cfg = {
-        GRID_YIELD_SINCE_KEY: (now - timedelta(minutes=121)).isoformat(),
+        "grid_yield_since_shard_0": (now - timedelta(minutes=121)).isoformat(),
         "citation_grid_cursor": {
             "saturated_at": (now - timedelta(hours=1)).isoformat(),
             "row_offset": 200,
             "last_total_rows": 500,
         },
     }
-    assert pls_grid_yield_cap_reached(cfg, now=now) is True
+    assert pls_grid_yield_cap_reached(cfg, 0, now=now) is True
     assert pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now) is None
 
 

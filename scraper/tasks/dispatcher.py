@@ -343,7 +343,9 @@ async def run_source(
             )
             if yield_reason:
                 logger.info("%s: %s; skipping login-session job at start", source_name, yield_reason)
-                await pls_note_search_harvest_grid_yield(db, source, yield_reason)
+                await pls_note_search_harvest_grid_yield(
+                    db, source, yield_reason, reporter_shard=reporter_shard
+                )
                 source.next_scrape_at = datetime.now(timezone.utc) + timedelta(
                     minutes=cadence_for_source(source, await get_harvest_mode(db))
                 )
@@ -550,9 +552,11 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 pls_stall_reason = None
                 if pending_search_gaps > 0:
                     last_j = await pls_last_judgment_at(db)
-                    pls_stall_reason = pls_stall_verdict_for_config(
+                    stall_verdict = pls_stall_verdict_for_config(
                         cfg, last_promotion_at=last_j, source_state=s.state, now=now
-                    ).get("stalled_reason")
+                    )
+                    if stall_verdict.get("stalled"):
+                        pls_stall_reason = stall_verdict.get("stalled_reason")
                 preempted = False
                 for job in list(running_jobs):
                     if not pls_preempt_running_job_for_search_harvest(
@@ -591,12 +595,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 yield_reason = None
                 if s.source_name == PLS_SOURCE_NAME:
                     if pls_stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS:
-                        pending_top = await pls_pending_search_harvest_count(
+                        slot1, slot2 = await pls_unsharded_enqueue_pending_counts(
                             db, stall_reason=pls_stall_reason, now=now
                         )
                     else:
                         slot1, slot2 = await pls_unsharded_enqueue_pending_counts(db, now=now)
-                        pending_top = slot1 + slot2 if slot1 > 0 and slot2 > 0 else 0
+                    pending_top = slot1 + slot2 if slot1 > 0 and slot2 > 0 else 0
                     yield_reason = pls_yield_citation_grid_to_search_harvest(
                         cfg,
                         None,
@@ -631,16 +635,22 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     for shard in (0, 1):
                         if shard in running_shards or (shard + 1) not in active_slots:
                             continue
+                        shard_stall = (
+                            pls_stall_reason
+                            if pls_stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS
+                            else None
+                        )
                         shard_pending = await pls_pending_search_harvest_count(
                             db,
                             reporter_shard=shard,
+                            stall_reason=shard_stall,
                             now=now,
                         )
                         shard_yield = pls_yield_citation_grid_to_search_harvest(
                             cfg,
                             shard,
                             shard_pending,
-                            stall_reason=pls_stall_reason,
+                            stall_reason=shard_stall,
                             now=now,
                         )
                         if shard_yield:
