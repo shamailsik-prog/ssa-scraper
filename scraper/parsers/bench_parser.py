@@ -16,8 +16,12 @@ from typing import List, Optional
 HONORIFICS = re.compile(
     r"(?i)\b(mr\.?|mrs\.?|ms\.?|justice|j\.|jj\.|hon'?ble|honourable|honorable|the|chief|acting|c\.?j\.?|cj|hcj|senior puisne judge|judge|judges|sahib|dr\.?)\b"
 )
-CORAM_LINE = re.compile(r"(?im)^[ \t]*(?:coram|bench|before|present)[ \t]*[:\-—]?[ \t]*([A-Za-z].*?)[ \t]*$")
-CORAM_BLOCK = re.compile(r"(?is)\b(?:coram|bench|before)\s*[:\-—]?\s*(.{5,400}?)(?:\n\s*\n|\bpetitioner|\bappellant|\bapplicant|\bversus|\bvs\.?|\bv\.\s)")
+CORAM_LINE = re.compile(
+    r"(?im)^[ \t]*(?:coram|bench|before|present)\s*\.?\s*(?::|\s*[:\-—])?\s*([A-Za-z].*?)[ \t]*$"
+)
+CORAM_BLOCK = re.compile(
+    r"(?is)\b(?:coram|bench|before|present)\s*\.?\s*(?::|\s*[:\-—])?\s*(.{5,400}?)(?:\n\s*\n|\bpetitioner|\bappellant|\bapplicant|\bversus|\bvs\.?|\bv\.\s)"
+)
 JUDGE_SUFFIX = re.compile(r"(?i),?\s*(?:j\.?|jj\.?|c\.?j\.?|cj|hcj|acj|actg\.?\s*c\.?j\.?)\s*(?=$|,|;|\band\b|&)")
 SPLIT = re.compile(r"\s*(?:,|;|\band\b|&|\n)\s*", re.I)
 JUDGE_CHROME_NOISE = re.compile(r"(?i)(obtaining\s+subscription|update\s+subscriber|^\s*read\s*$)")
