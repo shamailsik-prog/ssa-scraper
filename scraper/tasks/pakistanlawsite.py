@@ -112,6 +112,11 @@ def _citation_grid_verified_wrap(start_offset: int, next_offset: int, *, total_v
     return bool(total_verified and next_offset < start_offset)
 
 
+def _citation_grid_verified_end(start_offset: int, processed_rows: int, total_rows: int, *, total_verified: bool) -> bool:
+    """Never certify a grid lap from a truncated snapshot or cached total alone."""
+    return bool(total_verified and total_rows > 0 and processed_rows > 0 and start_offset + processed_rows >= total_rows)
+
+
 _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
 _REPORTER_BY_UPPER: Dict[str, str] = {}
 for _reporter in KNOWN_REPORTERS:
@@ -1485,19 +1490,11 @@ class PakistanLawSitePipeline:
             count_wrap=last_committed_offset != next_offset,
         )
         wrapped = _citation_grid_verified_wrap(start_offset, next_offset, total_verified=total_rows_known)
-        # the window read up to the grid's last row (a whole-grid window from row 0 ends a lap without "wrapping")
-        max_snapshot_rows = int(getattr(settings, "PLS_ARCHIVED_GRID_MAX_ROWS", 400) or 400)
-        compact_window_is_full_grid = (
-            not total_rows_known
-            and total_rows_meta is None
-            and row_count > 0
-            and row_count < max_snapshot_rows
-            and processed_rows_total >= row_count
-        )
-        reached_end = bool(
-            total_rows > 0
-            and start_offset + processed_rows_total >= total_rows
-            and (total_rows_known or compact_window_is_full_grid)
+        # A short snapshot does not prove that the server has no further pages.
+        # Only a positive current-page total can certify end-of-grid; a cached
+        # total or row_count fallback may guide scanning but not reconciliation.
+        reached_end = _citation_grid_verified_end(
+            start_offset, processed_rows_total, total_rows, total_verified=total_rows_known
         )
         result.update({"processed": processed_rows_total, "start_offset": start_offset, "next_offset": next_offset, "wrapped": wrapped, "reached_end": reached_end})
         logger.info(
