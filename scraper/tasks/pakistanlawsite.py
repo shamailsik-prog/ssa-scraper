@@ -814,6 +814,7 @@ class PakistanLawSitePipeline:
             else:
                 await self._set_grid_journal(first)
         windows = 0
+        confirmed_window = False
         while True:
             if await self._maybe_yield_citation_grid_for_search_harvest():
                 break
@@ -838,6 +839,10 @@ class PakistanLawSitePipeline:
                 )
                 self.stats["citation_grid_stub_stop"] = True
                 break
+            if not outcome.get("cursor_unconfirmed") and (
+                outcome.get("rows", 0) > 0 or outcome.get("wrapped") or outcome.get("reached_end")
+            ):
+                confirmed_window = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
             ):
@@ -870,6 +875,13 @@ class PakistanLawSitePipeline:
                 break
             if windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
                 break
+        # Keep the original yield timestamp throughout the capped grid run. Clearing it
+        # before the first window would immediately re-enable the saturated-grid yield
+        # and prevent the promised recovery lap from doing any work.
+        if confirmed_window and not self.stats.get("yielded_for_search_harvest"):
+            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+            await pls_clear_grid_yield_marker(self.db, self.source)
 
     async def _run_citation_grid_window(self, search_map: Dict[str, Any], limits: Dict[str, int]) -> Dict[str, Any]:
         await self._charge_page()
@@ -1806,9 +1818,6 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
-                from scraper.pls_grid_health import pls_clear_grid_yield_marker
-
-                await pls_clear_grid_yield_marker(self.db, self.source)
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,
