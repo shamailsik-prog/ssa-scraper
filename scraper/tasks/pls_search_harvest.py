@@ -64,6 +64,7 @@ from scraper.tasks.pakistanlawsite import (
     PacingBudgetExceeded,
     PakistanLawSitePipeline,
     SOURCE_NAME,
+    quarantined_capture_retryable,
 )
 from scraper.tasks.search_map import active_map, map_as_dict
 
@@ -77,41 +78,90 @@ async def _source_row(db: AsyncSession) -> ScraperSource:
     return row
 
 
+def _staging_counts_as_known(
+    status: str,
+    reason: Optional[str],
+    text_len: Optional[int],
+    head: Optional[str],
+    route: Any,
+) -> bool:
+    """Do not count retryable bad-page captures as held judgments.
+
+    Quarantines decided on the merits remain held; login/error/headnote stubs
+    remain discoverable within the existing bounded refetch allowance.
+    """
+    if status in ("extracted", "promoted", "duplicate"):
+        return True
+    if status == "quarantined":
+        return not quarantined_capture_retryable(reason, text_len, route, head)
+    return False
+
+
 async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]:
     if not keys:
         return set()
     known: Set[str] = set()
     case_names = {k[len(CASE_KEY_PREFIX):] for k in keys if k.startswith(CASE_KEY_PREFIX)}
     if case_names:
-        # a judgment page's CaseName in a promoted or staged (any status) capture: already held
-        for model in (Judgment, ScraperStaging):
-            name_col = func.upper(func.substring(model.source_url, CASE_NAME_URL_SUBSTRING_PATTERN))
-            q = select(name_col).where(model.source_name == SOURCE_NAME, name_col.in_(list(case_names)))
-            for (name,) in (await db.execute(q)).all():
-                if name:
-                    known.add(CASE_KEY_PREFIX + str(name))
+        # CaseName can identify an AJ&K judgment even when its citation is absent.
+        # A retryable staged error page is not evidence that its judgment was captured.
+        judgment_name = func.upper(func.substring(Judgment.source_url, CASE_NAME_URL_SUBSTRING_PATTERN))
+        for (name,) in (await db.execute(
+            select(judgment_name).where(
+                Judgment.source_name == SOURCE_NAME,
+                judgment_name.in_(list(case_names)),
+            )
+        )).all():
+            if name:
+                known.add(CASE_KEY_PREFIX + str(name))
+        staging_name = func.upper(func.substring(ScraperStaging.source_url, CASE_NAME_URL_SUBSTRING_PATTERN))
+        staged = await db.execute(
+            select(
+                staging_name,
+                ScraperStaging.status,
+                ScraperStaging.quarantine_reason,
+                func.octet_length(ScraperStaging.raw_text),
+                func.substr(ScraperStaging.raw_text, 1, 3000),
+                ScraperStaging.route_json,
+            ).where(
+                ScraperStaging.source_name == SOURCE_NAME,
+                staging_name.in_(list(case_names)),
+                ScraperStaging.status.in_(("extracted", "promoted", "duplicate", "quarantined")),
+            )
+        )
+        for name, status, reason, text_len, head, route in staged.all():
+            if name and _staging_counts_as_known(status, reason, text_len, head, route):
+                known.add(CASE_KEY_PREFIX + str(name))
     key_list = [k for k in keys if not k.startswith(CASE_KEY_PREFIX)]
     if not key_list:
         return known
-    for canonical, in (await db.execute(select(Judgment.canonical_citation).where(Judgment.canonical_citation.in_(key_list)))).all():
+    for canonical, in (await db.execute(
+        select(Judgment.canonical_citation).where(Judgment.canonical_citation.in_(key_list))
+    )).all():
         if canonical:
             known.add(str(canonical))
-    for citation_string, in (
-        await db.execute(select(Citation.citation_string).where(Citation.citation_string.in_(key_list)))
-    ).all():
+    for citation_string, in (await db.execute(
+        select(Citation.citation_string).where(Citation.citation_string.in_(key_list))
+    )).all():
         if citation_string:
             known.add(str(citation_string))
     if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
-        for extracted, in (
-            await db.execute(
-                select(ScraperStaging.extracted_citation).where(
-                    ScraperStaging.source_name == SOURCE_NAME,
-                    ScraperStaging.extracted_citation.in_(key_list),
-                    ScraperStaging.status.in_(["extracted", "promoted", "duplicate", "quarantined"]),
-                )
+        staged_citations = await db.execute(
+            select(
+                ScraperStaging.extracted_citation,
+                ScraperStaging.status,
+                ScraperStaging.quarantine_reason,
+                func.octet_length(ScraperStaging.raw_text),
+                func.substr(ScraperStaging.raw_text, 1, 3000),
+                ScraperStaging.route_json,
+            ).where(
+                ScraperStaging.source_name == SOURCE_NAME,
+                ScraperStaging.extracted_citation.in_(key_list),
+                ScraperStaging.status.in_(("extracted", "promoted", "duplicate", "quarantined")),
             )
-        ).all():
-            if extracted:
+        )
+        for extracted, status, reason, text_len, head, route in staged_citations.all():
+            if extracted and _staging_counts_as_known(status, reason, text_len, head, route):
                 known.add(str(extracted))
     return known
 
