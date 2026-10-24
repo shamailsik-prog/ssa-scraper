@@ -72,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     flag.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     flag.add_argument("--limit", type=int, default=None)
+    aliases = sub.add_parser(
+        "cleanup-false-citation-aliases",
+        help="Dry-run scan of non-primary aliases from body cites; --apply removes them (with backup)",
+    )
+    aliases.add_argument("--apply", action="store_true", help="Delete suspicious aliases and requalify blocked staging (default dry-run)")
+    aliases.add_argument("--undo", metavar="RUN_ID", help="Restore citations deleted by a prior --apply run_id")
+    aliases.add_argument("--csv", dest="csv_path", default=None, help="CSV output path")
     sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
     args = parser.parse_args(argv)
     if args.command == "reset-retired-frontier-no-reason":
@@ -115,6 +122,24 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.pls_backfill import run_strip_urdu_headnote_mojibake
 
         print(run_async(run_strip_urdu_headnote_mojibake(dry_run=not args.apply, limit=args.limit)))
+        return 0
+    if args.command == "cleanup-false-citation-aliases":
+        from pathlib import Path
+
+        from scraper.tasks.citation_alias_cleanup import run_citation_alias_cleanup
+
+        out = run_async(
+            run_citation_alias_cleanup(
+                apply=args.apply,
+                undo=args.undo,
+                csv_path=Path(args.csv_path) if args.csv_path else None,
+            )
+        )
+        if out.get("summary"):
+            print(out["summary"])
+        import json
+
+        print(json.dumps(out, indent=2, default=str))
         return 0
     if args.command == "backfill-flag-urdu-headnote-mojibake":
         from scraper.tasks.pls_backfill import run_backfill_flag_urdu_headnote_mojibake
