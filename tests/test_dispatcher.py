@@ -617,6 +617,76 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
     assert not any(item[0] == "scraper.tasks.dispatcher.run_login_session_job" for item in sent)
 
 
+async def test_dispatch_enqueues_grid_when_unsharded_yield_cap_reached(db, monkeypatch):
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+
+    from scraper.auth.session_manager import merge_source_config
+
+    now = datetime.now(timezone.utc)
+    target = await _prepare_pls_due(db, (1, 2))
+    await merge_source_config(
+        db,
+        target,
+        {
+            "grid_yield_since_shard_0": (now - timedelta(minutes=121)).isoformat(),
+            "grid_yield_since_shard_1": (now - timedelta(minutes=121)).isoformat(),
+        },
+    )
+    target.config_json = {
+        **dict(target.config_json or {}),
+        "citation_grid_cursor_shard_0": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 100,
+            "last_total_rows": 500,
+        },
+        "citation_grid_cursor_shard_1": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 50,
+            "last_total_rows": 500,
+        },
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=CLD|year=2020",
+            query_json={"reporter": "CLD", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLC|year=2020",
+            query_json={"reporter": "PLC", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+
+    async def _recent_promotion(_db):
+        return now
+
+    monkeypatch.setattr(dispatcher, "pls_last_judgment_at", _recent_promotion)
+    await set_harvest_mode(db, "updates", changed_by="qa", reason="yield cap")
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, args, kwargs or {}, queue)),
+    )
+    result = await dispatch_due_sources()
+    assert any(item[0] == "scraper.tasks.dispatcher.run_login_session_job" for item in sent)
+    assert "PakistanLawSite:search_harvest_tick" not in result["queued"]
+
+
 async def test_dispatch_stall_path_slot2_in_progress_only_still_enqueues_shard0(db, monkeypatch):
     """Stall-path unsharded yield needs both shares; slot-2-only in_progress work must not skip shard 0."""
     from scraper.harvest_mode import set_harvest_mode

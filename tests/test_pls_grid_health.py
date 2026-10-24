@@ -46,6 +46,25 @@ def test_grid_yield_cap_allows_saturated_lap():
     assert pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now) is None
 
 
+def test_unsharded_grid_yield_cap_when_either_shard_past_limit():
+    now = datetime.now(timezone.utc)
+    cfg = {
+        "grid_yield_since_shard_1": (now - timedelta(minutes=121)).isoformat(),
+        "citation_grid_cursor_shard_0": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 1,
+            "last_total_rows": 500,
+        },
+        "citation_grid_cursor_shard_1": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 1,
+            "last_total_rows": 500,
+        },
+    }
+    assert pls_grid_yield_cap_reached(cfg, None, now=now) is True
+    assert pls_yield_citation_grid_to_search_harvest(cfg, None, 30, now=now) is None
+
+
 @pytest.mark.asyncio
 async def test_pending_count_slot2_only_not_counted_for_slot1(db, monkeypatch):
     from scraper.config import settings

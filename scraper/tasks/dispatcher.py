@@ -36,6 +36,7 @@ from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
     pls_last_judgment_at,
+    pls_grid_yield_cap_reached,
     pls_note_search_harvest_grid_yield,
     pls_pending_search_harvest_count,
     pls_preempt_running_job_for_search_harvest,
@@ -662,7 +663,11 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                             queue_search_harvest_ticks(app)
                             queued.append(f"{s.source_name}:search_harvest_tick")
                             continue
-                        if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), shard, now=now):
+                        if (
+                            s.source_name == "PakistanLawSite"
+                            and dispatch_saturated(dict(s.config_json or {}), shard, now=now)
+                            and not pls_grid_yield_cap_reached(cfg, shard, now=now)
+                        ):
                             logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
                             skipped_saturated.append(f"{s.source_name}:shard{shard}")
                             this_source_saturated = True
@@ -683,7 +688,11 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                     # One slot left and a shard already runs on it.
                     continue
                 else:
-                    if s.source_name == "PakistanLawSite" and dispatch_saturated(dict(s.config_json or {}), None, now=now):
+                    if (
+                        s.source_name == "PakistanLawSite"
+                        and dispatch_saturated(dict(s.config_json or {}), None, now=now)
+                        and not pls_grid_yield_cap_reached(cfg, None, now=now)
+                    ):
                         logger.info("skip enqueue %s: the unsharded grid walk is saturated; recheck later", s.source_name)
                         skipped_saturated.append(s.source_name)
                         s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))

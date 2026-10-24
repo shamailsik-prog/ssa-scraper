@@ -247,13 +247,19 @@ def pls_grid_max_yield_minutes() -> int:
 def pls_grid_yield_cap_reached(
     cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None
 ) -> bool:
-    since = parse_iso(cfg.get(grid_yield_since_key(reporter_shard)))
-    if since is None:
-        return False
+    """Per-shard yield timers; unsharded checks treat the cap as reached when either shard is past the limit."""
     now = now or datetime.now(timezone.utc)
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-    return (now - since).total_seconds() >= pls_grid_max_yield_minutes() * 60
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    limit = pls_grid_max_yield_minutes() * 60
+    for shard in shards:
+        since = parse_iso(cfg.get(grid_yield_since_key(shard)))
+        if since is None:
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        if (now - since).total_seconds() >= limit:
+            return True
+    return False
 
 
 def pls_yield_citation_grid_to_search_harvest(
@@ -387,17 +393,19 @@ async def pls_clear_grid_yield_marker(
     from scraper.auth.session_manager import merge_source_config
 
     cfg = dict(source.config_json or {})
-    yield_key = grid_yield_since_key(reporter_shard)
-    if not cfg.get(yield_key):
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    patch: Dict[str, Any] = {}
+    for shard in shards:
+        yield_key = grid_yield_since_key(shard)
+        if cfg.get(yield_key):
+            patch[yield_key] = None
+    if not patch:
         return
     watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
     watch.pop("search_harvest_yield_reason", None)
     watch.pop("search_harvest_yield_at", None)
-    await merge_source_config(
-        db,
-        source,
-        {yield_key: None, PLS_STALL_WATCHDOG_KEY: watch},
-    )
+    patch[PLS_STALL_WATCHDOG_KEY] = watch
+    await merge_source_config(db, source, patch)
 
 
 def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any], *, stall_reason: Optional[str] = None) -> bool:
