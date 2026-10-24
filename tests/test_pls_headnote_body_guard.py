@@ -44,6 +44,20 @@ def _pad_fixture_to_full_ready(name: str) -> str:
     return text + "\n" + ("x" * (5200 - len(text)))
 
 
+def _pad_fixture_before_counsel_block(name: str, min_len: int = 5200) -> str:
+    """Pad inside the headnote block so counsel/hearing lines stay at the end."""
+    text = _read(name).rstrip()
+    if len(text) >= min_len:
+        return text
+    need = min_len - len(text)
+    filler = ("Headnote digest padding without judgment body.\n" * (need // 42 + 2))[:need]
+    split_at = "\nFor "
+    if split_at in text:
+        head, tail = text.split(split_at, 1)
+        return head + "\n" + filler + split_at + tail
+    return text + "\n" + filler
+
+
 def test_mutant_headnote_body_guard_default_off():
     assert Settings.model_fields["SSA_PLS_HEADNOTE_BODY_GUARD"].default is False
 
@@ -254,6 +268,102 @@ async def test_undo_headnote_scan_leaves_other_runs_alone(db, monkeypatch):
     ).scalars().first()
     assert left is not None
     assert left.run_id == run_b
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "pcrlj_1984_3208_shape.txt",
+        "pcrlj_1984_3229_shape.txt",
+        "clc_1993_169_shape.txt",
+        "pcrlj_2004_834_shape.txt",
+    ],
+)
+def test_auditor_missed_headnote_shapes_flagged_after_counsel_hearing_fix(fixture_name):
+    text = _pad_fixture_before_counsel_block(fixture_name)
+    signal = detect_headnote_only_no_body(text)
+    assert signal is not None
+    assert signal.signal == "no_body_after_hearing_or_counsel"
+
+
+def test_counsel_only_petitioners_and_state_without_hearing_line():
+    text = _pad_fixture_before_counsel_block("counsel_only_petitioners_and_state.txt")
+    signal = detect_headnote_only_no_body(text)
+    assert signal is not None
+    assert signal.signal == "no_body_after_hearing_or_counsel"
+
+
+def test_pls_disposal_tail_mba_hbt_not_flagged():
+    text = _pad_fixture_to_full_ready("disposal_mba_hbt_tail.txt")
+    assert detect_headnote_only_no_body(text) is None
+
+
+class _EmptyAsyncStream:
+    async def close(self) -> None:
+        return None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_find_headnote_only_promoted_uses_yield_per(db):
+    from scraper.tasks.judgment_headnote_body_scan import _SCAN_PAGE_SIZE, find_headnote_only_promoted
+
+    captured: dict = {}
+
+    async def capture_stream(stmt):
+        captured["yield_per"] = stmt.get_execution_options().get("yield_per")
+        return _EmptyAsyncStream()
+
+    db.stream = capture_stream  # type: ignore[method-assign]
+    await find_headnote_only_promoted(db, limit=0)
+    assert captured.get("yield_per") == _SCAN_PAGE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_undo_headnote_scan_second_run_id(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", True)
+    text = _long_headnote_over_5k()
+    jid1, jid2 = uuid4(), uuid4()
+    for jid, cite in ((jid1, "PLD 1991 Lahore 401"), (jid2, "PLD 1991 Lahore 402")):
+        db.add(
+            Judgment(
+                id=jid,
+                source_name="PakistanLawSite",
+                court_name="Lahore High Court",
+                canonical_citation=cite,
+                case_title="Dual run undo",
+                full_text=text,
+                full_text_hash=canonical_text_hash(text),
+                judge_names=["Abdul Qadeer Chaudhry"],
+                access_method="rendered_copy",
+            )
+        )
+    await db.commit()
+    fixes = [
+        {"id": str(jid1), "canonical_citation": "PLD 1991 Lahore 401", "reason": "headnote_only: test"},
+        {"id": str(jid2), "canonical_citation": "PLD 1991 Lahore 402", "reason": "headnote_only: test"},
+    ]
+    run_first = "run_first_undo"
+    run_second = "run_second_keep"
+    await apply_headnote_body_quarantine(db, run_first, fixes[:1])
+    await apply_headnote_body_quarantine(db, run_second, fixes[1:])
+    await db.commit()
+    removed = await undo_headnote_body_scan(db, run_first)
+    await db.commit()
+    assert removed == 1
+    assert (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == jid1))
+    ).scalars().first() is None
+    kept = (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == jid2))
+    ).scalars().first()
+    assert kept is not None
+    assert kept.run_id == run_second
 
 
 def test_headnote_body_guard_does_not_gate_case_description_modal_wait():

@@ -14,7 +14,7 @@ from scraper.parsers.bench_parser import normalise_judge_name
 # thin first-pass rows stay eligible for modal refetch.
 FULL_READY_JUDGMENT_CHARS = 5000
 HEADNOTE_BODY_MIN_TAIL_AFTER_HEARING_CHARS = 300
-HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER = 0
+HEADNOTE_BODY_MIN_CHARS_AFTER_JUDGMENT_MARKER = 80
 
 
 def judgment_is_full_ready(full_text: Optional[str], judge_names: Any, *, body_guard: Optional[bool] = None) -> bool:
@@ -103,14 +103,28 @@ _MODAL_CHROME_INLINE_PREFIX_RE = re.compile(
 _BODY_ORDER_MARKER_RE = re.compile(r"(?im)^\s*(?:JUDGMENT|JUDGEMENT|ORDER)\b")
 _HEARING_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?im)^[^\n]*\bdate\s*(?:\(\s*s\s*\)|s)?\s+of\s+hearing\s*:[^\n]*$"),
+    re.compile(r"(?im)^[^\n]*\bdate\s+of\s*[-–]?\s*hearing\s*;?[^\n]*$"),
+    re.compile(r"(?im)^[^\n]*\bdate\s+hearing\b[^\n]*$"),
     re.compile(r"(?im)^[^\n]*\bdates?\s+of\s+bearing\s*:[^\n]*$"),
     re.compile(r"(?im)^[^\n]*\bdate\s+of\s+institution\s*:[^\n]*$"),
 )
-_COUNSEL_FOR_PARTY_RE = re.compile(
-    r"(?i)^.{1,240}?\bfor\s+(?:the\s+)?(?:petitioner|respondent|appellant|plaintiff|defendant|accused|complainant)\s*[.,]?\s*$"
-)
 _COUNSEL_LINE_MAX_CHARS = 240
-_PLS_DISPOSAL_IN_TAIL_RE = re.compile(r"(?i)\b[A-Z]{1,6}/A-\d+/L\s+\S+")
+_COUNSEL_PARTY_ROLES_RE = (
+    r"petitioners?|respondents?|appellants?|plaintiffs?|defendants?|accused|complainants?|applicants?|state"
+)
+_COUNSEL_FOR_PARTY_RE = re.compile(
+    rf"(?i)^\bfor\s+(?:the\s+)?(?:{_COUNSEL_PARTY_ROLES_RE})\b"
+    rf"(?:\s+no\.?\s*\d+|\s*\(in\s+[^\)]{{1,120}}\))?"
+    rf"(?:\s*:\s*[^\n]*)?"
+    r"\s*$"
+)
+_PLS_DISPOSAL_IN_TAIL_RE = re.compile(
+    r"(?i)\b(?:"
+    r"[A-Z](?:\.[A-Z]){1,5}\.?/(?:A-\d+|\d+)/[A-Z]"
+    r"|"
+    r"[A-Z]{1,6}/A-\d+/L\s+\S+"
+    r")\b"
+)
 
 _JUDGMENT_CONTENT_ANCHORS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?im)^\s*(?:before|coram)\b"),
@@ -383,8 +397,8 @@ def detect_headnote_only_no_body(raw_text: Optional[str]) -> Optional[JudgmentGu
         return None
     marker = _BODY_ORDER_MARKER_RE.search(blob)
     if marker is not None:
-        after = blob[marker.end() :].strip()
-        if len(after) >= HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER:
+        after_len = len(blob[marker.end() :].strip())
+        if after_len >= HEADNOTE_BODY_MIN_CHARS_AFTER_JUDGMENT_MARKER:
             return None
     tail = _tail_after_hearing_or_counsel_block(blob)
     if tail is not None and tail < HEADNOTE_BODY_MIN_TAIL_AFTER_HEARING_CHARS:
@@ -393,12 +407,14 @@ def detect_headnote_only_no_body(raw_text: Optional[str]) -> Optional[JudgmentGu
             signal="no_body_after_hearing_or_counsel",
             matched_value=blob[-400:],
         )
-    if marker is not None and len(blob[marker.end() :].strip()) < HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER:
-        return JudgmentGuardSignal(
-            reason_code="headnote_only",
-            signal="no_body_after_judgment_marker",
-            matched_value=blob[marker.start() : marker.start() + 500],
-        )
+    if marker is not None:
+        after_len = len(blob[marker.end() :].strip())
+        if after_len < HEADNOTE_BODY_MIN_CHARS_AFTER_JUDGMENT_MARKER:
+            return JudgmentGuardSignal(
+                reason_code="headnote_only",
+                signal="no_body_after_judgment_marker",
+                matched_value=blob[marker.start() : marker.start() + 500],
+            )
     return None
 
 
