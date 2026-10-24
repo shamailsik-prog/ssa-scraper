@@ -20,6 +20,8 @@ from scraper.auth.session_manager import (
     LoginRequired,
     SessionLock,
     SessionLockHeld,
+    is_playwright_harvest_browser_fatal,
+    is_playwright_harvest_target_closed,
     release_page_result,
 )
 from scraper.config import settings
@@ -914,6 +916,39 @@ async def run_search_harvest(
         )
 
 
+async def _release_harvest_query_to_pending(
+    db: AsyncSession,
+    query_row: Optional[PlsSearchHarvestQuery],
+    chosen: int,
+    exc: BaseException,
+    *,
+    browser_fatal: bool,
+) -> Dict[str, Any]:
+    """Put the ledger row back to pending; cursor and row counters stay as-is for the next tick."""
+    if query_row is not None:
+        query_row.status = "pending"
+        query_row.last_error = str(exc)[:1000]
+        await db.commit()
+    out: Dict[str, Any] = {
+        "paused": True,
+        "slot": chosen,
+        "reason": str(exc),
+        "query_key": query_row.query_key if query_row else None,
+    }
+    if browser_fatal:
+        out["browser_fatal"] = True
+    return out
+
+
+async def _release_harvest_query_after_browser_fatal(
+    db: AsyncSession,
+    query_row: Optional[PlsSearchHarvestQuery],
+    chosen: int,
+    exc: BaseException,
+) -> Dict[str, Any]:
+    return await _release_harvest_query_to_pending(db, query_row, chosen, exc, browser_fatal=True)
+
+
 async def _run_search_harvest_locked(
     db: AsyncSession,
     *,
@@ -1003,6 +1038,12 @@ async def _run_search_harvest_locked(
             query_row.last_error = str(exc)[:1000]
         await db.commit()
         return {"paused": True, "slot": chosen, "reason": str(exc), "query_key": query_row.query_key if query_row else None}
+    except Exception as exc:
+        if is_playwright_harvest_browser_fatal(exc):
+            return await _release_harvest_query_after_browser_fatal(db, query_row, chosen, exc)
+        if is_playwright_harvest_target_closed(exc):
+            return await _release_harvest_query_to_pending(db, query_row, chosen, exc, browser_fatal=False)
+        raise
     finally:
         if runner is not None:
             try:

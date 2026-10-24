@@ -58,7 +58,9 @@ def test_stalled_false_when_recent():
 
 def test_stalled_reason_saturated_and_paused():
     old = NOW - timedelta(hours=40)
-    assert compute_stalled(last_promotion_at=old, now=NOW, threshold_hours=6, saturation={"all_saturated": True})["stalled_reason"] == "grid_saturated"
+    saturated = compute_stalled(last_promotion_at=old, now=NOW, threshold_hours=6, saturation={"all_saturated": True})
+    assert saturated["stalled"] is False
+    assert saturated["stalled_reason"] == "grid_saturated"
     assert compute_stalled(last_promotion_at=old, now=NOW, threshold_hours=6, harvest_paused=True)["stalled_reason"] == "harvest_paused"
 
 

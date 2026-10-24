@@ -20,11 +20,26 @@ from scraper.tasks.promotion_health import NOTIFICATION_CODE, evaluate_promotion
 from scraper.tasks.treatment import classify_treatment_task
 
 
+def test_promote_staging_records_routes_to_promote_queue_by_default():
+    assert promote_task_queue() == PROMOTE_QUEUE
+
+
 def test_promote_staging_records_routes_to_promote_queue_when_enabled(monkeypatch):
     monkeypatch.setattr(settings, "SSA_PROMOTE_DEDICATED_QUEUE_ENABLED", True)
     from scraper.celery_queues import promote_task_queue as pq
 
     assert pq() == PROMOTE_QUEUE
+
+
+def test_docker_compose_sets_promote_dedicated_queue():
+    from pathlib import Path
+
+    text = Path("docker-compose.yml").read_text(encoding="utf-8")
+    assert "SSA_PROMOTE_DEDICATED_QUEUE_ENABLED" in text
+
+
+def test_promotion_stale_alert_routes_to_promote_queue():
+    assert app.conf.task_routes["scraper.tasks.promotion_health.promotion_stale_alert"]["queue"] == PROMOTE_QUEUE
 
 
 def test_render_blueprint_splits_promote_worker():
