@@ -269,3 +269,69 @@ def test_capture_modal_script_waits_for_body_marker_when_flag_on():
     assert "stableReads >= 4" in source
     assert "for (let i = 0; i < maxPolls; i += 1)" in source
     assert "maxPolls = waitForBody ? 80 : 80" in source
+
+
+@pytest.mark.asyncio
+async def test_scan_apply_revalidates_corrected_judgment_and_source(db):
+    """A stale scan must not hide a judgment completed after scan."""
+    jid = uuid4()
+    text = _long_headnote_over_5k()
+    db.add(Judgment(
+        id=jid, source_name="PakistanLawSite", court_name="Lahore High Court",
+        canonical_citation="PLD 1992 Lahore 201", case_title="Stale scan",
+        full_text=text, full_text_hash=canonical_text_hash(text),
+        judge_names=["Abdul Qadeer Chaudhry"], access_method="rendered_copy",
+    ))
+    await db.commit()
+    report = await find_headnote_only_promoted(db)
+    stale = next(row for row in report["fixes"] if row["id"] == str(jid))
+    judgment = await db.get(Judgment, jid)
+    completed = text + "\nJUDGMENT\n" + ("This is the complete court judgment text. " * 20)
+    judgment.full_text = completed
+    judgment.full_text_hash = canonical_text_hash(completed)
+    await db.commit()
+    assert await apply_headnote_body_quarantine(db, "stale_scan_regression", [stale]) == 0
+    assert (await db.execute(select(DocumentQuarantine).where(
+        DocumentQuarantine.doc_id == jid))).scalars().first() is None
+    judgment.source_name = "AnotherSource"
+    judgment.full_text = text
+    judgment.full_text_hash = canonical_text_hash(text)
+    await db.commit()
+    assert await apply_headnote_body_quarantine(db, "wrong_source_regression", [stale]) == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_undo_preserves_other_reasons_in_same_run(db):
+    """Undo must not remove a human-reviewed or conflicting judgment."""
+    run_id = "shared_reason_scope"
+    headnote_id, reviewed_id = uuid4(), uuid4()
+    db.add(DocumentQuarantine(
+        doc_type="judgment", doc_id=headnote_id, run_id=run_id,
+        reason="headnote_only: no_body_after_hearing_or_counsel",
+    ))
+    db.add(DocumentQuarantine(
+        doc_type="judgment", doc_id=reviewed_id, run_id=run_id,
+        reason="citation conflict: human review",
+    ))
+    await db.commit()
+    assert await undo_headnote_body_scan(db, run_id) == 1
+    await db.commit()
+    remaining = (await db.execute(select(DocumentQuarantine).where(
+        DocumentQuarantine.run_id == run_id))).scalars().all()
+    assert len(remaining) == 1
+    assert remaining[0].doc_id == reviewed_id
+
+
+@pytest.mark.asyncio
+async def test_scan_undo_is_independent_of_redis(db, monkeypatch):
+    """No Redis metadata should be required after TTL expiry or restart."""
+    from scraper.tasks import judgment_headnote_body_scan as scan
+    assert not hasattr(scan, "_record_run")
+    run_id = "durable_without_redis"
+    jid = uuid4()
+    db.add(DocumentQuarantine(
+        doc_type="judgment", doc_id=jid, run_id=run_id,
+        reason="headnote_only: no_body_after_hearing_or_counsel",
+    ))
+    await db.commit()
+    assert await undo_headnote_body_scan(db, run_id) == 1
