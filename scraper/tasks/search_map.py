@@ -21,6 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.extractors.deterministic import _has_archived_patient_grid, introspect_search_form
+from scraper.search_form_roles import enrich_fields_with_harvest_aliases
+from scraper.search_form_harvest_vocabulary import capture_harvest_split_vocabulary
 from scraper.extractors.scrapegraph_base import ExtractionInput
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.models import ScraperSource, SearchFormMap
@@ -81,7 +83,12 @@ def build_map_record(proposal: Dict[str, Any], html: str, mapped_by: str) -> Dic
         if role and role not in fields:
             fields[role] = {"name": f["name"], "selector": f["selector"], "kind": f["kind"], "options": f.get("options") or [], "option_labels": f.get("option_labels") or []}
         fields.setdefault("_all", []).append({"name": f["name"], "selector": f["selector"], "kind": f["kind"], "role": role})
+    alias_map = enrich_fields_with_harvest_aliases(fields)
     reporter_opts = (fields.get("reporter") or {}).get("options") or []
+    limits_extra: Dict[str, Any] = {}
+    if alias_map:
+        limits_extra["harvest_role_aliases"] = alias_map
+    limits_extra["harvest_split_vocabulary"] = capture_harvest_split_vocabulary(html, fields)
     return {
         "fields": fields,
         "result_layout": {"row_selector": proposal.get("result_row_selector") or "table tr", "columns": proposal.get("result_columns") or {}, "detail_link_selector": proposal.get("detail_link_selector") or "a[href]"},
@@ -92,6 +99,7 @@ def build_map_record(proposal: Dict[str, Any], html: str, mapped_by: str) -> Dic
             "reporters_offered": reporter_opts[:100],
             "max_results_per_page": proposal.get("page_size"),
             "surface": proposal.get("surface") or "no_query_form",
+            **limits_extra,
         },
         "dom_hash": dom_hash(html),
         "mapped_by": mapped_by,

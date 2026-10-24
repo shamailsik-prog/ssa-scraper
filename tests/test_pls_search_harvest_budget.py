@@ -60,6 +60,9 @@ def _runner(db, monkeypatch, clock):
 
     runner = harvest.SearchHarvestRunner.__new__(harvest.SearchHarvestRunner)
     runner.db, runner.source, runner.dry_run = db, None, False
+    runner.probe_mode = False
+    runner._probe_rows = []
+    runner._probe_form_values = {}
     runner.pipeline = FakePipeline(clock)
     runner.memory = SimpleNamespace(note_window=lambda: None)
     runner.pacing_profile = {"login_delay_min": 1, "login_delay_max": 1}
@@ -106,7 +109,7 @@ async def test_tick_stopped_mid_page_resumes_at_the_next_row_without_double_coun
     first = await runner.run_query(q, {})
     assert first["out_of_time"] is True
     assert runner.pipeline.fetched_details == ["https://example.test/case/1", "https://example.test/case/2"]
-    assert q.cursor_json["row_index"] == 2 and q.pages_enumerated == 0 and q.rows_seen == 0
+    assert q.cursor_json["row_index"] == 2 and q.pages_enumerated == 0 and q.rows_seen == 2
 
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
     runner = _runner(db, monkeypatch, clock)

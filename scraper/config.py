@@ -384,7 +384,47 @@ class Settings(BaseSettings):
     PLS_CASEID_WALK_RECHECK_HOURS: float = Field(default=12.0, description="After a failed calibration on held judgments, wait this long before trying again.")
     PLS_SEARCH_RESULT_CAP: int = Field(
         default=500,
-        description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",
+        description="Legacy CitationSearch result cap for split/done heuristics when PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP is off.",
+    )
+    PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP: bool = Field(
+        default=False,
+        description="When true, use PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP (~400) instead of PLS_SEARCH_RESULT_CAP for harvest split/done logic.",
+    )
+    PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP: int = Field(
+        default=400,
+        description="Observed PakistanLawSite CitationSearch page cap when USE_OBSERVED_400_CAP is enabled.",
+    )
+    PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS: bool = Field(
+        default=False,
+        description="When true, map harvest keyword splits onto the dashboard party text box via harvest_role_aliases.",
+    )
+    PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK: bool = Field(
+        default=False,
+        description="Deprecated: splits use harvest_split_vocabulary on the search map only. When true, allow PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS only if also set PLS_SEARCH_HARVEST_ALLOW_GUESSED_COURT_TOKENS.",
+    )
+    PLS_SEARCH_HARVEST_ALLOW_GUESSED_COURT_TOKENS: bool = Field(
+        default=False,
+        description="When true with COURT_SPLIT_FALLBACK, use PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS if the live map has no court vocabulary.",
+    )
+    PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS: bool = Field(
+        default=False,
+        description="When true, oversized queries may fall back to a–z keyword splits; default uses dashboard harvest_split_vocabulary only.",
+    )
+    PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS: int = Field(
+        default=380,
+        description="When site_total is blank, treat a journal-year query with at least this many rows_seen and no next page as truncated for auto-split (0 = use PLS_SEARCH_RESULT_CAP only).",
+    )
+    PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR: bool = Field(
+        default=False,
+        description="When true, auto-split reporter×year queries that end on one page at the truncation row count even when site_total is null.",
+    )
+    PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS: str = Field(
+        default="SC,HC,LHC,SHC,PHC,BHC,FSC,FST",
+        description="Court tokens used when splitting oversized queries if the search map court field has no dropdown options.",
+    )
+    PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE: bool = Field(
+        default=False,
+        description="When true, re-queue done harvest rows that stopped after one page while rows_seen < site_total_results. Never reopens when site_total is null/blank.",
     )
     PLS_SEARCH_HARVEST_TICK_SECONDS: int = Field(
         default=1200,

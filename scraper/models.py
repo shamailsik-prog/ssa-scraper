@@ -905,7 +905,7 @@ class PlsSearchHarvestQuery(Base):
         nullable=False,
         default="pending",
         server_default=text("'pending'"),
-        comment="pending|in_progress|done|split|skipped|failed",
+        comment="pending|in_progress|done|split|split_ineffective|needs_resplit|skipped|failed",
     )
     priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
     site_total_results: Mapped[Optional[int]] = mapped_column(Integer)

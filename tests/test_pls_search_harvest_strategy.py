@@ -7,9 +7,13 @@ from scraper.pls_search_harvest_core import (
     SPLIT_ORDER,
     cited_citations_in_text,
     is_capped,
+    is_journal_year_query,
     iter_extended_plan_queries,
     make_query_key,
     page_continuity_gaps,
+    harvest_result_cap,
+    should_auto_split_journal_year,
+    split_children_union_incomplete,
     split_oversized_query,
     unmapped_harvest_reason,
 )
@@ -17,7 +21,10 @@ from scraper.pls_search_harvest_core import (
 ROLES = {"reporter", "year", "month", "court", "bench", "party_initial", "keyword"}
 
 
-def test_split_order_month_then_court_then_bench_then_party_then_keyword():
+def test_split_order_month_then_court_then_bench_then_party_then_keyword(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS", True)
     q = {"reporter": "PLD", "year": 2020}
     kw = dict(result_cap=500, court_options=["SC", "LHC"], available_roles=ROLES, bench_options=["single", "division"])
     step1 = split_oversized_query(q, 500, **kw)
@@ -68,6 +75,48 @@ def test_unmapped_reason_for_new_roles():
     assert "month" in (unmapped_harvest_reason(smap, {"reporter": "PLD", "year": 2020, "month": 3}, {}) or "")
     assert unmapped_harvest_reason(smap, {"judge": "X", "year": 2020}, {}) is None
     assert SPLIT_ORDER == ("month", "court", "bench", "party_initial", "keyword")
+
+
+def test_journal_year_auto_split_flag(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR", True)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS", 380)
+    q = {"reporter": "YLR", "year": 2024}
+    assert is_journal_year_query(q)
+    assert should_auto_split_journal_year(
+        q, rows_seen=400, site_total=None, result_cap=400, has_next_page=False
+    )
+    assert not should_auto_split_journal_year(
+        q, rows_seen=100, site_total=None, result_cap=400, has_next_page=False
+    )
+    assert not should_auto_split_journal_year(
+        {**q, "court": "SC"}, rows_seen=400, site_total=None, result_cap=400, has_next_page=False
+    )
+    assert not should_auto_split_journal_year(
+        q, rows_seen=390, site_total=390, result_cap=400, has_next_page=False
+    )
+    assert should_auto_split_journal_year(
+        q, rows_seen=380, site_total=385, result_cap=400, has_next_page=False
+    )
+
+
+def test_split_children_union_incomplete_after_children():
+    parent_keys = {f"k{i}" for i in range(400)}
+    child_a = {f"k{i}" for i in range(200)}
+    child_b = {f"k{i}" for i in range(200, 350)}
+    assert split_children_union_incomplete(400, [child_a, child_b])
+    assert not split_children_union_incomplete(400, [parent_keys, child_a])
+
+
+def test_harvest_result_cap_defaults_to_legacy_500(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_RESULT_CAP", 500)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", False)
+    assert harvest_result_cap() == 500
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", True)
+    assert harvest_result_cap() == 400
 
 
 def test_year_only_seed_submits_the_year():

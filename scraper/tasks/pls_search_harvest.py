@@ -10,6 +10,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
@@ -56,6 +57,10 @@ from scraper.pls_search_harvest_core import (
     is_capped,
     iter_extended_plan_queries,
     page_continuity_gaps,
+    harvest_result_cap,
+    harvest_result_fingerprint_from_keys,
+    should_auto_split_journal_year,
+    split_children_union_incomplete,
     split_oversized_query,
     unmapped_harvest_reason,
     years_for_plan,
@@ -117,10 +122,9 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
 
 
 def _court_options_from_map(search_map: Dict[str, Any]) -> List[str]:
-    fields = search_map.get("fields") or {}
-    court = fields.get("court") or {}
-    opts = [str(o).strip() for o in (court.get("options") or []) if str(o).strip()]
-    return opts
+    from scraper.search_form_harvest_vocabulary import court_split_values
+
+    return court_split_values(search_map)
 
 
 def _reporter_options_from_map(search_map: Dict[str, Any]) -> List[str]:
@@ -201,7 +205,7 @@ async def seed_extended_plan(
     m = await active_map(db, SOURCE_NAME)
     if m is not None:
         smap = map_as_dict(m)
-    courts = _court_options_from_map(smap) or [c for (c,) in (await db.execute(select(Court.name).where(Court.is_active.is_(True)))).all()]
+    courts = _court_options_from_map(smap)
     judges = [n for (n,) in (await db.execute(select(Judge.name).limit(judge_limit))).all() if n]
     statutes = []
     for st_id, st_name in (await db.execute(select(Statute.id, Statute.name).limit(statute_limit))).all():
@@ -260,7 +264,7 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     from scraper.models import Citation, Judgment
 
     status_counts = {st: int(n) for st, n in (await db.execute(select(PlsSearchHarvestQuery.status, func.count()).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME).group_by(PlsSearchHarvestQuery.status))).all()}
-    cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+    cap = harvest_result_cap()
     capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
     exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
     totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
@@ -289,12 +293,19 @@ async def reopen_premature_done_queries(
     *,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Re-queue search harvest jobs marked done after only page 1 with no parsed site total."""
-    reopen_reason = "reopened: marked done without known site total and at most one page enumerated"
+    """Re-queue jobs marked done too early when a known site total was not fully enumerated.
+
+    Never acts on null/blank site_total_results (PLS no longer prints totals on every row).
+    """
+    if not getattr(settings, "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE", False):
+        return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE is off", "would_reopen": 0}
+    reopen_reason = "reopened: marked done after one page while rows_seen < site_total_results"
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status == "done",
-        PlsSearchHarvestQuery.site_total_results.is_(None),
+        PlsSearchHarvestQuery.site_total_results.isnot(None),
+        PlsSearchHarvestQuery.site_total_results > 0,
+        PlsSearchHarvestQuery.rows_seen < PlsSearchHarvestQuery.site_total_results,
         func.coalesce(PlsSearchHarvestQuery.pages_enumerated, 0) <= 1,
     )
     rows = (await db.execute(stmt)).scalars().all()
@@ -509,11 +520,15 @@ class SearchHarvestRunner:
         redis_client=None,
         job_id=None,
         dry_run: bool = False,
+        probe_mode: bool = False,
     ):
         self.db = db
         self.source = source
         self.pipeline = PakistanLawSitePipeline(db, source, redis_client=redis_client, job_id=job_id)
-        self.dry_run = dry_run
+        self.dry_run = dry_run or probe_mode
+        self.probe_mode = probe_mode
+        self._probe_rows: List[Dict[str, Any]] = []
+        self._probe_form_values: Dict[str, str] = {}
         self.memory = PlsBrowserMemoryState()
         self.harvest_mode = "updates"
         self.pacing_profile = login_pacing_profile("updates")
@@ -556,6 +571,124 @@ class SearchHarvestRunner:
         except Exception as exc:  # a spot check never ends the harvest
             logger.warning("PLS search harvest: spot check between pages failed: %s", exc)
 
+    async def _stop_pending_split_children(self, parent_id: Any, reason: str) -> int:
+        rows = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent_id,
+                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                )
+            )
+        ).scalars().all()
+        n = 0
+        for row in rows:
+            row.status = "split_ineffective"
+            row.last_error = reason[:1000]
+            n += 1
+        return n
+
+    async def _halt_ineffective_split_parent(
+        self,
+        parent: PlsSearchHarvestQuery,
+        reason: str,
+    ) -> None:
+        parent.status = "needs_resplit"
+        parent.last_error = (
+            f"{reason[:900]}; parent rows_seen={int(parent.rows_seen or 0)}"
+        )[:1000]
+        parent.split_reason = (parent.split_reason or "")[:400]
+
+    async def _maybe_abort_ineffective_split_child(
+        self,
+        query_row: PlsSearchHarvestQuery,
+        fingerprint: str,
+        rows_seen: int,
+        seen_keys: Set[str],
+    ) -> bool:
+        """When every finished split child (at least three) repeats the parent's row-set, stop the wave."""
+        if not fingerprint or not query_row.parent_id:
+            return False
+        parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
+        if parent is None:
+            return False
+        parent_fp = (parent.cursor_json or {}).get("split_source_fingerprint")
+        cj = dict(query_row.cursor_json or {})
+        cj["result_fingerprint"] = fingerprint
+        if seen_keys:
+            cj["result_keys"] = sorted(seen_keys)
+        query_row.cursor_json = cj
+
+        if not parent_fp or fingerprint != parent_fp:
+            return False
+
+        siblings = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent.id,
+                )
+            )
+        ).scalars().all()
+        terminal = ("done", "split_ineffective", "failed", "skipped")
+        matching_parent: List[PlsSearchHarvestQuery] = []
+        for s in siblings:
+            if s.id != query_row.id and s.status not in terminal:
+                continue
+            s_fp = fingerprint if s.id == query_row.id else (s.cursor_json or {}).get("result_fingerprint")
+            if (
+                s_fp == parent_fp
+                and int(s.rows_seen if s.id != query_row.id else rows_seen or 0) >= int(parent.rows_seen or 0)
+            ):
+                matching_parent.append(s)
+        if len(matching_parent) < 3:
+            return False
+
+        reason = (
+            f"split ineffective: {len(matching_parent)} children each returned the same "
+            f"{int(parent.rows_seen or 0)} rows as parent (split dimension not narrowing results)"
+        )
+        query_row.status = "split_ineffective"
+        query_row.last_error = reason[:1000]
+        await self._stop_pending_split_children(parent.id, reason)
+        await self._halt_ineffective_split_parent(parent, reason)
+        await self.db.flush()
+        return True
+
+    async def _maybe_finalize_split_parent(self, parent_id: Any) -> None:
+        parent = await self.db.get(PlsSearchHarvestQuery, parent_id)
+        if parent is None or parent.status != "split":
+            return
+        children = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent_id,
+                )
+            )
+        ).scalars().all()
+        if not children:
+            return
+        open_status = ("pending", "in_progress")
+        if any(c.status in open_status for c in children):
+            return
+        expected = int((parent.cursor_json or {}).get("split_expected_rows_seen") or parent.rows_seen or 0)
+        key_sets: List[Set[str]] = []
+        for child in children:
+            if child.status not in ("done", "split_ineffective", "failed", "skipped"):
+                continue
+            raw = (child.cursor_json or {}).get("result_keys") or []
+            if raw:
+                key_sets.append(set(str(k) for k in raw))
+        if not key_sets:
+            return
+        if split_children_union_incomplete(expected, key_sets):
+            parent.status = "needs_resplit"
+            union_n = len(set().union(*key_sets))
+            parent.last_error = (
+                f"split children union {union_n} rows < parent rows_seen={expected}; incomplete coverage"
+            )[:1000]
+
     async def run_query(
         self,
         query_row: PlsSearchHarvestQuery,
@@ -569,10 +702,12 @@ class SearchHarvestRunner:
             cursor = {"page": 1, "row_index": 0}
         reason = unmapped_harvest_reason(search_map, query_json, cursor)
         if reason:
-            query_row.status = "failed"
-            query_row.last_error = reason[:1000]
-            return {"status": "failed", "reason": reason}
-        cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+            if not self.probe_mode:
+                query_row.status = "failed"
+                query_row.last_error = reason[:1000]
+            return {"status": "failed", "reason": reason, "form_values": build_harvest_form_values(search_map, query_json, cursor)}
+        self._probe_form_values = build_harvest_form_values(search_map, query_json, cursor)
+        cap = harvest_result_cap()
         pages_done = int(query_row.pages_enumerated or 0)
         page_limit = max_pages if max_pages > 0 else int(getattr(settings, "PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY", 0) or 0)
         rows_seen = int(query_row.rows_seen or 0)
@@ -632,14 +767,23 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
+            if self.probe_mode:
+                for row in fresh_rows:
+                    keys = citation_keys_for_row(row)
+                    self._probe_rows.append(
+                        {
+                            "citation": row.get("citation"),
+                            "detail_url": row.get("detail_url") or row.get("pdf_url"),
+                            "case_name": case_name_from_url(row.get("detail_url") or row.get("pdf_url")),
+                            "known": bool(keys and keys & known_set),
+                        }
+                    )
             if rereading:
                 rows_counted, known_counted = 0, 0
-            else:
+            elif self.dry_run:
                 rows_counted, known_counted = len(fresh_rows), known_on_page
-            rows_seen += rows_counted
-            rows_known += known_counted
-
-            if not self.dry_run:
+            else:
+                rows_counted, known_counted = 0, 0
                 route_base = {
                     "harvest": "search_gap",
                     "query_key": query_row.query_key,
@@ -648,13 +792,15 @@ class SearchHarvestRunner:
                 for idx, row in enumerate(rows):
                     if idx < start_row_index:
                         continue
-                    detail_url = row.get("detail_url") or row.get("pdf_url")
-                    if not detail_url:
+                    if id(row) not in fresh_ids:
                         continue
+                    rows_counted += 1
                     keys = citation_keys_for_row(row)
                     if keys & known_set:
+                        known_counted += 1
                         continue
-                    if id(row) not in fresh_ids:
+                    detail_url = row.get("detail_url") or row.get("pdf_url")
+                    if not detail_url:
                         continue
                     detail = await self.pipeline.fetch_detail(detail_url)
                     result = await self.pipeline.preserve_and_extract(
@@ -669,30 +815,33 @@ class SearchHarvestRunner:
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change
                     # after the first flush, so the stored row_index stayed at 1-9 while ticks reached row 67+. Commit
                     # per row so a killed or redeployed tick keeps its place and its staged rows.
-                    query_row.cursor_json = dict(cursor)
-                    query_row.rows_new = rows_new
-                    await self.db.commit()
+                    if not self.probe_mode:
+                        query_row.cursor_json = dict(cursor)
+                        query_row.rows_new = rows_new
+                        query_row.rows_seen = rows_seen + rows_counted
+                        query_row.rows_known = rows_known + known_counted
+                        await self.db.commit()
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
                     if deadline is not None and time.monotonic() >= deadline and idx + 1 < len(rows):
                         out_of_time = True
                         break
-            else:
+            rows_seen += rows_counted
+            rows_known += known_counted
+            if self.dry_run and not rereading:
                 rows_new += len(new_rows)
 
             if out_of_time:
-                # Stop mid-page and give the login worker back; the cursor (this page, next row) resumes the
-                # query on the next tick, which counts this page's rows again, so they are not counted now.
-                rows_seen -= rows_counted
-                rows_known -= known_counted
+                # Mid-page stop: rows_seen already reflects each opened or known-skipped row on this page.
                 release_page_result(page)
-                query_row.rows_seen = rows_seen
-                query_row.rows_known = rows_known
-                query_row.rows_new = rows_new
-                query_row.site_total_results = site_total
-                query_row.last_run_at = datetime.now(timezone.utc)
-                query_row.status = "in_progress"
-                await self.db.flush()
+                if not self.probe_mode:
+                    query_row.rows_seen = rows_seen
+                    query_row.rows_known = rows_known
+                    query_row.rows_new = rows_new
+                    query_row.site_total_results = site_total
+                    query_row.last_run_at = datetime.now(timezone.utc)
+                    query_row.status = "in_progress"
+                    await self.db.flush()
                 break
 
             confirmed_last = rereading and not outcome.data.get("next_page")
@@ -711,91 +860,136 @@ class SearchHarvestRunner:
                 pass
 
             gap = compute_gap_size(site_total, rows_known, rows_seen)
-            query_row.site_total_results = site_total
-            query_row.pages_enumerated = pages_done
-            query_row.rows_seen = rows_seen
-            query_row.rows_known = rows_known
-            query_row.rows_new = rows_new
-            query_row.gap_size = gap
-            if site_total is not None:
-                # Only a known site total measures the gap. With the total unknown the gap reads 0, and 1000 - 0
-                # sent the row to the back of the ledger, behind every row that had one (13 October 2026); it keeps
-                # its planned priority instead.
-                query_row.priority = max(1, 1000 - gap)
-            query_row.last_run_at = datetime.now(timezone.utc)
-            await self.db.flush()
+            if not self.probe_mode:
+                query_row.site_total_results = site_total
+                query_row.pages_enumerated = pages_done
+                query_row.rows_seen = rows_seen
+                query_row.rows_known = rows_known
+                query_row.rows_new = rows_new
+                query_row.gap_size = gap
+                if site_total is not None:
+                    query_row.priority = max(1, 1000 - gap)
+                query_row.last_run_at = datetime.now(timezone.utc)
+                await self.db.flush()
 
             if page_limit and pages_done >= page_limit:
-                cursor["page"] = page_idx
-                query_row.cursor_json = dict(cursor)
-                query_row.status = "in_progress"
+                if not self.probe_mode:
+                    cursor["page"] = page_idx
+                    query_row.cursor_json = dict(cursor)
+                    query_row.status = "in_progress"
                 break
             if not nxt:
-                if is_capped(site_total, rows_seen, cap):
+                truncated = is_capped(site_total, rows_seen, cap) or should_auto_split_journal_year(
+                    query_json,
+                    rows_seen=rows_seen,
+                    site_total=site_total,
+                    result_cap=cap,
+                    has_next_page=False,
+                )
+                if truncated:
                     # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
                     # loudly when nothing narrower can be expressed.
-                    children = split_oversized_query(
+                    children = self._split_children_for_truncation(
+                        search_map,
                         query_json,
-                        int(site_total if site_total is not None else rows_seen),
-                        result_cap=cap,
-                        court_options=_court_options_from_map(search_map),
-                        available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword"},
-                        bench_options=[str(o) for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []],
+                        site_total=site_total,
+                        rows_seen=rows_seen,
+                        cap=cap,
                     )
-                    if children:
+                    if children and not self.probe_mode:
+                        cj = dict(query_row.cursor_json or {})
+                        cj["split_source_fingerprint"] = harvest_result_fingerprint_from_keys(seen_keys)
+                        cj["split_expected_rows_seen"] = rows_seen
+                        query_row.cursor_json = cj
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
-                        query_row.split_reason = f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
+                        query_row.split_reason = (
+                            f"site_total={site_total} rows_seen={rows_seen} reached cap={cap}"
+                            if is_capped(site_total, rows_seen, cap)
+                            else f"journal_year_truncation rows_seen={rows_seen} cap={cap} site_total={site_total}"
+                        )
                         break
-                    query_row.status = "failed"
-                    query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                    if not self.probe_mode and not children:
+                        query_row.status = "failed"
+                        query_row.last_error = (
+                            f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                        )
                     break
                 may_done, incomplete_reason = search_harvest_may_mark_done(
                     site_total=site_total,
                     rows_seen=rows_seen,
                     rows_on_page=len(rows),
                 )
-                if not may_done and confirmed_last and site_total is None:
+                if (
+                    not may_done
+                    and confirmed_last
+                    and site_total is None
+                    and not should_auto_split_journal_year(
+                        query_json,
+                        rows_seen=rows_seen,
+                        site_total=site_total,
+                        result_cap=cap,
+                        has_next_page=False,
+                    )
+                ):
                     may_done = True
-                if may_done:
-                    query_row.status = "done"
-                    query_row.last_error = None if confirmed_last else query_row.last_error
-                    query_row.cursor_json = {"page": 1, "row_index": 0}
-                else:
-                    query_row.status = "in_progress"
-                    query_row.last_error = incomplete_reason[:1000]
-                    if site_total is not None and rows_seen < int(site_total):
-                        cursor = {"page": page_idx + 1, "row_index": 0}
+                if not self.probe_mode:
+                    unknown_end = (
+                        "pagination ended without next link and site total unknown"
+                    )
+                    if not may_done and incomplete_reason == unknown_end:
+                        cj = dict(query_row.cursor_json or {})
+                        if confirmed_last or cj.get("unknown_end_seen"):
+                            may_done = True
+                        else:
+                            cj["unknown_end_seen"] = True
+                            query_row.cursor_json = cj
+                    if may_done:
+                        query_row.status = "done"
+                        if incomplete_reason:
+                            query_row.last_error = incomplete_reason[:1000]
+                        else:
+                            query_row.last_error = None
+                        query_row.cursor_json = {"page": 1, "row_index": 0}
                     else:
-                        cursor = {"page": page_idx, "row_index": 0}
-                    query_row.cursor_json = dict(cursor)
+                        query_row.status = "in_progress"
+                        query_row.last_error = incomplete_reason[:1000]
+                        if site_total is not None and rows_seen < int(site_total):
+                            cursor = {"page": page_idx + 1, "row_index": 0}
+                        else:
+                            cursor = {"page": page_idx, "row_index": 0}
+                        query_row.cursor_json = dict(cursor)
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
-            query_row.cursor_json = dict(cursor)
+            cursor.pop("unknown_end_seen", None)
+            if not self.probe_mode:
+                query_row.cursor_json = dict(cursor)
             if repeat_pages >= 2:
-                # Two pages in a row brought nothing new: the next link leads back over pages already read. Stop
-                # here, keep the place, and say why, instead of walking the same rows until the time runs out.
-                query_row.status = "in_progress"
-                query_row.last_error = f"pages {page_idx - 2} and {page_idx - 1} repeated rows of earlier pages; pagination stopped for this run"[:1000]
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
+                    query_row.last_error = f"pages {page_idx - 2} and {page_idx - 1} repeated rows of earlier pages; pagination stopped for this run"[:1000]
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 out_of_time = True
-                query_row.status = "in_progress"
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
                 break
-            await self.db.commit()
+            if not self.probe_mode:
+                await self.db.commit()
             await self._maybe_spot_check()
             await self._pace_sleep()
             try:
                 page = await self.pipeline.fetch_detail(nxt)
             except Exception as exc:
-                query_row.status = "in_progress"
-                query_row.last_error = f"pagination interrupted: {exc}"[:1000]
+                if not self.probe_mode:
+                    query_row.status = "in_progress"
+                    query_row.last_error = f"pagination interrupted: {exc}"[:1000]
                 break
             self.memory.note_window()
             await self._maybe_recycle_browser()
 
-        return {
+        result: Dict[str, Any] = {
             "query_key": query_row.query_key,
             "status": query_row.status,
             "site_total_results": site_total,
@@ -803,10 +997,73 @@ class SearchHarvestRunner:
             "rows_seen": rows_seen,
             "rows_known": rows_known,
             "rows_new": rows_new,
-            "gap_size": query_row.gap_size,
+            "gap_size": compute_gap_size(site_total, rows_known, rows_seen)
+            if self.probe_mode
+            else query_row.gap_size,
             "dry_run": self.dry_run,
             "out_of_time": out_of_time,
         }
+        if self.probe_mode:
+            result.update(
+                {
+                    "read_only_probe": True,
+                    "form_values": self._probe_form_values,
+                    "rows_on_page": len(self._probe_rows),
+                    "probe_rows": self._probe_rows,
+                }
+            )
+        elif query_row.parent_id and rows_new == 0 and seen_keys:
+            fp = harvest_result_fingerprint_from_keys(seen_keys)
+            if await self._maybe_abort_ineffective_split_child(query_row, fp, rows_seen, seen_keys):
+                result["status"] = query_row.status
+                result["split_ineffective"] = True
+        elif (
+            not self.probe_mode
+            and query_row.parent_id
+            and query_row.status in ("done", "split_ineffective", "failed", "skipped")
+            and seen_keys
+        ):
+            cj = dict(query_row.cursor_json or {})
+            cj.setdefault("result_keys", sorted(seen_keys))
+            query_row.cursor_json = cj
+            await self._maybe_finalize_split_parent(query_row.parent_id)
+        return result
+
+    def _split_children_for_truncation(
+        self,
+        search_map: Dict[str, Any],
+        query_json: Dict[str, Any],
+        *,
+        site_total: Optional[int],
+        rows_seen: int,
+        cap: int,
+    ) -> List[Dict[str, Any]]:
+        from scraper.search_form_roles import harvest_expressible_roles
+
+        effective_total = int(site_total if site_total is not None else rows_seen)
+        journal_trunc = should_auto_split_journal_year(
+            query_json,
+            rows_seen=rows_seen,
+            site_total=site_total,
+            result_cap=cap,
+            has_next_page=False,
+        )
+        if effective_total < cap and (journal_trunc or is_capped(site_total, rows_seen, cap)):
+            effective_total = max(effective_total, cap)
+        from scraper.search_form_harvest_vocabulary import keyword_split_values
+
+        return split_oversized_query(
+            query_json,
+            effective_total,
+            result_cap=cap,
+            court_options=_court_options_from_map(search_map),
+            keyword_splits=keyword_split_values(search_map),
+            available_roles=harvest_expressible_roles(search_map) | {"court", "keyword"},
+            bench_options=[
+                str(o)
+                for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []
+            ],
+        )
 
     async def _enqueue_split_children(
         self,
@@ -913,6 +1170,109 @@ async def run_search_harvest(
             redis_client=redis_client,
             job_id=job_id,
         )
+
+
+async def run_search_harvest_probe(
+    db: AsyncSession,
+    *,
+    query_key: str,
+    max_pages: int = 1,
+    redis_client=None,
+) -> Dict[str, Any]:
+    """Read-only live search: one login-locked page fetch with no harvest ledger or slot writes."""
+    if not query_key:
+        return {"error": "query_key is required"}
+    if not settings.login_scraping_effective:
+        return {"skipped": True, "reason": "login scraping not permitted in this environment"}
+    source = await _source_row(db)
+    if source.state in ("HALTED", "DISABLED", "PAUSED"):
+        return {"skipped": True, "reason": f"source state {source.state}"}
+    ledger_row = (
+        await db.execute(
+            select(PlsSearchHarvestQuery).where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.query_key == query_key,
+            )
+        )
+    ).scalars().first()
+    if ledger_row is None:
+        return {"error": f"unknown query_key {query_key}"}
+    probe_query = SimpleNamespace(
+        id=ledger_row.id,
+        query_key=ledger_row.query_key,
+        query_json=dict(ledger_row.query_json or {}),
+        cursor_json={"page": 1, "row_index": 0},
+        pages_enumerated=0,
+        rows_seen=0,
+        rows_known=0,
+        rows_new=0,
+        site_total_results=None,
+        status=ledger_row.status,
+        gap_size=0,
+        slot=ledger_row.slot,
+    )
+    harvest_lock: Optional[SessionLock] = None
+    chosen: Optional[int] = None
+    for n in SEARCH_HARVEST_SLOTS:
+        state = await _slot_state(db, n)
+        if state != "ACTIVE":
+            continue
+        candidate = SessionLock(f"{SOURCE_NAME}:search_harvest:slot{n}", redis_client, max_holders=1, **_harvest_lock_options())
+        try:
+            await _acquire_harvest_lock(candidate)
+        except SessionLockHeld:
+            await candidate.release()
+            continue
+        harvest_lock, chosen = candidate, n
+        break
+    if harvest_lock is None or chosen is None:
+        return {"skipped": True, "reason": "no ACTIVE login slot with a free search-harvest lock"}
+    try:
+        async with harvest_run_pg_lock(chosen) as pg_harvest_held:
+            if not pg_harvest_held:
+                await harvest_lock.release()
+                return {"skipped": True, "reason": f"postgres harvest advisory lock held for slot {chosen}"}
+            m = await active_map(db, SOURCE_NAME)
+            if m is None:
+                return {"skipped": True, "reason": "no active search form map"}
+            search_map = map_as_dict(m)
+            runner = SearchHarvestRunner(db, source, redis_client=redis_client, probe_mode=True)
+            runner.harvest_mode = await get_harvest_mode(db)
+            runner.pacing_profile = login_pacing_profile(runner.harvest_mode)
+            runner.pipeline.harvest_mode = runner.harvest_mode
+            runner.pipeline.pacing_profile = runner.pacing_profile
+            runner.spot_check_between_pages = False
+            lock = SessionLock(SOURCE_NAME, redis_client, max_holders=1)
+            try:
+                await lock.acquire()
+            except SessionLockHeld:
+                return {"skipped": True, "reason": "login session lock held"}
+            slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1)
+            try:
+                await slot_lock.acquire()
+            except SessionLockHeld:
+                await lock.release()
+                return {"skipped": True, "reason": f"login slot {chosen} is in use"}
+            runner.pipeline._session_lock = lock
+            runner.pipeline._slot_lock = slot_lock
+            runner.pipeline.runner.preferred_slot_number = chosen
+            runner.pipeline.runner.exclusive_slot = True
+            runner.pipeline._run_locks.append(harvest_lock)
+            runner.pipeline._assert_permitted()
+            try:
+                result = await runner.run_query(probe_query, search_map, max_pages=max(1, int(max_pages or 1)))
+            finally:
+                try:
+                    await runner.pipeline.runner.close()
+                except Exception:
+                    pass
+                await slot_lock.release()
+                await lock.release()
+            await db.rollback()
+            return {**result, "slot": chosen, "read_only_probe": True}
+    finally:
+        if harvest_lock is not None:
+            await harvest_lock.release()
 
 
 async def _run_search_harvest_locked(
@@ -1139,6 +1499,26 @@ def cli_gap_report(argv: Optional[List[str]] = None) -> int:
             return await gap_report_rows(db, limit=args.limit)
 
     print(json.dumps(run_async(_run()), indent=2))
+    return 0
+
+
+def cli_search_harvest_probe(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--query-key", required=True)
+    parser.add_argument("--max-pages", type=int, default=1)
+    args = parser.parse_args(argv)
+
+    async def _run():
+        async with SessionLocal() as db:
+            return await run_search_harvest_probe(
+                db,
+                query_key=args.query_key,
+                max_pages=args.max_pages,
+            )
+
+    print(json.dumps(run_async(_run()), indent=2, default=str))
     return 0
 
 

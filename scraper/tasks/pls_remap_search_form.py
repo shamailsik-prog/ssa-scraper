@@ -7,14 +7,33 @@ from typing import Any, Dict
 from sqlalchemy import select
 
 from scraper.auth.session_manager import ContinuityRunner, SessionManager, playwright_browser_factory
+from scraper.config import settings
 from scraper.database import SessionLocal
 from scraper.extractors.deterministic import introspect_search_form
 from scraper.models import ScraperSource
 from scraper.pls_navigation import pls_check_url
-from scraper.tasks.search_map import active_map, map_as_dict, map_search_form
+from scraper.search_form_roles import verify_harvest_role_samples
+from scraper.tasks.search_map import active_map, build_map_record, map_as_dict, map_search_form, verify_selectors
 
 logger = logging.getLogger(__name__)
 SOURCE_NAME = "PakistanLawSite"
+
+
+class _ReadOnlyContinuityRunner(ContinuityRunner):
+    """Dry-run remap: read an already-logged-in slot without leasing, touching, or config writes."""
+
+    async def ensure_browser(self):
+        if self.browser is not None:
+            return self.browser
+        for slot in await self.manager.slots():
+            if slot.state == "ACTIVE":
+                return await self.open(slot)
+        raise RuntimeError("dry-run remap requires an ACTIVE login slot; no slot lease or login attempted")
+
+    async def run(self, op, *, timeout=None):
+        browser = await self.ensure_browser()
+        limit = float(timeout if timeout is not None else settings.PLS_BROWSER_OP_TIMEOUT_SECONDS)
+        return await self._call(op, browser, limit)
 
 
 async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
@@ -32,7 +51,8 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
             "field_roles": sorted(k for k in (before.fields or {}) if k != "_all") if before else [],
         }
         manager = SessionManager(db, source)
-        runner = ContinuityRunner(manager, playwright_browser_factory)
+        runner_cls = _ReadOnlyContinuityRunner if dry_run else ContinuityRunner
+        runner = runner_cls(manager, playwright_browser_factory)
         try:
             async def op(browser):
                 page = await browser.goto(pls_check_url())
@@ -41,7 +61,7 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
             page = await runner.run(op)
             probe = introspect_search_form(page.html or "")
             if probe.get("surface") != "query_form" or not (probe.get("fields") or []):
-                return {
+                out = {
                     "ok": False,
                     "error": "dashboard did not expose Citation Search query_form",
                     "surface": probe.get("surface"),
@@ -49,15 +69,24 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
                     "before": before_info,
                     "url": page.url,
                 }
+                if dry_run:
+                    await db.rollback()
+                return out
             if dry_run:
-                return {
+                record = build_map_record(verify_selectors(page.html or "", probe), page.html or "", "dry_run")
+                harvest_proof = verify_harvest_role_samples(record)
+                out = {
                     "ok": True,
                     "dry_run": True,
+                    "read_only": True,
                     "before": before_info,
                     "would_map_roles": [f.get("role") for f in probe["fields"]],
                     "reporters": next((f.get("options") for f in probe["fields"] if f.get("role") == "reporter"), []),
+                    "harvest_role_proof": harvest_proof,
                     "url": page.url,
                 }
+                await db.rollback()
+                return out
             m = await map_search_form(db, source, page.html or "", page_url=page.url or "")
             # Keep grid walk available: dual map (dashboard fields + archivedpatientGrid layout).
             from scraper.extractors.deterministic import enrich_dashboard_result_layout
@@ -74,9 +103,11 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
             m.stale = False
             await db.commit()
             after = map_as_dict(m)
+            harvest_proof = verify_harvest_role_samples(after)
             return {
                 "ok": True,
                 "before": before_info,
+                "harvest_role_proof": harvest_proof,
                 "after": {
                     "map_version": m.map_version,
                     "stale": m.stale,

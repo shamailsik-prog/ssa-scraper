@@ -105,6 +105,19 @@ def iter_base_plan_queries(
                     yield normalize_query_json(q)
 
 
+def _harvest_fill_search_map(search_map: Dict[str, Any]) -> Dict[str, Any]:
+    """Stored map only: never inject the party→keyword alias into submit values."""
+    fields = dict(search_map.get("fields") or {})
+    fields.pop("_all", None)
+    out = dict(search_map)
+    out["fields"] = fields
+    return out
+
+
+def _prune_empty_harvest_values(values: Dict[str, str]) -> Dict[str, str]:
+    return {k: v for k, v in values.items() if v is not None and str(v).strip() != ""}
+
+
 def build_harvest_form_values(
     search_map: Dict[str, Any],
     query_json: Dict[str, Any],
@@ -113,69 +126,108 @@ def build_harvest_form_values(
     """Map a harvest query onto search-form roles (extends tier frontier build_values)."""
     from scraper.tasks.pakistanlawsite import build_values
 
+    fill_map = _harvest_fill_search_map(search_map)
+    fields = fill_map.get("fields") or {}
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
     tier_cursor = dict(cursor)
-    if "page" in cursor and "page_no" not in cursor:
-        tier_cursor["page_no"] = cursor["page"]
-    values = build_values(search_map, tier_query, tier_cursor)
-    fields = search_map.get("fields") or {}
+    page = int(cursor.get("page") or cursor.get("page_no") or 1)
+    # Page 1 is a fresh Citation Search submit: do not pass page_no into build_values (it would fill the
+    # party/keyword box as a pagination surrogate on dashboard maps without a page control).
+    if page > 1:
+        if "page" in cursor and "page_no" not in tier_cursor:
+            tier_cursor["page_no"] = cursor["page"]
+    else:
+        tier_cursor.pop("page_no", None)
+    values = build_values(fill_map, tier_query, tier_cursor)
     for role in ("court", "category"):
         if role in fields and query_json.get(role):
             values[role] = str(query_json[role])
-    if "keyword" in fields and query_json.get("keyword") and "keyword" not in values:
-        values["keyword"] = str(query_json["keyword"])
+    from scraper.search_form_roles import apply_harvest_query_keyword
+
+    apply_harvest_query_keyword(values, search_map, query_json)
     if "year" in fields and query_json.get("year") and "year" not in values:
         # court/judge/party x year seeds have no reporter: submit the year so each key is a distinct search
         values["year"] = str(query_json["year"])
     for role in ("month", "bench", "party_initial", "citation"):
         if role in fields and query_json.get(role) is not None:
             values[role] = str(query_json[role])
-    # judge / party / citation text with no dedicated field is searched through the free-text keyword box
+    # judge / party / citation text with no dedicated field is searched through the free-text party/keyword box
     for role in ("judge", "party", "citation"):
-        if query_json.get(role) and role not in fields and "keyword" in fields and "keyword" not in values:
-            values["keyword"] = str(query_json[role])
-        elif query_json.get(role) and role in fields:
+        if not query_json.get(role):
+            continue
+        if role in fields:
             values[role] = str(query_json[role])
-    if "page" in fields:
-        page = cursor.get("page") or cursor.get("page_no") or 1
+        elif query_json.get("keyword"):
+            continue
+        elif "party" in fields and "party" not in values:
+            values["party"] = str(query_json[role])
+        elif "keyword" in fields:
+            values["keyword"] = str(query_json[role])
+    if "page" in fields and page > 1:
         values["page"] = str(page)
-    return values
+    return _prune_empty_harvest_values(values)
 
 
 def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
+    from scraper.search_form_roles import resolve_harvest_fields
     from scraper.tasks.pakistanlawsite import unmapped_query_reason
 
+    express_fields = resolve_harvest_fields(search_map)
+    express_map = dict(search_map)
+    express_map["fields"] = express_fields
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
     tier_cursor = dict(cursor)
-    if "page" in cursor and "page_no" not in cursor:
+    page = int(cursor.get("page") or cursor.get("page_no") or 1)
+    if page > 1 and "page" in cursor and "page_no" not in tier_cursor:
         tier_cursor["page_no"] = cursor["page"]
+    elif page <= 1:
+        tier_cursor.pop("page_no", None)
     if any(k in tier_query for k in ("reporter", "statute", "keyword")):
-        reason = unmapped_query_reason(search_map, tier_query, tier_cursor)
+        reason = unmapped_query_reason(express_map, tier_query, tier_cursor)
         if reason:
             return reason
     elif (search_map.get("surface") or (search_map.get("limits") or {}).get("surface")) == "grid_surface_no_query_form":
-        fields = search_map.get("fields") or {}
-        if not any(role in fields for role in ("reporter", "year", "page", "keyword", "statute", "section", "citation_no")):
+        if not any(
+            role in express_fields
+            for role in ("reporter", "year", "page", "keyword", "party", "statute", "section", "citation_no")
+        ):
             return "CitationSearch surface is grid_surface_no_query_form; no query form is available"
-    fields = search_map.get("fields") or {}
-    if query_json.get("court") and "court" not in fields:
+    stored_fields = _harvest_fill_search_map(search_map).get("fields") or {}
+    if query_json.get("court") and "court" not in stored_fields:
         return "search map cannot express court filter; missing role: court"
-    if query_json.get("category") and "category" not in fields:
+    if query_json.get("category") and "category" not in stored_fields:
         return "search map cannot express category filter; missing role: category"
-    if query_json.get("year") and "reporter" not in query_json and "year" not in fields:
+    if query_json.get("year") and "reporter" not in query_json and "year" not in stored_fields:
         return "search map cannot express year filter; missing role: year"
     for role in ("month", "bench", "party_initial"):
-        if query_json.get(role) is not None and role not in fields:
+        if query_json.get(role) is not None and role not in stored_fields:
             return f"search map cannot express {role} filter; missing role: {role}"
     for role in ("judge", "party", "citation"):
-        if query_json.get(role) and role not in fields and "keyword" not in fields:
+        if query_json.get(role) and role not in stored_fields and "keyword" not in express_fields and "party" not in express_fields:
             return f"search map cannot express {role} query; missing roles: {role}, keyword"
+    if query_json.get("keyword") and "keyword" not in express_fields and "party" not in stored_fields:
+        return "search map cannot express keyword query; missing usable role: keyword"
     if not build_harvest_form_values(search_map, query_json, cursor):
         return "search map cannot express harvest query; no usable mapped fields"
     return None
 
 
 CASE_KEY_PREFIX = "case:"
+
+
+def harvest_result_fingerprint_from_keys(keys: Set[str]) -> str:
+    """Stable hash of a result row-set (citation / case-name keys) for split-effectiveness checks."""
+    if not keys:
+        return ""
+    payload = "\n".join(sorted(keys))
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def harvest_result_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
+    keys: Set[str] = set()
+    for row in rows:
+        keys.update(citation_keys_for_row(row))
+    return harvest_result_fingerprint_from_keys(keys)
 
 
 def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
@@ -278,9 +330,106 @@ def split_oversized_query(
         if dim == "party_initial" and "party_initial" in roles:
             return [normalize_query_json({**normalized, "party_initial": ch}) for ch in _ALPHA_KEYWORD_SPLITS]
         if dim == "keyword":
-            splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
+            if keyword_splits is None:
+                from scraper.config import settings
+
+                if getattr(settings, "PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS", False):
+                    splits = list(_ALPHA_KEYWORD_SPLITS)
+                else:
+                    continue
+            else:
+                splits = list(keyword_splits)
+                if not splits:
+                    continue
             return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
     return []
+
+
+def is_journal_year_query(query_json: Dict[str, Any]) -> bool:
+    """Reporter × year with no narrower split dimensions already set."""
+    normalized = normalize_query_json(query_json)
+    if not normalized.get("reporter") or normalized.get("year") is None:
+        return False
+    for dim in SPLIT_ORDER:
+        if dim in normalized:
+            return False
+    extra = set(normalized.keys()) - {"reporter", "year"}
+    return not extra
+
+
+def journal_year_truncation_rows(result_cap: int) -> int:
+    from scraper.config import settings
+
+    floor = int(getattr(settings, "PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS", 0) or 0)
+    if floor > 0:
+        return min(floor, result_cap)
+    return result_cap
+
+
+def harvest_result_cap() -> int:
+    from scraper.config import settings
+
+    legacy = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
+    if getattr(settings, "PLS_SEARCH_HARVEST_USE_OBSERVED_400_CAP", False):
+        return int(getattr(settings, "PLS_SEARCH_HARVEST_OBSERVED_RESULT_CAP", 400) or 400)
+    return legacy
+
+
+def should_auto_split_journal_year(
+    query_json: Dict[str, Any],
+    *,
+    rows_seen: int,
+    site_total: Optional[int],
+    result_cap: int,
+    has_next_page: bool,
+) -> bool:
+    from scraper.config import settings
+
+    if not getattr(settings, "PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR", False):
+        return False
+    if has_next_page or not is_journal_year_query(query_json):
+        return False
+    if site_total is not None and rows_seen >= int(site_total):
+        return False
+    trunc = journal_year_truncation_rows(result_cap)
+    if site_total is not None and int(site_total) < trunc:
+        return False
+    if site_total is not None and rows_seen < int(site_total):
+        return rows_seen >= trunc or int(site_total) >= trunc
+    return rows_seen >= trunc
+
+
+def split_dimension_added(parent: Dict[str, Any], child: Dict[str, Any]) -> Optional[str]:
+    p = normalize_query_json(parent)
+    c = normalize_query_json(child)
+    for dim in SPLIT_ORDER:
+        if dim in c and dim not in p:
+            return dim
+    return None
+
+
+def split_children_union_incomplete(
+    parent_rows_seen: int,
+    child_key_sets: Sequence[Set[str]],
+) -> bool:
+    """True when finished split children do not account for every row the parent enumerated."""
+    if parent_rows_seen <= 0 or not child_key_sets:
+        return False
+    union: Set[str] = set()
+    for keys in child_key_sets:
+        union |= keys
+    return len(union) < parent_rows_seen
+
+
+def split_children_cover_rows(
+    parent: Dict[str, Any],
+    children: Sequence[Dict[str, Any]],
+    *,
+    rows_seen: int,
+    result_cap: int,
+) -> bool:
+    """Deprecated pre-split heuristic; callers should enqueue when children exist and use split_children_union_incomplete after children finish."""
+    return bool(children)
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
