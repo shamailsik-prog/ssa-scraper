@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from celery import shared_task
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from scraper.auth.session_manager import LoginRequired, SessionLock, SessionLockHeld, merge_source_config, release_page_result
 from scraper.config import settings
@@ -44,7 +44,7 @@ from scraper.pls_caseid import (
     same_judgment,
     split_group_key,
 )
-from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME, claim_free_slot, release_claimed_slot
+from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME, claim_free_slot, quarantined_capture_retryable, release_claimed_slot
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,29 @@ def page_text(page) -> str:
 
 
 async def load_known(db) -> Dict[str, Set[int]]:
-    """Serials already in the corpus or in staging (any status), so none is asked for twice."""
+    """Skip captured CaseNames, never retryable login/error/pending staging stubs."""
     urls: List[Optional[str]] = []
-    for model in (Judgment, ScraperStaging):
-        rows = await db.execute(select(model.source_url).where(model.source_name == SOURCE_NAME, model.source_url.like("%CaseName=%")))
-        urls.extend(r[0] for r in rows.all())
+    rows = await db.execute(select(Judgment.source_url).where(
+        Judgment.source_name == SOURCE_NAME, Judgment.source_url.like("%CaseName=%")
+    ))
+    urls.extend(r[0] for r in rows.all())
+    staged = await db.execute(select(
+        ScraperStaging.source_url,
+        ScraperStaging.status,
+        ScraperStaging.quarantine_reason,
+        func.octet_length(ScraperStaging.raw_text),
+        func.substr(ScraperStaging.raw_text, 1, 3000),
+        ScraperStaging.route_json,
+    ).where(
+        ScraperStaging.source_name == SOURCE_NAME,
+        ScraperStaging.source_url.like("%CaseName=%"),
+    ))
+    for url, status, reason, text_len, head, route in staged.all():
+        if status in ("extracted", "promoted", "duplicate"):
+            urls.append(url)
+        elif status == "quarantined" and not quarantined_capture_retryable(reason, text_len, route, head):
+            # Final merits quarantines and exhausted bounded retries remain held.
+            urls.append(url)
     return known_by_group(urls)
 
 
@@ -124,7 +142,11 @@ class CaseIdWalker:
         row = (await self.db.execute(select(Judgment.full_text).where(Judgment.source_name == SOURCE_NAME, url_match(Judgment.source_url)).limit(1))).first()
         if row and row[0]:
             return row[0]
-        row = (await self.db.execute(select(ScraperStaging.raw_text).where(ScraperStaging.source_name == SOURCE_NAME, url_match(ScraperStaging.source_url)).limit(1))).first()
+        row = (await self.db.execute(select(ScraperStaging.raw_text).where(
+            ScraperStaging.source_name == SOURCE_NAME,
+            url_match(ScraperStaging.source_url),
+            ScraperStaging.status.in_(("extracted", "promoted", "duplicate")),
+        ).limit(1))).first()
         return (row[0] if row else None) or ""
 
     async def calibrate(self, state: Dict[str, Any], known: Dict[str, Set[int]]) -> bool:
@@ -167,16 +189,19 @@ class CaseIdWalker:
         known = await load_known(self.db)
         if not known:
             return {"skipped": "no case IDs in the corpus to learn the numbering from"}
+        walk_known = {k: v for k, v in known.items() if group_eligible_for_walk(k)}
+        if not walk_known:
+            return {"skipped": "no eligible case-ID groups for the configured walk"}
         if _calibration_due(state, now):
-            ok = await self.calibrate(state, known)
+            # Do not let an excluded extended group block legacy calibration.
+            ok = await self.calibrate(state, walk_known)
             await self._save(state)
             if not ok:
                 return {"stopped": "calibration failed", "calibration": state.get("calibration")}
         elif not state.get("calibrated_at"):
             return {"skipped": "calibration failed recently; waiting for the recheck", "calibration": state.get("calibration")}
 
-        walk_known = {k: v for k, v in known.items() if group_eligible_for_walk(k)}
-        years = [split_group_key(k)[0] for k in walk_known] or [split_group_key(k)[0] for k in known]
+        years = [split_group_key(k)[0] for k in walk_known]
         first_year = int(settings.PLS_EARLIEST_YEAR or 0) or min(years)
         order = group_order(walk_known, first_year=min(first_year, min(years)), last_year=now.year)
         if self.partition is not None:
