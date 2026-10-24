@@ -14,6 +14,8 @@ from scraper.extractors.judgment_guards import detect_headnote_only_no_body, gua
 from scraper.models import DocumentQuarantine, Judgment
 
 SOURCE_NAME = "PakistanLawSite"
+
+
 async def find_headnote_only_promoted(
     db: AsyncSession,
     *,
