@@ -59,9 +59,24 @@ HTTP gap report (read-only, same as `/status`):
 
 ## Site limits
 
-- **Result cap:** `PLS_SEARCH_RESULT_CAP` (default 500) — when the results page shows a higher total, the parent query is marked `split` and child queries are enqueued (court options from the mapped form, then single-letter keyword prefixes).
+- **Result cap:** `PLS_SEARCH_RESULT_CAP` (default 500) — when the results page shows a higher total, the parent query is marked `split` and child queries are enqueued using **live dashboard vocabulary** (`limits.harvest_split_vocabulary` on the active `search_form_map`: court tokens parsed from the Citation Search page and keyword/party options from mapped fields). The harvester does **not** fall back to generic `Court.name` rows or a–z keyword guesses unless `PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS=1` (off by default) or deprecated `PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK` with `PLS_SEARCH_HARVEST_ALLOW_GUESSED_COURT_TOKENS`.
 - **Pagination:** All pages are followed via the mapped `next_selector` or extracted `next_page` URL until exhausted or `PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY` is reached.
 - **No CAPTCHA bypass:** Verification or login surfaces halt the run like the main PLS pipeline.
+
+## Coverage: search harvest vs case-ID walk
+
+Search harvest is **discovery and gap-fill**, not a completeness proof. Reporter×year (and successful court/keyword splits) stop at the site result cap (~400–500 rows per query). When court splits are empty because the dashboard court field is text-only, children cannot narrow an oversized query unless the map captured court tokens from the page script (`harvest_split_vocabulary`).
+
+**Recommended layered coverage** (aligned with production-readiness audit §B):
+
+| Layer | Role |
+|--------|------|
+| **Case-ID walk** | Primary backstop: serial `pls_caseid` space is site-native (`PLS_CASEID_WALK_*`). Run continuously on both login slots with pacing; it does not depend on CitationSearch caps or form vocabulary. |
+| **Search harvest** | Systematic seeds (reporter×year, extended court/judge/statute families) plus auto-split when capped, using **only** map vocabulary for court/keyword dimensions. |
+| **Citation grid** | Secondary sweep for rows missing from search; keep refetch thresholds aligned with headnote guards. |
+| **Map health** | Dual-map grid+query layout; refuse stale grid-only maps for harvest (`search_map.py`). |
+
+**Evaluation:** Case-ID walk is the only path that can approach **full** PLS judgment coverage over time without assuming every judgment appears in a capped CitationSearch result set. Search harvest remains essential for finding judgments by reporter/year and for snowballing cited keys, but operators should treat **case-ID walk + grid + capped search with working splits** as the combined completeness strategy, with promotion quarantine/requalify for bad pages. Honest throughput (~100–350 judgments/h) reflects login-slot contention and per-query caps, not a single harvest mode in isolation.
 
 ## Celery
 

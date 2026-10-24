@@ -120,13 +120,9 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
 
 
 def _court_options_from_map(search_map: Dict[str, Any]) -> List[str]:
-    stored = (search_map.get("fields") or {}).get("court") or {}
-    opts = [str(o).strip() for o in (stored.get("options") or []) if str(o).strip()]
-    if opts:
-        return opts
-    if stored and getattr(settings, "PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK", False):
-        return [t.strip() for t in str(settings.PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS or "").split(",") if t.strip()]
-    return []
+    from scraper.search_form_harvest_vocabulary import court_split_values
+
+    return court_split_values(search_map)
 
 
 def _reporter_options_from_map(search_map: Dict[str, Any]) -> List[str]:
@@ -207,7 +203,7 @@ async def seed_extended_plan(
     m = await active_map(db, SOURCE_NAME)
     if m is not None:
         smap = map_as_dict(m)
-    courts = _court_options_from_map(smap) or [c for (c,) in (await db.execute(select(Court.name).where(Court.is_active.is_(True)))).all()]
+    courts = _court_options_from_map(smap)
     judges = [n for (n,) in (await db.execute(select(Judge.name).limit(judge_limit))).all() if n]
     statutes = []
     for st_id, st_name in (await db.execute(select(Statute.id, Statute.name).limit(statute_limit))).all():
@@ -910,11 +906,14 @@ class SearchHarvestRunner:
         )
         if effective_total < cap and (journal_trunc or is_capped(site_total, rows_seen, cap)):
             effective_total = max(effective_total, cap)
+        from scraper.search_form_harvest_vocabulary import keyword_split_values
+
         return split_oversized_query(
             query_json,
             effective_total,
             result_cap=cap,
             court_options=_court_options_from_map(search_map),
+            keyword_splits=keyword_split_values(search_map),
             available_roles=harvest_expressible_roles(search_map) | {"court", "keyword"},
             bench_options=[
                 str(o)

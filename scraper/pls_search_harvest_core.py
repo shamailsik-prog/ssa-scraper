@@ -315,7 +315,17 @@ def split_oversized_query(
         if dim == "party_initial" and "party_initial" in roles:
             return [normalize_query_json({**normalized, "party_initial": ch}) for ch in _ALPHA_KEYWORD_SPLITS]
         if dim == "keyword":
-            splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
+            if keyword_splits is None:
+                from scraper.config import settings
+
+                if getattr(settings, "PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS", False):
+                    splits = list(_ALPHA_KEYWORD_SPLITS)
+                else:
+                    continue
+            else:
+                splits = list(keyword_splits)
+                if not splits:
+                    continue
             return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
     return []
 

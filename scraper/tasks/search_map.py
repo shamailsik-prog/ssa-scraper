@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scraper.config import settings
 from scraper.extractors.deterministic import _has_archived_patient_grid, introspect_search_form
 from scraper.search_form_roles import enrich_fields_with_harvest_aliases
+from scraper.search_form_harvest_vocabulary import capture_harvest_split_vocabulary
 from scraper.extractors.scrapegraph_base import ExtractionInput
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.models import ScraperSource, SearchFormMap
@@ -87,6 +88,7 @@ def build_map_record(proposal: Dict[str, Any], html: str, mapped_by: str) -> Dic
     limits_extra: Dict[str, Any] = {}
     if alias_map:
         limits_extra["harvest_role_aliases"] = alias_map
+    limits_extra["harvest_split_vocabulary"] = capture_harvest_split_vocabulary(html, fields)
     return {
         "fields": fields,
         "result_layout": {"row_selector": proposal.get("result_row_selector") or "table tr", "columns": proposal.get("result_columns") or {}, "detail_link_selector": proposal.get("detail_link_selector") or "a[href]"},

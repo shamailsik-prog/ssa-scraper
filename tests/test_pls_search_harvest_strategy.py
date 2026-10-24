@@ -21,7 +21,10 @@ from scraper.pls_search_harvest_core import (
 ROLES = {"reporter", "year", "month", "court", "bench", "party_initial", "keyword"}
 
 
-def test_split_order_month_then_court_then_bench_then_party_then_keyword():
+def test_split_order_month_then_court_then_bench_then_party_then_keyword(monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS", True)
     q = {"reporter": "PLD", "year": 2020}
     kw = dict(result_cap=500, court_options=["SC", "LHC"], available_roles=ROLES, bench_options=["single", "division"])
     step1 = split_oversized_query(q, 500, **kw)

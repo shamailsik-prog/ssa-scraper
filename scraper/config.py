@@ -400,7 +400,15 @@ class Settings(BaseSettings):
     )
     PLS_SEARCH_HARVEST_COURT_SPLIT_FALLBACK: bool = Field(
         default=False,
-        description="When true and the search map court field has no dropdown options, use PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS for oversized-query splits.",
+        description="Deprecated: splits use harvest_split_vocabulary on the search map only. When true, allow PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS only if also set PLS_SEARCH_HARVEST_ALLOW_GUESSED_COURT_TOKENS.",
+    )
+    PLS_SEARCH_HARVEST_ALLOW_GUESSED_COURT_TOKENS: bool = Field(
+        default=False,
+        description="When true with COURT_SPLIT_FALLBACK, use PLS_SEARCH_HARVEST_COURT_SPLIT_TOKENS if the live map has no court vocabulary.",
+    )
+    PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS: bool = Field(
+        default=False,
+        description="When true, oversized queries may fall back to a–z keyword splits; default uses dashboard harvest_split_vocabulary only.",
     )
     PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS: int = Field(
         default=380,
