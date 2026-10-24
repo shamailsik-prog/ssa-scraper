@@ -151,7 +151,8 @@ async def test_known_total_last_page_marks_done(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reopen_premature_done_queries(db):
+async def test_reopen_premature_done_skips_null_site_total(db, monkeypatch):
+    monkeypatch.setattr(harvest.settings, "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE", True)
     q = PlsSearchHarvestQuery(
         source_name="PakistanLawSite",
         query_key="search:reporter=CLC|year=2019",
@@ -160,6 +161,31 @@ async def test_reopen_premature_done_queries(db):
         pages_enumerated=1,
         rows_seen=284,
         site_total_results=None,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    preview = await harvest.reopen_premature_done_queries(db, dry_run=True)
+    assert preview.get("would_reopen", 0) == 0
+
+    applied = await harvest.reopen_premature_done_queries(db, dry_run=False)
+    assert applied.get("reopened", 0) == 0
+    assert q.status == "done"
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_reopen_premature_done_when_known_total_incomplete(db, monkeypatch):
+    monkeypatch.setattr(harvest.settings, "PLS_SEARCH_HARVEST_REOPEN_PREMATURE_DONE", True)
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=CLC|year=2019|known-total",
+        query_json={"reporter": "CLC", "year": 2019},
+        status="done",
+        pages_enumerated=1,
+        rows_seen=50,
+        site_total_results=200,
         cursor_json={"page": 1, "row_index": 0},
     )
     db.add(q)
