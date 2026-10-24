@@ -222,16 +222,135 @@ def partition_rows_by_known(
     return known, new_rows
 
 
+GAP_SAMPLES_LIMIT = 50
+
+
+def row_gap_diagnostics(row: Dict[str, Any]) -> Dict[str, Any]:
+    keys = sorted(citation_keys_for_row(row))
+    return {
+        "citation": row.get("citation"),
+        "title": row.get("title"),
+        "detail_url": row.get("detail_url"),
+        "pdf_url": row.get("pdf_url"),
+        "keys": keys,
+    }
+
+
+def append_gap_sample(cursor: Dict[str, Any], row: Dict[str, Any]) -> None:
+    samples = list(cursor.get("gap_samples") or [])
+    if len(samples) >= GAP_SAMPLES_LIMIT:
+        return
+    samples.append(row_gap_diagnostics(row))
+    cursor["gap_samples"] = samples
+
+
+def unlinked_row_identity(row: Dict[str, Any]) -> str:
+    keys = sorted(citation_keys_for_row(row))
+    if keys:
+        return "|".join(keys)
+    citation = str(row.get("citation") or "").strip()
+    title = str(row.get("title") or "").strip()
+    return f"{citation}\0{title}"
+
+
+def reset_lap_gap_diagnostics(cursor: Dict[str, Any]) -> None:
+    """Start a new enumeration lap: fresh gap samples and per-lap unlinked identities."""
+    cursor["gap_samples"] = []
+    cursor["unlinked_keys"] = []
+    cursor["rows_unlinked"] = 0
+
+
+def note_unlinked_row(cursor: Dict[str, Any], row: Dict[str, Any]) -> int:
+    ident = unlinked_row_identity(row)
+    keys = list(cursor.get("unlinked_keys") or [])
+    if ident not in keys:
+        keys.append(ident)
+        cursor["unlinked_keys"] = keys
+    n = len(keys)
+    cursor["rows_unlinked"] = n
+    return n
+
+
+def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
+    if not cursor:
+        return 0
+    stored = cursor.get("unlinked_keys")
+    if stored is not None:
+        return len(stored)
+    return int(cursor.get("rows_unlinked") or 0)
+
+
+def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if cursor.get("gap_samples"):
+        out["gap_samples"] = cursor["gap_samples"]
+    if cursor.get("unlinked_keys"):
+        out["unlinked_keys"] = cursor["unlinked_keys"]
+    if cursor.get("rows_unlinked"):
+        out["rows_unlinked"] = cursor["rows_unlinked"]
+    return out
+
+
+def cursor_reset_for_done(cursor: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve gap diagnostics when a query finishes."""
+    return {"page": 1, "row_index": 0, **gap_diagnostics_slice(cursor)}
+
+
+def unlinked_gap_credit(rows_seen: int, rows_known: int, rows_unlinked: int) -> int:
+    """Linkless rows may only offset the seen-but-unknown portion of the gap."""
+    seen_unknown = max(0, int(rows_seen) - int(rows_known))
+    return min(max(0, int(rows_unlinked or 0)), seen_unknown)
+
+
 def compute_gap_size(
     site_total: Optional[int],
     rows_known: int,
     rows_seen: int,
+    *,
+    rows_unlinked: int = 0,
 ) -> int:
+    credited = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
     if site_total is not None and site_total > rows_known:
-        return int(site_total - rows_known)
+        return max(0, int(site_total - rows_known - credited))
     if rows_seen > rows_known:
-        return int(rows_seen - rows_known)
+        return max(0, int(rows_seen - rows_known - credited))
     return 0
+
+
+def unlinked_done_safety_error(rows_seen: int, rows_unlinked: int) -> str:
+    if rows_unlinked <= 0:
+        return ""
+    if rows_unlinked > 25:
+        return f"too many unmatched rows without detail_url ({rows_unlinked}>25)"
+    if rows_seen > 0 and (rows_unlinked / rows_seen) > 0.05:
+        return (
+            f"unmatched-without-link ratio {rows_unlinked}/{rows_seen} exceeds 5%; not marking done"
+        )
+    return ""
+
+
+def search_harvest_may_mark_done_unlinked(
+    *,
+    site_total: Optional[int],
+    rows_seen: int,
+    rows_known: int,
+    rows_unlinked: int,
+    pagination_confirmed: bool = False,
+) -> Tuple[bool, str]:
+    """Mark done_unlinked only after a confirmed last page when enumeration is complete (rows_seen meets or
+    exceeds the site total, or the site showed no total) and every unseen row on the page is linkless."""
+    if not pagination_confirmed or rows_unlinked <= 0:
+        return False, ""
+    if unlinked_done_safety_error(rows_seen, rows_unlinked):
+        return False, ""
+    if int(rows_seen) - int(rows_known) != int(rows_unlinked):
+        return False, ""
+    if site_total is not None and rows_seen < int(site_total):
+        return False, ""
+    return (
+        True,
+        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url on the last page",
+    )
 
 
 def parse_total_results_from_html(html: str) -> Optional[int]:
@@ -300,6 +419,7 @@ def search_harvest_may_mark_done(
     """When the extractor reports no next-page link, decide if the query may be marked done.
 
     Done only for a genuinely empty page, or when the site total is known and every row was seen.
+    Unlinkable rows use status done_unlinked via search_harvest_may_mark_done_unlinked instead.
     """
     if rows_on_page == 0:
         return True, ""

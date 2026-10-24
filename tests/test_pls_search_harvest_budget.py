@@ -83,7 +83,12 @@ async def test_tick_stops_when_its_time_is_up_and_the_next_tick_resumes(db, monk
     assert first["out_of_time"] is True and q.status == "in_progress"
     assert runner.pipeline.fetched_details == [f"https://example.test/case/{n}" for n in (1, 2, 3)]
     # page 1 finished before the time ran out: the next tick starts on page 2
-    assert q.cursor_json == {"page": 2, "row_index": 0, "next_url": "page2"} and q.pages_enumerated == 1
+    assert (
+        q.cursor_json.get("page") == 2
+        and q.cursor_json.get("row_index") == 0
+        and q.cursor_json.get("next_url") == "page2"
+        and q.pages_enumerated == 1
+    )
 
     clock[0] = 0.0
     runner = _runner(db, monkeypatch, clock)
