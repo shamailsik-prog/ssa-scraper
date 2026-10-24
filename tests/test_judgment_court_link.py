@@ -179,11 +179,24 @@ async def test_consistency_limit_does_not_hide_real_mismatch(db):
             access_method="rendered_copy",
         ),
     ])
+    db.add(
+        Judgment(
+            id=uuid4(),
+            source_name="PakistanLawSite",
+            court_name="Federal Shariat Court",
+            court_id=None,
+            canonical_citation="0000 CLC 0",
+            full_text="x" * 500,
+            full_text_hash="consistency_null_separate",
+            access_method="rendered_copy",
+        )
+    )
     await db.commit()
     matches = await find_judgment_court_mismatches(db, limit=1)
     assert len(matches) == 1
     assert matches[0]["id"] == str(mismatch_id)
     report = await consistency_report(db, limit=1)
+    assert report["null_court_id_count"] == 1
     assert report["real_mismatch_count"] == 1
     assert len(report["mismatches"]) == 1
     assert report["mismatches"][0]["id"] == str(mismatch_id)
