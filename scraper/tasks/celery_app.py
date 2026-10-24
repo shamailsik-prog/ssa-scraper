@@ -171,9 +171,15 @@ logger.info("Celery configured for deploy role %s: queues scraper/login_session/
 @worker_process_init.connect
 def _pls_worker_child_init(**_kwargs) -> None:
     """Prefork pool child: heartbeat daemon (lock release is worker_process_shutdown / task finally)."""
+    import atexit
+
+    from scraper.config import settings
+    from scraper.pls_lock_registry import release_all_registered_sync
     from scraper.pls_worker_heartbeat import start_worker_heartbeat_daemon
 
     start_worker_heartbeat_daemon()
+    if settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN:
+        atexit.register(release_all_registered_sync)
 
 
 @task_prerun.connect

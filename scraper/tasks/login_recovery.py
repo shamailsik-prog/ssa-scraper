@@ -334,7 +334,13 @@ async def recover_slot(
     # obstacle. Waiting for the whole PakistanLawSite lock skipped slot 1's re-login 21 times in a row on 13 October
     # 2026 while login 2's back-to-back harvest held it. A job whose own login dropped already holds this lock
     # (holds_slot_lock) and recovers it in place.
-    slot_lock = None if holds_slot_lock else SessionLock(f"{source.source_name}:slot{slot.slot_number}", redis_client)
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    slot_lock = (
+        None
+        if holds_slot_lock
+        else SessionLock(f"{source.source_name}:slot{slot.slot_number}", redis_client, **pls_session_lock_kwargs())
+    )
     if slot_lock is not None:
         try:
             await slot_lock.acquire()

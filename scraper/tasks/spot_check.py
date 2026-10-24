@@ -233,7 +233,9 @@ async def check_judgments(
     pipeline._assert_permitted()
     from scraper.auth.session_manager import SessionLock
 
-    lock = SessionLock(SOURCE_NAME, redis_client)
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    lock = SessionLock(SOURCE_NAME, redis_client, **pls_session_lock_kwargs())
     try:
         await lock.acquire()
     except SessionLockHeld:

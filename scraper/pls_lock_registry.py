@@ -5,24 +5,26 @@ from __future__ import annotations
 import logging
 import signal
 import threading
-from typing import List, Optional, Set, Tuple
+from typing import List, Literal, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-_held: List[Tuple[str, str]] = []
+LockKind = Literal["exclusive", "shared"]
+
+_held: List[Tuple[str, str, LockKind]] = []
 _guard = threading.Lock()
 _RELEASE_REDIS_SOCKET_TIMEOUT = 2.0
 
 
-def register_lock(redis_key: str, token: str) -> None:
+def register_lock(redis_key: str, token: str, *, kind: LockKind = "exclusive") -> None:
     with _guard:
-        _held.append((redis_key, token))
+        _held.append((redis_key, token, kind))
 
 
-def unregister_lock(redis_key: str, token: str) -> None:
+def unregister_lock(redis_key: str, token: str, *, kind: LockKind = "exclusive") -> None:
     with _guard:
         try:
-            _held.remove((redis_key, token))
+            _held.remove((redis_key, token, kind))
         except ValueError:
             pass
 
@@ -40,6 +42,35 @@ def _restore_signal_handlers(previous: List[Tuple[int, object]]) -> None:
             signal.signal(sig, handler)
         except (ValueError, OSError, AttributeError):
             pass
+
+
+def _release_one(client, key: str, token: str, kind: LockKind) -> bool:
+    try:
+        if kind == "shared":
+            ok = client.eval(
+                """
+                local removed = redis.call('zrem', KEYS[1], ARGV[1])
+                if tonumber(removed) == 0 then return 0 end
+                if redis.call('zcard', KEYS[1]) == 0 then redis.call('del', KEYS[1]) end
+                return 1
+                """,
+                1,
+                key,
+                token,
+            )
+            return int(ok or 0) == 1
+        ok = client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            key,
+            token,
+        )
+        return int(ok or 0) == 1
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.warning("pls lock shutdown: could not release %s: %s", key, exc)
+        return False
 
 
 def release_all_registered_sync() -> int:
@@ -67,10 +98,10 @@ def release_all_registered_sync() -> int:
                 prior_mask = None
 
         with _guard:
-            pairs = list(_held)
+            triples = list(_held)
             _held.clear()
 
-        if not pairs:
+        if not triples:
             return 0
         try:
             import redis
@@ -79,20 +110,12 @@ def release_all_registered_sync() -> int:
         released = 0
         try:
             client = redis.from_url(settings.REDIS_URL, socket_timeout=_RELEASE_REDIS_SOCKET_TIMEOUT)
-            for key, token in pairs:
+            for key, token, kind in triples:
                 try:
-                    ok = client.eval(
-                        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
-                        1,
-                        key,
-                        token,
-                    )
-                    if int(ok or 0) == 1:
+                    if _release_one(client, key, token, kind):
                         released += 1
                 except SystemExit as exc:
                     pending_exit = exc
-                except Exception as exc:
-                    logger.warning("pls lock shutdown: could not release %s: %s", key, exc)
             client.close()
         except Exception as exc:
             logger.warning("pls lock shutdown: redis unavailable: %s", exc)

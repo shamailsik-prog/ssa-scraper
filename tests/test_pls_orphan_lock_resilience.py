@@ -572,6 +572,69 @@ async def test_harvest_lock_flags_off_use_legacy_token_and_no_takeover(monkeypat
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_shutdown_release_clears_registered_shared_login_holder(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    source = "PakistanLawSite"
+    exclusive = LOCK_KEY.format(source=source)
+    shared = f"{exclusive}:holders"
+    token = lock_holder_token()
+    await r.delete(exclusive, shared)
+    await r.zadd(shared, {token: 9_999_999_999_999})
+    register_lock(shared, token, kind="shared")
+    assert release_all_registered_sync() == 1
+    assert int(await r.zcard(shared) or 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_login_and_slot_locks_registered_for_shutdown_release(r, monkeypatch):
+    """Harvest-style login + slot locks must register for worker shutdown (compose recreate)."""
+    monkeypatch.setattr(settings, "PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    opts = pls_session_lock_kwargs()
+    source = "PakistanLawSite"
+    exclusive = LOCK_KEY.format(source=source)
+    slot_key = LOCK_KEY.format(source=f"{source}:slot1")
+    await r.delete(exclusive, f"{exclusive}:holders", slot_key)
+    login = SessionLock(source, r, max_holders=2, **opts)
+    slot = SessionLock(f"{source}:slot1", r, max_holders=1, **opts)
+    await login.acquire()
+    await slot.acquire()
+    try:
+        released = release_all_registered_sync()
+        assert released >= 2
+        assert await r.get(slot_key) is None
+        assert int(await r.zcard(f"{exclusive}:holders") or 0) == 0
+    finally:
+        login._held = False
+        slot._held = False
+
+
+@pytest.mark.asyncio
+async def test_shared_login_lock_prunes_dead_holder_for_takeover(r, monkeypatch):
+    monkeypatch.setattr(settings, "PLS_LOCK_HOLDER_IDENTITY", True)
+    monkeypatch.setattr(settings, "PLS_LOCK_DEAD_HOLDER_TAKEOVER", True)
+    source = "PakistanLawSite"
+    exclusive = LOCK_KEY.format(source=source)
+    shared = f"{exclusive}:holders"
+    stale = f"gone-container:{999999}:{'c' * 16}"
+    await r.delete(exclusive, shared, worker_alive_redis_key("gone-container"))
+    t = await r.time()
+    now_ms = int(t[0]) * 1000 + int(t[1]) // 1000
+    await r.zadd(shared, {stale: now_ms + 3_600_000})
+    lock = SessionLock(source, r, max_holders=2, holder_identity=True)
+    await lock.acquire(dead_holder_takeover=True)
+    try:
+        members = [m.decode() for m in await r.zrange(shared, 0, -1)]
+        assert stale not in members
+        assert lock._token in members
+    finally:
+        await lock.release()
+    await r.delete(exclusive, shared)
+
+
 def test_compute_stalled_locks_held_no_staging_separate_field(monkeypatch):
     monkeypatch.setattr("scraper.deploy_role.harvests_login_sources", lambda: True)
     monkeypatch.setattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", True)

@@ -411,10 +411,9 @@ async def pick_next_query(
 
 
 def _harvest_lock_options() -> Dict[str, bool]:
-    return {
-        "holder_identity": bool(settings.PLS_LOCK_HOLDER_IDENTITY),
-        "track_shutdown": bool(settings.PLS_LOCK_RELEASE_ON_WORKER_SHUTDOWN),
-    }
+    from scraper.pls_lock_session import pls_session_lock_kwargs
+
+    return pls_session_lock_kwargs()
 
 
 async def _acquire_harvest_lock(lock: SessionLock) -> None:
@@ -991,7 +990,7 @@ async def _run_search_harvest_locked(
 
         active_slot_count = len([s for s in await runner.pipeline.manager.slots() if s.state == "ACTIVE"])
         max_holders = max(1, min(int(runner.pacing_profile.get("login_session_concurrency") or 1), active_slot_count))
-        lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders)
+        lock = SessionLock(SOURCE_NAME, redis_client, max_holders=max_holders, **_harvest_lock_options())
         try:
             await lock.acquire()
         except SessionLockHeld:
@@ -999,7 +998,7 @@ async def _run_search_harvest_locked(
             await db.commit()
             return {"skipped": True, "slot": chosen, "reason": "login session lock held"}
         # This tick's own login only, never the other (two browsers on one login end each other, R3.5).
-        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1)
+        slot_lock = SessionLock(f"{SOURCE_NAME}:slot{chosen}", redis_client, max_holders=1, **_harvest_lock_options())
         try:
             await slot_lock.acquire()
         except SessionLockHeld:

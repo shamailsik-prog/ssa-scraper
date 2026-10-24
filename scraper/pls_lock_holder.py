@@ -95,3 +95,14 @@ async def lock_value_holder_stale(redis_client, value: str) -> bool:
     if host == lock_host_identity():
         return not local_pid_alive(pid)
     return not await remote_worker_heartbeat_present(redis_client, host)
+
+
+def lock_value_holder_stale_sync(redis_client, value: str) -> bool:
+    """Sync Redis client variant of ``lock_value_holder_stale``."""
+    parsed = parse_lock_holder(value)
+    if parsed is None:
+        return False
+    host, pid, _ = parsed
+    if host == lock_host_identity():
+        return not local_pid_alive(pid)
+    return not bool(redis_client.exists(worker_alive_redis_key(host)))

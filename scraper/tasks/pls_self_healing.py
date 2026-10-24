@@ -66,7 +66,9 @@ async def keepalive_pakistanlawsite_slots() -> Dict[str, Any]:
         slots = await manager.slots()
         for slot in slots:
             if slot.state == "ACTIVE":
-                lock = SessionLock(source.source_name)
+                from scraper.pls_lock_session import pls_session_lock_kwargs
+
+                lock = SessionLock(source.source_name, **pls_session_lock_kwargs())
                 try:
                     await lock.acquire()
                 except SessionLockHeld:
@@ -185,7 +187,9 @@ async def stall_watchdog_pakistanlawsite() -> Dict[str, Any]:
         recovery: list = []
         for slot in await manager.slots():
             if slot.state == "ACTIVE":
-                lock = SessionLock(source.source_name)
+                from scraper.pls_lock_session import pls_session_lock_kwargs
+
+                lock = SessionLock(source.source_name, **pls_session_lock_kwargs())
                 try:
                     await lock.acquire()
                 except SessionLockHeld:
