@@ -2462,7 +2462,18 @@ def _journal_script(grids, *, default_rows):
     sc.page(("goto", settings.PLS_CHECK_URL), JOURNAL_FORM_CHECK_PAGE)
     sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(default_rows))
     for value, rows in grids.items():
-        sc.page(("search", (("reporter", value),)), _archived_grid_html(rows), url=settings.PLS_SEARCH_URL)
+        # This synthetic journal grid contains the complete row set. Supply an
+        # explicit current-page total, as the authenticated compact-grid reader
+        # does when it has independently confirmed the grid size. A bare short
+        # HTML snapshot is not evidence of end-of-grid completeness.
+        sc.routes[("search", (("reporter", value),))] = (
+            lambda _browser, rows=rows: PageResult(
+                url=settings.PLS_SEARCH_URL,
+                html=_archived_grid_html(rows),
+                status=200,
+                metadata={"total_rows": len(rows), "start_row": 0, "seek_mode": "dom_absolute"},
+            )
+        )
         for citation, title, _court, detail_url in rows:
             sc.page(("goto", detail_url), judgment_html(citation, title=title))
     return sc
