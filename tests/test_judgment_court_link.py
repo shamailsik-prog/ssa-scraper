@@ -146,9 +146,14 @@ async def test_consistency_limit_does_not_hide_real_mismatch(db):
     """Normalized alias candidates must not consume the SQL/display limit."""
     from scraper.judgment_court_consistency import find_judgment_court_mismatches
 
-    ap = Court(name="Andhra Pradesh High Court, India", short_code="AP_HC_LIMIT_TEST", court_level="high")
-    pk = Court(name="Supreme Court of Pakistan", short_code="SC_PAK_LIMIT_TEST", court_level="supreme")
-    db.add_all([ap, pk])
+    ap = (await db.execute(select(Court).where(Court.name == "Andhra Pradesh High Court, India"))).scalars().first()
+    if ap is None:
+        ap = Court(name="Andhra Pradesh High Court, India", short_code="AP_HC_LIMIT_TEST", court_level="high")
+        db.add(ap)
+    pk = (await db.execute(select(Court).where(Court.name == "Supreme Court of Pakistan"))).scalars().first()
+    if pk is None:
+        pk = Court(name="Supreme Court of Pakistan", short_code="SC_PAK_LIMIT_TEST", court_level="supreme")
+        db.add(pk)
     await db.flush()
     alias_id = uuid4()
     mismatch_id = uuid4()
