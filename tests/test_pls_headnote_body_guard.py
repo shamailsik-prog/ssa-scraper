@@ -19,6 +19,7 @@ from scraper.tasks.promotion import canonical_text_hash, promote_judgment_stagin
 from scraper.tasks.judgment_headnote_body_scan import (
     apply_headnote_body_quarantine,
     find_headnote_only_promoted,
+    run_headnote_body_scan,
     undo_headnote_body_scan,
 )
 from scraper.tasks.pakistanlawsite import quarantined_capture_retryable
@@ -36,6 +37,13 @@ def _long_headnote_over_5k() -> str:
     return head + ("z" * 5200) + "\nDate(s) of hearing:" + tail
 
 
+def _pad_fixture_to_full_ready(name: str) -> str:
+    text = _read(name).rstrip()
+    if len(text) >= 5000:
+        return text
+    return text + "\n" + ("x" * (5200 - len(text)))
+
+
 def test_mutant_headnote_body_guard_default_off():
     assert Settings.model_fields["SSA_PLS_HEADNOTE_BODY_GUARD"].default is False
 
@@ -49,6 +57,25 @@ def test_detect_long_headnote_after_hearing_date_line():
 
 def test_short_scmr_order_with_judgment_marker_not_flagged():
     assert detect_headnote_only_no_body(_read("scmr_312_short_order.txt")) is None
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "scmr_717_1999_shape.txt",
+        "plc_344_1992_shape.txt",
+        "pld_2016_lahore_539_shape.txt",
+    ],
+)
+def test_known_full_judgment_shapes_not_flagged(fixture_name):
+    assert detect_headnote_only_no_body(_pad_fixture_to_full_ready(fixture_name)) is None
+
+
+def test_m2_narrative_party_mention_without_counsel_line_not_flagged(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", True)
+    text = _pad_fixture_to_full_ready("m2_narrative_party_mention_shape.txt")
+    assert detect_headnote_only_no_body(text) is None
+    assert judgment_is_full_ready(text, ["Example Judge"])
 
 
 def test_judgment_is_full_ready_rejects_long_headnote_when_guard_on(monkeypatch):
@@ -142,12 +169,103 @@ async def test_scan_apply_and_undo_document_quarantine(db, monkeypatch):
     ).scalars().first() is None
 
 
-def test_capture_modal_script_waits_for_body_marker_not_reporter_prefix():
+@pytest.mark.asyncio
+async def test_run_headnote_scan_apply_refuses_when_flag_off(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False)
+    out = await run_headnote_body_scan(apply=True)
+    assert out.get("error")
+    assert "SSA_PLS_HEADNOTE_BODY_GUARD" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_undo_headnote_scan_without_redis_metadata_deletes_by_run_id(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", True)
+    jid = uuid4()
+    run_id = "expiredmeta1"
+    text = _long_headnote_over_5k()
+    db.add(
+        Judgment(
+            id=jid,
+            source_name="PakistanLawSite",
+            court_name="Lahore High Court",
+            canonical_citation="PLD 1991 Lahore 201",
+            case_title="Undo fallback",
+            full_text=text,
+            full_text_hash=canonical_text_hash(text),
+            judge_names=["Abdul Qadeer Chaudhry"],
+            access_method="rendered_copy",
+        )
+    )
+    db.add(
+        DocumentQuarantine(
+            doc_type="judgment",
+            doc_id=jid,
+            run_id=run_id,
+            reason="headnote_only: no_body_after_hearing_or_counsel",
+        )
+    )
+    await db.commit()
+    removed = await undo_headnote_body_scan(db, run_id)
+    assert removed == 1
+
+
+@pytest.mark.asyncio
+async def test_undo_headnote_scan_leaves_other_runs_alone(db, monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", True)
+    text = _long_headnote_over_5k()
+    jid_a, jid_b = uuid4(), uuid4()
+    run_a, run_b = "run_a_only", "run_b_keep"
+    for jid, cite in ((jid_a, "PLD 1991 Lahore 301"), (jid_b, "PLD 1991 Lahore 302")):
+        db.add(
+            Judgment(
+                id=jid,
+                source_name="PakistanLawSite",
+                court_name="Lahore High Court",
+                canonical_citation=cite,
+                case_title="M5 isolation",
+                full_text=text,
+                full_text_hash=canonical_text_hash(text),
+                judge_names=["Abdul Qadeer Chaudhry"],
+                access_method="rendered_copy",
+            )
+        )
+    db.add(
+        DocumentQuarantine(
+            doc_type="judgment",
+            doc_id=jid_a,
+            run_id=run_a,
+            reason="headnote_only: no_body_after_hearing_or_counsel",
+        )
+    )
+    db.add(
+        DocumentQuarantine(
+            doc_type="judgment",
+            doc_id=jid_b,
+            run_id=run_b,
+            reason="headnote_only: no_body_after_hearing_or_counsel",
+        )
+    )
+    await db.commit()
+    removed = await undo_headnote_body_scan(db, run_a)
+    await db.commit()
+    assert removed >= 1
+    left = (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == jid_b))
+    ).scalars().first()
+    assert left is not None
+    assert left.run_id == run_b
+
+
+def test_capture_modal_script_waits_for_body_marker_when_flag_on():
     import inspect
 
     from scraper.auth import session_manager
 
     source = inspect.getsource(session_manager.PlaywrightBrowser._capture_case_description_modal)
+    assert "waitForBody" in source
     assert "bodyMarker" in source
-    assert "CLC|SCMR|PLD" not in source
     assert "stableReads" in source
+    assert "text.length >= 600" in source
+    assert "stableReads >= 4" in source
+    assert "for (let i = 0; i < maxPolls; i += 1)" in source
+    assert "maxPolls = waitForBody ? 80 : 80" in source

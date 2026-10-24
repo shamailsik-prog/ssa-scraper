@@ -1156,9 +1156,10 @@ class PlaywrightBrowser:
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
         wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)
+        wait_for_body = bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False))
         return await self._wrap(
             self._page.evaluate(
-                """async ({ waitMs }) => {
+                """async ({ waitMs, waitForBody }) => {
                 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                 const findTrigger = () => document.querySelector(
                     'input.caseDescription[value="Case Description"], input.caseDescription'
@@ -1196,19 +1197,28 @@ class PlaywrightBrowser:
                 const bodyMarker = /(?:^|\\n)\\s*(?:JUDGMENT|JUDGEMENT|ORDER)\\b/i;
                 let lastLen = 0;
                 let stableReads = 0;
-                for (let i = 0; i < 120; i += 1) {
+                const maxPolls = waitForBody ? 80 : 80;
+                for (let i = 0; i < maxPolls; i += 1) {
                     modal = document.querySelector('#ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
-                    if (bodyMarker.test(text)) {
-                        break;
-                    }
-                    if (text.length >= 2000 && text.length === lastLen) {
-                        stableReads += 1;
-                        if (stableReads >= 3) {
+                    if (waitForBody) {
+                        if (bodyMarker.test(text)) {
                             break;
                         }
+                        if (text.length >= 600 && text.length === lastLen) {
+                            stableReads += 1;
+                            if (stableReads >= 4) {
+                                break;
+                            }
+                        } else {
+                            stableReads = 0;
+                        }
                     } else {
-                        stableReads = 0;
+                        const hasBeforeMarker = /Before.+/i.test(text);
+                        const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
+                        if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
+                            break;
+                        }
                     }
                     lastLen = text.length;
                     await sleep(150);
@@ -1220,7 +1230,7 @@ class PlaywrightBrowser:
                     case_description_modal_text_length: text.length,
                 };
             }""",
-                {"waitMs": wait_ms},
+                {"waitMs": wait_ms, "waitForBody": wait_for_body},
             )
         )
 

@@ -78,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Report promoted PLS judgments with counsel/hearing metadata but no judgment body (dry-run by default)",
     )
     hn.add_argument("--apply", action="store_true", help="Insert document_quarantine rows for matches")
+    hn.add_argument("--force", action="store_true", help="Allow --apply when SSA_PLS_HEADNOTE_BODY_GUARD is off")
     hn.add_argument("--undo", metavar="RUN_ID", default="", help="Remove quarantine rows from a prior --apply run")
     hn.add_argument("--limit", type=int, default=None)
     args = parser.parse_args(argv)
@@ -134,7 +135,13 @@ def main(argv: list[str] | None = None) -> int:
         from scraper.tasks.judgment_headnote_body_scan import run_headnote_body_scan
 
         undo = (args.undo or "").strip() or None
-        print(json.dumps(run_async(run_headnote_body_scan(apply=args.apply, undo=undo, limit=args.limit)), indent=2, default=str))
+        print(
+            json.dumps(
+                run_async(run_headnote_body_scan(apply=args.apply, undo=undo, limit=args.limit, force=args.force)),
+                indent=2,
+                default=str,
+            )
+        )
         return 0
     if args.command == "grid-report":
         import json

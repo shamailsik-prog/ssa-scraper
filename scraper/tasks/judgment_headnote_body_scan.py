@@ -17,6 +17,8 @@ from scraper.models import DocumentQuarantine, Judgment
 
 SOURCE_NAME = "PakistanLawSite"
 RUN_META_PREFIX = "judgment_headnote_body_scan:"
+HEADNOTE_BODY_SCAN_REASON_PREFIX = "headnote_only"
+_SCAN_PAGE_SIZE = 250
 
 
 def _run_meta_key(run_id: str) -> str:
@@ -31,29 +33,35 @@ async def find_headnote_only_promoted(
     stmt = (
         select(Judgment.id, Judgment.canonical_citation, Judgment.full_text)
         .where(Judgment.source_name == SOURCE_NAME)
-        .order_by(Judgment.promoted_at.desc().nullslast())
+        .order_by(Judgment.promoted_at.desc().nullslast(), Judgment.id.desc())
+        .execution_options(yield_per=_SCAN_PAGE_SIZE)
     )
-    if limit is not None:
-        stmt = stmt.limit(int(limit))
     fixes: List[Dict[str, str]] = []
     scanned = 0
-    for jid, citation, full_text in (await db.execute(stmt)).all():
-        scanned += 1
-        signal = detect_headnote_only_no_body(full_text)
-        if signal is None:
-            continue
-        fixes.append(
-            {
-                "id": str(jid),
-                "canonical_citation": citation or "",
-                "reason": guard_reason(signal),
-                "signal": signal.signal,
-            }
-        )
+    stream = await db.stream(stmt)
+    try:
+        async for row in stream:
+            if limit is not None and scanned >= int(limit):
+                break
+            jid, citation, full_text = row
+            scanned += 1
+            signal = detect_headnote_only_no_body(full_text)
+            if signal is None:
+                continue
+            fixes.append(
+                {
+                    "id": str(jid),
+                    "canonical_citation": citation or "",
+                    "reason": guard_reason(signal),
+                    "signal": signal.signal,
+                }
+            )
+    finally:
+        await stream.close()
     return {"scanned": scanned, "count": len(fixes), "fixes": fixes}
 
 
-async def _record_run(db: AsyncSession, run_id: str, doc_ids: List[UUID]) -> None:
+async def _record_run(run_id: str, doc_ids: List[UUID]) -> None:
     import redis.asyncio as aioredis
 
     payload = {
@@ -88,13 +96,25 @@ async def apply_headnote_body_quarantine(db: AsyncSession, run_id: str, fixes: L
                 doc_type="judgment",
                 doc_id=jid,
                 run_id=run_id,
-                reason=(row.get("reason") or "headnote_only: no_body_after_hearing_or_counsel")[:500],
+                reason=(row.get("reason") or f"{HEADNOTE_BODY_SCAN_REASON_PREFIX}: no_body_after_hearing_or_counsel")[:500],
                 quarantined_at=now,
             )
         )
         applied.append(jid)
-    await _record_run(db, run_id, applied)
+    await _record_run(run_id, applied)
     return len(applied)
+
+
+async def _delete_quarantine_by_run_id(db: AsyncSession, run_id: str, *, doc_ids: Optional[List[UUID]] = None) -> int:
+    stmt = delete(DocumentQuarantine).where(
+        DocumentQuarantine.doc_type == "judgment",
+        DocumentQuarantine.run_id == run_id,
+        DocumentQuarantine.reason.like(f"{HEADNOTE_BODY_SCAN_REASON_PREFIX}%"),
+    )
+    if doc_ids:
+        stmt = stmt.where(DocumentQuarantine.doc_id.in_(doc_ids))
+    result = await db.execute(stmt)
+    return int(result.rowcount or 0)
 
 
 async def undo_headnote_body_scan(db: AsyncSession, run_id: str) -> int:
@@ -105,20 +125,12 @@ async def undo_headnote_body_scan(db: AsyncSession, run_id: str) -> int:
         raw = await client.get(_run_meta_key(run_id))
     finally:
         await client.aclose()
-    if not raw:
-        return 0
-    payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-    doc_ids = [UUID(x) for x in payload.get("doc_ids") or []]
-    if not doc_ids:
-        return 0
-    result = await db.execute(
-        delete(DocumentQuarantine).where(
-            DocumentQuarantine.doc_type == "judgment",
-            DocumentQuarantine.run_id == run_id,
-            DocumentQuarantine.doc_id.in_(doc_ids),
-        )
-    )
-    return int(result.rowcount or 0)
+    if raw:
+        payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        doc_ids = [UUID(x) for x in payload.get("doc_ids") or []]
+        if doc_ids:
+            return await _delete_quarantine_by_run_id(db, run_id, doc_ids=doc_ids)
+    return await _delete_quarantine_by_run_id(db, run_id)
 
 
 async def run_headnote_body_scan(
@@ -126,6 +138,7 @@ async def run_headnote_body_scan(
     apply: bool = False,
     undo: Optional[str] = None,
     limit: Optional[int] = None,
+    force: bool = False,
 ) -> Dict[str, Any]:
     from scraper.database import SessionLocal
 
@@ -134,6 +147,11 @@ async def run_headnote_body_scan(
             removed = await undo_headnote_body_scan(db, undo)
             await db.commit()
             return {"undo": undo, "removed": removed}
+    if apply and not bool(getattr(settings, "SSA_PLS_HEADNOTE_BODY_GUARD", False)) and not force:
+        return {
+            "error": "SSA_PLS_HEADNOTE_BODY_GUARD is off; enable the flag or pass --force to apply",
+            "dry_run": True,
+        }
     async with SessionLocal() as db:
         report = await find_headnote_only_promoted(db, limit=limit)
         if not apply:
