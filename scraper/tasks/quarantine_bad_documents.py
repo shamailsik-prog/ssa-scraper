@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 
 STATUTE_QUARANTINE_REASON = "b7_bad_document:no_parseable_sections"
 JUDGMENT_QUARANTINE_REASON = "b7_bad_document:empty_or_short_text"
-MIN_JUDGMENT_TEXT_CHARS = 140
+from scraper.judgment_min_body import LEGACY_DOCUMENT_VALIDATION_MIN_CHARS, judgment_min_body_chars
+
+# Static SQL templates use the legacy floor; runtime counts/apply use judgment_min_body_chars().
+MIN_JUDGMENT_TEXT_CHARS = LEGACY_DOCUMENT_VALIDATION_MIN_CHARS
 LATEST_RUN_KEY = "b7_quarantine_latest_run_id"
 
 
@@ -113,16 +116,49 @@ async def _table_snapshot(db: AsyncSession) -> List[Dict[str, Any]]:
     ]
 
 
+def _judgment_short_sql(min_chars: int) -> str:
+    return f"""
+SELECT COUNT(*)::bigint AS n
+FROM judgment j
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'judgment' AND dq.doc_id = j.id
+  )
+  AND (
+    j.full_text IS NULL
+    OR length(btrim(j.full_text)) < {min_chars}
+  )
+"""
+
+
+def _judgment_short_by_reporter_sql(min_chars: int) -> str:
+    return f"""
+SELECT COALESCE(j.reporter, '(null)') AS document_type, COUNT(*)::bigint AS n
+FROM judgment j
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_quarantine dq
+    WHERE dq.doc_type = 'judgment' AND dq.doc_id = j.id
+  )
+  AND (
+    j.full_text IS NULL
+    OR length(btrim(j.full_text)) < {min_chars}
+  )
+GROUP BY COALESCE(j.reporter, '(null)')
+ORDER BY n DESC
+"""
+
+
 async def bad_document_counts(db: AsyncSession) -> Dict[str, Any]:
+    min_j_chars = judgment_min_body_chars()
     statute_total = int((await db.execute(text(BAD_STATUTE_COUNT_SQL))).scalar() or 0)
-    judgment_total = int((await db.execute(text(BAD_JUDGMENT_COUNT_SQL))).scalar() or 0)
+    judgment_total = int((await db.execute(text(_judgment_short_sql(min_j_chars)))).scalar() or 0)
     statute_by_type = [
         {"document_type": row.document_type, "count": int(row.n)}
         for row in (await db.execute(text(BAD_STATUTE_BY_TYPE_SQL))).all()
     ]
     judgment_by_type = [
         {"document_type": row.document_type, "count": int(row.n)}
-        for row in (await db.execute(text(BAD_JUDGMENT_BY_REPORTER_SQL))).all()
+        for row in (await db.execute(text(_judgment_short_by_reporter_sql(min_j_chars)))).all()
     ]
     return {
         "statute_bad_rows": statute_total,
@@ -137,7 +173,7 @@ async def bad_document_counts(db: AsyncSession) -> Dict[str, Any]:
             "statute_by_type": BAD_STATUTE_BY_TYPE_SQL.strip(),
             "judgment_by_reporter": BAD_JUDGMENT_BY_REPORTER_SQL.strip(),
         },
-        "min_judgment_text_chars": MIN_JUDGMENT_TEXT_CHARS,
+        "min_judgment_text_chars": min_j_chars,
     }
 
 
@@ -180,6 +216,7 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
         )
         statutes_inserted += 1
 
+    min_j_chars = judgment_min_body_chars()
     judgment_ids = (
         await db.execute(
             text(
@@ -192,7 +229,7 @@ async def apply_quarantine(db: AsyncSession) -> Dict[str, Any]:
                   )
                   AND (
                     j.full_text IS NULL
-                    OR length(btrim(j.full_text)) < {MIN_JUDGMENT_TEXT_CHARS}
+                    OR length(btrim(j.full_text)) < {min_j_chars}
                   )
                 """
             )

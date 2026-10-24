@@ -319,12 +319,19 @@ def reconcile_judgment(
         conf = min(conf, 0.4)
     conf = max(0.0, min(1.0, round(conf, 3)))
     out["extractor_confidence"] = conf
+    from scraper.reconcile_quality import first_blocking_reconcile_error
+
+    blocking_reconcile = first_blocking_reconcile_error(errors)
+    from scraper.config import settings as _settings
+
+    reconcile_error_quarantine = bool(getattr(_settings, "SSA_RECONCILE_ERROR_QUARANTINE", False)) and blocking_reconcile
     quarantine = (
         stub_signal is not None
         or conf < min_confidence
         or not out["citations"]
         or not out.get("court")
         or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
+        or reconcile_error_quarantine
     )
     reason = None
     if quarantine:
@@ -336,6 +343,8 @@ def reconcile_judgment(
             reason = "court unknown"
         elif any(c["field"] == "primary_citation" for c in conflicts):
             reason = "citation conflict between deterministic parser and AI"
+        elif reconcile_error_quarantine and blocking_reconcile:
+            reason = f"reconcile error: {blocking_reconcile}"
         else:
             reason = f"confidence {conf} below threshold {min_confidence}"
     return ValidationOutcome(out, conf, conflicts, errors, quarantine, reason)
