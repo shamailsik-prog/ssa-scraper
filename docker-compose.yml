@@ -59,13 +59,14 @@ services:
       retries: 5
       start_period: 40s
 
-  # Public sources, promotion, treatment, archive mirror, reconcile and dispatch (specification 1).
+  # Public sources, treatment, archive mirror, reconcile and dispatch (specification 1).
+  # `promote` is included as a rollout fallback when worker-promote is not up yet.
   worker-public:
     <<: *app
     depends_on:
       api:
         condition: service_healthy
-    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance --concurrency=2 -n scraper-public@%h --loglevel=INFO --max-memory-per-child=${CELERY_PUBLIC_MAX_MEMORY_KB:-1258291}
+    command: celery -A scraper.tasks.celery_app worker -Q scraper,maintenance,promote --concurrency=2 -n scraper-public@%h --loglevel=INFO --max-memory-per-child=${CELERY_PUBLIC_MAX_MEMORY_KB:-1258291}
     healthcheck:
       test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d scraper-public@$(hostname) --timeout 10 | grep -q pong"]
       interval: 30s
@@ -73,8 +74,21 @@ services:
       retries: 5
       start_period: 40s
 
-  # Dedicated capacity for dispatch, promotion and the archive mirror, so long public-source jobs on
-  # worker-public can never hold them up (worker-public still serves this queue as a fallback).
+  worker-promote:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+    command: celery -A scraper.tasks.celery_app worker -Q promote --concurrency=${CELERY_PROMOTE_CONCURRENCY:-1} -n promote@%h --loglevel=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A scraper.tasks.celery_app inspect ping -d promote@$(hostname) --timeout 10 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  # Dedicated capacity for dispatch and the archive mirror, so long public-source jobs on
+  # worker-public can never hold them up (worker-public still serves maintenance/promote as fallback).
   worker-maintenance:
     <<: *app
     depends_on:

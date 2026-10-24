@@ -305,6 +305,22 @@ class Settings(BaseSettings):
         default=True,
         description="Event-driven chain: a committed fetch batch enqueues promotion, and a promotion that saved something enqueues the archive mirror (debounced). Beat stays the safety net.",
     )
+    SSA_PROMOTE_DEDICATED_QUEUE_ENABLED: bool = Field(
+        default=False,
+        description="When true, route promote_staging_records to the dedicated promote Celery queue (worker-promote / sikander-worker-promote on Render). Default false keeps promotion on maintenance until a promote worker is deployed.",
+    )
+    PROMOTION_STALE_ALERT_ENABLED: bool = Field(
+        default=True,
+        description="Notify when promotions stall while extracted staging rows are waiting (queue backlog / worker isolation).",
+    )
+    PROMOTION_STALE_PROMOTION_MINUTES: float = Field(
+        default=15.0,
+        description="Alert when the newest judgment promoted_at is older than this many minutes.",
+    )
+    PROMOTION_STALE_EXTRACTED_MIN_AGE_MINUTES: float = Field(
+        default=10.0,
+        description="Only count extracted staging rows at least this old toward a promotion-stale alert.",
+    )
     DISPATCH_DEDUPE_ENABLED: bool = Field(
         default=True,
         description="The dispatcher does not queue a public source again while a job it queued for that source has not started yet.",
@@ -562,6 +578,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------- treatment
     TREATMENT_MODEL: str = Field(default="", description="External classifier for PUBLIC residue. Blank = deterministic only.")
     TREATMENT_MIN_CONFIDENCE: float = Field(default=0.7)
+    CLASSIFY_TREATMENT_SOFT_TIME_LIMIT: int = Field(
+        default=240,
+        description="Soft wall-clock limit (seconds) for classify_treatment; partial rows already committed are kept.",
+    )
+    CLASSIFY_TREATMENT_BATCH: int = Field(
+        default=200,
+        description="Default batch size for classify_treatment (Beat and task kwargs override when set).",
+    )
     LOCAL_TREATMENT_BASE_URL: str = Field(default="", description="On-prem OpenAI-compatible endpoint for login_session residue.")
     LOCAL_TREATMENT_MODEL: str = Field(default="")
     LOCAL_TREATMENT_API_KEY: SecretStr = Field(default=SecretStr(""))

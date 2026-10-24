@@ -44,7 +44,9 @@ def test_request_promotion_is_debounced_per_source(chain_on):
     assert [s["kwargs"].get("source_name") for s in chain_on] == ["PakistanLawSite", "SupremeCourt"]
     first = chain_on[0]
     assert first["name"] == "scraper.tasks.promotion.promote_staging_records"
-    assert first["queue"] == "maintenance"
+    from scraper.celery_queues import promote_task_queue
+
+    assert first["queue"] == promote_task_queue()
     assert first["kwargs"]["limit"] == 200
     assert first["countdown"] > 0  # the staging commit lands before the run
 

@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from scraper.celery_queues import promote_task_queue
 from scraper.config import settings
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,12 @@ PROMOTE_WINDOW_SECONDS = 30
 MIRROR_WINDOW_SECONDS = 60
 PROMOTE_TASK = "scraper.tasks.promotion.promote_staging_records"
 MIRROR_TASK = "scraper.tasks.archive_mirror.mirror_pending"
-QUEUE = "maintenance"  # the queue Beat's promote-staging and archive-mirror entries route to
+
+def _promote_queue() -> str:
+    return promote_task_queue()
+
+
+MIRROR_QUEUE = "maintenance"  # archive mirror stays on maintenance
 BATCH_LIMIT = 200  # same batch size as the Beat entries
 
 _PENDING_INFO_KEY = "corpus_chain_promote_sources"
@@ -59,7 +65,8 @@ def _request(key: str, window: int, task_name: str, kwargs: Dict[str, Any]) -> b
             return False
         from scraper.tasks.celery_app import app
 
-        app.send_task(task_name, kwargs=kwargs, queue=QUEUE, countdown=window)
+        queue = _promote_queue() if task_name == PROMOTE_TASK else MIRROR_QUEUE
+        app.send_task(task_name, kwargs=kwargs, queue=queue, countdown=window)
         return True
     except Exception as exc:
         logger.warning("chain: %s not enqueued (Beat will pick the work up): %s", task_name, exc)
