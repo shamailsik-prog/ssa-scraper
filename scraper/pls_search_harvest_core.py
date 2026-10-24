@@ -335,18 +335,30 @@ def search_harvest_may_mark_done_unlinked(
     rows_seen: int,
     rows_known: int,
     rows_unlinked: int,
+    pagination_confirmed: bool = False,
 ) -> Tuple[bool, str]:
-    """When pagination ends short of site_total, allow done_unlinked only if unlinked explains the shortfall
-    within the rows_seen-rows_known budget (no site_total credit in search_harvest_may_mark_done)."""
-    if site_total is None or rows_seen >= int(site_total):
+    """Mark done_unlinked only after confirmed last page when every seen row is known or linkless and the
+    site shortfall equals the linkless count (within the 5%/25 safety cap)."""
+    if not pagination_confirmed or rows_unlinked <= 0:
         return False, ""
-    shortfall = int(site_total) - int(rows_seen)
-    credit = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
-    if shortfall > credit or credit <= 0:
+    if unlinked_done_safety_error(rows_seen, rows_unlinked):
         return False, ""
+    seen_unknown = int(rows_seen) - int(rows_known)
+    if seen_unknown != int(rows_unlinked):
+        return False, ""
+    if site_total is not None:
+        if rows_seen >= int(site_total):
+            return False, ""
+        shortfall = int(site_total) - int(rows_seen)
+        if shortfall != int(rows_unlinked):
+            return False, ""
+    else:
+        gap = compute_gap_size(None, rows_known, rows_seen, rows_unlinked=rows_unlinked)
+        if gap != int(rows_unlinked):
+            return False, ""
     return (
         True,
-        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url explain shortfall {shortfall}",
+        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url explain the remaining gap",
     )
 
 

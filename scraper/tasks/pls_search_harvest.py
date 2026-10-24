@@ -272,7 +272,17 @@ async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> D
     cap = int(getattr(settings, "PLS_SEARCH_RESULT_CAP", 500) or 500)
     capped_open = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done", PlsSearchHarvestQuery.site_total_results >= cap))).scalar() or 0)
     exhausted = int((await db.execute(select(func.count()).select_from(PlsSearchHarvestQuery).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "failed", PlsSearchHarvestQuery.last_error.ilike("%exhausted%")))).scalar() or 0)
-    totals = (await db.execute(select(func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0), func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0)).where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, PlsSearchHarvestQuery.status == "done"))).one()
+    totals = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(PlsSearchHarvestQuery.site_total_results), 0),
+                func.coalesce(func.sum(PlsSearchHarvestQuery.rows_known), 0),
+            ).where(
+                PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
+            )
+        )
+    ).one()
     page_rows = (await db.execute(select(Citation.reporter, Citation.year, Citation.page).join(Judgment, Judgment.id == Citation.judgment_id).where(Judgment.source_name == SOURCE_NAME, Citation.is_primary.is_(True), Citation.page.isnot(None)))).all()
     by_ry: Dict[Any, List[int]] = {}
     for rep, yr, pg in page_rows:
@@ -810,6 +820,7 @@ class SearchHarvestRunner:
                         rows_seen=rows_seen,
                         rows_known=rows_known,
                         rows_unlinked=rows_unlinked,
+                        pagination_confirmed=confirmed_last or pages_done > 0,
                     )
                 if done_unlinked:
                     safety = unlinked_done_safety_error(rows_seen, rows_unlinked)

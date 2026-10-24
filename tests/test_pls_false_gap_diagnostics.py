@@ -55,17 +55,26 @@ def test_may_mark_done_ignores_unlinked():
 
 def test_done_unlinked_requires_shortfall_within_credit():
     ok, reason = search_harvest_may_mark_done_unlinked(
-        site_total=100,
-        rows_seen=90,
-        rows_known=70,
-        rows_unlinked=10,
-    )
-    assert ok is True and "shortfall" in reason
-    assert search_harvest_may_mark_done_unlinked(
-        site_total=100,
-        rows_seen=90,
-        rows_known=70,
+        site_total=200,
+        rows_seen=195,
+        rows_known=190,
         rows_unlinked=5,
+        pagination_confirmed=True,
+    )
+    assert ok is True and "unmatched" in reason
+    assert search_harvest_may_mark_done_unlinked(
+        site_total=300,
+        rows_seen=290,
+        rows_known=0,
+        rows_unlinked=10,
+        pagination_confirmed=True,
+    )[0] is False
+    assert search_harvest_may_mark_done_unlinked(
+        site_total=200,
+        rows_seen=195,
+        rows_known=190,
+        rows_unlinked=3,
+        pagination_confirmed=True,
     )[0] is False
 
 
