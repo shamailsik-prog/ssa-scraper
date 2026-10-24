@@ -139,3 +139,67 @@ async def test_consistency_report_splits_null_and_mismatch(db):
     report = await consistency_report(db)
     assert report["null_court_id_count"] >= 1
     assert report["real_mismatch_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_consistency_limit_does_not_hide_real_mismatch(db):
+    """Normalized alias candidates must not consume the SQL/display limit."""
+    from scraper.judgment_court_consistency import find_judgment_court_mismatches
+
+    ap = (await db.execute(select(Court).where(Court.name == "Andhra Pradesh High Court, India"))).scalars().first()
+    if ap is None:
+        ap = Court(name="Andhra Pradesh High Court, India", short_code="AP_HC_LIMIT_TEST", court_level="high")
+        db.add(ap)
+    pk = (await db.execute(select(Court).where(Court.name == "Supreme Court of Pakistan"))).scalars().first()
+    if pk is None:
+        pk = Court(name="Supreme Court of Pakistan", short_code="SC_PAK_LIMIT_TEST", court_level="supreme")
+        db.add(pk)
+    await db.flush()
+    alias_id = uuid4()
+    mismatch_id = uuid4()
+    db.add_all([
+        Judgment(
+            id=alias_id,
+            source_name="PakistanLawSite",
+            court_name="ANDHRA-PRADESH-HIGH-COURT-INDIA",
+            court_id=ap.id,
+            canonical_citation="0000 CLC 1",
+            full_text="x" * 500,
+            full_text_hash="consistency_alias_limit",
+            access_method="rendered_copy",
+        ),
+        Judgment(
+            id=mismatch_id,
+            source_name="PakistanLawSite",
+            court_name="Supreme Court of Bangladesh",
+            court_id=pk.id,
+            canonical_citation="0000 CLC 2",
+            full_text="x" * 500,
+            full_text_hash="consistency_true_mismatch_limit",
+            access_method="rendered_copy",
+        ),
+    ])
+    db.add(
+        Judgment(
+            id=uuid4(),
+            source_name="PakistanLawSite",
+            court_name="Federal Shariat Court",
+            court_id=None,
+            canonical_citation="0000 CLC 0",
+            full_text="x" * 500,
+            full_text_hash="consistency_null_separate",
+            access_method="rendered_copy",
+        )
+    )
+    await db.commit()
+    matches = await find_judgment_court_mismatches(db, limit=1)
+    assert len(matches) == 1
+    assert matches[0]["id"] == str(mismatch_id)
+    report = await consistency_report(db, limit=1)
+    assert report["null_court_id_count"] == 1
+    assert report["real_mismatch_count"] == 1
+    assert len(report["mismatches"]) == 1
+    assert report["mismatches"][0]["id"] == str(mismatch_id)
+    zero_display = await consistency_report(db, limit=0)
+    assert zero_display["real_mismatch_count"] == 1
+    assert zero_display["mismatches"] == []
