@@ -155,9 +155,18 @@ def parse_pls_header_court(text: Optional[str]) -> Optional[str]:
         return None
     m = _PLS_COURT_LINE.search(header)
     if not m:
-        bracket = re.search(r"^\s*\[([A-Za-z][A-Za-z\s&]+)\]\s*$", header, re.M)
+        bracket = re.search(
+            r"^\s*\[((?:Supreme|High)\s+Court[^\]]+|[^\]]{2,80})\]\s*$",
+            header,
+            re.M | re.I,
+        )
         if bracket:
-            return bracket.group(1).strip()
+            label = re.sub(r"\s+", " ", bracket.group(1)).strip()
+            if re.search(r"(?i)\b(?:india|bangladesh|england|u\.?k|sri\s+lanka)\b", label):
+                return label
+            if re.search(r"(?i)\b(?:supreme|high)\s+court\b", label):
+                return label
+            return label.strip()
         return None
     name = re.sub(r"\s+", " ", m.group(1)).strip()
     if name.upper() == "SUPREME COURT OF PAKISTAN":

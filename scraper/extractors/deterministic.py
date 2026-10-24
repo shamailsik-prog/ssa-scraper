@@ -241,6 +241,14 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     elif hint_court:
         court = hint_court
         evidence["court"] = f"result row: {hint}"
+    from scraper.config import settings
+    from scraper.parsers.pls_court_resolution import is_default_supreme_court_of_pakistan, resolve_pls_court
+
+    if settings.SSA_PLS_COURT_RESOLUTION and is_default_supreme_court_of_pakistan(court):
+        resolved = resolve_pls_court(court, raw_text, citation_end=own_end)
+        if resolved and resolved != court:
+            evidence["court"] = (evidence.get("court") or "") + f" -> resolved: {resolved}"
+            court = resolved
     if not court and own_end is not None:
         # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]";
         # that bracket is this judgment's court, ahead of the court of a case it cites further down
