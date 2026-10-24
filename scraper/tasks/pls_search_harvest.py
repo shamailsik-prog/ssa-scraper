@@ -17,7 +17,6 @@ from sqlalchemy import false, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
-    BrowserDisconnected,
     LoginRequired,
     SessionLock,
     SessionLockHeld,
@@ -1025,8 +1024,6 @@ async def _run_search_harvest_locked(
             query_row.last_error = str(exc)[:1000]
         await db.commit()
         return {"paused": True, "slot": chosen, "reason": str(exc), "query_key": query_row.query_key if query_row else None}
-    except BrowserDisconnected as exc:
-        return await _release_harvest_query_after_browser_fatal(db, query_row, chosen, exc)
     except Exception as exc:
         if is_playwright_harvest_browser_fatal(exc):
             return await _release_harvest_query_after_browser_fatal(db, query_row, chosen, exc)

@@ -377,6 +377,8 @@ def compute_stalled(
     threshold_hours: Optional[float] = None,
     saturation: Optional[Dict[str, Any]] = None,
     harvest_paused: bool = False,
+    source_state: str = "ACTIVE",
+    require_staging_and_promotion_idle: bool = False,
     search_harvest_locks_held: bool = False,
     last_staging_at: Optional[datetime] = None,
     search_harvest_lock_held_minutes: Optional[float] = None,
@@ -399,7 +401,15 @@ def compute_stalled(
     if last_staging_at is not None and last_staging_at.tzinfo is None:
         last_staging_at = last_staging_at.replace(tzinfo=timezone.utc)
     idle_hours = None if last_promotion_at is None else max(0.0, (now - last_promotion_at).total_seconds() / 3600.0)
-    stalled = idle_hours is None or idle_hours >= threshold
+    staging_idle_hours = None
+    if last_staging_at is not None:
+        staging_idle_hours = max(0.0, (now - last_staging_at).total_seconds() / 3600.0)
+    stall_promotion = idle_hours is None or idle_hours >= threshold
+    stall_staging = last_staging_at is None or staging_idle_hours >= threshold
+    if require_staging_and_promotion_idle and source_state == "ACTIVE" and not harvest_paused:
+        stalled = stall_promotion and stall_staging
+    else:
+        stalled = stall_promotion
     reason = None
     if stalled:
         if harvest_paused:
@@ -422,8 +432,10 @@ def compute_stalled(
         "stalled": bool(stalled),
         "stalled_reason": reason,
         "hours_since_last_judgment": None if idle_hours is None else round(idle_hours, 2),
+        "hours_since_last_staging": None if staging_idle_hours is None else round(staging_idle_hours, 2),
         "threshold_hours": threshold,
         "last_judgment_at": last_promotion_at.isoformat() if last_promotion_at else None,
+        "last_staging_at": last_staging_at.isoformat() if last_staging_at else None,
         "locks_held_no_staging": locks_held_no_staging,
         "minutes_since_last_staging": None if staging_idle_min is None else round(staging_idle_min, 2),
         "search_harvest_lock_held_minutes": None if lock_held_minutes is None else round(lock_held_minutes, 2),
@@ -474,12 +486,15 @@ def pls_stall_verdict_for_config(
     saturation = grid_saturation_view(cfg, now=now)
     paused = source_state != "ACTIVE" or bool(cfg.get("paused_by_admin"))
     threshold = stall_threshold_hours(source_state=source_state, harvest_paused=paused)
+    require_dual = source_state == "ACTIVE" and not paused
     return compute_stalled(
         last_promotion_at=last_promotion_at,
         now=now,
         threshold_hours=threshold,
         saturation=saturation,
         harvest_paused=paused,
+        source_state=source_state,
+        require_staging_and_promotion_idle=require_dual,
         search_harvest_locks_held=search_harvest_locks_held,
         last_staging_at=last_staging_at,
         search_harvest_lock_held_minutes=search_harvest_lock_held_minutes,
@@ -494,12 +509,11 @@ async def pls_stall_verdict_live(
     source_state: str,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    locks_held = False
-    last_staging = None
-    lock_held_minutes = None
-    if bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)):
-        locks_held, lock_held_minutes = await _search_harvest_lock_scan()
-        last_staging = await pls_last_staging_at(db)
+    last_staging = await pls_last_staging_at(db)
+    locks_held, lock_held_minutes = await _search_harvest_lock_scan()
+    if not bool(getattr(settings, "PLS_STALL_LOCK_HELD_NO_STAGING_ENABLED", False)):
+        lock_held_minutes = None
+        locks_held = False
     return pls_stall_verdict_for_config(
         cfg,
         last_promotion_at=last_promotion_at,

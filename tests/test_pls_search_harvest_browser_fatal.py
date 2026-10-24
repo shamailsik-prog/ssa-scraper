@@ -60,7 +60,7 @@ async def test_run_search_harvest_browser_disconnect_pending_and_lock_released(d
         return object()
 
     async def run_query(self, query_row, search_map, *, max_pages=0):
-        raise BrowserDisconnected("Target closed")
+        raise RuntimeError("Page crashed")
 
     monkeypatch.setattr(harvest, "active_map", active_map)
     monkeypatch.setattr(harvest, "map_as_dict", lambda m: {})

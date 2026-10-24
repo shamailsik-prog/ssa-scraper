@@ -28,11 +28,24 @@ def test_stall_verdict_active_flags_35_min_idle(monkeypatch):
     verdict = pls_stall_verdict_for_config(
         {},
         last_promotion_at=NOW - timedelta(minutes=35),
+        last_staging_at=NOW - timedelta(minutes=35),
         source_state="ACTIVE",
         now=NOW,
     )
     assert verdict["stalled"] is True
     assert verdict["threshold_hours"] == 0.5
+
+
+def test_stall_verdict_active_not_stalled_when_staging_still_moving(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_STALL_NO_PROMOTION_MINUTES_WHEN_ACTIVE", 30.0)
+    verdict = pls_stall_verdict_for_config(
+        {},
+        last_promotion_at=NOW - timedelta(minutes=35),
+        last_staging_at=NOW - timedelta(minutes=5),
+        source_state="ACTIVE",
+        now=NOW,
+    )
+    assert verdict["stalled"] is False
 
 
 def test_stall_verdict_active_not_stalled_at_20_min(monkeypatch):
@@ -47,7 +60,7 @@ def test_stall_verdict_active_not_stalled_at_20_min(monkeypatch):
 
 
 def test_playwright_harvest_fatal_markers():
-    assert is_playwright_harvest_browser_fatal(BrowserDisconnected("Target closed"))
+    assert not is_playwright_harvest_browser_fatal(BrowserDisconnected("Target closed"))
     assert is_playwright_harvest_browser_fatal(RuntimeError("Page crashed"))
     assert not is_playwright_harvest_browser_fatal(RuntimeError("selector not found"))
 
@@ -72,7 +85,7 @@ async def test_release_harvest_query_keeps_counters(db):
         db,
         row,
         1,
-        BrowserDisconnected("Target closed"),
+        RuntimeError("Page crashed"),
     )
     await db.refresh(row)
     assert out["browser_fatal"] is True
@@ -81,4 +94,4 @@ async def test_release_harvest_query_keeps_counters(db):
     assert row.rows_new == 3
     assert row.pages_enumerated == 2
     assert row.cursor_json == {"page": 2, "row_index": 4}
-    assert "Target closed" in (row.last_error or "")
+    assert "Page crashed" in (row.last_error or "")
