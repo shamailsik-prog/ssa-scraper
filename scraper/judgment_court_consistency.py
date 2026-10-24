@@ -64,8 +64,9 @@ async def find_judgment_court_mismatches(db: AsyncSession, *, limit: Optional[in
       )
     ORDER BY j.canonical_citation NULLS LAST
     """
-    if limit is not None:
-        q += f" LIMIT {int(limit)}"
+    # The SQL predicate is intentionally broader than court_labels_match:
+    # legacy aliases are normalized only in Python. Limiting SQL candidates
+    # first can return zero real mismatches while later mismatches remain.
     rows = (await db.execute(text(q))).all()
     out: List[Dict[str, Any]] = []
     for row in rows:
@@ -80,13 +81,21 @@ async def find_judgment_court_mismatches(db: AsyncSession, *, limit: Optional[in
                 "court_row_name": row.court_row_name or "",
             }
         )
+    if limit is not None:
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        return out[:limit]
     return out
 
 
 async def consistency_report(db: AsyncSession, *, limit: Optional[int] = None) -> Dict[str, Any]:
-    mismatches = await find_judgment_court_mismatches(db, limit=limit)
+    # Count every normalized mismatch independently of the display limit.
+    all_mismatches = await find_judgment_court_mismatches(db)
     null_count = await count_null_court_id_pls(db)
-    real_count = len(mismatches)
+    real_count = len(all_mismatches)
+    mismatches = all_mismatches[:limit] if limit is not None else all_mismatches
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
     return {
         "null_court_id_count": null_count,
         "real_mismatch_count": real_count,
