@@ -227,6 +227,49 @@ def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
 
 SEARCH_HARVEST_PRIORITY_STALL_REASONS = frozenset({"no_output_while_harvesting", "grid_saturated"})
 
+# run_login_session_job (citation-grid walks) is queued from:
+# - dispatcher.dispatch_due_sources (Celery Beat / DISPATCH_LOOP_SECONDS)
+# - pls_self_healing.pls_grid_stall_watchdog (no_output while grid_harvest_incomplete)
+# - routers.sources manual scrape kick
+
+
+def pls_yield_citation_grid_to_search_harvest(
+    cfg: Dict[str, Any],
+    reporter_shard: Optional[int],
+    pending_harvest: int,
+    *,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """When the ledger has work, prefer search-harvest over a saturated citation-grid lap."""
+    if pending_harvest <= 0:
+        return None
+    if defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
+        return "search-harvest gaps while promotion stalled or grid saturated (watchdog)"
+    if dispatch_saturated(cfg, reporter_shard, now=now):
+        return (
+            f"search-harvest has {pending_harvest} pending row(s) while citation grid is saturated"
+        )
+    return None
+
+
+async def pls_pending_search_harvest_count(db: AsyncSession) -> int:
+    from scraper.models import PlsSearchHarvestQuery
+
+    return int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(PlsSearchHarvestQuery)
+                .where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
 
 def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any], *, stall_reason: Optional[str] = None) -> bool:
     """When promotion is stalled or the grid is saturated, yield the login queue to search-harvest gaps."""

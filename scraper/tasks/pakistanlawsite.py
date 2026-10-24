@@ -768,6 +768,21 @@ class PakistanLawSitePipeline:
             row_offset = 0
         return cursor_key, cursor, max(0, row_offset)
 
+    async def _maybe_yield_citation_grid_for_search_harvest(self) -> bool:
+        from scraper.pls_grid_health import pls_pending_search_harvest_count, pls_yield_citation_grid_to_search_harvest
+
+        pending = await pls_pending_search_harvest_count(self.db)
+        reason = pls_yield_citation_grid_to_search_harvest(
+            dict(self.source.config_json or {}),
+            self.reporter_shard,
+            pending,
+        )
+        if not reason:
+            return False
+        self.stats["yielded_for_search_harvest"] = reason
+        logger.info("PakistanLawSite citation-grid: %s (yielding session for search-harvest)", reason)
+        return True
+
     async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
         """CitationSearch is an authenticated citation table, not a form: walk it window by window.
 
@@ -795,6 +810,8 @@ class PakistanLawSitePipeline:
                 await self._set_grid_journal(first)
         windows = 0
         while True:
+            if await self._maybe_yield_citation_grid_for_search_harvest():
+                break
             try:
                 outcome = await self._run_citation_grid_window(search_map, limits)
             except CitationSearchNavigationFailed as exc:
