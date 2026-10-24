@@ -269,3 +269,12 @@ def test_capture_modal_script_waits_for_body_marker_when_flag_on():
     assert "stableReads >= 4" in source
     assert "for (let i = 0; i < maxPolls; i += 1)" in source
     assert "maxPolls = waitForBody ? 80 : 80" in source
+
+
+@pytest.mark.parametrize("marker", ["JUDGMENT", "ORDER", "JUDGEMENT"])
+def test_empty_body_after_decision_marker_is_incomplete(marker):
+    """An empty decision heading must not count as a complete judgment."""
+    text = "PLD 1991 Lahore 200\nDate(s) of hearing: 12-03-1991\n" + marker
+    signal = detect_headnote_only_no_body(text)
+    assert signal is not None
+    assert signal.reason_code == "headnote_only"
