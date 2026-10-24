@@ -295,6 +295,7 @@ def _runner(db, monkeypatch, pages, *, total=None):
 
     runner = harvest.SearchHarvestRunner.__new__(harvest.SearchHarvestRunner)
     runner.db, runner.source, runner.dry_run = db, None, False
+    runner.probe_mode = False  # __new__ fixture bypasses constructor's default
     runner.pipeline = FakePipeline()
     runner.memory = SimpleNamespace(note_window=lambda: None)
     runner.pacing_profile = {"login_delay_min": 0, "login_delay_max": 0}
