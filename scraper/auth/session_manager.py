@@ -74,8 +74,9 @@ def is_playwright_harvest_browser_fatal(exc: BaseException) -> bool:
     msg = str(exc).lower()
     if "target closed" in msg or "browser has been closed" in msg:
         return False
-    if isinstance(exc, BrowserDisconnected):
-        return False
+    # _wrap converts a Playwright "Page crashed" into BrowserDisconnected for
+    # same-slot reconnect. If reconnect also fails, retain its fatal identity
+    # so the harvest ledger can be returned to pending safely.
     return any(marker in msg for marker in _PLAYWRIGHT_HARVEST_PAGE_CRASH_MARKERS)
 
 
