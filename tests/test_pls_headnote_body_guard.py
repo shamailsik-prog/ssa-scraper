@@ -151,3 +151,60 @@ def test_capture_modal_script_waits_for_body_marker_not_reporter_prefix():
     assert "bodyMarker" in source
     assert "CLC|SCMR|PLD" not in source
     assert "stableReads" in source
+
+
+@pytest.mark.asyncio
+async def test_scan_apply_revalidates_corrected_judgment_and_source(db):
+    """A stale scan must not hide a real judgment completed before --apply."""
+    jid = uuid4()
+    text = _long_headnote_over_5k()
+    db.add(
+        Judgment(
+            id=jid,
+            source_name="PakistanLawSite",
+            court_name="Lahore High Court",
+            canonical_citation="PLD 1992 Lahore 201",
+            case_title="Stale scan regression",
+            full_text=text,
+            full_text_hash=canonical_text_hash(text),
+            judge_names=["Abdul Qadeer Chaudhry"],
+            access_method="rendered_copy",
+        )
+    )
+    await db.commit()
+    report = await find_headnote_only_promoted(db)
+    stale = next(row for row in report["fixes"] if row["id"] == str(jid))
+    completed = text + "\nJUDGMENT\n" + ("This is the complete court judgment text. " * 20)
+    judgment = await db.get(Judgment, jid)
+    judgment.full_text = completed
+    judgment.full_text_hash = canonical_text_hash(completed)
+    await db.commit()
+    assert await apply_headnote_body_quarantine(db, "stale_scan_regression", [stale]) == 0
+    assert (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == jid))
+    ).scalars().first() is None
+    judgment.source_name = "AnotherSource"
+    judgment.full_text = text
+    judgment.full_text_hash = canonical_text_hash(text)
+    await db.commit()
+    assert await apply_headnote_body_quarantine(db, "wrong_source_regression", [stale]) == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_undo_uses_durable_run_id_not_redis(db):
+    """Undo remains possible after Redis restart/TTL expiration."""
+    jid = uuid4()
+    db.add(
+        DocumentQuarantine(
+            doc_type="judgment",
+            doc_id=jid,
+            run_id="durable_headnote_undo",
+            reason="headnote_only: no_body_after_hearing_or_counsel",
+        )
+    )
+    await db.commit()
+    assert await undo_headnote_body_scan(db, "durable_headnote_undo") == 1
+    await db.commit()
+    assert (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == jid))
+    ).scalars().first() is None
