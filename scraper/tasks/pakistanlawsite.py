@@ -914,7 +914,10 @@ class PakistanLawSitePipeline:
                     if not journal_unsupported(cfg.get(journal_cursor_key(journal)))
                 }
                 completed_lap = bool(required and required.issubset(done))
-            elif verified_end and not journals:
+            elif verified_end and (not journals or self._journal_rotation_disabled):
+                # The site may have no usable journal dropdown; in that case
+                # the pipeline fell back to the default grid, whose verified
+                # end-of-grid is the appropriate recovery boundary.
                 completed_lap = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
