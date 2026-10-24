@@ -40,6 +40,8 @@ def verifier_writer_engine() -> AsyncEngine:
         password = settings.CORPUS_VERIFIER_PASSWORD.get_secret_value()
         role = settings.CORPUS_VERIFIER_ROLE
         if not password:
+            if settings.APP_ENV != "development":
+                raise RuntimeError("CORPUS_VERIFIER_PASSWORD is required outside development")
             password = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
             role = settings.CORPUS_WRITER_ROLE
         url = make_url(settings.DATABASE_URL).set(username=role, password=password)
