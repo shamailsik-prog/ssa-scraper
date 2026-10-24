@@ -816,6 +816,7 @@ class PakistanLawSitePipeline:
             else:
                 await self._set_grid_journal(first)
         windows = 0
+        confirmed_window = False
         while True:
             if await self._maybe_yield_citation_grid_for_search_harvest():
                 break
@@ -833,11 +834,6 @@ class PakistanLawSitePipeline:
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
-            from scraper.pls_grid_health import pls_clear_grid_yield_marker
-
-            await pls_clear_grid_yield_marker(
-                self.db, self.source, reporter_shard=self.reporter_shard
-            )
             if outcome.get("citation_grid_stub_stop"):
                 logger.info(
                     "PakistanLawSite citation-grid: intermittent no-results stub; "
@@ -845,6 +841,10 @@ class PakistanLawSitePipeline:
                 )
                 self.stats["citation_grid_stub_stop"] = True
                 break
+            if not outcome.get("cursor_unconfirmed") and (
+                outcome.get("rows", 0) > 0 or outcome.get("wrapped") or outcome.get("reached_end")
+            ):
+                confirmed_window = True
             if self.grid_journal and not outcome.get("cursor_unconfirmed") and (
                 outcome.get("journal_done") or outcome["wrapped"] or outcome.get("reached_end") or outcome["rows"] == 0 or not self._journal_available(self.grid_journal)
             ):
@@ -877,6 +877,15 @@ class PakistanLawSitePipeline:
                 break
             if windows >= MAX_CITATION_GRID_WINDOWS_PER_RUN:
                 break
+        # Only a confirmed grid window ends the capped recovery attempt. A stub,
+        # unconfirmed cursor, or immediate yield must preserve the original marker.
+        # Clearing the other login shard's marker would re-block its recovery.
+        if confirmed_window and not self.stats.get("yielded_for_search_harvest"):
+            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+            await pls_clear_grid_yield_marker(
+                self.db, self.source, reporter_shard=self.reporter_shard
+            )
 
     async def _run_citation_grid_window(self, search_map: Dict[str, Any], limits: Dict[str, int]) -> Dict[str, Any]:
         await self._charge_page()
