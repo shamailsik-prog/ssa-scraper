@@ -55,6 +55,18 @@ def test_plain_journal_year_query_fills_only_reporter_and_year():
     assert ylr["value_roles"] == ["reporter", "year"]
 
 
+def test_keyword_split_prefers_party_when_stale_keyword_role_exists(monkeypatch):
+    """Production maps may still list a keyword control that is not the live filter; splits must hit party."""
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False)
+    smap = _dashboard_map()
+    smap["limits"] = {**(smap.get("limits") or {}), "harvest_role_aliases": {"keyword": "party"}}
+    smap["fields"]["keyword"] = {"name": "stale", "selector": "#stale-keyword", "kind": "text", "options": []}
+    q = {"reporter": "SCMR", "year": 2025, "keyword": "z"}
+    values = build_harvest_form_values(smap, q, {"page": 1})
+    assert values.get("party") == "z"
+    assert "keyword" not in values
+
+
 def test_keyword_split_applies_to_party_box_without_alias_flag(monkeypatch):
     """PLD 2017 letter splits must submit the keyword token even when KEYWORD_PARTY_ALIAS is off."""
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_KEYWORD_PARTY_ALIAS", False)

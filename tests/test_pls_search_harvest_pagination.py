@@ -17,6 +17,37 @@ from scraper.tasks import pls_search_harvest as harvest
 def test_search_harvest_may_mark_done_rules():
     done, reason = search_harvest_may_mark_done(site_total=None, rows_seen=284, rows_on_page=284)
     assert done is False and "unknown" in reason
+
+
+@pytest.mark.asyncio
+async def test_mid_page_timeout_keeps_rows_seen_with_rows_new(db, monkeypatch):
+    """CLD 2024: rows_new grew from per-row commits while rows_seen/pages stayed 0 after out_of_time rollback."""
+    rows = [_row(i) for i in range(1, 6)]
+    pages = {"page1": (rows, None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=None, dry_run=False)
+    monkeypatch.setattr(harvest.settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 1)
+    clock = [100.0]
+
+    async def sleep(seconds):
+        clock[0] += 2
+
+    runner.pipeline.sleep = sleep
+    monkeypatch.setattr(harvest.time, "monotonic", lambda: clock[0])
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="cld-counter-mid-page",
+        query_json={"reporter": "CLD", "year": 2024},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    await runner.run_query(q, runner._search_map)
+    assert q.rows_new >= 1
+    assert q.rows_seen == q.rows_new
+    assert q.pages_enumerated == 0
+    assert q.status == "in_progress"
+    await db.rollback()
     assert search_harvest_may_mark_done(site_total=600, rows_seen=284, rows_on_page=284)[0] is False
     assert search_harvest_may_mark_done(site_total=6, rows_seen=6, rows_on_page=3) == (True, "")
     assert search_harvest_may_mark_done(site_total=None, rows_seen=0, rows_on_page=0) == (True, "")
@@ -87,7 +118,7 @@ def _row(n: int) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_unknown_total_without_next_stays_in_progress(db, monkeypatch):
+async def test_unknown_total_without_next_closes_on_second_tick(db, monkeypatch):
     pages = {
         "page1": ([_row(i) for i in range(1, 5)], None),
     }
@@ -101,10 +132,12 @@ async def test_unknown_total_without_next_stays_in_progress(db, monkeypatch):
     db.add(q)
     await db.flush()
 
-    result = await runner.run_query(q, runner._search_map)
-    assert result["status"] == "in_progress"
-    assert q.status == "in_progress"
+    first = await runner.run_query(q, runner._search_map)
+    assert first["status"] == "in_progress"
     assert q.pages_enumerated == 1
+    assert "site total unknown" in (q.last_error or "")
+    second = await runner.run_query(q, runner._search_map)
+    assert second["status"] == "done" and q.status == "done"
     assert "site total unknown" in (q.last_error or "")
     await db.rollback()
 
@@ -229,8 +262,8 @@ async def test_unknown_total_last_page_is_confirmed_by_one_reread_then_done(db, 
     assert first["status"] == "in_progress" and q.rows_seen == 4
     second = await runner.run_query(q, runner._search_map)
     assert second["status"] == "done" and q.status == "done"
-    # the re-read is not counted again
     assert q.rows_seen == 4 and q.pages_enumerated == 1
+    assert q.last_error and "site total unknown" in q.last_error
     await db.rollback()
 
 

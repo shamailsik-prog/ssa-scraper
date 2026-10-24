@@ -13,16 +13,20 @@ DEFAULT_HARVEST_ROLE_ALIASES: Dict[str, str] = {
 
 def keyword_text_submit_role(search_map: Dict[str, Any]) -> Optional[str]:
     """The form control that receives harvest ``keyword`` split tokens (keyword or party text box)."""
+    aliases = harvest_role_aliases(search_map)
+    if aliases.get("keyword"):
+        return aliases["keyword"]
     stored = dict(search_map.get("fields") or {})
-    if "keyword" in stored:
-        return "keyword"
+    stored.pop("_all", None)
     if "party" in stored:
         return "party"
-    resolved = resolve_harvest_fields(search_map)
-    if "keyword" in resolved:
+    if "keyword" in stored:
         return "keyword"
+    resolved = resolve_harvest_fields(search_map)
     if "party" in resolved:
         return "party"
+    if "keyword" in resolved:
+        return "keyword"
     return None
 
 
@@ -34,6 +38,8 @@ def apply_harvest_query_keyword(values: Dict[str, str], search_map: Dict[str, An
     role = keyword_text_submit_role(search_map)
     if role:
         values[role] = str(kw)
+        if role != "keyword":
+            values.pop("keyword", None)
 
 
 def harvest_keyword_party_alias_enabled() -> bool:

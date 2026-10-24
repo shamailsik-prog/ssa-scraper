@@ -779,12 +779,10 @@ class SearchHarvestRunner:
                     )
             if rereading:
                 rows_counted, known_counted = 0, 0
-            else:
+            elif self.dry_run:
                 rows_counted, known_counted = len(fresh_rows), known_on_page
-            rows_seen += rows_counted
-            rows_known += known_counted
-
-            if not self.dry_run:
+            else:
+                rows_counted, known_counted = 0, 0
                 route_base = {
                     "harvest": "search_gap",
                     "query_key": query_row.query_key,
@@ -793,13 +791,15 @@ class SearchHarvestRunner:
                 for idx, row in enumerate(rows):
                     if idx < start_row_index:
                         continue
-                    detail_url = row.get("detail_url") or row.get("pdf_url")
-                    if not detail_url:
+                    if id(row) not in fresh_ids:
                         continue
+                    rows_counted += 1
                     keys = citation_keys_for_row(row)
                     if keys & known_set:
+                        known_counted += 1
                         continue
-                    if id(row) not in fresh_ids:
+                    detail_url = row.get("detail_url") or row.get("pdf_url")
+                    if not detail_url:
                         continue
                     detail = await self.pipeline.fetch_detail(detail_url)
                     result = await self.pipeline.preserve_and_extract(
@@ -817,20 +817,21 @@ class SearchHarvestRunner:
                     if not self.probe_mode:
                         query_row.cursor_json = dict(cursor)
                         query_row.rows_new = rows_new
+                        query_row.rows_seen = rows_seen + rows_counted
+                        query_row.rows_known = rows_known + known_counted
                         await self.db.commit()
                     await self._pace_sleep()
                     await self._maybe_recycle_browser()
                     if deadline is not None and time.monotonic() >= deadline and idx + 1 < len(rows):
                         out_of_time = True
                         break
-            else:
+            rows_seen += rows_counted
+            rows_known += known_counted
+            if self.dry_run and not rereading:
                 rows_new += len(new_rows)
 
             if out_of_time:
-                # Stop mid-page and give the login worker back; the cursor (this page, next row) resumes the
-                # query on the next tick, which counts this page's rows again, so they are not counted now.
-                rows_seen -= rows_counted
-                rows_known -= known_counted
+                # Mid-page stop: rows_seen already reflects each opened or known-skipped row on this page.
                 release_page_result(page)
                 if not self.probe_mode:
                     query_row.rows_seen = rows_seen
@@ -932,9 +933,22 @@ class SearchHarvestRunner:
                 ):
                     may_done = True
                 if not self.probe_mode:
+                    unknown_end = (
+                        "pagination ended without next link and site total unknown"
+                    )
+                    if not may_done and incomplete_reason == unknown_end:
+                        cj = dict(query_row.cursor_json or {})
+                        if confirmed_last or cj.get("unknown_end_seen"):
+                            may_done = True
+                        else:
+                            cj["unknown_end_seen"] = True
+                            query_row.cursor_json = cj
                     if may_done:
                         query_row.status = "done"
-                        query_row.last_error = None if confirmed_last else query_row.last_error
+                        if incomplete_reason:
+                            query_row.last_error = incomplete_reason[:1000]
+                        else:
+                            query_row.last_error = None
                         query_row.cursor_json = {"page": 1, "row_index": 0}
                     else:
                         query_row.status = "in_progress"
@@ -947,6 +961,7 @@ class SearchHarvestRunner:
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
+            cursor.pop("unknown_end_seen", None)
             if not self.probe_mode:
                 query_row.cursor_json = dict(cursor)
             if repeat_pages >= 2:
