@@ -13,7 +13,12 @@ from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
 @pytest.mark.parametrize(
     ("age_minutes", "window_outcome", "expected_calls", "clears_shard0"),
     [
-        (121, {"rows": 1, "wrapped": True, "cursor_unconfirmed": False}, 1, True),
+        (121, {"rows": 1, "processed": 1, "wrapped": True, "cursor_unconfirmed": False}, 1, True),
+        # A confirmed page is not enough: the grid can contain thousands of rows.
+        (121, {"rows": 1, "processed": 1, "wrapped": False, "reached_end": False, "cursor_unconfirmed": False}, 1, False),
+        # An observed row with no cursor advancement is not verified progress.
+        (121, {"rows": 1, "processed": 0, "wrapped": False, "reached_end": False, "cursor_unconfirmed": False}, 1, False),
+        (121, {"rows": 1, "processed": 1, "wrapped": False, "reached_end": True, "cursor_unconfirmed": False}, 1, True),
         (1, None, 0, False),
         (121, {"rows": 1, "wrapped": False, "cursor_unconfirmed": True}, 1, False),
         (
@@ -24,7 +29,7 @@ from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
         ),
     ],
 )
-async def test_capped_grid_recovery_only_clears_confirmed_shard(
+async def test_capped_grid_recovery_only_clears_completed_shard_lap(
     db, login_source, monkeypatch, age_minutes, window_outcome, expected_calls, clears_shard0
 ):
     from scraper import pls_grid_health
