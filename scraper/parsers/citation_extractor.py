@@ -534,7 +534,9 @@ def normalise_citation(raw: str) -> str:
         court_raw = m_pld.group("court")
         page = _clean_page(m_pld.group("page"))
         court_canonical = canonical_court(court_raw) or court_raw.strip()
-        if court_canonical in ("SC", "FSC", "IHC", "AJ&K", "GB"):
+        if court_canonical == "AJ&K":
+            court_out = "Aj&K"
+        elif court_canonical in ("SC", "FSC", "IHC", "GB"):
             court_out = court_canonical
         else:
             court_out = court_canonical

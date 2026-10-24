@@ -55,7 +55,7 @@ def _norms(text):
         # the AJ&K High Court keeps the key bare "AJ&K" always had ("Aj&K"); only its Supreme Court is apart
         ("P L D 2026 High Court (AJ&K) 1", "PLD 2026 Aj&K 1"),
         ("PLD 2023 AJ&K 1", "PLD 2023 Aj&K 1"),
-        ("PLD 2023 AJK 1", "PLD 2023 AJ&K 1"),
+        ("PLD 2023 AJK 1", "PLD 2023 Aj&K 1"),
         ("2023 CLC (AJ&K) 1", "2023 CLC (Aj&K) 1"),
         ("2023 YLR (AJ&K) 5", "2023 YLR (Aj&K) 5"),
         ("2023 CLC (A.J.&K.) 3", "2023 CLC (A.J.&K.) 3"),

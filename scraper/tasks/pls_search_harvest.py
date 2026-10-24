@@ -36,6 +36,7 @@ from scraper.models import (
     ScraperStaging,
 )
 from scraper.pls_browser_memory import PlsBrowserMemoryHardLimit, PlsBrowserMemoryState, check_rss_limits
+from scraper.parsers.harvest_citation_match import citation_harvest_equivalent_keys
 from scraper.pls_search_harvest_core import (
     SEARCH_HARVEST_SLOTS,
     build_harvest_form_values,
@@ -92,14 +93,18 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
     key_list = [k for k in keys if not k.startswith(CASE_KEY_PREFIX)]
     if not key_list:
         return known
+    expanded: Set[str] = set()
+    for k in key_list:
+        expanded |= citation_harvest_equivalent_keys(k)
+    key_list = list(expanded)
     for canonical, in (await db.execute(select(Judgment.canonical_citation).where(Judgment.canonical_citation.in_(key_list)))).all():
         if canonical:
-            known.add(str(canonical))
+            known |= citation_harvest_equivalent_keys(str(canonical))
     for citation_string, in (
         await db.execute(select(Citation.citation_string).where(Citation.citation_string.in_(key_list)))
     ).all():
         if citation_string:
-            known.add(str(citation_string))
+            known |= citation_harvest_equivalent_keys(str(citation_string))
     if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
         for extracted, in (
             await db.execute(
@@ -111,7 +116,7 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
             )
         ).all():
             if extracted:
-                known.add(str(extracted))
+                known |= citation_harvest_equivalent_keys(str(extracted))
     return known
 
 
