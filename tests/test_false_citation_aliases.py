@@ -251,3 +251,47 @@ def test_alias_suspicion_reason_ref_only_in_body():
         "(a) Topic---\nPLD 1990 Lahore 4 ref.\n"
     )
     assert alias_suspicion_reason("PLD 1990 Lahore 4", body, primary="1992 CLC 956") == "ref-only mention"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backup_value, must_refuse",
+    [
+        (None, False),
+        ("[]", False),
+        ('[{"id":"00000000-0000-0000-0000-000000000001"}]', True),
+        ("{}", True),
+        ("not-json", True),
+    ],
+)
+async def test_cleanup_undo_refuses_destructive_promoted_deletion(backup_value, must_refuse):
+    """Undo cannot assume 'promoted' means 'newly created' or unchanged."""
+    from types import SimpleNamespace
+
+    from scraper.tasks.citation_alias_cleanup import _delete_requalify_judgments
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return None if backup_value is None else SimpleNamespace(value=backup_value)
+
+    class FakeDB:
+        def __init__(self):
+            self.delete_calls = 0
+
+        async def execute(self, _query):
+            return FakeResult()
+
+        async def delete(self, _obj):
+            self.delete_calls += 1
+            raise AssertionError("No judgment may be deleted without independent proof")
+
+    db = FakeDB()
+    if must_refuse:
+        with pytest.raises(RuntimeError, match="Refusing undo"):
+            await _delete_requalify_judgments(db, "test-run")
+    else:
+        assert await _delete_requalify_judgments(db, "test-run") == 0
+    assert db.delete_calls == 0

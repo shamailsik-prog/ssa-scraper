@@ -277,8 +277,14 @@ async def _backup_requalify_judgments(db: AsyncSession, run_id: str, records: Li
 
 
 async def _delete_requalify_judgments(db: AsyncSession, run_id: str) -> int:
-    from uuid import UUID
+    """Fail closed: a promotion result does not prove a new judgment was created.
 
+    Promotion may upgrade an existing incomplete judgment. Deleting it on undo
+    would destroy the pre-existing record, citations, and downstream references.
+    A later-corrected judgment is equally unsafe to delete. Until the cleanup
+    records immutable creation provenance and verifies dependent state, refuse
+    the entire undo transaction rather than silently reporting a successful undo.
+    """
     row = (
         await db.execute(
             select(CorpusMetadata).where(CorpusMetadata.key == REQUALIFY_JUDGMENT_BACKUP_KEY.format(run_id=run_id))
@@ -286,15 +292,19 @@ async def _delete_requalify_judgments(db: AsyncSession, run_id: str) -> int:
     ).scalars().first()
     if row is None or not row.value:
         return 0
-    deleted = 0
-    for item in json.loads(row.value):
-        j = (await db.execute(select(Judgment).where(Judgment.id == UUID(item["id"])))).scalars().first()
-        if j is None:
-            continue
-        await db.delete(j)
-        deleted += 1
-    return deleted
-
+    try:
+        payload = json.loads(row.value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Refusing undo {run_id}: promoted-judgment backup is unreadable") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Refusing undo {run_id}: promoted-judgment backup has unexpected format")
+    if payload:
+        raise RuntimeError(
+            f"Refusing undo {run_id}: {len(payload)} promoted judgment(s) cannot be safely deleted. "
+            "Promotion can upgrade pre-existing judgments, and later changes or dependent records "
+            "have not been verified. Manual reconciliation required; undo rolled back."
+        )
+    return 0
 
 async def _undo_requalify(db: AsyncSession, run_id: str) -> Dict[str, int]:
     from uuid import UUID
