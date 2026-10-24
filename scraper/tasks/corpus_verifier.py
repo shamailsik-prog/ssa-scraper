@@ -211,7 +211,7 @@ async def _statute_sections(reader: AsyncSession, statute_id: UUID) -> List[Dict
     rows = (
         await reader.execute(
             select(StatuteSection.section_number, StatuteSectionVersion.section_text)
-            .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+            .outerjoin(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
             .where(StatuteSection.statute_id == statute_id)
         )
     ).all()

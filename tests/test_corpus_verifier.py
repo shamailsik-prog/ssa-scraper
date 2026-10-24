@@ -94,3 +94,43 @@ async def test_verifier_batch_writes_results_only_in_verification_schema(db, mon
     after = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().one()
     assert after.full_text == before.full_text
     assert after.court_name == before.court_name
+
+
+@pytest.mark.asyncio
+async def test_statute_rule_fails_if_one_of_many_sections_lacks_current_text():
+    from scraper.models import Statute
+    from scraper.verification.rules import verify_statute_row
+
+    statute = Statute(id=uuid4(), name="Verifier Missing Version Act 2026", year_enacted=2026)
+    sections = [
+        {"section_number": "1", "section_text": "Legitimate statutory text. " * 10},
+        {"section_number": "2", "section_text": ""},
+    ]
+    out = verify_statute_row(statute, sections, duplicate_names=set())
+    assert out.verdict == "FAIL"
+    assert "statute_section_current_text_missing" in out.reason_codes
+
+
+@pytest.mark.asyncio
+async def test_statute_verifier_keeps_sections_without_current_versions(db):
+    from scraper.models import Statute, StatuteSection, StatuteSectionVersion
+    from scraper.tasks.corpus_verifier import _statute_sections
+    from scraper.verification.rules import verify_statute_row
+
+    statute = Statute(id=uuid4(), name="Verifier Partial Sections Act 2026", year_enacted=2026)
+    section_ok = StatuteSection(id=uuid4(), statute_id=statute.id, section_number="1")
+    section_missing = StatuteSection(id=uuid4(), statute_id=statute.id, section_number="2")
+    version = StatuteSectionVersion(
+        id=uuid4(), section_id=section_ok.id, section_text="Long genuine provision. " * 10,
+        text_hash="a" * 64,
+    )
+    section_ok.current_version_id = version.id
+    db.add_all([statute, section_ok, section_missing, version])
+    await db.commit()
+
+    sections = await _statute_sections(db, statute.id)
+    assert len(sections) == 2
+    assert any(s["section_number"] == "2" and not s["section_text"] for s in sections)
+    outcome = verify_statute_row(statute, sections, duplicate_names=set())
+    assert outcome.verdict == "FAIL"
+    assert "statute_section_current_text_missing" in outcome.reason_codes
