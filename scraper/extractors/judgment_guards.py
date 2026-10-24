@@ -14,7 +14,7 @@ from scraper.parsers.bench_parser import normalise_judge_name
 # thin first-pass rows stay eligible for modal refetch.
 FULL_READY_JUDGMENT_CHARS = 5000
 HEADNOTE_BODY_MIN_TAIL_AFTER_HEARING_CHARS = 300
-HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER = 0
+HEADNOTE_BODY_MIN_CHARS_AFTER_MARKER = 1
 
 
 def judgment_is_full_ready(full_text: Optional[str], judge_names: Any, *, body_guard: Optional[bool] = None) -> bool:
