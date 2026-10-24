@@ -3,7 +3,8 @@ Celery application. Queues:
   * scraper        — public sources (worker-public)
   * login_session  — PakistanLawSite, one worker, concurrency 1 (worker-scraper)
   * embeddings     — worker-embed
-  * maintenance    — promotion, treatment, archive mirror, reconcile, dispatch (worker-public)
+  * promote        — promote_staging_records (worker-promote; worker-public fallback during rollout)
+  * maintenance    — treatment, archive mirror, reconcile, dispatch (worker-public / worker-maintenance)
 Beat owns scheduling; ScrapeGraph 'monitor' jobs are supplemental only and never replace it.
 """
 
@@ -14,9 +15,12 @@ import logging
 from celery import Celery
 from celery.signals import task_postrun, task_prerun, worker_process_init, worker_process_shutdown, worker_ready
 
+from scraper.celery_queues import promote_task_queue
 from scraper.config import settings
 
 logger = logging.getLogger(__name__)
+
+_PROMOTE_QUEUE = promote_task_queue()
 
 app = Celery(
     "sikander_corpus",
@@ -36,6 +40,7 @@ app = Celery(
         "scraper.tasks.pls_caseid_walk",
         "scraper.tasks.pls_backfill",
         "scraper.tasks.judgment_identity_reconcile",
+        "scraper.tasks.promotion_health",
     ],
 )
 app.conf.update(
@@ -50,10 +55,11 @@ app.conf.update(
         "scraper.tasks.dispatcher.run_login_session_job": {"queue": "login_session"},
         "scraper.tasks.dispatcher.run_source_job": {"queue": "scraper"},
         "scraper.tasks.embeddings.process_embedding_queue": {"queue": "embeddings"},
-        "scraper.tasks.promotion.promote_staging_records": {"queue": "maintenance"},
+        "scraper.tasks.promotion.promote_staging_records": {"queue": _PROMOTE_QUEUE},
         "scraper.tasks.pls_backfill.requalify_quarantined": {"queue": "maintenance"},
         "scraper.tasks.promotion.reconcile_instrument_relations": {"queue": "maintenance"},
         "scraper.tasks.treatment.classify_treatment": {"queue": "maintenance"},
+        "scraper.tasks.promotion_health.promotion_stale_alert": {"queue": "maintenance"},
         "scraper.tasks.unreported_reader.read_unreported_batch": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_treatment_citation_links": {"queue": "maintenance"},
         "scraper.tasks.treatment.reconcile_judgment_citation_relations": {"queue": "maintenance"},
@@ -72,6 +78,10 @@ app.conf.update(
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
         "promote-staging": {"task": "scraper.tasks.promotion.promote_staging_records", "schedule": 900, "kwargs": {"limit": 200}},
+        "promotion-stale-alert": {
+            "task": "scraper.tasks.promotion_health.promotion_stale_alert",
+            "schedule": 300,
+        },
         # PakistanLawSite judgments held for a reason a later extractor fix removes ("court unknown") are re-checked
         # from their stored text; no request goes to the site, and merits holds are left to a person.
         "pls-requalify-quarantined": {
@@ -165,7 +175,12 @@ if settings.JUDGMENT_CITATION_RECONCILE_ENABLED:
 from scraper.deploy_role import beat_schedule_for_role, deploy_role  # noqa: E402
 
 app.conf.beat_schedule = beat_schedule_for_role(app.conf.beat_schedule)
-logger.info("Celery configured for deploy role %s: queues scraper/login_session/embeddings/maintenance; beat %s", deploy_role(), list(app.conf.beat_schedule))
+logger.info(
+    "Celery configured for deploy role %s: queues scraper/login_session/embeddings/promote(%s)/maintenance; beat %s",
+    deploy_role(),
+    _PROMOTE_QUEUE,
+    list(app.conf.beat_schedule),
+)
 
 
 @worker_process_init.connect
