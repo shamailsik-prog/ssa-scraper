@@ -404,6 +404,27 @@ def split_dimension_added(parent: Dict[str, Any], child: Dict[str, Any]) -> Opti
     return None
 
 
+def split_children_case_coverage_incomplete(
+    parent_rows_seen: int,
+    child_key_sets: Sequence[Set[str]],
+) -> bool:
+    """Fail closed when aliases outnumber distinct CaseName judgment identities.
+
+    A single row can contribute raw citation, normalized citation and case: keys.
+    The union of those aliases cannot establish coverage of N parent rows.
+    Rows without a CaseName are not independently countable from flat key sets.
+    """
+    if parent_rows_seen <= 0:
+        return False
+    cases = {
+        key
+        for keys in child_key_sets
+        for key in keys
+        if key.startswith(CASE_KEY_PREFIX)
+    }
+    return len(cases) < parent_rows_seen
+
+
 def split_children_union_incomplete(
     parent_rows_seen: int,
     child_key_sets: Sequence[Set[str]],
