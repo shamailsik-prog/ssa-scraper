@@ -47,7 +47,12 @@ from scraper.pls_search_harvest_core import (
     gap_report_sort_key,
     row_gap_diagnostics,
     cursor_reset_for_done,
+    gap_diagnostics_slice,
+    note_unlinked_row,
+    reset_lap_gap_diagnostics,
     rows_unlinked_from_cursor,
+    search_harvest_may_mark_done_unlinked,
+    unlinked_done_safety_error,
     iter_base_plan_queries,
     make_query_key,
     normalize_query_json,
@@ -618,6 +623,10 @@ class SearchHarvestRunner:
         await self._maybe_recycle_browser()
 
         while True:
+            if page_idx == 1 and start_row_index == 0 and not rereading:
+                reset_lap_gap_diagnostics(cursor)
+            unlinked_keys_snapshot = list(cursor.get("unlinked_keys") or [])
+
             from scraper.extractors.hybrid_extractor import HybridExtractor
 
             extractor = HybridExtractor(self.db, self.source, local=self.pipeline.local_engine)
@@ -660,6 +669,15 @@ class SearchHarvestRunner:
             rows_seen += rows_counted
             rows_known += known_counted
 
+            for row in fresh_rows:
+                if row.get("detail_url") or row.get("pdf_url"):
+                    continue
+                keys = citation_keys_for_row(row)
+                if keys & known_set:
+                    continue
+                note_unlinked_row(cursor, row)
+            rows_unlinked = rows_unlinked_from_cursor(cursor)
+
             if not self.dry_run:
                 route_base = {
                     "harvest": "search_gap",
@@ -672,9 +690,6 @@ class SearchHarvestRunner:
                     detail_url = row.get("detail_url") or row.get("pdf_url")
                     keys = citation_keys_for_row(row)
                     if not detail_url:
-                        if id(row) in fresh_ids and not (keys & known_set):
-                            rows_unlinked += 1
-                            cursor["rows_unlinked"] = rows_unlinked
                         continue
                     if keys & known_set:
                         continue
@@ -709,11 +724,15 @@ class SearchHarvestRunner:
                 # query on the next tick, which counts this page's rows again, so they are not counted now.
                 rows_seen -= rows_counted
                 rows_known -= known_counted
+                cursor["unlinked_keys"] = unlinked_keys_snapshot
+                cursor["rows_unlinked"] = len(unlinked_keys_snapshot)
+                rows_unlinked = rows_unlinked_from_cursor(cursor)
                 release_page_result(page)
                 query_row.rows_seen = rows_seen
                 query_row.rows_known = rows_known
                 query_row.rows_new = rows_new
                 query_row.site_total_results = site_total
+                query_row.cursor_json = dict(cursor)
                 query_row.last_run_at = datetime.now(timezone.utc)
                 query_row.status = "in_progress"
                 await self.db.flush()
@@ -780,25 +799,48 @@ class SearchHarvestRunner:
                     site_total=site_total,
                     rows_seen=rows_seen,
                     rows_on_page=len(rows),
-                    rows_unlinked=rows_unlinked,
                 )
                 if not may_done and confirmed_last and site_total is None:
                     may_done = True
+                done_unlinked = False
+                unlinked_reason = ""
+                if not may_done:
+                    done_unlinked, unlinked_reason = search_harvest_may_mark_done_unlinked(
+                        site_total=site_total,
+                        rows_seen=rows_seen,
+                        rows_known=rows_known,
+                        rows_unlinked=rows_unlinked,
+                    )
+                if done_unlinked:
+                    safety = unlinked_done_safety_error(rows_seen, rows_unlinked)
+                    if safety:
+                        logger.warning(
+                            "PLS search harvest %s: %s",
+                            query_row.query_key,
+                            safety,
+                        )
+                        done_unlinked = False
+                        incomplete_reason = safety
                 if may_done:
                     query_row.status = "done"
                     query_row.last_error = None if confirmed_last else query_row.last_error
                     query_row.cursor_json = cursor_reset_for_done(cursor)
+                elif done_unlinked:
+                    query_row.status = "done_unlinked"
+                    query_row.last_error = None
+                    query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
                     query_row.status = "in_progress"
-                    query_row.last_error = incomplete_reason[:1000]
-                    if site_total is not None and rows_seen < int(site_total) - rows_unlinked:
-                        cursor = {"page": page_idx + 1, "row_index": 0}
+                    query_row.last_error = (unlinked_reason or incomplete_reason)[:1000]
+                    if site_total is not None and rows_seen < int(site_total):
+                        cursor["page"] = page_idx + 1
                     else:
-                        cursor = {"page": page_idx, "row_index": 0}
+                        cursor["page"] = page_idx
+                    cursor["row_index"] = 0
                     query_row.cursor_json = dict(cursor)
                 break
             page_idx += 1
-            cursor = {"page": page_idx, "row_index": 0, "next_url": nxt}
+            cursor = {"page": page_idx, "row_index": 0, "next_url": nxt, **gap_diagnostics_slice(cursor)}
             query_row.cursor_json = dict(cursor)
             if repeat_pages >= 2:
                 # Two pages in a row brought nothing new: the next link leads back over pages already read. Stop

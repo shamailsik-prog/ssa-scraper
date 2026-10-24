@@ -244,20 +244,62 @@ def append_gap_sample(cursor: Dict[str, Any], row: Dict[str, Any]) -> None:
     cursor["gap_samples"] = samples
 
 
+def unlinked_row_identity(row: Dict[str, Any]) -> str:
+    keys = sorted(citation_keys_for_row(row))
+    if keys:
+        return "|".join(keys)
+    citation = str(row.get("citation") or "").strip()
+    title = str(row.get("title") or "").strip()
+    return f"{citation}\0{title}"
+
+
+def reset_lap_gap_diagnostics(cursor: Dict[str, Any]) -> None:
+    """Start a new enumeration lap: fresh gap samples and per-lap unlinked identities."""
+    cursor["gap_samples"] = []
+    cursor["unlinked_keys"] = []
+    cursor["rows_unlinked"] = 0
+
+
+def note_unlinked_row(cursor: Dict[str, Any], row: Dict[str, Any]) -> int:
+    ident = unlinked_row_identity(row)
+    keys = list(cursor.get("unlinked_keys") or [])
+    if ident not in keys:
+        keys.append(ident)
+        cursor["unlinked_keys"] = keys
+    n = len(keys)
+    cursor["rows_unlinked"] = n
+    return n
+
+
 def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
     if not cursor:
         return 0
+    stored = cursor.get("unlinked_keys")
+    if stored is not None:
+        return len(stored)
     return int(cursor.get("rows_unlinked") or 0)
+
+
+def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if cursor.get("gap_samples"):
+        out["gap_samples"] = cursor["gap_samples"]
+    if cursor.get("unlinked_keys"):
+        out["unlinked_keys"] = cursor["unlinked_keys"]
+    if cursor.get("rows_unlinked"):
+        out["rows_unlinked"] = cursor["rows_unlinked"]
+    return out
 
 
 def cursor_reset_for_done(cursor: Dict[str, Any]) -> Dict[str, Any]:
     """Preserve gap diagnostics when a query finishes."""
-    out: Dict[str, Any] = {"page": 1, "row_index": 0}
-    if cursor.get("gap_samples"):
-        out["gap_samples"] = cursor["gap_samples"]
-    if cursor.get("rows_unlinked"):
-        out["rows_unlinked"] = cursor["rows_unlinked"]
-    return out
+    return {"page": 1, "row_index": 0, **gap_diagnostics_slice(cursor)}
+
+
+def unlinked_gap_credit(rows_seen: int, rows_known: int, rows_unlinked: int) -> int:
+    """Linkless rows may only offset the seen-but-unknown portion of the gap."""
+    seen_unknown = max(0, int(rows_seen) - int(rows_known))
+    return min(max(0, int(rows_unlinked or 0)), seen_unknown)
 
 
 def compute_gap_size(
@@ -267,12 +309,45 @@ def compute_gap_size(
     *,
     rows_unlinked: int = 0,
 ) -> int:
-    unlinked = max(0, int(rows_unlinked or 0))
+    credited = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
     if site_total is not None and site_total > rows_known:
-        return max(0, int(site_total - rows_known - unlinked))
+        return max(0, int(site_total - rows_known - credited))
     if rows_seen > rows_known:
-        return max(0, int(rows_seen - rows_known - unlinked))
+        return max(0, int(rows_seen - rows_known - credited))
     return 0
+
+
+def unlinked_done_safety_error(rows_seen: int, rows_unlinked: int) -> str:
+    if rows_unlinked <= 0:
+        return ""
+    if rows_unlinked > 25:
+        return f"too many unmatched rows without detail_url ({rows_unlinked}>25)"
+    if rows_seen > 0 and (rows_unlinked / rows_seen) > 0.05:
+        return (
+            f"unmatched-without-link ratio {rows_unlinked}/{rows_seen} exceeds 5%; not marking done"
+        )
+    return ""
+
+
+def search_harvest_may_mark_done_unlinked(
+    *,
+    site_total: Optional[int],
+    rows_seen: int,
+    rows_known: int,
+    rows_unlinked: int,
+) -> Tuple[bool, str]:
+    """When pagination ends short of site_total, allow done_unlinked only if unlinked explains the shortfall
+    within the rows_seen-rows_known budget (no site_total credit in search_harvest_may_mark_done)."""
+    if site_total is None or rows_seen >= int(site_total):
+        return False, ""
+    shortfall = int(site_total) - int(rows_seen)
+    credit = unlinked_gap_credit(rows_seen, rows_known, rows_unlinked)
+    if shortfall > credit or credit <= 0:
+        return False, ""
+    return (
+        True,
+        f"pagination ended; {rows_unlinked} unmatched row(s) without detail_url explain shortfall {shortfall}",
+    )
 
 
 def parse_total_results_from_html(html: str) -> Optional[int]:
@@ -337,26 +412,17 @@ def search_harvest_may_mark_done(
     site_total: Optional[int],
     rows_seen: int,
     rows_on_page: int,
-    rows_unlinked: int = 0,
 ) -> Tuple[bool, str]:
     """When the extractor reports no next-page link, decide if the query may be marked done.
 
     Done only for a genuinely empty page, or when the site total is known and every row was seen.
-    Rows without a detail link are counted separately and do not block completion when they explain
-    the shortfall versus site_total.
+    Unlinkable rows use status done_unlinked via search_harvest_may_mark_done_unlinked instead.
     """
     if rows_on_page == 0:
         return True, ""
     if site_total is None:
         return False, "pagination ended without next link and site total unknown"
     if rows_seen < int(site_total):
-        shortfall = int(site_total) - int(rows_seen)
-        unlinked = max(0, int(rows_unlinked or 0))
-        if unlinked and shortfall <= unlinked:
-            return (
-                True,
-                f"pagination ended; {unlinked} unmatched row(s) had no detail_url (shortfall {shortfall})",
-            )
         return (
             False,
             f"pagination ended without next link with rows_seen={rows_seen}<site_total={site_total}",
