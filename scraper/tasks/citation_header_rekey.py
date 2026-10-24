@@ -327,30 +327,22 @@ async def _undo_run(db: AsyncSession, run_id: str) -> Dict[str, Any]:
             if st is not None:
                 st.extracted_citation = item.get("old")
                 restored += 1
+    # Refetch keys are not creation provenance. _queue_citation_refetch returns
+    # an existing query_key when another run already owns that pending query.
+    # Deleting by key during undo would silently destroy unrelated discovery
+    # work (and a completed query may have been re-created in the meantime).
+    # Preserve all refetch jobs; extra bounded refetch work is safer than loss.
     ref_row = (
         await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == REFETCH_KEY.format(run_id=run_id)))
     ).scalars().first()
+    refetch_retained = len(json.loads(ref_row.value)) if ref_row is not None and ref_row.value else 0
     removed_refetch = 0
-    if ref_row and ref_row.value:
-        for key in json.loads(ref_row.value):
-            q = (
-                await db.execute(
-                    select(PlsSearchHarvestQuery).where(
-                        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-                        PlsSearchHarvestQuery.query_key == key,
-                        PlsSearchHarvestQuery.status == "pending",
-                    )
-                )
-            ).scalars().first()
-            if q is not None:
-                await db.delete(q)
-                removed_refetch += 1
     for key in (BACKUP_KEY.format(run_id=run_id), UNDO_LOG_KEY.format(run_id=run_id), REFETCH_KEY.format(run_id=run_id)):
         meta = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == key))).scalars().first()
         if meta is not None:
             await db.delete(meta)
     await db.commit()
-    return {"undone": True, "run_id": run_id, "judgments_restored": restored, "refetch_removed": removed_refetch}
+    return {"undone": True, "run_id": run_id, "judgments_restored": restored, "refetch_removed": removed_refetch, "refetch_retained": refetch_retained}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
