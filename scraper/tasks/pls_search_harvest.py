@@ -1109,12 +1109,19 @@ def cli_plan(argv: Optional[List[str]] = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Count only; do not insert (default)")
+    parser.add_argument("--apply", action="store_true", help="Insert missing plan rows and commit")
     args = parser.parse_args(argv)
+    dry_run = not args.apply
+    if args.dry_run:
+        dry_run = True
 
     async def _run():
         async with SessionLocal() as db:
-            return await seed_search_harvest_plan(db, dry_run=args.dry_run)
+            out = await seed_search_harvest_plan(db, dry_run=dry_run)
+            if not dry_run:
+                await db.commit()
+            return out
 
     print(json.dumps(run_async(_run()), indent=2))
     return 0

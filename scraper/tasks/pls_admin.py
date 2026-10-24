@@ -18,7 +18,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     reset.add_argument("--dry-run", action="store_true", help="Count only; do not update")
     plan = sub.add_parser("search-harvest-plan", help="Seed resumable PLS search gap harvest queries")
-    plan.add_argument("--dry-run", action="store_true")
+    plan.add_argument("--dry-run", action="store_true", help="Count only; do not insert (default)")
+    plan.add_argument("--apply", action="store_true", help="Insert missing plan rows and commit")
     gap = sub.add_parser("search-harvest-gap-report", help="JSON gap report (site total vs rows_known)")
     gap.add_argument("--limit", type=int, default=200)
     ext = sub.add_parser("search-harvest-plan-extended", help="Seed court/judge/statute/keyword/party x year queries")
@@ -275,7 +276,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "search-harvest-plan":
         from scraper.tasks.pls_search_harvest import cli_plan
 
-        return cli_plan(["--dry-run"] if args.dry_run else [])
+        plan_argv: list[str] = []
+        if args.dry_run:
+            plan_argv.append("--dry-run")
+        if args.apply:
+            plan_argv.append("--apply")
+        return cli_plan(plan_argv)
     if args.command == "search-harvest-gap-report":
         from scraper.tasks.pls_search_harvest import cli_gap_report
 

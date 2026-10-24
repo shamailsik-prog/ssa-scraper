@@ -23,9 +23,11 @@ Requires the same human-login session, search form map, and `ALLOW_LOGIN_SCRAPIN
 Seed the plan (idempotent):
 
 ```bash
+python -m scraper.tasks.pls_admin search-harvest-plan --apply
 python -m scraper.tasks.pls_admin search-harvest-plan
-python -m scraper.tasks.pls_admin search-harvest-plan --dry-run
 ```
+
+Default is dry-run (counts only). Pass `--apply` to insert missing plan rows and commit.
 
 Gap report (JSON):
 
@@ -47,7 +49,7 @@ HTTP gap report (read-only, same as `/status`):
 ## Live smoke (one query, page count)
 
 1. Ensure an ACTIVE browser slot and a current `search_form_map` for `PakistanLawSite`.
-2. Seed plan: `python -m scraper.tasks.pls_admin search-harvest-plan`
+2. Seed plan: `python -m scraper.tasks.pls_admin search-harvest-plan --apply`
 3. Dry-run one query with a page cap:
 
    ```bash
