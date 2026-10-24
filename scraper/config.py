@@ -430,6 +430,10 @@ class Settings(BaseSettings):
         default=False,
         description="When true, quarantine PakistanLawSite captures with counsel/hearing metadata but no JUDGMENT/ORDER body (long headnote-only modal text). Also treats such promoted rows as incomplete for grid refetch.",
     )
+    SSA_HEADER_CITATION_KEY_GUARD: bool = Field(
+        default=False,
+        description="When true, refuse promotion when the normalised header citation disagrees with the storage key (header_key_mismatch).",
+    )
     PLS_SEARCH_HARVEST_MAX_PAGES_PER_QUERY: int = Field(
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
