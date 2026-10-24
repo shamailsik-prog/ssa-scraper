@@ -406,6 +406,14 @@ class Settings(BaseSettings):
         default=False,
         description="When on, prefer foreign heading court over grid default Supreme Court of Pakistan on PLS pages. Set SSA_PLS_COURT_RESOLUTION=1 or true to enable.",
     )
+    SSA_JUDGMENT_COURT_ID_BACKFILL: bool = Field(
+        default=False,
+        description="When on, pls_admin backfill-judgment-courts --apply may repoint judgment court_id to match court_name (foreign courts).",
+    )
+    SSA_JUDGMENT_COURT_ID_NAME_GUARD: bool = Field(
+        default=False,
+        description="When on, promotion quarantines judgments whose court_id row name disagrees with court_name.",
+    )
     SSA_PLD_CITATION_RELABEL: bool = Field(
         default=True,
         description="Default on. Relabel PLD citations missing a court token using the judgment header. Set SSA_PLD_CITATION_RELABEL=0 or false to disable.",

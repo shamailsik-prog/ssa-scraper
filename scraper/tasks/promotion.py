@@ -659,6 +659,26 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             {"reason_code": val_reason, "validation_errors": st.validation_errors},
         )
         return "quarantined"
+    if bool(getattr(settings, "SSA_JUDGMENT_COURT_ID_NAME_GUARD", False)):
+        from scraper.judgment_court_consistency import judgment_court_fields_consistent
+
+        court_name_for_row = court.name if court else data.get("court")
+        if not judgment_court_fields_consistent(
+            court_name=court_name_for_row,
+            court_id=court.id if court else None,
+            court_row=court,
+        ):
+            await _quarantine(
+                db,
+                st,
+                "court_id/court_name mismatch at promotion",
+                "judgment",
+                {
+                    "court_name": court_name_for_row,
+                    "court_id": str(court.id) if court else None,
+                },
+            )
+            return "quarantined"
     meta = parse_case_metadata(full_text) if st.source_name == "PakistanLawSite" else None
     final_docket = incoming_docket or (meta.docket_number if meta else case_number)
     j = Judgment(

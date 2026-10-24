@@ -64,6 +64,16 @@ def main(argv: list[str] | None = None) -> int:
     court_bf.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     court_bf.add_argument("--undo", metavar="RUN_ID", help="Restore court_name values from a prior --apply run")
     court_bf.add_argument("--limit", type=int, default=None)
+    court_bf.add_argument(
+        "--consistency-report",
+        action="store_true",
+        help="Report court_id vs court_name mismatches (read-only)",
+    )
+    jcc = sub.add_parser(
+        "judgment-court-consistency-report",
+        help="Report PLS judgments whose court_id row disagrees with court_name",
+    )
+    jcc.add_argument("--limit", type=int, default=None)
     req = sub.add_parser("requalify-quarantine", help="Re-run deterministic extraction on quarantined captures and promote the ones that now validate")
     req.add_argument("--apply", action="store_true", help="Promote/write changes (default is dry-run)")
     req.add_argument("--limit", type=int, default=2000)
@@ -131,7 +141,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-judgment-courts":
         from scraper.tasks.judgment_court_backfill import run_judgment_court_backfill
 
-        print(run_async(run_judgment_court_backfill(apply=args.apply, undo=args.undo, limit=args.limit)))
+        print(
+            run_async(
+                run_judgment_court_backfill(
+                    apply=args.apply,
+                    undo=args.undo,
+                    limit=args.limit,
+                    consistency_report_only=args.consistency_report,
+                )
+            )
+        )
+        return 0
+    if args.command == "judgment-court-consistency-report":
+        from scraper.database import SessionLocal
+        from scraper.judgment_court_consistency import consistency_report
+
+        async def _report():
+            async with SessionLocal() as db:
+                return await consistency_report(db, limit=args.limit)
+
+        print(run_async(_report()))
         return 0
     if args.command == "requalify-quarantine":
         from scraper.tasks.pls_backfill import run_requalify
