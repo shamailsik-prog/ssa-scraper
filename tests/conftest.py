@@ -40,6 +40,7 @@ os.environ["ENCRYPTION_KEY"] = os.environ.get("ENCRYPTION_KEY") or Fernet.genera
 os.environ["ADMIN_API_KEY"] = "test-admin-key"
 os.environ["SIKANDER_READER_PASSWORD"] = os.environ.get("SIKANDER_READER_PASSWORD") or "readerpw"
 os.environ["CORPUS_WRITER_PASSWORD"] = os.environ.get("CORPUS_WRITER_PASSWORD") or "writerpw"
+os.environ["CORPUS_VERIFIER_PASSWORD"] = os.environ.get("CORPUS_VERIFIER_PASSWORD") or ""
 os.environ["ENVIRONMENT"] = "chambers"
 os.environ["ALLOW_LOGIN_SCRAPING"] = "true"
 os.environ["APP_ENV"] = "development"
@@ -137,6 +138,12 @@ async def clean_db():
     async def _truncate_and_seed() -> None:
         async with engine.begin() as conn:
             await conn.execute(truncate_sql)
+            await conn.execute(
+                text(
+                    "TRUNCATE verification.verification_results, verification.verification_run_state "
+                    "RESTART IDENTITY CASCADE"
+                )
+            )
             await _ensure_judgment_case_hash_includes_unreported(conn)
         await seed_data()
 

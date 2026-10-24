@@ -36,6 +36,7 @@ app = Celery(
         "scraper.tasks.pls_caseid_walk",
         "scraper.tasks.pls_backfill",
         "scraper.tasks.judgment_identity_reconcile",
+        "scraper.tasks.corpus_verifier",
     ],
 )
 app.conf.update(
@@ -68,6 +69,8 @@ app.conf.update(
         "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
+        "scraper.tasks.corpus_verifier.corpus_verifier_tick": {"queue": "maintenance"},
+        "scraper.tasks.corpus_verifier.corpus_verifier_nightly_report": {"queue": "maintenance"},
     },
     beat_schedule={
         "dispatch-due-sources": {"task": "scraper.tasks.dispatcher.dispatch_due_sources", "schedule": settings.DISPATCH_LOOP_SECONDS},
@@ -143,6 +146,16 @@ def search_harvest_beat_entries() -> dict:
 
 if settings.PLS_SEARCH_HARVEST_ENABLED:
     app.conf.beat_schedule.update(search_harvest_beat_entries())
+if settings.SSA_CORPUS_RECORD_VERIFIER:
+    app.conf.beat_schedule["corpus-verifier-tick"] = {
+        "task": "scraper.tasks.corpus_verifier.corpus_verifier_tick",
+        "schedule": settings.CORPUS_VERIFIER_SCHEDULE_SECONDS,
+        "options": {"expires": settings.CORPUS_VERIFIER_SCHEDULE_SECONDS},
+    }
+    app.conf.beat_schedule["corpus-verifier-nightly-report"] = {
+        "task": "scraper.tasks.corpus_verifier.corpus_verifier_nightly_report",
+        "schedule": 86400,
+    }
 if settings.PLS_CASEID_WALK_ENABLED:
     # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
     for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):
