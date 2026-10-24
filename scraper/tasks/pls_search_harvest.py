@@ -59,6 +59,7 @@ from scraper.pls_search_harvest_core import (
     harvest_result_cap,
     harvest_result_fingerprint_from_keys,
     should_auto_split_journal_year,
+    split_children_case_coverage_incomplete,
     split_children_union_incomplete,
     split_oversized_query,
     unmapped_harvest_reason,
@@ -681,11 +682,15 @@ class SearchHarvestRunner:
                 key_sets.append(set(str(k) for k in raw))
         if not key_sets:
             return
-        if split_children_union_incomplete(expected, key_sets):
+        # Flat result_keys include citation aliases, not one key per judgment.
+        # Counting those aliases as rows can hide missing parent judgments.
+        if split_children_union_incomplete(expected, key_sets) or split_children_case_coverage_incomplete(expected, key_sets):
             parent.status = "needs_resplit"
             union_n = len(set().union(*key_sets))
+            case_n = len({key for keys in key_sets for key in keys if key.startswith("case:")})
             parent.last_error = (
-                f"split children union {union_n} rows < parent rows_seen={expected}; incomplete coverage"
+                f"split children union {union_n} alias keys / {case_n} distinct CaseNames "
+                f"cannot verify parent rows_seen={expected}; incomplete coverage"
             )[:1000]
 
     async def run_query(
