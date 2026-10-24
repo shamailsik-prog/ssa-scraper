@@ -572,7 +572,7 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
         )
     )
     monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
-    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
     await set_harvest_mode(db, "updates", changed_by="qa", reason="saturated defer")
     await db.commit()
 
