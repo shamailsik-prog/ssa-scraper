@@ -75,6 +75,31 @@ def judgment_header_slice(text: Optional[str]) -> str:
     return window[: cut.start()] if cut else window
 
 
+_HEADNOTE_TOPIC = re.compile(r"(?:^|\n)\s*\([a-z]\)\s", re.I)
+
+
+def judgment_caption_slice(text: Optional[str]) -> str:
+    """Citation caption only: lines before parties, docket, headnotes, or rel./ref. markers.
+
+    Parallel report citations in this block may become aliases; body and headnote mentions must not."""
+    raw = text or ""
+    if not raw:
+        return ""
+    scan_limit = min(len(raw), max(2000, int(len(raw) * 0.08)))
+    scan = raw[:scan_limit]
+    cuts: List[int] = []
+    for pat in (_HEADER_REL_REF, _VERSUS, _DECIDED):
+        m = pat.search(scan)
+        if m:
+            cuts.append(m.start())
+    hm = _HEADNOTE_TOPIC.search(scan)
+    if hm:
+        cuts.append(hm.start())
+    if cuts:
+        return raw[: min(cuts)]
+    return judgment_header_slice(raw)
+
+
 def parse_pls_header_court(text: Optional[str]) -> Optional[str]:
     """Court name from the PLS header block only (not reconciled metadata)."""
     header = judgment_header_slice(text)
@@ -98,7 +123,11 @@ def _title_start(lines: List[str]) -> int:
     for i in range(min(len(lines), 5)):
         ln = lines[i]
         low = ln.lower()
-        if low.startswith(("before", "coram")) or (i <= 2 and re.match(r"^[\[(][A-Za-z].{1,70}[\])]$", ln)):
+        if (
+            low.startswith(("before", "coram", "present"))
+            or re.match(r"^present[.:]", low)
+            or (i <= 2 and re.match(r"^[\[(][A-Za-z].{1,70}[\])]$", ln))
+        ):
             idx = i + 1
     return idx
 
