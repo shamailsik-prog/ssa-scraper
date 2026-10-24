@@ -1813,6 +1813,12 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
+                from scraper.pls_grid_health import pls_consume_grid_yield_cap_bypass
+
+                if await pls_consume_grid_yield_cap_bypass(
+                    self.db, self.source, reporter_shard=self.reporter_shard
+                ):
+                    self.stats["grid_yield_cap_bypass_consumed"] = True
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,

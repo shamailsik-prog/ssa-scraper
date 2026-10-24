@@ -46,6 +46,23 @@ def test_grid_yield_cap_allows_saturated_lap():
     assert pls_yield_citation_grid_to_search_harvest(cfg, 0, 30, now=now) is None
 
 
+@pytest.mark.asyncio
+async def test_consume_grid_yield_cap_bypass_resets_shard_timers(db, login_source):
+    from scraper.pls_grid_health import pls_consume_grid_yield_cap_bypass, pls_grid_yield_cap_reached
+
+    now = datetime.now(timezone.utc)
+    login_source.config_json = {
+        **dict(login_source.config_json or {}),
+        "grid_yield_since_shard_0": (now - timedelta(minutes=121)).isoformat(),
+    }
+    await db.flush()
+    assert pls_grid_yield_cap_reached(dict(login_source.config_json), 0, now=now) is True
+    assert await pls_consume_grid_yield_cap_bypass(db, login_source, reporter_shard=0, now=now) is True
+    cfg = dict(login_source.config_json or {})
+    assert pls_grid_yield_cap_reached(cfg, 0, now=now) is False
+    await db.rollback()
+
+
 def test_unsharded_grid_yield_cap_when_either_shard_past_limit():
     now = datetime.now(timezone.utc)
     cfg = {

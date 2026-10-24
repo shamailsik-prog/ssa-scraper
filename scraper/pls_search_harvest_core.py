@@ -341,8 +341,9 @@ def search_harvest_may_mark_done_unlinked(
     exceeds the site total, or the site showed no total) and every unseen row on the page is linkless."""
     if not pagination_confirmed or rows_unlinked <= 0:
         return False, ""
-    if unlinked_done_safety_error(rows_seen, rows_unlinked):
-        return False, ""
+    safety = unlinked_done_safety_error(rows_seen, rows_unlinked)
+    if safety:
+        return False, safety
     if int(rows_seen) - int(rows_known) != int(rows_unlinked):
         return False, ""
     if site_total is not None and rows_seen < int(site_total):

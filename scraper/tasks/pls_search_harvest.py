@@ -844,6 +844,12 @@ class SearchHarvestRunner:
                     query_row.last_error = None
                     query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
+                    if unlinked_reason and unlinked_done_safety_error(rows_seen, rows_unlinked):
+                        logger.warning(
+                            "PLS search harvest %s: %s",
+                            query_row.query_key,
+                            unlinked_reason,
+                        )
                     query_row.status = "in_progress"
                     query_row.last_error = (unlinked_reason or incomplete_reason)[:1000]
                     if site_total is not None and rows_seen < int(site_total):

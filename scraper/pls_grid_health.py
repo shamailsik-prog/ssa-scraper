@@ -14,6 +14,7 @@ from scraper.models import Judgment, ScraperJob, ScraperSource, ScraperStaging
 SOURCE_NAME = "PakistanLawSite"
 PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
 GRID_YIELD_SINCE_KEY = "grid_yield_since"
+GRID_CAP_LAP_AT_KEY = "grid_cap_lap_at"
 
 
 def grid_yield_since_key(reporter_shard: Optional[int]) -> str:
@@ -382,6 +383,28 @@ async def pls_note_search_harvest_grid_yield(
     watch["search_harvest_yield_at"] = now.isoformat()
     patch[PLS_STALL_WATCHDOG_KEY] = watch
     await merge_source_config(db, source, patch)
+
+
+async def pls_consume_grid_yield_cap_bypass(
+    db: AsyncSession,
+    source: ScraperSource,
+    *,
+    reporter_shard: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Restart yield timers when a cap-expired grid job begins so a lap that never finishes a window cannot bypass every dispatch."""
+    from scraper.auth.session_manager import merge_source_config
+
+    now = now or datetime.now(timezone.utc)
+    cfg = dict(source.config_json or {})
+    if not pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
+        return False
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    patch: Dict[str, Any] = {GRID_CAP_LAP_AT_KEY: now.isoformat()}
+    for shard in shards:
+        patch[grid_yield_since_key(shard)] = now.isoformat()
+    await merge_source_config(db, source, patch)
+    return True
 
 
 async def pls_clear_grid_yield_marker(
