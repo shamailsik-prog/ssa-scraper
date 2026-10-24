@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     PLS_STALL_WATCHDOG_SECONDS: int = Field(default=1800, description="Celery Beat cadence for citation-grid stall watchdog.")
     PLS_STALL_NO_PROMOTION_HOURS: float = Field(default=6.0, description="/status stalled=true (and a PLS_NO_NEW_JUDGMENTS notification) when no PakistanLawSite judgment was promoted for this many hours.")
     PLS_SATURATED_RECHECK_HOURS: float = Field(default=12.0, description="A citation-grid shard whose last full lap staged nothing new is not scheduled again for this many hours.")
+    PLS_GRID_MAX_YIELD_MINUTES: int = Field(
+        default=120,
+        description="After search-harvest has blocked a saturated citation-grid walk this long (grid_yield_since), allow one grid lap even if harvest rows are still pending.",
+    )
     PLS_GRID_JOURNAL_ROTATION: bool = Field(default=True, description="Walk the citation grid once per journal: select each journal in the site's citation-search form and give it its own cursor. Off, or when the form offers no journal choice, the default grid (the site's last or default search) is walked.")
     PLS_GRID_JOURNALS: str = Field(default="", description="Comma-separated journals for the per-journal grid walk, in order; blank = PLS_SUBSCRIBED_REPORTERS.")
     PLS_GRID_JOURNAL_MIN_MATCH: float = Field(default=0.5, description="Share of a journal grid's rows that must carry the requested journal's citations; below it the journal is marked unsupported (the form did not filter) and skipped until the saturation recheck.")

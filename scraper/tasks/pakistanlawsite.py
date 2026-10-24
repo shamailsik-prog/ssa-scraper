@@ -768,6 +768,28 @@ class PakistanLawSitePipeline:
             row_offset = 0
         return cursor_key, cursor, max(0, row_offset)
 
+    async def _maybe_yield_citation_grid_for_search_harvest(self) -> bool:
+        from scraper.pls_grid_health import (
+            pls_note_search_harvest_grid_yield,
+            pls_pending_search_harvest_count,
+            pls_yield_citation_grid_to_search_harvest,
+        )
+
+        pending = await pls_pending_search_harvest_count(self.db, reporter_shard=self.reporter_shard)
+        reason = pls_yield_citation_grid_to_search_harvest(
+            dict(self.source.config_json or {}),
+            self.reporter_shard,
+            pending,
+        )
+        if not reason:
+            return False
+        await pls_note_search_harvest_grid_yield(
+            self.db, self.source, reason, reporter_shard=self.reporter_shard
+        )
+        self.stats["yielded_for_search_harvest"] = reason
+        logger.info("PakistanLawSite citation-grid: %s (yielding session for search-harvest)", reason)
+        return True
+
     async def run_citation_grid_surface(self, search_map: Dict[str, Any]) -> None:
         """CitationSearch is an authenticated citation table, not a form: walk it window by window.
 
@@ -795,6 +817,8 @@ class PakistanLawSitePipeline:
                 await self._set_grid_journal(first)
         windows = 0
         while True:
+            if await self._maybe_yield_citation_grid_for_search_harvest():
+                break
             try:
                 outcome = await self._run_citation_grid_window(search_map, limits)
             except CitationSearchNavigationFailed as exc:
@@ -809,6 +833,11 @@ class PakistanLawSitePipeline:
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
+            from scraper.pls_grid_health import pls_clear_grid_yield_marker
+
+            await pls_clear_grid_yield_marker(
+                self.db, self.source, reporter_shard=self.reporter_shard
+            )
             if outcome.get("citation_grid_stub_stop"):
                 logger.info(
                     "PakistanLawSite citation-grid: intermittent no-results stub; "
@@ -1838,6 +1867,9 @@ class PakistanLawSitePipeline:
                             exc,
                         )
                         break
+                if self.stats.get("yielded_for_search_harvest") and self._slot_lock is not None:
+                    await self._slot_lock.release()
+                    self._slot_lock = None
                 self.source.last_scraped_at = datetime.now(timezone.utc)
                 if stopped_clean:
                     self.source.last_success_at = self.source.last_scraped_at

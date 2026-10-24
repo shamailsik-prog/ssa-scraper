@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -13,6 +13,13 @@ from scraper.models import Judgment, ScraperJob, ScraperSource, ScraperStaging
 
 SOURCE_NAME = "PakistanLawSite"
 PLS_STALL_WATCHDOG_KEY = "pls_stall_watchdog"
+GRID_YIELD_SINCE_KEY = "grid_yield_since"
+
+
+def grid_yield_since_key(reporter_shard: Optional[int]) -> str:
+    if reporter_shard in (0, 1):
+        return f"grid_yield_since_shard_{reporter_shard}"
+    return GRID_YIELD_SINCE_KEY
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -227,6 +234,179 @@ def grid_cursor_key_for_shard(reporter_shard: Optional[int]) -> str:
 
 SEARCH_HARVEST_PRIORITY_STALL_REASONS = frozenset({"no_output_while_harvesting", "grid_saturated"})
 
+# run_login_session_job (citation-grid walks) is queued from:
+# - dispatcher.dispatch_due_sources (Celery Beat / DISPATCH_LOOP_SECONDS)
+# - pls_self_healing.pls_grid_stall_watchdog (no_output while grid_harvest_incomplete)
+# - routers.sources manual scrape kick
+
+
+def pls_grid_max_yield_minutes() -> int:
+    return int(getattr(settings, "PLS_GRID_MAX_YIELD_MINUTES", 120) or 120)
+
+
+def pls_grid_yield_cap_reached(
+    cfg: Dict[str, Any], reporter_shard: Optional[int], *, now: Optional[datetime] = None
+) -> bool:
+    """Per-shard yield timers; unsharded checks treat the cap as reached when either shard is past the limit."""
+    now = now or datetime.now(timezone.utc)
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    limit = pls_grid_max_yield_minutes() * 60
+    for shard in shards:
+        since = parse_iso(cfg.get(grid_yield_since_key(shard)))
+        if since is None:
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        if (now - since).total_seconds() >= limit:
+            return True
+    return False
+
+
+def pls_yield_citation_grid_to_search_harvest(
+    cfg: Dict[str, Any],
+    reporter_shard: Optional[int],
+    pending_harvest: int,
+    *,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """When the ledger has work, prefer search-harvest over a saturated citation-grid lap."""
+    now = now or datetime.now(timezone.utc)
+    if pls_grid_yield_cap_reached(cfg, reporter_shard, now=now):
+        return None
+    if pending_harvest <= 0:
+        return None
+    if defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
+        return "search-harvest gaps while promotion stalled or grid saturated (watchdog)"
+    if dispatch_saturated(cfg, reporter_shard, now=now):
+        return (
+            f"search-harvest has {pending_harvest} pending row(s) while citation grid is saturated"
+        )
+    return None
+
+
+def _search_harvest_tick_seconds() -> int:
+    return max(1, int(getattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0) or 0) or 1200)
+
+
+def _pending_harvest_filters(
+    *,
+    stall_reason: Optional[str],
+    now: datetime,
+):
+    from scraper.models import PlsSearchHarvestQuery
+
+    if stall_reason in SEARCH_HARVEST_PRIORITY_STALL_REASONS:
+        cutoff = now - timedelta(seconds=2 * _search_harvest_tick_seconds())
+        return (
+            PlsSearchHarvestQuery.status == "in_progress",
+            PlsSearchHarvestQuery.last_run_at.is_not(None),
+            PlsSearchHarvestQuery.last_run_at >= cutoff,
+            or_(PlsSearchHarvestQuery.last_error.is_(None), PlsSearchHarvestQuery.last_error == ""),
+        )
+    return (
+        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+        or_(
+            PlsSearchHarvestQuery.status == "pending",
+            PlsSearchHarvestQuery.last_error.is_(None),
+            PlsSearchHarvestQuery.last_error == "",
+        ),
+    )
+
+
+async def pls_pending_search_harvest_count(
+    db: AsyncSession,
+    *,
+    slot: Optional[int] = None,
+    reporter_shard: Optional[int] = None,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Rows this login slot may claim: own reporter share, plus the other share when cross-slot claim is on."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.pls_search_harvest import _share_filter
+
+    if reporter_shard in (0, 1):
+        slot = reporter_shard + 1
+    now = now or datetime.now(timezone.utc)
+    stmt = (
+        select(func.count())
+        .select_from(PlsSearchHarvestQuery)
+        .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, *_pending_harvest_filters(stall_reason=stall_reason, now=now))
+    )
+    if slot in (1, 2):
+        own = _share_filter(slot)
+        if getattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False):
+            other = _share_filter(2 if slot == 1 else 1)
+            stmt = stmt.where(or_(own, other))
+        else:
+            stmt = stmt.where(own)
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
+async def pls_unsharded_enqueue_pending_counts(
+    db: AsyncSession,
+    *,
+    stall_reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[int, int]:
+    """Pending counts per slot share for an unsharded login-session enqueue decision."""
+    slot1 = await pls_pending_search_harvest_count(db, slot=1, stall_reason=stall_reason, now=now)
+    slot2 = await pls_pending_search_harvest_count(db, slot=2, stall_reason=stall_reason, now=now)
+    return slot1, slot2
+
+
+async def pls_note_search_harvest_grid_yield(
+    db: AsyncSession,
+    source: ScraperSource,
+    reason: str,
+    *,
+    reporter_shard: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    from scraper.auth.session_manager import merge_source_config
+
+    now = now or datetime.now(timezone.utc)
+    cfg = dict(source.config_json or {})
+    patch: Dict[str, Any] = {}
+    yield_key = grid_yield_since_key(reporter_shard)
+    if reporter_shard is None:
+        for shard in (0, 1):
+            sk = grid_yield_since_key(shard)
+            if not cfg.get(sk):
+                patch[sk] = now.isoformat()
+    elif not cfg.get(yield_key):
+        patch[yield_key] = now.isoformat()
+    watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
+    watch["search_harvest_yield_reason"] = reason
+    watch["search_harvest_yield_at"] = now.isoformat()
+    patch[PLS_STALL_WATCHDOG_KEY] = watch
+    await merge_source_config(db, source, patch)
+
+
+async def pls_clear_grid_yield_marker(
+    db: AsyncSession,
+    source: ScraperSource,
+    *,
+    reporter_shard: Optional[int] = None,
+) -> None:
+    from scraper.auth.session_manager import merge_source_config
+
+    cfg = dict(source.config_json or {})
+    shards: Tuple[int, ...] = (0, 1) if reporter_shard is None else (int(reporter_shard),)
+    patch: Dict[str, Any] = {}
+    for shard in shards:
+        yield_key = grid_yield_since_key(shard)
+        if cfg.get(yield_key):
+            patch[yield_key] = None
+    if not patch:
+        return
+    watch = dict(cfg.get(PLS_STALL_WATCHDOG_KEY) or {})
+    watch.pop("search_harvest_yield_reason", None)
+    watch.pop("search_harvest_yield_at", None)
+    patch[PLS_STALL_WATCHDOG_KEY] = watch
+    await merge_source_config(db, source, patch)
+
 
 def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any], *, stall_reason: Optional[str] = None) -> bool:
     """When promotion is stalled or the grid is saturated, yield the login queue to search-harvest gaps."""
@@ -292,6 +472,11 @@ def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, no
     walk is saturated only when every configured journal is saturated or unsupported."""
     if settings.PLS_GRID_JOURNAL_ROTATION and settings.grid_journals and not journal_rotation_off(cfg, now=now):
         return journals_all_done(cfg, journals_for_shard(reporter_shard), now=now)
+    if reporter_shard is None:
+        shard0 = cursor_saturated(cfg.get("citation_grid_cursor_shard_0"), now=now)
+        shard1 = cursor_saturated(cfg.get("citation_grid_cursor_shard_1"), now=now)
+        if shard0 and shard1:
+            return True
     return cursor_saturated(cfg.get(grid_cursor_key_for_shard(reporter_shard)), now=now)
 
 
