@@ -5,6 +5,8 @@ from __future__ import annotations
 from scraper.config import settings
 from scraper.pls_caseid import (
     case_url,
+    ceiling,
+    group_key,
     group_order,
     known_by_group,
     looks_like_case_page,
@@ -12,6 +14,7 @@ from scraper.pls_caseid import (
     next_serial,
     parse_case_id,
     record,
+    split_group_key,
 )
 from scraper.tasks import pls_caseid_walk
 from scraper.tasks.pls_caseid_walk import STATE_KEY, CaseIdWalker
@@ -26,6 +29,33 @@ def test_parse_case_id_from_live_links():
     assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=1980L238&&court= &&Row=0") == (1980, "L", 238)
     assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=x") is None
     assert parse_case_id(None) is None
+
+
+def test_parse_case_id_extended_court_tokens_and_hyphenated_codes():
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2023HCAJK1&Row=0") == (2023, "HCAJK", 1)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2023SCAJK1&Row=0") == (2023, "SCAJK", 1)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2019NIRC42&Row=0") == (2019, "NIRC", 42)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2020PLAT7&Row=0") == (2020, "PLAT", 7)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2021SCUK99&Row=0") == (2021, "SCUK", 99)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH12&Row=0") == (2024, "LAT-SINDH", 12)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2025HC-A3&Row=0") == (2025, "HC-A", 3)
+    assert parse_case_id(f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2026SC-A701&Row=0") == (2026, "SC-A", 701)
+
+
+def test_hyphenated_group_key_split_and_ceiling():
+    url = f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH50&Row=0"
+    year, court = parse_case_id(url)[:2]
+    key = group_key(year, court)
+    assert key == "2024LAT-SINDH"
+    assert split_group_key(key) == (2024, "LAT-SINDH")
+    known = known_by_group([url])
+    assert known == {key: {50}}
+    state = new_state()
+    assert ceiling(state, known[key], floor=1000, pad=100) == 1000
+    assert ceiling(state, known[key], floor=10, pad=100) == 150
+    state["next"] = 51
+    assert next_serial(state, known[key], floor=1000, pad=100) == 51
+    assert case_url(BASE, key, 51).endswith("CaseName=2024LAT-SINDH51&")
 
 
 def test_known_groups_and_order_dense_first_then_empty_years_newest_first():

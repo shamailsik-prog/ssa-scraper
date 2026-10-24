@@ -195,10 +195,14 @@ def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
     return keys
 
 
-# Site CaseName codes: 4-digit year, court/journal letters (SC, HCAJK, SCAJK, L, …), trailing digits.
-CASE_NAME_CODE_PATTERN = r"\d{4}[A-Za-z]{1,8}\d{1,6}"
+# Site CaseName codes: year + court/journal token (SC, HCAJK, LAT-SINDH, HC-A, …) + serial digits.
+CASE_NAME_COURT_SEGMENT_PATTERN = r"[A-Za-z]{1,8}(?:-[A-Za-z]{1,12})?"
+CASE_NAME_CODE_PATTERN = rf"\d{{4}}{CASE_NAME_COURT_SEGMENT_PATTERN}\d{{1,6}}"
 # Terminator must allow '&' (query string); only block another code character.
 CASE_NAME_URL_SUBSTRING_PATTERN = rf"CaseName=({CASE_NAME_CODE_PATTERN})(?![0-9A-Za-z])"
+CASE_ID_URL_PATTERN = (
+    rf"CaseName=(\d{{4}})({CASE_NAME_COURT_SEGMENT_PATTERN})(\d{{1,6}})(?![0-9A-Za-z])"
+)
 _CASE_NAME_RE = re.compile(CASE_NAME_URL_SUBSTRING_PATTERN)
 
 

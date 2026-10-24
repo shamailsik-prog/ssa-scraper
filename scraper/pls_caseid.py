@@ -19,8 +19,9 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from scraper.extractors.judgment_guards import _has_case_content
 from scraper.parsers.citation_extractor import extract_citations
+from scraper.pls_search_harvest_core import CASE_ID_URL_PATTERN
 
-CASE_ID_RE = re.compile(r"CaseName=(\d{4})([A-Za-z]{1,3})(\d{1,6})(?![0-9A-Za-z])")
+CASE_ID_RE = re.compile(CASE_ID_URL_PATTERN)
 BLOCK = 100
 MIN_CASE_PAGE_CHARS = 300
 
