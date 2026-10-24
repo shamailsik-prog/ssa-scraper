@@ -139,3 +139,90 @@ async def test_consistency_report_splits_null_and_mismatch(db):
     report = await consistency_report(db)
     assert report["null_court_id_count"] >= 1
     assert report["real_mismatch_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_link_apply_preserves_later_court_id_correction(db):
+    """A dry-run plan cannot overwrite a court_id corrected before apply."""
+    from scraper.models import Court, Judgment
+
+    jid = uuid4()
+    j = Judgment(
+        id=jid,
+        source_name="PakistanLawSite",
+        court_name="SUPREME-COURT-AZAD-KASHMIR",
+        court_id=None,
+        canonical_citation="1991 CLC 32001",
+        full_text="1991 CLC 32001\n[Azad J & K]\nBefore A and B, JJ\n" + ("x" * 400),
+        full_text_hash="link_stale_id_correction",
+        access_method="rendered_copy",
+    )
+    db.add(j)
+    await db.commit()
+    plan = await find_court_id_links(db, create=True)
+    link = next(row for row in plan["links"] if row["id"] == str(jid))
+    corrected = Court(
+        name="Federal Shariat Court (independent correction)",
+        short_code="FSC_INDEPENDENT_CORRECTION",
+        court_level="federal",
+    )
+    db.add(corrected)
+    await db.flush()
+    j.court_id = corrected.id
+    await db.flush()
+    result = await apply_court_id_links(db, "stale_id_correction", [link])
+    await db.flush()
+    assert result["court_ids_updated"] == 0
+    assert j.court_id == corrected.id
+
+
+@pytest.mark.asyncio
+async def test_link_apply_revalidates_changed_ajk_header(db):
+    """A single-judge AJK HC header invalidates a prior AJK SC proposal."""
+    jid = uuid4()
+    j = Judgment(
+        id=jid,
+        source_name="PakistanLawSite",
+        court_name="SUPREME-COURT-AZAD-KASHMIR",
+        court_id=None,
+        canonical_citation="1991 CLC 32002",
+        full_text="1991 CLC 32002\n[Azad J & K]\nBefore A and B, JJ\n" + ("x" * 400),
+        full_text_hash="link_stale_header",
+        access_method="rendered_copy",
+    )
+    db.add(j)
+    await db.commit()
+    plan = await find_court_id_links(db, create=True)
+    link = next(row for row in plan["links"] if row["id"] == str(jid))
+    j.full_text = "1991 CLC 32002\n[Azad J & K]\nBefore Muhammad Yousaf, J\n" + ("y" * 400)
+    await db.flush()
+    result = await apply_court_id_links(db, "stale_ajk_header", [link])
+    await db.flush()
+    assert result["court_ids_updated"] == 0
+    assert j.court_id is None
+
+
+@pytest.mark.asyncio
+async def test_link_apply_rejects_changed_court_name(db):
+    """A later court-name correction must not inherit an old target court_id."""
+    jid = uuid4()
+    j = Judgment(
+        id=jid,
+        source_name="PakistanLawSite",
+        court_name="SUPREME-COURT-AZAD-KASHMIR",
+        court_id=None,
+        canonical_citation="1991 CLC 32003",
+        full_text="1991 CLC 32003\n[Azad J & K]\nBefore A and B, JJ\n" + ("x" * 400),
+        full_text_hash="link_stale_name",
+        access_method="rendered_copy",
+    )
+    db.add(j)
+    await db.commit()
+    plan = await find_court_id_links(db, create=True)
+    link = next(row for row in plan["links"] if row["id"] == str(jid))
+    j.court_name = "Federal Shariat Court"
+    await db.flush()
+    result = await apply_court_id_links(db, "stale_court_name", [link])
+    await db.flush()
+    assert result["court_ids_updated"] == 0
+    assert j.court_id is None
