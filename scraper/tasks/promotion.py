@@ -61,8 +61,8 @@ from scraper.models import (
     StatutesStaging,
 )
 from scraper.parsers.bench_parser import normalise_judge_name
-from scraper.extractors.deterministic import decision_date_from_text, referred_after_citation
-from scraper.parsers.case_metadata import judgment_header_slice, parse_case_metadata, parse_pls_header_court
+from scraper.extractors.deterministic import citation_referred_in_text, decision_date_from_text, referred_after_citation
+from scraper.parsers.case_metadata import judgment_caption_slice, judgment_header_slice, parse_case_metadata, parse_pls_header_court
 from scraper.parsers.citation_extractor import (
     canonical_court,
     canonicalise_statute_name,
@@ -193,13 +193,13 @@ judgment_exact_identity_matches = _judgment_case_identity_matches
 
 def _header_citation_set(page_text: str) -> set[str]:
     raw_text = page_text or ""
-    header_end = len(judgment_header_slice(raw_text))
+    header_end = len(judgment_caption_slice(raw_text))
     header: set[str] = set()
     for c in extract_citations(raw_text):
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if not norm:
             continue
-        referred = referred_after_citation.match(raw_text, c["span"][1]) is not None
+        referred = citation_referred_in_text(raw_text, c["span"][0], c["span"][1])
         if c["span"][0] < header_end and not referred:
             header.add(norm)
     return header

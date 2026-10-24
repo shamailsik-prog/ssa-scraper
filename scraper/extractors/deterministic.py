@@ -27,6 +27,7 @@ from scraper.parsers.citation_extractor import (
     normalise_citation,
     score_confidence,
 )
+from scraper.parsers.case_metadata import judgment_caption_slice
 from scraper.parsers.statute_parser import (
     detect_statute_name,
     listed_title_supported_by_text,
@@ -121,13 +122,65 @@ def case_title_from_text(text: str, html: Optional[str] = None) -> tuple[Optiona
     if m:
         title = re.sub(r"\s+", " ", m.group(0)).strip(" .")
         return title, title[:200]
+    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
+    for i, ln in enumerate(lines):
+        if not re.match(r"^(?:versus|vs\.?)$", ln, re.I):
+            continue
+        if i < 1 or i + 1 >= len(lines):
+            continue
+        pet = re.sub(r"\s*-{1,}.*$", "", lines[i - 1]).strip()
+        res = re.sub(r"\s*-{1,}.*$", "", lines[i + 1]).strip()
+        if len(pet) >= 3 and len(res) >= 3:
+            title = re.sub(r"\s+", " ", f"{pet} versus {res}").strip(" .")
+            return title, title[:200]
     return None, None
 
 
 referred_after_citation = re.compile(
-    r"\s*[,;]?\s*(?:ref|rel|fol|foll|distinguished|dist|considered|overruled|approved|referred)\b\.?",
+    r"\s*[,;]?\s*(?:ref|rel|fol|foll|distinguished|dist|considered|overruled|approved|referred|not\s+applicable)\b\.?",
     re.IGNORECASE,
 )
+_REF_LIST_MARKER = re.compile(
+    r"\b(?:ref|rel|fol|foll|distinguished|dist|considered|overruled|approved|referred|not\s+applicable)\b\.?",
+    re.IGNORECASE,
+)
+_HEADNOTE_TOPIC_LINE = re.compile(r"(?:^|\n)\s*\([a-z]\)\s", re.IGNORECASE)
+
+
+def citation_referred_in_text(text: str, span_start: int, span_end: int) -> bool:
+    """True when a cite is rel/ref/fol/dist — including a marker at the end of a ;/and citation list."""
+    if not text:
+        return False
+    if referred_after_citation.match(text, span_end) is not None:
+        return True
+    from scraper.parsers.case_metadata import judgment_caption_slice
+
+    if span_start < len(judgment_caption_slice(text)):
+        return False
+    line_start = text.rfind("\n", 0, span_start) + 1
+    line_end = text.find("\n", span_end)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    ref_on_line = _REF_LIST_MARKER.search(line)
+    if ref_on_line is not None and span_end - line_start <= ref_on_line.start():
+        return True
+    head_start = 0
+    for m in _HEADNOTE_TOPIC_LINE.finditer(text[:span_start]):
+        head_start = m.end()
+    if head_start == 0:
+        return False
+    window_end = len(text)
+    next_topic = _HEADNOTE_TOPIC_LINE.search(text, span_end)
+    if next_topic is not None:
+        window_end = next_topic.start()
+    else:
+        window_end = min(len(text), span_end + 1200)
+    window = text[head_start:window_end]
+    ref_in_window = _REF_LIST_MARKER.search(window)
+    if ref_in_window is not None and span_start - head_start < ref_in_window.start():
+        return True
+    return False
 
 
 def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], source_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -139,14 +192,14 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     own_end: Optional[int] = None
     cit_end: Dict[str, int] = {}
     cited: List[str] = []
-    head_limit = max(300, min(800, int(len(raw_text) * 0.15)))
+    caption_end = len(judgment_caption_slice(raw_text))
     for c in cits:
         norm = c.get("normalized") or normalise_citation(c["raw"])
         cit_end.setdefault(norm, c["span"][1])
         # "Muhammad Ahmad Ameen 2006 SCMR 631 ref." in a headnote is a case the judgment cites, never its own
         # citation, however near the top it sits (staging 6404c66e was promoted as 2006 SCMR 631 that way)
-        referred = referred_after_citation.match(raw_text, c["span"][1]) is not None
-        if c["span"][0] < head_limit and len(own) < 6 and not referred:
+        referred = citation_referred_in_text(raw_text, c["span"][0], c["span"][1])
+        if c["span"][0] < caption_end and len(own) < 6 and not referred:
             own.append(norm)
             if own_end is None:
                 own_end = c["span"][1]
