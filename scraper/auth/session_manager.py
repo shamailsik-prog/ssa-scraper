@@ -1156,9 +1156,10 @@ class PlaywrightBrowser:
 
     async def _capture_case_description_modal(self) -> Dict[str, Any]:
         wait_ms = int(max(0.0, float(getattr(settings, "PLS_CASE_DESCRIPTION_WAIT_SECONDS", 6.0) or 0.0)) * 1000)
+        wait_for_body = bool(getattr(settings, "SSA_PLS_CASE_MODAL_WAIT_FOR_BODY", False))
         return await self._wrap(
             self._page.evaluate(
-                """async ({ waitMs }) => {
+                """async ({ waitMs, waitForBody }) => {
                 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                 const findTrigger = () => document.querySelector(
                     'input.caseDescription[value="Case Description"], input.caseDescription'
@@ -1193,14 +1194,39 @@ class PlaywrightBrowser:
                 }
                 let modal = null;
                 let text = '';
+                const bodyMarker = /(?:^|\\n)\\s*(?:JUDGMENT|JUDGEMENT|ORDER)\\b/i;
+                const caseBodyMarker = /(?:^|\\n)\\s*(?:BEFORE|CORAM|IN\\s+THE\\s+.+\\bCOURT\\b)/i;
+                const chromeShell = (value) => (
+                    /View\\s+Head\\s+Notes?\\s+of\\s+this\\s+case/i.test(value || '')
+                    && !bodyMarker.test(value || '')
+                    && !caseBodyMarker.test(value || '')
+                    && !/\\bversus\\b/i.test(value || '')
+                );
+                let lastLen = 0;
+                let stableReads = 0;
                 for (let i = 0; i < 80; i += 1) {
                     modal = document.querySelector('#ExceptionResponseScreen1');
                     text = modal && modal.innerText ? modal.innerText.trim() : '';
-                    const hasBeforeMarker = /Before.+/i.test(text);
-                    const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
-                    if (text.length >= 2000 || hasBeforeMarker || hasReporterMarker) {
-                        break;
+                    if (waitForBody) {
+                        if (bodyMarker.test(text) || caseBodyMarker.test(text)) {
+                            break;
+                        }
+                        if (!chromeShell(text) && text.length >= 600 && text.length === lastLen) {
+                            stableReads += 1;
+                            if (stableReads >= 4) {
+                                break;
+                            }
+                        } else {
+                            stableReads = 0;
+                        }
+                    } else {
+                        const hasBeforeMarker = /Before.+/i.test(text);
+                        const hasReporterMarker = /CLC|SCMR|PLD/i.test(text);
+                        if (!chromeShell(text) && (text.length >= 2000 || hasBeforeMarker || hasReporterMarker)) {
+                            break;
+                        }
                     }
+                    lastLen = text.length;
                     await sleep(150);
                 }
                 return {
@@ -1210,7 +1236,7 @@ class PlaywrightBrowser:
                     case_description_modal_text_length: text.length,
                 };
             }""",
-                {"waitMs": wait_ms},
+                {"waitMs": wait_ms, "waitForBody": wait_for_body},
             )
         )
 

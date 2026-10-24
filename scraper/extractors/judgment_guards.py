@@ -13,10 +13,19 @@ from scraper.parsers.bench_parser import normalise_judge_name
 # body is long enough to be a judgment and the bench is populated. Headnotes and
 # thin first-pass rows stay eligible for modal refetch.
 FULL_READY_JUDGMENT_CHARS = 5000
+_BODY_ORDER_MARKER_RE = re.compile(r"(?im)^\s*(?:JUDGMENT|JUDGEMENT|ORDER)\b")
+_PLS_VIEW_HEADNOTES_CHROME_RE = re.compile(r"(?i)view\s+head\s+notes?\s+of\s+this\s+case")
+CHROME_STUB_REFETCH_ROUTE_KEY = "chrome_stub_refetch_eligible"
 
 
 def judgment_is_full_ready(full_text: Optional[str], judge_names: Any) -> bool:
-    return len(full_text or "") >= FULL_READY_JUDGMENT_CHARS and bool(judge_names)
+    if not judge_names or len(full_text or "") < FULL_READY_JUDGMENT_CHARS:
+        return False
+    from scraper.config import settings
+
+    if bool(getattr(settings, "SSA_PLS_CHROME_STUB_DETECT", True)) and detect_pls_case_description_chrome_stub(full_text):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -353,6 +362,24 @@ def detect_headnotes_only(
     return None
 
 
+def detect_pls_case_description_chrome_stub(raw_text: Optional[str]) -> Optional[JudgmentGuardSignal]:
+    """PLS Case Description modal shell (menu/footer) captured before the judgment body loads."""
+    blob = strip_leading_judgment_chrome(raw_text or "")
+    if not blob.strip():
+        return None
+    if not _PLS_VIEW_HEADNOTES_CHROME_RE.search(blob):
+        return None
+    if _BODY_ORDER_MARKER_RE.search(blob):
+        return None
+    if any(pattern.search(blob) for pattern in _STRONG_CASE_BODY_CONTENT_RES):
+        return None
+    return JudgmentGuardSignal(
+        reason_code="login_stub",
+        signal="case_description_chrome_shell",
+        matched_value=blob[:500],
+    )
+
+
 def detect_judgment_stub(
     *,
     source_url: Optional[str],
@@ -361,6 +388,9 @@ def detect_judgment_stub(
     judge_names: Optional[Iterable[Any]],
     judge_fields: Optional[dict[str, Any]] = None,
 ) -> Optional[JudgmentGuardSignal]:
+    chrome_stub = detect_pls_case_description_chrome_stub(raw_text)
+    if chrome_stub is not None:
+        return chrome_stub
     has_case = _has_case_content(raw_text=raw_text, raw_html=raw_html)
     url = source_url or ""
     if _URL_LOGIN_STUB_RE.search(url) and not has_case:

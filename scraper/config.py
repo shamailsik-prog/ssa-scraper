@@ -289,6 +289,18 @@ class Settings(BaseSettings):
     BACKFILL_PLS_RUN_MAX_MINUTES: int = Field(default=50, description="Backfill mode: keep harvesting consecutive citation-grid windows inside one login_session job for up to this many minutes, so the session is not idle between Beat kicks (0 = one window per job). Keep it under the login-session lock TTL (60 min) and the job stale cut-off.")
     PLS_CITATION_GRID_SKIP_STAGED: bool = Field(default=True, description="Skip citation-grid rows whose citation already has a staging row (extracted, promoted, duplicate or quarantined) so a wrap of the grid does not re-download pages that were already preserved.")
     PLS_CASE_DESCRIPTION_WAIT_SECONDS: float = Field(default=6.0, description="How long to wait for the 'Case Description' control to render on a ReferenceCaseLawSearch page before the page is classified as headnote-only.")
+    SSA_PLS_CASE_MODAL_WAIT_FOR_BODY: bool = Field(
+        default=False,
+        description="When true, poll the Case Description modal until judgment body markers appear (or stable non-chrome text) before capture.",
+    )
+    SSA_PLS_CHROME_STUB_DETECT: bool = Field(
+        default=True,
+        description="Treat PLS Case Description chrome shells as stubs (not full-ready) and allow refetch marking.",
+    )
+    SSA_PLS_CHROME_STUB_REFETCH_MARK: bool = Field(
+        default=True,
+        description="Allow pls_admin mark-chrome-stub-refetch to tag staging rows for grid refetch (dry-run by default).",
+    )
     PROMOTE_PREFERRED_SOURCE: str = Field(
         default="PakistanLawSite",
         description="Judgment source that reserves a share of each promote batch so oldest-first public rows cannot starve login harvest.",

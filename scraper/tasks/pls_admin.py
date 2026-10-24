@@ -73,6 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     flag.add_argument("--apply", action="store_true", help="Write changes (default is dry-run)")
     flag.add_argument("--limit", type=int, default=None)
     sub.add_parser("grid-report", help="Classify every citation-grid row: judgment / set aside (by class) / not captured")
+    chrome = sub.add_parser(
+        "mark-chrome-stub-refetch",
+        help="Report promoted PLS rows whose body is Case Description chrome only; optionally mark staging for grid refetch (dry-run by default)",
+    )
+    chrome.add_argument("--apply", action="store_true", help="Write quarantine/refetch markers (default is dry-run)")
+    chrome.add_argument("--limit", type=int, default=None)
     args = parser.parse_args(argv)
     if args.command == "reset-retired-frontier-no-reason":
         from scraper.database import SessionLocal
