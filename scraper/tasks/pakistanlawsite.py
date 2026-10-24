@@ -844,6 +844,22 @@ class PakistanLawSitePipeline:
             windows += 1
             self.stats["citation_grid_windows"] = windows
             await self._persist_live_session()
+            if (
+                self.stats.get("grid_yield_cap_bypass_consumed")
+                and not self.stats.get("grid_cap_marker_restored")
+                and not outcome.get("cursor_unconfirmed")
+                and not outcome.get("citation_grid_stub_stop")
+                and int(outcome.get("processed") or 0) > 0
+            ):
+                # Consuming the cap temporarily resets the timer to throttle
+                # zero-progress attempts. Once a verified window advances, restore
+                # the original expired marker so the NEXT job can resume the lap.
+                # Otherwise a 50/500-row partial window defers the other 450 rows
+                # for another PLS_GRID_MAX_YIELD_MINUTES.
+                prior_markers = self.stats.get("grid_cap_prior_yield_markers") or {}
+                if prior_markers:
+                    await merge_source_config(self.db, self.source, prior_markers)
+                self.stats["grid_cap_marker_restored"] = True
             if outcome.get("citation_grid_stub_stop"):
                 logger.info(
                     "PakistanLawSite citation-grid: intermittent no-results stub; "
@@ -1837,12 +1853,24 @@ class PakistanLawSitePipeline:
                 await self.ensure_search_map(archived_grid_start_row=grid_start_row)
             )
             if self._is_citation_grid_map(search_map):
-                from scraper.pls_grid_health import pls_consume_grid_yield_cap_bypass
+                from scraper.pls_grid_health import (
+                    grid_yield_since_key,
+                    pls_consume_grid_yield_cap_bypass,
+                )
 
+                # Preserve both shard markers for unsharded jobs, including
+                # missing keys (None). Only restore after verified cursor progress.
+                cap_shards = (0, 1) if self.reporter_shard is None else (int(self.reporter_shard),)
+                before_cap = dict(self.source.config_json or {})
+                prior_markers = {
+                    grid_yield_since_key(shard): before_cap.get(grid_yield_since_key(shard))
+                    for shard in cap_shards
+                }
                 if await pls_consume_grid_yield_cap_bypass(
                     self.db, self.source, reporter_shard=self.reporter_shard
                 ):
                     self.stats["grid_yield_cap_bypass_consumed"] = True
+                    self.stats["grid_cap_prior_yield_markers"] = prior_markers
                 logger.info(
                     "PakistanLawSite using citation-grid surface mode (archivedpatientGrid) shard=%s titles=%s",
                     self.reporter_shard,
