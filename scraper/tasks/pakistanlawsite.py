@@ -707,7 +707,12 @@ class PakistanLawSitePipeline:
 
     def _journal_available(self, journal: str) -> bool:
         cur = (self.source.config_json or {}).get(journal_cursor_key(journal))
-        return not (cursor_saturated(cur) or journal_unsupported(cur))
+        # A capped recovery job must be allowed to revisit saturated journals.
+        # Unsupported journals still require their normal recheck; never bypass
+        # a journal that the licensed source did not actually offer.
+        if journal_unsupported(cur):
+            return False
+        return not cursor_saturated(cur) or bool(self.stats.get("grid_yield_cap_bypass_consumed"))
 
     def _pick_grid_journal(self, *, after: Optional[str] = None) -> Optional[str]:
         """The next journal with grid work left, round-robin from `after` (or from the one last walked)."""
@@ -769,6 +774,11 @@ class PakistanLawSitePipeline:
         return cursor_key, cursor, max(0, row_offset)
 
     async def _maybe_yield_citation_grid_for_search_harvest(self) -> bool:
+        # The cap was consumed at job start, which deliberately restarted the
+        # timer. Without this guard the new timer immediately causes this same
+        # recovery job to yield before it examines a single grid row.
+        if self.stats.get("grid_yield_cap_bypass_consumed"):
+            return False
         from scraper.pls_grid_health import (
             pls_note_search_harvest_grid_yield,
             pls_pending_search_harvest_count,
