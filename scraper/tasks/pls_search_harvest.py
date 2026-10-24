@@ -98,7 +98,7 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
     known: Set[str] = set()
     case_names = {k[len(CASE_KEY_PREFIX):] for k in keys if k.startswith(CASE_KEY_PREFIX)}
     if case_names:
-        # a judgment page's CaseName in a promoted or staged (any status) capture: already held
+        # A promoted judgment or a non-retryable staged capture is held; bad-page stubs must be retried.
         judgment_name = func.upper(func.substring(Judgment.source_url, r"CaseName=(\d{4}[A-Za-z]{1,3}\d{1,6})(?![0-9A-Za-z])"))
         for (name,) in (await db.execute(select(judgment_name).where(
             Judgment.source_name == SOURCE_NAME, judgment_name.in_(list(case_names))
@@ -109,7 +109,7 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
         staging_rows = await db.execute(
             select(
                 staging_name, ScraperStaging.status, ScraperStaging.quarantine_reason,
-                func.length(ScraperStaging.raw_text), func.substr(ScraperStaging.raw_text, 1, 3000),
+                func.octet_length(ScraperStaging.raw_text), func.substr(ScraperStaging.raw_text, 1, 3000),
                 ScraperStaging.route_json,
             ).where(
                 ScraperStaging.source_name == SOURCE_NAME,
@@ -135,7 +135,7 @@ async def load_known_citation_keys(db: AsyncSession, keys: Set[str]) -> Set[str]
         staging_citations = await db.execute(
             select(
                 ScraperStaging.extracted_citation, ScraperStaging.status,
-                ScraperStaging.quarantine_reason, func.length(ScraperStaging.raw_text),
+                ScraperStaging.quarantine_reason, func.octet_length(ScraperStaging.raw_text),
                 func.substr(ScraperStaging.raw_text, 1, 3000), ScraperStaging.route_json,
             ).where(
                 ScraperStaging.source_name == SOURCE_NAME,
