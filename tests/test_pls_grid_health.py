@@ -301,3 +301,110 @@ async def test_heartbeat_job_raises_when_dispatcher_preempted(db, login_source):
     pipeline.stats = {"pages_charged": 0, "staged": 0}
     with pytest.raises(ScraperJobPreempted, match="preempted"):
         await pipeline._heartbeat_job()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("yield_age_minutes", "expected_windows"),
+    [(121, 1), (1, 0)],
+)
+async def test_grid_yield_cap_survives_run_entry_until_real_grid_progress(
+    db, login_source, monkeypatch, yield_age_minutes, expected_windows
+):
+    """A capped grid job must not erase its yield timestamp before checking the first window."""
+    from types import SimpleNamespace
+
+    from scraper.auth.session_manager import merge_source_config
+    from scraper.config import settings
+    from scraper.tasks import pakistanlawsite as pls
+    from scraper import pls_grid_health
+
+    now = datetime.now(timezone.utc)
+    marker = (now - timedelta(minutes=yield_age_minutes)).isoformat()
+    await merge_source_config(
+        db,
+        login_source,
+        {
+            GRID_YIELD_SINCE_KEY: marker,
+            "citation_grid_cursor": {
+                "saturated_at": (now - timedelta(hours=1)).isoformat(),
+                "row_offset": 10,
+                "last_total_rows": 500,
+            },
+        },
+    )
+    await db.commit()
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNAL_ROTATION", False)
+
+    async def pending(*args, **kwargs):
+        return 5
+
+    monkeypatch.setattr(pls_grid_health, "pls_pending_search_harvest_count", pending)
+
+    class FakeLock:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def acquire(self):
+            pass
+
+        async def release(self):
+            pass
+
+        async def refresh(self):
+            pass
+
+    monkeypatch.setattr(pls, "SessionLock", FakeLock)
+    pipeline = pls.PakistanLawSitePipeline(db, login_source)
+    monkeypatch.setattr(pipeline, "_assert_permitted", lambda: None)
+
+    slot = SimpleNamespace(slot_number=1, state="ACTIVE")
+
+    async def slots():
+        return [slot]
+
+    async def current_slot():
+        return slot
+
+    pipeline.manager = SimpleNamespace(slots=slots, current_slot=current_slot)
+
+    async def close():
+        pass
+
+    pipeline.runner = SimpleNamespace(preferred_slot_number=None, close=close)
+    monkeypatch.setattr(pipeline, "_dual_map_grid_layout", lambda mapping: mapping)
+    monkeypatch.setattr(pipeline, "_is_citation_grid_map", lambda mapping: True)
+    monkeypatch.setattr(pipeline, "_journal_candidates", lambda: [])
+    monkeypatch.setattr(
+        pipeline,
+        "_citation_grid_limits",
+        lambda: {"max_detail": 10, "scan_window": 50, "run_minutes": 0},
+    )
+
+    async def fake_search_map(**kwargs):
+        return {}
+
+    async def no_persist():
+        pass
+
+    window_calls = []
+
+    async def fake_window(mapping, limits):
+        window_calls.append(True)
+        return {"rows": 1, "wrapped": True, "cursor_unconfirmed": False}
+
+    monkeypatch.setattr(pipeline, "ensure_search_map", fake_search_map)
+    monkeypatch.setattr(pipeline, "_persist_live_session", no_persist)
+    monkeypatch.setattr(pipeline, "_run_citation_grid_window", fake_window)
+
+    result = await pipeline.run()
+    assert len(window_calls) == expected_windows
+    assert result["citation_grid_windows"] == expected_windows
+    cfg = login_source.config_json or {}
+    if expected_windows:
+        assert not result.get("yielded_for_search_harvest")
+        assert not cfg.get(GRID_YIELD_SINCE_KEY)
+    else:
+        assert result.get("yielded_for_search_harvest")
+        assert cfg.get(GRID_YIELD_SINCE_KEY) == marker
+    await db.rollback()
