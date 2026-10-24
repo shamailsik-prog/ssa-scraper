@@ -99,11 +99,11 @@ def test_classify_treatment_task_catches_soft_time_limit(monkeypatch):
 
 
 @pytest.mark.timeout(90)
-def test_blocked_maintenance_worker_does_not_delay_promote_task():
-    """Two workers (maintenance + promote): a slow classify must not block promote_staging_records."""
+def test_long_classify_on_maintenance_does_not_delay_promote_task():
+    """Promote worker drains `promote` while a classify_treatment message waits on `maintenance`."""
     if not os.environ.get("REDIS_URL"):
         pytest.skip("REDIS_URL not set")
-    maint_env = {**os.environ, "CLASSIFY_TREATMENT_TEST_SLEEP_SECONDS": "25"}
+    suffix = str(os.getpid())
     base_cmd = [
         sys.executable,
         "-m",
@@ -114,26 +114,26 @@ def test_blocked_maintenance_worker_does_not_delay_promote_task():
         "--loglevel=WARNING",
         "--pool=solo",
     ]
-    maint = subprocess.Popen(
-        [*base_cmd, "-Q", "maintenance", "--concurrency=1", "-n", "testmaint@%h"],
-        env=maint_env,
-    )
     promote = subprocess.Popen(
-        [*base_cmd, "-Q", "promote", "--concurrency=1", "-n", "testpromote@%h"],
+        [*base_cmd, "-Q", "promote", "--concurrency=1", "-n", f"testpromote-{suffix}@%h"],
         env=os.environ.copy(),
     )
     try:
-        time.sleep(8)
+        time.sleep(10)
         from scraper.tasks.promotion import promote_staging_records_task
         from scraper.tasks.treatment import classify_treatment_task
 
-        classify_treatment_task.apply_async(kwargs={"limit": 1}, queue="maintenance")
+        classify_async = classify_treatment_task.apply_async(kwargs={"limit": 1}, queue="maintenance")
         promote_async = promote_staging_records_task.apply_async(kwargs={"limit": 0}, queue="promote")
-        promote_async.get(timeout=20)
+        promote_result = promote_async.get(timeout=25)
+        assert promote_result is not None
+        assert promote_async.successful()
+        assert classify_async.state != "SUCCESS", "promote must not wait for classify_treatment to finish"
+        assert app.conf.task_routes["scraper.tasks.treatment.classify_treatment"]["queue"] == "maintenance"
+        assert app.conf.task_routes["scraper.tasks.promotion.promote_staging_records"]["queue"] == PROMOTE_QUEUE
     finally:
-        for proc in (promote, maint):
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        promote.terminate()
+        try:
+            promote.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            promote.kill()
