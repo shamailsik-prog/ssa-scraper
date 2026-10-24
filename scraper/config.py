@@ -43,6 +43,7 @@ SECRET_FIELD_NAMES = (
     "SGAI_API_KEY",
     "SIKANDER_READER_PASSWORD",
     "CORPUS_WRITER_PASSWORD",
+    "CORPUS_VERIFIER_PASSWORD",
     "CORPUS_API_KEY",
     "GOOGLE_APPLICATION_CREDENTIALS_JSON",
     "PLS_PASS",
@@ -421,7 +422,7 @@ class Settings(BaseSettings):
     CORPUS_VERIFIER_ROLE: str = Field(default="corpus_verifier")
     CORPUS_VERIFIER_PASSWORD: SecretStr = Field(
         default=SecretStr(""),
-        description="Login for verification schema writes only. Blank in dev/tests falls back to corpus_writer for verification tables.",
+        description="Dedicated verification-schema writer credential. Required outside development; dev may fall back to corpus_writer.",
     )
     CORPUS_VERIFIER_BATCH_SIZE: int = Field(default=150, description="Records per verifier tick per stream.")
     CORPUS_VERIFIER_PASS_SAMPLE_RATE: float = Field(
