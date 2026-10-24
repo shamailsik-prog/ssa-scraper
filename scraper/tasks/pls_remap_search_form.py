@@ -11,7 +11,8 @@ from scraper.database import SessionLocal
 from scraper.extractors.deterministic import introspect_search_form
 from scraper.models import ScraperSource
 from scraper.pls_navigation import pls_check_url
-from scraper.tasks.search_map import active_map, map_as_dict, map_search_form
+from scraper.search_form_roles import verify_harvest_role_samples
+from scraper.tasks.search_map import active_map, build_map_record, map_as_dict, map_search_form, verify_selectors
 
 logger = logging.getLogger(__name__)
 SOURCE_NAME = "PakistanLawSite"
@@ -50,12 +51,15 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
                     "url": page.url,
                 }
             if dry_run:
+                record = build_map_record(verify_selectors(page.html or "", probe), page.html or "", "dry_run")
+                harvest_proof = verify_harvest_role_samples(record)
                 return {
                     "ok": True,
                     "dry_run": True,
                     "before": before_info,
                     "would_map_roles": [f.get("role") for f in probe["fields"]],
                     "reporters": next((f.get("options") for f in probe["fields"] if f.get("role") == "reporter"), []),
+                    "harvest_role_proof": harvest_proof,
                     "url": page.url,
                 }
             m = await map_search_form(db, source, page.html or "", page_url=page.url or "")
@@ -74,9 +78,11 @@ async def run_remap_search_form(*, dry_run: bool = False) -> Dict[str, Any]:
             m.stale = False
             await db.commit()
             after = map_as_dict(m)
+            harvest_proof = verify_harvest_role_samples(after)
             return {
                 "ok": True,
                 "before": before_info,
+                "harvest_role_proof": harvest_proof,
                 "after": {
                     "map_version": m.map_version,
                     "stale": m.stale,

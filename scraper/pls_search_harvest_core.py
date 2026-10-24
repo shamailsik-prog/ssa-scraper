@@ -111,8 +111,10 @@ def build_harvest_form_values(
     cursor: Dict[str, Any],
 ) -> Dict[str, str]:
     """Map a harvest query onto search-form roles (extends tier frontier build_values)."""
+    from scraper.search_form_roles import with_resolved_harvest_map
     from scraper.tasks.pakistanlawsite import build_values
 
+    search_map = with_resolved_harvest_map(search_map)
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
     tier_cursor = dict(cursor)
     if "page" in cursor and "page_no" not in cursor:
@@ -143,8 +145,10 @@ def build_harvest_form_values(
 
 
 def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
+    from scraper.search_form_roles import with_resolved_harvest_map
     from scraper.tasks.pakistanlawsite import unmapped_query_reason
 
+    search_map = with_resolved_harvest_map(search_map)
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
     tier_cursor = dict(cursor)
     if "page" in cursor and "page_no" not in cursor:
@@ -277,6 +281,47 @@ def split_oversized_query(
             splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
             return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
     return []
+
+
+def is_journal_year_query(query_json: Dict[str, Any]) -> bool:
+    """Reporter × year with no narrower split dimensions already set."""
+    normalized = normalize_query_json(query_json)
+    if not normalized.get("reporter") or normalized.get("year") is None:
+        return False
+    for dim in SPLIT_ORDER:
+        if dim in normalized:
+            return False
+    extra = set(normalized.keys()) - {"reporter", "year"}
+    return not extra
+
+
+def journal_year_truncation_rows(result_cap: int) -> int:
+    from scraper.config import settings
+
+    floor = int(getattr(settings, "PLS_SEARCH_HARVEST_JOURNAL_YEAR_TRUNCATION_ROWS", 0) or 0)
+    if floor > 0:
+        return min(floor, result_cap)
+    return result_cap
+
+
+def should_auto_split_journal_year(
+    query_json: Dict[str, Any],
+    *,
+    rows_seen: int,
+    site_total: Optional[int],
+    result_cap: int,
+    has_next_page: bool,
+) -> bool:
+    from scraper.config import settings
+
+    if not getattr(settings, "PLS_SEARCH_HARVEST_AUTO_SPLIT_JOURNAL_YEAR", False):
+        return False
+    if has_next_page or not is_journal_year_query(query_json):
+        return False
+    trunc = journal_year_truncation_rows(result_cap)
+    if site_total is not None and int(site_total) < trunc:
+        return False
+    return rows_seen >= trunc
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:

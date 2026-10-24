@@ -13,6 +13,8 @@ DASHBOARD_SNIPPET = """
   <input type="text" id="Citation_Year_Search_input" placeholder="Enter Year (required)" value="2026"/>
   <input type="text" id="Citation_Court_Search_input" placeholder="Enter Court"/>
   <input type="text" id="Citation_Code_Or_Page_Search_input" placeholder="Enter Code or Page"/>
+  <input type="text" id="Citation_Judge_Search_input" placeholder="Enter Judge"/>
+  <input type="text" id="Citation_Party_Search_input" placeholder="Enter Party"/>
   <button class="btn btn-success Citation_Search_btn" type="button">Search</button>
 </div>
 <table id="whatsNewTable"><tr><th>x</th></tr></table>
@@ -26,6 +28,8 @@ def test_dashboard_citation_panel_is_query_form():
     roles = {f["role"] for f in probe["fields"]}
     assert "reporter" in roles
     assert "year" in roles
+    assert "court" in roles
+    assert "party" in roles
     assert "submit" in roles
     reporter = next(f for f in probe["fields"] if f["role"] == "reporter")
     assert reporter["selector"] == "#Citation_Category_Search_dropdown"
