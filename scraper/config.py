@@ -336,6 +336,10 @@ class Settings(BaseSettings):
         default=30,
         description="A login slot that has been logged out (not ACTIVE) this long has its share of the search-harvest ledger taken over by the other slot, which keeps its own share as well.",
     )
+    PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM: bool = Field(
+        default=False,
+        description="When true, a slot with no pending rows in its own reporter share may claim the other slot's pending rows while that slot is still ACTIVE. Own share is always tried first. Set to 1 or true to enable.",
+    )
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(
         default=True,
         description="A slot's search-harvest tick that did work queues the next tick for the same slot when it ends, so each login harvests continuously instead of once per beat interval; the per-slot lock keeps it to one tick per slot.",
