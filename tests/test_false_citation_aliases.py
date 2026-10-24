@@ -8,7 +8,7 @@ from scraper.extractors.deterministic import extract_judgment_deterministic
 from scraper.parsers.bench_parser import parse_bench
 from scraper.parsers.citation_extractor import score_confidence
 from scraper.parsers.case_metadata import judgment_caption_slice
-from scraper.tasks.citation_alias_cleanup import caption_citation_strings, _alias_suspicion_reason
+from scraper.tasks.citation_alias_cleanup import alias_suspicion_reason, caption_citation_strings, legitimate_parallel_alias
 
 
 def _pad(n: int = 80) -> str:
@@ -116,11 +116,38 @@ def test_caption_slice_excludes_versus_block():
     assert "PLD 1990" not in cap
 
 
+def test_cleanup_does_not_flag_pld_scmr_parallel_heading():
+    body = (
+        "PLD 1990 SC 1\n1990 SCMR 500\nSUPREME COURT OF PAKISTAN\n"
+        "Before A Judge, J\nX---Petitioner\nversus\nY---Respondent\n"
+        "Civil Suit No. 1 of 1990, decided on 1st January, 1990.\n"
+        "(a) Topic---\n"
+        + _pad(20)
+        + "\nAs held in 1990 SCMR 500 the test applies.\n"
+        + _pad(10)
+    )
+    assert legitimate_parallel_alias("1990 SCMR 500", body, primary="PLD 1990 SC 1")
+    assert alias_suspicion_reason("1990 SCMR 500", body, primary="PLD 1990 SC 1") is None
+
+
+def test_cleanup_flags_clc_956_pld_lahore_body_mention():
+    body = (
+        "1992 C L C 956\n[Peshawar]\nBefore Muhammad Bashir Khan Jehangiri, J\n"
+        "Mst. KAUSAR---Petitioner\nversus\nMUHAMMAD MUSHTAQ---Respondent\n"
+        "Civil Revision No.329 of 1989, decided on 22nd November, 1989.\n"
+        "(a) Civil Procedure Code---\n"
+        + _pad(40)
+        + "\nPLD 1990 Lah. 4 not applicable to the facts.\n"
+        + _pad(20)
+    )
+    assert alias_suspicion_reason("PLD 1990 Lahore 4", body, primary="1992 CLC 956") == "ref-only mention"
+    assert not legitimate_parallel_alias("PLD 1990 Lahore 4", body, primary="1992 CLC 956")
+
+
 def test_alias_suspicion_reason_ref_only_in_body():
     body = (
         "1992 CLC 956\nBefore J\nA versus B\n"
         "decided on 1st January, 1990.\n"
         "(a) Topic---\nPLD 1990 Lahore 4 ref.\n"
     )
-    cap = caption_citation_strings(body)
-    assert _alias_suspicion_reason("PLD 1990 Lahore 4", body, cap) == "ref-only mention"
+    assert alias_suspicion_reason("PLD 1990 Lahore 4", body, primary="1992 CLC 956") == "ref-only mention"

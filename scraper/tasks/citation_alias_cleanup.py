@@ -21,7 +21,7 @@ from scraper.extractors.hybrid_extractor import load_court_directory
 from scraper.extractors.validation import reconcile_judgment
 from scraper.config import settings
 from scraper.models import Citation, CorpusMetadata, Judgment, QuarantineQueue, ScraperStaging
-from scraper.parsers.case_metadata import judgment_caption_slice
+from scraper.parsers.case_metadata import judgment_caption_slice, judgment_header_slice
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
 from scraper.tasks.promotion import promote_judgment_staging
 
@@ -34,9 +34,8 @@ LATEST_RUN_KEY = "false_citation_alias_cleanup_latest_run"
 ALREADY_BELONGS = re.compile(r"citation .+ already belongs to judgment", re.I)
 
 
-def caption_citation_strings(text: str) -> Set[str]:
+def _citation_strings_before(text: str, end: int) -> Set[str]:
     raw = text or ""
-    end = len(judgment_caption_slice(raw))
     out: Set[str] = set()
     for c in extract_citations(raw):
         norm = c.get("normalized") or normalise_citation(c["raw"])
@@ -47,25 +46,50 @@ def caption_citation_strings(text: str) -> Set[str]:
     return out
 
 
-def _alias_suspicion_reason(alias: str, full_text: str, caption: Set[str]) -> Optional[str]:
-    if alias in caption:
+def caption_citation_strings(text: str) -> Set[str]:
+    return _citation_strings_before(text, len(judgment_caption_slice(text or "")))
+
+
+def head_citation_citation_strings(text: str) -> Set[str]:
+    """Citations in the PLS head block before rel./ref. (wider than caption; keeps true parallels)."""
+    return _citation_strings_before(text, len(judgment_header_slice(text or "")))
+
+
+def legitimate_parallel_alias(alias: str, full_text: str, *, primary: Optional[str] = None) -> bool:
+    """Same judgment under another reporter, or any cite in caption / head-citation block."""
+    raw = full_text or ""
+    if not alias or not raw:
+        return False
+    if alias in caption_citation_strings(raw) or alias in head_citation_citation_strings(raw):
+        return True
+    meta = {"citation": primary} if primary else {}
+    own = det.extract_judgment_deterministic(html=None, text=raw, source_meta=meta).get("citations") or []
+    return alias in own
+
+
+def alias_suspicion_reason(alias: str, full_text: str, *, primary: Optional[str] = None) -> Optional[str]:
+    """None when the alias is a genuine parallel; else ref-only or not-in-text."""
+    if legitimate_parallel_alias(alias, full_text, primary=primary):
         return None
     raw = full_text or ""
-    if not raw:
-        return "not in target text"
-    found_in_text = False
+    head_end = len(judgment_header_slice(raw))
+    mentions: List[Tuple[bool, bool]] = []
     for c in extract_citations(raw):
         norm = c.get("normalized") or normalise_citation(c["raw"])
         if norm != alias:
             continue
-        found_in_text = True
-        if referred_after_citation.match(raw, c["span"][1]) is not None:
-            return "ref-only mention"
-        if c["span"][0] >= len(judgment_caption_slice(raw)):
-            return "ref-only mention"
-    if not found_in_text:
+        is_ref = referred_after_citation.match(raw, c["span"][1]) is not None
+        in_head = c["span"][0] < head_end and not is_ref
+        mentions.append((in_head, is_ref))
+    if not mentions:
         return "not in target text"
+    if any(in_head for in_head, _ in mentions):
+        return None
     return "ref-only mention"
+
+
+# Back-compat for tests importing the private name
+_alias_suspicion_reason = alias_suspicion_reason
 
 
 async def _quarantined_staging_for_alias(db: AsyncSession, alias: str) -> List[str]:
@@ -104,8 +128,7 @@ async def scan_false_aliases(db: AsyncSession) -> Tuple[List[Dict[str, Any]], in
             last_id = cit.id
             total_non_primary += 1
             alias = cit.citation_string
-            caption = caption_citation_strings(j.full_text or "")
-            reason = _alias_suspicion_reason(alias, j.full_text or "", caption)
+            reason = alias_suspicion_reason(alias, j.full_text or "", primary=j.canonical_citation)
             if not reason:
                 continue
             staging_ids = await _quarantined_staging_for_alias(db, alias)
