@@ -382,6 +382,10 @@ class Settings(BaseSettings):
     PLS_CASEID_WALK_CEILING: int = Field(default=6000, description="Lowest serial ceiling of a (year, court) group; a group ends past max(this, highest held serial + PAD).")
     PLS_CASEID_WALK_CEILING_PAD: int = Field(default=1000, description="How far past the highest held or found serial a group keeps probing block starts.")
     PLS_CASEID_WALK_RECHECK_HOURS: float = Field(default=12.0, description="After a failed calibration on held judgments, wait this long before trying again.")
+    PLS_CASEID_WALK_EXTENDED_COURTS: bool = Field(
+        default=False,
+        description="When true, case-ID walk may open empty (year, court) groups for extended CaseName court tokens (hyphenated and >3 letters). Default false keeps the legacy court set and per-tick probe budget.",
+    )
     PLS_SEARCH_RESULT_CAP: int = Field(
         default=500,
         description="PakistanLawSite CitationSearch result cap observed in production; queries above this are split by court/keyword.",

@@ -55,7 +55,9 @@ def test_hyphenated_group_key_split_and_ceiling():
     assert ceiling(state, known[key], floor=10, pad=100) == 150
     state["next"] = 51
     assert next_serial(state, known[key], floor=1000, pad=100) == 51
-    assert case_url(BASE, key, 51).endswith("CaseName=2024LAT-SINDH51&")
+    built = case_url(BASE, key, 51)
+    assert "CaseName=2024LAT-SINDH51&" in built
+    assert parse_case_id(built) == (2024, "LAT-SINDH", 51)
 
 
 def test_known_groups_and_order_dense_first_then_empty_years_newest_first():
@@ -71,6 +73,35 @@ def test_known_groups_and_order_dense_first_then_empty_years_newest_first():
     order = group_order(known, first_year=2025, last_year=2026)
     assert order[:2] == ["1980L", "2026S"]
     assert order[2:] == ["2026L", "2025L", "2025S"]
+
+
+def test_group_order_skips_extended_courts_for_empty_years_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", False)
+    known = known_by_group(
+        [
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2026S701",
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH12",
+        ]
+    )
+    order = group_order(known, first_year=2025, last_year=2026)
+    assert "2024LAT-SINDH" in order
+    assert "2026LAT-SINDH" not in order
+    assert "2025LAT-SINDH" not in order
+    assert "2025S" in order
+    assert order.index("2026S") < order.index("2025S")
+
+
+def test_group_order_empty_years_for_extended_courts_when_flag_on(monkeypatch):
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_EXTENDED_COURTS", True)
+    known = known_by_group(
+        [
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2026S701",
+            f"{BASE}/Login/ReferenceCaseLawSearch?CaseName=2024LAT-SINDH12",
+        ]
+    )
+    order = group_order(known, first_year=2025, last_year=2026)
+    assert "2026LAT-SINDH" in order
+    assert "2025LAT-SINDH" in order
 
 
 def test_walk_skips_held_serials_and_jumps_to_block_starts_after_a_miss_streak():
