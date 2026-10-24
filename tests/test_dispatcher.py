@@ -483,7 +483,10 @@ async def test_run_source_skips_saturated_grid_when_search_harvest_pending(db, m
         )
     ).scalar()
     assert running == 0
-    await db.rollback()
+    from scraper.auth.session_manager import merge_source_config
+
+    await merge_source_config(db, source, {"grid_yield_since": None})
+    await db.commit()
 
 
 async def test_run_source_does_not_skip_shard0_when_only_slot2_share_pending(db, monkeypatch):
@@ -537,11 +540,13 @@ async def test_dispatch_defers_saturated_grid_when_search_pending_without_stall_
     from scraper.models import PlsSearchHarvestQuery
     from scraper.tasks.celery_app import app
 
+    from scraper.auth.session_manager import merge_source_config
+
     now = datetime.now(timezone.utc)
     target = await _prepare_pls_due(db, (1, 2))
+    await merge_source_config(db, target, {"grid_yield_since": None})
     target.config_json = {
         **dict(target.config_json or {}),
-        "grid_yield_since": None,
         "citation_grid_cursor_shard_0": {
             "saturated_at": (now - timedelta(hours=1)).isoformat(),
             "row_offset": 100,
