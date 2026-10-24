@@ -61,8 +61,71 @@ def test_stall_verdict_active_not_stalled_at_20_min(monkeypatch):
 
 def test_playwright_harvest_fatal_markers():
     assert not is_playwright_harvest_browser_fatal(BrowserDisconnected("Target closed"))
+    assert not is_playwright_harvest_browser_fatal(BrowserDisconnected("Browser has been closed"))
     assert is_playwright_harvest_browser_fatal(RuntimeError("Page crashed"))
+    assert is_playwright_harvest_browser_fatal(BrowserDisconnected("Page crashed"))
     assert not is_playwright_harvest_browser_fatal(RuntimeError("selector not found"))
+
+
+@pytest.mark.asyncio
+async def test_real_playwright_error_wrapper_preserves_crash_classification():
+    from playwright.async_api import Error as PWError
+    from scraper.auth.session_manager import PlaywrightBrowser
+
+    async def page_crash():
+        raise PWError("Page crashed")
+
+    with pytest.raises(BrowserDisconnected) as caught:
+        await PlaywrightBrowser._wrap(None, page_crash())
+    assert is_playwright_harvest_browser_fatal(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_pagination_crash_is_not_swallowed(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from scraper.extractors.hybrid_extractor import HybridExtractor
+
+    row = SimpleNamespace(
+        query_key="search:reporter=PLD|year=2026",
+        query_json={"reporter": "PLD", "year": 2026},
+        cursor_json={"page": 1, "row_index": 0},
+        pages_enumerated=0,
+        rows_seen=0,
+        rows_known=0,
+        rows_new=0,
+        site_total_results=None,
+        gap_size=0,
+        status="in_progress",
+        last_error=None,
+    )
+    runner = object.__new__(harvest.SearchHarvestRunner)
+    runner.db = SimpleNamespace(flush=AsyncMock(), commit=AsyncMock())
+    runner.source = SimpleNamespace()
+    runner.pipeline = SimpleNamespace(
+        fetch_results=AsyncMock(return_value=SimpleNamespace(html="<html></html>", url="https://example.org/page1")),
+        fetch_detail=AsyncMock(side_effect=BrowserDisconnected("Page crashed")),
+        runner=SimpleNamespace(browser=None),
+        local_engine=None,
+    )
+    runner.memory = SimpleNamespace(note_window=lambda: None)
+    runner.dry_run = True
+    runner._maybe_recycle_browser = AsyncMock()
+    runner._maybe_spot_check = AsyncMock()
+    runner._pace_sleep = AsyncMock()
+    monkeypatch.setattr(harvest, "unmapped_harvest_reason", lambda *args: None)
+    monkeypatch.setattr(harvest, "build_harvest_form_values", lambda *args: {})
+    monkeypatch.setattr(harvest, "load_known_citation_keys", AsyncMock(return_value=set()))
+    monkeypatch.setattr(harvest, "release_page_result", lambda page: None)
+    monkeypatch.setattr(
+        HybridExtractor,
+        "extract_result_rows",
+        AsyncMock(return_value=SimpleNamespace(data={"result_rows": [], "next_page": "https://example.org/page2"})),
+    )
+    with pytest.raises(BrowserDisconnected, match="Page crashed"):
+        await runner.run_query(row, {"fields": {}}, max_pages=10)
+    assert row.cursor_json["next_url"] == "https://example.org/page2"
+
 
 
 @pytest.mark.asyncio
