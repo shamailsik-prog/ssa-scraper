@@ -443,6 +443,11 @@ def dispatch_saturated(cfg: Dict[str, Any], reporter_shard: Optional[int], *, no
     walk is saturated only when every configured journal is saturated or unsupported."""
     if settings.PLS_GRID_JOURNAL_ROTATION and settings.grid_journals and not journal_rotation_off(cfg, now=now):
         return journals_all_done(cfg, journals_for_shard(reporter_shard), now=now)
+    if reporter_shard is None:
+        shard0 = cursor_saturated(cfg.get("citation_grid_cursor_shard_0"), now=now)
+        shard1 = cursor_saturated(cfg.get("citation_grid_cursor_shard_1"), now=now)
+        if shard0 and shard1:
+            return True
     return cursor_saturated(cfg.get(grid_cursor_key_for_shard(reporter_shard)), now=now)
 
 
