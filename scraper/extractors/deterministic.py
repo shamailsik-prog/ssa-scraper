@@ -27,7 +27,7 @@ from scraper.parsers.citation_extractor import (
     normalise_citation,
     score_confidence,
 )
-from scraper.parsers.case_metadata import judgment_caption_slice
+from scraper.parsers.case_metadata import also_reported_citation_strings, judgment_caption_slice
 from scraper.parsers.statute_parser import (
     detect_statute_name,
     listed_title_supported_by_text,
@@ -206,6 +206,10 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
             evidence.setdefault("citations", raw_text[max(0, c["span"][0] - 30) : c["span"][1] + 30].strip())
         else:
             cited.append(norm)
+    for parallel in also_reported_citation_strings(raw_text):
+        if parallel and parallel not in own and len(own) < 6:
+            own.append(parallel)
+            evidence.setdefault("citations", f"also reported: {parallel}")
     hint = source_meta.get("citation")
     if hint:
         hn = normalise_citation(hint)

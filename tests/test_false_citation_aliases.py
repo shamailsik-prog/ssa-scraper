@@ -222,6 +222,28 @@ def test_also_reported_parallel_after_versus_kept():
     assert legitimate_parallel_alias("1990 SCMR 999", body, primary="PLD 1990 SC 1")
 
 
+def test_extract_own_includes_also_reported_line():
+    body = (
+        "1990 PLD SC 1\n[Peshawar]\nBefore J, J\n"
+        "A---Petitioner\nversus\nB---Respondent\n"
+        "Also reported as 1990 SCMR 999\n"
+        "decided on 1st March, 1990.\n"
+        + _pad(40)
+    )
+    out = extract_judgment_deterministic(html=None, text=body, source_meta={"citation": "PLD 1990 SC 1"})
+    assert "PLD 1990 SC 1" in out["citations"]
+    assert "1990 SCMR 999" in out["citations"]
+
+
+def test_alias_suspicion_reason_body_mention_without_ref():
+    body = (
+        "1992 CLC 956\nBefore J\nA versus B\n"
+        "decided on 1st January, 1990.\n"
+        "(a) Topic---\nThe court followed PLD 1990 Lahore 4 on the merits.\n"
+    )
+    assert alias_suspicion_reason("PLD 1990 Lahore 4", body, primary="1992 CLC 956") == "body mention"
+
+
 def test_alias_suspicion_reason_ref_only_in_body():
     body = (
         "1992 CLC 956\nBefore J\nA versus B\n"

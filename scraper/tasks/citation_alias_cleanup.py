@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 SOURCE_NAME = "PakistanLawSite"
 BACKUP_KEY = "false_citation_alias_cleanup_backup_{run_id}"
 REQUALIFY_BACKUP_KEY = "false_citation_alias_cleanup_requalify_{run_id}"
+REQUALIFY_JUDGMENT_BACKUP_KEY = "false_citation_alias_cleanup_requalify_judgments_{run_id}"
 UNDO_PRIOR_KEY = "false_citation_alias_cleanup_undo_prior_{run_id}"
 LATEST_RUN_KEY = "false_citation_alias_cleanup_latest_run"
 ALREADY_BELONGS_SQL = "%already belongs to judgment%"
@@ -77,8 +78,7 @@ def alias_suspicion_reason(alias: str, full_text: str, *, primary: Optional[str]
     if not mentions:
         return "not in target text"
     if any(not is_ref for is_ref in mentions):
-        # Body cite without list ref marker — still a false alias if not in caption
-        return "ref-only mention"
+        return "body mention"
     return "ref-only mention"
 
 
@@ -196,14 +196,115 @@ async def _restore_backup(db: AsyncSession, run_id: str) -> Dict[str, Any]:
     return {"citations_restored": restored, "skipped_reclaimed": skipped_reclaimed}
 
 
+def _judgment_backup_payload(j: Judgment, citations: List[Citation]) -> Dict[str, Any]:
+    return {
+        "id": str(j.id),
+        "canonical_citation": j.canonical_citation,
+        "case_title": j.case_title,
+        "court_id": str(j.court_id) if j.court_id else None,
+        "court_name": j.court_name,
+        "judge_names": j.judge_names,
+        "bench_size": j.bench_size,
+        "bench_type": j.bench_type,
+        "decision_date": j.decision_date.isoformat() if j.decision_date else None,
+        "year": j.year,
+        "reporter": j.reporter,
+        "volume": j.volume,
+        "page_number": j.page_number,
+        "docket_number": j.docket_number,
+        "docket_key": j.docket_key,
+        "unreported": j.unreported,
+        "proceeding_type": j.proceeding_type,
+        "petitioner": j.petitioner,
+        "respondent": j.respondent,
+        "full_text": j.full_text,
+        "full_text_hash": j.full_text_hash,
+        "headnotes": j.headnotes,
+        "summary": j.summary,
+        "statutes_cited": j.statutes_cited,
+        "citations_cited": j.citations_cited,
+        "access_method": j.access_method,
+        "source_name": j.source_name,
+        "source_url": j.source_url,
+        "source_provenance_id": str(j.source_provenance_id) if j.source_provenance_id else None,
+        "original_document_id": str(j.original_document_id) if j.original_document_id else None,
+        "has_original_pdf": j.has_original_pdf,
+        "language": j.language,
+        "confidence_score": j.confidence_score,
+        "quality_flag_urdu_headnote_mojibake": j.quality_flag_urdu_headnote_mojibake,
+        "headnote_stripped_full_text": j.headnote_stripped_full_text,
+        "extraction_engine": j.extraction_engine,
+        "citations": [
+            {
+                "id": str(c.id),
+                "citation_string": c.citation_string,
+                "raw_string": c.raw_string,
+                "reporter": c.reporter,
+                "year": c.year,
+                "page": c.page,
+                "is_primary": c.is_primary,
+                "source_evidence": c.source_evidence,
+            }
+            for c in citations
+        ],
+    }
+
+
+async def _backup_requalify_judgments(db: AsyncSession, run_id: str, records: List[Dict[str, Any]]) -> None:
+    from uuid import UUID
+
+    judgment_ids = [
+        UUID(item["promoted_to_id"])
+        for item in records
+        if item.get("result") == "promoted" and item.get("promoted_to_id")
+    ]
+    if not judgment_ids:
+        return
+    payload: List[Dict[str, Any]] = []
+    for jid in judgment_ids:
+        j = (await db.execute(select(Judgment).where(Judgment.id == jid))).scalars().first()
+        if j is None:
+            continue
+        cits = (await db.execute(select(Citation).where(Citation.judgment_id == jid))).scalars().all()
+        payload.append(_judgment_backup_payload(j, list(cits)))
+    if payload:
+        db.add(
+            CorpusMetadata(
+                key=REQUALIFY_JUDGMENT_BACKUP_KEY.format(run_id=run_id),
+                value=json.dumps(payload),
+            )
+        )
+
+
+async def _delete_requalify_judgments(db: AsyncSession, run_id: str) -> int:
+    from uuid import UUID
+
+    row = (
+        await db.execute(
+            select(CorpusMetadata).where(CorpusMetadata.key == REQUALIFY_JUDGMENT_BACKUP_KEY.format(run_id=run_id))
+        )
+    ).scalars().first()
+    if row is None or not row.value:
+        return 0
+    deleted = 0
+    for item in json.loads(row.value):
+        j = (await db.execute(select(Judgment).where(Judgment.id == UUID(item["id"])))).scalars().first()
+        if j is None:
+            continue
+        await db.delete(j)
+        deleted += 1
+    return deleted
+
+
 async def _undo_requalify(db: AsyncSession, run_id: str) -> Dict[str, int]:
     from uuid import UUID
 
+    judgments_deleted = await _delete_requalify_judgments(db, run_id)
     row = (
         await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == REQUALIFY_BACKUP_KEY.format(run_id=run_id)))
     ).scalars().first()
     if row is None or not row.value:
-        return {"staging_rows_reverted": 0}
+        return {"staging_rows_reverted": 0, "judgments_deleted": judgments_deleted}
     reverted = 0
     for item in json.loads(row.value):
         st = (await db.execute(select(ScraperStaging).where(ScraperStaging.id == UUID(item["staging_id"])))).scalars().first()
@@ -214,7 +315,7 @@ async def _undo_requalify(db: AsyncSession, run_id: str) -> Dict[str, int]:
         st.promoted_to_id = UUID(item["prior_promoted_to_id"]) if item.get("prior_promoted_to_id") else None
         reverted += 1
     await db.delete(row)
-    return {"staging_rows_reverted": reverted}
+    return {"staging_rows_reverted": reverted, "judgments_deleted": judgments_deleted}
 
 
 async def requalify_already_belongs(
@@ -265,8 +366,26 @@ async def requalify_already_belongs(
         if dry_run:
             if out.quarantine:
                 counts["would_still_quarantine"] += 1
-            else:
-                counts["would_promote"] += 1
+                continue
+            nested = await db.begin_nested()
+            try:
+                reconciled = dict(out.data or {})
+                st.reconciled_json = reconciled
+                st.confidence_score = out.confidence
+                st.validation_errors = out.errors
+                st.status = "extracted"
+                st.quarantine_reason = None
+                await db.flush()
+                result = await promote_judgment_staging(db, st, force=True)
+                if result == "duplicate":
+                    counts["would_duplicate"] += 1
+                elif result == "promoted":
+                    counts["would_promote"] += 1
+                else:
+                    counts["would_still_quarantine"] += 1
+            finally:
+                await nested.rollback()
+                await db.refresh(st)
             continue
         if out.quarantine:
             counts["still_quarantined"] += 1
@@ -394,6 +513,7 @@ async def run_citation_alias_cleanup(
         requal, requal_records = await requalify_already_belongs(db, dry_run=False, alias_strings=alias_strings)
         if requal_records:
             db.add(CorpusMetadata(key=REQUALIFY_BACKUP_KEY.format(run_id=run_id), value=json.dumps(requal_records)))
+            await _backup_requalify_judgments(db, run_id, requal_records)
             await db.commit()
         out["applied"] = {"run_id": run_id, "aliases_removed": len(citation_ids), "requalify": requal}
         return out
