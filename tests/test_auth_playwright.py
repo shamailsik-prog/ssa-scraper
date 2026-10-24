@@ -684,12 +684,10 @@ async def test_capture_case_description_modal_waits_for_full_text_ready_markers(
     }
     modal_eval_call = next(call for call in page.calls if call[0] == "evaluate" and "#ExceptionResponseScreen1" in call[1])
     script = modal_eval_call[1]
-    assert "for (let i = 0; i < maxPolls; i += 1)" in script
-    assert "maxPolls = waitForBody ? 80 : 80" in script
+    assert "for (let i = 0; i < 80; i += 1)" in script
     assert "await sleep(150)" in script
-    assert "bodyMarker" in script
-    assert "stableReads" in script
-    assert "waitForBody" in script
+    assert "hasBeforeMarker" in script
+    assert "waitForBody" not in script
 
 
 async def test_playwright_submit_search_waits_for_domcontentloaded_navigation():

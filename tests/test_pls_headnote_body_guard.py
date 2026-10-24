@@ -256,16 +256,11 @@ async def test_undo_headnote_scan_leaves_other_runs_alone(db, monkeypatch):
     assert left.run_id == run_b
 
 
-def test_capture_modal_script_waits_for_body_marker_when_flag_on():
+def test_headnote_body_guard_does_not_gate_case_description_modal_wait():
     import inspect
 
     from scraper.auth import session_manager
 
     source = inspect.getsource(session_manager.PlaywrightBrowser._capture_case_description_modal)
-    assert "waitForBody" in source
-    assert "bodyMarker" in source
-    assert "stableReads" in source
-    assert "text.length >= 600" in source
-    assert "stableReads >= 4" in source
-    assert "for (let i = 0; i < maxPolls; i += 1)" in source
-    assert "maxPolls = waitForBody ? 80 : 80" in source
+    assert "SSA_PLS_HEADNOTE_BODY_GUARD" not in source
+    assert "waitForBody" not in source
