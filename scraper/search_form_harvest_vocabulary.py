@@ -17,22 +17,24 @@ def _dedupe(values: List[str]) -> List[str]:
     out: List[str] = []
     for v in values:
         key = v.strip()
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
+        fold = key.casefold()
+        if fold in seen:
+            continue
+        seen.add(fold)
         out.append(key)
     return out
 
 
 def _options_from_field(fields: Dict[str, Any], role: str) -> List[str]:
+    """Option values only (never human labels); labels duplicate values and inflate split children."""
     field = fields.get(role) or {}
     opts = [str(o).strip() for o in (field.get("options") or []) if str(o).strip()]
     for pair in field.get("option_labels") or []:
         if isinstance(pair, (list, tuple)) and pair:
             opts.append(str(pair[0]).strip())
-            if len(pair) > 1:
-                opts.append(str(pair[1]).strip())
-    return opts
+    return _dedupe(opts)
 
 
 def capture_harvest_split_vocabulary(html: str, fields: Dict[str, Any]) -> Dict[str, List[str]]:

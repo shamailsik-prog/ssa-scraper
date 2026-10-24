@@ -20,11 +20,18 @@ SOURCE_NAME = "PakistanLawSite"
 
 
 class _ReadOnlyContinuityRunner(ContinuityRunner):
-    """Dry-run remap: no slot touches, source pause, or alternate-slot recovery writes."""
+    """Dry-run remap: read an already-logged-in slot without leasing, touching, or config writes."""
+
+    async def ensure_browser(self):
+        if self.browser is not None:
+            return self.browser
+        for slot in await self.manager.slots():
+            if slot.state == "ACTIVE":
+                return await self.open(slot)
+        raise RuntimeError("dry-run remap requires an ACTIVE login slot; no slot lease or login attempted")
 
     async def run(self, op, *, timeout=None):
         browser = await self.ensure_browser()
-        slot_no = browser.slot_number
         limit = float(timeout if timeout is not None else settings.PLS_BROWSER_OP_TIMEOUT_SECONDS)
         return await self._call(op, browser, limit)
 

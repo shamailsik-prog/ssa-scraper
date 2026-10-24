@@ -390,6 +390,8 @@ def should_auto_split_journal_year(
     trunc = journal_year_truncation_rows(result_cap)
     if site_total is not None and int(site_total) < trunc:
         return False
+    if site_total is not None and rows_seen < int(site_total):
+        return rows_seen >= trunc or int(site_total) >= trunc
     return rows_seen >= trunc
 
 
@@ -402,6 +404,19 @@ def split_dimension_added(parent: Dict[str, Any], child: Dict[str, Any]) -> Opti
     return None
 
 
+def split_children_union_incomplete(
+    parent_rows_seen: int,
+    child_key_sets: Sequence[Set[str]],
+) -> bool:
+    """True when finished split children do not account for every row the parent enumerated."""
+    if parent_rows_seen <= 0 or not child_key_sets:
+        return False
+    union: Set[str] = set()
+    for keys in child_key_sets:
+        union |= keys
+    return len(union) < parent_rows_seen
+
+
 def split_children_cover_rows(
     parent: Dict[str, Any],
     children: Sequence[Dict[str, Any]],
@@ -409,16 +424,8 @@ def split_children_cover_rows(
     rows_seen: int,
     result_cap: int,
 ) -> bool:
-    """True when child queries can account for every row the parent saw (no silent loss on partial court lists)."""
-    if not children:
-        return False
-    dim = split_dimension_added(parent, children[0])
-    if dim is None:
-        return True
-    n = len(children)
-    if dim == "month":
-        return n >= len(_MONTHS)
-    return n * result_cap >= rows_seen
+    """Deprecated pre-split heuristic; callers should enqueue when children exist and use split_children_union_incomplete after children finish."""
+    return bool(children)
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:

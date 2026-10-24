@@ -13,7 +13,7 @@ from scraper.pls_search_harvest_core import (
     page_continuity_gaps,
     harvest_result_cap,
     should_auto_split_journal_year,
-    split_children_cover_rows,
+    split_children_union_incomplete,
     split_oversized_query,
     unmapped_harvest_reason,
 )
@@ -96,14 +96,17 @@ def test_journal_year_auto_split_flag(monkeypatch):
     assert not should_auto_split_journal_year(
         q, rows_seen=390, site_total=390, result_cap=400, has_next_page=False
     )
+    assert should_auto_split_journal_year(
+        q, rows_seen=380, site_total=385, result_cap=400, has_next_page=False
+    )
 
 
-def test_split_children_cover_rows_requires_enough_court_children():
-    parent = {"reporter": "PLD", "year": 2020}
-    courts = [{"reporter": "PLD", "year": 2020, "court": f"C{i}"} for i in range(3)]
-    assert not split_children_cover_rows(parent, courts, rows_seen=1500, result_cap=400)
-    courts = [{"reporter": "PLD", "year": 2020, "court": f"C{i}"} for i in range(10)]
-    assert split_children_cover_rows(parent, courts, rows_seen=390, result_cap=400)
+def test_split_children_union_incomplete_after_children():
+    parent_keys = {f"k{i}" for i in range(400)}
+    child_a = {f"k{i}" for i in range(200)}
+    child_b = {f"k{i}" for i in range(200, 350)}
+    assert split_children_union_incomplete(400, [child_a, child_b])
+    assert not split_children_union_incomplete(400, [parent_keys, child_a])
 
 
 def test_harvest_result_cap_defaults_to_legacy_500(monkeypatch):

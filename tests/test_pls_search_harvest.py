@@ -30,12 +30,15 @@ def test_iter_base_plan_queries_reporter_year_grid():
     assert normalize_query_json({"reporter": "PLD", "year": 2024}) in queries
 
 
-def test_split_oversized_by_court_then_keyword():
+def test_split_oversized_by_court_then_keyword(monkeypatch):
+    from scraper.config import settings
+
     parent = {"reporter": "PLD", "year": 2020}
     courts = split_oversized_query(parent, 800, result_cap=500, court_options=["SC", "HC"])
     assert len(courts) == 2
     assert courts[0]["court"] == "SC"
     with_court = {"reporter": "PLD", "year": 2020, "court": "SC"}
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_LEGACY_ALPHA_KEYWORD_SPLITS", True)
     keywords = split_oversized_query(with_court, 800, result_cap=500, court_options=["SC"])
     assert len(keywords) == 26
     assert keywords[0]["keyword"] == "a"

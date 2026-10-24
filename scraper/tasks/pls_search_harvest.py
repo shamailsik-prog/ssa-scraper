@@ -59,7 +59,7 @@ from scraper.pls_search_harvest_core import (
     harvest_result_cap,
     harvest_result_fingerprint_from_keys,
     should_auto_split_journal_year,
-    split_children_cover_rows,
+    split_children_union_incomplete,
     split_oversized_query,
     unmapped_harvest_reason,
     years_for_plan,
@@ -587,52 +587,106 @@ class SearchHarvestRunner:
             n += 1
         return n
 
+    async def _halt_ineffective_split_parent(
+        self,
+        parent: PlsSearchHarvestQuery,
+        reason: str,
+    ) -> None:
+        parent.status = "needs_resplit"
+        parent.last_error = (
+            f"{reason[:900]}; parent rows_seen={int(parent.rows_seen or 0)}"
+        )[:1000]
+        parent.split_reason = (parent.split_reason or "")[:400]
+
     async def _maybe_abort_ineffective_split_child(
         self,
         query_row: PlsSearchHarvestQuery,
         fingerprint: str,
         rows_seen: int,
+        seen_keys: Set[str],
     ) -> bool:
-        """When a split child returns the same row set as its parent or a sibling, stop the split wave."""
+        """When every finished split child (at least three) repeats the parent's row-set, stop the wave."""
         if not fingerprint or not query_row.parent_id:
             return False
         parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
         if parent is None:
             return False
         parent_fp = (parent.cursor_json or {}).get("split_source_fingerprint")
-        reason = None
-        if parent_fp and fingerprint == parent_fp and rows_seen >= int(parent.rows_seen or 0):
-            reason = (
-                f"split ineffective: child {query_row.query_key} returned the same {rows_seen} rows as parent "
-                f"(keyword split not applied to the search form)"
-            )
-        if reason is None:
-            siblings = (
-                await self.db.execute(
-                    select(PlsSearchHarvestQuery).where(
-                        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-                        PlsSearchHarvestQuery.parent_id == parent.id,
-                        PlsSearchHarvestQuery.id != query_row.id,
-                    )
-                )
-            ).scalars().all()
-            for sib in siblings:
-                sib_fp = (sib.cursor_json or {}).get("result_fingerprint")
-                if sib_fp and sib_fp == fingerprint and int(sib.rows_seen or 0) == rows_seen:
-                    reason = (
-                        f"split ineffective: {query_row.query_key} matches sibling {sib.query_key} "
-                        f"({rows_seen} rows, 0 new)"
-                    )
-                    break
-        if reason is None:
-            cj = dict(query_row.cursor_json or {})
-            cj["result_fingerprint"] = fingerprint
-            query_row.cursor_json = cj
+        cj = dict(query_row.cursor_json or {})
+        cj["result_fingerprint"] = fingerprint
+        if seen_keys:
+            cj["result_keys"] = sorted(seen_keys)
+        query_row.cursor_json = cj
+
+        if not parent_fp or fingerprint != parent_fp:
             return False
+
+        siblings = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent.id,
+                )
+            )
+        ).scalars().all()
+        terminal = ("done", "split_ineffective", "failed", "skipped")
+        matching_parent: List[PlsSearchHarvestQuery] = []
+        for s in siblings:
+            if s.id != query_row.id and s.status not in terminal:
+                continue
+            s_fp = fingerprint if s.id == query_row.id else (s.cursor_json or {}).get("result_fingerprint")
+            if (
+                s_fp == parent_fp
+                and int(s.rows_seen if s.id != query_row.id else rows_seen or 0) >= int(parent.rows_seen or 0)
+            ):
+                matching_parent.append(s)
+        if len(matching_parent) < 3:
+            return False
+
+        reason = (
+            f"split ineffective: {len(matching_parent)} children each returned the same "
+            f"{int(parent.rows_seen or 0)} rows as parent (split dimension not narrowing results)"
+        )
         query_row.status = "split_ineffective"
         query_row.last_error = reason[:1000]
         await self._stop_pending_split_children(parent.id, reason)
+        await self._halt_ineffective_split_parent(parent, reason)
+        await self.db.flush()
         return True
+
+    async def _maybe_finalize_split_parent(self, parent_id: Any) -> None:
+        parent = await self.db.get(PlsSearchHarvestQuery, parent_id)
+        if parent is None or parent.status != "split":
+            return
+        children = (
+            await self.db.execute(
+                select(PlsSearchHarvestQuery).where(
+                    PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+                    PlsSearchHarvestQuery.parent_id == parent_id,
+                )
+            )
+        ).scalars().all()
+        if not children:
+            return
+        open_status = ("pending", "in_progress")
+        if any(c.status in open_status for c in children):
+            return
+        expected = int((parent.cursor_json or {}).get("split_expected_rows_seen") or parent.rows_seen or 0)
+        key_sets: List[Set[str]] = []
+        for child in children:
+            if child.status not in ("done", "split_ineffective", "failed", "skipped"):
+                continue
+            raw = (child.cursor_json or {}).get("result_keys") or []
+            if raw:
+                key_sets.append(set(str(k) for k in raw))
+        if not key_sets:
+            return
+        if split_children_union_incomplete(expected, key_sets):
+            parent.status = "needs_resplit"
+            union_n = len(set().union(*key_sets))
+            parent.last_error = (
+                f"split children union {union_n} rows < parent rows_seen={expected}; incomplete coverage"
+            )[:1000]
 
     async def run_query(
         self,
@@ -840,12 +894,10 @@ class SearchHarvestRunner:
                         rows_seen=rows_seen,
                         cap=cap,
                     )
-                    covers = children and split_children_cover_rows(
-                        query_json, children, rows_seen=rows_seen, result_cap=cap
-                    )
-                    if children and covers and not self.probe_mode:
+                    if children and not self.probe_mode:
                         cj = dict(query_row.cursor_json or {})
                         cj["split_source_fingerprint"] = harvest_result_fingerprint_from_keys(seen_keys)
+                        cj["split_expected_rows_seen"] = rows_seen
                         query_row.cursor_json = cj
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
                         query_row.status = "split"
@@ -855,15 +907,11 @@ class SearchHarvestRunner:
                             else f"journal_year_truncation rows_seen={rows_seen} cap={cap} site_total={site_total}"
                         )
                         break
-                    if not self.probe_mode:
-                        if children and not covers:
-                            query_row.status = "failed"
-                            query_row.last_error = (
-                                f"proposed {len(children)} split children cannot cover {rows_seen} rows at cap={cap}; NOT split"
-                            )[:1000]
-                        else:
-                            query_row.status = "failed"
-                            query_row.last_error = f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                    if not self.probe_mode and not children:
+                        query_row.status = "failed"
+                        query_row.last_error = (
+                            f"capped at {cap} results and no narrower dimension left to split on (exhausted); NOT complete"
+                        )
                     break
                 may_done, incomplete_reason = search_harvest_may_mark_done(
                     site_total=site_total,
@@ -950,9 +998,19 @@ class SearchHarvestRunner:
             )
         elif query_row.parent_id and rows_new == 0 and seen_keys:
             fp = harvest_result_fingerprint_from_keys(seen_keys)
-            if await self._maybe_abort_ineffective_split_child(query_row, fp, rows_seen):
+            if await self._maybe_abort_ineffective_split_child(query_row, fp, rows_seen, seen_keys):
                 result["status"] = query_row.status
                 result["split_ineffective"] = True
+        elif (
+            not self.probe_mode
+            and query_row.parent_id
+            and query_row.status in ("done", "split_ineffective", "failed", "skipped")
+            and seen_keys
+        ):
+            cj = dict(query_row.cursor_json or {})
+            cj.setdefault("result_keys", sorted(seen_keys))
+            query_row.cursor_json = cj
+            await self._maybe_finalize_split_parent(query_row.parent_id)
         return result
 
     def _split_children_for_truncation(
@@ -967,15 +1025,12 @@ class SearchHarvestRunner:
         from scraper.search_form_roles import harvest_expressible_roles
 
         effective_total = int(site_total if site_total is not None else rows_seen)
-        journal_trunc = (
-            site_total is None
-            and should_auto_split_journal_year(
-                query_json,
-                rows_seen=rows_seen,
-                site_total=site_total,
-                result_cap=cap,
-                has_next_page=False,
-            )
+        journal_trunc = should_auto_split_journal_year(
+            query_json,
+            rows_seen=rows_seen,
+            site_total=site_total,
+            result_cap=cap,
+            has_next_page=False,
         )
         if effective_total < cap and (journal_trunc or is_capped(site_total, rows_seen, cap)):
             effective_total = max(effective_total, cap)
