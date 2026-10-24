@@ -302,8 +302,8 @@ class Settings(BaseSettings):
         description="Event-driven chain: a committed fetch batch enqueues promotion, and a promotion that saved something enqueues the archive mirror (debounced). Beat stays the safety net.",
     )
     SSA_PROMOTE_DEDICATED_QUEUE_ENABLED: bool = Field(
-        default=True,
-        description="Route promote_staging_records to the dedicated promote Celery queue (worker-promote). When false, promotion stays on maintenance.",
+        default=False,
+        description="When true, route promote_staging_records to the dedicated promote Celery queue (worker-promote / sikander-worker-promote on Render). Default false keeps promotion on maintenance until a promote worker is deployed.",
     )
     PROMOTION_STALE_ALERT_ENABLED: bool = Field(
         default=True,

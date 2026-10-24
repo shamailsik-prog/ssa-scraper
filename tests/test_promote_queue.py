@@ -20,9 +20,20 @@ from scraper.tasks.promotion_health import NOTIFICATION_CODE, evaluate_promotion
 from scraper.tasks.treatment import classify_treatment_task
 
 
-def test_promote_staging_records_routes_to_promote_queue():
-    assert promote_task_queue() == PROMOTE_QUEUE
-    assert app.conf.task_routes["scraper.tasks.promotion.promote_staging_records"]["queue"] == PROMOTE_QUEUE
+def test_promote_staging_records_routes_to_promote_queue_when_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "SSA_PROMOTE_DEDICATED_QUEUE_ENABLED", True)
+    from scraper.celery_queues import promote_task_queue as pq
+
+    assert pq() == PROMOTE_QUEUE
+
+
+def test_render_blueprint_splits_promote_worker():
+    from pathlib import Path
+
+    text = Path("render.yaml").read_text(encoding="utf-8")
+    assert "sikander-worker-promote" in text
+    assert "-Q promote" in text
+    assert "scraper,maintenance,embeddings" in text
 
 
 def test_promote_routes_to_maintenance_when_dedicated_queue_disabled(monkeypatch):
@@ -99,8 +110,9 @@ def test_classify_treatment_task_catches_soft_time_limit(monkeypatch):
 
 
 @pytest.mark.timeout(90)
-def test_long_classify_on_maintenance_does_not_delay_promote_task():
+def test_long_classify_on_maintenance_does_not_delay_promote_task(monkeypatch):
     """Promote worker drains `promote` while a classify_treatment message waits on `maintenance`."""
+    monkeypatch.setattr(settings, "SSA_PROMOTE_DEDICATED_QUEUE_ENABLED", True)
     if not os.environ.get("REDIS_URL"):
         pytest.skip("REDIS_URL not set")
     suffix = str(os.getpid())
@@ -130,7 +142,7 @@ def test_long_classify_on_maintenance_does_not_delay_promote_task():
         assert promote_async.successful()
         assert classify_async.state != "SUCCESS", "promote must not wait for classify_treatment to finish"
         assert app.conf.task_routes["scraper.tasks.treatment.classify_treatment"]["queue"] == "maintenance"
-        assert app.conf.task_routes["scraper.tasks.promotion.promote_staging_records"]["queue"] == PROMOTE_QUEUE
+        assert promote_task_queue() == PROMOTE_QUEUE
     finally:
         promote.terminate()
         try:
