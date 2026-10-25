@@ -2531,6 +2531,39 @@ async def test_pipeline_walks_each_journal_grid_with_its_own_cursor(db, login_so
     assert "2024 CLC 7001" not in staged
 
 
+async def test_unverified_journal_grid_cursor_never_wraps_to_snapshot_length(
+    db, login_source, monkeypatch
+):
+    """A 2-row compact snapshot is not proof that the journal has only 2 rows.
+
+    No licensed service is contacted; this is a scripted, unverified page.
+    """
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
+    await _activate(db, login_source)
+    rows = [
+        ("PLD 2024 SC 9801", "Case 9801", "Supreme Court", "https://www.pakistanlawsite.com/case/9801"),
+        ("PLD 2024 SC 9802", "Case 9802", "Supreme Court", "https://www.pakistanlawsite.com/case/9802"),
+    ]
+    sc = _journal_script({"1": rows}, default_rows=rows)
+    # Deliberately remove verified total/seek metadata from the synthetic grid.
+    sc.page(("search", (("reporter", "1"),)), _archived_grid_html(rows), url=settings.PLS_SEARCH_URL)
+    await _run_pls(db, login_source, sc)
+    await db.refresh(login_source)
+    cur = login_source.config_json["citation_grid_cursor_journal_PLD"]
+    assert cur["row_offset"] == 2  # old code incorrectly reset this to zero
+    assert cur.get("last_total_rows") is None
+
+    # A subsequent unseekable page must fail closed instead of silently
+    # revisiting rows 0-1 and claiming the unseen remainder was harvested.
+    sc.log.clear()
+    stats = await _run_pls(db, login_source, sc)
+    assert stats.get("citation_grid_seek_failed") is True
+    assert _case_gotos(sc) == []
+    await db.refresh(login_source)
+    assert login_source.config_json["citation_grid_cursor_journal_PLD"]["row_offset"] == 2
+
+
 async def test_journal_grid_that_ignores_the_choice_is_set_aside(db, login_source, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "PLD,SCMR")
     monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", 0)
