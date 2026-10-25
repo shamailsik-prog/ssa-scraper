@@ -205,6 +205,30 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
     for role in ("judge", "party", "citation"):
         if query_json.get(role) and role not in stored_fields and "keyword" not in express_fields and "party" not in express_fields:
             return f"search map cannot express {role} query; missing roles: {role}, party/keyword"
+    # A query is not narrowed if two independent text constraints write the
+    # same physical input. In particular, keyword splits alias to the party
+    # control on CitationSearch, where a party/initial filter would overwrite it.
+    text_roles = ("keyword", "party_initial", "party", "judge", "citation")
+    active = [role for role in text_roles if query_json.get(role) is not None and str(query_json[role]).strip()]
+    if len(active) > 1:
+        base_query = {k: v for k, v in query_json.items() if k not in text_roles}
+        base_values = build_harvest_form_values(search_map, base_query, cursor)
+        physical_fields = ("keyword", "party_initial", "party", "judge", "citation")
+        occupied: Dict[str, str] = {}
+        for role in active:
+            single = build_harvest_form_values(
+                search_map, {**base_query, role: query_json[role]}, cursor
+            )
+            for field in physical_fields:
+                if field not in single or single[field] == base_values.get(field):
+                    continue
+                previous = occupied.get(field)
+                if previous is not None:
+                    return (
+                        f"search map cannot express {previous} and {role} independently; "
+                        f"both target {field} control"
+                    )
+                occupied[field] = role
     if not build_harvest_form_values(search_map, query_json, cursor):
         return "search map cannot express harvest query; no usable mapped fields"
     return None
