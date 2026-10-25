@@ -28,6 +28,7 @@ async def test_ensure_roles_rotates_writer_password(monkeypatch):
     writer = f"probe_writer_{suffix}"
     monkeypatch.setattr(settings, "CORPUS_WRITER_ROLE", writer)
     monkeypatch.setattr(settings, "SIKANDER_READER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(settings, "CORPUS_API_READER_PASSWORD", SecretStr(""))
     try:
         monkeypatch.setattr(settings, "CORPUS_WRITER_PASSWORD", SecretStr("writer-rotate-a"))
         await ensure_roles()
@@ -50,6 +51,7 @@ async def test_ensure_roles_rotates_reader_password(monkeypatch):
     reader = f"probe_reader_{suffix}"
     monkeypatch.setattr(settings, "SIKANDER_READER_ROLE", reader)
     monkeypatch.setattr(settings, "CORPUS_WRITER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(settings, "CORPUS_API_READER_PASSWORD", SecretStr(""))
     try:
         monkeypatch.setattr(settings, "SIKANDER_READER_PASSWORD", SecretStr("reader-rotate-a"))
         await ensure_roles()
@@ -64,3 +66,26 @@ async def test_ensure_roles_rotates_reader_password(monkeypatch):
     finally:
         async with engine.begin() as conn:
             await drop_owned_role(conn, reader)
+
+
+@pytest.mark.asyncio
+async def test_ensure_roles_rotates_corpus_api_reader_password(monkeypatch):
+    suffix = uuid.uuid4().hex[:10]
+    api_reader = f"probe_api_reader_{suffix}"
+    monkeypatch.setattr(settings, "CORPUS_API_READER_ROLE", api_reader)
+    monkeypatch.setattr(settings, "CORPUS_WRITER_PASSWORD", SecretStr(""))
+    monkeypatch.setattr(settings, "SIKANDER_READER_PASSWORD", SecretStr(""))
+    try:
+        monkeypatch.setattr(settings, "CORPUS_API_READER_PASSWORD", SecretStr("api-rotate-a"))
+        await ensure_roles()
+        first = await _role_password_hash(api_reader)
+        assert first
+
+        monkeypatch.setattr(settings, "CORPUS_API_READER_PASSWORD", SecretStr("api-rotate-b"))
+        await ensure_roles()
+        second = await _role_password_hash(api_reader)
+        assert second
+        assert first != second
+    finally:
+        async with engine.begin() as conn:
+            await drop_owned_role(conn, api_reader)

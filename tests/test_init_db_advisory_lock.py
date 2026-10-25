@@ -47,6 +47,8 @@ def _subprocess_env(probe_url: str, *, catalog_lock: bool, role_suffix: str) -> 
     env["DATABASE_NULL_POOL"] = "1"
     env["CORPUS_WRITER_ROLE"] = f"probe_writer_{role_suffix}"
     env["SIKANDER_READER_ROLE"] = f"probe_reader_{role_suffix}"
+    env["CORPUS_API_READER_ROLE"] = f"probe_api_reader_{role_suffix}"
+    env.setdefault("CORPUS_API_READER_PASSWORD", "corpusapipw")
     if catalog_lock:
         env["DB_LOCK_ON_CATALOG"] = "1"
     else:
@@ -133,6 +135,7 @@ async def _teardown_probe_db(
     *,
     corpus_writer_role: str | None = None,
     corpus_reader_role: str | None = None,
+    corpus_api_reader_role: str | None = None,
 ) -> None:
     admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
@@ -151,6 +154,8 @@ async def _teardown_probe_db(
                     await drop_owned_role(conn, corpus_writer_role)
                 if corpus_reader_role:
                     await drop_owned_role(conn, corpus_reader_role)
+                if corpus_api_reader_role:
+                    await drop_owned_role(conn, corpus_api_reader_role)
                 await drop_owned_role(conn, probe_role)
             finally:
                 if restore_public:
@@ -172,6 +177,7 @@ async def test_init_db_without_connect_on_postgres_catalog():
     suffix = uuid.uuid4().hex[:10]
     writer_role = f"probe_writer_{suffix}"
     reader_role = f"probe_reader_{suffix}"
+    api_reader_role = f"probe_api_reader_{suffix}"
 
     public_revoked = False
     async with postgres_catalog_probe_cluster_lock(admin_url):
@@ -199,6 +205,7 @@ async def test_init_db_without_connect_on_postgres_catalog():
                 public_revoked,
                 corpus_writer_role=writer_role,
                 corpus_reader_role=reader_role,
+                corpus_api_reader_role=api_reader_role,
             )
 
 
@@ -216,6 +223,7 @@ async def test_init_db_with_catalog_lock_fails_without_postgres_connect():
     suffix = uuid.uuid4().hex[:10]
     writer_role = f"probe_writer_{suffix}"
     reader_role = f"probe_reader_{suffix}"
+    api_reader_role = f"probe_api_reader_{suffix}"
 
     public_revoked = False
     async with postgres_catalog_probe_cluster_lock(admin_url):
@@ -247,4 +255,5 @@ async def test_init_db_with_catalog_lock_fails_without_postgres_connect():
                 public_revoked,
                 corpus_writer_role=writer_role,
                 corpus_reader_role=reader_role,
+                corpus_api_reader_role=api_reader_role,
             )
