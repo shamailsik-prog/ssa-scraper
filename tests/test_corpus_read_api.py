@@ -1,7 +1,7 @@
 """The read-only corpus API for the Sikander legal research and drafting agent (cursor-init
 docs/agents/sikander-legal-agent): search, a judgment by citation, citation verification, citing judgments
 with their treatment, and a statute section. Its own key (CORPUS_API_KEY), never the admin key, and every
-query runs as the sikander_reader role in a read-only transaction."""
+query runs as the corpus_writer role in a read-only transaction."""
 
 from __future__ import annotations
 
@@ -177,5 +177,5 @@ async def test_queries_run_as_the_read_only_reader_role(db, client):
     async for s in reader_session():
         from sqlalchemy import text
 
-        assert (await s.execute(text("SELECT current_user"))).scalar() == settings.SIKANDER_READER_ROLE
+        assert (await s.execute(text("SELECT current_user"))).scalar() == settings.CORPUS_WRITER_ROLE
         assert (await s.execute(text("SHOW transaction_read_only"))).scalar() == "on"

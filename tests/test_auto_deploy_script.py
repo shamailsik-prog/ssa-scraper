@@ -10,6 +10,15 @@ def test_auto_deploy_script_is_valid_bash():
     subprocess.run(["bash", "-n", str(script)], check=True)
 
 
+def test_auto_deploy_script_never_runs_sql_grants():
+    import re
+
+    text = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
+    assert "GRANT policy" in text
+    assert not re.search(r"^\s*GRANT\s+", text, flags=re.IGNORECASE | re.MULTILINE)
+    assert not re.search(r"^\s*REVOKE\s+", text, flags=re.IGNORECASE | re.MULTILINE)
+
+
 def test_auto_deploy_default_services_exclude_celery_beat():
     text = Path("scripts/auto_deploy.sh").read_text(encoding="utf-8")
     assert "DEFAULT_APP_SERVICES=(api worker-scraper worker-login-recovery worker-public worker-maintenance)" in text

@@ -3,10 +3,11 @@ Async engine, session factory, migration runner, database roles and seed data.
 
 Roles (Amendment §0, Cursor command):
   * corpus_writer  — the service role (the only writer). Created when CORPUS_WRITER_PASSWORD is set.
-  * sikander_reader — the read-only role handed to SIKANDER AI. It may SELECT the contract
-    tables only. Every internal table (staging, session state, extraction audit, archive
-    configuration, secrets) is explicitly REVOKEd. Created when SIKANDER_READER_PASSWORD is
-    set; otherwise the dashboard shows NOT CONFIGURED.
+  * sikander_reader — read-only role for direct SQL / least-privilege access. SELECT on contract
+    tables only; tables with content columns (judgment, instrument, source_provenance, …) get
+    column-level grants (metadata/id/status), never table-wide. Internal tables are REVOKEd.
+    The HTTP corpus API uses corpus_writer in a read-only transaction instead. Created when
+    SIKANDER_READER_PASSWORD is set; otherwise the dashboard shows NOT CONFIGURED.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
 from scraper.keys import fit_key
+from scraper.reader_grants import READER_COLUMN_LIMITED_TABLES, reader_grant_select_sql, reader_select_columns
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +374,19 @@ async def ensure_roles() -> dict:
 _run_ensure_roles = ensure_roles
 
 
+async def _public_table_column_names(conn, table: str) -> list[str]:
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = :t ORDER BY ordinal_position"
+            ),
+            {"t": table},
+        )
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 async def _apply_role_grants(lock_conn, status: dict) -> None:
     from scraper.models import CONTRACT_TABLES, INTERNAL_TABLES
 
@@ -411,7 +426,12 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
         await lock_conn.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role}"))
         await lock_conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role}"))
         for t in CONTRACT_TABLES:
-            await lock_conn.execute(text(f"GRANT SELECT ON TABLE {_quote_ident(t)} TO {role}"))
+            qt = _quote_ident(t)
+            if t in READER_COLUMN_LIMITED_TABLES:
+                cols = reader_select_columns(t, await _public_table_column_names(lock_conn, t))
+                await lock_conn.execute(text(reader_grant_select_sql(qt, role, cols)))
+            else:
+                await lock_conn.execute(text(f"GRANT SELECT ON TABLE {qt} TO {role}"))
         for t in INTERNAL_TABLES:
             await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {role}"))
         for t in INTERNAL_TABLES:
