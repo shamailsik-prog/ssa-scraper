@@ -1088,7 +1088,9 @@ class PakistanLawSitePipeline:
         total_rows_known = _citation_grid_total_verified(total_rows_meta)
         if total_rows is None or total_rows <= 0:
             total_rows = row_count
-        if row_offset >= total_rows:
+        # A cached or snapshot-length fallback is not a verified grid boundary.
+        # Never silently rewind an unverified cursor to row zero.
+        if total_rows_known and row_offset >= total_rows:
             row_offset = row_offset % total_rows
         start_row_meta = grid_metadata.get("start_row")
         seek_mode = str(grid_metadata.get("seek_mode") or "").strip().lower()
@@ -1125,7 +1127,11 @@ class PakistanLawSitePipeline:
         start_offset = row_offset
         start_in_window = row_offset - snapshot_start_row
         remaining_rows_in_window = max(0, row_count - start_in_window)
-        remaining_rows_total = max(0, total_rows - start_offset)
+        # Without a current-page total, only the visible snapshot bounds this
+        # window. A cached count may be stale and must not truncate new rows.
+        remaining_rows_total = (
+            max(0, total_rows - start_offset) if total_rows_known else remaining_rows_in_window
+        )
         take_cap = min(scan_window, row_count)
         take_count = min(take_cap, remaining_rows_in_window, remaining_rows_total)
         cfg = dict(self.source.config_json or {})
@@ -1246,7 +1252,9 @@ class PakistanLawSitePipeline:
         last_committed_offset = start_offset
 
         def next_offset_after(processed_rows: int) -> int:
-            if total_rows <= 0:
+            if total_rows <= 0 or not total_rows_known:
+                # Unknown totals cannot establish a wrap. Advance monotonically
+                # and require a confirmed seek on the next window/job.
                 return start_offset + processed_rows
             absolute = start_offset + processed_rows
             if absolute >= total_rows:
@@ -1265,7 +1273,7 @@ class PakistanLawSitePipeline:
                     "last_start_offset": start_offset,
                     "last_take_count": processed_rows,
                     "last_rows_seen": row_count,
-                    "last_total_rows": total_rows,
+                    "last_total_rows": total_rows if total_rows_known else None,
                     "last_snapshot_start_row": snapshot_start_row,
                     "last_seek_mode": seek_mode or "none",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
