@@ -155,7 +155,11 @@ class PublicPipeline:
                 CrawlFrontier.status.in_(["pending", "in_progress"]),
                 or_(CrawlFrontier.next_run_at.is_(None), CrawlFrontier.next_run_at <= now),
             )
-            .order_by(CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
+            .order_by(
+                CrawlFrontier.attempts.asc(),
+                CrawlFrontier.priority.asc(),
+                CrawlFrontier.created_at.asc(),
+            )
             .limit(limit)
         )
         return list((await self.db.execute(q)).scalars().all())
@@ -529,6 +533,7 @@ class PublicPipeline:
         route: Dict[str, Any],
     ) -> None:
         from scraper.judgment_document_body import (
+            EMPTY_BODY_RETIRE_AFTER_ATTEMPTS,
             PDF_MISS_DEFER_ERROR,
             PDF_MISS_RETIRE_AFTER_ATTEMPTS,
             classify_pdf_endpoint_body,
@@ -553,8 +558,12 @@ class PublicPipeline:
         fr.status = "pending"
         fr.last_error = pdf_miss_error_message(status, detail)
         fr.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
+        fr.priority = min(99, max(int(fr.priority or 50), 50) + max(1, int(fr.attempts)))
         self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
-        if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+        retire_after = (
+            EMPTY_BODY_RETIRE_AFTER_ATTEMPTS if body_kind == "empty" else PDF_MISS_RETIRE_AFTER_ATTEMPTS
+        )
+        if fr.attempts >= retire_after:
             fr.status = "retired"
             fr.last_error = pdf_miss_error_message(
                 status,
@@ -589,6 +598,7 @@ class PublicPipeline:
                     fr.next_run_at = datetime.now(timezone.utc) + timedelta(
                         seconds=pdf_miss_backoff_seconds(fr.attempts)
                     )
+                    fr.priority = min(99, max(int(fr.priority or 50), 50) + max(1, int(fr.attempts)))
                     self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
                     if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
                         fr.status = "retired"

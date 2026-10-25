@@ -60,6 +60,38 @@ async def test_html_judgment_accepted_from_pdf_shaped_url(db, source, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_empty_whitespace_body_retires_after_three_attempts(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/EMPTY-RETIRE"
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={"kind": "judgment", "url": url, "route": {"pdf_endpoint_kind": "view-file"}},
+        cursor_json={},
+        priority=50,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return _pdf_shaped_result("   \n\t  ", url=url)
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
+
+    for expected_attempts in (1, 2):
+        assert await pipeline._drain_one(row) == "ok"
+        assert row.status == "pending"
+        assert row.attempts == expected_attempts
+
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "retired"
+    assert row.attempts == 3
+    assert "empty document body" in (row.last_error or "")
+    assert "retired after 3 attempts" in (row.last_error or "")
+
+
+@pytest.mark.asyncio
 async def test_empty_whitespace_body_pending_with_backoff(db, source, monkeypatch):
     url = "http://127.0.0.1:9/caselaw/view-file/EMPTY"
     row = CrawlFrontier(

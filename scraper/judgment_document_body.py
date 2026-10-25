@@ -11,6 +11,8 @@ from scraper.parsers.text_cleaner import clean_html
 MIN_HTML_JUDGMENT_WORDS = 200
 PDF_MISS_DEFER_ERROR = "missing %PDF signature; body is not an accepted HTML judgment"
 PDF_MISS_RETIRE_AFTER_ATTEMPTS = 10
+# Whitespace-only HTTP 200 on a PDF-shaped URL is permanent; do not burn the default 10-attempt budget.
+EMPTY_BODY_RETIRE_AFTER_ATTEMPTS = 3
 TRANSIENT_HTTP_STATUSES = frozenset({406, 408, 425, 429, 502, 503, 504})
 _HTML_JUDGMENT_MARKER_RE = re.compile(
     r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
