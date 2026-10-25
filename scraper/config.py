@@ -43,6 +43,7 @@ SECRET_FIELD_NAMES = (
     "SGAI_API_KEY",
     "SIKANDER_READER_PASSWORD",
     "CORPUS_WRITER_PASSWORD",
+    "CORPUS_API_READER_PASSWORD",
     "CORPUS_API_KEY",
     "GOOGLE_APPLICATION_CREDENTIALS_JSON",
     "PLS_PASS",
@@ -98,6 +99,14 @@ class Settings(BaseSettings):
     )
     CORPUS_WRITER_ROLE: str = Field(default="corpus_writer")
     CORPUS_WRITER_PASSWORD: SecretStr = Field(default=SecretStr(""))
+    CORPUS_API_READER_ROLE: str = Field(
+        default="corpus_api_reader",
+        description="Read-only role for the HTTP /corpus/v1 API (full contract-table SELECT; no internal tables).",
+    )
+    CORPUS_API_READER_PASSWORD: SecretStr = Field(
+        default=SecretStr(""),
+        description="Blank = corpus API reader role not created; /corpus/v1 answers 503 when CORPUS_API_KEY is set.",
+    )
 
     # ----------------------------------------------------------- redis/celery
     REDIS_URL: str = Field(default="redis://redis:6379/0")
@@ -802,6 +811,10 @@ class Settings(BaseSettings):
                 "JUDGMENT_CITATION_RECONCILE_LOOKBACK_HOURS, JUDGMENT_CITATION_RECONCILE_BATCH_SIZE and "
                 "JUDGMENT_CITATION_RECONCILE_INTERVAL_SECONDS must be positive"
             )
+        if self.CORPUS_API_READER_ROLE == self.CORPUS_WRITER_ROLE:
+            raise ValueError("CORPUS_API_READER_ROLE must differ from CORPUS_WRITER_ROLE")
+        if self.CORPUS_API_READER_ROLE == self.SIKANDER_READER_ROLE:
+            raise ValueError("CORPUS_API_READER_ROLE must differ from SIKANDER_READER_ROLE")
         if self.PLS_USER or self.PLS_PASS.get_secret_value() or self.PLS_USER_B or self.PLS_PASS_B.get_secret_value():
             logger.warning("PLS_USER/PLS_PASS are deprecated and ignored: PakistanLawSite uses human login only")
         # legacy aliases
@@ -852,6 +865,10 @@ class Settings(BaseSettings):
     @property
     def reader_role_configured(self) -> bool:
         return bool(self.SIKANDER_READER_PASSWORD.get_secret_value())
+
+    @property
+    def corpus_api_reader_configured(self) -> bool:
+        return bool(self.CORPUS_API_READER_PASSWORD.get_secret_value())
 
     def get_fernet(self) -> Fernet:
         if not self.ENCRYPTION_KEY:

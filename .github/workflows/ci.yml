@@ -34,6 +34,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       SIKANDER_READER_PASSWORD: readerpw
       CORPUS_WRITER_PASSWORD: writerpw
+      CORPUS_API_READER_PASSWORD: corpusapipw
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,16 +65,41 @@ jobs:
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sikander_reader') THEN
               EXECUTE 'DROP OWNED BY sikander_reader CASCADE';
             END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'corpus_api_reader') THEN
+              EXECUTE 'DROP OWNED BY corpus_api_reader CASCADE';
+            END IF;
           END
           $body$;
           SQL
           PGPASSWORD=legal psql -h localhost -U legal -d postgres -v ON_ERROR_STOP=1 <<'SQL'
           DROP ROLE IF EXISTS corpus_writer;
           DROP ROLE IF EXISTS sikander_reader;
+          DROP ROLE IF EXISTS corpus_api_reader;
           SQL
           DB_LOCK_ON_CATALOG=1 pytest -n 4 --dist loadgroup -q
       - name: Tests against PostgreSQL + Redis
-        run: pytest -q
+        run: |
+          PGPASSWORD=legal psql -h localhost -U legal -d legal_scraper_test -v ON_ERROR_STOP=1 <<'SQL'
+          DO $body$
+          BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'corpus_writer') THEN
+              EXECUTE 'DROP OWNED BY corpus_writer CASCADE';
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sikander_reader') THEN
+              EXECUTE 'DROP OWNED BY sikander_reader CASCADE';
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'corpus_api_reader') THEN
+              EXECUTE 'DROP OWNED BY corpus_api_reader CASCADE';
+            END IF;
+          END
+          $body$;
+          SQL
+          PGPASSWORD=legal psql -h localhost -U legal -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+          DROP ROLE IF EXISTS corpus_writer;
+          DROP ROLE IF EXISTS sikander_reader;
+          DROP ROLE IF EXISTS corpus_api_reader;
+          SQL
+          pytest -q
       - name: xdist smoke (per-worker databases)
         run: |
           DB_LOCK_ON_CATALOG=1 pytest -n 2 --dist loadfile -q \

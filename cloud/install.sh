@@ -217,6 +217,7 @@ put("SECRET_KEY", secrets.token_hex(32))
 put("SIKANDER_READER_PASSWORD", secrets.token_urlsafe(24))
 put("CORPUS_API_KEY", secrets.token_hex(32))
 put("CORPUS_WRITER_PASSWORD", secrets.token_urlsafe(24))
+put("CORPUS_API_READER_PASSWORD", secrets.token_urlsafe(24))
 put("POSTGRES_PASSWORD", pg)
 put("DATABASE_URL", f"postgresql+asyncpg://legal:{pg}@postgres:5432/legal_scraper")
 # The firm's own trusted host. 'chambers' is the label the service requires before it will run

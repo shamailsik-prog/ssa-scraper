@@ -78,10 +78,16 @@ def _dsn(user: str, pw: str) -> str:
 
 
 async def test_reader_can_select_contract_tables():
+    from scraper.reader_grants import READER_OPS_COLUMN_ALLOWLIST
+
     conn = await asyncpg.connect(_dsn(settings.SIKANDER_READER_ROLE, settings.SIKANDER_READER_PASSWORD.get_secret_value()))
     try:
         for t in CONTRACT_TABLES:
-            await conn.fetch(f'SELECT * FROM "{t}" LIMIT 1')
+            if t in READER_OPS_COLUMN_ALLOWLIST:
+                cols = ", ".join(f'"{c}"' for c in READER_OPS_COLUMN_ALLOWLIST[t])
+                await conn.fetch(f"SELECT {cols} FROM \"{t}\" LIMIT 1")
+            else:
+                await conn.fetch(f'SELECT * FROM "{t}" LIMIT 1')
     finally:
         await conn.close()
 

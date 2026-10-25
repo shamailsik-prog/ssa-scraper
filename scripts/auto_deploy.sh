@@ -3,6 +3,10 @@
 # docker-compose services that need it — after PakistanLawSite harvest/login work is idle.
 set -euo pipefail
 
+# GRANT policy: this script must never run SQL GRANT/REVOKE. Reader re-grants happen only via
+# ensure_roles() in scraper/database.py (column-level SELECT on content tables). Ops snippets:
+# docs/CHANGES.md — RE-APPLY GRANT.
+
 DIR="${SSA_SCRAPER_DIR:-/opt/ssa-scraper}"
 BRANCH="${SSA_SCRAPER_BRANCH:-main}"
 REMOTE="origin"
