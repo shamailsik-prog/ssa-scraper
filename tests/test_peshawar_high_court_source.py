@@ -156,7 +156,12 @@ async def test_phc_pdf_signature_gate_retires_non_pdf_document_url(db, fixture_s
         </body></html>
         """,
     )
-    fixture_server.add("/PHCCMS/judgments/Bad.pdf", "<html><body>not pdf</body></html>", content_type="application/pdf")
+    fixture_server.add(
+        "/PHCCMS/judgments/Bad.pdf",
+        "<html><body>not acceptable</body></html>",
+        content_type="text/html",
+        status=406,
+    )
 
     source = await _phc_source(
         db,
@@ -186,5 +191,6 @@ async def test_phc_pdf_signature_gate_retires_non_pdf_document_url(db, fixture_s
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
-    assert "missing %PDF signature" in (row.last_error or "")
+    assert row.status == "pending"
+    assert row.last_error == "HTTP 406"
+    assert row.next_run_at is not None

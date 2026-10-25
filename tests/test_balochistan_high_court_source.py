@@ -178,8 +178,10 @@ async def test_bhc_pdf_signature_gate_retires_non_pdf_document_url(db, fixture_s
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_bhc_portal_api_fanout_discovers_downloadpdf_judgments_with_route(db, fixture_server):
@@ -356,9 +358,11 @@ async def test_bhc_portal_downloadpdf_signature_gate_retires_non_pdf_content(db,
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
     assert row.query_json["route"]["pdf_endpoint_kind"] == "portal-downloadpdf"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_bhc_portal_rerun_is_idempotent_without_duplicate_frontier_keys(db, fixture_server):

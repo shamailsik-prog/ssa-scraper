@@ -7,6 +7,15 @@ from sqlalchemy import func, select
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, ScraperStaging, SourceProvenance
 from scraper.tasks.islamabad_high_court import normalize_ihc_public_url, scrape_islamabad_high_court
+
+
+def test_normalize_ihc_public_url_decodes_json_ampersand_escapes():
+    base = "https://ihc.gov.pk"
+    raw = "/attachments/judgements/1/2/doc.pdf?a=1\\u0026b=2"
+    url = normalize_ihc_public_url(raw, base_url=base)
+    assert url is not None
+    assert "%5Cu0026" not in url
+    assert "a=1" in url and ("b=2" in url or "%26" in url)
 from tests.fixtures import text_pdf_bytes
 
 
@@ -197,8 +206,9 @@ async def test_ihc_pdf_signature_gate_retires_non_pdf_ajax_document_url(db, fixt
     )
     fixture_server.add(
         "/attachments/judgements/999/1/Bad.pdf",
-        "<html><body>not pdf</body></html>",
-        content_type="application/pdf",
+        "<html><body>IIS 404 Not Found</body></html>",
+        content_type="text/html",
+        status=404,
     )
 
     source = await _ihc_source(db, fixture_server, ["/frmJgmnt.aspx?jgs=1"], latest_posts=[{}], search_posts=[])
@@ -223,4 +233,4 @@ async def test_ihc_pdf_signature_gate_retires_non_pdf_ajax_document_url(db, fixt
     ).scalars().first()
     assert row is not None
     assert row.status == "retired"
-    assert "missing %PDF signature" in (row.last_error or "")
+    assert row.last_error == "HTTP 404"

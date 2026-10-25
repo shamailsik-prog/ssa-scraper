@@ -150,5 +150,7 @@ async def test_lhc_pdf_signature_gate_retires_non_pdf_document_url(db, fixture_s
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None

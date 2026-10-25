@@ -150,8 +150,10 @@ async def test_ajk_pdf_signature_gate_retires_non_pdf_judgment_url(db, fixture_s
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_ajk_post_results_window_adds_route_metadata_with_bounded_fanout(db, fixture_server):

@@ -90,7 +90,7 @@ def normalize_ihc_public_url(raw: str, *, base_url: str) -> Optional[str]:
     """Normalize a discovered candidate to IHC public-domain URL form."""
     if not raw:
         return None
-    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").strip().strip("\"'")
+    candidate = html.unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&").strip().strip("\"'")
     if not candidate or candidate.lower().startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
         return None
     candidate = _unwrap_wayback(candidate)
@@ -115,6 +115,7 @@ def normalize_ihc_public_url(raw: str, *, base_url: str) -> Optional[str]:
         netloc = canonical_host + (f":{parts.port}" if parts.port else "")
     path = quote(parts.path or "/", safe="/%:@,+;=()-.~_")
     query = (parts.query or "").replace(" ", "%20")
+    query = query.replace("%5Cu0026", "%26").replace("%5cu0026", "%26")
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
