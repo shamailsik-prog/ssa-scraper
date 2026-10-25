@@ -845,8 +845,11 @@ class SearchHarvestRunner:
                     query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
                     split_children: List[Dict[str, Any]] = []
+                    seen_unknown = max(0, int(rows_seen) - int(rows_known))
+                    linked_unseen = max(0, seen_unknown - int(rows_unlinked or 0))
                     if (
                         gap > 0
+                        and linked_unseen > 0
                         and site_total is not None
                         and rows_seen < int(site_total)
                         and incomplete_reason
