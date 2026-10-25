@@ -12,6 +12,9 @@ MIN_HTML_JUDGMENT_WORDS = 200
 PDF_MISS_DEFER_ERROR = "missing %PDF signature; body is not an accepted HTML judgment"
 PDF_MISS_RETIRE_AFTER_ATTEMPTS = 10
 TRANSIENT_HTTP_STATUSES = frozenset({406, 408, 425, 429, 502, 503, 504})
+_HTML_JUDGMENT_MARKER_RE = re.compile(
+    r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
+)
 
 
 def frontier_http_status_action(status_code: int) -> str:
@@ -19,6 +22,8 @@ def frontier_http_status_action(status_code: int) -> str:
     if status_code < 400:
         return "ok"
     if status_code in (404, 410):
+        return "retire"
+    if status_code in (400, 401, 403):
         return "retire"
     if status_code in TRANSIENT_HTTP_STATUSES or status_code >= 500:
         return "defer"
@@ -32,6 +37,11 @@ def pdf_miss_error_message(status_code: int, detail: str) -> str:
 def html_judgment_word_count(html: str) -> int:
     text = clean_html(html or "")
     return len(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+def html_body_has_judgment_marker(html: str) -> bool:
+    text = clean_html(html or "")
+    return bool(_HTML_JUDGMENT_MARKER_RE.search(text))
 
 
 def body_is_whitespace_only(content: bytes) -> bool:
@@ -52,7 +62,7 @@ def classify_pdf_endpoint_body(res: FetchResult) -> PdfEndpointBodyKind:
         return "pdf"
     if body_is_whitespace_only(res.content):
         return "empty"
-    if html_judgment_word_count(res.text) >= MIN_HTML_JUDGMENT_WORDS:
+    if html_judgment_word_count(res.text) >= MIN_HTML_JUDGMENT_WORDS and html_body_has_judgment_marker(res.text):
         return "html_judgment"
     return "defer"
 

@@ -574,10 +574,15 @@ class PublicPipeline:
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
             elif res.status_code >= 400:
-                from scraper.judgment_document_body import frontier_http_status_action, pdf_miss_backoff_seconds
+                from scraper.judgment_document_body import (
+                    PDF_MISS_RETIRE_AFTER_ATTEMPTS,
+                    frontier_http_status_action,
+                    pdf_miss_backoff_seconds,
+                )
 
-                fr.last_error = f"HTTP {res.status_code}"
-                if frontier_http_status_action(res.status_code) == "retire":
+                code = int(res.status_code)
+                fr.last_error = f"HTTP {code}"
+                if frontier_http_status_action(code) == "retire":
                     fr.status = "retired"
                 else:
                     fr.status = "pending"
@@ -585,6 +590,9 @@ class PublicPipeline:
                         seconds=pdf_miss_backoff_seconds(fr.attempts)
                     )
                     self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
+                    if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+                        fr.status = "retired"
+                        fr.last_error = f"HTTP {code} (retired after {fr.attempts} attempts)"
             elif self._judgment_pdf_endpoint_miss(fr, url, res):
                 await self._handle_judgment_pdf_endpoint_miss(fr, res, url=url, route=route)
             else:

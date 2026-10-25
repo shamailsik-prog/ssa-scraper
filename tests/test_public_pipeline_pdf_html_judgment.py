@@ -255,3 +255,71 @@ async def test_undo_skips_rows_already_progressed_by_worker(db, source):
     ).scalars().first()
     assert fresh.status == "retired"
     assert done.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_http_503_retires_after_ten_attempts(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/503"
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={"kind": "judgment", "url": url, "route": {"pdf_endpoint_kind": "view-file"}},
+        cursor_json={},
+        priority=50,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return FetchResult(
+            url=url,
+            final_url=url,
+            status_code=503,
+            content=b"service unavailable",
+            content_type="text/html",
+        )
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
+
+    for _ in range(9):
+        assert await pipeline._drain_one(row) == "ok"
+        assert row.status == "pending"
+        assert row.last_error == "HTTP 503"
+        assert row.attempts == _ + 1
+
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "retired"
+    assert row.last_error == "HTTP 503 (retired after 10 attempts)"
+    assert row.attempts == 10
+
+
+@pytest.mark.asyncio
+async def test_long_nav_html_without_judgment_marker_not_ingested(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/NAV"
+    filler = " ".join(["Home About Contact Search Results Pagination Browse Archive"] * 40)
+    body = f"<html><body><div class='site-chrome'>{filler}</div></body></html>"
+    assert html_judgment_word_count(body) >= 300
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={"kind": "judgment", "url": url, "route": {"pdf_endpoint_kind": "view-file"}},
+        cursor_json={},
+        priority=50,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return _pdf_shaped_result(body, url=url)
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
+    monkeypatch.setattr(pipeline, "ingest_judgment", AsyncMock(return_value="staged"))
+
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "pending"
+    pipeline.ingest_judgment.assert_not_awaited()
+    assert PDF_MISS_DEFER_ERROR in (row.last_error or "")
