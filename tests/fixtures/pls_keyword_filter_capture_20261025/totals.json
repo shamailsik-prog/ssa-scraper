@@ -1,0 +1,5 @@
+{"slot":1,"source":"PakistanLawSite","endpoint":"POST /Login/CitationSearch (book=SCMR,year=2025,party=<letter>)","tip":"beb7076","captured_pkt":"2026-10-25 09:34:17-09:34:54 PKT","note":"no site_total element in response; rows = data <tr> minus header; single response, no pager",
+"parent":{"party":"","rows":264,"bytes":239170,"md5":"ac7206466f7af44c3afb6592eb8e87d2"},
+"a":{"rows":264,"bytes":239170,"md5":"ac7206466f7af44c3afb6592eb8e87d2","identical_to_parent":true},
+"m":{"rows":210,"bytes":192644,"md5":"e50e847d216203be2fd238c5a09afb32"},
+"z":{"rows":75,"bytes":69183,"md5":"bce19338329c99d7284528323c7eb309"}}

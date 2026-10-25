@@ -747,7 +747,7 @@ _DASHBOARD_CITATION_ROLES = {
     "Citation_Court_Search_input": "court",
     "Citation_Code_Or_Page_Search_input": "page",
     "Citation_Judge_Search_input": "judge",
-    "Citation_Party_Search_input": "keyword",
+    "Citation_Party_Search_input": "party",
 }
 
 
