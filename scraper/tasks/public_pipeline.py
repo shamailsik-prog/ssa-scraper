@@ -545,19 +545,20 @@ class PublicPipeline:
             fr.last_error = None
             fr.last_run_at = datetime.now(timezone.utc)
             return
-        if body_kind == "empty":
-            fr.status = "retired"
-            fr.last_error = pdf_miss_error_message(status, "empty document body for judgment document URL")
-            return
+        detail = (
+            "empty document body for judgment document URL"
+            if body_kind == "empty"
+            else PDF_MISS_DEFER_ERROR
+        )
         fr.status = "pending"
-        fr.last_error = pdf_miss_error_message(status, PDF_MISS_DEFER_ERROR)
+        fr.last_error = pdf_miss_error_message(status, detail)
         fr.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
         self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
         if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
             fr.status = "retired"
             fr.last_error = pdf_miss_error_message(
                 status,
-                f"{PDF_MISS_DEFER_ERROR} (retired after {fr.attempts} attempts)",
+                f"{detail} (retired after {fr.attempts} attempts)",
             )
 
     async def _drain_one(self, fr: CrawlFrontier) -> str:

@@ -6,7 +6,10 @@ import pytest
 
 from scraper.fetchers import FetchResult, HttpFetcher
 from scraper.judgment_document_body import PDF_MISS_DEFER_ERROR, html_judgment_word_count
-from scraper.models import CrawlFrontier
+from sqlalchemy import select
+
+from scraper.models import CorpusMetadata, CrawlFrontier
+from scraper.tasks.public_frontier_requeue import LATEST_RUN_KEY
 from scraper.tasks.public_frontier_requeue import count_pdf_miss_retired, requeue_pdf_miss_retired, undo_requeue_run
 from scraper.tasks.public_pipeline import PublicPipeline
 from tests.fixtures import judgment_html
@@ -57,7 +60,7 @@ async def test_html_judgment_accepted_from_pdf_shaped_url(db, source, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_empty_whitespace_body_retired(db, source, monkeypatch):
+async def test_empty_whitespace_body_pending_with_backoff(db, source, monkeypatch):
     url = "http://127.0.0.1:9/caselaw/view-file/EMPTY"
     row = CrawlFrontier(
         source_name=source.source_name,
@@ -77,8 +80,11 @@ async def test_empty_whitespace_body_retired(db, source, monkeypatch):
     monkeypatch.setattr(pipeline, "fetch", fake_fetch)
 
     assert await pipeline._drain_one(row) == "ok"
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "empty document body" in (row.last_error or "")
+    assert row.next_run_at is not None
+    assert row.attempts == 1
 
 
 @pytest.mark.asyncio
@@ -177,3 +183,75 @@ async def test_requeue_pdf_miss_retired_limit_pilot_slice(db, source):
         db, source_name=source.source_name, run_id="pilot", limit=2, dry_run=True
     )
     assert pilot["matched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_requeue_apply_twice_upserts_latest_metadata_without_pk_error(db, source):
+    for idx in (1, 2):
+        db.add(
+            CrawlFrontier(
+                source_name=source.source_name,
+                tier=0,
+                query_key=f"judgment:http://example.test/twice-{idx}",
+                query_json={"kind": "judgment", "url": f"http://example.test/twice-{idx}"},
+                cursor_json={},
+                status="retired",
+                last_error="missing %PDF signature for judgment document URL",
+                attempts=1,
+                priority=50,
+            )
+        )
+    await db.commit()
+
+    first = await requeue_pdf_miss_retired(
+        db, source_name=source.source_name, run_id="run-a", limit=1, dry_run=False
+    )
+    second = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="run-b", dry_run=False)
+    assert first["matched"] == 1
+    assert second["matched"] == 1
+    latest = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
+    assert latest is not None
+    assert latest.value == "run-b"
+
+
+@pytest.mark.asyncio
+async def test_undo_skips_rows_already_progressed_by_worker(db, source):
+    for label in ("fresh", "done"):
+        db.add(
+            CrawlFrontier(
+                source_name=source.source_name,
+                tier=0,
+                query_key=f"judgment:http://example.test/{label}",
+                query_json={"kind": "judgment", "url": f"http://example.test/{label}"},
+                cursor_json={},
+                status="retired",
+                last_error="missing %PDF signature for judgment document URL",
+                attempts=2,
+                priority=50,
+            )
+        )
+    await db.commit()
+
+    applied = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="run-progress", dry_run=False)
+    assert applied["matched"] == 2
+
+    progressed = (
+        await db.execute(select(CrawlFrontier).where(CrawlFrontier.query_key == "judgment:http://example.test/done"))
+    ).scalars().first()
+    progressed.status = "done"
+    progressed.attempts = 1
+    progressed.last_error = None
+    await db.commit()
+
+    undone = await undo_requeue_run(db, "run-progress")
+    assert undone["restored"] == 1
+    assert undone["skipped"] == 1
+
+    fresh = (
+        await db.execute(select(CrawlFrontier).where(CrawlFrontier.query_key == "judgment:http://example.test/fresh"))
+    ).scalars().first()
+    done = (
+        await db.execute(select(CrawlFrontier).where(CrawlFrontier.query_key == "judgment:http://example.test/done"))
+    ).scalars().first()
+    assert fresh.status == "retired"
+    assert done.status == "done"

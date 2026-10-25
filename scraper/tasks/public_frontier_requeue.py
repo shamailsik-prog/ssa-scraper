@@ -51,6 +51,24 @@ def _undo_prior_latest_key(run_id: str) -> str:
     return f"public_frontier_pdf_miss_requeue_undo:{run_id}:prior_latest"
 
 
+def _row_matches_fresh_requeue_state(row: CrawlFrontier) -> bool:
+    """True when the worker has not changed a row since --apply reset it to pending."""
+    return (
+        row.status == "pending"
+        and int(row.attempts or 0) == 0
+        and row.last_error is None
+        and row.next_run_at is None
+    )
+
+
+async def _upsert_corpus_metadata(db: AsyncSession, key: str, value: str) -> None:
+    row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == key))).scalars().first()
+    if row is None:
+        db.add(CorpusMetadata(key=key, value=value))
+    else:
+        row.value = value
+
+
 def _matches_year(row: CrawlFrontier, year: Optional[int]) -> bool:
     """True when ``year`` is unset or its decimal string appears in citation or URL."""
     if year is None:
@@ -127,9 +145,9 @@ async def requeue_pdf_miss_retired(
             row.next_run_at = None
     if not dry_run and snapshot:
         prior = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
-        db.add(CorpusMetadata(key=_undo_prior_latest_key(run_id), value=prior.value if prior else ""))
-        db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
-        db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
+        await _upsert_corpus_metadata(db, _undo_prior_latest_key(run_id), prior.value if prior else "")
+        await _upsert_corpus_metadata(db, _undo_snapshot_key(run_id), json.dumps(snapshot))
+        await _upsert_corpus_metadata(db, LATEST_RUN_KEY, run_id)
         await db.commit()
     return {"run_id": run_id, "matched": len(snapshot), "dry_run": dry_run, "source_name": source_name, "year": year}
 
@@ -137,10 +155,15 @@ async def requeue_pdf_miss_retired(
 async def undo_requeue_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     snap_row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_snapshot_key(run_id)))).scalars().first()
     restored = 0
+    skipped = 0
     if snap_row is not None and snap_row.value:
         for item in json.loads(snap_row.value):
             row = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.id == UUID(item["id"])))).scalars().first()
             if row is None:
+                skipped += 1
+                continue
+            if not _row_matches_fresh_requeue_state(row):
+                skipped += 1
                 continue
             row.status = item["status"]
             row.last_error = item.get("last_error")
@@ -160,7 +183,7 @@ async def undo_requeue_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     if prior_row is not None:
         await db.delete(prior_row)
     await db.commit()
-    return {"restored": restored}
+    return {"restored": restored, "skipped": skipped}
 
 
 async def run_public_frontier_requeue(
