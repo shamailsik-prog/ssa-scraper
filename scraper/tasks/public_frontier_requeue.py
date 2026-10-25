@@ -1,12 +1,23 @@
 """Re-queue crawl_frontier rows retired for missing %PDF on PDF-shaped judgment URLs.
 
 Ops-only maintenance: dry-run by default. Does not run automatically on deploy.
-Intended first use after the HTML-judgment fix is live:
 
-    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --year 1980 --dry-run
-    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --year 1980 --apply
+After the HTML-judgment fix is live, recover the ~1,980 SindhHighCourt rows (Monitor
+"SHC 1980" means **row count**, not calendar year 1980). Omit ``--year``:
 
-Do not bulk-re-queue IslamabadHighCourt (404 URLs) or PeshawarHighCourt (406 backoff handles those).
+    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --dry-run
+    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --apply
+
+Optional pilot on a small slice before full apply:
+
+    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --limit 50 --dry-run
+    python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --limit 50 --apply
+
+``--year`` only matches rows whose citation or URL **contains that digit string**
+(e.g. ``--year 2024``). Do **not** pass ``--year 1980`` for the ~1,980-row recovery;
+that would select only year-1980-looking citations and miss almost the entire batch.
+
+Do not bulk-re-queue IslamabadHighCourt (404 URLs) or PeshawarHighCourt (406 backoff).
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ def _undo_prior_latest_key(run_id: str) -> str:
 
 
 def _matches_year(row: CrawlFrontier, year: Optional[int]) -> bool:
+    """True when ``year`` is unset or its decimal string appears in citation or URL."""
     if year is None:
         return True
     needle = str(year)
@@ -176,13 +188,40 @@ async def run_public_frontier_requeue(
         return result
 
 
+_OPS_EPILOG = """
+Examples (SindhHighCourt ~1,980-row PDF-miss recovery — no --year):
+
+  python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --dry-run
+  python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --apply
+
+Pilot before full apply:
+
+  python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --limit 50 --dry-run
+  python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --limit 50 --apply
+
+Optional substring filter (not for the ~1,980-row recovery):
+
+  python -m scraper.tasks.public_frontier_requeue --source SindhHighCourt --year 2024 --dry-run
+"""
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Re-queue frontier rows retired for missing %PDF on judgment document URLs (dry-run default)",
+        epilog=_OPS_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--source", required=True, help="Scraper source name (e.g. SindhHighCourt)")
-    parser.add_argument("--year", type=int, help="Optional citation/url year filter (e.g. 1980 for SHC)")
-    parser.add_argument("--limit", type=int, help="Max rows to touch")
+    parser.add_argument(
+        "--year",
+        type=int,
+        metavar="YEAR",
+        help=(
+            "Optional: only rows whose citation or URL contains this year substring "
+            "(e.g. 2024). Do not use for the ~1,980-row SindhHighCourt recovery (omit --year)."
+        ),
+    )
+    parser.add_argument("--limit", type=int, help="Max rows to touch (use for a small pilot before --apply)")
     parser.add_argument("--dry-run", action="store_true", help="Count only (default when --apply omitted)")
     parser.add_argument("--apply", action="store_true", help="Reset matched rows to pending and write undo backup")
     parser.add_argument("--undo", metavar="RUN_ID", help="Restore rows from a prior --apply run_id")

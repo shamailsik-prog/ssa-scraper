@@ -131,15 +131,16 @@ async def test_requeue_pdf_miss_retired_dry_run_and_apply_undo(db, source):
     db.add(row)
     await db.commit()
 
+    assert await count_pdf_miss_retired(db, source_name=source.source_name) == 1
     assert await count_pdf_miss_retired(db, source_name=source.source_name, year=1980) == 1
     assert await count_pdf_miss_retired(db, source_name=source.source_name, year=1999) == 0
 
-    dry = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="dry", year=1980, dry_run=True)
+    dry = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="dry", dry_run=True)
     assert dry["matched"] == 1
     await db.refresh(row)
     assert row.status == "retired"
 
-    applied = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="run-1", year=1980, dry_run=False)
+    applied = await requeue_pdf_miss_retired(db, source_name=source.source_name, run_id="run-1", dry_run=False)
     await db.refresh(row)
     assert row.status == "pending"
     assert row.last_error is None
@@ -150,3 +151,29 @@ async def test_requeue_pdf_miss_retired_dry_run_and_apply_undo(db, source):
     await db.refresh(row)
     assert row.status == "retired"
     assert row.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_requeue_pdf_miss_retired_limit_pilot_slice(db, source):
+    for idx in range(3):
+        db.add(
+            CrawlFrontier(
+                source_name=source.source_name,
+                tier=0,
+                query_key=f"judgment:http://example.test/pilot-{idx}",
+                query_json={"kind": "judgment", "url": f"http://example.test/pilot-{idx}"},
+                cursor_json={},
+                status="retired",
+                last_error="missing %PDF signature for judgment document URL",
+                priority=50,
+            )
+        )
+    await db.commit()
+
+    assert await count_pdf_miss_retired(db, source_name=source.source_name) == 3
+    assert await count_pdf_miss_retired(db, source_name=source.source_name, limit=2) == 2
+
+    pilot = await requeue_pdf_miss_retired(
+        db, source_name=source.source_name, run_id="pilot", limit=2, dry_run=True
+    )
+    assert pilot["matched"] == 2
