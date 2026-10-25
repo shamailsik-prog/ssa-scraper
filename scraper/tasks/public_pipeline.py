@@ -576,6 +576,7 @@ class PublicPipeline:
             elif res.status_code >= 400:
                 from scraper.judgment_document_body import (
                     PDF_MISS_RETIRE_AFTER_ATTEMPTS,
+                    TRANSIENT_HTTP_STATUSES,
                     frontier_http_status_action,
                     pdf_miss_backoff_seconds,
                 )
@@ -590,7 +591,14 @@ class PublicPipeline:
                         seconds=pdf_miss_backoff_seconds(fr.attempts)
                     )
                     self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
-                    if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+                    # Temporary server/rate-limit failures do not establish that
+                    # a judgment has disappeared. Keep the frontier retryable
+                    # rather than silently losing it after an arbitrary count.
+                    if (
+                        fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS
+                        and code not in TRANSIENT_HTTP_STATUSES
+                        and code < 500
+                    ):
                         fr.status = "retired"
                         fr.last_error = f"HTTP {code} (retired after {fr.attempts} attempts)"
             elif self._judgment_pdf_endpoint_miss(fr, url, res):
