@@ -305,3 +305,42 @@ async def test_run_query_logs_unmatched_and_done_unlinked(db, monkeypatch, caplo
     assert q.status == "done"
     assert q.rows_new == 1
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_pagination_gap_splits_parent_when_site_total_unreached(db, monkeypatch):
+    """Pagination ended early with a positive gap: narrow via split instead of eternal in_progress stall."""
+    from sqlalchemy import func, select
+
+    pages = {"page1": ([_row(i) for i in range(1, 9)], None)}
+    runner = _runner_factory(monkeypatch, db, pages, total=100)
+    runner.dry_run = True
+    search_map = {
+        "fields": {
+            "reporter": {"options": ["PLD"]},
+            "court": {"options": ["SC", "HC"]},
+            "keyword": {},
+        }
+    }
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=PLD|year=2018",
+        query_json={"reporter": "PLD", "year": 2018},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+
+    await runner.run_query(q, search_map)
+
+    assert q.status == "split"
+    assert "pagination_gap" in (q.split_reason or "")
+    child_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(PlsSearchHarvestQuery)
+            .where(PlsSearchHarvestQuery.parent_id == q.id)
+        )
+    ).scalar()
+    assert child_count == 2
+    await db.rollback()
