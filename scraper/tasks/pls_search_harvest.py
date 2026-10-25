@@ -844,6 +844,37 @@ class SearchHarvestRunner:
                     query_row.last_error = None
                     query_row.cursor_json = cursor_reset_for_done(cursor)
                 else:
+                    split_children: List[Dict[str, Any]] = []
+                    seen_unknown = max(0, int(rows_seen) - int(rows_known))
+                    linked_unseen = max(0, seen_unknown - int(rows_unlinked or 0))
+                    if (
+                        gap > 0
+                        and linked_unseen > 0
+                        and site_total is not None
+                        and rows_seen < int(site_total)
+                        and incomplete_reason
+                        and "pagination ended without next link" in incomplete_reason
+                    ):
+                        split_children = split_oversized_query(
+                            query_json,
+                            int(site_total),
+                            result_cap=cap,
+                            court_options=_court_options_from_map(search_map),
+                            available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword", "party"},
+                            bench_options=[
+                                str(o)
+                                for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []
+                            ],
+                            pagination_gap=True,
+                        )
+                    if split_children:
+                        await self._enqueue_split_children(query_row, split_children, int(site_total), cap)
+                        query_row.status = "split"
+                        query_row.split_reason = (
+                            f"pagination_gap site_total={site_total} rows_seen={rows_seen} "
+                            f"rows_unlinked={rows_unlinked} gap={gap}"
+                        )[:1000]
+                        break
                     if unlinked_reason and unlinked_done_safety_error(rows_seen, rows_unlinked):
                         logger.warning(
                             "PLS search harvest %s: %s",

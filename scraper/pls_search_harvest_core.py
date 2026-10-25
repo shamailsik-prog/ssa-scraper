@@ -376,13 +376,16 @@ def split_oversized_query(
     keyword_splits: Optional[Sequence[str]] = None,
     available_roles: Optional[Iterable[str]] = None,
     bench_options: Sequence[str] = (),
+    pagination_gap: bool = False,
 ) -> List[Dict[str, Any]]:
     """A result list that reaches the site's cap is NOT complete. Return narrower child queries, narrowing by the
     first dimension of SPLIT_ORDER (month, court, bench, party first letter, keyword) that the parent has not
     used yet and that the search form can express (`available_roles`; default is the legacy court/keyword pair).
     Returns [] only when every expressible dimension is already used; the caller must then mark the job failed
-    (exhausted), never done."""
-    if site_total < result_cap:
+    (exhausted), never done.
+
+    ``pagination_gap``: pagination ended before every site-reported row was seen (PLD false-gap / linkless stall)."""
+    if not pagination_gap and site_total < result_cap:
         return []
     roles = set(available_roles) if available_roles is not None else set(_LEGACY_ROLES)
     normalized = normalize_query_json(query_json)
