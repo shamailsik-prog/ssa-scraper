@@ -117,7 +117,10 @@ async def requeue_pdf_miss_retired(
         prior = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
         db.add(CorpusMetadata(key=_undo_prior_latest_key(run_id), value=prior.value if prior else ""))
         db.add(CorpusMetadata(key=_undo_snapshot_key(run_id), value=json.dumps(snapshot)))
-        db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
+        if prior is None:
+            db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
+        else:
+            prior.value = run_id
         await db.commit()
     return {"run_id": run_id, "matched": len(snapshot), "dry_run": dry_run, "source_name": source_name, "year": year}
 
@@ -125,10 +128,22 @@ async def requeue_pdf_miss_retired(
 async def undo_requeue_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     snap_row = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == _undo_snapshot_key(run_id)))).scalars().first()
     restored = 0
+    skipped_changed = 0
     if snap_row is not None and snap_row.value:
         for item in json.loads(snap_row.value):
             row = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.id == UUID(item["id"])))).scalars().first()
             if row is None:
+                continue
+            # Undo only an untouched requeue. Once a worker has fetched or
+            # retried a judgment, restoring "retired" would erase its progress
+            # and can hide a successfully harvested document from the frontier.
+            if not (
+                row.status == "pending"
+                and row.attempts == 0
+                and row.last_error is None
+                and row.next_run_at is None
+            ):
+                skipped_changed += 1
                 continue
             row.status = item["status"]
             row.last_error = item.get("last_error")
@@ -148,7 +163,7 @@ async def undo_requeue_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     if prior_row is not None:
         await db.delete(prior_row)
     await db.commit()
-    return {"restored": restored}
+    return {"restored": restored, "skipped_changed": skipped_changed}
 
 
 async def run_public_frontier_requeue(
