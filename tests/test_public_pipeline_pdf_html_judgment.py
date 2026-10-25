@@ -13,6 +13,7 @@ from scraper.tasks.public_frontier_requeue import LATEST_RUN_KEY
 from scraper.tasks.public_frontier_requeue import count_pdf_miss_retired, requeue_pdf_miss_retired, undo_requeue_run
 from scraper.tasks.public_pipeline import PublicPipeline
 from tests.fixtures import judgment_html
+from tests.test_judgment_document_body import _shc_order_sheet_word_html
 
 
 def _pdf_shaped_result(html: str, *, url: str, content_type: str = "application/pdf") -> FetchResult:
@@ -23,6 +24,38 @@ def _pdf_shaped_result(html: str, *, url: str, content_type: str = "application/
         content=html.encode("utf-8"),
         content_type=content_type,
     )
+
+
+@pytest.mark.asyncio
+async def test_shc_order_sheet_word_html_ingested_from_pdf_shaped_url(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/SHC-ORDER-SHEET"
+    body = _shc_order_sheet_word_html()
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={
+            "kind": "judgment",
+            "url": url,
+            "route": {"pdf_endpoint_kind": "view-file"},
+            "meta": {"citation": "2024 SHC KHI 1234"},
+        },
+        cursor_json={},
+        priority=50,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return _pdf_shaped_result(body, url=url)
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
+    monkeypatch.setattr(pipeline, "ingest_judgment", AsyncMock(return_value="staged"))
+
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "done"
+    pipeline.ingest_judgment.assert_awaited_once()
 
 
 @pytest.mark.asyncio

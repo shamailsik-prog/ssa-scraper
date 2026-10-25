@@ -10,6 +10,8 @@ from scraper.fetchers import FetchResult, has_pdf_signature
 from scraper.parsers.text_cleaner import clean_html
 
 MIN_HTML_JUDGMENT_WORDS = 200
+# Short Word-HTML order sheets / hearing lists lack "judgment" vocabulary but are real documents.
+MIN_HTML_STRONG_COURT_DOCUMENT_WORDS = 50
 PDF_MISS_DEFER_ERROR = "missing %PDF signature; body is not an accepted HTML judgment"
 PDF_MISS_RETIRE_AFTER_ATTEMPTS = 10
 # Whitespace-only HTTP 200 may be a short SHC burst; retire only after repeated empties over 24h.
@@ -19,6 +21,15 @@ EMPTY_BODY_FIRST_SEEN_AT_KEY = "empty_body_first_seen_at"
 TRANSIENT_HTTP_STATUSES = frozenset({406, 408, 425, 429, 502, 503, 504})
 _HTML_JUDGMENT_MARKER_RE = re.compile(
     r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
+)
+# Headers and formats common on Pakistani high-court sites (SHC view-file Word-HTML, etc.).
+_HTML_STRONG_COURT_DOCUMENT_RE = re.compile(
+    r"(?i)(?:"
+    r"\border sheet\b|"
+    r"\bin the high court of\b|"
+    r"\bin the supreme court of\b|"
+    r"\bpresent:\s*(?:mr\.?|ms\.?|mrs\.?|hon|the\s+registrar|court)"
+    r")"
 )
 
 
@@ -44,9 +55,23 @@ def html_judgment_word_count(html: str) -> int:
     return len(re.findall(r"\w+", text, flags=re.UNICODE))
 
 
+def html_body_has_strong_court_document_marker(html: str) -> bool:
+    text = clean_html(html or "")
+    return bool(_HTML_STRONG_COURT_DOCUMENT_RE.search(text))
+
+
 def html_body_has_judgment_marker(html: str) -> bool:
     text = clean_html(html or "")
-    return bool(_HTML_JUDGMENT_MARKER_RE.search(text))
+    return bool(
+        _HTML_JUDGMENT_MARKER_RE.search(text)
+        or _HTML_STRONG_COURT_DOCUMENT_RE.search(text)
+    )
+
+
+def min_html_judgment_words(html: str) -> int:
+    if html_body_has_strong_court_document_marker(html):
+        return MIN_HTML_STRONG_COURT_DOCUMENT_WORDS
+    return MIN_HTML_JUDGMENT_WORDS
 
 
 def body_is_whitespace_only(content: bytes) -> bool:
@@ -67,7 +92,8 @@ def classify_pdf_endpoint_body(res: FetchResult) -> PdfEndpointBodyKind:
         return "pdf"
     if body_is_whitespace_only(res.content):
         return "empty"
-    if html_judgment_word_count(res.text) >= MIN_HTML_JUDGMENT_WORDS and html_body_has_judgment_marker(res.text):
+    threshold = min_html_judgment_words(res.text)
+    if html_judgment_word_count(res.text) >= threshold and html_body_has_judgment_marker(res.text):
         return "html_judgment"
     return "defer"
 
