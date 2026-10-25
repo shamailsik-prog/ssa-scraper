@@ -258,7 +258,7 @@ async def test_undo_skips_rows_already_progressed_by_worker(db, source):
 
 
 @pytest.mark.asyncio
-async def test_http_503_retires_after_ten_attempts(db, source, monkeypatch):
+async def test_http_503_remains_pending_after_ten_attempts(db, source, monkeypatch):
     url = "http://127.0.0.1:9/caselaw/view-file/503"
     row = CrawlFrontier(
         source_name=source.source_name,
@@ -290,9 +290,17 @@ async def test_http_503_retires_after_ten_attempts(db, source, monkeypatch):
         assert row.attempts == _ + 1
 
     assert await pipeline._drain_one(row) == "ok"
-    assert row.status == "retired"
-    assert row.last_error == "HTTP 503 (retired after 10 attempts)"
+    assert row.status == "pending"
+    assert row.last_error == "HTTP 503"
     assert row.attempts == 10
+    assert row.next_run_at is not None
+
+    # Repeated transient outages cannot retire an otherwise legitimate judgment.
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "pending"
+    assert row.last_error == "HTTP 503"
+    assert row.attempts == 11
+    assert row.next_run_at is not None
 
 
 @pytest.mark.asyncio
