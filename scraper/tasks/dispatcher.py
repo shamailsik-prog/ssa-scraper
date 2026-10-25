@@ -29,7 +29,7 @@ from scraper.harvest_mode import (
     source_backfill_priority,
     source_selected_for_mode,
 )
-from scraper.models import BrowserSessionSlot, PlsSearchHarvestQuery, ScraperJob, ScraperSource
+from scraper.models import BrowserSessionSlot, CrawlFrontier, PlsSearchHarvestQuery, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.pls_grid_health import (
     SOURCE_NAME as PLS_SOURCE_NAME,
@@ -468,6 +468,31 @@ def _running_reporter_shards(running_jobs) -> list[Optional[int]]:
     return shards
 
 
+async def _public_source_has_pending_frontier(db, source_name: str) -> bool:
+    """True when tier-0 frontier rows still need a public-source drain (updates-mode scheduling)."""
+    row = (
+        await db.execute(
+            select(CrawlFrontier.id)
+            .where(
+                CrawlFrontier.source_name == source_name,
+                CrawlFrontier.tier == 0,
+                CrawlFrontier.status.in_(["pending", "in_progress"]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+def _next_public_scrape_at(source: ScraperSource, mode: str, now: datetime, *, frontier_backlog: bool) -> datetime:
+    """When the frontier still holds work, recheck soon instead of the full updates cadence."""
+    if mode == "updates" and frontier_backlog:
+        wait = int(settings.PUBLIC_BACKLOG_CONTINUE_SECONDS or 0)
+        if wait > 0:
+            return now + timedelta(seconds=wait)
+    return now + timedelta(minutes=cadence_for_source(source, mode))
+
+
 async def _active_slot_numbers(db, source_name: str) -> list[int]:
     rows = (
         await db.execute(
@@ -535,7 +560,12 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue  # retired on the owner's instruction, even if re-enabled on the dashboard
             if not source_selected_for_mode(s, mode):
                 continue
+            frontier_backlog = False
+            if mode == "updates" and s.access_method != "login_session":
+                frontier_backlog = await _public_source_has_pending_frontier(db, s.source_name)
             due = s.next_scrape_at is None or s.next_scrape_at <= now
+            if not due and frontier_backlog:
+                due = True
             if not due:
                 continue
             if s.access_method == "login_session" and login_work_held():
@@ -583,6 +613,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 if preempted:
                     recovered_stale = True
             if recovered_stale:
+                if frontier_backlog and s.access_method != "login_session":
+                    s.next_scrape_at = now
                 await db.flush()
             if len(running_jobs) >= concurrency:
                 logger.info(
@@ -712,7 +744,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             else:
                 logger.info("%s: a job queued earlier has not started yet; not queuing another", s.source_name)
                 skipped_saturated.append(f"{s.source_name}:already_queued")
-            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+            if s.access_method != "login_session":
+                s.next_scrape_at = _next_public_scrape_at(s, mode, now, frontier_backlog=frontier_backlog)
+            else:
+                s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
         await db.commit()
     return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}
 
