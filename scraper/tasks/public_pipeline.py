@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Type
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -146,9 +146,15 @@ class PublicPipeline:
         return added
 
     async def pending(self, limit: int) -> List[CrawlFrontier]:
+        now = datetime.now(timezone.utc)
         q = (
             select(CrawlFrontier)
-            .where(CrawlFrontier.source_name == self.source.source_name, CrawlFrontier.tier == 0, CrawlFrontier.status.in_(["pending", "in_progress"]))
+            .where(
+                CrawlFrontier.source_name == self.source.source_name,
+                CrawlFrontier.tier == 0,
+                CrawlFrontier.status.in_(["pending", "in_progress"]),
+                or_(CrawlFrontier.next_run_at.is_(None), CrawlFrontier.next_run_at <= now),
+            )
             .order_by(CrawlFrontier.priority.asc(), CrawlFrontier.created_at.asc())
             .limit(limit)
         )
@@ -269,7 +275,7 @@ class PublicPipeline:
     # ------------------------------------------------------------------ ingestion
     async def ingest_judgment(self, res: FetchResult, *, route: Dict[str, Any], row_meta: Optional[Dict[str, Any]] = None) -> str:
         row_meta = row_meta or {}
-        if res.is_pdf:
+        if res.is_pdf and has_pdf_signature(res.content):
             pdf_prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind="pdf", route=route, http_status=res.status_code, is_original_document=True, document_kind="original_pdf")
             text, ocr = pdf_text_with_ocr(res.content)
             prov = pdf_prov
@@ -502,6 +508,59 @@ class PublicPipeline:
 
         await self.db.commit()
 
+    def _judgment_pdf_endpoint_miss(self, fr: CrawlFrontier, url: Optional[str], res: FetchResult) -> bool:
+        if fr.query_json.get("kind", "judgment") != "judgment":
+            return False
+        if has_pdf_signature(res.content):
+            return False
+        route = fr.query_json.get("route") or {}
+        return bool(
+            _url_looks_like_pdf(url)
+            or route.get("pdf_endpoint_kind")
+            or res.is_pdf
+        )
+
+    async def _handle_judgment_pdf_endpoint_miss(
+        self,
+        fr: CrawlFrontier,
+        res: FetchResult,
+        *,
+        url: Optional[str],
+        route: Dict[str, Any],
+    ) -> None:
+        from scraper.judgment_document_body import (
+            PDF_MISS_DEFER_ERROR,
+            PDF_MISS_RETIRE_AFTER_ATTEMPTS,
+            classify_pdf_endpoint_body,
+            pdf_miss_backoff_seconds,
+        )
+
+        from scraper.judgment_document_body import pdf_miss_error_message
+
+        status = int(res.status_code or 0)
+        body_kind = classify_pdf_endpoint_body(res)
+        if body_kind == "html_judgment":
+            await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
+            fr.status = "done"
+            fr.last_error = None
+            fr.last_run_at = datetime.now(timezone.utc)
+            return
+        detail = (
+            "empty document body for judgment document URL"
+            if body_kind == "empty"
+            else PDF_MISS_DEFER_ERROR
+        )
+        fr.status = "pending"
+        fr.last_error = pdf_miss_error_message(status, detail)
+        fr.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
+        self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
+        if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+            fr.status = "retired"
+            fr.last_error = pdf_miss_error_message(
+                status,
+                f"{detail} (retired after {fr.attempts} attempts)",
+            )
+
     async def _drain_one(self, fr: CrawlFrontier) -> str:
         """Process one frontier row. Returns 'ok' or 'halted' (explicit block: stop the run)."""
         fr.status = "in_progress"
@@ -514,14 +573,28 @@ class PublicPipeline:
             if res.verdict.kind in ("verification", "login"):
                 fr.status = "retired"
                 fr.last_error = f"page requires {res.verdict.kind}; public source has no login path"
-            elif kind == "judgment" and (
-                _url_looks_like_pdf(url) or res.is_pdf or bool((fr.query_json.get("route") or {}).get("pdf_endpoint_kind"))
-            ) and not has_pdf_signature(res.content):
-                fr.status = "retired"
-                fr.last_error = "missing %PDF signature for judgment document URL"
             elif res.status_code >= 400:
-                fr.status = "retired" if res.status_code in (404, 410) else "pending"
-                fr.last_error = f"HTTP {res.status_code}"
+                from scraper.judgment_document_body import (
+                    PDF_MISS_RETIRE_AFTER_ATTEMPTS,
+                    frontier_http_status_action,
+                    pdf_miss_backoff_seconds,
+                )
+
+                code = int(res.status_code)
+                fr.last_error = f"HTTP {code}"
+                if frontier_http_status_action(code) == "retire":
+                    fr.status = "retired"
+                else:
+                    fr.status = "pending"
+                    fr.next_run_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=pdf_miss_backoff_seconds(fr.attempts)
+                    )
+                    self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
+                    if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+                        fr.status = "retired"
+                        fr.last_error = f"HTTP {code} (retired after {fr.attempts} attempts)"
+            elif self._judgment_pdf_endpoint_miss(fr, url, res):
+                await self._handle_judgment_pdf_endpoint_miss(fr, res, url=url, route=route)
             else:
                 if kind == "judgment":
                     await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})

@@ -1260,9 +1260,8 @@ class BalochistanAssemblyPipeline(PublicPipeline):
             elif expect_pdf and not has_pdf_signature(res.content):
                 fr.status = "retired"
                 fr.last_error = f"missing %PDF signature for {kind} document URL"
-            elif kind == "judgment" and (_url_looks_like_pdf(url) or res.is_pdf) and not has_pdf_signature(res.content):
-                fr.status = "retired"
-                fr.last_error = "missing %PDF signature for judgment document URL"
+            elif self._judgment_pdf_endpoint_miss(fr, url, res):
+                await self._handle_judgment_pdf_endpoint_miss(fr, res, url=url, route=route)
             elif res.status_code >= 400:
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"

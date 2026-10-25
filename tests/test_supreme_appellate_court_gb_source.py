@@ -151,8 +151,10 @@ async def test_sacgb_pdf_signature_gate_retires_non_pdf_judgment_url(db, fixture
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_sacgb_judgments_table_window_adds_result_metadata_with_bounded_fanout(db, fixture_server):
@@ -266,11 +268,13 @@ async def test_sacgb_latest_judgements_table_non_pdf_is_retired_with_result_rout
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
     assert row.query_json["route"]["listing_fetch"] == "result_table"
     assert row.query_json["route"]["result_table_kind"] == "latest_judgements"
     assert row.query_json["route"]["result_row_serial"] == "1."
     assert row.query_json["route"]["result_case_no"] == "Cr. Misc No. 14/2022"
     assert row.query_json["route"]["result_title"] == "Shoaib Ahmed vs State"
     assert row.query_json["route"]["result_judgment_date"] == "29-09-2022"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
