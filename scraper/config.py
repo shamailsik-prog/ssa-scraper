@@ -328,7 +328,9 @@ class Settings(BaseSettings):
     )
     PUBLIC_BACKLOG_CONTINUE_SECONDS: int = Field(
         default=60,
-        description="A public source whose run stopped at its page limit, completed work and still has frontier rows runs again this soon instead of waiting its cadence. 0 = always wait the cadence.",
+        ge=0,
+        le=3600,
+        description="A public source whose run stopped at its page limit, completed work and still has frontier rows runs again this soon instead of waiting its cadence. 0 = always wait the cadence (dispatcher backlog override off).",
     )
     PLS_SUBSCRIBED_REPORTERS: str = Field(default="", description="Comma list. Firm value. Blank = NOT CONFIGURED; Tier 1 idles.")
     PLS_EARLIEST_YEAR: int = Field(default=0, description="Firm value. 0 = NOT CONFIGURED; Tier 1 covers current year only.")
