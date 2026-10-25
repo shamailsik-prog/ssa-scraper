@@ -255,3 +255,43 @@ async def test_a_reread_that_finds_a_next_link_carries_on(db, monkeypatch):
     assert second["status"] == "in_progress"
     assert q.rows_seen == 3 and q.pages_enumerated == 2
     await db.rollback()
+
+
+def test_empty_last_page_cannot_hide_missing_site_results():
+    """A transient blank page must not certify a query with outstanding site results."""
+    for rows_seen in (0, 3):
+        done, reason = search_harvest_may_mark_done(
+            site_total=9, rows_seen=rows_seen, rows_on_page=0
+        )
+        assert done is False
+        assert f"rows_seen={rows_seen}<site_total=9" in reason
+    done, reason = search_harvest_may_mark_done(
+        site_total=None, rows_seen=3, rows_on_page=0
+    )
+    assert done is False and "unknown" in reason
+    assert search_harvest_may_mark_done(
+        site_total=3, rows_seen=3, rows_on_page=0
+    ) == (True, "")
+
+
+@pytest.mark.asyncio
+async def test_empty_second_page_with_known_gap_stays_in_progress(db, monkeypatch):
+    pages = {
+        "page1": ([_row(1), _row(2)], "page2"),
+        "page2": ([], None),
+    }
+    runner = _runner_factory(monkeypatch, db, pages, total=5)
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="pagination-empty-known-gap",
+        query_json={"reporter": "CLC", "year": 2019},
+        status="in_progress",
+    )
+    db.add(q)
+    await db.flush()
+    result = await runner.run_query(q, {})
+    assert result["status"] == "in_progress"
+    assert q.status == "in_progress"
+    assert q.rows_seen == 2
+    assert "rows_seen=2<site_total=5" in (q.last_error or "")
+    await db.rollback()
