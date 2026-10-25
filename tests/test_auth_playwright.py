@@ -1308,7 +1308,17 @@ async def test_pipeline_citation_grid_fast_forwards_known_full_citations(db, log
         ("PLD 2024 SC 913", "New 913", "Supreme Court", "https://www.pakistanlawsite.com/case/913"),
     ]
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    # The synthetic page represents the entire grid; explicitly verify its
+    # total so this test exercises deduplication rather than unknown-total
+    # fail-closed cursor behavior.
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = (
+        lambda _browser, rows=rows: PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html=_archived_grid_html(rows),
+            status=200,
+            metadata={"total_rows": len(rows), "start_row": 0, "seek_mode": "dom_absolute"},
+        )
+    )
     sc.page(("goto", "https://www.pakistanlawsite.com/case/911"), judgment_html("PLD 2024 SC 911", title="Known 911"))
     sc.page(("goto", "https://www.pakistanlawsite.com/case/912"), judgment_html("PLD 2024 SC 912", title="Known 912"))
     sc.page(("goto", "https://www.pakistanlawsite.com/case/913"), judgment_html("PLD 2024 SC 913", title="New 913"))
@@ -2069,7 +2079,17 @@ async def test_pipeline_citation_grid_skips_rows_already_staged(db, login_source
         ("PLD 2024 SC 4002", "Case 4002", "Supreme Court", "https://www.pakistanlawsite.com/case/4002"),
     ]
     sc = BrowserScript()
-    sc.page(("goto", settings.PLS_SEARCH_URL), _archived_grid_html(rows))
+    # The synthetic page represents the entire grid; explicitly verify its
+    # total so this test exercises deduplication rather than unknown-total
+    # fail-closed cursor behavior.
+    sc.routes[("goto", settings.PLS_SEARCH_URL)] = (
+        lambda _browser, rows=rows: PageResult(
+            url=settings.PLS_SEARCH_URL,
+            html=_archived_grid_html(rows),
+            status=200,
+            metadata={"total_rows": len(rows), "start_row": 0, "seek_mode": "dom_absolute"},
+        )
+    )
     for citation, title, _court, detail_url in rows:
         sc.page(("goto", detail_url), judgment_html(citation, title=title))
     r = aioredis.from_url(settings.REDIS_URL)
