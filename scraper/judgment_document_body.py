@@ -20,7 +20,7 @@ EMPTY_BODY_RETIRE_MIN_AGE_SECONDS = 86400
 EMPTY_BODY_FIRST_SEEN_AT_KEY = "empty_body_first_seen_at"
 TRANSIENT_HTTP_STATUSES = frozenset({406, 408, 425, 429, 502, 503, 504})
 _HTML_JUDGMENT_MARKER_RE = re.compile(
-    r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v\.)\b"
+    r"(?i)\b(judgment|judgement|decided on|coram|before|versus|vs\.?|v/s|v\.)\b"
 )
 # Headers and formats common on Pakistani high-court sites (SHC view-file Word-HTML, etc.).
 _HTML_STRONG_COURT_DOCUMENT_RE = re.compile(
@@ -31,6 +31,14 @@ _HTML_STRONG_COURT_DOCUMENT_RE = re.compile(
     r"\bpresent:\s*(?:mr\.?|ms\.?|mrs\.?|hon|the\s+registrar|court)"
     r")"
 )
+
+# Word-HTML hard-wraps phrases across <br/> / newlines; collapse before phrase matching.
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _html_text_collapsed_whitespace(html: str) -> str:
+    text = clean_html(html or "")
+    return _WS_COLLAPSE_RE.sub(" ", text).strip()
 
 
 def frontier_http_status_action(status_code: int) -> str:
@@ -56,12 +64,12 @@ def html_judgment_word_count(html: str) -> int:
 
 
 def html_body_has_strong_court_document_marker(html: str) -> bool:
-    text = clean_html(html or "")
+    text = _html_text_collapsed_whitespace(html)
     return bool(_HTML_STRONG_COURT_DOCUMENT_RE.search(text))
 
 
 def html_body_has_judgment_marker(html: str) -> bool:
-    text = clean_html(html or "")
+    text = _html_text_collapsed_whitespace(html)
     return bool(
         _HTML_JUDGMENT_MARKER_RE.search(text)
         or _HTML_STRONG_COURT_DOCUMENT_RE.search(text)
