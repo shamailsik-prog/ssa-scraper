@@ -72,13 +72,44 @@ def test_split_skips_keyword_when_party_control_not_expressible():
     assert kids == []
 
 
-def test_keyword_child_redundant_only_when_both_totals_equal():
+def test_keyword_child_redundant_when_both_totals_equal():
     assert keyword_child_redundant_with_parent(
         parent_site_total=264,
         parent_rows_seen=264,
         child_site_total=264,
         child_rows_seen=264,
     )
+
+
+def test_keyword_child_redundant_when_both_totals_missing_and_rows_seen_equal():
+    """Live SCMR often omits site total; letter a with same row count as parent should skip."""
+    assert keyword_child_redundant_with_parent(
+        parent_site_total=None,
+        parent_rows_seen=264,
+        child_site_total=None,
+        child_rows_seen=264,
+    )
+
+
+def test_keyword_child_not_redundant_when_totals_missing_and_rows_seen_differ():
+    assert not keyword_child_redundant_with_parent(
+        parent_site_total=None,
+        parent_rows_seen=264,
+        child_site_total=None,
+        child_rows_seen=210,
+    )
+
+
+def test_keyword_child_not_redundant_when_totals_present_and_unequal():
+    assert not keyword_child_redundant_with_parent(
+        parent_site_total=264,
+        parent_rows_seen=264,
+        child_site_total=210,
+        child_rows_seen=210,
+    )
+
+
+def test_keyword_child_not_redundant_when_only_one_total_known():
     assert not keyword_child_redundant_with_parent(
         parent_site_total=264,
         parent_rows_seen=264,
@@ -89,12 +120,6 @@ def test_keyword_child_redundant_only_when_both_totals_equal():
         parent_site_total=None,
         parent_rows_seen=264,
         child_site_total=264,
-        child_rows_seen=264,
-    )
-    assert not keyword_child_redundant_with_parent(
-        parent_site_total=264,
-        parent_rows_seen=264,
-        child_site_total=210,
         child_rows_seen=264,
     )
 

@@ -489,14 +489,17 @@ def keyword_child_redundant_with_parent(
     child_site_total: Optional[int],
     child_rows_seen: int,
 ) -> bool:
-    """True when a keyword/party letter child has the same known site total as its parent.
+    """True when a keyword/party letter child did not narrow vs its parent.
 
-    Requires both parent and child ``site_total_results`` to be non-null and equal. If either total is
-    unknown, the child is not treated as redundant (never infer from ``rows_seen`` alone).
+    When both parent and child ``site_total_results`` are known, redundancy is decided from equal totals
+    (#340). When either total is unknown (common when the site omits the total element), fall back to
+    equal enumerated ``rows_seen`` counts after pagination completed.
     """
-    if parent_site_total is None or child_site_total is None:
-        return False
-    return int(child_site_total) == int(parent_site_total)
+    if parent_site_total is not None and child_site_total is not None:
+        return int(child_site_total) == int(parent_site_total)
+    if parent_site_total is None and child_site_total is None:
+        return int(parent_rows_seen) == int(child_rows_seen)
+    return False
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
