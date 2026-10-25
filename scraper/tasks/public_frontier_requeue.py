@@ -34,6 +34,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import SessionLocal, run_async
+from scraper.judgment_document_body import EMPTY_BODY_FIRST_SEEN_AT_KEY
 from scraper.models import CorpusMetadata, CrawlFrontier
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,10 @@ async def requeue_pdf_miss_retired(
             row.last_error = None
             row.attempts = 0
             row.next_run_at = None
+            row.priority = 50
+            cursor = dict(row.cursor_json or {})
+            cursor.pop(EMPTY_BODY_FIRST_SEEN_AT_KEY, None)
+            row.cursor_json = cursor
     if not dry_run and snapshot:
         prior = (await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))).scalars().first()
         await _upsert_corpus_metadata(db, _undo_prior_latest_key(run_id), prior.value if prior else "")

@@ -54,6 +54,10 @@ def _container_id() -> str:
     return socket.gethostname()
 
 
+def _bump_defer_priority(fr: CrawlFrontier) -> None:
+    fr.priority = min(99, int(fr.priority or 50) + max(1, int(fr.attempts)))
+
+
 def _slim(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if d is None:
         return None
@@ -533,15 +537,17 @@ class PublicPipeline:
         route: Dict[str, Any],
     ) -> None:
         from scraper.judgment_document_body import (
-            EMPTY_BODY_RETIRE_AFTER_ATTEMPTS,
             PDF_MISS_DEFER_ERROR,
             PDF_MISS_RETIRE_AFTER_ATTEMPTS,
             classify_pdf_endpoint_body,
+            empty_body_retire_allowed,
+            note_empty_body_first_seen,
             pdf_miss_backoff_seconds,
         )
 
         from scraper.judgment_document_body import pdf_miss_error_message
 
+        now = datetime.now(timezone.utc)
         status = int(res.status_code or 0)
         body_kind = classify_pdf_endpoint_body(res)
         if body_kind == "html_judgment":
@@ -557,13 +563,15 @@ class PublicPipeline:
         )
         fr.status = "pending"
         fr.last_error = pdf_miss_error_message(status, detail)
-        fr.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
-        fr.priority = min(99, max(int(fr.priority or 50), 50) + max(1, int(fr.attempts)))
+        fr.next_run_at = now + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
+        _bump_defer_priority(fr)
         self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
-        retire_after = (
-            EMPTY_BODY_RETIRE_AFTER_ATTEMPTS if body_kind == "empty" else PDF_MISS_RETIRE_AFTER_ATTEMPTS
-        )
-        if fr.attempts >= retire_after:
+        if body_kind == "empty":
+            fr.cursor_json = note_empty_body_first_seen(fr.cursor_json, now)
+            may_retire = empty_body_retire_allowed(fr.attempts, fr.cursor_json, now)
+        else:
+            may_retire = fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS
+        if may_retire:
             fr.status = "retired"
             fr.last_error = pdf_miss_error_message(
                 status,
@@ -598,7 +606,7 @@ class PublicPipeline:
                     fr.next_run_at = datetime.now(timezone.utc) + timedelta(
                         seconds=pdf_miss_backoff_seconds(fr.attempts)
                     )
-                    fr.priority = min(99, max(int(fr.priority or 50), 50) + max(1, int(fr.attempts)))
+                    _bump_defer_priority(fr)
                     self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
                     if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
                         fr.status = "retired"
@@ -783,9 +791,16 @@ async def run_public_source(
         if exists is None:
             db.add(CrawlFrontier(source_name=source.source_name, tier=0, query_key=key, query_json={"kind": "listing", "url": url, "target_kind": item.get("target_kind", "judgment"), "depth": 0}, cursor_json={}, priority=30))
         elif exists.status in ("done", "retired") and item.get("refresh", True):
+            from scraper.judgment_document_body import EMPTY_BODY_FIRST_SEEN_AT_KEY
+
             exists.status = "pending"
             exists.last_error = None
             exists.attempts = 0
+            exists.next_run_at = None
+            exists.priority = 30
+            cursor = dict(exists.cursor_json or {})
+            cursor.pop(EMPTY_BODY_FIRST_SEEN_AT_KEY, None)
+            exists.cursor_json = cursor
     await db.flush()
     own_fetcher = fetcher is None
     if own_fetcher:

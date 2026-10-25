@@ -60,8 +60,8 @@ async def test_html_judgment_accepted_from_pdf_shaped_url(db, source, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_empty_whitespace_body_retires_after_three_attempts(db, source, monkeypatch):
-    url = "http://127.0.0.1:9/caselaw/view-file/EMPTY-RETIRE"
+async def test_empty_whitespace_three_times_within_24h_stays_pending(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/EMPTY-BURST"
     row = CrawlFrontier(
         source_name=source.source_name,
         tier=0,
@@ -79,10 +79,39 @@ async def test_empty_whitespace_body_retires_after_three_attempts(db, source, mo
     pipeline = PublicPipeline(db, source, fetcher=None)
     monkeypatch.setattr(pipeline, "fetch", fake_fetch)
 
-    for expected_attempts in (1, 2):
+    for expected_attempts in (1, 2, 3):
         assert await pipeline._drain_one(row) == "ok"
         assert row.status == "pending"
         assert row.attempts == expected_attempts
+
+    assert row.cursor_json.get("empty_body_first_seen_at")
+
+
+@pytest.mark.asyncio
+async def test_empty_whitespace_body_retires_after_three_attempts_and_24h(db, source, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from scraper.judgment_document_body import EMPTY_BODY_FIRST_SEEN_AT_KEY
+
+    url = "http://127.0.0.1:9/caselaw/view-file/EMPTY-RETIRE"
+    first_seen = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={"kind": "judgment", "url": url, "route": {"pdf_endpoint_kind": "view-file"}},
+        cursor_json={EMPTY_BODY_FIRST_SEEN_AT_KEY: first_seen},
+        priority=50,
+        attempts=2,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return _pdf_shaped_result("   \n\t  ", url=url)
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
 
     assert await pipeline._drain_one(row) == "ok"
     assert row.status == "retired"
