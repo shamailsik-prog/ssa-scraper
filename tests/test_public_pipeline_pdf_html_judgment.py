@@ -6,7 +6,8 @@ import pytest
 
 from scraper.fetchers import FetchResult, HttpFetcher
 from scraper.judgment_document_body import PDF_MISS_DEFER_ERROR, html_judgment_word_count
-from scraper.models import CrawlFrontier
+from scraper.models import CorpusMetadata, CrawlFrontier
+from sqlalchemy import select
 from scraper.tasks.public_frontier_requeue import count_pdf_miss_retired, requeue_pdf_miss_retired, undo_requeue_run
 from scraper.tasks.public_pipeline import PublicPipeline
 from tests.fixtures import judgment_html
@@ -150,3 +151,73 @@ async def test_requeue_pdf_miss_retired_dry_run_and_apply_undo(db, source):
     await db.refresh(row)
     assert row.status == "retired"
     assert row.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_requeue_multiple_runs_reuse_latest_run_key(db, source):
+    """Second apply must not violate corpus_metadata's primary key."""
+    for suffix in ("A", "B"):
+        db.add(CrawlFrontier(
+            source_name=source.source_name,
+            tier=0,
+            query_key=f"judgment:http://example.test/view-file/{suffix}",
+            query_json={"kind": "judgment", "url": f"http://example.test/view-file/{suffix}"},
+            cursor_json={},
+            status="retired",
+            last_error="missing %PDF signature for judgment document URL",
+            attempts=1,
+            priority=50,
+        ))
+    await db.commit()
+    first = await requeue_pdf_miss_retired(
+        db, source_name=source.source_name, run_id="requeue-first", limit=1, dry_run=False
+    )
+    second = await requeue_pdf_miss_retired(
+        db, source_name=source.source_name, run_id="requeue-second", limit=1, dry_run=False
+    )
+    assert first["matched"] == second["matched"] == 1
+    latest = (await db.execute(select(CorpusMetadata).where(
+        CorpusMetadata.key == "public_frontier_pdf_miss_requeue_latest_run_id"
+    ))).scalars().one()
+    assert latest.value == "requeue-second"
+    assert (await undo_requeue_run(db, "requeue-second"))["restored"] == 1
+    await db.refresh(latest)
+    assert latest.value == "requeue-first"
+
+
+@pytest.mark.asyncio
+async def test_undo_requeue_does_not_retire_rows_workers_have_processed(db, source):
+    """A completed judgment and a retried fetch must survive an ops undo."""
+    rows = []
+    for suffix in ("DONE", "RETRY"):
+        row = CrawlFrontier(
+            source_name=source.source_name,
+            tier=0,
+            query_key=f"judgment:http://example.test/view-file/{suffix}",
+            query_json={"kind": "judgment", "url": f"http://example.test/view-file/{suffix}"},
+            cursor_json={},
+            status="retired",
+            last_error="missing %PDF signature for judgment document URL",
+            attempts=1,
+            priority=50,
+        )
+        db.add(row)
+        rows.append(row)
+    await db.commit()
+    result = await requeue_pdf_miss_retired(
+        db, source_name=source.source_name, run_id="requeue-progress", dry_run=False
+    )
+    assert result["matched"] == 2
+    rows[0].status = "done"
+    rows[0].attempts = 1
+    rows[1].status = "pending"
+    rows[1].attempts = 1
+    rows[1].last_error = "HTTP 503"
+    await db.commit()
+
+    undone = await undo_requeue_run(db, "requeue-progress")
+    assert undone == {"restored": 0, "skipped_changed": 2}
+    await db.refresh(rows[0])
+    await db.refresh(rows[1])
+    assert rows[0].status == "done" and rows[0].attempts == 1
+    assert rows[1].status == "pending" and rows[1].last_error == "HTTP 503"
