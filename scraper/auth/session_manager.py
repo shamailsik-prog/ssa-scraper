@@ -1380,11 +1380,13 @@ class PlaywrightBrowser:
             ) from exc
 
     async def submit_search(self, search_map: Dict[str, Any], values: Dict[str, str], **kwargs: Any) -> PageResult:
+        from scraper.search_form_roles import resolve_harvest_fields
+
         archived_grid_start_row = int(kwargs.get("archived_grid_start_row", 0) or 0)
         wait_for_ajax_results = bool(kwargs.get("wait_for_ajax_results"))
         if search_map_uses_dashboard_citation_panel(search_map):
             await self.ensure_dashboard_citation_search_panel_visible()
-        fields = search_map.get("fields") or {}
+        fields = resolve_harvest_fields(search_map)
         for role, value in values.items():
             f = fields.get(role)
             if not f:
