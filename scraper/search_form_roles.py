@@ -17,10 +17,10 @@ def keyword_text_submit_role(search_map: Dict[str, Any]) -> Optional[str]:
         return aliases["keyword"]
     stored = dict(search_map.get("fields") or {})
     stored.pop("_all", None)
-    if "party" in stored:
-        return "party"
     if "keyword" in stored:
         return "keyword"
+    if "party" in stored:
+        return "party"
     resolved = resolve_harvest_fields(search_map)
     if "party" in resolved:
         return "party"
