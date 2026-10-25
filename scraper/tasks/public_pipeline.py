@@ -281,7 +281,10 @@ class PublicPipeline:
             prov = pdf_prov
             html = None
         else:
-            prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=res.content_kind, route=route, http_status=res.status_code)
+            # A PDF-shaped URL may serve a genuine HTML judgment with a PDF
+            # Content-Type. Classify preserved bytes, not the response header.
+            body_kind = "html" if res.is_pdf and not has_pdf_signature(res.content) else res.content_kind
+            prov = await record_provenance(self.db, source=self.source, url=res.final_url, content=res.content, content_kind=body_kind, route=route, http_status=res.status_code)
             html = res.text
             text = clean_html(html)
             pdf_prov = None
