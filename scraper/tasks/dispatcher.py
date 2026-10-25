@@ -29,7 +29,7 @@ from scraper.harvest_mode import (
     source_backfill_priority,
     source_selected_for_mode,
 )
-from scraper.models import BrowserSessionSlot, PlsSearchHarvestQuery, ScraperJob, ScraperSource
+from scraper.models import BrowserSessionSlot, CrawlFrontier, PlsSearchHarvestQuery, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.pls_grid_health import (
     SOURCE_NAME as PLS_SOURCE_NAME,
@@ -468,6 +468,89 @@ def _running_reporter_shards(running_jobs) -> list[Optional[int]]:
     return shards
 
 
+async def _public_source_has_pending_frontier(db, source_name: str) -> bool:
+    """True when tier-0 frontier rows still need a public-source drain (updates-mode scheduling)."""
+    row = (
+        await db.execute(
+            select(CrawlFrontier.id)
+            .where(
+                CrawlFrontier.source_name == source_name,
+                CrawlFrontier.tier == 0,
+                CrawlFrontier.status.in_(["pending", "in_progress"]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+def _public_backlog_continue_seconds() -> int:
+    """Bounded backlog recheck interval from settings; 0 disables dispatcher backlog override."""
+    return max(0, min(3600, int(settings.PUBLIC_BACKLOG_CONTINUE_SECONDS or 0)))
+
+
+async def _last_finished_public_job(db, source_name: str) -> Optional[ScraperJob]:
+    return (
+        await db.execute(
+            select(ScraperJob)
+            .where(
+                ScraperJob.source_name == source_name,
+                ScraperJob.status.in_(("done", "failed", "interrupted")),
+                ScraperJob.finished_at.is_not(None),
+            )
+            .order_by(ScraperJob.finished_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+
+def _public_job_made_backlog_progress(summary: Optional[Dict[str, Any]]) -> bool:
+    """Same progress signal as public_pipeline._continue_while_backlog (completed work while limited)."""
+    if not isinstance(summary, dict):
+        return False
+    if int(summary.get("completed") or 0) > 0:
+        return True
+    return bool(summary.get("backlog_remaining"))
+
+
+async def _public_backlog_dispatch_allowed(
+    db,
+    source: ScraperSource,
+    mode: str,
+    now: datetime,
+) -> bool:
+    """Whether updates-mode dispatch may pull next_scrape_at forward for tier-0 frontier backlog.
+
+    Matches the pipeline guard: only after a run that completed at least one row (or reported
+    backlog_remaining), or when the last finished job is older than the normal cadence (lost queue
+    task after recreate)."""
+    if mode != "updates" or source.access_method == "login_session":
+        return False
+    if _public_backlog_continue_seconds() <= 0:
+        return False
+    if not await _public_source_has_pending_frontier(db, source.source_name):
+        return False
+    last = await _last_finished_public_job(db, source.source_name)
+    if last is not None and _public_job_made_backlog_progress(last.result_summary):
+        return True
+    cadence = timedelta(minutes=cadence_for_source(source, mode))
+    if last is None:
+        return False
+    last_at = last.finished_at or last.started_at or last.created_at
+    if last_at is None:
+        return False
+    return (now - last_at) >= cadence
+
+
+def _next_public_scrape_at(source: ScraperSource, mode: str, now: datetime, *, backlog_dispatch: bool) -> datetime:
+    """When backlog dispatch is allowed, recheck soon instead of the full updates cadence."""
+    if mode == "updates" and backlog_dispatch:
+        wait = _public_backlog_continue_seconds()
+        if wait > 0:
+            return now + timedelta(seconds=wait)
+    return now + timedelta(minutes=cadence_for_source(source, mode))
+
+
 async def _active_slot_numbers(db, source_name: str) -> list[int]:
     rows = (
         await db.execute(
@@ -535,7 +618,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 continue  # retired on the owner's instruction, even if re-enabled on the dashboard
             if not source_selected_for_mode(s, mode):
                 continue
+            backlog_dispatch = await _public_backlog_dispatch_allowed(db, s, mode, now)
             due = s.next_scrape_at is None or s.next_scrape_at <= now
+            if not due and backlog_dispatch:
+                due = True
             if not due:
                 continue
             if s.access_method == "login_session" and login_work_held():
@@ -583,6 +669,8 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                 if preempted:
                     recovered_stale = True
             if recovered_stale:
+                if backlog_dispatch:
+                    s.next_scrape_at = now
                 await db.flush()
             if len(running_jobs) >= concurrency:
                 logger.info(
@@ -712,7 +800,10 @@ async def dispatch_due_sources() -> Dict[str, Any]:
             else:
                 logger.info("%s: a job queued earlier has not started yet; not queuing another", s.source_name)
                 skipped_saturated.append(f"{s.source_name}:already_queued")
-            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+            if s.access_method != "login_session":
+                s.next_scrape_at = _next_public_scrape_at(s, mode, now, backlog_dispatch=backlog_dispatch)
+            else:
+                s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
         await db.commit()
     return {"mode": mode, "auto_switched": auto_switched, "queued": queued, "skipped_saturated": skipped_saturated}
 
