@@ -545,19 +545,23 @@ class PublicPipeline:
             fr.last_error = None
             fr.last_run_at = datetime.now(timezone.utc)
             return
-        if body_kind == "empty":
-            fr.status = "retired"
-            fr.last_error = pdf_miss_error_message(status, "empty document body for judgment document URL")
-            return
+        # A 200 response with an empty body can be a transient source fault,
+        # not proof that the judgment has ceased to exist. Keep it retryable
+        # under the same bounded backoff as other missing-PDF responses.
+        reason = (
+            "empty document body for judgment document URL"
+            if body_kind == "empty"
+            else PDF_MISS_DEFER_ERROR
+        )
         fr.status = "pending"
-        fr.last_error = pdf_miss_error_message(status, PDF_MISS_DEFER_ERROR)
+        fr.last_error = pdf_miss_error_message(status, reason)
         fr.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=pdf_miss_backoff_seconds(fr.attempts))
         self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
         if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
             fr.status = "retired"
             fr.last_error = pdf_miss_error_message(
                 status,
-                f"{PDF_MISS_DEFER_ERROR} (retired after {fr.attempts} attempts)",
+                f"{reason} (retired after {fr.attempts} attempts)",
             )
 
     async def _drain_one(self, fr: CrawlFrontier) -> str:
