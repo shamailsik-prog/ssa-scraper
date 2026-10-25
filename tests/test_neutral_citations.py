@@ -122,8 +122,11 @@ async def test_held_shc_judgment_is_requalified_when_its_grid_row_is_seen_again(
         await scrape_sindh_high_court(source, db, fetcher=fetcher, limit=20)
     await db.commit()
     st = (await db.execute(select(ScraperStaging).where(ScraperStaging.source_name == "SindhHighCourt"))).scalars().one()
-    assert st.status == "quarantined"
-    assert st.quarantine_reason == "no citation supported by source"
+    # No row citation and no law-report cite in the body: it stages for the unreported promotion path.
+    assert st.status == "extracted"
+    assert st.quarantine_reason is None
+    st.status = "quarantined"
+    st.quarantine_reason = "no citation supported by source"
     db.add(QuarantineQueue(staging_id=st.id, reason=st.quarantine_reason, source_name="SindhHighCourt"))
     await db.commit()
 

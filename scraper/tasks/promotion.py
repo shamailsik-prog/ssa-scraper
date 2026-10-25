@@ -75,7 +75,13 @@ from scraper.parsers.statute_parser import (
     looks_like_fragment_name,
     looks_like_garbage_name,
 )
-from scraper.unreported import SOURCE_COURT_CODE, find_case_number, proceeding_type, unreported_identity
+from scraper.unreported import (
+    SOURCE_COURT_CODE,
+    find_case_number,
+    proceeding_type,
+    unreported_hold_reason,
+    unreported_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -277,15 +283,6 @@ def pls_own_citation(
     return PlsOwnCitationResult(chosen)
 
 
-def _unreported_hold_reason(full_text: str, court: Optional[Court], data: Dict[str, Any], source_name: Optional[str] = None) -> Optional[str]:
-    """Why a judgment without a citation cannot enter as unreported (None when it can)."""
-    if court is None and source_name not in SOURCE_COURT_CODE and not (data.get("court_canonical") or data.get("court")):
-        return "court unknown"
-    if len((full_text or "").strip()) < int(settings.UNREPORTED_MIN_TEXT_CHARS or 0):
-        return "text too short for a judgment"
-    return None
-
-
 def _apply_pls_full_text_replacement(judgment: Judgment, new_full_text: str, data: Optional[Dict[str, Any]] = None) -> None:
     """Whenever full_text changes on a PLS judgment, drop stale overlay and recompute the headnote flag."""
     judgment.headnote_stripped_full_text = None
@@ -445,7 +442,7 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         if st.source_name in SOURCE_COURT_CODE:
             # a court's own website: the court is the site's, whatever court the text happens to name
             court = await _court_by_name(db, SOURCE_COURT_CODE[st.source_name]) or court
-        held = _unreported_hold_reason(full_text, court, data, st.source_name)
+        held = unreported_hold_reason(full_text, court, data, st.source_name)
         if held:
             await _quarantine(db, st, f"unreported judgment held: {held}", "judgment")
             return "quarantined"
@@ -2449,7 +2446,7 @@ def _pending_statute_staging_query(*, limit: int, source_name: Optional[str] = N
 NO_CITATION = "no citation supported by source"
 
 
-async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -> int:
+async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None, source_name: Optional[str] = None) -> int:
     """Judgments held as "no citation supported by source" from a court's own website go back to
     `extracted`, so this run promotes them as unreported judgments; their review items are closed. One that
     still cannot enter (no court, too little text) is held again with that reason, so it is never retried
@@ -2457,42 +2454,43 @@ async def release_unreported(db: AsyncSession, *, limit: Optional[int] = None) -
     if not settings.UNREPORTED_JUDGMENTS:
         logger.info("unreported release: switched off (UNREPORTED_JUDGMENTS=false)")
         return 0
-    held = (
-        await db.execute(
-            select(ScraperStaging)
-            .where(
-                ScraperStaging.status == "quarantined",
-                # older rows carry the reason only on their review item, not on the staging row itself
-                or_(
-                    ScraperStaging.quarantine_reason == NO_CITATION,
-                    # held only because the court could not be read from the text; the source now names it
-                    and_(
-                        ScraperStaging.quarantine_reason == f"{NO_CITATION} (not taken as unreported: court unknown)",
-                        ScraperStaging.source_name.in_(list(SOURCE_COURT_CODE)),
-                    ),
-                    and_(
-                        ScraperStaging.quarantine_reason.is_(None),
-                        exists(
-                            select(QuarantineQueue.id).where(
-                                QuarantineQueue.staging_id == ScraperStaging.id,
-                                QuarantineQueue.reviewed.is_(False),
-                                QuarantineQueue.reason == NO_CITATION,
-                            )
-                        ),
+    held_query = (
+        select(ScraperStaging)
+        .where(
+            ScraperStaging.status == "quarantined",
+            # older rows carry the reason only on their review item, not on the staging row itself
+            or_(
+                ScraperStaging.quarantine_reason == NO_CITATION,
+                # held only because the court could not be read from the text; the source now names it
+                and_(
+                    ScraperStaging.quarantine_reason == f"{NO_CITATION} (not taken as unreported: court unknown)",
+                    ScraperStaging.source_name.in_(list(SOURCE_COURT_CODE)),
+                ),
+                and_(
+                    ScraperStaging.quarantine_reason.is_(None),
+                    exists(
+                        select(QuarantineQueue.id).where(
+                            QuarantineQueue.staging_id == ScraperStaging.id,
+                            QuarantineQueue.reviewed.is_(False),
+                            QuarantineQueue.reason == NO_CITATION,
+                        )
                     ),
                 ),
-                ScraperStaging.promoted_to_id.is_(None),
-                ScraperStaging.source_name != "PakistanLawSite",
-            )
-            .order_by(ScraperStaging.created_at)
-            .limit(int(limit or settings.UNREPORTED_RELEASE_BATCH))
+            ),
+            ScraperStaging.promoted_to_id.is_(None),
+            ScraperStaging.source_name != "PakistanLawSite",
         )
-    ).scalars().all()
+        .order_by(ScraperStaging.created_at)
+        .limit(int(limit or settings.UNREPORTED_RELEASE_BATCH))
+    )
+    if source_name:
+        held_query = held_query.where(ScraperStaging.source_name == source_name)
+    held = (await db.execute(held_query)).scalars().all()
     now = datetime.now(timezone.utc)
     released = 0
     for st in held:
         data = st.reconciled_json or {}
-        why = _unreported_hold_reason(strip_leading_judgment_chrome(st.raw_text or ""), None, data, st.source_name)
+        why = unreported_hold_reason(strip_leading_judgment_chrome(st.raw_text or ""), None, data, st.source_name)
         items = (await db.execute(select(QuarantineQueue).where(QuarantineQueue.staging_id == st.id, QuarantineQueue.reviewed.is_(False)))).scalars().all()
         if why:
             # not a judgment that can stand as unreported: it stays held, says why, and is not picked again
@@ -2544,7 +2542,7 @@ async def promote_staging_records(limit: int = 200, *, source_name: Optional[str
             await _quarantine(db, st, st.quarantine_reason or "below threshold", "judgment")
             counts["quarantined"] += 1
         await db.commit()
-        released = await release_unreported(db)
+        released = await release_unreported(db, source_name=source_name)
         if released:
             counts["released_unreported"] = released
         await db.commit()
