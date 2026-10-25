@@ -593,6 +593,7 @@ class PublicPipeline:
             elif res.status_code >= 400:
                 from scraper.judgment_document_body import (
                     PDF_MISS_RETIRE_AFTER_ATTEMPTS,
+                    TRANSIENT_HTTP_STATUSES,
                     frontier_http_status_action,
                     pdf_miss_backoff_seconds,
                 )
@@ -608,7 +609,13 @@ class PublicPipeline:
                     )
                     _bump_defer_priority(fr)
                     self.stats["deferred"] = int(self.stats.get("deferred", 0)) + 1
-                    if fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS:
+                    # A retry threshold cannot prove a judgment is gone.
+                    # Preserve transient/rate-limit responses for later retries.
+                    if (
+                        fr.attempts >= PDF_MISS_RETIRE_AFTER_ATTEMPTS
+                        and code not in TRANSIENT_HTTP_STATUSES
+                        and code < 500
+                    ):
                         fr.status = "retired"
                         fr.last_error = f"HTTP {code} (retired after {fr.attempts} attempts)"
             elif self._judgment_pdf_endpoint_miss(fr, url, res):
