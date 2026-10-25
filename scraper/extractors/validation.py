@@ -19,6 +19,7 @@ from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
 from scraper.config import settings
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
+from scraper.unreported import SOURCE_COURT_CODE, court_website_unreported_enabled, unreported_hold_reason
 
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
 MANDATORY_STATUTE_FIELDS = ("statute_name", "sections")
@@ -319,20 +320,38 @@ def reconcile_judgment(
         conf = min(conf, 0.4)
     conf = max(0.0, min(1.0, round(conf, 3)))
     out["extractor_confidence"] = conf
+    unreported_hold: Optional[str] = None
+    unreported_candidate = court_website_unreported_enabled(source_name) and not cits
+    if unreported_candidate:
+        unreported_hold = unreported_hold_reason(
+            raw_text,
+            out.get("court_canonical") or out.get("court"),
+            out,
+            source_name,
+        )
+    skip_missing_citation = unreported_candidate and unreported_hold is None
+    skip_missing_court = skip_missing_citation and source_name in SOURCE_COURT_CODE
+    # Promotion does not re-check extractor confidence; court-site captures without a reporter cite are
+    # often below the global 0.85 threshold when year or directory-normalised court is missing.
+    skip_confidence_gate = skip_missing_citation
     quarantine = (
         stub_signal is not None
-        or conf < min_confidence
-        or not out["citations"]
-        or not out.get("court")
+        or (conf < min_confidence and not skip_confidence_gate)
+        or (not out["citations"] and not skip_missing_citation)
+        or (not out.get("court") and not skip_missing_court)
         or bool([c for c in conflicts if c["field"] in ("primary_citation",)])
     )
+    if unreported_candidate and unreported_hold:
+        quarantine = True
     reason = None
     if quarantine:
         if stub_signal is not None:
             reason = guard_reason(stub_signal)
-        elif not out["citations"]:
+        elif unreported_candidate and unreported_hold:
+            reason = f"no citation supported by source (not taken as unreported: {unreported_hold})"
+        elif not out["citations"] and not skip_missing_citation:
             reason = "no citation supported by source"
-        elif not out.get("court"):
+        elif not out.get("court") and not skip_missing_court:
             reason = "court unknown"
         elif any(c["field"] == "primary_citation" for c in conflicts):
             reason = "citation conflict between deterministic parser and AI"

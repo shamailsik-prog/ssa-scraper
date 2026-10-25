@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Type
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
@@ -651,10 +651,10 @@ NO_CITATION_REASON = "no citation supported by source"
 
 
 async def requalify_held_judgment(db: AsyncSession, source: ScraperSource, *, frontier_key: str, citation: str) -> int:
-    """A judgment held as "no citation supported by source" whose result row is now known to name `citation`
-    (a neutral citation the parser did not read before) is checked again with that citation, deterministically.
-    One that now validates goes back to "extracted" for promotion and its review item is closed; one that still
-    fails keeps its hold with the reason it fails for now. Returns how many were released."""
+    """A judgment whose result row now names `citation` (a neutral citation the parser did not read before) is
+    checked again with that citation, deterministically. Applies to rows held for "no citation" and to
+    extracted rows still without a citation (unreported staging). One that now validates is left or set to
+    `extracted` for promotion; review items are closed. Returns how many were updated."""
     from scraper.extractors import deterministic as det
     from scraper.extractors.hybrid_extractor import load_court_directory
     from scraper.extractors.validation import reconcile_judgment
@@ -664,10 +664,21 @@ async def requalify_held_judgment(db: AsyncSession, source: ScraperSource, *, fr
         await db.execute(
             select(ScraperStaging).where(
                 ScraperStaging.source_name == source.source_name,
-                ScraperStaging.status == "quarantined",
-                ScraperStaging.quarantine_reason == NO_CITATION_REASON,
                 ScraperStaging.promoted_to_id.is_(None),
                 ScraperStaging.route_json["frontier"].astext == frontier_key,
+                or_(
+                    and_(
+                        ScraperStaging.status == "quarantined",
+                        ScraperStaging.quarantine_reason == NO_CITATION_REASON,
+                    ),
+                    and_(
+                        ScraperStaging.status == "extracted",
+                        or_(
+                            ScraperStaging.extracted_citation.is_(None),
+                            ScraperStaging.extracted_citation == "",
+                        ),
+                    ),
+                ),
             )
         )
     ).scalars().all()
@@ -681,7 +692,14 @@ async def requalify_held_judgment(db: AsyncSession, source: ScraperSource, *, fr
         meta = {"citation": citation, "title": st.extracted_title, "url": st.source_url}
         dj = det.extract_judgment_deterministic(html=st.raw_html, text=text, source_meta=meta)
         out = reconcile_judgment(
-            deterministic=dj, ai=None, raw_text=text, source_url=st.source_url, raw_html=st.raw_html, court_directory=directory, min_confidence=min_confidence
+            deterministic=dj,
+            ai=None,
+            raw_text=text,
+            source_url=st.source_url,
+            raw_html=st.raw_html,
+            court_directory=directory,
+            min_confidence=min_confidence,
+            source_name=source.source_name,
         )
         data = dict(out.data or {})
         st.deterministic_json = _slim(dj)

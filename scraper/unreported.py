@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
+
+from scraper.config import settings
 
 # Court abbreviations used in the identity of an unreported judgment, by source name.
 COURT_ABBR = {
@@ -131,6 +133,30 @@ def proceeding_type(case_number: Optional[str], text: Optional[str] = None) -> s
             if pat.search(low):
                 return name
     return "other"
+
+
+def court_website_unreported_enabled(source_name: Optional[str]) -> bool:
+    """True when judgments from this source may enter as unreported (court's own website, not PakistanLawSite)."""
+    return bool(
+        settings.UNREPORTED_JUDGMENTS
+        and source_name
+        and source_name != "PakistanLawSite"
+        and source_name in SOURCE_COURT_CODE
+    )
+
+
+def unreported_hold_reason(
+    full_text: str,
+    court: Union[str, Any, None],
+    data: Dict[str, Any],
+    source_name: Optional[str] = None,
+) -> Optional[str]:
+    """Why a judgment without a citation cannot enter as unreported (None when it can)."""
+    if court is None and source_name not in SOURCE_COURT_CODE and not (data.get("court_canonical") or data.get("court")):
+        return "court unknown"
+    if len((full_text or "").strip()) < int(settings.UNREPORTED_MIN_TEXT_CHARS or 0):
+        return "text too short for a judgment"
+    return None
 
 
 def unreported_identity(source_name: str, case_number: Optional[str], decision_date: Optional[date], text_hash: str) -> str:
