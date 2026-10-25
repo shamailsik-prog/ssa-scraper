@@ -27,7 +27,7 @@ from sqlalchemy.types import TypeDecorator
 
 from scraper.config import settings
 from scraper.keys import fit_key
-from scraper.reader_grants import READER_COLUMN_LIMITED_TABLES, reader_grant_select_sql, reader_select_columns
+from scraper.reader_grants import reader_forbids_table_wide_select, reader_grant_select_sql, reader_select_columns
 
 logger = logging.getLogger(__name__)
 
@@ -427,8 +427,9 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
         await lock_conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role}"))
         for t in CONTRACT_TABLES:
             qt = _quote_ident(t)
-            if t in READER_COLUMN_LIMITED_TABLES:
-                cols = reader_select_columns(t, await _public_table_column_names(lock_conn, t))
+            live_cols = await _public_table_column_names(lock_conn, t)
+            if reader_forbids_table_wide_select(t, live_cols):
+                cols = reader_select_columns(t, live_cols)
                 await lock_conn.execute(text(reader_grant_select_sql(qt, role, cols)))
             else:
                 await lock_conn.execute(text(f"GRANT SELECT ON TABLE {qt} TO {role}"))

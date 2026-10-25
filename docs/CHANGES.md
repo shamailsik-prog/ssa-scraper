@@ -6,7 +6,9 @@ After manual privilege drift on a droplet, re-apply reader grants with **column-
 Never run table-wide `GRANT SELECT ON public.judgment` (or `instrument`, `source_provenance`,
 `scraper_staging`, `statutes_staging`). Blocked columns include `raw_html`, `raw_text`, `full_text`,
 `headnote*`, `summary`, `ai_json`, `deterministic_json`, `reconciled_json`, `route_json`, `routes`,
-`validation_errors`, `statutes_cited`, and `embedding`.
+`validation_errors`, `statutes_cited`, and any column whose name contains `embedding`
+(including `statute_section.embedding`). `statute_section_version.section_text` and
+`treatment.evidence_passage` remain readable via ordinary table-wide grants on those tables.
 
 Preferred: restart the `api` service so `ensure_roles()` runs on startup (`init_db`).
 
@@ -51,6 +53,12 @@ GRANT SELECT (
   raw_ref, kind, extraction_engine, status, promoted_to_id, quarantine_reason, confidence_score,
   created_at, updated_at
 ) ON TABLE public.statutes_staging TO sikander_reader;
+
+-- statute_section (no embedding vector)
+GRANT SELECT (
+  id, statute_id, section_number, section_title, chapter, part, sort_key, current_version_id,
+  created_at, updated_at
+) ON TABLE public.statute_section TO sikander_reader;
 ```
 
 Canonical lists are defined in `scraper/reader_grants.py` (`READER_OPS_COLUMN_ALLOWLIST`).

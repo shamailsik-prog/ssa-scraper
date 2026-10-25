@@ -7,7 +7,7 @@ Table-wide ``GRANT SELECT`` is forbidden on tables that store page blobs, extrac
 from __future__ import annotations
 
 import re
-from typing import AbstractSet, Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 # Tables that must never receive table-wide reader SELECT (content / blob columns).
 READER_COLUMN_LIMITED_TABLES: frozenset[str] = frozenset(
@@ -44,15 +44,22 @@ READER_BLOCKED_COLUMN_PREFIXES: tuple[str, ...] = ("headnote",)
 
 def is_reader_blocked_column(name: str) -> bool:
     lower = name.lower()
+    if "embedding" in lower:
+        return True
     if lower in READER_BLOCKED_COLUMNS:
         return True
     return any(lower.startswith(prefix) for prefix in READER_BLOCKED_COLUMN_PREFIXES)
 
 
+def reader_forbids_table_wide_select(table_name: str, column_names: Iterable[str]) -> bool:
+    """True when reader must get column-level SELECT (content tables or any blocked column present)."""
+    if table_name in READER_COLUMN_LIMITED_TABLES:
+        return True
+    return any(is_reader_blocked_column(c) for c in column_names)
+
+
 def reader_select_columns(table_name: str, column_names: Iterable[str]) -> tuple[str, ...]:
-    """Metadata/id/status columns the reader role may SELECT on a column-limited table."""
-    if table_name not in READER_COLUMN_LIMITED_TABLES:
-        raise ValueError(f"reader_select_columns called for non-limited table {table_name!r}")
+    """Columns the reader role may SELECT (metadata/id/status; no blobs or embeddings)."""
     allowed = tuple(c for c in column_names if not is_reader_blocked_column(c))
     if not allowed:
         raise ValueError(f"no reader-selectable columns left on {table_name!r}")
@@ -66,8 +73,8 @@ def reader_grant_select_sql(table_ident: str, role_ident: str, columns: Sequence
 
 
 def assert_no_table_wide_reader_grant(sql: str, *, table_name: str) -> None:
-    """Guard for deploy/ops scripts: reject table-wide SELECT on column-limited tables."""
-    if table_name not in READER_COLUMN_LIMITED_TABLES:
+    """Guard for deploy/ops scripts: reject table-wide SELECT where column grants are required."""
+    if table_name not in READER_OPS_COLUMN_ALLOWLIST:
         return
     pattern = re.compile(
         rf"GRANT\s+SELECT\s+ON\s+(?:TABLE\s+)?(?:public\.)?{re.escape(table_name)}\b",
@@ -200,12 +207,24 @@ READER_OPS_COLUMN_ALLOWLIST: Mapping[str, tuple[str, ...]] = {
         "created_at",
         "updated_at",
     ),
+    "statute_section": (
+        "id",
+        "statute_id",
+        "section_number",
+        "section_title",
+        "chapter",
+        "part",
+        "sort_key",
+        "current_version_id",
+        "created_at",
+        "updated_at",
+    ),
 }
 
 
 def ops_reapply_grant_snippet(table_name: str, role: str = "sikander_reader") -> str:
-    """Single statement for docs/ops RE-APPLY GRANT (column-limited tables only)."""
-    if table_name not in READER_COLUMN_LIMITED_TABLES:
-        raise ValueError(f"ops snippet only for column-limited tables, not {table_name!r}")
+    """Single statement for docs/ops RE-APPLY GRANT (tables that forbid table-wide SELECT)."""
+    if table_name not in READER_OPS_COLUMN_ALLOWLIST:
+        raise ValueError(f"no ops column allow-list for {table_name!r}")
     cols = READER_OPS_COLUMN_ALLOWLIST[table_name]
     return reader_grant_select_sql(f'"{table_name}"', role, cols)

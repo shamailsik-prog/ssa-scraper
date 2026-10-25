@@ -34,7 +34,7 @@ refuse_unsafe_database_url(os.environ["DATABASE_URL"])
 from scraper.database import init_db, engine
 from scraper.config import settings
 from scraper.models import CONTRACT_TABLES
-from scraper.reader_grants import READER_COLUMN_LIMITED_TABLES, READER_OPS_COLUMN_ALLOWLIST
+from scraper.reader_grants import READER_OPS_COLUMN_ALLOWLIST
 import asyncpg
 
 async def main():
@@ -46,7 +46,7 @@ async def main():
     conn = await asyncpg.connect(dsn)
     try:
         for t in CONTRACT_TABLES:
-            if t in READER_COLUMN_LIMITED_TABLES:
+            if t in READER_OPS_COLUMN_ALLOWLIST:
                 cols = ", ".join(f'"{c}"' for c in READER_OPS_COLUMN_ALLOWLIST[t])
                 await conn.fetch(f'SELECT {cols} FROM "{t}" LIMIT 1')
             else:
