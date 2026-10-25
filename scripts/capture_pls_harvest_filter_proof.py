@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "pls_harvest_filter_proof"
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "pls_keyword_filter_capture_20261025"
 
 
 def _main_sha() -> str:
