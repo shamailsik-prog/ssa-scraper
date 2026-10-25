@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from typing import Any, Dict, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 # Harvest ``keyword`` split tokens submit to the party text box on the live dashboard.
 DEFAULT_HARVEST_ROLE_ALIASES: Dict[str, str] = {
@@ -92,6 +95,14 @@ def apply_harvest_query_keyword(values: Dict[str, str], search_map: Dict[str, An
         values[role] = str(kw)
         if role != "keyword":
             values.pop("keyword", None)
+    else:
+        logger.warning(
+            "PLS harvest keyword split %r not submitted: no party/keyword control on search map "
+            "(map_version=%s fields=%s)",
+            kw,
+            search_map.get("map_version"),
+            sorted((search_map.get("fields") or {}).keys()),
+        )
 
 
 def apply_harvest_party_initial(values: Dict[str, str], search_map: Dict[str, Any], query_json: Dict[str, Any]) -> None:

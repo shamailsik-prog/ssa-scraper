@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scraper.pls_search_harvest_core import (
     build_harvest_form_values,
+    is_capped,
     keyword_child_redundant_with_parent,
     split_oversized_query,
 )
@@ -71,7 +72,7 @@ def test_split_skips_keyword_when_party_control_not_expressible():
     assert kids == []
 
 
-def test_keyword_child_redundant_detector():
+def test_keyword_child_redundant_only_when_both_totals_equal():
     assert keyword_child_redundant_with_parent(
         parent_site_total=264,
         parent_rows_seen=264,
@@ -82,5 +83,43 @@ def test_keyword_child_redundant_detector():
         parent_site_total=264,
         parent_rows_seen=264,
         child_site_total=None,
-        child_rows_seen=210,
+        child_rows_seen=264,
     )
+    assert not keyword_child_redundant_with_parent(
+        parent_site_total=None,
+        parent_rows_seen=264,
+        child_site_total=264,
+        child_rows_seen=264,
+    )
+    assert not keyword_child_redundant_with_parent(
+        parent_site_total=264,
+        parent_rows_seen=264,
+        child_site_total=210,
+        child_rows_seen=264,
+    )
+
+
+def test_capped_child_must_not_use_redundant_skip_gate():
+    """Auditor H2: capped totals must reach split/failed, not skipped-as-redundant."""
+    cap = 500
+    parent_total = child_total = 500
+    assert keyword_child_redundant_with_parent(
+        parent_site_total=parent_total,
+        parent_rows_seen=500,
+        child_site_total=child_total,
+        child_rows_seen=500,
+    )
+    assert is_capped(child_total, 500, cap)
+    assert is_capped(parent_total, 500, cap)
+    # run_query only skips when neither side is capped
+    may_skip = (
+        not is_capped(child_total, 500, cap)
+        and not is_capped(parent_total, 500, cap)
+        and keyword_child_redundant_with_parent(
+            parent_site_total=parent_total,
+            parent_rows_seen=500,
+            child_site_total=child_total,
+            child_rows_seen=500,
+        )
+    )
+    assert may_skip is False

@@ -802,20 +802,27 @@ class SearchHarvestRunner:
             if not nxt:
                 if query_json.get("keyword") and query_row.parent_id:
                     parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
-                    if parent is not None and keyword_child_redundant_with_parent(
-                        parent_site_total=parent.site_total_results,
-                        parent_rows_seen=int(parent.rows_seen or 0),
-                        child_site_total=site_total,
-                        child_rows_seen=rows_seen,
-                    ):
-                        query_row.status = "skipped"
-                        query_row.last_error = (
-                            f"keyword letter {query_json['keyword']!r} did not narrow vs parent "
-                            f"(parent rows_seen={parent.rows_seen} site_total={parent.site_total_results}; "
-                            f"child rows_seen={rows_seen} site_total={site_total})"
-                        )[:1000]
-                        query_row.cursor_json = cursor_reset_for_done(cursor)
-                        break
+                    if parent is not None:
+                        child_capped = is_capped(site_total, rows_seen, cap)
+                        parent_capped = is_capped(
+                            parent.site_total_results,
+                            int(parent.rows_seen or 0),
+                            cap,
+                        )
+                        if not child_capped and not parent_capped and keyword_child_redundant_with_parent(
+                            parent_site_total=parent.site_total_results,
+                            parent_rows_seen=int(parent.rows_seen or 0),
+                            child_site_total=site_total,
+                            child_rows_seen=rows_seen,
+                        ):
+                            query_row.status = "skipped"
+                            query_row.last_error = (
+                                f"keyword letter {query_json['keyword']!r} did not narrow vs parent "
+                                f"(parent rows_seen={parent.rows_seen} site_total={parent.site_total_results}; "
+                                f"child rows_seen={rows_seen} site_total={site_total})"
+                            )[:1000]
+                            query_row.cursor_json = cursor_reset_for_done(cursor)
+                            break
                 if is_capped(site_total, rows_seen, cap):
                     # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
                     # loudly when nothing narrower can be expressed.

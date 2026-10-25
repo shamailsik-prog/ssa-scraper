@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 from scraper.config import KNOWN_REPORTERS
 from scraper.keys import fit_key
@@ -468,6 +471,11 @@ def split_oversized_query(
                 from scraper.search_form_roles import keyword_splits_expressible
 
                 if not keyword_splits_expressible(search_map):
+                    logger.warning(
+                        "PLS harvest skipping keyword split dimension: party/keyword control not expressible "
+                        "on search map (query=%s)",
+                        normalized,
+                    )
                     continue
             splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
             return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
@@ -481,13 +489,14 @@ def keyword_child_redundant_with_parent(
     child_site_total: Optional[int],
     child_rows_seen: int,
 ) -> bool:
-    """True when a keyword/party letter child returned the same volume as its parent (site substring match)."""
-    if parent_rows_seen <= 0:
+    """True when a keyword/party letter child has the same known site total as its parent.
+
+    Requires both parent and child ``site_total_results`` to be non-null and equal. If either total is
+    unknown, the child is not treated as redundant (never infer from ``rows_seen`` alone).
+    """
+    if parent_site_total is None or child_site_total is None:
         return False
-    if parent_site_total is not None and child_site_total is not None:
-        if int(child_site_total) == int(parent_site_total) and int(child_rows_seen) >= int(parent_rows_seen):
-            return True
-    return int(child_rows_seen) >= int(parent_rows_seen)
+    return int(child_site_total) == int(parent_site_total)
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
