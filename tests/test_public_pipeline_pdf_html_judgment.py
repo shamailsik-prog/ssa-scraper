@@ -57,7 +57,7 @@ async def test_html_judgment_accepted_from_pdf_shaped_url(db, source, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_empty_whitespace_body_retired(db, source, monkeypatch):
+async def test_empty_whitespace_body_deferred_with_backoff(db, source, monkeypatch):
     url = "http://127.0.0.1:9/caselaw/view-file/EMPTY"
     row = CrawlFrontier(
         source_name=source.source_name,
@@ -77,8 +77,10 @@ async def test_empty_whitespace_body_retired(db, source, monkeypatch):
     monkeypatch.setattr(pipeline, "fetch", fake_fetch)
 
     assert await pipeline._drain_one(row) == "ok"
-    assert row.status == "retired"
+    assert row.status == "pending"
     assert "empty document body" in (row.last_error or "")
+    assert row.next_run_at is not None
+    assert row.attempts == 1
 
 
 @pytest.mark.asyncio
@@ -150,3 +152,30 @@ async def test_requeue_pdf_miss_retired_dry_run_and_apply_undo(db, source):
     await db.refresh(row)
     assert row.status == "retired"
     assert row.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_body_retires_only_after_bounded_retries(db, source, monkeypatch):
+    url = "http://127.0.0.1:9/caselaw/view-file/EMPTY-RETRY"
+    row = CrawlFrontier(
+        source_name=source.source_name,
+        tier=0,
+        query_key=f"judgment:{url}",
+        query_json={"kind": "judgment", "url": url, "route": {"pdf_endpoint_kind": "view-file"}},
+        cursor_json={},
+        attempts=9,
+        priority=50,
+    )
+    db.add(row)
+    await db.flush()
+
+    async def fake_fetch(_url):
+        return _pdf_shaped_result("   ", url=url)
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    monkeypatch.setattr(pipeline, "fetch", fake_fetch)
+    assert await pipeline._drain_one(row) == "ok"
+    assert row.status == "retired"
+    assert row.attempts == 10
+    assert "empty document body" in (row.last_error or "")
+    assert "retired after 10 attempts" in (row.last_error or "")
