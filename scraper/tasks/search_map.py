@@ -109,7 +109,9 @@ async def active_map(db: AsyncSession, source_name: str) -> Optional[SearchFormM
 
 
 def map_as_dict(m: SearchFormMap) -> Dict[str, Any]:
-    return {
+    from scraper.search_form_roles import normalize_harvest_search_map
+
+    raw = {
         "fields": m.fields,
         "result_layout": m.result_layout,
         "page_size": m.page_size,
@@ -120,6 +122,9 @@ def map_as_dict(m: SearchFormMap) -> Dict[str, Any]:
         "map_version": m.map_version,
         "dom_hash": m.dom_hash,
     }
+    if m.source_name == "PakistanLawSite":
+        return normalize_harvest_search_map(raw)
+    return raw
 
 
 async def map_search_form(

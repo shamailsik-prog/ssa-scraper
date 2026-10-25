@@ -66,6 +66,7 @@ from scraper.pls_search_harvest_core import (
     iter_extended_plan_queries,
     page_continuity_gaps,
     split_oversized_query,
+    keyword_child_redundant_with_parent,
     unmapped_harvest_reason,
     years_for_plan,
 )
@@ -799,6 +800,22 @@ class SearchHarvestRunner:
                 query_row.status = "in_progress"
                 break
             if not nxt:
+                if query_json.get("keyword") and query_row.parent_id:
+                    parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
+                    if parent is not None and keyword_child_redundant_with_parent(
+                        parent_site_total=parent.site_total_results,
+                        parent_rows_seen=int(parent.rows_seen or 0),
+                        child_site_total=site_total,
+                        child_rows_seen=rows_seen,
+                    ):
+                        query_row.status = "skipped"
+                        query_row.last_error = (
+                            f"keyword letter {query_json['keyword']!r} did not narrow vs parent "
+                            f"(parent rows_seen={parent.rows_seen} site_total={parent.site_total_results}; "
+                            f"child rows_seen={rows_seen} site_total={site_total})"
+                        )[:1000]
+                        query_row.cursor_json = cursor_reset_for_done(cursor)
+                        break
                 if is_capped(site_total, rows_seen, cap):
                     # A list that reaches the cap is truncated by the site: never complete. Narrow it, or fail it
                     # loudly when nothing narrower can be expressed.
@@ -809,6 +826,7 @@ class SearchHarvestRunner:
                         court_options=_court_options_from_map(search_map),
                         available_roles=set((search_map.get("fields") or {}).keys()) | {"court", "keyword"},
                         bench_options=[str(o) for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []],
+                        search_map=search_map,
                     )
                     if children:
                         await self._enqueue_split_children(query_row, children, int(site_total or rows_seen), cap)
@@ -866,6 +884,7 @@ class SearchHarvestRunner:
                                 for o in ((search_map.get("fields") or {}).get("bench") or {}).get("options") or []
                             ],
                             pagination_gap=True,
+                            search_map=search_map,
                         )
                     if split_children:
                         await self._enqueue_split_children(query_row, split_children, int(site_total), cap)

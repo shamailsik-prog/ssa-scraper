@@ -10,8 +10,61 @@ DEFAULT_HARVEST_ROLE_ALIASES: Dict[str, str] = {
     "keyword": "party",
 }
 
+_DASHBOARD_PARTY_CONTROL = {
+    "name": "Citation_Party_Search_input",
+    "selector": "#Citation_Party_Search_input",
+    "kind": "text",
+    "options": [],
+    "option_labels": [],
+}
+
+
+def _is_dashboard_citation_map(search_map: Dict[str, Any]) -> bool:
+    limits = search_map.get("limits") or {}
+    if limits.get("dashboard_citation_fields"):
+        return True
+    fields = search_map.get("fields") or {}
+    reporter = fields.get("reporter") or {}
+    year = fields.get("year") or {}
+    sel = f"{reporter.get('selector') or ''} {year.get('selector') or ''}"
+    return "Citation_Category_Search_dropdown" in sel or "Citation_Year_Search_input" in sel
+
+
+def _migrate_legacy_party_keyword_role(fields: Dict[str, Any]) -> None:
+    """Older maps labelled the party box as role ``keyword``; harvest splits expect ``party``."""
+    kw = fields.get("keyword") or {}
+    sel = str(kw.get("selector") or "")
+    if "party" in fields or "Citation_Party_Search_input" not in sel:
+        return
+    fields["party"] = dict(kw)
+    fields.pop("keyword", None)
+
+
+def normalize_harvest_search_map(search_map: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure dashboard harvest maps can submit party/keyword split letters to the live Citation Search form."""
+    out = deepcopy(search_map or {})
+    fields = dict(out.get("fields") or {})
+    fields.pop("_all", None)
+    _migrate_legacy_party_keyword_role(fields)
+    if _is_dashboard_citation_map(out) and "party" not in fields:
+        fields["party"] = dict(_DASHBOARD_PARTY_CONTROL)
+    limits = dict(out.get("limits") or {})
+    aliases = dict(limits.get("harvest_role_aliases") or {})
+    aliases.update(enrich_fields_with_harvest_aliases(fields))
+    if aliases:
+        limits["harvest_role_aliases"] = aliases
+    out["fields"] = fields
+    out["limits"] = limits
+    return out
+
+
+def keyword_splits_expressible(search_map: Dict[str, Any]) -> bool:
+    """True when alphabet keyword children can be submitted to a physical control."""
+    return keyword_text_submit_role(search_map) is not None
+
 
 def keyword_text_submit_role(search_map: Dict[str, Any]) -> Optional[str]:
+    search_map = normalize_harvest_search_map(search_map)
     aliases = harvest_role_aliases(search_map)
     if aliases.get("keyword"):
         return aliases["keyword"]
