@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 from scraper.config import KNOWN_REPORTERS
 from scraper.keys import fit_key
@@ -123,9 +126,14 @@ def build_harvest_form_values(
     cursor: Dict[str, Any],
 ) -> Dict[str, str]:
     """Map a harvest query onto search-form roles (extends tier frontier build_values)."""
-    from scraper.search_form_roles import apply_harvest_party_initial, apply_harvest_query_keyword
+    from scraper.search_form_roles import (
+        apply_harvest_party_initial,
+        apply_harvest_query_keyword,
+        normalize_harvest_search_map,
+    )
     from scraper.tasks.pakistanlawsite import build_values
 
+    search_map = normalize_harvest_search_map(search_map)
     fill_map = _harvest_fill_search_map(search_map)
     fields = fill_map.get("fields") or {}
     tier_query = {k: query_json[k] for k in ("reporter", "year", "statute", "section", "keyword") if k in query_json}
@@ -165,9 +173,10 @@ def build_harvest_form_values(
 
 
 def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, Any], cursor: Dict[str, Any]) -> Optional[str]:
-    from scraper.search_form_roles import resolve_harvest_fields
+    from scraper.search_form_roles import normalize_harvest_search_map, resolve_harvest_fields
     from scraper.tasks.pakistanlawsite import unmapped_query_reason
 
+    search_map = normalize_harvest_search_map(search_map)
     express_fields = resolve_harvest_fields(search_map)
     express_map = dict(search_map)
     express_map["fields"] = express_fields
@@ -433,6 +442,7 @@ def split_oversized_query(
     available_roles: Optional[Iterable[str]] = None,
     bench_options: Sequence[str] = (),
     pagination_gap: bool = False,
+    search_map: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """A result list that reaches the site's cap is NOT complete. Return narrower child queries, narrowing by the
     first dimension of SPLIT_ORDER (month, court, bench, party first letter, keyword) that the parent has not
@@ -457,9 +467,36 @@ def split_oversized_query(
         if dim == "party_initial" and "party_initial" in roles:
             return [normalize_query_json({**normalized, "party_initial": ch}) for ch in _ALPHA_KEYWORD_SPLITS]
         if dim == "keyword":
+            if search_map is not None:
+                from scraper.search_form_roles import keyword_splits_expressible
+
+                if not keyword_splits_expressible(search_map):
+                    logger.warning(
+                        "PLS harvest skipping keyword split dimension: party/keyword control not expressible "
+                        "on search map (query=%s)",
+                        normalized,
+                    )
+                    continue
             splits = list(keyword_splits or _ALPHA_KEYWORD_SPLITS)
             return [normalize_query_json({**normalized, "keyword": kw}) for kw in splits]
     return []
+
+
+def keyword_child_redundant_with_parent(
+    *,
+    parent_site_total: Optional[int],
+    parent_rows_seen: int,
+    child_site_total: Optional[int],
+    child_rows_seen: int,
+) -> bool:
+    """True when a keyword/party letter child has the same known site total as its parent.
+
+    Requires both parent and child ``site_total_results`` to be non-null and equal. If either total is
+    unknown, the child is not treated as redundant (never infer from ``rows_seen`` alone).
+    """
+    if parent_site_total is None or child_site_total is None:
+        return False
+    return int(child_site_total) == int(parent_site_total)
 
 
 def is_capped(site_total: Optional[int], rows_seen: int, result_cap: int) -> bool:
