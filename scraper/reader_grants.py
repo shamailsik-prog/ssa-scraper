@@ -59,8 +59,18 @@ def reader_forbids_table_wide_select(table_name: str, column_names: Iterable[str
 
 
 def reader_select_columns(table_name: str, column_names: Iterable[str]) -> tuple[str, ...]:
-    """Columns the reader role may SELECT (metadata/id/status; no blobs or embeddings)."""
-    allowed = tuple(c for c in column_names if not is_reader_blocked_column(c))
+    """Grant only explicitly reviewed metadata columns; unknown schema changes fail closed.
+
+    A deny-list alone silently grants newly added content columns with unfamiliar
+    names. The frozen operational allow-list is the upper bound on SQL access.
+    """
+    reviewed = READER_OPS_COLUMN_ALLOWLIST.get(table_name)
+    if reviewed is None:
+        raise ValueError(f"no explicit reader column allow-list for {table_name!r}")
+    permitted = set(reviewed)
+    allowed = tuple(
+        c for c in column_names if c in permitted and not is_reader_blocked_column(c)
+    )
     if not allowed:
         raise ValueError(f"no reader-selectable columns left on {table_name!r}")
     return allowed
