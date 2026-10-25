@@ -71,6 +71,7 @@ os.environ.pop("DB_LOCK_ON_CATALOG", None)
 os.environ["DATABASE_NULL_POOL"] = "1"
 os.environ["SIKANDER_READER_PASSWORD"] = "reader-demote-a"
 os.environ["CORPUS_WRITER_PASSWORD"] = ""
+os.environ["CORPUS_API_READER_PASSWORD"] = ""
 os.environ["SIKANDER_READER_ROLE"] = os.environ["PROBE_READER_ROLE"]
 from sqlalchemy import text
 from scraper.database import ensure_roles, init_db, engine
@@ -91,6 +92,7 @@ async def main():
 asyncio.run(main())
 """
         env = os.environ.copy()
+        env["CORPUS_API_READER_PASSWORD"] = ""
         env["PROBE_DATABASE_URL"] = url
         env["PROBE_READER_ROLE"] = reader_role
         try:
@@ -167,6 +169,7 @@ os.environ.pop("DB_LOCK_ON_CATALOG", None)
 os.environ["DATABASE_NULL_POOL"] = "1"
 os.environ["SIKANDER_READER_PASSWORD"] = "readerpw"
 os.environ["CORPUS_WRITER_PASSWORD"] = "writerpw"
+os.environ["CORPUS_API_READER_PASSWORD"] = ""
 os.environ["CORPUS_WRITER_ROLE"] = os.environ["PROBE_WRITER_ROLE"]
 os.environ["SIKANDER_READER_ROLE"] = os.environ["PROBE_READER_ROLE"]
 from scraper.database import ensure_roles, init_db, engine
@@ -177,6 +180,7 @@ async def main():
 asyncio.run(main())
 """
         env = os.environ.copy()
+        env["CORPUS_API_READER_PASSWORD"] = ""
         env["PROBE_DATABASE_URL"] = url
         env["PROBE_WRITER_ROLE"] = writer_role
         env["PROBE_READER_ROLE"] = reader_role
@@ -249,6 +253,7 @@ os.environ.pop("DB_LOCK_ON_CATALOG", None)
 os.environ["DATABASE_NULL_POOL"] = "1"
 os.environ["SIKANDER_READER_PASSWORD"] = "readerpw"
 os.environ["CORPUS_WRITER_PASSWORD"] = "writerpw"
+os.environ["CORPUS_API_READER_PASSWORD"] = ""
 os.environ["CORPUS_WRITER_ROLE"] = os.environ["PROBE_WRITER_ROLE"]
 os.environ["SIKANDER_READER_ROLE"] = os.environ["PROBE_READER_ROLE"]
 from scraper.database import ensure_roles, engine
@@ -258,6 +263,7 @@ async def main():
 asyncio.run(main())
 """
         env = os.environ.copy()
+        env["CORPUS_API_READER_PASSWORD"] = ""
         env["PROBE_DATABASE_URL"] = url
         env["PROBE_WRITER_ROLE"] = writer_role
         env["PROBE_READER_ROLE"] = reader_role
@@ -361,6 +367,7 @@ os.environ.pop("DB_LOCK_ON_CATALOG", None)
 os.environ["DATABASE_NULL_POOL"] = "1"
 os.environ["SIKANDER_READER_PASSWORD"] = "reader-demote-a"
 os.environ["CORPUS_WRITER_PASSWORD"] = ""
+os.environ["CORPUS_API_READER_PASSWORD"] = ""
 os.environ["SIKANDER_READER_ROLE"] = os.environ["PROBE_READER_ROLE"]
 from sqlalchemy import text
 from scraper.database import ensure_roles, init_db, engine
@@ -381,6 +388,7 @@ async def main():
 asyncio.run(main())
 '''
         env = os.environ.copy()
+        env["CORPUS_API_READER_PASSWORD"] = ""
         env["PROBE_DATABASE_URL"] = url
         env["PROBE_READER_ROLE"] = reader_role
         try:

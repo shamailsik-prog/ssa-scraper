@@ -17,12 +17,12 @@ tools need. Nothing in it writes to the database.
 - **Its own key.** Every request sends `X-Corpus-Key: <CORPUS_API_KEY>`. The admin key does not work here,
   so the agent never holds admin power. Repeated wrong keys from one address are refused for five minutes.
   They are counted separately from wrong admin keys, so a misconfigured agent cannot lock you out of `/admin`.
-- **Its own login.** Every query runs as the `corpus_writer` role in a read-only transaction with a
-  15-second time limit, so a heavy search cannot hold the database. Direct SQL uses `sikander_reader`,
-  which has column-level SELECT only on content tables (no `full_text` / staging blobs); see
-  `docs/CHANGES.md`.
+- **Its own login.** Every query runs as the `corpus_api_reader` role (not `corpus_writer`) in a
+  read-only transaction with a 15-second time limit. That role has table-wide SELECT on contract tables
+  only; internal tables are revoked. Direct SQL for analysts uses `sikander_reader` (column-limited);
+  see `docs/CHANGES.md`.
 - **Off by default.** With `CORPUS_API_KEY` blank, the API answers `503 not configured`. It also needs
-  `CORPUS_WRITER_PASSWORD`, which every install sets.
+  `CORPUS_API_READER_PASSWORD`, which every install sets.
 
 ## Turning it on
 

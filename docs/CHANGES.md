@@ -12,6 +12,14 @@ Never run table-wide `GRANT SELECT ON public.judgment` (or `instrument`, `source
 
 Preferred: restart the `api` service so `ensure_roles()` runs on startup (`init_db`).
 
+**Staging tables:** `ensure_roles()` does **not** grant `sikander_reader` any access to
+`scraper_staging` / `statutes_staging` (internal tables stay REVOKEd). Stall-watch, promotion
+metrics, and `/status` read staging through `corpus_writer` inside the app. The manual SQL below
+for `scraper_staging` is for exceptional ops re-grants only, not the default role shape.
+
+**Corpus HTTP API:** `/corpus/v1` uses the separate `corpus_api_reader` role (table-wide SELECT on
+contract tables only). It is not `corpus_writer` and cannot read internal tables.
+
 Manual SQL (replace role name if customised):
 
 ```sql

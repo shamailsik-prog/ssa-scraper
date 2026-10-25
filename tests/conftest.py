@@ -40,6 +40,7 @@ os.environ["ENCRYPTION_KEY"] = os.environ.get("ENCRYPTION_KEY") or Fernet.genera
 os.environ["ADMIN_API_KEY"] = "test-admin-key"
 os.environ["SIKANDER_READER_PASSWORD"] = os.environ.get("SIKANDER_READER_PASSWORD") or "readerpw"
 os.environ["CORPUS_WRITER_PASSWORD"] = os.environ.get("CORPUS_WRITER_PASSWORD") or "writerpw"
+os.environ["CORPUS_API_READER_PASSWORD"] = os.environ.get("CORPUS_API_READER_PASSWORD") or "corpusapipw"
 os.environ["ENVIRONMENT"] = "chambers"
 os.environ["ALLOW_LOGIN_SCRAPING"] = "true"
 os.environ["APP_ENV"] = "development"

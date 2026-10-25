@@ -8,8 +8,8 @@ section. Nothing here writes.
 
 * Its own key: X-Corpus-Key = CORPUS_API_KEY, never the admin key, so the agent holds no admin power.
   Repeated wrong keys from one address are refused for a while, counted apart from /admin's.
-* Its own login: every query runs as the corpus_writer role in a read-only transaction with a statement
-  time limit (the sikander_reader role is column-limited for direct SQL and cannot read full text).
+* Its own login: every query runs as the corpus_api_reader role in a read-only transaction with a statement
+  time limit (distinct from corpus_writer; sikander_reader is column-limited for direct SQL).
 """
 
 from __future__ import annotations
@@ -48,10 +48,10 @@ def _engine() -> AsyncEngine:
     connection must never cross event loops."""
     global _reader_engine
     if _reader_engine is None:
-        password = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
+        password = settings.CORPUS_API_READER_PASSWORD.get_secret_value()
         if not password:
-            raise HTTPException(status_code=503, detail="corpus API not configured: CORPUS_WRITER_PASSWORD is blank")
-        url = make_url(settings.DATABASE_URL).set(username=settings.CORPUS_WRITER_ROLE, password=password)
+            raise HTTPException(status_code=503, detail="corpus API not configured: CORPUS_API_READER_PASSWORD is blank")
+        url = make_url(settings.DATABASE_URL).set(username=settings.CORPUS_API_READER_ROLE, password=password)
         _reader_engine = create_async_engine(
             url,
             poolclass=NullPool,

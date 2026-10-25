@@ -4,10 +4,11 @@ Async engine, session factory, migration runner, database roles and seed data.
 Roles (Amendment §0, Cursor command):
   * corpus_writer  — the service role (the only writer). Created when CORPUS_WRITER_PASSWORD is set.
   * sikander_reader — read-only role for direct SQL / least-privilege access. SELECT on contract
-    tables only; tables with content columns (judgment, instrument, source_provenance, …) get
-    column-level grants (metadata/id/status), never table-wide. Internal tables are REVOKEd.
-    The HTTP corpus API uses corpus_writer in a read-only transaction instead. Created when
-    SIKANDER_READER_PASSWORD is set; otherwise the dashboard shows NOT CONFIGURED.
+    tables only; tables with content columns get column-level grants (metadata/id/status).
+    Internal tables (including scraper_staging) are REVOKEd; stall-watch and /status use
+    corpus_writer, not this role. Created when SIKANDER_READER_PASSWORD is set.
+  * corpus_api_reader — read-only role for the HTTP /corpus/v1 API only: table-wide SELECT on
+    contract tables, internal tables REVOKEd. Created when CORPUS_API_READER_PASSWORD is set.
 """
 
 from __future__ import annotations
@@ -330,7 +331,7 @@ async def _connection_is_superuser(conn) -> bool:
     return bool(row.scalar())
 
 
-async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> None:
+async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str, *, rolname: str) -> None:
     """Rotate password and align reader safety attributes; idempotent ALTER fragments only."""
     row = (
         await conn.execute(
@@ -339,7 +340,7 @@ async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> Non
                 "rolreplication, rolbypassrls "
                 "FROM pg_roles WHERE rolname = :r"
             ),
-            {"r": settings.SIKANDER_READER_ROLE},
+            {"r": rolname},
         )
     ).one()
     current = {col: bool(row[i]) for i, col in enumerate(_READER_ROLE_BOOL_COLS)}
@@ -359,7 +360,7 @@ async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> Non
             continue
         if not want and col in _SUPERUSER_ONLY_READER_DEMOTE_COLS and not caller_super:
             raise RoleAttributeChangeRequiresSuperuserError(
-                f"cannot set {attr_tokens[col][1]} on {settings.SIKANDER_READER_ROLE!r}: "
+                f"cannot set {attr_tokens[col][1]} on {rolname!r}: "
                 "connected role is not a superuser"
             )
         clauses.append(attr_tokens[col][0] if want else attr_tokens[col][1])
@@ -367,7 +368,7 @@ async def _alter_reader_role_login(conn, role_ident: str, reader_pw: str) -> Non
 
 
 async def ensure_roles() -> dict:
-    """Create/refresh corpus_writer and sikander_reader. Idempotent; safe to call on every start."""
+    """Create/refresh corpus_writer, sikander_reader, and corpus_api_reader. Idempotent."""
     return await _ensure_roles_locked()
 
 
@@ -387,10 +388,64 @@ async def _public_table_column_names(conn, table: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+async def _bootstrap_safe_reader_role(lock_conn, rolename: str, password: str) -> str:
+    role_ident = _quote_ident(rolename)
+    exists = (await lock_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": rolename})).scalar()
+    if not exists:
+        await lock_conn.execute(
+            text(
+                f"CREATE ROLE {role_ident} LOGIN PASSWORD {_pg_literal(password)} "
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
+                "NOREPLICATION NOBYPASSRLS"
+            )
+        )
+    else:
+        await _alter_reader_role_login(lock_conn, role_ident, password, rolname=rolename)
+    return role_ident
+
+
+async def _revoke_reader_baseline(lock_conn, role_ident: str, dbname: str) -> None:
+    await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role_ident}"))
+    await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role_ident}"))
+    await lock_conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role_ident}"))
+    await lock_conn.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role_ident}"))
+    await lock_conn.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role_ident}"))
+    await lock_conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role_ident}"))
+
+
+async def _grant_sikander_reader_contract(lock_conn, role_ident: str) -> None:
+    from scraper.models import CONTRACT_TABLES
+
+    for t in CONTRACT_TABLES:
+        qt = _quote_ident(t)
+        live_cols = await _public_table_column_names(lock_conn, t)
+        if reader_forbids_table_wide_select(t, live_cols):
+            cols = reader_select_columns(t, live_cols)
+            await lock_conn.execute(text(reader_grant_select_sql(qt, role_ident, cols)))
+        else:
+            await lock_conn.execute(text(f"GRANT SELECT ON TABLE {qt} TO {role_ident}"))
+
+
+async def _grant_corpus_api_reader_contract(lock_conn, role_ident: str) -> None:
+    from scraper.models import CONTRACT_TABLES
+
+    for t in CONTRACT_TABLES:
+        qt = _quote_ident(t)
+        await lock_conn.execute(text(f"GRANT SELECT ON TABLE {qt} TO {role_ident}"))
+
+
+async def _revoke_internal_from_reader(lock_conn, role_ident: str) -> None:
+    from scraper.models import INTERNAL_TABLES
+
+    for t in INTERNAL_TABLES:
+        await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {role_ident}"))
+
+
 async def _apply_role_grants(lock_conn, status: dict) -> None:
-    from scraper.models import CONTRACT_TABLES, INTERNAL_TABLES
+    from scraper.models import INTERNAL_TABLES
 
     reader_pw = settings.SIKANDER_READER_PASSWORD.get_secret_value()
+    api_reader_pw = settings.CORPUS_API_READER_PASSWORD.get_secret_value()
     writer_pw = settings.CORPUS_WRITER_PASSWORD.get_secret_value()
     await _pg_advisory_xact_lock(lock_conn, PG_ADVISORY_ROLE_SETUP_KEY1, PG_ADVISORY_ROLE_SETUP_KEY2)
     dbname = (await lock_conn.execute(text("SELECT current_database()"))).scalar()
@@ -407,41 +462,23 @@ async def _apply_role_grants(lock_conn, status: dict) -> None:
         await lock_conn.execute(text(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role}"))
         status["writer"] = "CONFIGURED"
     if reader_pw:
-        role = _quote_ident(settings.SIKANDER_READER_ROLE)
-        exists = (await lock_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:r"), {"r": settings.SIKANDER_READER_ROLE})).scalar()
-        if not exists:
-            await lock_conn.execute(
-                text(
-                    f"CREATE ROLE {role} LOGIN PASSWORD {_pg_literal(reader_pw)} "
-                    "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
-                    "NOREPLICATION NOBYPASSRLS"
-                )
-            )
-        else:
-            await _alter_reader_role_login(lock_conn, role, reader_pw)
-        await lock_conn.execute(text(f"GRANT CONNECT ON DATABASE {_quote_ident(dbname)} TO {role}"))
-        await lock_conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-        await lock_conn.execute(text(f"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"))
-        await lock_conn.execute(text(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}"))
-        await lock_conn.execute(text(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role}"))
-        await lock_conn.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {role}"))
-        for t in CONTRACT_TABLES:
-            qt = _quote_ident(t)
-            live_cols = await _public_table_column_names(lock_conn, t)
-            if reader_forbids_table_wide_select(t, live_cols):
-                cols = reader_select_columns(t, live_cols)
-                await lock_conn.execute(text(reader_grant_select_sql(qt, role, cols)))
-            else:
-                await lock_conn.execute(text(f"GRANT SELECT ON TABLE {qt} TO {role}"))
-        for t in INTERNAL_TABLES:
-            await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM {role}"))
-        for t in INTERNAL_TABLES:
-            await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM PUBLIC"))
+        role = await _bootstrap_safe_reader_role(lock_conn, settings.SIKANDER_READER_ROLE, reader_pw)
+        await _revoke_reader_baseline(lock_conn, role, dbname)
+        await _grant_sikander_reader_contract(lock_conn, role)
+        await _revoke_internal_from_reader(lock_conn, role)
         status["reader"] = "CONFIGURED"
+    if api_reader_pw:
+        api_role = await _bootstrap_safe_reader_role(lock_conn, settings.CORPUS_API_READER_ROLE, api_reader_pw)
+        await _revoke_reader_baseline(lock_conn, api_role, dbname)
+        await _grant_corpus_api_reader_contract(lock_conn, api_role)
+        await _revoke_internal_from_reader(lock_conn, api_role)
+        status["corpus_api_reader"] = "CONFIGURED"
+    for t in INTERNAL_TABLES:
+        await lock_conn.execute(text(f"REVOKE ALL ON TABLE {_quote_ident(t)} FROM PUBLIC"))
 
 
 async def _ensure_roles_locked() -> dict:
-    status = {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED"}
+    status = {"reader": "NOT CONFIGURED", "writer": "NOT CONFIGURED", "corpus_api_reader": "NOT CONFIGURED"}
     lock_url = _advisory_lock_database_url()
     use_catalog = lock_url != str(settings.DATABASE_URL)
     lock_engine = create_async_engine(lock_url, **_engine_kwargs()) if use_catalog else engine
