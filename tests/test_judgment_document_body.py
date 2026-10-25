@@ -38,6 +38,37 @@ satisfaction of the trial court. Notice to the complainant. Case adjourned to 15
     )
 
 
+def _shc_order_sheet_crlf_wrapped_word_html() -> str:
+    """Word export hard-wraps ORDER/SHEET and court headers across line breaks (SHC view-file)."""
+    lines = [
+        "ORDER",
+        "SHEET",
+        "IN",
+        "THE HIGH COURT OF SINDH AT KARACHI",
+        "Criminal Bail Application No. S-748 of 2024",
+        "Applicant: Muhammad Ali",
+        "V/S",
+        "The State through SHO Police Station Garden",
+        "Present: Mr. Ahmed Khan, Advocate for the applicant.",
+        "Mr. Public Prosecutor for the State.",
+        "Heard. The applicant is in custody since 12-01-2024 in case FIR No. 45/2024.",
+        "After hearing learned counsel and perusing the record, ad-interim bail is granted subject to",
+        "furnishing solvent surety in the sum of Rs. 200,000/- and P.R. bond in the like amount to the",
+        "satisfaction of the trial court. Notice to the complainant. Case adjourned to 15-04-2024.",
+        "Copy to be supplied to both sides. Office is directed to communicate this order forthwith.",
+    ]
+    inner = "<br/>\r\n".join(lines)
+    mso_pad = (
+        '<p class="MsoNormal"><span style="font-size:11.0pt">&#160;</span></p>' * 80
+    )
+    return (
+        '<html xmlns:o="urn:schemas-microsoft-com:office:office">'
+        '<head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">'
+        "</head><body>"
+        f"<div>{inner}</div>{mso_pad}</body></html>"
+    )
+
+
 def _shc_circuit_court_word_html() -> str:
     body_text = """
 IN THE HIGH COURT OF SINDH CIRCUIT COURT, LARKANA
@@ -59,6 +90,27 @@ def test_order_sheet_word_html_has_marker_without_judgment_keyword():
     assert "judgment" not in html.lower()
     assert html_body_has_judgment_marker(html)
     assert html_judgment_word_count(html) < 200
+
+
+def test_crlf_wrapped_order_sheet_has_strong_marker_without_judgment_keyword():
+    html = _shc_order_sheet_crlf_wrapped_word_html()
+    assert "judgment" not in html.lower()
+    assert "Versus" not in html
+    assert html_body_has_judgment_marker(html)
+    wc = html_judgment_word_count(html)
+    assert 50 <= wc < 200
+
+
+def test_classify_crlf_wrapped_order_sheet_word_html_as_html_judgment():
+    html = _shc_order_sheet_crlf_wrapped_word_html()
+    res = FetchResult(
+        url="https://caselaw.shc.gov.pk/caselaw/view-file/CRLF-TOKEN",
+        final_url="https://caselaw.shc.gov.pk/caselaw/view-file/CRLF-TOKEN",
+        status_code=200,
+        content=html.encode("windows-1252"),
+        content_type="application/pdf",
+    )
+    assert classify_pdf_endpoint_body(res) == "html_judgment"
 
 
 def test_classify_order_sheet_word_html_as_html_judgment():
