@@ -109,8 +109,10 @@ async def test_pdf_signature_gate_retires_non_pdf_judgment_url(db, fixture_serve
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_fsc_alljud_table_window_adds_result_metadata_with_bounded_fanout(db, fixture_server):
@@ -231,12 +233,14 @@ async def test_fsc_orders_table_non_pdf_is_retired_with_route_metadata(db, fixtu
         )
     ).scalars().first()
     assert row is not None
-    assert row.status == "retired"
+    assert row.status == "pending"
     assert row.query_json["route"]["listing_fetch"] == "result_table"
     assert row.query_json["route"]["result_table_kind"] == "orders"
     assert row.query_json["route"]["result_order_date"] == "13.06.2020"
     assert row.query_json["route"]["pdf_endpoint_kind"] == "orders-upload"
+    assert "HTTP 200" in (row.last_error or "")
     assert "missing %PDF signature" in (row.last_error or "")
+    assert row.next_run_at is not None
 
 
 async def test_fsc_alljud_rerun_is_idempotent_without_duplicate_frontier_keys(db, fixture_server):
