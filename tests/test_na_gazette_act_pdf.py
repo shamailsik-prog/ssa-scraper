@@ -109,6 +109,21 @@ def test_strip_gazette_page_break_preserves_substantive_gazette_citation():
     assert "published in the Gazette of Pakistan" in cleaned
 
 
+def test_strip_gazette_page_break_preserves_extraordinary_part_i_wrapped_citation():
+    citation = (
+        "the Gazette of Pakistan, Extraordinary, Part I, and shall take effect forthwith."
+    )
+    body = f"9. Commencement.- (3) Notification in {citation}"
+    cleaned = strip_gazette_page_break_lines(body)
+    assert citation in cleaned
+
+
+def test_strip_gazette_page_break_preserves_dated_gazette_repeal_citation():
+    citation = "The Gazette of Pakistan dated 5th March 2020 is repealed."
+    cleaned = strip_gazette_page_break_lines(citation)
+    assert cleaned.strip() == citation
+
+
 def test_strip_gazette_page_break_removes_header_shaped_lines():
     body = (
         "18. Cognizance.- No court shall take cognizance.\n"

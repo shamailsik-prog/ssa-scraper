@@ -17,17 +17,19 @@ from scraper.parsers.statute_parser import (
 _GAZETTE_NAME_RE = re.compile(
     r"(?i)\bTHE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE|GAZETIE)\s+OF\s+PAKISTAN\b",
 )
-GAZETTE_PAGE_HEADER_FRAGMENT_RE = re.compile(
+_GAZETTE_HEADER_DATE_RE = re.compile(
     r"(?i)(?:"
-    r"THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE|GAZETIE)\s+OF\s+PAKISTAN[^\n]{0,200}?(?:EXTRA|OCT\.?)"
-    r"|^\s*\d{1,4}\s+THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN"
-    r"|^\s*\[?\s*PART\s*I\b"
+    r"\bOCT\.?\s*\d{1,2}\s*,?\s*\d{4}"
+    r"|EXTRA\.?\s*,?\s*OCT\.?"
+    r"|OCT\.?\s*\[?\s*PART\s*I"
+    r"|\d{1,2},\d{4}\s*(?:\[?\s*PART\s*I)?\s*$"
     r")"
 )
-GAZETTE_PAGE_LINE_RE = re.compile(
-    r"(?i)^\s*(?:\d{1,2},\d{4}\s*)?(?:\d{1,4}\s+)?THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN\b.*$",
+_OCR_GAZETTE_PAGE_AT_START_RE = re.compile(
+    r"(?i)^\s*(?:\d{1,4}\s+THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)|\d[a-z0-9]\d\s+)"
 )
-GAZETTE_PART_FRAGMENT_RE = re.compile(r"(?i)^\s*\[?\s*PART\s*I\b[^\n]{0,40}$")
+_OCR_GAZETTE_PAGE_AT_END_RE = re.compile(r"(?i)\b\d[a-z0-9]\d\s*$")
+_PART_STUB_LINE_RE = re.compile(r"(?i)^\[PART\s*$")
 
 ASSEMBLY_SOURCE_NAMES = frozenset(
     {
@@ -88,7 +90,7 @@ def contains_gazette_page_header_fragment(text: str) -> bool:
     for line in text.splitlines():
         if _is_gazette_page_header_line(line.strip()):
             return True
-    return bool(GAZETTE_PAGE_HEADER_FRAGMENT_RE.search(text))
+    return False
 
 
 def _is_substantive_gazette_citation_line(stripped: str) -> bool:
@@ -99,7 +101,22 @@ def _is_substantive_gazette_citation_line(stripped: str) -> bool:
         return True
     if re.search(r"(?i)\bevery\s+rule\b.*\bGazette\s+of\s+Pakistan\b", stripped):
         return True
+    if re.search(
+        r"(?i)\bGazette\s+of\s+Pakistan,\s*Extraordinary,\s*Part\s+I,\s*and\s+shall\s+take\s+effect\b",
+        stripped,
+    ):
+        return True
+    if re.search(r"(?i)\bGazette\s+of\s+Pakistan\s+dated\b.*\bis\s+repealed\b", stripped):
+        return True
     return False
+
+
+def _has_gazette_header_date(stripped: str) -> bool:
+    return bool(_GAZETTE_HEADER_DATE_RE.search(stripped))
+
+
+def _has_ocr_gazette_page_number_at_edge(stripped: str) -> bool:
+    return bool(_OCR_GAZETTE_PAGE_AT_START_RE.match(stripped) or _OCR_GAZETTE_PAGE_AT_END_RE.search(stripped))
 
 
 def _is_gazette_page_header_line(stripped: str) -> bool:
@@ -107,23 +124,15 @@ def _is_gazette_page_header_line(stripped: str) -> bool:
         return False
     if re.fullmatch(r"\d{1,2},\d{4}", stripped):
         return True
-    if GAZETTE_PART_FRAGMENT_RE.match(stripped):
+    if _PART_STUB_LINE_RE.match(stripped):
         return True
     if _is_substantive_gazette_citation_line(stripped):
         return False
-    if GAZETTE_PAGE_LINE_RE.match(stripped):
-        return True
     if not _GAZETTE_NAME_RE.search(stripped):
         return False
     if len(stripped) > 280:
         return False
-    if re.search(r"(?i)\b(?:EXTRA|OCT\.?|PUBLISHED\s+BY\s+AUTHORITY)\b", stripped):
-        return True
-    if re.search(r"(?i)\bPART\s*I\b", stripped):
-        return True
-    if re.match(r"(?i)^\s*\d{1,4}\s+THE\s+", stripped):
-        return True
-    return len(stripped) <= 100 and re.match(r"(?i)^(?:\d{1,4}\s+)?THE\s+", stripped)
+    return _has_gazette_header_date(stripped) or _has_ocr_gazette_page_number_at_edge(stripped)
 
 
 def normalize_assembly_gazette_pdf_text(text: str) -> str:
