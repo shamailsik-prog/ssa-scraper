@@ -2097,6 +2097,19 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
     sections = data.get("sections") or []
     parseable_sections = _parseable_statute_sections(sections)
     evidence = data.get("field_evidence") or {}
+    if evidence.get("bundled_gazette_unresolved"):
+        await _quarantine(
+            db,
+            st,
+            "bundled_gazette_unresolved: PDF has several ACT No. boundaries and the target act was not isolated",
+            "statute",
+            {
+                "reason_code": "bundled_gazette_unresolved",
+                "statute_name": name[:280],
+                "bundled_gazette_unresolved": str(evidence.get("bundled_gazette_unresolved"))[:200],
+            },
+        )
+        return "quarantined"
     if st.source_name == "PakistanCode":
         # Every PakistanCode statute is read against its own table of contents (statute_contents.py);
         # only a statute whose title matched and whose listed sections were all found with real text
