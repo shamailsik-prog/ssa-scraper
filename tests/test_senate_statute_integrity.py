@@ -268,6 +268,167 @@ def test_ocr_garbled_same_act_is_match_not_quarantined(stored, pdf_title, year, 
     assert result.needs_reextract is False
 
 
+PCSIR_NAME = "Pakistan Council of Scientific and Industrial Research Act, 1973"
+PCSIR_OCR_TITLE = "Pakistan Councll of Sclentific and Industrlal Research Act, 1973"
+_PCSIR_BODY = (
+    "The Council shall promote scientific and industrial research and shall "
+    "establish laboratories and institutes for that purpose throughout Pakistan."
+)
+
+
+def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
+    """#364 selects the segment once the title is OCR-same, then roman 30 vs 31 quarantines it.
+
+    The printed act number is a fragile OCR compare. It must not force MISMATCH
+    when the short title already agrees.
+    """
+    assert title_relation(PCSIR_NAME, PCSIR_OCR_TITLE) == "same"
+    result = classify_senate_identity(
+        stored_name=PCSIR_NAME,
+        year_enacted=1973,
+        source_url="https://senate.gov.pk/uploads/documents/pcsir.pdf|XXX of 1973",
+        sections=[_section("3", _PCSIR_BODY)],
+        pdf_text=_called_act_pdf(PCSIR_OCR_TITLE, _PCSIR_BODY, act_no="XXXI of 1973"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
+def test_identical_title_one_roman_misread_keeps_year_section_match():
+    """A true title match plus roman 30 vs 31 still stays MATCH, and the year section is kept."""
+    stored = "Criminal Law Amendment (Special Court) Act, 1976"
+    body = (
+        "The special court shall try the scheduled offences listed in this Act "
+        "and shall record its judgment in writing before pronouncing sentence."
+    )
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=1976,
+        source_url="https://senate.gov.pk/uploads/documents/same-title.pdf|XVII of 1976",
+        sections=[_section("1976", body)],
+        pdf_text=_called_act_pdf(stored, body, act_no="XVIII of 1976"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" not in result.signals
+    assert "year_as_section_number" in result.signals
+
+
+@pytest.mark.parametrize(
+    ("stored", "year", "pipe_no", "pdf_no"),
+    [
+        ("Criminal Law Amendment (Special Court) Act, 1976", 1976, "XVII of 1976", "VII of 1976"),
+        ("West Pakistan Arms (Amendment) Act, 1974", 1974, "XX of 1974", "XI of 1974"),
+        ("Cantonments (Amendment) Act, 2015", 2015, "IV of 2015", "VI of 2015"),
+    ],
+)
+def test_identical_title_distant_act_number_stays_mismatch(stored, year, pipe_no, pdf_no):
+    """The same words do not excuse an act number that is more than one numeral off."""
+    body = (
+        "The special court shall try the scheduled offences listed in this Act "
+        "and shall record its judgment in writing before pronouncing sentence."
+    )
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=year,
+        source_url=f"https://senate.gov.pk/uploads/documents/same-title.pdf|{pipe_no}",
+        sections=[_section(str(year), body)],
+        pdf_text=_called_act_pdf(stored, body, act_no=pdf_no),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+    assert "year_as_section_number" in result.signals
+
+
+def test_main_act_versus_amendment_stays_mismatch_when_section_absent():
+    """Companies Act, 2017 is not Companies (Amendment) Act, 2017, even at XIX vs XV."""
+    stored = "Companies Act, 2017"
+    pdf_title = "Companies (Amendment) Act, 2017"
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/companies.pdf|XIX of 2017",
+        sections=[_section("2", _OCR_SECTION)],
+        pdf_text=_called_act_pdf(pdf_title, _LONG_OTHER_BODY, act_no="XV of 2017"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" in result.signals
+    assert "section_absent_from_pdf" in result.signals
+
+
+def test_amendment_versus_second_amendment_stays_mismatch():
+    """Ordinal wording stays significant even when the act numbers are one numeral apart."""
+    stored = "Criminal Laws (Amendment) Act, 2017"
+    pdf_title = "Criminal Laws (Second Amendment) Act, 2017"
+    body = (
+        "The schedule of offences triable by the special court is amended "
+        "and the court shall record reasons for every sentence it pronounces."
+    )
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/cl-amend.pdf|XXX of 2017",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXXI of 2017"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
+def test_yearless_stored_title_versus_titled_year_stays_mismatch():
+    """A stored title with no year does not agree with Finance Act, 2016."""
+    stored = "Finance Act"
+    pdf_title = "Finance Act, 2016"
+    body = "Income tax rates for the tax year shall be the rates set out in the first schedule to this Act."
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=None,
+        source_url="https://senate.gov.pk/uploads/documents/finance-bare.pdf|XXX of 2016",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXXI of 2016"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+
+
+def test_different_year_act_number_disagrees_stays_mismatch():
+    """Finance Act, 2015 against the 2016 PDF is a different instrument, not an OCR act number."""
+    body = "Income tax rates for the tax year shall be the rates set out in the first schedule to this Act."
+    result = classify_senate_identity(
+        stored_name="Finance Act, 2015",
+        year_enacted=2015,
+        source_url="https://senate.gov.pk/uploads/documents/finance.pdf|X of 2015",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf("Finance Act, 2016", body, act_no="XI of 2016"),
+        pdf_available=True,
+    )
+    assert title_relation("Finance Act, 2015", "Finance Act, 2016") == "year_differs"
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
 @pytest.mark.parametrize(
     ("stored", "pdf_title", "year"),
     [
@@ -295,6 +456,24 @@ def test_wrong_pdf_act_title_stays_mismatch_quarantine(stored, pdf_title, year):
     assert result.reason == "senate_integrity:url_act_mismatch"
     assert result.needs_reextract is False
     assert "pdf_title_disagrees" in result.signals
+
+
+def test_wrong_pdf_title_and_act_number_stay_mismatch():
+    """A different instrument stays MISMATCH when both the short title and the act number disagree."""
+    result = classify_senate_identity(
+        stored_name="Arms (Second Amendment) Act, 1974",
+        year_enacted=1974,
+        source_url="https://senate.gov.pk/uploads/documents/wrong-pdf.pdf|XXIX of 1974",
+        sections=[_section("2", _OCR_SECTION)],
+        pdf_text=_called_act_pdf("Esso Undertakings (Vesting) Act, 1976", _LONG_OTHER_BODY, act_no="XI of 1976"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "pdf_title_disagrees" in result.signals
+    assert "act_number_disagrees" in result.signals
 
 
 def test_shared_gazette_second_act_is_not_quarantined():
@@ -513,7 +692,8 @@ def test_fe3f02bd_gazette_header_is_not_an_act():
     assert result.reason == "senate_integrity:partial_identity"
 
 
-def test_year_parsed_as_section_number_is_partial():
+def test_year_parsed_as_section_number_does_not_override_matching_title():
+    """Section-number repair is a separate sweep. A matching title stays MATCH."""
     pdf = """
     BENAMI TRANSACTIONS (PROHIBITION) ACT, 2017
     1. Short title.—This Act may be called the Benami Transactions (Prohibition) Act, 2017.
@@ -534,9 +714,32 @@ def test_year_parsed_as_section_number_is_partial():
         pdf_text=pdf,
         pdf_available=True,
     )
-    assert result.verdict == VERDICT_PARTIAL
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.needs_reextract is False
     assert "year_as_section_number" in result.signals
-    assert result.action == ACTION_NEEDS_REEXTRACT
+
+
+def test_year_as_section_without_agreeing_title_stays_partial():
+    """The year-shaped section number still marks PARTIAL when no short title agrees."""
+    body = (
+        "No person shall enter into any benami transaction except as permitted by this Act, "
+        "and any property held benami shall be liable to confiscation by the initiating officer."
+    )
+    result = classify_senate_identity(
+        stored_name="Benami Transactions (Prohibition) Act, 2017",
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/7950868f.pdf|V of 2017",
+        sections=[_section("1882", body)],
+        pdf_text=f"3. Prohibition.—{body}",
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_PARTIAL
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:partial_identity"
+    assert result.needs_reextract is False
+    assert "year_as_section_number" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
 
 
 def test_fetch_fail_when_pdf_unavailable():

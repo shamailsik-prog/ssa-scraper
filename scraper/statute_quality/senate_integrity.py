@@ -5,6 +5,12 @@ The label differing from ``statute.name`` is not, by itself, a mismatch.
 
 Verdicts: MATCH, MISMATCH, PARTIAL, FETCH_FAIL, plus SKIPPED_SHELL for the
 already-quarantined fragment-name / bill-title / no-section rows.
+
+An act-number gap is ignored only when the significant words agree in both
+directions under OCR equivalence, both titles carry the same year, and the
+act numbers share that year and differ by one (roman 30 against 31). Amendment
+and ordinal words stay significant. A year stored as a section number stays
+on the row and does not leave MATCH when that wording already agrees.
 """
 
 from __future__ import annotations
@@ -422,6 +428,31 @@ def title_relation(left: str, right: str) -> str:
     return "same"
 
 
+def _bidirectional_ocr_titles(left: str, right: str) -> bool:
+    """Every significant word has an OCR partner, in both directions.
+
+    ``title_relation`` still treats a subset or a Jaccard overlap of 0.55 as
+    ``same``. That is too wide to drop an act-number disagreement: ``Companies
+    Act`` would swallow ``Companies (Amendment) Act``, and ``Amendment`` would
+    swallow ``Second Amendment``. Amendment and ordinal words are not stop words.
+    """
+    a, b = _tokens(left), _tokens(right)
+    if not a or not b or len(a) != len(b):
+        return False
+    return _matched_token_count(a, b) == len(a)
+
+
+def _titles_share_enactment_year(left: str, right: str) -> bool:
+    """Both titles carry a year, and the year sets are equal."""
+    years_left, years_right = _years(left), _years(right)
+    return bool(years_left) and years_left == years_right
+
+
+def _one_roman_act_misread(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    """Same act-number year, values one apart (roman 30 against 31)."""
+    return left[1] == right[1] and abs(left[0] - right[0]) == 1
+
+
 @dataclass(frozen=True)
 class _ActSegment:
     act_number: Optional[tuple[int, int]]
@@ -593,6 +624,7 @@ def _verdict(
     pdf_title: Optional[str],
     pipe_label: Optional[str],
     fetch_url: str,
+    title_agrees: bool = False,
 ) -> SenateIntegrityVerdict:
     signal_tuple = tuple(dict.fromkeys(signals))
     repairable = bool(pdf_title) and not is_gazette_non_act_title(pdf_title)
@@ -619,6 +651,10 @@ def _verdict(
         "section_absent_from_pdf",
         "section_names_other_act",
     }
+    # A year stored as a section number is a storage defect (#363), not a
+    # different statute, once the short title already agrees.
+    if title_agrees:
+        identity.discard("year_as_section_number")
     if identity.intersection(signal_tuple):
         if repairable and "gazette_header_not_act" not in signal_tuple:
             return SenateIntegrityVerdict(
@@ -725,6 +761,22 @@ def classify_senate_identity(
     chosen = _choose_segment(segments, stored_name=stored_name, pipe_label=pipe_label, pipe_act=pipe_act)
     pdf_title = chosen.title if chosen is not None else (segments[0].title if segments else None)
     compare_text = chosen.text if chosen is not None else text
+    title_agrees = bool(
+        chosen is not None
+        and pdf_title
+        and is_coherent_act_title(stored_name)
+        and _bidirectional_ocr_titles(stored_name, pdf_title)
+        and _titles_share_enactment_year(stored_name, pdf_title)
+    )
+    # Drop the act-number signal only for a one-numeral misread on that title.
+    # A wider gap, a missing year, or an extra amendment/ordinal word still disagrees.
+    act_number_is_one_roman_misread = bool(
+        title_agrees
+        and pipe_act
+        and chosen is not None
+        and chosen.act_number
+        and _one_roman_act_misread(pipe_act, chosen.act_number)
+    )
 
     def _note_title_relation(title: Optional[str]) -> None:
         if not title or not is_coherent_act_title(stored_name):
@@ -742,7 +794,12 @@ def classify_senate_identity(
             signals.append("year_disagrees")
 
     if chosen is not None:
-        if pipe_act and chosen.act_number and pipe_act != chosen.act_number:
+        if (
+            pipe_act
+            and chosen.act_number
+            and pipe_act != chosen.act_number
+            and not act_number_is_one_roman_misread
+        ):
             signals.append("act_number_disagrees")
         _note_title_relation(pdf_title)
     else:
@@ -763,4 +820,10 @@ def classify_senate_identity(
     elif pdf_available:
         signals.append("pdf_text_empty")
 
-    return _verdict(signals=signals, pdf_title=pdf_title, pipe_label=pipe_label, fetch_url=fetch_url)
+    return _verdict(
+        signals=signals,
+        pdf_title=pdf_title,
+        pipe_label=pipe_label,
+        fetch_url=fetch_url,
+        title_agrees=title_agrees,
+    )

@@ -24,7 +24,7 @@ Run a dry-run on each corpus and record the JSON `counts` (`MATCH`, `MISMATCH`, 
 python -m scraper.tasks.senate_statute_integrity
 ```
 
-The default reads visible Senate-sourced rows, fetches the PDF (or recorded bytes if the fetch fails), and prints JSON. It does not write. A Gazette PDF that contains several acts is scored against the segment whose act number or short title matches the pipe label or the stored name. A row is `MISMATCH` only when no segment matches and the stored sections are not in the PDF.
+The default reads visible Senate-sourced rows, fetches the PDF (or recorded bytes if the fetch fails), and prints JSON. It does not write. A Gazette PDF that contains several acts is scored against the segment whose act number or short title matches the pipe label or the stored name. Run this dry-run, with `--skip-fetch` when the check should use recorded bytes only, and write the JSON `counts` down before any `--apply`. `--apply` stays off unless it is passed. `--skip-fetch` stays off unless it is passed.
 
 Useful limits:
 
@@ -41,9 +41,9 @@ Verdicts:
 
 | Verdict | Meaning |
 | --- | --- |
-| `MATCH` | PDF short title agrees with the stored act, and spot-checked section text appears in the PDF. A scanned title that differs only by OCR confusions (`i`/`l`/`1`, `c`/`e`, digit lookalikes, `m`/`rn` in a longer word) still agrees. |
-| `MISMATCH` | No Gazette segment matches the pipe label or stored name, and the stored sections are not in the PDF. An incoherent name plus missing sections is a mismatch. |
-| `PARTIAL` | The matching PDF segment is the same instrument, but the stored name or a section is corrupt: preamble or definitions fragment, newline title, wrong year, year parsed as a section number, or a gazette running header such as `President's Orders and Regulations`. |
+| `MATCH` | PDF short title agrees with the stored act, including a scanned title that differs only by OCR confusions (`i`/`l`/`1`, `c`/`e`, digit lookalikes, `m`/`rn` in a longer word). An act-number gap is ignored only when three things are all true: the significant words match in both directions under those OCR confusions (not a subset or a 0.55 overlap), both titles carry the same year, and the act numbers are that year and one apart (roman 30 against 31). `Amendment` and ordinal words such as `Second` stay significant, so a principal Act against its Amendment stays `MISMATCH`. `year_as_section_number` is still reported and does not change `MATCH` when that wording already agrees. Renaming those section numbers is a separate sweep. |
+| `MISMATCH` | Forced by `pdf_title_disagrees`, by `act_number_disagrees` unless the one-numeral exception above applies, or by `section_absent_from_pdf` together with an incoherent stored name. A missing year (`Finance Act` against `Finance Act, 2016`), a different year (`Finance Act, 2015` against `2016`), or a wider act-number gap on an otherwise identical title still forces `MISMATCH`. `year_as_section_number` does not force `MISMATCH`. |
+| `PARTIAL` | The stored name or a section is corrupt and the short title does not already agree: preamble or definitions fragment, newline title, wrong year, year parsed as a section number with no agreeing title, or a gazette running header such as `President's Orders and Regulations`. |
 | `FETCH_FAIL` | No live PDF and no recorded PDF bytes. |
 | `SKIPPED_SHELL` | Already quarantined, fragment name, pipe label, no sections. Not fetched. |
 
@@ -55,10 +55,10 @@ Verdicts:
 python -m scraper.tasks.senate_statute_integrity --apply
 ```
 
-Record the dry-run counts for MAIN and FREE-SITES first. Only visible rows are written:
+Record a fresh dry-run for MAIN and FREE-SITES first (`python -m scraper.tasks.senate_statute_integrity --skip-fetch` when using recorded bytes). Do that again after any compare change, before `--apply`. Only visible rows are written:
 
 - `MISMATCH` inserts `document_quarantine` with reason `senate_integrity:url_act_mismatch`. `needs_section_refetch` stays false, because re-extracting would copy the wrong act into this row.
-- `MATCH` is left unchanged. An OCR-near same-act title is `MATCH`, so `--apply` does not quarantine it and does not set `needs_section_refetch`. A different instrument stays `MISMATCH`, including ordinal amendments (Eighteenth against Nineteenth) and a wrong PDF such as Arms against Esso Vesting, Banking Companies against Benami, or Islamabad local government against Factories.
+- `MATCH` is left unchanged. An OCR-near same-act title is `MATCH`, so `--apply` does not quarantine it and does not set `needs_section_refetch`. A one-numeral act-number misread (roman 30 against 31) on that title is also left unchanged, including when a section number is a year. A different instrument stays `MISMATCH`, including a principal Act against its Amendment, Amendment against Second Amendment, a year-less title against a titled year, ordinal amendments (Eighteenth against Nineteenth), Finance Act, 2015 against 2016, and a wrong PDF such as Arms against Esso Vesting, Banking Companies against Benami, or Islamabad local government against Factories.
 - Repairable `PARTIAL` sets `needs_section_refetch` and does not quarantine. The row stays servable. Nothing in this sweep rewrites the name or the section text; the flag marks the row for a later re-extract.
 - A gazette header with no coherent act title is quarantined as `senate_integrity:partial_identity` and is not flagged for re-extract.
 - `FETCH_FAIL`, `MATCH`, and shells are left unchanged.
