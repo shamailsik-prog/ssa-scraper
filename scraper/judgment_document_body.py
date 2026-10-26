@@ -29,21 +29,41 @@ _HTML_STRONG_COURT_DOCUMENT_RE = re.compile(
     r"(?i)(?:"
     r"\border\s*sheet\b|"
     r"\bordersheet\b|"
-    r"\bhigh court of sindh\b|"
-    r"\bin the high court of\b|"
+    r"\bhigh court of sindh\s+larkan[ao]\s+bench\b|"
     r"\bin the supreme court of\b|"
     r"\bfor katcha peshi\b|"
     r"\bpresent:\s*(?:mr\.?|ms\.?|mrs\.?|hon|the\s+registrar|court)"
     r")"
 )
-# Spaced "O R D E R" / short Larkano bench bail sheets (see FREE-SITES SHC view-file rows).
-_HTML_SHORT_ORDER_SHEET_RE = re.compile(
+_HTML_ORDER_SHEET_SURFACE_RE = re.compile(
+    r"(?i)(?:\border\s*sheet\b|\bordersheet\b|\bfor katcha peshi\b)"
+)
+_HTML_SHC_HEADER_RE = re.compile(
     r"(?i)(?:"
-    r"\border\s*sheet\b|"
-    r"\bordersheet\b|"
-    r"\bfor katcha peshi\b|"
-    r"(?:\bhigh court of sindh\b|\bin the high court of sindh\b)"
-    r".{0,200}?\b(?:criminal\s+bail|\bcr\.?\s*misc|c\.?\s*p\.?|\bbail\b)"
+    r"\bin the high court of sindh\b|"
+    r"\bhigh court of sindh\s+at\s+\w+\b|"
+    r"\bhigh court of sindh\s+larkan[ao]\s+bench\b|"
+    r"\bhigh court of sindh\s+circuit\b"
+    r")"
+)
+_HTML_SHC_CASE_NO_RE = re.compile(
+    r"(?i)(?:"
+    r"\bcriminal\s+bail\s+application\s+no\.?\s*[a-z0-9./-]+|"
+    r"\bcr\.?\s*misc\.?\s*a?\.?\s*no\.?\s*[a-z0-9./-]+|"
+    r"\bc\.\s*p\.\s*(?:no\.?\s*)?(?:[sd]|d)-?\s*\d[\w./-]*|"
+    r"\b(?:1st|2nd|3rd|\d+th)\s+criminal\s+bail\s+application\s+no\.?\s*[a-z0-9./-]+"
+    r")"
+)
+# Cause lists, rosters, and adjournment notices (not dispositive order sheets).
+_HTML_NON_JUDGMENT_PROBE_RE = re.compile(
+    r"(?i)(?:"
+    r"\bcause\s*list\b|"
+    r"\bdaily\s+cause\b|"
+    r"\broster\b|"
+    r"\bfor\s+(?:hearing|adjournment)\b|"
+    r"\badjournment\s+notice\b|"
+    r"\blahore\s+high\s+court\b|"
+    r"\bin the high court of punjab\b"
     r")"
 )
 
@@ -72,6 +92,20 @@ def _html_text_for_markers(html: str) -> str:
     return _collapse_letter_spaced_words(_html_text_collapsed_whitespace(html))
 
 
+def _html_body_is_non_judgment_probe(text: str) -> bool:
+    return bool(_HTML_NON_JUDGMENT_PROBE_RE.search(text))
+
+
+def _html_has_order_sheet_surface(text: str) -> bool:
+    if _HTML_ORDER_SHEET_SURFACE_RE.search(text):
+        return True
+    # Letter-spaced O R D E R → ORDER on SHC bail sheets without an ORDER SHEET heading.
+    return bool(
+        re.search(r"\border\b", text, flags=re.I)
+        and re.search(r"\bcriminal\s+bail\b", text, flags=re.I)
+    )
+
+
 def frontier_http_status_action(status_code: int) -> str:
     """How to treat a document fetch HTTP status before body classification."""
     if status_code < 400:
@@ -96,20 +130,30 @@ def html_judgment_word_count(html: str) -> int:
 
 def html_body_has_short_order_sheet_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
-    return bool(_HTML_SHORT_ORDER_SHEET_RE.search(text))
+    if _html_body_is_non_judgment_probe(text):
+        return False
+    return (
+        _html_has_order_sheet_surface(text)
+        and bool(_HTML_SHC_HEADER_RE.search(text))
+        and bool(_HTML_SHC_CASE_NO_RE.search(text))
+    )
 
 
 def html_body_has_strong_court_document_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
+    if _html_body_is_non_judgment_probe(text):
+        return False
     return bool(_HTML_STRONG_COURT_DOCUMENT_RE.search(text))
 
 
 def html_body_has_judgment_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
+    if _html_body_is_non_judgment_probe(text):
+        return False
     return bool(
         _HTML_JUDGMENT_MARKER_RE.search(text)
         or _HTML_STRONG_COURT_DOCUMENT_RE.search(text)
-        or _HTML_SHORT_ORDER_SHEET_RE.search(text)
+        or html_body_has_short_order_sheet_marker(html)
     )
 
 

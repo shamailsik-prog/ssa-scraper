@@ -284,6 +284,41 @@ def test_classify_hyderabad_ordersheet_one_word():
     assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "48aac4be")) == "html_judgment"
 
 
+def test_auditor_probes_defer_not_html_judgment():
+    """Cause lists, adjournment notices, Lahore rosters, and SHC header filler must not pass."""
+    probes = {
+        "cause_list": """
+        IN THE HIGH COURT OF SINDH AT KARACHI
+        DAILY CAUSE LIST FOR CRIMINAL BAIL MATTERS
+        ORDER SHEET
+        1. Criminal Bail Application No. S-100/2024
+        2. Criminal Bail Application No. S-101/2024
+        For hearing on 12-03-2024. Roster published by Registrar.
+        """,
+        "cp_adjournment_notice": """
+        IN THE HIGH COURT OF SINDH AT HYDERABAD
+        ORDER SHEET
+        C.P. D-100/2024
+        ADJOURNMENT NOTICE: Matter adjourned for next date without arguments.
+        For information of parties only.
+        """,
+        "lahore_roster": """
+        IN THE HIGH COURT OF PUNJAB AT LAHORE
+        ORDER SHEET
+        Criminal roster for the week. Bail matters listed for hearing.
+        """,
+        "shc_header_filler": (
+            "IN THE HIGH COURT OF SINDH AT KARACHI " + " ".join(["procedural"] * 60)
+        ),
+    }
+    for html in probes.values():
+        res = _fetch_result_for_word_html(
+            f"<html><body>{html.replace(chr(10), '<br/>')}</body></html>",
+            "probe",
+        )
+        assert classify_pdf_endpoint_body(res) == "defer"
+
+
 def test_windows_1252_nbsp_letter_spaced_order_has_marker():
     html = (
         "<html><body>IN THE HIGH COURT OF SINDH AT LARKANA\r\n"
