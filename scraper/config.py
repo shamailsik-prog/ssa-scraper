@@ -30,6 +30,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD", "GBLR", "PLJ", "NLR", "KLR", "PCRLJ")
+# Site journal codes: 2–8 letters, or that stem plus one parenthetical series and an
+# optional trailing letter. PLC(CS), PLC(CS)N and the printed PLC (C.S.) are real
+# dropdown codes; digits and other punctuation are not.
+_JOURNAL_CODE_RE = re.compile(r"[A-Za-z]{2,8}(?: ?\([A-Za-z](?:\.?[A-Za-z]){0,5}\.?\)[A-Za-z]?)?")
 ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", "sftp", "smb", "local_path")
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
@@ -722,9 +726,9 @@ class Settings(BaseSettings):
         if not v:
             return ""
         items = [x.strip() for x in v.split(",") if x.strip()]
-        bad = [x for x in items if not re.fullmatch(r"[A-Za-z]{2,8}", x)]
+        bad = [x for x in items if not _JOURNAL_CODE_RE.fullmatch(x)]
         if bad:
-            raise ValueError(f"Reporter codes must be alphabetic: {bad}")
+            raise ValueError(f"Reporter codes must be journal abbreviations (letters, or a parenthetical series such as PLC(CS)): {bad}")
         return ",".join(items)
 
     @model_validator(mode="after")
