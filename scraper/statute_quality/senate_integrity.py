@@ -8,7 +8,7 @@ already-quarantined fragment-name / bill-title / no-section rows.
 
 An act-number gap is ignored only when the significant words agree in both
 directions under OCR equivalence, both titles carry the same year, and the
-act numbers share that year and differ by one (XXX against XXXI). Amendment
+act numbers share that year and differ by one (roman 30 against 31). Amendment
 and ordinal words stay significant. A year stored as a section number stays
 on the row and does not leave MATCH when that wording already agrees.
 """
@@ -449,7 +449,7 @@ def _titles_share_enactment_year(left: str, right: str) -> bool:
 
 
 def _one_roman_act_misread(left: tuple[int, int], right: tuple[int, int]) -> bool:
-    """Same act-number year, values one apart (XXX is 30, XXXI is 31)."""
+    """Same act-number year, values one apart (roman 30 against 31)."""
     return left[1] == right[1] and abs(left[0] - right[0]) == 1
 
 

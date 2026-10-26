@@ -277,7 +277,7 @@ _PCSIR_BODY = (
 
 
 def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
-    """#364 selects the segment once the title is OCR-same, then XXX vs XXXI quarantines it.
+    """#364 selects the segment once the title is OCR-same, then roman 30 vs 31 quarantines it.
 
     The printed act number is a fragile OCR compare. It must not force MISMATCH
     when the short title already agrees.
@@ -300,7 +300,7 @@ def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
 
 
 def test_identical_title_one_roman_misread_keeps_year_section_match():
-    """A true title match plus XXX-vs-XXXI still stays MATCH, and the year section is kept."""
+    """A true title match plus roman 30 vs 31 still stays MATCH, and the year section is kept."""
     stored = "Criminal Law Amendment (Special Court) Act, 1976"
     body = (
         "The special court shall try the scheduled offences listed in this Act "
