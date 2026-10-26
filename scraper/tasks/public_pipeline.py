@@ -416,7 +416,12 @@ class PublicPipeline:
         staging.validation_errors = outcome.errors + [c.get("reason", "") for c in outcome.conflicts]
         if not outcome.quarantine:
             if kind == "statute":
-                val_ok, val_reason = validate_statute_reconciled_json(staging.reconciled_json, raw_text=text)
+                val_ok, val_reason = validate_statute_reconciled_json(
+                    staging.reconciled_json,
+                    raw_text=text,
+                    source_name=staging.source_name,
+                    source_url=staging.source_url,
+                )
             else:
                 val_ok, val_reason = validate_judgment_reconciled_json(staging.reconciled_json, raw_text=text)
             if not val_ok:
