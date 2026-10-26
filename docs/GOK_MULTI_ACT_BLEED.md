@@ -12,7 +12,7 @@ On 2026-10-26 the read-only droplet counts for this host were about 2,674 rows o
 
 | Reason | When |
 | --- | --- |
-| `multi_act_pdf_bleed:law.gok.pk` | A second act title in the stored text, a document-order restart of section numbering, or a run of headings about a body (Authority, Tribunal, and similar) that the stored act never names or defines. |
+| `multi_act_pdf_bleed:law.gok.pk` | A second act title in the stored text, a document-order restart of section numbering, or a run of headings about a body (Authority, Tribunal, and similar) that the stored act never names or defines. An act name on its own line inside amending or repealing text is a citation, not a second act, unless a new section 1, `1. Short title`, or `may be called` follows it, or the previous line is a finished sentence. |
 | `name_pdf_mismatch:law.gok.pk` | The PDF filename is a different instrument from the stored name. Parenthetical act numbers such as `(Act II of 1962)` and a `\|II` source-url label are ignored. |
 
 A year used as a section number (1800–2030), or a year/junk number that only sits before section 1, is reported and is not quarantined. Those patterns are too common on this host to quarantine in bulk (hundreds of year-like section numbers; about 22 rows per host are only a year before section 1).

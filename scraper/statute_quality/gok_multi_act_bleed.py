@@ -93,6 +93,10 @@ _FOREIGN_BODY = re.compile(
 )
 _EMBEDDED_SECTION_ONE = re.compile(r"(?im)^\s*1[\.\)]\s+short\s+title\b")
 _SECTION_LINE = re.compile(r"^\d{1,3}[\.\)]\s+\S")
+_FINISHED_SENTENCE_END = re.compile(r"[.?!](?:[\"'”’)\]]+)?\s*$")
+_UNFINISHED_TAIL = re.compile(r"(?:[:;,—–]|--)(?:[\"'”’)\]]+)?\s*$")
+_FOLLOWING_RESTART = re.compile(r"(?i)^\s*1[\.\)]\s+\S")
+_FOLLOWING_CALLED = re.compile(r"(?i)\b(?:(?:may|shall)\s+be\s+called|short\s+title)\b")
 
 
 @dataclass(frozen=True)
@@ -151,10 +155,70 @@ def _is_act_heading_line(line: str) -> bool:
     return _ACT_HEADING_LINE.match(stripped) is not None
 
 
+def _is_unfinished_sentence(line: Optional[str]) -> bool:
+    """True when ``line`` continues into the next line.
+
+    A missing line is not unfinished: a heading that opens a chunk can be a
+    new act. A line that ends with a colon, comma, or dash (``namely:—``,
+    ``In``) is unfinished amending or repealing text.
+    """
+    if line is None:
+        return False
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _UNFINISHED_TAIL.search(stripped):
+        return True
+    if _FINISHED_SENTENCE_END.search(stripped):
+        return False
+    return True
+
+
+def _previous_nonempty(lines: Sequence[str], index: int) -> Optional[str]:
+    for cursor in range(index - 1, -1, -1):
+        if lines[cursor].strip():
+            return lines[cursor]
+    return None
+
+
+def _following_opens_new_act(lines: Sequence[str], index: int) -> bool:
+    """True when the lines after a title restart numbering or state a short title."""
+    seen = 0
+    for cursor in range(index + 1, len(lines)):
+        stripped = lines[cursor].strip()
+        if not stripped:
+            continue
+        seen += 1
+        if _FOLLOWING_RESTART.match(stripped) or _EMBEDDED_SECTION_ONE.search(stripped):
+            return True
+        if _FOLLOWING_CALLED.search(stripped):
+            return True
+        if seen >= 6:
+            break
+    return False
+
+
+def _heading_opens_new_act(lines: Sequence[str], index: int) -> bool:
+    """A bare act-name line is a new act only with independent evidence.
+
+    Evidence is a numbering restart, an embedded ``1. Short title`` or
+    ``may be called``, or a previous line that is not an unfinished sentence.
+    A title wrapped out of amending or repealing text is a citation.
+    """
+    if not _is_unfinished_sentence(_previous_nonempty(lines, index)):
+        return True
+    return _following_opens_new_act(lines, index)
+
+
 def _foreign_titles(text: str, anchor_name: str) -> list[str]:
     found: list[str] = []
-    for line in (text or "").splitlines():
-        if _is_act_heading_line(line) and not _same_instrument(line, anchor_name):
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        if (
+            _is_act_heading_line(line)
+            and not _same_instrument(line, anchor_name)
+            and _heading_opens_new_act(lines, index)
+        ):
             found.append(line.strip())
     for match in _CALLED_TITLE.finditer(text or ""):
         title = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;—-")
@@ -166,21 +230,28 @@ def _foreign_titles(text: str, anchor_name: str) -> list[str]:
 def truncate_at_second_act_heading(text: str, anchor_name: str) -> str:
     """Drop a later act that shares one law.gok.pk PDF with ``anchor_name``.
 
-    Inline citations such as ``amended by the Finance Act, 1990`` stay. The
-    cut runs only after the anchor act's own heading or a numbered section
-    has already appeared.
+    A standalone act name is cut only when it opens a new act: the previous
+    line is a finished sentence, or the following lines restart at section 1,
+    say ``1. Short title``, or say ``may be called``. A title carried over
+    from amending or repealing text stays.
     """
     if not text or not anchor_name:
         return text
+    raw_lines = text.splitlines(keepends=True)
+    stripped_lines = [line.strip() for line in raw_lines]
     seen_anchor = False
     seen_section = False
     offset = 0
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
+    for index, line in enumerate(raw_lines):
+        stripped = stripped_lines[index]
         if _is_act_heading_line(stripped):
             if _same_instrument(stripped, anchor_name):
                 seen_anchor = True
-            elif (seen_anchor or seen_section) and offset > 0:
+            elif (
+                (seen_anchor or seen_section)
+                and offset > 0
+                and _heading_opens_new_act(stripped_lines, index)
+            ):
                 return text[:offset].rstrip()
         elif _SECTION_LINE.match(stripped):
             seen_section = True

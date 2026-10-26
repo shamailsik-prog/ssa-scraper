@@ -361,6 +361,77 @@ def test_truncate_at_second_act_heading_keeps_the_anchor_act():
     assert "Headquarters of the Authority" not in cut
 
 
+FINANCE_NAME = "The Azad Jammu and Kashmir Finance Act, 2023"
+FINANCE_URL = "https://law.gok.pk/wp-content/uploads/2023/07/THE-AZAD-JAMMU-AND-KASHMIR-FINANCE-ACT-2023.pdf"
+FINANCE_AMENDING_TEXT = """THE AZAD JAMMU AND KASHMIR FINANCE ACT, 2023
+
+1. Short title, extent and commencement.— (1) This Act may be called the Azad Jammu and Kashmir Finance Act, 2023.
+(2) It shall come into force at once.
+
+2. Amendment of the Sales Tax Act.— In
+The Azad Jammu and Kashmir Sales Tax Act, 1990
+in section 3, for the words "ten percent" the words "fifteen percent" shall be substituted.
+
+3. Repeal.— The following Act is hereby repealed, namely:—
+The Azad Jammu and Kashmir Entertainments Duty Act, 1958
+and the repeal shall take effect on the day this Act comes into force.
+"""
+
+
+def test_amending_and_repealing_act_title_on_its_own_line_is_not_a_second_act():
+    """A cited act name wrapped onto its own line is not another statute in this PDF."""
+    sections = [
+        _section(
+            "1",
+            "This Act may be called the Azad Jammu and Kashmir Finance Act, 2023.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "2",
+            "Amendment of the Sales Tax Act.— In\n"
+            "The Azad Jammu and Kashmir Sales Tax Act, 1990\n"
+            "in section 3, for the words \"ten percent\" the words \"fifteen percent\" shall be substituted.",
+            "Amendment of the Sales Tax Act",
+            1,
+        ),
+        _section(
+            "3",
+            "The following Act is hereby repealed, namely:—\n"
+            "The Azad Jammu and Kashmir Entertainments Duty Act, 1958\n"
+            "and the repeal shall take effect on the day this Act comes into force.",
+            "Repeal",
+            2,
+        ),
+    ]
+    result = classify_gok_multi_act(
+        stored_name=FINANCE_NAME,
+        source_url=FINANCE_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert "second_act_title" not in result.signals
+
+
+def test_truncate_keeps_amending_and_repealing_citations():
+    assert truncate_at_second_act_heading(FINANCE_AMENDING_TEXT, FINANCE_NAME) == FINANCE_AMENDING_TEXT
+
+
+def test_truncate_still_cuts_when_a_new_short_title_follows_the_heading():
+    text = (
+        "1. Short title.—This Act may be called the Azad Jammu and Kashmir Conciliation Courts Act, 1962.\n"
+        "In\n"
+        "THE NEW MIRPUR TOWN DEVELOPMENT AUTHORITY ACT, 1962\n"
+        "1. Short title.—This Act may be called the New Mirpur Town Development Authority Act, 1962.\n"
+        "12. Headquarters of the Authority.—The headquarters of the Authority shall be at Mirpur.\n"
+    )
+    cut = truncate_at_second_act_heading(text, CONCILIATION_NAME)
+    assert "Conciliation Courts" in cut
+    assert "Headquarters of the Authority" not in cut
+
+
 def test_truncate_ignores_inline_amendment_citation():
     text = (
         "1. Short title.—This Act may be called the Azad Jammu and Kashmir Conciliation Courts Act, 1962.\n\n"
