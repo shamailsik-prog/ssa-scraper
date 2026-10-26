@@ -13,7 +13,7 @@ Context: PostgreSQL 16 + pgvector, FastAPI, Celery, httpx, BeautifulSoup,
 
 import re
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Match, Optional, Sequence, Tuple
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 
@@ -99,6 +99,12 @@ SECTION_RANGE_FOOTNOTE_RE = re.compile(
     r'(?i)\b(?:for|in)\s+sections?\s+\d+[A-Z]?(?:\s*,\s*\d+[A-Z]?)*(?:\s+and\s+\d+[A-Z]?)\b'
 )
 TRAILING_AND_SECTION_RE = re.compile(r'(?i)^\s*(?:and|or)\s+\d+[A-Z]?\.?\s*$')
+# Auditor 2026-10-26: section_number values that are years, not headings.
+EXACT_YEAR_SECTION_RE = re.compile(r"^(1[89]|20)\d{2}$")
+# assembly_pdf_sections treats a jump of more than 120 as a bogus heading.
+YEAR_SECTION_SEQUENCE_GAP = 120
+_YEAR_CITATION_BEFORE_RE = re.compile(r"(?i)(?:\(|\bof)\s*$")
+_YEAR_CITATION_DT_RE = re.compile(r"(?i)^\s*dt\.")
 ACT_SECTION_SANITY_CAPS = {
     "canal and drainage act 1873": 75,
     "canal and drainage act": 75,
@@ -200,6 +206,123 @@ def _normalize_statute_key(name: str) -> str:
 def _parse_numeric_section_number(raw_section_number: str) -> Optional[int]:
     match = re.search(r'\d+', raw_section_number or "")
     return int(match.group(0)) if match else None
+
+
+def is_exact_year_section_number(raw_section_number: str) -> bool:
+    """True for a 4-digit token 1800–2099 (``^(1[89]|20)\\d{2}$``)."""
+    return bool(EXACT_YEAR_SECTION_RE.fullmatch((raw_section_number or "").strip()))
+
+
+def year_section_fits_sequence(number: int, siblings: Sequence[Tuple[str, int]]) -> bool:
+    """A year-shaped heading is real only when it continues this act's section numbers.
+
+    Non-year section numbers are the anchors. The year fits when one of them is within
+    ``YEAR_SECTION_SEQUENCE_GAP`` (the same jump ``assembly_pdf_sections`` already treats
+    as bogus). With no anchor, only a single tight run of year-shaped headings fits
+    (sections 1798–1801). An isolated 1860 next to s.25 does not.
+    """
+    anchors = [n for token, n in siblings if not is_exact_year_section_number(token)]
+    if anchors:
+        return min(abs(number - anchor) for anchor in anchors) <= YEAR_SECTION_SEQUENCE_GAP
+    year_vals = sorted({n for token, n in siblings if is_exact_year_section_number(token)})
+    if len(year_vals) < 2:
+        return False
+    return all(b - a <= YEAR_SECTION_SEQUENCE_GAP for a, b in zip(year_vals, year_vals[1:]))
+
+
+def _year_citation_context(text: str, match: Match[str]) -> bool:
+    """Year token follows '(' or 'of ', ends with ')', or is followed by 'dt.'."""
+    token = (match.group(1) or "").strip()
+    if not is_exact_year_section_number(token):
+        return False
+    before = text[: match.start(1)]
+    heading = text[match.start(1) : match.end()]
+    after = text[match.end() : match.end() + 16]
+    if _YEAR_CITATION_BEFORE_RE.search(before):
+        return True
+    if re.search(r"\)\s*$", heading):
+        return True
+    if _YEAR_CITATION_DT_RE.match(after):
+        return True
+    return False
+
+
+def _previous_tail_marks_year_citation(previous_text: str) -> bool:
+    """The prior section was cut on a line break after '(' or 'of '."""
+    return bool(_YEAR_CITATION_BEFORE_RE.search(previous_text or ""))
+
+
+def _section_text_is_year_citation(token: str, text: str) -> bool:
+    if not is_exact_year_section_number(token):
+        return False
+    raw = text or ""
+    if re.search(rf"(?i)(?:\(|\bof)\s*{re.escape(token)}\b", raw):
+        return True
+    if re.match(rf"(?is)^\s*(?:(?:section|sec\.|s\.)\s+)?{re.escape(token)}\s*\)", raw):
+        return True
+    if re.match(
+        rf"(?is)^\s*(?:(?:section|sec\.|s\.)\s+)?{re.escape(token)}\b[^\n]{{0,12}}?\bdt\.",
+        raw,
+    ):
+        return True
+    return False
+
+
+def _sibling_number_pairs(tokens: Sequence[str]) -> List[Tuple[str, int]]:
+    pairs: List[Tuple[str, int]] = []
+    for token in tokens:
+        cleaned = (token or "").strip()
+        number = _parse_numeric_section_number(cleaned)
+        if number is None:
+            continue
+        pairs.append((cleaned, number))
+    return pairs
+
+
+def reject_year_section_heading(token: str, siblings: Sequence[Tuple[str, int]], *, citation: bool) -> bool:
+    """Do not accept 1800–2099 as a heading when it is a citation or off the act's sequence."""
+    if not is_exact_year_section_number(token):
+        return False
+    if citation:
+        return True
+    return not year_section_fits_sequence(int(token), siblings)
+
+
+def year_section_is_bogus_heading(
+    token: str,
+    text: str,
+    previous_text: str,
+    sibling_tokens: Sequence[str],
+) -> bool:
+    """Same citation and sequence rule the splitter uses, for one stored section."""
+    citation = _section_text_is_year_citation(token, text) or _previous_tail_marks_year_citation(previous_text or "")
+    return reject_year_section_heading(token, _sibling_number_pairs(sibling_tokens), citation=citation)
+
+
+def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
+    """Drop split points that are year citations ('of 1860)', '2001) dt.').
+
+    Off-sequence year headings such as ``2000.`` stay as their own chunks so the
+    previous real section can be accepted first; ``_deduplicate_sections`` then
+    merges that tail back. Gluing the tail on here would make a definitions
+    section look like a footnote when the tail says ``inserted by``.
+    """
+    kept: List[Match[str]] = []
+    for match in matches:
+        if _year_citation_context(text, match):
+            continue
+        kept.append(match)
+    return kept
+
+
+def _append_section_text(target: Dict[str, str], extra: str) -> None:
+    addition = (extra or "").strip()
+    if not addition:
+        return
+    current = target.get("section_text") or ""
+    if addition in current:
+        return
+    target["section_text"] = current.rstrip() + "\n" + addition
 
 def _section_cap_for_statute(statute_name: str) -> Optional[int]:
     key = _normalize_statute_key(statute_name)
@@ -430,22 +553,45 @@ def prefer_official_statute_title(detected_name: Optional[str], official_title: 
 
 def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional[str] = None) -> List[Dict[str, str]]:
     sanity_cap = _section_cap_for_statute(statute_name or "")
+    siblings = _sibling_number_pairs([s.get("section_number", "") for s in sections])
     seen = set()
     out = []
+    pending_year_text = ""
     for s in sections:
         key = s.get("section_number", "").strip().lower()
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue
+        token = (s.get("section_number") or "").strip()
+        text = s.get("section_text") or ""
+        num_int = _parse_numeric_section_number(token)
+        # Year citations and off-sequence years are not headings. Keep their text on the
+        # previous real section instead of dropping the tail (Auditor 2026-10-26).
+        # Do this before the footnote/tiny filters: the tail often says "inserted by" or
+        # "dt." and must not be discarded, and it must not be glued on early enough to
+        # make the previous real section look like a footnote.
+        previous_text = out[-1].get("section_text") if out else ""
+        if reject_year_section_heading(
+            token,
+            siblings,
+            citation=_section_text_is_year_citation(token, text) or _previous_tail_marks_year_citation(previous_text),
+        ):
+            if text.strip():
+                if out:
+                    _append_section_text(out[-1], text)
+                else:
+                    pending_year_text = (pending_year_text + "\n" + text).strip()
+            continue
         # filter tiny sections that are likely not real
-        if len(s.get("section_text", "")) < 20:
+        if len(text) < 20:
             continue
-        if _is_false_section_candidate(s.get("section_text", "")):
+        if _is_false_section_candidate(text):
             continue
-        num_int = _parse_numeric_section_number(s.get("section_number", ""))
         if num_int == 0:
             continue
-        if num_int is not None and 1800 <= num_int <= 2100:
+        # 1860A / 2100 still use the pre-existing numeric sanity drop. Exact years
+        # 1800–2099 are decided above so an in-sequence heading can survive.
+        if not is_exact_year_section_number(token) and num_int is not None and 1800 <= num_int <= 2100:
             continue
         if sanity_cap is not None and num_int is not None and num_int > sanity_cap:
             continue
@@ -457,6 +603,10 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
                 # but allow if number is e.g., 511
                 if num_int > 5000:
                     continue
+        if pending_year_text:
+            s = dict(s)
+            s["section_text"] = pending_year_text + "\n" + (s.get("section_text") or "")
+            pending_year_text = ""
         seen.add(key)
         out.append(s)
     return out
@@ -592,6 +742,7 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         if len(matches) < 2:
             # try alternative without newline requirement
             matches = list(re.finditer(r'(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])', plain))
+        matches = _filter_year_heading_matches(plain, matches)
         sections = []
         if len(matches) >= 2:
             for i, m in enumerate(matches):
