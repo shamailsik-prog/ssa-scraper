@@ -5,6 +5,10 @@ The label differing from ``statute.name`` is not, by itself, a mismatch.
 
 Verdicts: MATCH, MISMATCH, PARTIAL, FETCH_FAIL, plus SKIPPED_SHELL for the
 already-quarantined fragment-name / bill-title / no-section rows.
+
+A short title that already agrees, including OCR-near wording, stays MATCH
+when the only other defects are a mismatched act number or a year stored as
+a section number. A different instrument stays MISMATCH.
 """
 
 from __future__ import annotations
@@ -593,6 +597,7 @@ def _verdict(
     pdf_title: Optional[str],
     pipe_label: Optional[str],
     fetch_url: str,
+    title_agrees: bool = False,
 ) -> SenateIntegrityVerdict:
     signal_tuple = tuple(dict.fromkeys(signals))
     repairable = bool(pdf_title) and not is_gazette_non_act_title(pdf_title)
@@ -619,6 +624,10 @@ def _verdict(
         "section_absent_from_pdf",
         "section_names_other_act",
     }
+    # A year stored as a section number is a storage defect (#363), not a
+    # different statute, once the short title already agrees.
+    if title_agrees:
+        identity.discard("year_as_section_number")
     if identity.intersection(signal_tuple):
         if repairable and "gazette_header_not_act" not in signal_tuple:
             return SenateIntegrityVerdict(
@@ -725,6 +734,12 @@ def classify_senate_identity(
     chosen = _choose_segment(segments, stored_name=stored_name, pipe_label=pipe_label, pipe_act=pipe_act)
     pdf_title = chosen.title if chosen is not None else (segments[0].title if segments else None)
     compare_text = chosen.text if chosen is not None else text
+    title_agrees = bool(
+        chosen is not None
+        and pdf_title
+        and is_coherent_act_title(stored_name)
+        and title_relation(stored_name, pdf_title) == "same"
+    )
 
     def _note_title_relation(title: Optional[str]) -> None:
         if not title or not is_coherent_act_title(stored_name):
@@ -742,7 +757,11 @@ def classify_senate_identity(
             signals.append("year_disagrees")
 
     if chosen is not None:
-        if pipe_act and chosen.act_number and pipe_act != chosen.act_number:
+        # OCR-tolerant title agreement is what selected this segment (PCSIR:
+        # scanned title is the same Act, while XXX and XXXI are not). The first
+        # ACT No. is too fragile to quarantine that row. A different year
+        # (Finance Act, 2015 against 2016) is still an act-number mismatch.
+        if pipe_act and chosen.act_number and pipe_act != chosen.act_number and not title_agrees:
             signals.append("act_number_disagrees")
         _note_title_relation(pdf_title)
     else:
@@ -763,4 +782,10 @@ def classify_senate_identity(
     elif pdf_available:
         signals.append("pdf_text_empty")
 
-    return _verdict(signals=signals, pdf_title=pdf_title, pipe_label=pipe_label, fetch_url=fetch_url)
+    return _verdict(
+        signals=signals,
+        pdf_title=pdf_title,
+        pipe_label=pipe_label,
+        fetch_url=fetch_url,
+        title_agrees=title_agrees,
+    )
