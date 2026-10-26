@@ -634,6 +634,319 @@ def test_preamble_amended_does_not_hide_a_later_acts_short_title():
     assert "numbering_restart" in result.signals
 
 
+WILDLIFE_NAME = (
+    "The Azad Jammu and Kashmir Wildlife (Protection, Preservation, Conservation and Management) Act, 2014"
+)
+WILDLIFE_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/"
+    "The-Azad-Jammu-and-Kashmir-Wildlife-Protection-Preservation-Conservation-and-Management-Act-2014-Act-IV-of-2015.pdf"
+)
+LIBERATION_NAME = "The Jammu and Kashmir Liberation Cell Act, 2014"
+LIBERATION_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/"
+    "The-Jammu-and-Kashmir-Liberation-Cell-Act-2014-ACT-XIII-OF-2014.pdf"
+)
+POWER_NAME = "The Power Development Organization Act, 2014"
+POWER_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/"
+    "The-Power-Development-Organization-Act-2014-ACT-XXI-OF-2014.pdf"
+)
+ZAKAT_NAME = "The Zakat and Ushr Act, 1985"
+ZAKAT_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/The-Zakat-and-Ushr-Act-1985-ACT-XIX-OF-1985.pdf"
+)
+PRESS_NAME = "The Azad Jammu and Kashmir Press Foundation Act, 2003"
+PRESS_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/"
+    "The-Azad-Jammu-and-Kashmir-Press-Foundation-Act-2003-ACT-XVII-OF-2003.pdf"
+)
+BHIMBHER_GARBLED_NAME = "The Bhimbher Universty Act, 2023"
+BHIMBHER_URL = "https://law.gok.pk/wp-content/uploads/2023/12/The-Bhimbher-University-Act-2023.pdf"
+PRESIDENTIAL_NAME = "The Azad Jammu and Kashmir Presidential Election Act, 1974"
+PRESIDENTIAL_VOLUME_URL = (
+    "https://law.gok.pk/wp-content/uploads/2023/05/"
+    "The-Azad-Jammu-And-Kashmir-Presidential-Election-Act-1974-ACT-IX-OF-1974.pdf"
+)
+CONTRACT_NAME = "The Contract Act, 1872"
+REGULATION_OF_SERVICES_URL = (
+    "https://law.gok.pk/wp-content/uploads/2024/03/"
+    "The-Azad-Jammu-and-Kashmir-Regulation-of-the-Services-of-Certain-Categories-of-Contractual-"
+    "Adhoc-or-Temporary-Government-Employment-Terms-and-Conditions-Act-2021-Act-XI-of-2021.pdf"
+)
+
+
+def test_commission_of_an_offence_is_not_a_foreign_body():
+    """``the commission of an offence`` is not the body ``Commission``.
+
+    Wildlife's own Board, named in the act, is not a second instrument either.
+    """
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Azad Jammu and Kashmir Wildlife "
+            "(Protection, Preservation, Conservation and Management) Act, 2014.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "6",
+            "6. Wildlife Management Advisory Board.- The government shall establish a Board "
+            "consisting of the following members, to be called the Wildlife Management Advisory Board.",
+            "Wildlife Management Advisory Board",
+            1,
+        ),
+        _section(
+            "7",
+            "7. Functions of the Board.- The Board shall advise the government on wildlife.",
+            "Functions of the Board",
+            2,
+        ),
+        _section(
+            "8",
+            "8. Executive Committee.- Besides the Board, there shall be an Executive Committee.",
+            "Executive Committee",
+            3,
+        ),
+        _section(
+            "39",
+            "39. Powers of Settlement Board.- The Board may enter upon any land.",
+            "Powers of Settlement Board",
+            4,
+        ),
+    ]
+    for index, number in enumerate(("62", "71", "74"), start=5):
+        sections.append(
+            _section(
+                number,
+                f"{number}. Prevention of Commission of Offence.- Every Wildlife Officer shall prevent "
+                "the commission of any offence under this Act.",
+                "Prevention of Commission of Offence",
+                index,
+            )
+        )
+    result = classify_gok_multi_act(
+        stored_name=WILDLIFE_NAME,
+        source_url=WILDLIFE_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "foreign_body_run" not in result.signals
+    assert "name_pdf_mismatch" not in result.signals
+
+
+def test_liberation_cell_own_board_is_not_a_foreign_body():
+    """The Cell's own Board is constituted by this act. The filename is the same instrument."""
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Jammu and Kashmir Liberation Cell Act, 2014.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "4",
+            "4. Constitution of Board.- The Board shall be a policy making body of the Cell.",
+            "Constitution of Board",
+            1,
+        ),
+    ]
+    for index, (number, title) in enumerate(
+        (
+            ("5", "Vice-Chairman of the Board"),
+            ("6", "Functions of the Board"),
+            ("8", "Appointment of officers"),
+            ("9", "Fund of the Cell"),
+            ("16", "Powers to make Regulations"),
+        ),
+        start=2,
+    ):
+        sections.append(
+            _section(
+                number,
+                f"{number}. {title}.- The Board shall act for the Cell.",
+                title,
+                index,
+            )
+        )
+    result = classify_gok_multi_act(
+        stored_name=LIBERATION_NAME,
+        source_url=LIBERATION_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "foreign_body_run" not in result.signals
+
+
+def test_power_organization_board_of_directors_is_not_a_foreign_body():
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Power Development Organization Act, 2014.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "4",
+            "4. Board of Directors.- The powers of the Organization shall vest in the Board.",
+            "Board of Directors",
+            1,
+        ),
+    ]
+    for index, number in enumerate(("6", "9", "20", "21", "22"), start=2):
+        sections.append(
+            _section(
+                number,
+                f"{number}. The Board shall meet and exercise the powers of the Organization.",
+                "Meeting of the Board",
+                index,
+            )
+        )
+    result = classify_gok_multi_act(
+        stored_name=POWER_NAME,
+        source_url=POWER_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "foreign_body_run" not in result.signals
+
+
+def test_zakat_council_named_by_the_act_is_not_a_foreign_body():
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Zakat and Ushr Act, 1985.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "13",
+            "13. Zakat Council.- The Government shall establish a Zakat Council to provide policy.",
+            "Zakat Council",
+            1,
+        ),
+    ]
+    for index, number in enumerate(("18", "27", "28", "29", "30"), start=2):
+        sections.append(
+            _section(
+                number,
+                f"{number}. The Council may give directions for the purposes of this Act.",
+                "Powers of the Council",
+                index,
+            )
+        )
+    result = classify_gok_multi_act(
+        stored_name=ZAKAT_NAME,
+        source_url=ZAKAT_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "foreign_body_run" not in result.signals
+
+
+def test_press_foundation_board_of_governors_is_not_a_foreign_body():
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Azad Jammu and Kashmir Press Foundation Act, 2003.",
+            "Short title",
+            0,
+        ),
+        _section(
+            "8",
+            "8. Press Foundation.- There shall be a Press Foundation administered by the Board of Governors.",
+            "Press Foundation",
+            1,
+        ),
+    ]
+    for index, number in enumerate(("11", "14", "17", "18", "19"), start=2):
+        sections.append(
+            _section(
+                number,
+                f"{number}. The Board may make regulations for the Foundation.",
+                "The Board",
+                index,
+            )
+        )
+    result = classify_gok_multi_act(
+        stored_name=PRESS_NAME,
+        source_url=PRESS_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "foreign_body_run" not in result.signals
+
+
+def test_ocr_garbled_bhimbher_short_title_is_the_same_act():
+    """Filename says Bhimbher University. The stored name and the called title disagree only by OCR."""
+    sections = _restart_sections(["8", "9", "10", "11", "12"])
+    sections.append(
+        _section(
+            "1",
+            "1. Short title, Extent and Commencement.- (1) This Act may be called "
+            "the Azad Jammu and Kashmir University of Bhimber Act, 2023.",
+            "Short title, Extent and Commencement",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=BHIMBHER_GARBLED_NAME,
+        source_url=BHIMBHER_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "second_act_title" not in result.signals
+    assert "numbering_restart" not in result.signals
+    assert "name_pdf_mismatch" not in result.signals
+
+
+def test_presidential_volume_that_continues_into_privileges_act_stays_mismatch():
+    """The 7-page Presidential Election volume prints the Privileges Act next. That is real bleed."""
+    sections = [
+        _section(
+            "1",
+            "1. Short title.- This Act may be called the Azad Jammu and Kashmir Presidential Election Act, 1974.",
+            "Short title",
+            0,
+        ),
+        _section("2", "2. Election of President.- The President shall be elected by State Subjects.", "Election of President", 1),
+        _section("3", "3. Power to make rules.- The Government may make rules.", "Power to make rules", 2),
+        _section("8", "8. A later provision of the first instrument.", "Later provision", 3),
+        _section(
+            "1",
+            "1. Short title and commencement.- (1) This Act may be called the "
+            "Azad Jammu and Kashmir Legislative Assembly Privileges Act, 1974.",
+            "Short title and commencement",
+            4,
+        ),
+        _section("2", "2. Definition.- Assembly means the Legislative Assembly.", "Definition", 5),
+    ]
+    result = classify_gok_multi_act(
+        stored_name=PRESIDENTIAL_NAME,
+        source_url=PRESIDENTIAL_VOLUME_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_BLEED
+    assert "second_act_title" in result.signals
+
+
+def test_contract_act_name_on_regulation_of_services_pdf_stays_mismatch():
+    result = classify_gok_multi_act(
+        stored_name=CONTRACT_NAME,
+        source_url=REGULATION_OF_SERVICES_URL,
+        sections=_plain_sections(),
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_NAME_MISMATCH
+    assert "name_pdf_mismatch" in result.signals
+
+
 def test_bare_short_title_restart_that_does_not_name_the_stored_act_is_bleed():
     """A drop back to section 1 headed 'Short title' is another act unless it names the stored one."""
     sections = _restart_sections(["8", "9", "10", "11", "12"])

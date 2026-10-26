@@ -5,10 +5,13 @@ names or section text. A four-digit year used as a section number, and a year
 or other junk number that merely sits before section 1, are reported and are
 not enough to quarantine. A numbering drop quarantines when the restarted
 text names a different instrument, or when it is a Short-title heading that
-does not name the stored act. The stored act's own short title, a date or
-schedule row stored as section 01, and a called title in the same sentence
-as ``substituted`` or ``namely`` are not bleed. ``amended`` in an earlier
-sentence does not hide the next act.
+does not name the stored act. The stored act's own short title, including one
+that differs only by a scan confusion or a single extra or missing letter, a
+date or schedule row stored as section 01, and a called title in the same
+sentence as ``substituted`` or ``namely`` are not bleed. ``amended`` in an
+earlier sentence does not hide the next act. A Board or Council the act
+itself constitutes is not a foreign body, and ``the commission of an offence``
+is not a Commission.
 """
 
 from __future__ import annotations
@@ -89,12 +92,40 @@ _CALLED_TITLE = re.compile(
     r"(.{6,180}?\b(?:act|ordinance|order|code)\b(?:,?\s+(?:18|19|20)\d{2})?)"
 )
 _PROSE_HEADING = re.compile(r"(?i)\b(shall|means|provided|whereas|amended|substituted|inserted)\b")
+_BODY_GROUP = r"authority|tribunal|board|council|corporation|commission"
+# "the commission of an offence" is the act of committing, not a body named Commission.
 _FOREIGN_BODY = re.compile(
     r"(?i)\b(?:headquarters|powers|duties|functions|fund|funds|constitution|composition|"
     r"meetings|employees|budget|accounts|establishment|housing\s+schemes?)\s+of\s+the\s+"
-    r"(authority|tribunal|board|council|corporation|commission)\b"
-    r"|\b(authority|tribunal|board|council|corporation|commission)\s+(?:fund|funds|budget)\b"
-    r"|\bthe\s+(authority|tribunal|board|council|corporation|commission)\b(?!\s+act\b)"
+    rf"({_BODY_GROUP})\b"
+    rf"|\b({_BODY_GROUP})\s+(?:fund|funds|budget)\b"
+    r"|\bthe\s+(authority|tribunal|board|council|corporation)\b(?!\s+act\b)"
+    r"|\bthe\s+(commission)\b(?!\s+act\b)"
+    r"(?!\s+of\s+(?:(?:an|any|the|such)\s+)?offences?\b)"
+)
+_BODY_MEANS = re.compile(rf"(?i)[\"'“”]?\s*({_BODY_GROUP})\s*[\"'“”]?\s+means\b")
+_BODY_CONSTITUTED = re.compile(
+    rf"(?i)\bconstitution\s+of\s+(?:the\s+)?({_BODY_GROUP})\b"
+    r"|\b(board|council)\s+of\s+(?:the\s+)?(?:directors|governors)\b"
+    rf"|\bestablish(?:ed)?\s+(?:a|an|the)\s+(?:[a-z]+\s+){{0,6}}({_BODY_GROUP})\b"
+)
+# i/l/1, c/e, o/0, s/5. Not a general edit distance: election/elections is only
+# a one-character slip when the two titles have the same number of words.
+_OCR_CONFUSABLE_SUBS = frozenset(
+    {
+        ("i", "l"),
+        ("l", "i"),
+        ("i", "1"),
+        ("1", "i"),
+        ("l", "1"),
+        ("1", "l"),
+        ("o", "0"),
+        ("0", "o"),
+        ("s", "5"),
+        ("5", "s"),
+        ("c", "e"),
+        ("e", "c"),
+    }
 )
 _EMBEDDED_SECTION_ONE = re.compile(r"(?im)^\s*1[\.\)]\s+short\s+title\b")
 _SECTION_LINE = re.compile(r"^\d{1,3}[\.\)]\s+\S")
@@ -163,12 +194,106 @@ def _content_tokens(value: str) -> set[str]:
     return {token for token in tokens if not _YEAR_TOKEN.fullmatch(token)}
 
 
+def _one_char_indel(left: str, right: str) -> bool:
+    """True when one word is the other plus a single letter (``bhimber`` / ``bhimbher``)."""
+    if abs(len(left) - len(right)) != 1:
+        return False
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    if len(shorter) < 6:
+        return False
+    return any(longer[:index] + longer[index + 1 :] == shorter for index in range(len(longer)))
+
+
+def _ocr_confusion_equivalent(left: str, right: str) -> bool:
+    """True when two words differ only by scan confusions, including ``m`` / ``rn``."""
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 5 or abs(len(left) - len(right)) > 2:
+        return False
+    budget = 1 if min(len(left), len(right)) < 8 else 2
+    allow_rn = max(len(left), len(right)) >= 8
+    unreachable = budget + 1
+    costs = [[unreachable] * (len(right) + 1) for _ in range(len(left) + 1)]
+    costs[0][0] = 0
+    for i in range(len(left) + 1):
+        for j in range(len(right) + 1):
+            used = costs[i][j]
+            if used > budget:
+                continue
+            if i < len(left) and j < len(right) and left[i] == right[j] and used < costs[i + 1][j + 1]:
+                costs[i + 1][j + 1] = used
+            if (
+                i < len(left)
+                and j < len(right)
+                and used + 1 <= budget
+                and (left[i], right[j]) in _OCR_CONFUSABLE_SUBS
+                and used + 1 < costs[i + 1][j + 1]
+            ):
+                costs[i + 1][j + 1] = used + 1
+            if allow_rn and used + 1 <= budget:
+                if (
+                    i < len(left)
+                    and left[i] == "m"
+                    and j + 1 < len(right)
+                    and right[j : j + 2] == "rn"
+                    and used + 1 < costs[i + 1][j + 2]
+                ):
+                    costs[i + 1][j + 2] = used + 1
+                if (
+                    j < len(right)
+                    and right[j] == "m"
+                    and i + 1 < len(left)
+                    and left[i : i + 2] == "rn"
+                    and used + 1 < costs[i + 2][j + 1]
+                ):
+                    costs[i + 2][j + 1] = used + 1
+    return costs[len(left)][len(right)] <= budget
+
+
+def _ocr_token_equivalent(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if _one_char_indel(left, right):
+        return True
+    return _ocr_confusion_equivalent(left, right)
+
+
+def _ocr_sets_align(left: set[str], right: set[str]) -> bool:
+    """Pair every word. Extra words on one side stay different.
+
+    ``Elections`` is one letter from ``Election``, but ``Elections Act`` is not
+    ``Election Commission Act``: the second title has a word the first lacks.
+    ``Bhimbher Universty`` does line up with ``University of Bhimber``.
+    """
+    if not left or len(left) != len(right):
+        return False
+    pending = list(right)
+
+    def pair(tokens: list[str]) -> bool:
+        if not tokens:
+            return True
+        token = tokens[0]
+        for index, other in enumerate(pending):
+            if other is None:
+                continue
+            if token == other or _ocr_token_equivalent(token, other):
+                pending[index] = None
+                if pair(tokens[1:]):
+                    return True
+                pending[index] = other
+        return False
+
+    return pair(list(left))
+
+
 def _same_instrument(left: str, right: str) -> bool:
     a = _content_tokens(left)
     b = _content_tokens(right)
     if not a or not b:
         return False
-    return bool(a & b)
+    if a & b:
+        return True
+    return _ocr_sets_align(a, b)
 
 
 def _is_act_heading_line(line: str) -> bool:
@@ -322,6 +447,40 @@ def _section_number(section: dict) -> Optional[int]:
     return _parse_numeric_section_number(str(section.get("section_number") or ""))
 
 
+def _called_titles(text: str) -> list[str]:
+    found: list[str] = []
+    for match in _CALLED_TITLE.finditer(text or ""):
+        title = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;—-")
+        if title:
+            found.append(title)
+    return found
+
+
+def _bodies_named_by_anchor(section: dict, anchor_name: str) -> set[str]:
+    """Bodies this section constitutes for the stored act, not for a later act.
+
+    ``Constitution of the Board`` of the Cell, ``Board of Directors`` of the
+    Organization, ``establish a Zakat Council``. A Tribunal constituted in
+    text that never names the stored act stays foreign.
+    """
+    blob = _section_blob(section)
+    if not _same_instrument(blob, anchor_name):
+        return set()
+    found: set[str] = set()
+    for pattern in (_BODY_MEANS, _BODY_CONSTITUTED):
+        for match in pattern.finditer(blob):
+            for group in match.groups():
+                if group:
+                    found.add(group.lower())
+    for token in _content_tokens(anchor_name):
+        if len(token) < 4:
+            continue
+        for body in _BODY_WORDS:
+            if re.search(rf"\b{re.escape(token)}\s+{body}\b", blob, re.I):
+                found.add(body)
+    return found
+
+
 def _defined_bodies(stored_name: str, sections: Sequence[dict]) -> set[str]:
     chunks = [stored_name or ""]
     for section in sections:
@@ -333,7 +492,10 @@ def _defined_bodies(stored_name: str, sections: Sequence[dict]) -> set[str]:
             chunks.append(title)
             chunks.append(str(section.get("section_text") or ""))
     blob = " ".join(chunks).lower()
-    return {word for word in _BODY_WORDS if re.search(rf"\b{word}\b", blob)}
+    defined = {word for word in _BODY_WORDS if re.search(rf"\b{word}\b", blob)}
+    for section in sections:
+        defined |= _bodies_named_by_anchor(section, stored_name)
+    return defined
 
 
 def _bodies_in_heading(section: dict) -> set[str]:
@@ -379,6 +541,11 @@ def _restart_opens_other_act(section: dict, anchor_name: str) -> bool:
     if _foreign_titles(text, anchor_name):
         return True
     if not _SHORT_TITLE_HEADING.search(_section_blob(section)):
+        return False
+    called = _called_titles(text)
+    # A called title of this act, including an OCR-garbled one, is not a new act.
+    # A heading that says only "Short title" and never names this act still is.
+    if called and all(_same_instrument(title, anchor_name) for title in called):
         return False
     return not _same_instrument(_section_blob(section), anchor_name)
 
