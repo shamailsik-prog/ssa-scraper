@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from scraper.config import settings
+from scraper.statute_quality.ocr_section_mash import VERDICT_MISMATCH, classify_ocr_section_mash
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,17 @@ def _enabled() -> bool:
     return bool(settings.SSA_DOCUMENT_SAVE_VALIDATION)
 
 
-def validate_statute_reconciled_json(data: Optional[Dict[str, Any]], *, raw_text: str = "") -> Tuple[bool, str]:
+def validate_statute_reconciled_json(
+    data: Optional[Dict[str, Any]],
+    *,
+    raw_text: str = "",
+    source_name: Optional[str] = None,
+    source_url: Optional[str] = None,
+) -> Tuple[bool, str]:
     """Return (ok, reason_code)."""
     if not _enabled():
         return True, ""
     payload = data or {}
-    name = (payload.get("statute_name") or "").strip()
     sections = payload.get("sections") or []
     dict_sections = [s for s in sections if isinstance(s, dict)]
     parseable = _parseable_sections(sections)
@@ -50,6 +56,14 @@ def validate_statute_reconciled_json(data: Optional[Dict[str, Any]], *, raw_text
         return False, "empty_statute_sections"
     if dict_sections and len(parseable) < len(dict_sections):
         return False, "empty_statute_sections"
+    verdict = classify_ocr_section_mash(
+        parseable,
+        source_url=source_url or str(payload.get("source_url") or ""),
+        source_name=source_name or str(payload.get("source_name") or ""),
+        scanned_source=None,
+    )
+    if verdict.verdict == VERDICT_MISMATCH:
+        return False, verdict.reason
     return True, ""
 
 

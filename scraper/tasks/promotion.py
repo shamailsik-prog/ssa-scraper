@@ -2209,7 +2209,12 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             if existing is not None:
                 existing.needs_section_refetch = True
                 await db.flush()
-        ok, val_reason = validate_statute_reconciled_json(data, raw_text=st.raw_text or "")
+        ok, val_reason = validate_statute_reconciled_json(
+            data,
+            raw_text=st.raw_text or "",
+            source_name=st.source_name,
+            source_url=st.source_url,
+        )
         if not ok:
             await record_validation_reject(db, kind="statute", reason_code=val_reason, source_name=st.source_name)
             await _quarantine(
@@ -2283,7 +2288,12 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
                 },
             )
             return "quarantined"
-    ok, val_reason = validate_statute_reconciled_json(data, raw_text=st.raw_text or "")
+    ok, val_reason = validate_statute_reconciled_json(
+        data,
+        raw_text=st.raw_text or "",
+        source_name=st.source_name,
+        source_url=st.source_url,
+    )
     if not ok:
         await record_validation_reject(db, kind="statute", reason_code=val_reason, source_name=st.source_name)
         await _quarantine(
