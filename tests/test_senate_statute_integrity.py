@@ -299,6 +299,83 @@ def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
     assert "pdf_title_disagrees" not in result.signals
 
 
+@pytest.mark.parametrize(
+    "pdf_title",
+    [
+        "Pakistan Council of Sciertific and Industrial Rcsearch Act, 1973",
+        "Pakistan Councll of Sclertific and Industrlal Rcsearch Act, 1973",
+    ],
+)
+def test_pcsir_sciertific_rcsearch_ocr_and_one_roman_gap_stays_match(pdf_title):
+    """MAIN 648084fb and FREE-SITES b2df675e: Sciertific/Rcsearch still the 1973 act.
+
+    ``title_relation`` already calls this pair the same act. The one-numeral
+    act-number gate must agree too, or roman 30 against 31 becomes
+    ``act_number_disagrees`` and a dry-run MATCH flips to MISMATCH.
+    ``Sclertific`` stacks an ``i``/``l`` slip on the ``n``/``r`` slip.
+    """
+    assert title_relation(PCSIR_NAME, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=PCSIR_NAME,
+        year_enacted=1973,
+        source_url="https://senate.gov.pk/uploads/documents/pcsir.pdf|XXX of 1973",
+        sections=[_section("3", _PCSIR_BODY)],
+        pdf_text=_called_act_pdf(pdf_title, _PCSIR_BODY, act_no="XXXI of 1973"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
+def test_national_versus_rational_one_roman_gap_stays_mismatch():
+    """An ``n``/``r`` slip is not accepted in an 8-letter word.
+
+    ``national`` / ``rational`` must not satisfy the act-number agreement
+    gate, even when the other words and the year match and the act numbers
+    are one apart.
+    """
+    stored = "Council of National Industrial Research Act, 1973"
+    pdf_title = "Council of Rational Industrial Research Act, 1973"
+    body = (
+        "The council shall keep a register of research institutes and shall "
+        "publish the register before the end of each calendar year."
+    )
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=1973,
+        source_url="https://senate.gov.pk/uploads/documents/national.pdf|XXX of 1973",
+        sections=[_section("3", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXXI of 1973"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
+def test_sciertific_title_with_distant_act_number_stays_mismatch():
+    """OCR noise does not excuse an act number more than one numeral off."""
+    pdf_title = "Pakistan Council of Sciertific and Industrial Rcsearch Act, 1973"
+    result = classify_senate_identity(
+        stored_name=PCSIR_NAME,
+        year_enacted=1973,
+        source_url="https://senate.gov.pk/uploads/documents/pcsir.pdf|XXX of 1973",
+        sections=[_section("3", _PCSIR_BODY)],
+        pdf_text=_called_act_pdf(pdf_title, _PCSIR_BODY, act_no="XX of 1973"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert "act_number_disagrees" in result.signals
+
+
 def test_identical_title_one_roman_misread_keeps_year_section_match():
     """A true title match plus roman 30 vs 31 still stays MATCH, and the year section is kept."""
     stored = "Criminal Law Amendment (Special Court) Act, 1976"

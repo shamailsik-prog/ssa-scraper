@@ -8,9 +8,13 @@ already-quarantined fragment-name / bill-title / no-section rows.
 
 An act-number gap is ignored only when the significant words agree in both
 directions under OCR equivalence, both titles carry the same year, and the
-act numbers share that year and differ by one (roman 30 against 31). Amendment
-and ordinal words stay significant. A year stored as a section number stays
-on the row and does not leave MATCH when that wording already agrees.
+act numbers share that year and differ by one (roman 30 against 31). That
+agreement also treats one ``n``/``r`` slip in a word of nine or more letters
+as the same word (``scientific`` / ``sciertific``), including when it stacks
+on an ``i``/``l`` slip. Shorter words stay strict, so ``national`` /
+``rational`` do not agree. Amendment and ordinal words stay significant. A
+year stored as a section number stays on the row and does not leave MATCH
+when that wording already agrees.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
 from scraper.parsers.statute_parser import (
@@ -329,13 +333,21 @@ _OCR_CONFUSABLE_SUBS = frozenset(
 )
 
 
-def _ocr_equivalent(left: str, right: str) -> bool:
+def _ocr_equivalent(
+    left: str,
+    right: str,
+    *,
+    subs: Optional[frozenset[tuple[str, str]]] = None,
+) -> bool:
     """True when two title words differ only by a few scan confusions.
 
     Allowed: ``i``/``l``/``1``, ``c``/``e``, and digit lookalikes, plus ``m``
     versus ``rn`` in a longer word (``amendment`` / ``arnendment``). At most
     one confusion in a word shorter than 8 characters, otherwise two.
+    ``subs`` replaces the single-character table for a caller that has already
+    decided a wider scan slip is safe. ``title_relation`` keeps the default.
     """
+    table = _OCR_CONFUSABLE_SUBS if subs is None else subs
     if left == right:
         return True
     if min(len(left), len(right)) < 5 or abs(len(left) - len(right)) > 2:
@@ -356,7 +368,7 @@ def _ocr_equivalent(left: str, right: str) -> bool:
                 i < len(left)
                 and j < len(right)
                 and used + 1 <= budget
-                and (left[i], right[j]) in _OCR_CONFUSABLE_SUBS
+                and (left[i], right[j]) in table
                 and used + 1 < costs[i + 1][j + 1]
             ):
                 costs[i + 1][j + 1] = used + 1
@@ -380,8 +392,13 @@ def _ocr_equivalent(left: str, right: str) -> bool:
     return costs[len(left)][len(right)] <= budget
 
 
-def _matched_token_count(left: set[str], right: set[str]) -> int:
+def _matched_token_count(
+    left: set[str],
+    right: set[str],
+    equivalent: Optional[Callable[[str, str], bool]] = None,
+) -> int:
     """One-to-one overlap. Exact words pair first, then OCR-equivalent leftovers."""
+    same_word = equivalent or _ocr_equivalent
     remaining = set(right)
     matched = 0
     leftover: list[str] = []
@@ -392,7 +409,7 @@ def _matched_token_count(left: set[str], right: set[str]) -> int:
         else:
             leftover.append(token)
     for token in leftover:
-        partner = next((other for other in remaining if _ocr_equivalent(token, other)), None)
+        partner = next((other for other in remaining if same_word(token, other)), None)
         if partner is not None:
             remaining.remove(partner)
             matched += 1
@@ -428,6 +445,26 @@ def title_relation(left: str, right: str) -> str:
     return "same"
 
 
+# ``n``/``r`` is a scan slip in long title words (``scientific`` / ``sciertific``).
+# It is not in the default table: an 8-letter pair such as ``national`` /
+# ``rational`` must stay distinct for ``title_relation``.
+_AGREEMENT_NR_SUBS = frozenset({("n", "r"), ("r", "n")})
+
+
+def _agreement_ocr_equivalent(left: str, right: str) -> bool:
+    """OCR partner test for the one-numeral act-number gate.
+
+    A word of nine or more letters may also swap ``n`` and ``r`` inside the
+    usual two-confusion budget, so ``sciertific`` and ``sclertific`` still
+    match ``scientific``. Shorter words use the strict table only.
+    """
+    if _ocr_equivalent(left, right):
+        return True
+    if min(len(left), len(right)) < 9:
+        return False
+    return _ocr_equivalent(left, right, subs=_OCR_CONFUSABLE_SUBS | _AGREEMENT_NR_SUBS)
+
+
 def _bidirectional_ocr_titles(left: str, right: str) -> bool:
     """Every significant word has an OCR partner, in both directions.
 
@@ -435,11 +472,12 @@ def _bidirectional_ocr_titles(left: str, right: str) -> bool:
     ``same``. That is too wide to drop an act-number disagreement: ``Companies
     Act`` would swallow ``Companies (Amendment) Act``, and ``Amendment`` would
     swallow ``Second Amendment``. Amendment and ordinal words are not stop words.
+    The partner test here additionally allows one long-word ``n``/``r`` slip.
     """
     a, b = _tokens(left), _tokens(right)
     if not a or not b or len(a) != len(b):
         return False
-    return _matched_token_count(a, b) == len(a)
+    return _matched_token_count(a, b, _agreement_ocr_equivalent) == len(a)
 
 
 def _titles_share_enactment_year(left: str, right: str) -> bool:
