@@ -12,6 +12,8 @@ from scraper.parsers.text_cleaner import clean_html
 MIN_HTML_JUDGMENT_WORDS = 200
 # Short Word-HTML order sheets / hearing lists lack "judgment" vocabulary but are real documents.
 MIN_HTML_STRONG_COURT_DOCUMENT_WORDS = 50
+# Real SHC bail / Katcha Peshi order sheets are often under 50 words after Word-HTML cleanup.
+MIN_HTML_SHORT_ORDER_SHEET_WORDS = 12
 PDF_MISS_DEFER_ERROR = "missing %PDF signature; body is not an accepted HTML judgment"
 PDF_MISS_RETIRE_AFTER_ATTEMPTS = 10
 # Whitespace-only HTTP 200 may be a short SHC burst; retire only after repeated empties over 24h.
@@ -25,20 +27,49 @@ _HTML_JUDGMENT_MARKER_RE = re.compile(
 # Headers and formats common on Pakistani high-court sites (SHC view-file Word-HTML, etc.).
 _HTML_STRONG_COURT_DOCUMENT_RE = re.compile(
     r"(?i)(?:"
-    r"\border sheet\b|"
+    r"\border\s*sheet\b|"
+    r"\bordersheet\b|"
+    r"\bhigh court of sindh\b|"
     r"\bin the high court of\b|"
     r"\bin the supreme court of\b|"
+    r"\bfor katcha peshi\b|"
     r"\bpresent:\s*(?:mr\.?|ms\.?|mrs\.?|hon|the\s+registrar|court)"
+    r")"
+)
+# Spaced "O R D E R" / short Larkano bench bail sheets (see FREE-SITES SHC view-file rows).
+_HTML_SHORT_ORDER_SHEET_RE = re.compile(
+    r"(?i)(?:"
+    r"\border\s*sheet\b|"
+    r"\bordersheet\b|"
+    r"\bfor katcha peshi\b|"
+    r"(?:\bhigh court of sindh\b|\bin the high court of sindh\b)"
+    r".{0,200}?\b(?:criminal\s+bail|\bcr\.?\s*misc|c\.?\s*p\.?|\bbail\b)"
     r")"
 )
 
 # Word-HTML hard-wraps phrases across <br/> / newlines; collapse before phrase matching.
 _WS_COLLAPSE_RE = re.compile(r"\s+")
+# Letter-spaced headings in Word exports: "O R D E R", "O R D E R S H E E T".
+_LETTER_SPACED_RUN_RE = re.compile(r"\b(?:[A-Za-z] )+[A-Za-z]\b")
+
+
+def _collapse_letter_spaced_words(text: str) -> str:
+    def _join_run(match: re.Match[str]) -> str:
+        letters = match.group(0).split()
+        if len(letters) >= 3 and all(len(part) == 1 for part in letters):
+            return "".join(letters)
+        return match.group(0)
+
+    return _LETTER_SPACED_RUN_RE.sub(_join_run, text)
 
 
 def _html_text_collapsed_whitespace(html: str) -> str:
     text = clean_html(html or "")
     return _WS_COLLAPSE_RE.sub(" ", text).strip()
+
+
+def _html_text_for_markers(html: str) -> str:
+    return _collapse_letter_spaced_words(_html_text_collapsed_whitespace(html))
 
 
 def frontier_http_status_action(status_code: int) -> str:
@@ -63,20 +94,28 @@ def html_judgment_word_count(html: str) -> int:
     return len(re.findall(r"\w+", text, flags=re.UNICODE))
 
 
+def html_body_has_short_order_sheet_marker(html: str) -> bool:
+    text = _html_text_for_markers(html)
+    return bool(_HTML_SHORT_ORDER_SHEET_RE.search(text))
+
+
 def html_body_has_strong_court_document_marker(html: str) -> bool:
-    text = _html_text_collapsed_whitespace(html)
+    text = _html_text_for_markers(html)
     return bool(_HTML_STRONG_COURT_DOCUMENT_RE.search(text))
 
 
 def html_body_has_judgment_marker(html: str) -> bool:
-    text = _html_text_collapsed_whitespace(html)
+    text = _html_text_for_markers(html)
     return bool(
         _HTML_JUDGMENT_MARKER_RE.search(text)
         or _HTML_STRONG_COURT_DOCUMENT_RE.search(text)
+        or _HTML_SHORT_ORDER_SHEET_RE.search(text)
     )
 
 
 def min_html_judgment_words(html: str) -> int:
+    if html_body_has_short_order_sheet_marker(html):
+        return MIN_HTML_SHORT_ORDER_SHEET_WORDS
     if html_body_has_strong_court_document_marker(html):
         return MIN_HTML_STRONG_COURT_DOCUMENT_WORDS
     return MIN_HTML_JUDGMENT_WORDS

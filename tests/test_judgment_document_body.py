@@ -2,6 +2,7 @@
 
 from scraper.fetchers import FetchResult
 from scraper.judgment_document_body import (
+    MIN_HTML_STRONG_COURT_DOCUMENT_WORDS,
     PDF_MISS_DEFER_ERROR,
     classify_pdf_endpoint_body,
     html_body_has_judgment_marker,
@@ -150,3 +151,146 @@ def test_short_non_court_html_still_defers():
 
 def test_pdf_miss_defer_error_message_unchanged():
     assert "not an accepted HTML judgment" in PDF_MISS_DEFER_ERROR
+
+
+def _word_doc_properties_preamble() -> str:
+    """MSO DocumentProperties noise ahead of order text (SHC view-file 92c752f2 shape)."""
+    return (
+        '<!--[if gte mso 9]><xml><o:DocumentProperties>'
+        "<o:Author>SHC</o:Author><o:Keywords>order</o:Keywords>"
+        "<o:Company>Microsoft Corporation</o:Company>"
+        "</o:DocumentProperties></xml><![endif]-->"
+    )
+
+
+def _shc_katcha_peshi_cr_misc_word_html() -> str:
+    """Cr.Misc.A.No. + For Katcha Peshi order sheet with doc-properties preamble (92c752f2)."""
+    lines = [
+        "ORDER SHEET",
+        "IN THE HIGH COURT OF SINDH AT LARKANA",
+        "Cr.Misc.A.No.S-32 of 2007 For Katcha Peshi",
+        "Present: Mr. Khan, Advocate for the applicant.",
+        "Heard. Matter adjourned to next date for arguments.",
+    ]
+    inner = "<br/>\r\n".join(lines)
+    return (
+        '<html xmlns:o="urn:schemas-microsoft-com:office:office">'
+        f"<head>{_word_doc_properties_preamble()}</head>"
+        '<body><div class="WordSection1">'
+        f"{inner}</div></body></html>"
+    )
+
+
+def _shc_larkana_bail_spaced_order_word_html(case_no: str) -> str:
+    """Larkana bail with letter-spaced O R D E R (ffce1b56 / ba9c3b56 / c1b3d4f0)."""
+    lines = [
+        "IN THE HIGH COURT OF SINDH AT LARKANA",
+        f"Criminal Bail Application No. {case_no}",
+        "O R D E R",
+        "After hearing learned counsel, ad-interim bail is granted subject to furnishing surety.",
+        "Notice to the complainant.",
+    ]
+    inner = "<br/>\r\n".join(lines)
+    return (
+        '<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">'
+        "</head><body>"
+        f"<div>{inner}</div></body></html>"
+    )
+
+
+def _shc_larkano_bench_spaced_order_word_html() -> str:
+    """LARKANO bench spelling with spaced ORDER (43a90e8b / 675299e7)."""
+    lines = [
+        "HIGH COURT OF SINDH LARKANO BENCH",
+        "1st Criminal Bail Application No. S-274/2022",
+        "O R D E R",
+        "Allowed subject to furnishing solvent surety to the satisfaction of the trial court.",
+    ]
+    return (
+        "<html><body><div>"
+        + "<br/>\r\n".join(lines)
+        + "</div></body></html>"
+    )
+
+
+def _shc_short_katcha_cp_word_html() -> str:
+    """Short C.P. Katcha Peshi sheet (7813b7b0)."""
+    return (
+        "<html><body>"
+        "IN THE HIGH COURT OF SINDH AT LARKANA<br/>"
+        "C.P.S-342 of 2007 For Katcha Peshi<br/>"
+        "ORDER SHEET<br/>"
+        "Adjourned to 12-04-2007."
+        "</body></html>"
+    )
+
+
+def _shc_hyderabad_ordersheet_word_html() -> str:
+    """ORDERSHEET one word + C.P. Hyderabad (48aac4be)."""
+    lines = [
+        "ORDERSHEET",
+        "IN THE HIGH COURT OF SINDH AT HYDERABAD",
+        "C.P. D-2478/2022",
+        "Present: Mr. Ali, Advocate for petitioner.",
+        "Heard. Petition dismissed for non-prosecution with liberty to file afresh.",
+        "Copy to parties.",
+    ]
+    return "<html><body>" + "<br/>".join(lines) + "</body></html>"
+
+
+def _fetch_result_for_word_html(html: str, token: str, *, encoding: str = "utf-8") -> FetchResult:
+    return FetchResult(
+        url=f"https://caselaw.shc.gov.pk/caselaw/view-file/{token}",
+        final_url=f"https://caselaw.shc.gov.pk/caselaw/view-file/{token}",
+        status_code=200,
+        content=html.encode(encoding),
+        content_type="application/pdf",
+    )
+
+
+def test_classify_katcha_peshi_cr_misc_with_doc_properties():
+    html = _shc_katcha_peshi_cr_misc_word_html()
+    assert html_judgment_word_count(html) < MIN_HTML_STRONG_COURT_DOCUMENT_WORDS
+    assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "92c752f2")) == "html_judgment"
+
+
+def test_classify_larkana_bail_spaced_order_cases():
+    for token, case_no in (
+        ("ffce1b56", "S-35/2023"),
+        ("ba9c3b56", "S-29/2023"),
+        ("c1b3d4f0", "S-414/2022"),
+    ):
+        html = _shc_larkana_bail_spaced_order_word_html(case_no)
+        res = _fetch_result_for_word_html(html, token, encoding="windows-1252")
+        assert classify_pdf_endpoint_body(res) == "html_judgment"
+
+
+def test_classify_larkano_bench_spaced_order():
+    html = _shc_larkano_bench_spaced_order_word_html()
+    res = _fetch_result_for_word_html(html, "675299e7")
+    assert classify_pdf_endpoint_body(res) == "html_judgment"
+    assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "43a90e8b")) == "html_judgment"
+
+
+def test_classify_short_katcha_cp_order_sheet():
+    html = _shc_short_katcha_cp_word_html()
+    assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "7813b7b0")) == "html_judgment"
+
+
+def test_classify_hyderabad_ordersheet_one_word():
+    html = _shc_hyderabad_ordersheet_word_html()
+    assert "ordersheet" in html.lower()
+    assert "order sheet" not in html.lower().replace("ordersheet", "")
+    assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "48aac4be")) == "html_judgment"
+
+
+def test_windows_1252_nbsp_letter_spaced_order_has_marker():
+    html = (
+        "<html><body>IN THE HIGH COURT OF SINDH AT LARKANA\r\n"
+        "Criminal Bail Application No. S-35/2023\r\n"
+        "O\xa0R\xa0D\xa0E\xa0R\r\n"
+        "Bail granted.</body></html>"
+    )
+    res = _fetch_result_for_word_html(html, "ffce1b56", encoding="windows-1252")
+    assert html_body_has_judgment_marker(res.text)
+    assert classify_pdf_endpoint_body(res) == "html_judgment"
