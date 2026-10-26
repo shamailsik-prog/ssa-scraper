@@ -10,6 +10,7 @@ already-quarantined fragment-name / bill-title / no-section rows.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional, Sequence
 from urllib.parse import urlsplit
@@ -290,20 +291,130 @@ def _years(text: str) -> set[int]:
     return {int(y) for y in re.findall(r"\b(?:18|19|20)\d{2}\b", text or "")}
 
 
+def _fold_title(text: str) -> str:
+    """Title text with diacritics removed, before case and punctuation folding."""
+    folded = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in folded if not unicodedata.combining(ch))
+
+
 def _tokens(name: str) -> set[str]:
-    cleaned = re.sub(r"[^a-z0-9\s]", " ", _collapse(name).lower())
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", _collapse(_fold_title(name)).lower())
     cleaned = re.sub(r"\b(?:18|19|20)\d{2}\b", " ", cleaned)
     return {tok for tok in cleaned.split() if len(tok) >= 4 and tok not in _TOKEN_STOP}
 
 
+# Single-character OCR swaps seen in Senate scans. Not general edit distance:
+# police/policy, arms/army, civil/civic, and port/part must stay distinct.
+_OCR_CONFUSABLE_SUBS = frozenset(
+    {
+        ("i", "l"),
+        ("l", "i"),
+        ("i", "1"),
+        ("1", "i"),
+        ("l", "1"),
+        ("1", "l"),
+        ("o", "0"),
+        ("0", "o"),
+        ("s", "5"),
+        ("5", "s"),
+        ("c", "e"),
+        ("e", "c"),
+    }
+)
+
+
+def _ocr_equivalent(left: str, right: str) -> bool:
+    """True when two title words differ only by a few scan confusions.
+
+    Allowed: ``i``/``l``/``1``, ``c``/``e``, and digit lookalikes, plus ``m``
+    versus ``rn`` in a longer word (``amendment`` / ``arnendment``). At most
+    one confusion in a word shorter than 8 characters, otherwise two.
+    """
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 5 or abs(len(left) - len(right)) > 2:
+        return False
+    budget = 1 if min(len(left), len(right)) < 8 else 2
+    allow_rn = max(len(left), len(right)) >= 8
+    unreachable = budget + 1
+    costs = [[unreachable] * (len(right) + 1) for _ in range(len(left) + 1)]
+    costs[0][0] = 0
+    for i in range(len(left) + 1):
+        for j in range(len(right) + 1):
+            used = costs[i][j]
+            if used > budget:
+                continue
+            if i < len(left) and j < len(right) and left[i] == right[j] and used < costs[i + 1][j + 1]:
+                costs[i + 1][j + 1] = used
+            if (
+                i < len(left)
+                and j < len(right)
+                and used + 1 <= budget
+                and (left[i], right[j]) in _OCR_CONFUSABLE_SUBS
+                and used + 1 < costs[i + 1][j + 1]
+            ):
+                costs[i + 1][j + 1] = used + 1
+            if allow_rn and used + 1 <= budget:
+                if (
+                    i < len(left)
+                    and left[i] == "m"
+                    and j + 1 < len(right)
+                    and right[j : j + 2] == "rn"
+                    and used + 1 < costs[i + 1][j + 2]
+                ):
+                    costs[i + 1][j + 2] = used + 1
+                if (
+                    j < len(right)
+                    and right[j] == "m"
+                    and i + 1 < len(left)
+                    and left[i : i + 2] == "rn"
+                    and used + 1 < costs[i + 2][j + 1]
+                ):
+                    costs[i + 2][j + 1] = used + 1
+    return costs[len(left)][len(right)] <= budget
+
+
+def _matched_token_count(left: set[str], right: set[str]) -> int:
+    """One-to-one overlap. Exact words pair first, then OCR-equivalent leftovers."""
+    remaining = set(right)
+    matched = 0
+    leftover: list[str] = []
+    for token in left:
+        if token in remaining:
+            remaining.remove(token)
+            matched += 1
+        else:
+            leftover.append(token)
+    for token in leftover:
+        partner = next((other for other in remaining if _ocr_equivalent(token, other)), None)
+        if partner is not None:
+            remaining.remove(partner)
+            matched += 1
+    return matched
+
+
+def _same_title_tokens(left: set[str], right: set[str]) -> bool:
+    """Subset or Jaccard overlap, with OCR-equivalent words counted as shared."""
+    matched = _matched_token_count(left, right)
+    if matched == min(len(left), len(right)):
+        return True
+    union = len(left) + len(right) - matched
+    return union > 0 and (matched / union) >= 0.55
+
+
 def title_relation(left: str, right: str) -> str:
-    """``same``, ``year_differs``, ``different``, or ``unknown``."""
+    """``same``, ``year_differs``, ``different``, or ``unknown``.
+
+    Significant words are compared after case, diacritic, and punctuation
+    folding. A scanned word still counts as shared when it differs only by
+    OCR confusions (see ``_ocr_equivalent``), so a garbled same-act title is
+    ``same`` rather than ``different``. Ordinal amendments and unrelated
+    instruments stay ``different``.
+    """
     a, b = _tokens(left), _tokens(right)
     if not a or not b:
         return "unknown"
-    inter = a & b
-    same_tokens = a <= b or b <= a or (len(inter) / len(a | b)) >= 0.55
-    if not same_tokens:
+    if not _same_title_tokens(a, b):
         return "different"
     years_a, years_b = _years(left), _years(right)
     if years_a and years_b and years_a.isdisjoint(years_b):

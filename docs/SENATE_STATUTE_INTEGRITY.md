@@ -41,7 +41,7 @@ Verdicts:
 
 | Verdict | Meaning |
 | --- | --- |
-| `MATCH` | PDF short title agrees with the stored act, and spot-checked section text appears in the PDF. |
+| `MATCH` | PDF short title agrees with the stored act, and spot-checked section text appears in the PDF. A scanned title that differs only by OCR confusions (`i`/`l`/`1`, `c`/`e`, digit lookalikes, `m`/`rn` in a longer word) still agrees. |
 | `MISMATCH` | No Gazette segment matches the pipe label or stored name, and the stored sections are not in the PDF. An incoherent name plus missing sections is a mismatch. |
 | `PARTIAL` | The matching PDF segment is the same instrument, but the stored name or a section is corrupt: preamble or definitions fragment, newline title, wrong year, year parsed as a section number, or a gazette running header such as `President's Orders and Regulations`. |
 | `FETCH_FAIL` | No live PDF and no recorded PDF bytes. |
@@ -58,6 +58,7 @@ python -m scraper.tasks.senate_statute_integrity --apply
 Record the dry-run counts for MAIN and FREE-SITES first. Only visible rows are written:
 
 - `MISMATCH` inserts `document_quarantine` with reason `senate_integrity:url_act_mismatch`. `needs_section_refetch` stays false, because re-extracting would copy the wrong act into this row.
+- `MATCH` is left unchanged. An OCR-near same-act title is `MATCH`, so `--apply` does not quarantine it and does not set `needs_section_refetch`. A different instrument stays `MISMATCH`, including ordinal amendments (Eighteenth against Nineteenth) and a wrong PDF such as Arms against Esso Vesting, Banking Companies against Benami, or Islamabad local government against Factories.
 - Repairable `PARTIAL` sets `needs_section_refetch` and does not quarantine. The row stays servable. Nothing in this sweep rewrites the name or the section text; the flag marks the row for a later re-extract.
 - A gazette header with no coherent act title is quarantined as `senate_integrity:partial_identity` and is not flagged for re-extract.
 - `FETCH_FAIL`, `MATCH`, and shells are left unchanged.

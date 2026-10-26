@@ -30,6 +30,7 @@ from scraper.statute_quality.senate_integrity import (
     classify_senate_identity,
     is_senate_sourced,
     split_statute_source_url,
+    title_relation,
 )
 from scraper.tasks.senate_statute_integrity import run_senate_statute_integrity
 
@@ -154,6 +155,146 @@ def test_three_way_mismatch_b6869d7b():
     assert "section_absent_from_pdf" in result.signals
     assert result.pdf_title
     assert "bar councils" in result.pdf_title.lower()
+
+
+@pytest.mark.parametrize(
+    ("stored", "pdf_title"),
+    [
+        ("Pakistan Engineering Council Act, 1976", "Pakistan Enginccring Councll Act, 1976"),
+        (
+            "Federal Public Service Commission Ordinance, 1977",
+            "Federal Publlc Servlce Commisslon Ordinance, 1977",
+        ),
+        (
+            "Economic Reforms (Amendment) Ordinance, 1972",
+            "Economlc Reforms (Arnendment) Ordinance, 1972",
+        ),
+        ("National Registration Act, 1973", "Natlonal Registratlon Act, 1973"),
+        ("National Registration Act, 1973", "Nat1onal Registration Act, 1973"),
+    ],
+)
+def test_title_relation_ocr_same_act_is_same(stored, pdf_title):
+    """Same instrument with scanned-title garbage must not be a different act."""
+    assert title_relation(stored, pdf_title) == "same"
+
+
+@pytest.mark.parametrize(
+    ("stored", "other"),
+    [
+        ("Arms (Second Amendment) Act, 1974", "Esso Undertakings (Vesting) Act, 1976"),
+        ("Banking Companies Ordinance, 1962", "Benami Transactions (Prohibition) Act, 2017"),
+        ("Islamabad Capital Territory Local Government Act, 2015", "Factories Act, 1934"),
+        (
+            "Constitution (Eighteenth Amendment) Act, 2010",
+            "Constitution (Nineteenth Amendment) Act, 2010",
+        ),
+        (
+            "Constitution (First Amendment) Act, 1974",
+            "Constitution (Fourth Amendment) Act, 1975",
+        ),
+        ("Arms Act, 1878", "Army Act, 1952"),
+        ("Police Order, 2002", "Policy Order, 2002"),
+        ("Civil Servants Act, 1973", "Civic Servants Act, 1973"),
+        (
+            "Capital Development Authority (Abatement of Arbitration Proceedings) Act, 1975",
+            "Legal Practitioners and Bar Councils Act, 1973",
+        ),
+        ("Pakistan Engineering Council Act, 1976", "Pakistan Medical Commission Act, 2020"),
+    ],
+)
+def test_title_relation_distinct_acts_stay_different(stored, other):
+    assert title_relation(stored, other) == "different"
+
+
+def _called_act_pdf(title: str, section_body: str, *, act_no: str | None = None) -> str:
+    heading = f"ACT No. {act_no}\n" if act_no else ""
+    return (
+        "THE GAZETTE OF PAKISTAN\n"
+        f"{heading}"
+        f"{title.upper()}\n"
+        f"1. Short title.—This Act may be called the {title}.\n"
+        f"2. Operative text.—{section_body}\n"
+    )
+
+
+_OCR_SECTION = (
+    "The council shall register qualified practitioners and regulate the profession "
+    "throughout the country, and shall publish an annual list of persons entitled to practise."
+)
+# Enough body words that a missing section is real absence, not a thin extract.
+_LONG_OTHER_BODY = " ".join(
+    [
+        "Every proprietor of a coastal fishing craft shall mark the hull and report each voyage",
+        "to the harbour master before departure, keep a written manifest of crew and cargo,",
+        "and pay the prescribed light dues to the port authority on arrival at the next port.",
+        "The collector may detain the craft until those dues and any penalty are satisfied.",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    ("stored", "pdf_title", "year", "act_no"),
+    [
+        ("Pakistan Engineering Council Act, 1976", "Pakistan Enginccring Councll Act, 1976", 1976, "V of 1976"),
+        (
+            "Federal Public Service Commission Ordinance, 1977",
+            "Federal Publlc Servlce Commisslon Ordinance, 1977",
+            1977,
+            "XLV of 1977",
+        ),
+        (
+            "Economic Reforms (Amendment) Ordinance, 1972",
+            "Economlc Reforms (Arnendment) Ordinance, 1972",
+            1972,
+            "XII of 1972",
+        ),
+        ("National Registration Act, 1973", "Natlonal Registratlon Act, 1973", 1973, "VII of 1973"),
+    ],
+)
+def test_ocr_garbled_same_act_is_match_not_quarantined(stored, pdf_title, year, act_no):
+    """Same act number plus an OCR-garbled short title is not a wrong PDF."""
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=year,
+        source_url=f"https://senate.gov.pk/uploads/documents/ocr-same.pdf|{act_no}",
+        sections=[_section("2", _OCR_SECTION)],
+        pdf_text=_called_act_pdf(pdf_title, _OCR_SECTION, act_no=act_no),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert "pdf_title_disagrees" not in result.signals
+    assert result.needs_reextract is False
+
+
+@pytest.mark.parametrize(
+    ("stored", "pdf_title", "year"),
+    [
+        ("Arms (Second Amendment) Act, 1974", "Esso Undertakings (Vesting) Act, 1976", 1974),
+        ("Banking Companies Ordinance, 1962", "Benami Transactions (Prohibition) Act, 2017", 1962),
+        ("Islamabad Capital Territory Local Government Act, 2015", "Factories Act, 1934", 2015),
+        (
+            "Constitution (Eighteenth Amendment) Act, 2010",
+            "Constitution (Nineteenth Amendment) Act, 2010",
+            2010,
+        ),
+    ],
+)
+def test_wrong_pdf_act_title_stays_mismatch_quarantine(stored, pdf_title, year):
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=year,
+        source_url=f"https://senate.gov.pk/uploads/documents/wrong-pdf.pdf|{stored}",
+        sections=[_section("2", _OCR_SECTION)],
+        pdf_text=_called_act_pdf(pdf_title, _LONG_OTHER_BODY),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "pdf_title_disagrees" in result.signals
 
 
 def test_shared_gazette_second_act_is_not_quarantined():
