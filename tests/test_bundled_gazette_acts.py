@@ -156,6 +156,200 @@ def test_pipe_label_and_title_that_name_different_acts_store_nothing():
     assert extracted["field_evidence"].get("bundled_gazette_unresolved")
 
 
+AMENDMENT_CITING_EARLIER_ACT = """
+ACT No. XII of 1980
+An Act further to amend the Service Tribunals Act, 1973.
+1. Short title.—This Act may be called the Service Tribunals (Amendment) Act, 1980.
+2. Amendment of section 3.—In the Service Tribunals Act, 1973, in section 3, after the word President the words or a person authorised by him shall be inserted and the tribunal shall note that insertion in its register.
+Act No. LXX of 1973.- In the Service Tribunals Act, 1973, in section 4, for the word thirty the word sixty shall be substituted and the appeal period shall be counted from the date of communication.
+5. Savings.—Every appeal already filed under the unamended section shall continue and shall be decided under the law as it stood before this amendment came into force.
+"""
+SAVINGS = "Every appeal already filed under the unamended section shall continue"
+
+
+def test_line_start_act_citation_with_pipe_label_does_not_drop_later_sections():
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=AMENDMENT_CITING_EARLIER_ACT,
+        source_meta={
+            "source_name": "Senate",
+            "url": "https://senate.gov.pk/uploads/documents/amendment.pdf|XII of 1980",
+            "act_title": "The Service Tribunals (Amendment) Act, 1980",
+        },
+    )
+    blob = _blob(extracted)
+    assert SAVINGS in blob
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+    assert "person authorised by him" in blob
+
+
+def test_line_start_act_citation_without_pipe_or_title_is_not_quarantined():
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=AMENDMENT_CITING_EARLIER_ACT,
+        source_meta={
+            "source_name": "Senate",
+            "url": "https://senate.gov.pk/uploads/documents/amendment.pdf",
+        },
+    )
+    assert extracted["sections"]
+    assert SAVINGS in _blob(extracted)
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+
+
+def test_next_line_in_the_citation_is_not_an_act_boundary():
+    text = AMENDMENT_CITING_EARLIER_ACT.replace(
+        "Act No. LXX of 1973.- In the Service Tribunals Act, 1973, in section 4, for the word thirty the word sixty shall be substituted and the appeal period shall be counted from the date of communication.",
+        "Act No. LXX of 1973\nIn the Service Tribunals Act, 1973, in section 4, for the word thirty the word sixty shall be substituted and the appeal period shall be counted from the date of communication.",
+    )
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={
+            "source_name": "Senate",
+            "url": "https://senate.gov.pk/uploads/documents/amendment.pdf|XII of 1980",
+            "act_title": "The Service Tribunals (Amendment) Act, 1980",
+        },
+    )
+    assert SAVINGS in _blob(extracted)
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+
+
+WRAPPED_TITLE_BUNDLE = """
+ACT No. LXVII of 1973
+An Act to amend the Life Insurance (Nationalisation) Order, 1972.
+1. Short title and commencement.—(1) This Act may be called
+the Life Insurance (Nationalisation) (Amendment) Act, 1973.
+2. General amendment.—In the Life Insurance (Nationalisation) Order, 1972, for the words Central Government the words Federal Government shall be substituted wherever they occur in that Order.
+
+ACT No. LXX of 1973
+An Act to provide for the establishment of Service Tribunals to exercise jurisdiction in respect of matters relating to the terms and conditions of service of civil servants.
+1. Short title, commencement and application.—(1) This Act may be called
+the Service Tribunals Act, 1973.
+2. Definitions.—In this Act, unless there is anything repugnant in the subject or context, civil servant means a person who is or has been a civil servant within the meaning of the Civil Servants Act, 1973.
+9. Repeal.—The Service Tribunals Ordinance, 1973, is hereby repealed.
+
+ACT No. LXXI of 1973
+An Act to regulate the appointment of persons to, and the terms and conditions of service of persons in, the service of Pakistan.
+1. Short title, application and commencement.—(1) This Act may be called
+the Civil Servants Act, 1973.
+2. Definitions.—In this Act, unless there is anything repugnant, civil servant means a person who is a member of a civil service of the Federation and is recorded on the federal establishment roll.
+"""
+
+
+def test_shall_be_called_title_wrapped_mid_name_selects_the_middle_act_without_a_pipe():
+    text = """
+    ACT No. LXVII of 1973
+    An Act to amend the Life Insurance (Nationalisation) Order, 1972.
+    1. Short title.—This Act shall be called the Life Insurance (Nationalisation) (Amendment) Act, 1973.
+    2. General amendment.—In the Life Insurance (Nationalisation) Order, 1972, for the words Central Government the words Federal Government shall be substituted wherever they occur in that Order.
+
+    ACT No. LXX of 1973
+    An Act to provide for the establishment of Service Tribunals.
+    1. Short title.—This Act shall be called the Service
+    Tribunals Act, 1973.
+    2. Definitions.—In this Act Tribunal means a Service Tribunal established under this Act to hear appeals of civil servants from the departments of the Federation.
+    9. Repeal.—The Service Tribunals Ordinance, 1973, is hereby repealed.
+
+    ACT No. LXXI of 1973
+    An Act to regulate the service of Pakistan.
+    1. Short title.—This Act shall be called the Civil Servants Act, 1973.
+    2. Definitions.—In this Act civil servant means a person who is a member of a civil service of the Federation and is recorded on the federal establishment roll.
+    """
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={"source_name": "Senate", "url": PDF_URL, "act_title": SERVICE_TRIBUNALS},
+    )
+    blob = _blob(extracted)
+    assert "Service Tribunals Ordinance, 1973" in blob
+    assert "Federal Government shall be substituted" not in blob
+    assert "federal establishment roll" not in blob
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+
+
+def test_wrapped_short_title_selects_the_middle_act_without_a_pipe_label():
+    """The real Service Tribunals short title breaks after 'may be called'."""
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=WRAPPED_TITLE_BUNDLE,
+        source_meta={
+            "source_name": "Senate",
+            "url": PDF_URL,
+            "act_title": SERVICE_TRIBUNALS,
+        },
+    )
+    blob = _blob(extracted)
+    assert "Service Tribunals Ordinance, 1973" in blob
+    assert "Federal Government shall be substituted" not in blob
+    assert "federal establishment roll" not in blob
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+
+
+def test_real_service_tribunals_ocr_is_not_treated_as_an_unresolved_bundle():
+    from pathlib import Path
+
+    from scraper.statute_quality.bundled_gazette import isolate_bundled_act
+
+    text = Path("tests/fixtures/statute_quality/senate_1660540467_508.txt").read_text()
+    isolation = isolate_bundled_act(text, target_name=SERVICE_TRIBUNALS, source_url=PDF_URL)
+    assert isolation.status != "unresolved"
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={"source_name": "Senate", "url": PDF_URL, "act_title": SERVICE_TRIBUNALS},
+    )
+    assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
+    assert extracted["sections"]
+
+
+def test_conciliation_courts_fixture_still_cuts_at_the_later_act_heading():
+    """MAIN 86215821 is a title-heading bleed, not an ACT No. bundle."""
+    from scraper.statute_quality.bundled_gazette import isolate_bundled_act
+    from scraper.statute_quality.gok_multi_act_bleed import (
+        REASON_BLEED,
+        VERDICT_MISMATCH,
+        classify_gok_multi_act,
+        truncate_at_second_act_heading,
+    )
+    from tests.test_gok_multi_act_bleed import (
+        CONCILIATION_NAME,
+        CONCILIATION_URL,
+        TWO_ACT_PDF,
+        _mirpur_bleed_sections,
+    )
+
+    isolation = isolate_bundled_act(
+        TWO_ACT_PDF,
+        target_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+    )
+    assert isolation.status == "single"
+    assert "Headquarters of the Authority" in isolation.text
+    cut = truncate_at_second_act_heading(isolation.text, CONCILIATION_NAME)
+    assert "Conciliation Court" in cut
+    assert "Headquarters of the Authority" not in cut
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=TWO_ACT_PDF,
+        source_meta={
+            "source_name": "AJKAssembly",
+            "url": CONCILIATION_URL.split("|", 1)[0],
+            "act_title": CONCILIATION_NAME,
+        },
+    )
+    blob = _blob(extracted)
+    assert "Conciliation Court" in blob
+    assert "Headquarters of the Authority" not in blob
+    verdict = classify_gok_multi_act(
+        stored_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+        sections=_mirpur_bleed_sections(),
+    )
+    assert verdict.verdict == VERDICT_MISMATCH
+    assert verdict.reason == REASON_BLEED
+
+
 def test_single_act_pdf_is_unchanged():
     text = """
     ACT No. LXX of 1973

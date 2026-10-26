@@ -74,9 +74,13 @@ _TOKEN_STOP = frozenset(
 )
 
 _CALLED_TITLE_RE = re.compile(
-    r"(?is)\b(?:this|the)\s+(?:act|ordinance|order)\s+may\s+be\s+called\s+(?:the\s+)?"
-    r"(?P<title>[^.;\n]{6,220}?\b(?:act|ordinance|order|rules|regulations)\b[^.;\n]{0,48})"
+    r"(?is)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+called\s+(?:the\s+)?"
+    r"(?P<title>(?:[^.;\n]|[ \t]*\n[ \t]*){6,240}?"
+    r"\b(?:act|ordinance|order|rules|regulations)\b[^.;\n]{0,48})"
 )
+_AN_ACT_OPENING_RE = re.compile(r"(?i)^an\s+act\b")
+_SHORT_TITLE_OPENING_RE = re.compile(r"(?i)^1\s*[\.\)\-]\s*short\s+title\b")
+_CITATION_FOLLOW_RE = re.compile(r"(?i)^(?:\.-|\.\s*-|,\s*in\s+section\b|in\s+the\b)")
 _ACT_NO_LABELED_RE = re.compile(
     r"(?i)\bact\s+no\.?\s*([IVXLCDM]+|\d{1,4})\s+of\s+((?:18|19|20)\d{2})\b"
 )
@@ -512,12 +516,65 @@ def _pdf_word_count(text: str) -> int:
     return len(_PDF_WORD_RE.findall(text or ""))
 
 
+def _opening_lines(text: str, match_end: int, limit: int = 4) -> list[str]:
+    """Non-empty lines after an ``ACT No.`` match, at most ``limit`` of them."""
+    rest = text[match_end:]
+    newline = rest.find("\n")
+    same_line = rest if newline < 0 else rest[:newline]
+    raw_lines = []
+    if same_line.strip():
+        raw_lines.append(same_line)
+    if newline >= 0:
+        raw_lines.extend(rest[newline + 1 :].splitlines())
+    opened: list[str] = []
+    for line in raw_lines:
+        cleaned = line.strip().lstrip("'\"“”‘’` ").strip()
+        if not cleaned:
+            continue
+        opened.append(cleaned)
+        if len(opened) >= limit:
+            break
+    return opened
+
+
+def _is_citation_act_heading(text: str, match: re.Match) -> bool:
+    """A wrapped amendment citation, not the start of another Act.
+
+    ``Act No. LXX of 1973.- In the …`` and a following ``In the`` / ``, in section``
+    quote the earlier Act. They are not a new boundary.
+    """
+    follower = _opening_lines(text, match.end(), limit=1)
+    if not follower:
+        return False
+    return _CITATION_FOLLOW_RE.match(follower[0]) is not None
+
+
+def _heading_opens_act(text: str, match: re.Match) -> bool:
+    """True when an ``An Act`` preamble or ``1. Short title`` follows within four lines."""
+    for line in _opening_lines(text, match.end(), limit=4):
+        if _AN_ACT_OPENING_RE.match(line) or _SHORT_TITLE_OPENING_RE.match(line):
+            return True
+    return False
+
+
+def _is_act_boundary(text: str, match: re.Match) -> bool:
+    if _is_citation_act_heading(text, match):
+        return False
+    return _heading_opens_act(text, match)
+
+
 def act_segments(pdf_text: str) -> list[_ActSegment]:
-    """Split a Gazette that prints several acts. A single act stays one segment."""
+    """Split a Gazette that prints several acts. A single act stays one segment.
+
+    A line-start ``Act No.`` is a boundary only when an ``An Act`` preamble or
+    ``1. Short title`` follows within four lines. A citation tail (``.-``,
+    ``In the``, ``, in section``) is not a boundary, so an amending Act that
+    quotes an earlier Act number keeps the sections that follow the quotation.
+    """
     text = pdf_text or ""
     if not text.strip():
         return []
-    headings = list(_ACT_NO_HEADING_RE.finditer(text))
+    headings = [match for match in _ACT_NO_HEADING_RE.finditer(text) if _is_act_boundary(text, match)]
     if len(headings) >= 2:
         segments: list[_ActSegment] = []
         for index, heading in enumerate(headings):

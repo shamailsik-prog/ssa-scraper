@@ -10,7 +10,7 @@ Confirmed row:
 
 That PDF is three Acts: LXVII of 1973 (Life Insurance (Nationalisation) (Amendment)), LXX of 1973 (Service Tribunals), LXXI of 1973. Stored sections 2 and 3 are the LXVII text. Section 4 of the Service Tribunals Act is missing. Section 59 is the footer. Section 9 runs into LXXI.
 
-New ingest isolates the segment whose act number matches the pipe label, or whose short title matches the target title, and splits only that segment. If the label and the title name two different segments, or neither matches, the extract stores no sections and promotion quarantines the staging row with `bundled_gazette_unresolved`. It does not set `needs_section_refetch`.
+New ingest isolates the segment whose act number matches the pipe label, or whose short title matches the target title, and splits only that segment. A line-start `Act No.` is a boundary only when `An Act` or `1. Short title` follows within four lines. A citation tail (`.-`, `In the`, `, in section`), including `Act No. LXX of 1973.- In the …`, is not a boundary, so the sections after that quotation stay with the amending Act. `may be called` and `shall be called` both supply the short title, including when the title breaks onto the next line. If the label and the title name two different segments, or neither matches, the extract stores no sections and promotion quarantines the staging row with `bundled_gazette_unresolved`. It does not set `needs_section_refetch`.
 
 The same cut runs for Senate, the National Assembly, law.gok.pk, and any other text that has two or more `ACT No.` lines. A law.gok.pk PDF that has no second `ACT No.` line still uses the existing title-heading cut, which drops a later act and does not pull a middle act out of an earlier one.
 
