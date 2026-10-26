@@ -350,7 +350,9 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     official_title = source_meta.get("act_title") or source_meta.get("detail_title")
     name = prefer_official_statute_title(detected_name, official_title)
     gazette_year: Optional[int] = None
-    if source_meta.get("source_name") in ("Senate", "AJKAssembly"):
+    from scraper.parsers.assembly_pdf_sections import is_assembly_source, normalize_assembly_gazette_pdf_text
+
+    if source_meta.get("source_name") in ("Senate", "AJKAssembly", "NationalAssembly"):
         from scraper.config import settings
 
         if settings.SSA_STATUTE_QUALITY_GAZETTE_HEADER:
@@ -359,6 +361,9 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
             gaz = extract_gazette_title_year(raw_text, source_name=source_meta.get("source_name"))
             if gaz:
                 name, gazette_year = gaz
+    if is_assembly_source(source_meta.get("source_name")):
+        body = normalize_assembly_gazette_pdf_text(body or "")
+        raw_text = normalize_assembly_gazette_pdf_text(raw_text or "")
     sections = split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 

@@ -7,6 +7,12 @@ from typing import Dict, List, Optional
 
 from scraper.parsers.statute_parser import SHORT_TITLE_CLAUSE_RE, _parse_numeric_section_number, _strip_section_prefix
 
+# Gazette PDFs (na.gov.pk uploads) often embed page headers mid-section.
+GAZETTE_PAGE_LINE_RE = re.compile(
+    r"(?i)^\s*(?:\d{1,2},\d{4}\s*)?(?:\d{1,4}\s+)?THE\s+GAZETTE\s+OF\s+PAKISTAN\b.*$",
+)
+GAZETTE_PART_LINE_RE = re.compile(r"(?i)^\s*\[?\s*PART\s+I\s*\]?\s*$")
+
 ASSEMBLY_SOURCE_NAMES = frozenset(
     {
         "PunjabAssembly",
@@ -29,6 +35,41 @@ PAGE_NUMBER_BODY_RE = re.compile(r"^\s*\d{1,4}\s*\.?\s*$")
 
 def is_assembly_source(source_name: Optional[str]) -> bool:
     return (source_name or "") in ASSEMBLY_SOURCE_NAMES
+
+
+def normalize_assembly_gazette_pdf_text(text: str) -> str:
+    """Fix common OCR section markers in federal gazette act PDFs before section splitting."""
+    if not text:
+        return text
+    out = text
+    out = re.sub(r"(?m)^(\s*)l\.\s+(?=Short\s+title\b)", r"\g<1>1. ", out, flags=re.IGNORECASE)
+    out = re.sub(r"(?m)^(\s*)3l\.\s+", r"\g<1>31. ", out, flags=re.IGNORECASE)
+    out = re.sub(r"(?m)^(\s*)ll\.\s+", r"\g<1>11. ", out, flags=re.IGNORECASE)
+    out = re.sub(
+        r"(?m)^(\s*)I\.\s+Authority\.(\{)",
+        r"\g<1>11. Authority.-\2",
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
+def strip_gazette_page_break_lines(body: str) -> str:
+    """Remove gazette page chrome lines that pdfplumber leaves inside a section body."""
+    kept: List[str] = []
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            kept.append(line)
+            continue
+        if GAZETTE_PAGE_LINE_RE.match(stripped):
+            continue
+        if GAZETTE_PART_LINE_RE.match(stripped):
+            continue
+        if re.fullmatch(r"\d{1,2},\d{4}", stripped):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def is_table_of_contents_chunk(text: str) -> bool:
@@ -62,7 +103,11 @@ def _is_bogus_section_number(num: str, body: str, prev_num: Optional[int]) -> bo
     n = _parse_numeric_section_number(num)
     if n is None:
         return False
+    if n == 0:
+        return True
     if YEAR_ONLY_RE.match(num or "") or (1800 <= n <= 2100 and len((body or "").strip()) < 40):
+        return True
+    if 1800 <= n <= 2100:
         return True
     stripped = _strip_section_prefix(body)
     if PAGE_NUMBER_BODY_RE.match(stripped):

@@ -85,6 +85,10 @@ SHORT_TITLE_CLAUSE_RE = re.compile(
     r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
     re.IGNORECASE,
 )
+SHALL_BE_CALLED_ACT_RE = re.compile(
+    r"(?is)\b(?:this|the)\s+act\s+shall\s+be\s+called\s+the\s+"
+    r"(?P<title>.{6,400}?\b(?:act|ordinance|order|rules|regulations)\b.{0,40})"
+)
 FOOTNOTE_ANNOTATION_RE = re.compile(
     r'(?i)\b(?:substituted|inserted|added|omitted|amended|renumbered|repealed)\s+by\b'
 )
@@ -218,11 +222,17 @@ def _is_false_section_candidate(section_text: str) -> bool:
     body = _strip_section_prefix(section_text)
     if not body:
         return True
+    try:
+        from scraper.parsers.assembly_pdf_sections import strip_gazette_page_break_lines
+
+        body = strip_gazette_page_break_lines(body) or body
+    except Exception:
+        pass
     if re.fullmatch(r'\d{1,4}', body):
         return True
     if TRAILING_AND_SECTION_RE.match(body):
         return True
-    if GAZETTE_FOOTNOTE_RE.search(body):
+    if GAZETTE_FOOTNOTE_RE.search(body) and len(body) < 400:
         return True
     if FOOTNOTE_ANNOTATION_RE.search(body):
         return True
@@ -232,6 +242,17 @@ def _is_false_section_candidate(section_text: str) -> bool:
 
 def is_short_title_clause(name: str) -> bool:
     return bool(SHORT_TITLE_CLAUSE_RE.match(_normalize_whitespace(name or "")))
+
+
+def _clean_called_act_title(raw: str) -> str:
+    title = _normalize_whitespace(raw or "")
+    title = re.split(r"\s+\(\d+\)", title, maxsplit=1)[0].strip(" .,:;")
+    year_match = re.search(r"\b((?:19|20)\d{2})\s*\.?\s*$", title)
+    if year_match:
+        name_part = title[: year_match.start()].strip(" ,.")
+        if name_part:
+            return f"{name_part}, {year_match.group(1)}"
+    return title
 
 
 def looks_like_clause_fragment(name: str) -> bool:
@@ -328,6 +349,10 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
         if _is_false_section_candidate(s.get("section_text", "")):
             continue
         num_int = _parse_numeric_section_number(s.get("section_number", ""))
+        if num_int == 0:
+            continue
+        if num_int is not None and 1800 <= num_int <= 2100:
+            continue
         if sanity_cap is not None and num_int is not None and num_int > sanity_cap:
             continue
         # filter bogus numbers like 99999
@@ -765,6 +790,12 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
             except Exception as e:
                 logger.warning(f"detect_statute_name URL parse failed for {url}: {e}")
 
+        called_early = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
+        if called_early:
+            title = _clean_called_act_title(called_early.group("title"))
+            if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
+                return title
+
         # 2) Search known statutes in text_to_search
         text_lower = text_to_search.lower()
         for key, canonical in KNOWN_STATUTES_MAP.items():
@@ -785,6 +816,12 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 
         # 3) Generic Act pattern with year - high confidence
         if text_to_search:
+            called = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
+            if called:
+                title = _clean_called_act_title(called.group("title"))
+                if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
+                    return title
+
             match_year = ACT_WITH_YEAR_PATTERN.search(text_to_search)
             if match_year:
                 candidate = _normalize_whitespace(match_year.group(1))
@@ -882,6 +919,17 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 def detect_statute_name(text: str, url: Optional[str] = None) -> str:
     """Detect a canonical statute name and reject URL-fragment leftovers."""
     detected = _detect_statute_name_from_text_or_url(text, url)
+    if is_short_title_clause(detected):
+        if text:
+            called = SHALL_BE_CALLED_ACT_RE.search(text[:20000])
+            if called:
+                title = _clean_called_act_title(called.group("title"))
+                if title and _is_plausible_act_title(title):
+                    detected = title
+                else:
+                    detected = "Unknown Statute"
+            else:
+                detected = "Unknown Statute"
     if looks_like_fragment_name(detected):
         logger.info("detect_statute_name: rejecting fragment name %r for url=%s", detected, url)
         return "Unknown Statute"
