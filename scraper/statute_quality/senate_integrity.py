@@ -6,9 +6,11 @@ The label differing from ``statute.name`` is not, by itself, a mismatch.
 Verdicts: MATCH, MISMATCH, PARTIAL, FETCH_FAIL, plus SKIPPED_SHELL for the
 already-quarantined fragment-name / bill-title / no-section rows.
 
-A short title that already agrees, including OCR-near wording, stays MATCH
-when the only other defects are a mismatched act number or a year stored as
-a section number. A different instrument stays MISMATCH.
+An act-number gap is ignored only when the significant words agree in both
+directions under OCR equivalence, both titles carry the same year, and the
+act numbers share that year and differ by one (XXX against XXXI). Amendment
+and ordinal words stay significant. A year stored as a section number stays
+on the row and does not leave MATCH when that wording already agrees.
 """
 
 from __future__ import annotations
@@ -426,6 +428,31 @@ def title_relation(left: str, right: str) -> str:
     return "same"
 
 
+def _bidirectional_ocr_titles(left: str, right: str) -> bool:
+    """Every significant word has an OCR partner, in both directions.
+
+    ``title_relation`` still treats a subset or a Jaccard overlap of 0.55 as
+    ``same``. That is too wide to drop an act-number disagreement: ``Companies
+    Act`` would swallow ``Companies (Amendment) Act``, and ``Amendment`` would
+    swallow ``Second Amendment``. Amendment and ordinal words are not stop words.
+    """
+    a, b = _tokens(left), _tokens(right)
+    if not a or not b or len(a) != len(b):
+        return False
+    return _matched_token_count(a, b) == len(a)
+
+
+def _titles_share_enactment_year(left: str, right: str) -> bool:
+    """Both titles carry a year, and the year sets are equal."""
+    years_left, years_right = _years(left), _years(right)
+    return bool(years_left) and years_left == years_right
+
+
+def _one_roman_act_misread(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    """Same act-number year, values one apart (XXX is 30, XXXI is 31)."""
+    return left[1] == right[1] and abs(left[0] - right[0]) == 1
+
+
 @dataclass(frozen=True)
 class _ActSegment:
     act_number: Optional[tuple[int, int]]
@@ -738,7 +765,17 @@ def classify_senate_identity(
         chosen is not None
         and pdf_title
         and is_coherent_act_title(stored_name)
-        and title_relation(stored_name, pdf_title) == "same"
+        and _bidirectional_ocr_titles(stored_name, pdf_title)
+        and _titles_share_enactment_year(stored_name, pdf_title)
+    )
+    # Drop the act-number signal only for a one-numeral misread on that title.
+    # A wider gap, a missing year, or an extra amendment/ordinal word still disagrees.
+    act_number_is_one_roman_misread = bool(
+        title_agrees
+        and pipe_act
+        and chosen is not None
+        and chosen.act_number
+        and _one_roman_act_misread(pipe_act, chosen.act_number)
     )
 
     def _note_title_relation(title: Optional[str]) -> None:
@@ -757,11 +794,12 @@ def classify_senate_identity(
             signals.append("year_disagrees")
 
     if chosen is not None:
-        # OCR-tolerant title agreement is what selected this segment (PCSIR:
-        # scanned title is the same Act, while XXX and XXXI are not). The first
-        # ACT No. is too fragile to quarantine that row. A different year
-        # (Finance Act, 2015 against 2016) is still an act-number mismatch.
-        if pipe_act and chosen.act_number and pipe_act != chosen.act_number and not title_agrees:
+        if (
+            pipe_act
+            and chosen.act_number
+            and pipe_act != chosen.act_number
+            and not act_number_is_one_roman_misread
+        ):
             signals.append("act_number_disagrees")
         _note_title_relation(pdf_title)
     else:

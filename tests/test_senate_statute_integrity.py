@@ -299,6 +299,28 @@ def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
     assert "pdf_title_disagrees" not in result.signals
 
 
+def test_identical_title_one_roman_misread_keeps_year_section_match():
+    """A true title match plus XXX-vs-XXXI still stays MATCH, and the year section is kept."""
+    stored = "Criminal Law Amendment (Special Court) Act, 1976"
+    body = (
+        "The special court shall try the scheduled offences listed in this Act "
+        "and shall record its judgment in writing before pronouncing sentence."
+    )
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=1976,
+        source_url="https://senate.gov.pk/uploads/documents/same-title.pdf|XVII of 1976",
+        sections=[_section("1976", body)],
+        pdf_text=_called_act_pdf(stored, body, act_no="XVIII of 1976"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" not in result.signals
+    assert "year_as_section_number" in result.signals
+
+
 @pytest.mark.parametrize(
     ("stored", "year", "pipe_no", "pdf_no"),
     [
@@ -307,8 +329,8 @@ def test_pcsir_ocr_title_and_garbled_act_number_stays_match():
         ("Cantonments (Amendment) Act, 2015", 2015, "IV of 2015", "VI of 2015"),
     ],
 )
-def test_identical_title_ignores_garbled_act_number_and_year_section(stored, year, pipe_no, pdf_no):
-    """Title-identical rows stay MATCH when the only other signals are OCR act number and a year section."""
+def test_identical_title_distant_act_number_stays_mismatch(stored, year, pipe_no, pdf_no):
+    """The same words do not excuse an act number that is more than one numeral off."""
     body = (
         "The special court shall try the scheduled offences listed in this Act "
         "and shall record its judgment in writing before pronouncing sentence."
@@ -321,12 +343,72 @@ def test_identical_title_ignores_garbled_act_number_and_year_section(stored, yea
         pdf_text=_called_act_pdf(stored, body, act_no=pdf_no),
         pdf_available=True,
     )
-    assert result.verdict == VERDICT_MATCH
-    assert result.action == ACTION_NONE
-    assert result.needs_reextract is False
-    assert "act_number_disagrees" not in result.signals
-    assert "pdf_title_disagrees" not in result.signals
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
     assert "year_as_section_number" in result.signals
+
+
+def test_main_act_versus_amendment_stays_mismatch_when_section_absent():
+    """Companies Act, 2017 is not Companies (Amendment) Act, 2017, even at XIX vs XV."""
+    stored = "Companies Act, 2017"
+    pdf_title = "Companies (Amendment) Act, 2017"
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/companies.pdf|XIX of 2017",
+        sections=[_section("2", _OCR_SECTION)],
+        pdf_text=_called_act_pdf(pdf_title, _LONG_OTHER_BODY, act_no="XV of 2017"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.needs_reextract is False
+    assert "act_number_disagrees" in result.signals
+    assert "section_absent_from_pdf" in result.signals
+
+
+def test_amendment_versus_second_amendment_stays_mismatch():
+    """Ordinal wording stays significant even when the act numbers are one numeral apart."""
+    stored = "Criminal Laws (Amendment) Act, 2017"
+    pdf_title = "Criminal Laws (Second Amendment) Act, 2017"
+    body = (
+        "The schedule of offences triable by the special court is amended "
+        "and the court shall record reasons for every sentence it pronounces."
+    )
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/cl-amend.pdf|XXX of 2017",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXXI of 2017"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
+def test_yearless_stored_title_versus_titled_year_stays_mismatch():
+    """A stored title with no year does not agree with Finance Act, 2016."""
+    stored = "Finance Act"
+    pdf_title = "Finance Act, 2016"
+    body = "Income tax rates for the tax year shall be the rates set out in the first schedule to this Act."
+    assert title_relation(stored, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=None,
+        source_url="https://senate.gov.pk/uploads/documents/finance-bare.pdf|XXX of 2016",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXXI of 2016"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
 
 
 def test_different_year_act_number_disagrees_stays_mismatch():
