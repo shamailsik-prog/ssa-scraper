@@ -378,6 +378,12 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
             cleaned_title = _clean_called_act_title(called.group("title"), preamble=raw_text, repair_ocr=True)
             if _is_plausible_act_title(cleaned_title):
                 name = cleaned_title
+    source_url = str(source_meta.get("url") or "")
+    from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source, truncate_at_second_act_heading
+
+    if source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url):
+        body = truncate_at_second_act_heading(body or "", name)
+        raw_text = truncate_at_second_act_heading(raw_text or "", name)
     sections = split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
