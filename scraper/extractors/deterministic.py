@@ -346,6 +346,14 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     listed_title = source_meta.get("act_title") or source_meta.get("detail_title")
     if source_meta.get("source_name") == "PakistanCode" and listed_title and raw_text:
         return _extract_statute_by_contents(raw_text, listed_title, source_meta)
+    source_url = str(source_meta.get("url") or "")
+    target_name = str(listed_title or source_meta.get("statute_name") or "")
+    from scraper.statute_quality.bundled_gazette import isolate_bundled_act
+
+    isolation = isolate_bundled_act(body, target_name=target_name, source_url=source_url)
+    if isolation.status == "isolated":
+        body = isolation.text
+        raw_text = isolation.text
     detected_name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
     official_title = source_meta.get("act_title") or source_meta.get("detail_title")
     name = prefer_official_statute_title(detected_name, official_title)
@@ -355,12 +363,16 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     if source_meta.get("source_name") in ("Senate", "AJKAssembly", "NationalAssembly"):
         from scraper.config import settings
 
-        if settings.SSA_STATUTE_QUALITY_GAZETTE_HEADER:
+        if settings.SSA_STATUTE_QUALITY_GAZETTE_HEADER and isolation.status != "unresolved":
             from scraper.statute_quality.gazette_header import extract_gazette_title_year
 
             gaz = extract_gazette_title_year(raw_text, source_name=source_meta.get("source_name"))
             if gaz:
                 name, gazette_year = gaz
+    if isolation.status == "isolated":
+        name = prefer_official_statute_title(isolation.title or detected_name, official_title)
+        if isolation.act_year is not None:
+            gazette_year = isolation.act_year
     if is_assembly_source(source_meta.get("source_name")):
         body = normalize_assembly_gazette_pdf_text(body or "")
         raw_text = normalize_assembly_gazette_pdf_text(raw_text or "")
@@ -378,13 +390,13 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
             cleaned_title = _clean_called_act_title(called.group("title"), preamble=raw_text, repair_ocr=True)
             if _is_plausible_act_title(cleaned_title):
                 name = cleaned_title
-    source_url = str(source_meta.get("url") or "")
     from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source, truncate_at_second_act_heading
 
-    if source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url):
+    unresolved = isolation.status == "unresolved"
+    if not unresolved and (source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url)):
         body = truncate_at_second_act_heading(body or "", name)
         raw_text = truncate_at_second_act_heading(raw_text or "", name)
-    sections = split_into_sections(body, name)
+    sections = [] if unresolved else split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
     if _sq_settings.SSA_STATUTE_QUALITY_SECTION_FILTER:
@@ -408,6 +420,10 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
 
         sections = clean_assembly_section_records(sections)
     evidence: Dict[str, str] = {}
+    if unresolved:
+        evidence["bundled_gazette_unresolved"] = f"{isolation.segment_count} ACT No. boundaries"
+    elif isolation.status == "isolated" and isolation.act_label:
+        evidence["bundled_gazette_isolated"] = isolation.act_label
     if name:
         evidence["statute_name"] = raw_text[:160]
     official = re.sub(r"\s+", " ", (official_title or "")).strip()

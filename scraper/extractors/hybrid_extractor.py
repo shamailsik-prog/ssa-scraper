@@ -292,6 +292,20 @@ class HybridExtractor:
         source_meta = source_meta or {}
         raw_text = text or (clean_html(html) if html else "")
         deterministic = det.extract_statute_deterministic(html=html, text=raw_text, source_meta=source_meta)
+        from scraper.statute_quality.bundled_gazette import isolate_bundled_act
+
+        target_name = str(
+            source_meta.get("act_title") or source_meta.get("detail_title") or source_meta.get("statute_name") or ""
+        )
+        isolation = isolate_bundled_act(
+            html or text or "",
+            target_name=target_name,
+            source_url=str(source_meta.get("url") or ""),
+        )
+        if isolation.status == "isolated":
+            raw_text = isolation.text
+        elif isolation.status == "unresolved":
+            raw_text = ""
         # A second act in one law.gok.pk PDF must not be re-attached from the uncut text.
         if source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(str(source_meta.get("url") or "")):
             anchor = str(deterministic.get("statute_name") or source_meta.get("act_title") or "")
