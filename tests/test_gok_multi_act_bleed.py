@@ -610,6 +610,53 @@ def test_prose_line_ending_this_act_is_not_a_second_act():
     assert "numbering_restart" not in result.signals
 
 
+def test_preamble_amended_does_not_hide_a_later_acts_short_title():
+    """A WHEREAS clause that says an older ordinance was amended does not quote the next act."""
+    sections = _court_sections()
+    sections.append(
+        _section(
+            "1",
+            "WHEREAS it is expedient to consolidate the law; the Azad Jammu and Kashmir "
+            "Ordinance, 1970 was amended by later instruments; "
+            "1. Short title.—This Act may be called the New Mirpur Town Development Authority Act, 1974.",
+            "Short title",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_BLEED
+    assert "second_act_title" in result.signals
+    assert "numbering_restart" in result.signals
+
+
+def test_bare_short_title_restart_that_does_not_name_the_stored_act_is_bleed():
+    """A drop back to section 1 headed 'Short title' is another act unless it names the stored one."""
+    sections = _restart_sections(["8", "9", "10", "11", "12"])
+    sections.append(
+        _section(
+            "1",
+            "Short title, extent and commencement.—(1) It extends to the whole of the "
+            "Azad Jammu and Kashmir Territory and shall come into force at once.",
+            "Short title, extent and commencement",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_BLEED
+    assert "numbering_restart" in result.signals
+    assert "second_act_title" not in result.signals
+
+
 def test_substituted_short_title_inside_an_amending_section_is_not_a_second_act():
     sections = [
         _section(

@@ -3,10 +3,12 @@
 The sweep that uses this module only quarantines. It does not rewrite statute
 names or section text. A four-digit year used as a section number, and a year
 or other junk number that merely sits before section 1, are reported and are
-not enough to quarantine. A numbering drop quarantines only when the restarted
-text opens a different instrument. The same act's short title, a date or
-schedule row stored as section 01, and a cited title inside an amending
-section are not bleed.
+not enough to quarantine. A numbering drop quarantines when the restarted
+text names a different instrument, or when it is a Short-title heading that
+does not name the stored act. The stored act's own short title, a date or
+schedule row stored as section 01, and a called title in the same sentence
+as ``substituted`` or ``namely`` are not bleed. ``amended`` in an earlier
+sentence does not hide the next act.
 """
 
 from __future__ import annotations
@@ -106,6 +108,19 @@ _FOLLOWING_CALLED = re.compile(
 _AMENDMENT_CITATION = re.compile(
     r"(?i)\b(?:substituted|inserted|amended|repealed|omitted|namely)\b"
 )
+# Verbs that introduce a quoted short title. "amended" in a preamble does not.
+_SUBSTITUTION_KEYWORD = re.compile(
+    r"(?i)\b(?:substituted|inserted|omitted|repealed|namely)\b"
+)
+# A real sentence end. Skip the period in "1." and the marginal note "title.—".
+# "enacted as follows" starts a new act.
+_CITATION_SENTENCE_BOUNDARY = re.compile(
+    r"(?i)[;?!]|(?<!\d)\.(?!\d)(?![-—–])|\benacted\s+as\s+follows\b"
+)
+_NEW_ACT_MARKER = re.compile(
+    r"(?i)\b(?:1[\.\)]\s+short\s+title|section\s+1[\.\)]\s+|enacted\s+as\s+follows)\b"
+)
+_SHORT_TITLE_HEADING = re.compile(r"(?i)\bshort\s+title\b")
 _THIS_INSTRUMENT = re.compile(r"(?i)\bthis\s+(?:act|ordinance|order|code)\b\s*$")
 
 
@@ -224,9 +239,21 @@ def _heading_opens_new_act(lines: Sequence[str], index: int) -> bool:
 
 
 def _called_title_is_citation(text: str, start: int) -> bool:
-    """A short title substituted or inserted by an amending section is a citation."""
-    window = (text or "")[max(0, start - 240):start]
-    return _AMENDMENT_CITATION.search(window) is not None
+    """A called title is a citation only when the keyword shares its sentence.
+
+    ``amended`` in an earlier sentence, or before ``1. Short title`` /
+    ``enacted as follows`` with no substitution verb, does not quote the
+    next act. ``substituted`` or ``namely`` in that same sentence does.
+    """
+    window = (text or "")[max(0, start - 500):start]
+    bounds = list(_CITATION_SENTENCE_BOUNDARY.finditer(window))
+    sentence = window[bounds[-1].end():] if bounds else window
+    if not _AMENDMENT_CITATION.search(sentence):
+        return False
+    marker = _NEW_ACT_MARKER.search(sentence)
+    if marker is None:
+        return True
+    return _SUBSTITUTION_KEYWORD.search(sentence[: marker.start()]) is not None
 
 
 def _foreign_titles(text: str, anchor_name: str) -> list[str]:
@@ -337,6 +364,25 @@ def _foreign_body_count(stored_name: str, sections: Sequence[dict]) -> int:
     return count
 
 
+def _section_blob(section: dict) -> str:
+    return "\n".join(
+        (
+            str(section.get("section_title") or ""),
+            str(section.get("section_text") or ""),
+        )
+    )
+
+
+def _restart_opens_other_act(section: dict, anchor_name: str) -> bool:
+    """True when a numbering drop is a later act, not the stored instrument."""
+    text = str(section.get("section_text") or "")
+    if _foreign_titles(text, anchor_name):
+        return True
+    if not _SHORT_TITLE_HEADING.search(_section_blob(section)):
+        return False
+    return not _same_instrument(_section_blob(section), anchor_name)
+
+
 def _number_signals(sections: Sequence[dict], anchor_name: str) -> set[str]:
     signals: set[str] = set()
     numbers: list[int] = []
@@ -369,10 +415,11 @@ def _number_signals(sections: Sequence[dict], anchor_name: str) -> set[str]:
         if number is None or number >= 1800:
             continue
         if seen_max is not None and number <= 2 and seen_max >= 5 and number < seen_max:
-            # A drop back to 1 is a second act only when that block names another
-            # instrument. The same act's own short title, a date stored as
-            # section 01, or a schedule row "01. Middle Classes" is not.
-            if _foreign_titles(str(section.get("section_text") or ""), anchor_name):
+            # A drop back to 1/2 is a second act when that block names another
+            # instrument, or when it is a Short-title heading that does not
+            # name the stored act. The stored act's own short title, a date
+            # stored as section 01, or a schedule row "01. Middle Classes" is not.
+            if _restart_opens_other_act(section, anchor_name):
                 signals.add("numbering_restart")
                 break
             continue
