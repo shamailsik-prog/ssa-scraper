@@ -251,18 +251,39 @@ def _collapse_whitespace_flat(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
 
 
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return la + lb
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[lb]
+
+
+def _looks_like_gazette_act_text(text: str) -> bool:
+    head = (text or "")[:12000]
+    return bool(re.search(r"(?i)THE\s+GAZETTE\s+OF\s+PAKISTAN", head)) and bool(
+        re.search(r"(?i)\bact\s+no\.?", head)
+    )
+
+
 def _repair_act_title_ocr(title: str, preamble: str) -> str:
-    """Replace OCR-mangled title tokens with matching preamble spellings when available."""
+    """Replace OCR-mangled title tokens using preamble dictionary + tight fuzzy match."""
+    from difflib import SequenceMatcher
+
     preamble_head = re.split(r"(?i)\benacted\s+as\s+follows\b", preamble or "", maxsplit=1)[0]
     pre_words = re.findall(r"[A-Za-z][A-Za-z'-]{3,}", preamble_head)
-    by_lower: Dict[str, str] = {}
-    for w in pre_words:
-        if w.isupper() and len(w) <= 10:
-            continue
-        low = w.lower()
-        existing = by_lower.get(low)
-        if existing is None or (existing.isupper() and not w.isupper()):
-            by_lower[low] = w
+    preamble_lower = {
+        w.lower()
+        for w in pre_words
+        if not (w.isupper() and len(w) <= 10)
+    }
 
     repaired: List[str] = []
     for token in re.findall(r"[A-Za-z][A-Za-z'-]*|[^A-Za-z\s]+|\s+", title):
@@ -276,29 +297,31 @@ def _repair_act_title_ocr(title: str, preamble: str) -> str:
         core = token.rstrip(",")
         suffix = token[len(core) :]
         low = core.lower()
-        if low in by_lower:
-            repaired.append(by_lower[low] + suffix)
+        if low in preamble_lower:
+            repaired.append(core + suffix)
             continue
         best: Optional[str] = None
-        if len(core) >= 8:
+        best_d = 3
+        if len(core) >= 6:
             for pw in pre_words:
-                if pw.isupper():
+                if pw.isupper() and len(pw) <= 10:
                     continue
-                if "structure" in low and "structure" in pw.lower():
+                pl = pw.lower()
+                if pl == low:
+                    continue
+                dist = _edit_distance(low, pl)
+                if dist < 1 or dist > 2:
+                    continue
+                if SequenceMatcher(None, low, pl).ratio() < 0.84:
+                    continue
+                if dist < best_d:
+                    best_d = dist
                     best = pw
-                    break
-                if len(pw) < 5:
-                    continue
-                if pw.lower()[:4] != low[:4]:
-                    continue
-                if abs(len(pw) - len(core)) <= 2:
-                    best = pw
-                    break
         repaired.append((best or core) + suffix)
     return _collapse_whitespace_flat("".join(repaired))
 
 
-def _clean_called_act_title(raw: str, preamble: Optional[str] = None) -> str:
+def _clean_called_act_title(raw: str, preamble: Optional[str] = None, *, repair_ocr: bool = False) -> str:
     title = _collapse_whitespace_flat(raw)
     title = re.split(r"\s+\(\d+\)", title, maxsplit=1)[0].strip(" .,:;")
     year_match = re.search(r"\b((?:19|20)\d{2})\s*\.?\s*$", title)
@@ -307,7 +330,7 @@ def _clean_called_act_title(raw: str, preamble: Optional[str] = None) -> str:
         name_part = re.sub(r",\s*$", "", name_part).strip()
         if name_part:
             title = f"{name_part}, {year_match.group(1)}"
-    if preamble:
+    if preamble and repair_ocr:
         title = _repair_act_title_ocr(title, preamble)
     return title
 
@@ -851,7 +874,11 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 
         called_early = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
         if called_early:
-            title = _clean_called_act_title(called_early.group("title"), preamble=text_to_search)
+            title = _clean_called_act_title(
+                called_early.group("title"),
+                preamble=text_to_search,
+                repair_ocr=_looks_like_gazette_act_text(text_to_search),
+            )
             if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
                 return title
 
@@ -877,7 +904,11 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
         if text_to_search:
             called = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
             if called:
-                title = _clean_called_act_title(called.group("title"), preamble=text_to_search)
+                title = _clean_called_act_title(
+                    called.group("title"),
+                    preamble=text_to_search,
+                    repair_ocr=_looks_like_gazette_act_text(text_to_search),
+                )
                 if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
                     return title
 
@@ -982,7 +1013,11 @@ def detect_statute_name(text: str, url: Optional[str] = None) -> str:
         if text:
             called = SHALL_BE_CALLED_ACT_RE.search(text[:20000])
             if called:
-                title = _clean_called_act_title(called.group("title"), preamble=text[:20000])
+                title = _clean_called_act_title(
+                    called.group("title"),
+                    preamble=text[:20000],
+                    repair_ocr=_looks_like_gazette_act_text(text),
+                )
                 if title and _is_plausible_act_title(title):
                     detected = title
                 else:

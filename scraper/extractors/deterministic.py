@@ -375,7 +375,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         official = _collapse_whitespace_flat(official_title or "")
         has_official = bool(official and _is_plausible_act_title(official))
         if called and not has_official:
-            cleaned_title = _clean_called_act_title(called.group("title"), preamble=raw_text)
+            cleaned_title = _clean_called_act_title(called.group("title"), preamble=raw_text, repair_ocr=True)
             if _is_plausible_act_title(cleaned_title):
                 name = cleaned_title
     sections = split_into_sections(body, name)
