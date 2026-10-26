@@ -364,6 +364,20 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     if is_assembly_source(source_meta.get("source_name")):
         body = normalize_assembly_gazette_pdf_text(body or "")
         raw_text = normalize_assembly_gazette_pdf_text(raw_text or "")
+        from scraper.parsers.statute_parser import (
+            SHALL_BE_CALLED_ACT_RE,
+            _clean_called_act_title,
+            _collapse_whitespace_flat,
+            _is_plausible_act_title,
+        )
+
+        called = SHALL_BE_CALLED_ACT_RE.search(raw_text or "")
+        official = _collapse_whitespace_flat(official_title or "")
+        has_official = bool(official and _is_plausible_act_title(official))
+        if called and not has_official:
+            cleaned_title = _clean_called_act_title(called.group("title"), preamble=raw_text)
+            if _is_plausible_act_title(cleaned_title):
+                name = cleaned_title
     sections = split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -374,6 +388,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     if _sq_settings.SSA_STATUTE_QUALITY_ASSEMBLY_PARSER:
         from scraper.parsers.assembly_pdf_sections import (
             assembly_body_too_thin,
+            clean_assembly_section_records,
             filter_assembly_pdf_sections,
             is_assembly_source,
         )
@@ -382,6 +397,10 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
             sections = filter_assembly_pdf_sections(sections)
             if assembly_body_too_thin(sections):
                 sections = []
+    if is_assembly_source(source_meta.get("source_name")):
+        from scraper.parsers.assembly_pdf_sections import clean_assembly_section_records
+
+        sections = clean_assembly_section_records(sections)
     evidence: Dict[str, str] = {}
     if name:
         evidence["statute_name"] = raw_text[:160]

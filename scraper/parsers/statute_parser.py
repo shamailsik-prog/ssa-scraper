@@ -244,14 +244,71 @@ def is_short_title_clause(name: str) -> bool:
     return bool(SHORT_TITLE_CLAUSE_RE.match(_normalize_whitespace(name or "")))
 
 
-def _clean_called_act_title(raw: str) -> str:
-    title = _normalize_whitespace(raw or "")
+LISTING_CHROME_TITLE_RE = re.compile(r"(?i)\b(share|print|filter\s+by|acts\s+of\s+parliament)\b")
+
+
+def _collapse_whitespace_flat(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def _repair_act_title_ocr(title: str, preamble: str) -> str:
+    """Replace OCR-mangled title tokens with matching preamble spellings when available."""
+    preamble_head = re.split(r"(?i)\benacted\s+as\s+follows\b", preamble or "", maxsplit=1)[0]
+    pre_words = re.findall(r"[A-Za-z][A-Za-z'-]{3,}", preamble_head)
+    by_lower: Dict[str, str] = {}
+    for w in pre_words:
+        if w.isupper() and len(w) <= 10:
+            continue
+        low = w.lower()
+        existing = by_lower.get(low)
+        if existing is None or (existing.isupper() and not w.isupper()):
+            by_lower[low] = w
+
+    repaired: List[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]*|[^A-Za-z\s]+|\s+", title):
+        if not token or token.isspace():
+            if token:
+                repaired.append(token)
+            continue
+        if not re.match(r"^[A-Za-z]", token):
+            repaired.append(token)
+            continue
+        core = token.rstrip(",")
+        suffix = token[len(core) :]
+        low = core.lower()
+        if low in by_lower:
+            repaired.append(by_lower[low] + suffix)
+            continue
+        best: Optional[str] = None
+        if len(core) >= 8:
+            for pw in pre_words:
+                if pw.isupper():
+                    continue
+                if "structure" in low and "structure" in pw.lower():
+                    best = pw
+                    break
+                if len(pw) < 5:
+                    continue
+                if pw.lower()[:4] != low[:4]:
+                    continue
+                if abs(len(pw) - len(core)) <= 2:
+                    best = pw
+                    break
+        repaired.append((best or core) + suffix)
+    return _collapse_whitespace_flat("".join(repaired))
+
+
+def _clean_called_act_title(raw: str, preamble: Optional[str] = None) -> str:
+    title = _collapse_whitespace_flat(raw)
     title = re.split(r"\s+\(\d+\)", title, maxsplit=1)[0].strip(" .,:;")
     year_match = re.search(r"\b((?:19|20)\d{2})\s*\.?\s*$", title)
     if year_match:
-        name_part = title[: year_match.start()].strip(" ,.")
+        name_part = title[: year_match.start()].strip(" .,:;")
+        name_part = re.sub(r",\s*$", "", name_part).strip()
         if name_part:
-            return f"{name_part}, {year_match.group(1)}"
+            title = f"{name_part}, {year_match.group(1)}"
+    if preamble:
+        title = _repair_act_title_ocr(title, preamble)
     return title
 
 
@@ -281,6 +338,8 @@ def looks_like_garbage_name(name: str) -> bool:
 def _is_plausible_act_title(name: str) -> bool:
     candidate = _normalize_whitespace(name or "")
     if not candidate or is_short_title_clause(candidate):
+        return False
+    if LISTING_CHROME_TITLE_RE.search(candidate):
         return False
     if looks_like_fragment_name(candidate):
         return False
@@ -328,8 +387,8 @@ def listed_title_supported_by_text(title: str, text: str) -> bool:
     return hits >= max(1, (len(tokens) + 1) // 2)
 
 def prefer_official_statute_title(detected_name: Optional[str], official_title: Optional[str]) -> str:
-    detected = _normalize_whitespace(detected_name or "") or "Unknown Statute"
-    official = _normalize_whitespace(official_title or "")
+    detected = _collapse_whitespace_flat(detected_name or "") or "Unknown Statute"
+    official = _collapse_whitespace_flat(official_title or "")
     if official and _is_plausible_act_title(official):
         return official
     return detected
@@ -792,7 +851,7 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 
         called_early = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
         if called_early:
-            title = _clean_called_act_title(called_early.group("title"))
+            title = _clean_called_act_title(called_early.group("title"), preamble=text_to_search)
             if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
                 return title
 
@@ -818,7 +877,7 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
         if text_to_search:
             called = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
             if called:
-                title = _clean_called_act_title(called.group("title"))
+                title = _clean_called_act_title(called.group("title"), preamble=text_to_search)
                 if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
                     return title
 
@@ -923,7 +982,7 @@ def detect_statute_name(text: str, url: Optional[str] = None) -> str:
         if text:
             called = SHALL_BE_CALLED_ACT_RE.search(text[:20000])
             if called:
-                title = _clean_called_act_title(called.group("title"))
+                title = _clean_called_act_title(called.group("title"), preamble=text[:20000])
                 if title and _is_plausible_act_title(title):
                     detected = title
                 else:

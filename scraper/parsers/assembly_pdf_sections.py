@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional
 
-from scraper.parsers.statute_parser import SHORT_TITLE_CLAUSE_RE, _parse_numeric_section_number, _strip_section_prefix
+from scraper.parsers.statute_parser import (
+    SHORT_TITLE_CLAUSE_RE,
+    _derive_title,
+    _extract_number_title_from_chunk,
+    _parse_numeric_section_number,
+    _strip_section_prefix,
+)
 
 # Gazette PDFs (na.gov.pk uploads) often embed page headers mid-section.
 GAZETTE_PAGE_LINE_RE = re.compile(
@@ -37,6 +43,33 @@ def is_assembly_source(source_name: Optional[str]) -> bool:
     return (source_name or "") in ASSEMBLY_SOURCE_NAMES
 
 
+def _fix_roman_i_misread_as_section_eleven(text: str) -> str:
+    """OCR often emits section 11 as a solitary 'I.' after section 10."""
+    matches = list(re.finditer(r"(?m)^(\s*)I\.\s+", text))
+    if not matches:
+        return text
+    out = text
+    for m in reversed(matches):
+        before = out[: m.start()]
+        after = out[m.end() :]
+        prev_nums = [int(x) for x in re.findall(r"(?m)^\s*(\d+)\.\s+", before)]
+        next_nums = [int(x) for x in re.findall(r"(?m)^\s*(\d+)\.\s+", after[:4000])]
+        if not prev_nums or prev_nums[-1] != 10:
+            continue
+        if not next_nums or next_nums[0] < 12:
+            continue
+        prefix = m.group(1)
+        out = out[: m.start()] + f"{prefix}11. " + out[m.end() :]
+    return out
+
+
+def _normalize_gazette_ocr_braces(text: str) -> str:
+    out = re.sub(r"(?m)\.-\{", ".-(", text)
+    out = re.sub(r"\{(\d)", r"(\1", out)
+    out = re.sub(r"\{l\)", "(1)", out, flags=re.IGNORECASE)
+    return out
+
+
 def normalize_assembly_gazette_pdf_text(text: str) -> str:
     """Fix common OCR section markers in federal gazette act PDFs before section splitting."""
     if not text:
@@ -45,12 +78,8 @@ def normalize_assembly_gazette_pdf_text(text: str) -> str:
     out = re.sub(r"(?m)^(\s*)l\.\s+(?=Short\s+title\b)", r"\g<1>1. ", out, flags=re.IGNORECASE)
     out = re.sub(r"(?m)^(\s*)3l\.\s+", r"\g<1>31. ", out, flags=re.IGNORECASE)
     out = re.sub(r"(?m)^(\s*)ll\.\s+", r"\g<1>11. ", out, flags=re.IGNORECASE)
-    out = re.sub(
-        r"(?m)^(\s*)I\.\s+Authority\.(\{)",
-        r"\g<1>11. Authority.-\2",
-        out,
-        flags=re.IGNORECASE,
-    )
+    out = _fix_roman_i_misread_as_section_eleven(out)
+    out = _normalize_gazette_ocr_braces(out)
     return out
 
 
@@ -117,6 +146,20 @@ def _is_bogus_section_number(num: str, body: str, prev_num: Optional[int]) -> bo
     if prev_num is not None and n > prev_num + 120:
         return True
     return False
+
+
+def clean_assembly_section_records(sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Strip gazette page chrome and OCR brace glitches from stored section bodies."""
+    for s in sections:
+        text = _normalize_gazette_ocr_braces(s.get("section_text") or "")
+        text = strip_gazette_page_break_lines(text)
+        s["section_text"] = text
+        num, title, _ = _extract_number_title_from_chunk(text)
+        if num:
+            derived = _derive_title(_strip_section_prefix(text))
+            if derived:
+                s["section_title"] = derived[:500]
+    return sections
 
 
 def filter_assembly_pdf_sections(sections: List[Dict[str, str]]) -> List[Dict[str, str]]:

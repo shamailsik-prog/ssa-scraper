@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import statute_staging_identity_url
 from scraper.parsers.assembly_pdf_sections import filter_assembly_pdf_sections, normalize_assembly_gazette_pdf_text
@@ -12,6 +14,8 @@ PDF_URL = "https://www.na.gov.pk/uploads/documents/6adee709285af_925.pdf"
 OFFICIAL_TITLE = (
     "The Pakistan Infrastructure Development and Assets Management Authority Act, 2026 (Act No. LII of 2026)"
 )
+DETECTED_TITLE = "Pakistan Infrastructure Development and Assets Management Authority Act, 2026"
+LISTING_CHROME_TITLE = "|Share Print Acts of Parliament Filter by"
 
 
 def _excerpt() -> str:
@@ -42,15 +46,40 @@ def test_split_captures_short_title_and_gazette_interrupted_sections():
     assert "0" not in numbers
 
 
-def test_detect_statute_name_prefers_act_title_not_short_title_clause():
+def test_detect_statute_name_exact_title_without_listing_metadata():
     text = normalize_assembly_gazette_pdf_text(_excerpt())
     detected = detect_statute_name(text, PDF_URL)
-    assert "shall be called" not in detected.lower()
-    assert "Infrastructure" in detected or detected.endswith("2026")
-    assert "Act" in detected
+    assert detected == DETECTED_TITLE
 
 
-def test_extract_statute_uses_listing_title_and_finds_core_sections():
+def test_extract_statute_exact_title_without_act_title():
+    text = normalize_assembly_gazette_pdf_text(_excerpt())
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={
+            "source_name": "NationalAssembly",
+            "url": PDF_URL,
+        },
+    )
+    assert extracted["statute_name"] == DETECTED_TITLE
+
+
+def test_extract_statute_exact_title_with_chrome_only_act_title():
+    text = normalize_assembly_gazette_pdf_text(_excerpt())
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={
+            "source_name": "NationalAssembly",
+            "url": PDF_URL,
+            "act_title": LISTING_CHROME_TITLE,
+        },
+    )
+    assert extracted["statute_name"] == DETECTED_TITLE
+
+
+def test_extract_statute_uses_listing_title_when_official_title_provided():
     text = normalize_assembly_gazette_pdf_text(_excerpt())
     extracted = extract_statute_deterministic(
         html=None,
@@ -66,7 +95,38 @@ def test_extract_statute_uses_listing_title_and_finds_core_sections():
     assert {"1", "11", "18", "29", "31"}.issubset(numbers)
 
 
+def test_gazette_page_headers_stripped_from_stored_section_bodies():
+    text = normalize_assembly_gazette_pdf_text(_excerpt())
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={"source_name": "NationalAssembly", "url": PDF_URL},
+    )
+    by_num = {s["section_number"]: s for s in extracted["sections"]}
+    assert "THE GAZETTE OF PAKISTAN" not in (by_num.get("18") or {}).get("section_text", "")
+    assert "THE GAZETTE OF PAKISTAN" not in (by_num.get("29") or {}).get("section_text", "")
+    title_11 = (by_num.get("11") or {}).get("section_title", "")
+    assert "{l)" not in title_11
+    assert "Authority" in title_11
+
+
 def test_statute_staging_identity_url_rejects_listing_chrome_suffix():
-    polluted = "|Share Print Acts of Parliament Filter by"
-    assert statute_staging_identity_url(PDF_URL, {"act_title": polluted}) is None
+    assert statute_staging_identity_url(PDF_URL, {"act_title": LISTING_CHROME_TITLE}) is None
     assert statute_staging_identity_url(PDF_URL, {"act_title": OFFICIAL_TITLE}) == f"{PDF_URL}|{OFFICIAL_TITLE[:200]}"
+
+
+def test_live_na_pidama_pdf_has_sections_one_through_thirty_eight():
+    httpx = pytest.importorskip("httpx")
+    from scraper.parsers.pdf_extractor import extract_pdf_text
+
+    pdf = httpx.get(PDF_URL, follow_redirects=True, timeout=60).content
+    text = extract_pdf_text(pdf)
+    extracted = extract_statute_deterministic(
+        html=None,
+        text=text,
+        source_meta={"source_name": "NationalAssembly", "url": PDF_URL},
+    )
+    assert extracted["statute_name"] == DETECTED_TITLE
+    nums = sorted(int(s["section_number"]) for s in extracted["sections"] if str(s["section_number"]).isdigit())
+    assert nums == list(range(1, 39))
+    assert statute_staging_identity_url(PDF_URL, {"act_title": LISTING_CHROME_TITLE}) is None
