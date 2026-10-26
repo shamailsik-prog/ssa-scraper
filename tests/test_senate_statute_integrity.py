@@ -29,6 +29,7 @@ from scraper.statute_quality.senate_integrity import (
     VERDICT_SKIPPED_SHELL,
     classify_senate_identity,
     is_senate_sourced,
+    parse_act_number,
     split_statute_source_url,
     title_relation,
 )
@@ -329,6 +330,106 @@ def test_pcsir_sciertific_rcsearch_ocr_and_one_roman_gap_stays_match(pdf_title):
     assert result.needs_reextract is False
     assert "act_number_disagrees" not in result.signals
     assert "pdf_title_disagrees" not in result.signals
+
+
+def test_pcsir_pipe_30_pdf_23_sciertific_title_stays_match():
+    """MAIN 648084fb and FREE-SITES b2df675e on tip 5593a040.
+
+    Titles already agree (Sciertific / Rcsearch). The PDF segment's roman
+    parses as 23 of 1973 against the pipe label 30 of 1973. That is one X in
+    an X-run read as III, not a different act.
+    """
+    pdf_title = "Pakistan Council of Sciertific and Industrial Rcsearch Act, 1973"
+    assert parse_act_number("XXX of 1973", pipe_label=True) == (30, 1973)
+    assert parse_act_number("XXIII of 1973", pipe_label=True) == (23, 1973)
+    assert title_relation(PCSIR_NAME, pdf_title) == "same"
+    result = classify_senate_identity(
+        stored_name=PCSIR_NAME,
+        year_enacted=1973,
+        source_url="https://senate.gov.pk/uploads/documents/pcsir.pdf|XXX of 1973",
+        sections=[_section("3", _PCSIR_BODY)],
+        pdf_text=_called_act_pdf(pdf_title, _PCSIR_BODY, act_no="XXIII of 1973"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert result.needs_reextract is False
+    assert result.signals == ()
+    assert result.pipe_label == "XXX of 1973"
+    assert result.pdf_title == pdf_title
+
+
+def test_x_run_final_x_read_as_iii_either_direction_stays_match():
+    """The same glyph slip the other way, and on a two-X run (20 against 13)."""
+    body = (
+        "The authority shall levy harbour dues and shall publish the schedule "
+        "of those dues before the start of each financial year."
+    )
+    stored = "Harbour Dues Act, 1974"
+    cases = (
+        ("XXIII of 1973", "XXX of 1973", PCSIR_NAME, 1973),
+        ("XX of 1974", "XIII of 1974", stored, 1974),
+        ("XIII of 1974", "XX of 1974", stored, 1974),
+    )
+    for pipe_no, pdf_no, name, year in cases:
+        title = name
+        result = classify_senate_identity(
+            stored_name=name,
+            year_enacted=year,
+            source_url=f"https://senate.gov.pk/uploads/documents/x-run.pdf|{pipe_no}",
+            sections=[_section("3", body if name is stored else _PCSIR_BODY)],
+            pdf_text=_called_act_pdf(title, body if name is stored else _PCSIR_BODY, act_no=pdf_no),
+            pdf_available=True,
+        )
+        assert result.verdict == VERDICT_MATCH, (pipe_no, pdf_no, result.signals)
+        assert "act_number_disagrees" not in result.signals
+
+
+@pytest.mark.parametrize(
+    ("pipe_no", "pdf_no"),
+    [
+        ("XXX of 1973", "XIII of 1973"),
+        ("XXX of 1973", "XXIII of 1974"),
+        ("XX of 1973", "XI of 1973"),
+        ("L of 1973", "XXX of 1973"),
+    ],
+)
+def test_sciertific_title_wrong_act_number_stays_mismatch(pipe_no, pdf_no):
+    """A agreeing Sciertific title does not absorb a real act-number gap."""
+    pdf_title = "Pakistan Council of Sciertific and Industrial Rcsearch Act, 1973"
+    result = classify_senate_identity(
+        stored_name=PCSIR_NAME,
+        year_enacted=1973,
+        source_url=f"https://senate.gov.pk/uploads/documents/pcsir.pdf|{pipe_no}",
+        sections=[_section("3", _PCSIR_BODY)],
+        pdf_text=_called_act_pdf(pdf_title, _PCSIR_BODY, act_no=pdf_no),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
+
+
+def test_amendment_versus_second_amendment_xxx_versus_xxiii_stays_mismatch():
+    """An X-run slip does not make Amendment the same act as Second Amendment."""
+    stored = "Criminal Laws (Amendment) Act, 2017"
+    pdf_title = "Criminal Laws (Second Amendment) Act, 2017"
+    body = (
+        "The schedule of offences triable by the special court is amended "
+        "and the court shall record reasons for every sentence it pronounces."
+    )
+    result = classify_senate_identity(
+        stored_name=stored,
+        year_enacted=2017,
+        source_url="https://senate.gov.pk/uploads/documents/cl-amend.pdf|XXX of 2017",
+        sections=[_section("2", body)],
+        pdf_text=_called_act_pdf(pdf_title, body, act_no="XXIII of 2017"),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert "act_number_disagrees" in result.signals
 
 
 def test_national_versus_rational_one_roman_gap_stays_mismatch():
