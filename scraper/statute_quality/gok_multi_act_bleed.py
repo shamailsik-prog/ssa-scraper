@@ -8,10 +8,11 @@ text names a different instrument, or when it is a Short-title heading that
 does not name the stored act. The stored act's own short title, including one
 that differs only by a scan confusion or a single extra or missing letter, a
 date or schedule row stored as section 01, and a called title in the same
-sentence as ``substituted`` or ``namely`` are not bleed. ``amended`` in an
-earlier sentence does not hide the next act. A Board or Council the act
-itself constitutes is not a foreign body, and ``the commission of an offence``
-is not a Commission.
+sentence as ``substituted`` or ``namely`` are not bleed. A one- or two-letter
+margin stamp in front of ``the`` (``ay) the ... University of Bhimber``) is
+not a second act. ``amended`` in an earlier sentence does not hide the next
+act. A Board or Council the act itself constitutes is not a foreign body, and
+``the commission of an offence`` is not a Commission.
 """
 
 from __future__ import annotations
@@ -90,6 +91,13 @@ _ACT_HEADING_LINE = re.compile(
 _CALLED_TITLE = re.compile(
     r"(?i)\bthis\s+(?:act|ordinance|order|code)\s+(?:may|shall)\s+be\s+called\s+(?:the\s+)?"
     r"(.{6,180}?\b(?:act|ordinance|order|code)\b(?:,?\s+(?:18|19|20)\d{2})?)"
+)
+# A margin stamp on a scan becomes one or two letters, sometimes with a
+# closing paren, glued to the front of "the". "New the ..." is a real word
+# and stays. "ay) the University of Bhimber Act" is this act.
+_CALLED_TITLE_STAMP = re.compile(
+    r"^(?:(?:[a-z0-9]{1,2}|[a-z0-9]{1,4}[^a-z0-9\s]+)\s+)+(?=the\s+)",
+    re.IGNORECASE,
 )
 _PROSE_HEADING = re.compile(r"(?i)\b(shall|means|provided|whereas|amended|substituted|inserted)\b")
 _BODY_GROUP = r"authority|tribunal|board|council|corporation|commission"
@@ -363,6 +371,12 @@ def _heading_opens_new_act(lines: Sequence[str], index: int) -> bool:
     return _following_opens_new_act(lines, index)
 
 
+def _normalize_called_title(title: str) -> str:
+    """Drop a scan stamp glued in front of ``the`` on a called title."""
+    cleaned = re.sub(r"\s+", " ", title or "").strip(" .,:;—-")
+    return _CALLED_TITLE_STAMP.sub("", cleaned).strip()
+
+
 def _called_title_is_citation(text: str, start: int) -> bool:
     """A called title is a citation only when the keyword shares its sentence.
 
@@ -394,7 +408,7 @@ def _foreign_titles(text: str, anchor_name: str) -> list[str]:
     for match in _CALLED_TITLE.finditer(text or ""):
         if _called_title_is_citation(text or "", match.start()):
             continue
-        title = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;—-")
+        title = _normalize_called_title(match.group(1))
         if title and not _same_instrument(title, anchor_name):
             found.append(title)
     return found
@@ -450,7 +464,7 @@ def _section_number(section: dict) -> Optional[int]:
 def _called_titles(text: str) -> list[str]:
     found: list[str] = []
     for match in _CALLED_TITLE.finditer(text or ""):
-        title = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;—-")
+        title = _normalize_called_title(match.group(1))
         if title:
             found.append(title)
     return found
