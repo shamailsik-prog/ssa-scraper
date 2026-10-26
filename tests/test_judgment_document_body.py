@@ -2,10 +2,12 @@
 
 from scraper.fetchers import FetchResult
 from scraper.judgment_document_body import (
+    MIN_HTML_JUDGMENT_WORDS,
     MIN_HTML_STRONG_COURT_DOCUMENT_WORDS,
     PDF_MISS_DEFER_ERROR,
     classify_pdf_endpoint_body,
     html_body_has_judgment_marker,
+    html_body_has_larkana_circuit_full_order_marker,
     html_judgment_word_count,
 )
 
@@ -270,6 +272,82 @@ def test_classify_larkano_bench_spaced_order():
     res = _fetch_result_for_word_html(html, "675299e7")
     assert classify_pdf_endpoint_body(res) == "html_judgment"
     assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "43a90e8b")) == "html_judgment"
+
+
+def _shc_larkana_circuit_full_order_word_html(
+    *,
+    place: str = "LARKANA",
+    case_line: str = "Cr.Misc. Application No. S-35/2023",
+    token_suffix: str = "",
+) -> str:
+    """Longer SHC Circuit Court full order (post-#357 cohort: ffce1b56 et al.)."""
+    reasoned = (
+        "After hearing learned counsel for the parties and perusing the record, it is observed "
+        "that the applicant is in custody in connection with FIR No. 45/2023. Investigation is "
+        "complete and no useful purpose will be served by further incarceration pending trial. "
+        "The factual matrix does not disclose reasonable grounds to believe the accused committed "
+        "a non-bailable offence. Ad-interim bail is granted subject to furnishing solvent surety "
+        "and P.R. bond to the satisfaction of the trial court. Notice to the complainant. "
+    )
+    lines = [
+        "HIGH COURT OF SINDH",
+        "CIRCUIT COURT",
+        place,
+        case_line,
+        "O R D E R",
+        reasoned * 8,
+        "Mr. Justice A.B. Khan , J . -",
+    ]
+    inner = "<br/>\r\n".join(lines)
+    return (
+        '<html xmlns:o="urn:schemas-microsoft-com:office:office">'
+        '<head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">'
+        f"<!-- fixture {token_suffix} -->"
+        "</head><body>"
+        f"<div class=\"WordSection1\">{inner}</div></body></html>"
+    )
+
+
+def test_larkana_circuit_full_order_marker_requires_circuit_header_and_bench():
+    html = _shc_larkana_circuit_full_order_word_html()
+    assert html_body_has_larkana_circuit_full_order_marker(html)
+    assert html_judgment_word_count(html) >= MIN_HTML_JUDGMENT_WORDS
+
+
+def test_classify_larkana_circuit_full_order_post_357_cohort():
+    cases = (
+        ("ffce1b56", "LARKANA", "Criminal Bail Application No. S-35/2023"),
+        ("43a90e8b", "LARKANO", "Criminal Bail Application No. S-274/2022"),
+        ("ba9c3b56", "LARKANA", "Criminal Bail Application No. S-29/2023"),
+        ("c1b3d4f0", "LARKANA", "Criminal Bail Application No. S-414/2022"),
+        ("675299e7", "LARKANO", "Cr.Misc.A.No.S-12 of 2022"),
+    )
+    for token, place, case_line in cases:
+        html = _shc_larkana_circuit_full_order_word_html(
+            place=place, case_line=case_line, token_suffix=token
+        )
+        res = _fetch_result_for_word_html(html, token, encoding="windows-1252")
+        assert classify_pdf_endpoint_body(res) == "html_judgment"
+
+
+def test_larkana_circuit_full_order_without_bench_still_defers():
+    html = _shc_larkana_circuit_full_order_word_html()
+    html = html.replace("Mr. Justice A.B. Khan , J . -", "Office copy.")
+    res = _fetch_result_for_word_html(html, "no-bench", encoding="windows-1252")
+    assert classify_pdf_endpoint_body(res) == "defer"
+
+
+def test_non_sindh_notice_and_bare_hcs_still_defer():
+    notice = """
+    HIGH COURT OF SINDH
+    NOTICE
+    All advocates are informed that the court will remain closed on account of public holiday.
+    """
+    bare_hcs = "HIGH COURT OF SINDH " + " ".join(["administrative"] * 80)
+    for body in (notice, bare_hcs):
+        html = f"<html><body>{body.replace(chr(10), '<br/>')}</body></html>"
+        res = _fetch_result_for_word_html(html, "neg")
+        assert classify_pdf_endpoint_body(res) == "defer"
 
 
 def test_classify_short_katcha_cp_order_sheet():
