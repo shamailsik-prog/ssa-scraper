@@ -85,6 +85,10 @@ SHORT_TITLE_CLAUSE_RE = re.compile(
     r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
     re.IGNORECASE,
 )
+SHALL_BE_CALLED_ACT_RE = re.compile(
+    r"(?is)\b(?:this|the)\s+act\s+shall\s+be\s+called\s+the\s+"
+    r"(?P<title>.{6,400}?\b(?:act|ordinance|order|rules|regulations)\b.{0,40})"
+)
 FOOTNOTE_ANNOTATION_RE = re.compile(
     r'(?i)\b(?:substituted|inserted|added|omitted|amended|renumbered|repealed)\s+by\b'
 )
@@ -218,11 +222,17 @@ def _is_false_section_candidate(section_text: str) -> bool:
     body = _strip_section_prefix(section_text)
     if not body:
         return True
+    try:
+        from scraper.parsers.assembly_pdf_sections import strip_gazette_page_break_lines
+
+        body = strip_gazette_page_break_lines(body) or body
+    except Exception:
+        pass
     if re.fullmatch(r'\d{1,4}', body):
         return True
     if TRAILING_AND_SECTION_RE.match(body):
         return True
-    if GAZETTE_FOOTNOTE_RE.search(body):
+    if GAZETTE_FOOTNOTE_RE.search(body) and len(body) < 400:
         return True
     if FOOTNOTE_ANNOTATION_RE.search(body):
         return True
@@ -232,6 +242,109 @@ def _is_false_section_candidate(section_text: str) -> bool:
 
 def is_short_title_clause(name: str) -> bool:
     return bool(SHORT_TITLE_CLAUSE_RE.match(_normalize_whitespace(name or "")))
+
+
+LISTING_CHROME_TITLE_RE = re.compile(r"(?i)\b(share|print|filter\s+by|acts\s+of\s+parliament)\b")
+
+
+def _collapse_whitespace_flat(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return la + lb
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[lb]
+
+
+def _looks_like_gazette_act_text(text: str) -> bool:
+    head = (text or "")[:12000]
+    return bool(re.search(r"(?i)THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN", head)) and bool(
+        re.search(r"(?i)\bact\s+no\.?", head)
+    )
+
+
+def _is_plural_suffix_swap(a: str, b: str) -> bool:
+    al, bl = a.lower(), b.lower()
+    if al == bl:
+        return False
+    for shorter, longer in ((al, bl), (bl, al)):
+        if longer == shorter + "s" or longer == shorter + "es":
+            return True
+    return False
+
+
+def _repair_act_title_ocr(title: str, preamble: str) -> str:
+    """Replace OCR-mangled title tokens using preamble dictionary + tight fuzzy match."""
+    from difflib import SequenceMatcher
+
+    preamble_head = re.split(r"(?i)\benacted\s+as\s+follows\b", preamble or "", maxsplit=1)[0]
+    pre_words = re.findall(r"[A-Za-z][A-Za-z'-]{3,}", preamble_head)
+    preamble_lower = {
+        w.lower()
+        for w in pre_words
+        if not (w.isupper() and len(w) <= 10)
+    }
+
+    repaired: List[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]*|[^A-Za-z\s]+|\s+", title):
+        if not token or token.isspace():
+            if token:
+                repaired.append(token)
+            continue
+        if not re.match(r"^[A-Za-z]", token):
+            repaired.append(token)
+            continue
+        core = token.rstrip(",")
+        suffix = token[len(core) :]
+        low = core.lower()
+        if low in preamble_lower:
+            repaired.append(core + suffix)
+            continue
+        best: Optional[str] = None
+        best_d = 3
+        if len(core) >= 6:
+            for pw in pre_words:
+                if pw.isupper() and len(pw) <= 10:
+                    continue
+                pl = pw.lower()
+                if pl == low:
+                    continue
+                dist = _edit_distance(low, pl)
+                if dist < 1 or dist > 2:
+                    continue
+                if SequenceMatcher(None, low, pl).ratio() < 0.84:
+                    continue
+                if _is_plural_suffix_swap(low, pl):
+                    continue
+                if dist < best_d:
+                    best_d = dist
+                    best = pw
+        repaired.append((best or core) + suffix)
+    return _collapse_whitespace_flat("".join(repaired))
+
+
+def _clean_called_act_title(raw: str, preamble: Optional[str] = None, *, repair_ocr: bool = False) -> str:
+    title = _collapse_whitespace_flat(raw)
+    title = re.split(r"\s+\(\d+\)", title, maxsplit=1)[0].strip(" .,:;")
+    year_match = re.search(r"\b((?:19|20)\d{2})\s*\.?\s*$", title)
+    if year_match:
+        name_part = title[: year_match.start()].strip(" .,:;")
+        name_part = re.sub(r",\s*$", "", name_part).strip()
+        if name_part:
+            title = f"{name_part}, {year_match.group(1)}"
+    if preamble and repair_ocr:
+        title = _repair_act_title_ocr(title, preamble)
+    return title
 
 
 def looks_like_clause_fragment(name: str) -> bool:
@@ -260,6 +373,8 @@ def looks_like_garbage_name(name: str) -> bool:
 def _is_plausible_act_title(name: str) -> bool:
     candidate = _normalize_whitespace(name or "")
     if not candidate or is_short_title_clause(candidate):
+        return False
+    if LISTING_CHROME_TITLE_RE.search(candidate):
         return False
     if looks_like_fragment_name(candidate):
         return False
@@ -307,8 +422,8 @@ def listed_title_supported_by_text(title: str, text: str) -> bool:
     return hits >= max(1, (len(tokens) + 1) // 2)
 
 def prefer_official_statute_title(detected_name: Optional[str], official_title: Optional[str]) -> str:
-    detected = _normalize_whitespace(detected_name or "") or "Unknown Statute"
-    official = _normalize_whitespace(official_title or "")
+    detected = _collapse_whitespace_flat(detected_name or "") or "Unknown Statute"
+    official = _collapse_whitespace_flat(official_title or "")
     if official and _is_plausible_act_title(official):
         return official
     return detected
@@ -328,6 +443,10 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
         if _is_false_section_candidate(s.get("section_text", "")):
             continue
         num_int = _parse_numeric_section_number(s.get("section_number", ""))
+        if num_int == 0:
+            continue
+        if num_int is not None and 1800 <= num_int <= 2100:
+            continue
         if sanity_cap is not None and num_int is not None and num_int > sanity_cap:
             continue
         # filter bogus numbers like 99999
@@ -765,6 +884,16 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
             except Exception as e:
                 logger.warning(f"detect_statute_name URL parse failed for {url}: {e}")
 
+        called_early = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
+        if called_early:
+            title = _clean_called_act_title(
+                called_early.group("title"),
+                preamble=text_to_search,
+                repair_ocr=_looks_like_gazette_act_text(text_to_search),
+            )
+            if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
+                return title
+
         # 2) Search known statutes in text_to_search
         text_lower = text_to_search.lower()
         for key, canonical in KNOWN_STATUTES_MAP.items():
@@ -785,6 +914,16 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 
         # 3) Generic Act pattern with year - high confidence
         if text_to_search:
+            called = SHALL_BE_CALLED_ACT_RE.search(text_to_search)
+            if called:
+                title = _clean_called_act_title(
+                    called.group("title"),
+                    preamble=text_to_search,
+                    repair_ocr=_looks_like_gazette_act_text(text_to_search),
+                )
+                if title and not is_short_title_clause(title) and _is_plausible_act_title(title):
+                    return title
+
             match_year = ACT_WITH_YEAR_PATTERN.search(text_to_search)
             if match_year:
                 candidate = _normalize_whitespace(match_year.group(1))
@@ -882,6 +1021,21 @@ def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) 
 def detect_statute_name(text: str, url: Optional[str] = None) -> str:
     """Detect a canonical statute name and reject URL-fragment leftovers."""
     detected = _detect_statute_name_from_text_or_url(text, url)
+    if is_short_title_clause(detected):
+        if text:
+            called = SHALL_BE_CALLED_ACT_RE.search(text[:20000])
+            if called:
+                title = _clean_called_act_title(
+                    called.group("title"),
+                    preamble=text[:20000],
+                    repair_ocr=_looks_like_gazette_act_text(text),
+                )
+                if title and _is_plausible_act_title(title):
+                    detected = title
+                else:
+                    detected = "Unknown Statute"
+            else:
+                detected = "Unknown Statute"
     if looks_like_fragment_name(detected):
         logger.info("detect_statute_name: rejecting fragment name %r for url=%s", detected, url)
         return "Unknown Statute"

@@ -18,6 +18,7 @@ import json
 import logging
 import pathlib
 import random
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
@@ -342,15 +343,31 @@ async def stage_judgment(
     return row
 
 
+_LISTING_CHROME_RE = re.compile(r"(?i)\b(share|print|filter\s+by|acts\s+of\s+parliament)\b")
+_ACT_NO_OF_YEAR_RE = re.compile(r"^(?:[IVXLC\d]+)\s+of\s+(?:19|20)\d{2}$", re.IGNORECASE)
+
+
 def statute_staging_identity_url(pdf_url: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Stable identity for a statute row so shared PDF bytes do not collapse distinct acts."""
+    from scraper.parsers.statute_parser import is_short_title_clause, _is_plausible_act_title
+
     meta = meta or {}
     detail = str(meta.get("detail_url") or "").strip()
     if detail:
         return detail
-    extra = str(meta.get("act_no") or meta.get("act_title") or "").strip()
-    if extra and pdf_url:
-        return f"{pdf_url}|{extra}"
+    if not pdf_url:
+        return None
+    act_no = str(meta.get("act_no") or "").strip()
+    if act_no and _ACT_NO_OF_YEAR_RE.match(act_no):
+        return f"{pdf_url}|{act_no}"
+    act_title = str(meta.get("act_title") or "").strip()
+    if (
+        act_title
+        and not _LISTING_CHROME_RE.search(act_title)
+        and not is_short_title_clause(act_title)
+        and _is_plausible_act_title(act_title)
+    ):
+        return f"{pdf_url}|{act_title[:200]}"
     return None
 
 
@@ -373,6 +390,8 @@ async def stage_statute(
     )
     if identity_key:
         existing_q = existing_q.where(StatutesStaging.source_url == identity_key)
+    elif url:
+        existing_q = existing_q.where(StatutesStaging.source_url == url)
     existing = (await db.execute(existing_q)).scalars().first()
     if existing is not None:
         return existing

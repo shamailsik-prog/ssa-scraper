@@ -30,6 +30,7 @@ REJECT_TITLE_PREFIX_RE = re.compile(r"(?i)^the\s+following\b")
 
 SENATE_SOURCES = frozenset({"Senate"})
 AJK_SOURCES = frozenset({"AJKAssembly"})
+NA_SOURCES = frozenset({"NationalAssembly"})
 
 
 def _normalize_title(raw: str) -> str:
@@ -47,7 +48,7 @@ def _year_from_title(title: str) -> Optional[int]:
 
 
 def extract_gazette_title_year(text: str, *, source_name: Optional[str]) -> Optional[Tuple[str, Optional[int]]]:
-    if not text or source_name not in (SENATE_SOURCES | AJK_SOURCES):
+    if not text or source_name not in (SENATE_SOURCES | AJK_SOURCES | NA_SOURCES):
         return None
     head = text[:16000]
     title_raw: Optional[str] = None
