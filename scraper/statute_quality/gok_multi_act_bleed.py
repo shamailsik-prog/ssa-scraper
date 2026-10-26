@@ -3,7 +3,10 @@
 The sweep that uses this module only quarantines. It does not rewrite statute
 names or section text. A four-digit year used as a section number, and a year
 or other junk number that merely sits before section 1, are reported and are
-not enough to quarantine.
+not enough to quarantine. A numbering drop quarantines only when the restarted
+text opens a different instrument. The same act's short title, a date or
+schedule row stored as section 01, and a cited title inside an amending
+section are not bleed.
 """
 
 from __future__ import annotations
@@ -96,7 +99,14 @@ _SECTION_LINE = re.compile(r"^\d{1,3}[\.\)]\s+\S")
 _FINISHED_SENTENCE_END = re.compile(r"[.?!](?:[\"'”’)\]]+)?\s*$")
 _UNFINISHED_TAIL = re.compile(r"(?:[:;,—–]|--)(?:[\"'”’)\]]+)?\s*$")
 _FOLLOWING_RESTART = re.compile(r"(?i)^\s*1[\.\)]\s+\S")
-_FOLLOWING_CALLED = re.compile(r"(?i)\b(?:(?:may|shall)\s+be\s+called|short\s+title)\b")
+# "shall be called in question" is a presumption clause, not a short title.
+_FOLLOWING_CALLED = re.compile(
+    r"(?i)\bshort\s+title\b|\b(?:may|shall)\s+be\s+called\s+(?!in\b|into\b|upon\b)"
+)
+_AMENDMENT_CITATION = re.compile(
+    r"(?i)\b(?:substituted|inserted|amended|repealed|omitted|namely)\b"
+)
+_THIS_INSTRUMENT = re.compile(r"(?i)\bthis\s+(?:act|ordinance|order|code)\b\s*$")
 
 
 @dataclass(frozen=True)
@@ -151,6 +161,9 @@ def _is_act_heading_line(line: str) -> bool:
     if not stripped or len(stripped) > 180:
         return False
     if _PROSE_HEADING.search(stripped):
+        return False
+    # A wrapped operative line that merely ends "this Act" is not an instrument title.
+    if _THIS_INSTRUMENT.search(stripped):
         return False
     return _ACT_HEADING_LINE.match(stripped) is not None
 
@@ -210,6 +223,12 @@ def _heading_opens_new_act(lines: Sequence[str], index: int) -> bool:
     return _following_opens_new_act(lines, index)
 
 
+def _called_title_is_citation(text: str, start: int) -> bool:
+    """A short title substituted or inserted by an amending section is a citation."""
+    window = (text or "")[max(0, start - 240):start]
+    return _AMENDMENT_CITATION.search(window) is not None
+
+
 def _foreign_titles(text: str, anchor_name: str) -> list[str]:
     found: list[str] = []
     lines = (text or "").splitlines()
@@ -221,6 +240,8 @@ def _foreign_titles(text: str, anchor_name: str) -> list[str]:
         ):
             found.append(line.strip())
     for match in _CALLED_TITLE.finditer(text or ""):
+        if _called_title_is_citation(text or "", match.start()):
+            continue
         title = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;—-")
         if title and not _same_instrument(title, anchor_name):
             found.append(title)
@@ -316,14 +337,20 @@ def _foreign_body_count(stored_name: str, sections: Sequence[dict]) -> int:
     return count
 
 
-def _number_signals(sections: Sequence[dict]) -> set[str]:
+def _number_signals(sections: Sequence[dict], anchor_name: str) -> set[str]:
     signals: set[str] = set()
     numbers: list[int] = []
-    for section in _ordered_sections(sections):
+    ordered = _ordered_sections(sections)
+    parsed: list[tuple[Optional[int], dict]] = []
+    for section in ordered:
         number = _section_number(section)
+        parsed.append((number, section))
         if number is not None:
             numbers.append(number)
-        if number != 1 and _EMBEDDED_SECTION_ONE.search(str(section.get("section_text") or "")):
+        text = str(section.get("section_text") or "")
+        # "1. Short title" inside a later section is another act only when that
+        # text names a different instrument, not when it quotes an amended title.
+        if number != 1 and _EMBEDDED_SECTION_ONE.search(text) and _foreign_titles(text, anchor_name):
             signals.add("numbering_restart")
     if any(1800 <= number <= 2030 for number in numbers):
         signals.add("year_fragment_section")
@@ -338,12 +365,17 @@ def _number_signals(sections: Sequence[dict]) -> set[str]:
     ):
         signals.add("year_before_section_one")
     seen_max: Optional[int] = None
-    for number in numbers[start:]:
-        if number >= 1800:
+    for number, section in parsed:
+        if number is None or number >= 1800:
             continue
         if seen_max is not None and number <= 2 and seen_max >= 5 and number < seen_max:
-            signals.add("numbering_restart")
-            break
+            # A drop back to 1 is a second act only when that block names another
+            # instrument. The same act's own short title, a date stored as
+            # section 01, or a schedule row "01. Middle Classes" is not.
+            if _foreign_titles(str(section.get("section_text") or ""), anchor_name):
+                signals.add("numbering_restart")
+                break
+            continue
         if seen_max is None or number > seen_max:
             seen_max = number
     return signals
@@ -379,7 +411,7 @@ def classify_gok_multi_act(
             pipe_label=pipe_label,
         )
     signals: set[str] = set()
-    signals.update(_number_signals(sections))
+    signals.update(_number_signals(sections, stored_name))
     corpus = [str(section.get("section_text") or "") for section in sections]
     if pdf_text:
         corpus.append(pdf_text)
