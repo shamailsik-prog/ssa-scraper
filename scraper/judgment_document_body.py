@@ -54,6 +54,14 @@ _HTML_SHC_CASE_NO_RE = re.compile(
     r"\b(?:1st|2nd|3rd|\d+th)\s+criminal\s+bail\s+application\s+no\.?\s*[a-z0-9./-]+"
     r")"
 )
+# SHC Circuit Court Larkana/Larkano full orders: reasoned bail/misc bodies with spaced ORDER + bench line.
+_HTML_SHC_BENCH_J_LINE_RE = re.compile(
+    r"(?i)(?:"
+    r",\s*J\s*\.\s*-|"
+    r"\bJ\s*\.\s*-\b"
+    r")"
+)
+
 # Cause lists and adjournment notices (short/strong paths only — not the 200-word judgment path).
 _HTML_NON_JUDGMENT_PROBE_RE = re.compile(
     r"(?i)(?:"
@@ -133,6 +141,27 @@ def _short_order_sheet_gates_met(text: str) -> bool:
     )
 
 
+def _html_has_shc_circuit_larkana_header(text: str) -> bool:
+    if not re.search(r"\bhigh court of sindh\b", text, flags=re.I):
+        return False
+    if not re.search(r"\bcircuit\s+court\b", text, flags=re.I):
+        return False
+    return bool(re.search(r"\blarkan[ao]\b", text, flags=re.I))
+
+
+def _larkana_circuit_full_order_gates_met(text: str) -> bool:
+    """Longer SHC Circuit Larkana/Larkano Word-HTML orders (spaced ORDER, bench line, no ORDER SHEET)."""
+    if _html_body_is_non_judgment_probe(text):
+        return False
+    if not _html_has_shc_circuit_larkana_header(text):
+        return False
+    if _HTML_ORDER_SHEET_SURFACE_RE.search(text):
+        return False
+    if not re.search(r"\border\b", text, flags=re.I):
+        return False
+    return bool(_HTML_SHC_BENCH_J_LINE_RE.search(text))
+
+
 def frontier_http_status_action(status_code: int) -> str:
     """How to treat a document fetch HTTP status before body classification."""
     if status_code < 400:
@@ -159,6 +188,10 @@ def html_body_has_short_order_sheet_marker(html: str) -> bool:
     return _short_order_sheet_gates_met(_html_text_for_markers(html))
 
 
+def html_body_has_larkana_circuit_full_order_marker(html: str) -> bool:
+    return _larkana_circuit_full_order_gates_met(_html_text_for_markers(html))
+
+
 def html_body_has_strong_court_document_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
     if _html_body_is_non_judgment_probe(text):
@@ -173,13 +206,17 @@ def html_body_has_judgment_marker(html: str) -> bool:
     if _html_body_is_non_judgment_probe(text):
         return False
     return bool(
-        _html_matches_strong_court_document(text) or _short_order_sheet_gates_met(text)
+        _html_matches_strong_court_document(text)
+        or _short_order_sheet_gates_met(text)
+        or _larkana_circuit_full_order_gates_met(text)
     )
 
 
 def min_html_judgment_words(html: str) -> int:
     if html_body_has_short_order_sheet_marker(html):
         return MIN_HTML_SHORT_ORDER_SHEET_WORDS
+    if html_body_has_larkana_circuit_full_order_marker(html):
+        return MIN_HTML_STRONG_COURT_DOCUMENT_WORDS
     if html_body_has_strong_court_document_marker(html):
         return MIN_HTML_STRONG_COURT_DOCUMENT_WORDS
     return MIN_HTML_JUDGMENT_WORDS
