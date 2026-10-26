@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import func, select
 
 from scraper.document_validation import validate_statute_reconciled_json
+from scraper.parsers.statute_contents import read_statute
 from scraper.models import CorpusMetadata, DocumentQuarantine, Statute, StatuteSection, StatuteSectionVersion
 from scraper.statute_quality.ocr_section_mash import (
     ACTION_NEEDS_REEXTRACT,
@@ -162,6 +163,115 @@ def test_amendment_that_quotes_one_later_section_is_not_a_mismatch():
     )
     assert verdict.verdict == VERDICT_MATCH
     assert REASON_HEADINGS_ABOVE_STORED not in verdict.reasons
+
+
+CLEAN_CONTENTS_ACT = """
+THE SAMPLE STATISTICS ACT, 1975
+
+1. Short title.—This Act may be called the Sample Statistics Act, 1975 and it extends to the whole of the territory described in the preamble of this Act.
+
+2. Definitions.—In this Act, unless there is anything repugnant in the subject or context, Director means the Director of Statistics appointed under this Act.
+
+3. Rules.—The Government may make rules for carrying the purposes of this Act into effect and shall publish those rules in the official Gazette.
+"""
+
+AMENDING_CONTENTS_ACT = """
+THE SAMPLE AMENDMENT ACT, 2025
+
+1. Short title.—This Act may be called the Sample Amendment Act, 2025 and it shall come into force at once throughout the province.
+
+2. Insertion of new sections.—In the said Act, after section 27, the following new sections shall be inserted, namely:-
+28. Functions of the Institute.—(1) The Institute shall provide child health services in Quetta and may hold property for that purpose.
+29. Power to make rules.—The Government may make rules to carry out the purposes of this Act and shall notify them.
+30. Repeal and savings.—The Ordinance is hereby repealed and anything done under it shall continue in force.
+"""
+
+
+def test_statute_contents_headingless_body_stays_match():
+    """statute_contents strips ``N. Title.—``. A clean body with no own heading is still a match."""
+    parsed = read_statute(CLEAN_CONTENTS_ACT, "The Sample Statistics Act, 1975")
+    sections = parsed["sections"]
+    assert [row["section_number"] for row in sections] == ["1", "2", "3"]
+    assert not sections[0]["section_text"].startswith("1.")
+    assert "Short title" not in sections[0]["section_text"]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url="https://law.gok.pk/wp-content/uploads/sample-statistics-1975.pdf",
+        source_name="AJKAssembly",
+    )
+    assert verdict.verdict == VERDICT_MATCH
+    assert verdict.reason == ""
+    assert REASON_HEADINGS_ABOVE_STORED not in verdict.reasons
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": "The Sample Statistics Act, 1975", "sections": sections},
+        raw_text="",
+        source_name="AJKAssembly",
+        source_url="https://law.gok.pk/wp-content/uploads/sample-statistics-1975.pdf",
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_amending_act_inserted_sections_stay_match_without_own_heading():
+    """Auditor probe: s.2 inserts ss.28–30 and statute_contents has already dropped ``2.``."""
+    parsed = read_statute(AMENDING_CONTENTS_ACT, "The Sample Amendment Act, 2025")
+    sections = parsed["sections"]
+    inserted = next(row for row in sections if row["section_number"] == "2")
+    assert not inserted["section_text"].startswith("2.")
+    assert "28. Functions of the Institute" in inserted["section_text"]
+    assert "30. Repeal and savings" in inserted["section_text"]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url="https://www.pabalochistan.gov.pk/acts/sample-amendment-2025.pdf",
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MATCH
+    assert verdict.action == ACTION_NONE
+    assert REASON_HEADINGS_ABOVE_STORED not in verdict.reasons
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "The Sample Amendment Act, 2025",
+            "source_name": "BalochistanAssembly",
+            "source_url": "https://www.pabalochistan.gov.pk/acts/sample-amendment-2025.pdf",
+            "sections": sections,
+        },
+        raw_text="",
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_quoted_and_substituted_insertions_are_not_headings():
+    sections = [
+        {
+            "section_number": "1",
+            "section_text": "This Act may be called the Sample Substitution Act, 2024 and it shall come into force at once.",
+        },
+        {
+            "section_number": "2",
+            "section_text": (
+                "In the said Act, for sections 28, 29 and 30, the following shall be substituted, namely:-\n"
+                '"28. Functions of the Institute.—(1) The Institute shall provide child health services."\n'
+                '"29. Power to make rules.—The Government may make rules for the Institute."\n'
+                '"30. Repeal and savings.—The Ordinance is hereby repealed."'
+            ),
+        },
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url="https://www.pabalochistan.gov.pk/acts/sample-substitution-2024.pdf",
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MATCH
+    assert 28 not in verdict.embedded_headings
+    assert 30 not in verdict.embedded_headings
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": "The Sample Substitution Act, 2024", "sections": sections},
+        raw_text="",
+        source_name="BalochistanAssembly",
+    )
+    assert ok is True
+    assert reason == ""
 
 
 def test_one_higher_heading_is_not_a_wide_margin():

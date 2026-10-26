@@ -62,6 +62,14 @@ _SENTENCE_START_RE = re.compile(
     r"notwithstanding|on|under|for|no|the|a|an)\b"
 )
 _QUOTE_CHARS = "\"'“”‘’«»"
+# Inserted or substituted text is the other Act's sections, not this row's numbering.
+_AMENDMENT_INTRO_RE = re.compile(
+    r"(?i)(?:"
+    r"\bnamely\b"
+    r"|\bfollowing\b[^.\n]{0,180}?\b(?:inserted|substituted|added)\b"
+    r"|\b(?:shall\s+be|hereby)\s+(?:inserted|substituted|added)\b"
+    r")"
+)
 
 
 @dataclass(frozen=True)
@@ -94,8 +102,19 @@ def pdf_lacks_text_layer(pdf_bytes: bytes) -> bool:
 
 
 def _prepare_line(line: str) -> str:
-    text = (line or "").strip().strip(_QUOTE_CHARS).strip()
-    return text
+    return (line or "").strip()
+
+
+def _is_quoted_line(line: str) -> bool:
+    text = (line or "").lstrip()
+    return bool(text) and text[0] in _QUOTE_CHARS
+
+
+def _heading_on_line(line: str) -> Optional[int]:
+    match = _HEADING_RE.match(line)
+    if match is None:
+        return None
+    return _accepted_heading_number(match.group("num"), match.group("rest") or "")
 
 
 def _accepted_heading_number(num_text: str, rest: str) -> Optional[int]:
@@ -121,19 +140,39 @@ def _accepted_heading_number(num_text: str, rest: str) -> Optional[int]:
 
 
 def embedded_section_headings(text: str) -> tuple[tuple[int, ...], bool]:
-    """Return real ``N.`` / ``Section N.`` headings and whether page noise was skipped.
+    """Return operative ``N.`` / ``Section N.`` headings and whether page noise was skipped.
 
     A line that is only a page number, ``Page N of M``, ``- N -``, or ``N.``
-    is not a section heading.
+    is not a section heading. Quoted lines, and headings after amendment
+    scaffolding (``namely``, ``following … inserted|substituted|added``), are
+    the text being inserted into another Act. They are not headings of this row.
+    ``statute_contents`` strips a section's own ``N.`` heading before storage,
+    so a missing own heading is not itself a mash.
     """
     found: list[int] = []
     ignored = False
+    in_amendment = False
     for raw_line in (text or "").splitlines():
         line = _prepare_line(raw_line)
         if not line:
             continue
         if _PAGE_OR_LINE_RE.match(line):
             ignored = True
+            continue
+        if _is_quoted_line(line):
+            if _AMENDMENT_INTRO_RE.search(line):
+                in_amendment = True
+            continue
+        cue = _AMENDMENT_INTRO_RE.search(line)
+        if cue is not None:
+            prefix = line[: cue.start()].strip()
+            if prefix:
+                number = _heading_on_line(prefix)
+                if number is not None:
+                    found.append(number)
+            in_amendment = True
+            continue
+        if in_amendment:
             continue
         match = _HEADING_RE.match(line)
         if match is None:
@@ -203,10 +242,14 @@ def classify_ocr_section_mash(
         if saw_page:
             ignored = True
         all_headings.extend(headings)
-        if own is None or own in headings:
+        # A stored section is a mash when operative headings (not amendment
+        # insertions) sit far above its number. The section's own heading may
+        # already have been stripped; its absence is not the signal.
+        foreign = [item for item in headings if own is None or item != own]
+        orphan_headings.extend(foreign)
+        if own is None:
             continue
-        orphan_headings.extend(headings)
-        higher = sorted({item for item in headings if item > own})
+        higher = sorted({item for item in foreign if item > own})
         if len(higher) >= MIN_HIGHER_HEADINGS and higher[-1] >= own + HEADING_GAP:
             mashed = True
 
