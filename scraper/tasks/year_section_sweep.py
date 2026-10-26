@@ -10,21 +10,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import sha256_text
-from scraper.models import EmbeddingQueue, Statute, StatuteSection, StatuteSectionVersion
+from scraper.models import (
+    CorpusMetadata,
+    EmbeddingQueue,
+    InstrumentSectionRelation,
+    Statute,
+    StatuteSection,
+    StatuteSectionVersion,
+)
 from scraper.statute_quality.year_section_merge import (
     YEAR_SECTION_NUMBER_SQL,
     plan_year_section_merges,
     source_host,
+    spread_host_samples,
 )
+
+LATEST_RUN_KEY = "year_section_sweep_latest_run_id"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +57,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _empty_host() -> Dict[str, int]:
-    return {"statutes": 0, "year_sections": 0, "merged": 0, "skipped_no_previous": 0, "skipped_empty": 0}
+    return {
+        "statutes": 0,
+        "year_sections": 0,
+        "merged": 0,
+        "skipped_no_previous": 0,
+        "skipped_empty": 0,
+        "skipped_in_sequence": 0,
+    }
+
+
+def _log_key(run_id: str) -> str:
+    return f"year_section_sweep_log:{run_id}"
 
 
 async def _affected_statute_ids(db: AsyncSession) -> List[UUID]:
@@ -129,6 +152,12 @@ async def _apply_plan(db: AsyncSession, plan: Dict[str, Any]) -> None:
             await db.flush()
         target.current_version_id = existing.id
     await db.flush()
+    for item in plan["merged"]:
+        await db.execute(
+            update(InstrumentSectionRelation)
+            .where(InstrumentSectionRelation.target_statute_section_id == UUID(item["year_section_id"]))
+            .values(target_statute_section_id=UUID(item["into_section_id"]))
+        )
     await db.execute(
         delete(EmbeddingQueue).where(
             EmbeddingQueue.table_name == "statute_section",
@@ -136,6 +165,34 @@ async def _apply_plan(db: AsyncSession, plan: Dict[str, Any]) -> None:
         )
     )
     await db.execute(delete(StatuteSection).where(StatuteSection.id.in_(year_ids)))
+    for target_id in {item["into_section_id"] for item in plan["merged"]}:
+        await _requeue_section_embedding(db, UUID(target_id))
+
+
+async def _requeue_section_embedding(db: AsyncSession, section_id: UUID) -> None:
+    row = (
+        await db.execute(
+            select(EmbeddingQueue).where(
+                EmbeddingQueue.table_name == "statute_section",
+                EmbeddingQueue.record_id == section_id,
+            )
+        )
+    ).scalars().first()
+    if row is None:
+        db.add(
+            EmbeddingQueue(
+                record_id=section_id,
+                table_name="statute_section",
+                access_method="public",
+                status="pending",
+                embedding_model=settings.EMBEDDING_MODEL,
+                embedding_dimensions=settings.EMBEDDING_DIM,
+            )
+        )
+        return
+    row.status = "pending"
+    row.attempts = 0
+    row.error_message = None
 
 
 async def run_year_section_sweep(*, apply: bool = False) -> Dict[str, Any]:
@@ -153,13 +210,25 @@ async def run_year_section_sweep(*, apply: bool = False) -> Dict[str, Any]:
         merged = 0
         skipped_no_previous = 0
         skipped_empty = 0
+        skipped_in_sequence = 0
         year_sections = 0
-        samples: List[Dict[str, Any]] = []
+        sample_rows: List[Dict[str, Any]] = []
+        log_merges: List[Dict[str, Any]] = []
+        text_by_section: Dict[str, str] = {
+            section["id"]: section["text"]
+            for group in sections.values()
+            for section in group
+        }
         for statute in statutes:
             plan = plan_year_section_merges(sections.get(statute.id, []))
             host = source_host(statute.source_url)
             bucket = by_host[host]
-            n_years = len(plan["merged"]) + len(plan["skipped_no_previous"]) + len(plan["skipped_empty"])
+            n_years = (
+                len(plan["merged"])
+                + len(plan["skipped_no_previous"])
+                + len(plan["skipped_empty"])
+                + len(plan["skipped_in_sequence"])
+            )
             if n_years == 0:
                 continue
             bucket["statutes"] += 1
@@ -167,40 +236,73 @@ async def run_year_section_sweep(*, apply: bool = False) -> Dict[str, Any]:
             bucket["merged"] += len(plan["merged"])
             bucket["skipped_no_previous"] += len(plan["skipped_no_previous"])
             bucket["skipped_empty"] += len(plan["skipped_empty"])
+            bucket["skipped_in_sequence"] += len(plan["skipped_in_sequence"])
             year_sections += n_years
             merged += len(plan["merged"])
             skipped_no_previous += len(plan["skipped_no_previous"])
             skipped_empty += len(plan["skipped_empty"])
-            if len(samples) < 20:
-                samples.append(
-                    {
-                        "statute_id": str(statute.id),
-                        "name": statute.name,
-                        "host": host,
-                        "merged": [
-                            {"year": item["year_section_number"], "into": item["into_section_number"]}
-                            for item in plan["merged"]
-                        ],
-                        "skipped_no_previous": [item["year_section_number"] for item in plan["skipped_no_previous"]],
-                    }
-                )
+            skipped_in_sequence += len(plan["skipped_in_sequence"])
+            sample_rows.append(
+                {
+                    "statute_id": str(statute.id),
+                    "name": statute.name,
+                    "host": host,
+                    "merged": [
+                        {"year": item["year_section_number"], "into": item["into_section_number"]}
+                        for item in plan["merged"]
+                    ],
+                    "skipped_no_previous": [item["year_section_number"] for item in plan["skipped_no_previous"]],
+                    "skipped_in_sequence": [item["year_section_number"] for item in plan["skipped_in_sequence"]],
+                }
+            )
             if apply:
+                for item in plan["merged"]:
+                    log_merges.append(
+                        {
+                            "statute_id": str(statute.id),
+                            "year_section_id": item["year_section_id"],
+                            "year_section_number": item["year_section_number"],
+                            "into_section_id": item["into_section_id"],
+                            "into_section_number": item["into_section_number"],
+                            "text": text_by_section.get(item["year_section_id"], ""),
+                        }
+                    )
                 await _apply_plan(db, plan)
+        run_id = None
         if apply:
+            run_id = uuid.uuid4().hex
+            latest = (
+                await db.execute(select(CorpusMetadata).where(CorpusMetadata.key == LATEST_RUN_KEY))
+            ).scalars().first()
+            if latest is None:
+                db.add(CorpusMetadata(key=LATEST_RUN_KEY, value=run_id))
+            else:
+                latest.value = run_id
+            db.add(
+                CorpusMetadata(
+                    key=_log_key(run_id),
+                    value=json.dumps({"run_id": run_id, "merges": log_merges}),
+                )
+            )
             await db.commit()
         return {
             "dry_run": not apply,
             "apply": apply,
+            "run_id": run_id,
             "statutes": sum(bucket["statutes"] for bucket in by_host.values()),
             "year_sections": year_sections,
             "merged": merged,
             "skipped_no_previous": skipped_no_previous,
             "skipped_empty": skipped_empty,
+            "skipped_in_sequence": skipped_in_sequence,
             "by_host": {host: counts for host, counts in sorted(by_host.items())},
-            "samples": samples,
+            "samples": spread_host_samples(sample_rows, limit=20),
             "note": (
-                "Dry-run writes nothing. --apply merges year-section text into the previous "
-                "real section and removes only those merged year rows. document_quarantine is unchanged. "
+                "Dry-run writes nothing. Read it on both MAIN and FREE-SITES before --apply on either. "
+                "--apply merges only bogus year-sections (citation or off-sequence). "
+                "skipped_in_sequence rows are kept. Citation links are re-pointed at the merge target, "
+                "the target is re-queued for embedding, and the deleted year text is stored in "
+                "corpus_metadata. document_quarantine is unchanged. "
                 "Live-verify 10 repaired statutes before any release or unquarantine. "
                 "See docs/YEAR_SECTION_SWEEP.md."
             ),

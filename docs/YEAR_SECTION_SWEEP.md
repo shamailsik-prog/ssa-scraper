@@ -9,22 +9,30 @@ This sweep is separate from Senate statute integrity and from any law.gok.pk mul
 For each affected statute, in section order (`sort_key`, then `created_at`):
 
 - A section number matching `^(1[89]|20)\d{2}$` is a year-section.
-- If a real (non-year) section precedes it, the year-section’s current text is appended to that real section as a **new** version. The previous version row stays.
-- The year-section row is removed only after that copy. Its text is the new version, not discarded.
-- A year-section with no previous real section is left unchanged (`skipped_no_previous`).
+- It is merged only when the splitter would reject it: the text is a citation (`of 1860)`, a heading that ends with `)`, `dt.`, or the previous section was cut after `(` / `of`), or the number does not continue this act’s section sequence (more than 120 away from a non-year section, unless the act is only a tight run of such headings).
+- `skipped_in_sequence` means the year-shaped number continues the act (1798, 1799, 1800, 1801). Those rows are left in place. `--apply` does not merge or delete them.
+- A merged year-section’s current text is appended to the previous kept section as a **new** version. The previous version row stays.
+- Before the year row is removed, `instrument_section_relation.target_statute_section_id` values that pointed at it are re-pointed at the merge target, and the target section is set back to `pending` on `embedding_queue`.
+- The removed year text is written to `corpus_metadata` under `year_section_sweep_log:<run_id>` (`year_section_sweep_latest_run_id` names the latest run). That log is the record of what `--apply` removed.
+- A bogus year-section with no previous real section is left unchanged (`skipped_no_previous`).
 - `document_quarantine` is not inserted, updated, or deleted. A hidden statute stays hidden. Nothing is auto-released or unquarantined.
 
 Re-extraction is not used. The statute row does not store the source PDF, and splitting again can drop the same tail.
 
 ## Commands
 
-Dry-run (default, no writes). Run this first and read `by_host`:
+Dry-run (default, no writes). Run it against **both** databases and read `by_host` on each before any `--apply`:
+
+1. MAIN
+2. FREE-SITES
+
+A dry-run from one database does not describe the other. `samples` are round-robin by host so one source cannot fill the list.
 
 ```bash
 python -m scraper.tasks.year_section_sweep
 ```
 
-Write merges only after that dry-run looks right:
+Write merges on that same database only after its own dry-run looks right:
 
 ```bash
 python -m scraper.tasks.year_section_sweep --apply
@@ -32,7 +40,7 @@ python -m scraper.tasks.year_section_sweep --apply
 
 `--apply` is never the default. There is no flag that unquarantines.
 
-`by_host` keys are the `source_url` hostname with a leading `www.` removed (`law.gok.pk`, `pabalochistan.gov.pk`, `senate.gov.pk`, `pakp.gov.pk`, and the rest). Each host has `statutes`, `year_sections`, `merged`, `skipped_no_previous`, and `skipped_empty`.
+`by_host` keys are the `source_url` hostname with a leading `www.` removed (`law.gok.pk`, `pabalochistan.gov.pk`, `senate.gov.pk`, `pakp.gov.pk`, `pas.gov.pk`, and the rest). Each host has `statutes`, `year_sections`, `merged`, `skipped_no_previous`, `skipped_empty`, and `skipped_in_sequence`.
 
 ## Before any release or unquarantine
 

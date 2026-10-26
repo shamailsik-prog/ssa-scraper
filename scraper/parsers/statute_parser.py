@@ -288,6 +288,17 @@ def reject_year_section_heading(token: str, siblings: Sequence[Tuple[str, int]],
     return not year_section_fits_sequence(int(token), siblings)
 
 
+def year_section_is_bogus_heading(
+    token: str,
+    text: str,
+    previous_text: str,
+    sibling_tokens: Sequence[str],
+) -> bool:
+    """Same citation and sequence rule the splitter uses, for one stored section."""
+    citation = _section_text_is_year_citation(token, text) or _previous_tail_marks_year_citation(previous_text or "")
+    return reject_year_section_heading(token, _sibling_number_pairs(sibling_tokens), citation=citation)
+
+
 def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
     """Drop split points that are year citations ('of 1860)', '2001) dt.').
 
