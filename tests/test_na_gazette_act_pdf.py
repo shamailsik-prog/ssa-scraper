@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
+
+# Independent auditor probe — must not use production header helpers.
+_LIVE_GAZETTE_EXTRA_CHROME_RE = re.compile(r"(?i)AZETTE OF PAKISTAN.{0,20}EXTRA")
 
 from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import statute_staging_identity_url
@@ -124,6 +128,21 @@ def test_strip_gazette_page_break_preserves_dated_gazette_repeal_citation():
     assert cleaned.strip() == citation
 
 
+def test_strip_gazette_page_break_preserves_oct_edition_wrapped_citation():
+    citation = "the Gazette of Pakistan, Oct. 12, 2026 edition, and shall apply."
+    body = f"4. Application.- (2) Rules published in {citation}"
+    cleaned = strip_gazette_page_break_lines(body)
+    assert citation in cleaned
+
+
+def test_strip_gazette_page_break_removes_extra_part_header_without_oct():
+    header = "THE GAZETTE OF PAKISTAN, EXTRA., [PARr I"
+    body = f"38. Removal.- (1) Text before.\n{header}\n(2) Continued."
+    cleaned = strip_gazette_page_break_lines(body)
+    assert header not in cleaned
+    assert "Continued" in cleaned
+
+
 def test_strip_gazette_page_break_removes_header_shaped_lines():
     body = (
         "18. Cognizance.- No court shall take cognizance.\n"
@@ -208,4 +227,5 @@ def test_live_na_pidama_pdf_has_sections_one_through_thirty_eight():
     assert statute_staging_identity_url(PDF_URL, {"act_title": LISTING_CHROME_TITLE}) is None
     for section in extracted["sections"]:
         body = section.get("section_text", "")
+        assert not _LIVE_GAZETTE_EXTRA_CHROME_RE.search(body)
         assert not contains_gazette_page_header_fragment(body)

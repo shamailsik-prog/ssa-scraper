@@ -25,6 +25,23 @@ _GAZETTE_HEADER_DATE_RE = re.compile(
     r"|\d{1,2},\d{4}\s*(?:\[?\s*PART\s*I)?\s*$"
     r")"
 )
+_GAZETTE_EXTRA_PART_HEADER_RE = re.compile(
+    r"(?i)\b(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN\b"
+    r"[^.\n]{0,120}?\bEXTRA\.?"
+    r"[^.\n]{0,60}?\bPAR[T]?[R]?\s*I\b",
+)
+_HEADER_TOKEN_STRIP_RE = re.compile(
+    r"(?i)(?:"
+    r"THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN"
+    r"|Gazette\s+of\s+Pakistan"
+    r"|EXTRA(?:ORDINARY)?"
+    r"|OCT\.?"
+    r"|PAR[T]?[R]?\s*I"
+    r"|PUBLISHED\s+BY\s+AUTHORITY"
+    r"|\d{1,2},\d{4}"
+    r"|^\d{1,4}\s+"
+    r")"
+)
 _OCR_GAZETTE_PAGE_AT_START_RE = re.compile(
     r"(?i)^\s*(?:\d{1,4}\s+THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)|\d[a-z0-9]\d\s+)"
 )
@@ -93,22 +110,25 @@ def contains_gazette_page_header_fragment(text: str) -> bool:
     return False
 
 
+def _lowercase_word_count_after_header_tokens(stripped: str) -> int:
+    scratch = _HEADER_TOKEN_STRIP_RE.sub(" ", stripped)
+    scratch = re.sub(r"[^A-Za-z\s]", " ", scratch)
+    count = 0
+    for word in scratch.split():
+        if len(word) < 2:
+            continue
+        if word.isupper():
+            continue
+        if any(ch.islower() for ch in word):
+            count += 1
+    return count
+
+
 def _is_substantive_gazette_citation_line(stripped: str) -> bool:
-    """Operative law that merely cites publication in the Gazette of Pakistan."""
-    if re.search(r"(?i)\b(?:published|notified)\s+in\s+the\s+Gazette\s+of\s+Pakistan\b", stripped):
-        return True
-    if re.search(r"(?i)\b(?:in|into)\s+the\s+(?:Official\s+)?Gazette\s+of\s+Pakistan\b", stripped):
-        return True
-    if re.search(r"(?i)\bevery\s+rule\b.*\bGazette\s+of\s+Pakistan\b", stripped):
-        return True
-    if re.search(
-        r"(?i)\bGazette\s+of\s+Pakistan,\s*Extraordinary,\s*Part\s+I,\s*and\s+shall\s+take\s+effect\b",
-        stripped,
-    ):
-        return True
-    if re.search(r"(?i)\bGazette\s+of\s+Pakistan\s+dated\b.*\bis\s+repealed\b", stripped):
-        return True
-    return False
+    """Keep Gazette mentions that read as operative prose, not page-header chrome."""
+    if not re.search(r"(?i)\bGazette\s+of\s+Pakistan\b", stripped) and not _GAZETTE_NAME_RE.search(stripped):
+        return False
+    return _lowercase_word_count_after_header_tokens(stripped) >= 3
 
 
 def _has_gazette_header_date(stripped: str) -> bool:
@@ -117,6 +137,10 @@ def _has_gazette_header_date(stripped: str) -> bool:
 
 def _has_ocr_gazette_page_number_at_edge(stripped: str) -> bool:
     return bool(_OCR_GAZETTE_PAGE_AT_START_RE.match(stripped) or _OCR_GAZETTE_PAGE_AT_END_RE.search(stripped))
+
+
+def _has_gazette_extra_part_header(stripped: str) -> bool:
+    return bool(_GAZETTE_EXTRA_PART_HEADER_RE.search(stripped))
 
 
 def _is_gazette_page_header_line(stripped: str) -> bool:
@@ -132,7 +156,11 @@ def _is_gazette_page_header_line(stripped: str) -> bool:
         return False
     if len(stripped) > 280:
         return False
-    return _has_gazette_header_date(stripped) or _has_ocr_gazette_page_number_at_edge(stripped)
+    return (
+        _has_gazette_header_date(stripped)
+        or _has_ocr_gazette_page_number_at_edge(stripped)
+        or _has_gazette_extra_part_header(stripped)
+    )
 
 
 def normalize_assembly_gazette_pdf_text(text: str) -> str:
