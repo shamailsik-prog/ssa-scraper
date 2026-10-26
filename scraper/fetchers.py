@@ -383,20 +383,13 @@ async def stage_statute(
     job_id=None,
     identity_key: Optional[str] = None,
 ) -> StatutesStaging:
-    stored_url = url
+    stored_url = identity_key or url
     existing_q = select(StatutesStaging).where(
         StatutesStaging.source_name == source.source_name,
         StatutesStaging.content_hash == prov.content_hash,
     )
     if identity_key:
-        from sqlalchemy import or_
-
-        existing_q = existing_q.where(
-            or_(
-                StatutesStaging.source_url == url,
-                StatutesStaging.source_url == identity_key,
-            )
-        )
+        existing_q = existing_q.where(StatutesStaging.source_url == identity_key)
     elif url:
         existing_q = existing_q.where(StatutesStaging.source_url == url)
     existing = (await db.execute(existing_q)).scalars().first()
