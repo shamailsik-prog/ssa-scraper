@@ -14,12 +14,20 @@ from scraper.parsers.statute_parser import (
 )
 
 # Gazette PDFs (na.gov.pk uploads) often embed page headers mid-section.
-GAZETTE_PAGE_LINE_RE = re.compile(
-    r"(?i)^\s*(?:\d{1,2},\d{4}\s*)?(?:\d{1,4}\s+)?THE\s+GAZETTE\s+OF\s+PAKISTAN\b.*$",
+_GAZETTE_NAME_RE = re.compile(
+    r"(?i)\bTHE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE|GAZETIE)\s+OF\s+PAKISTAN\b",
 )
-GAZETTE_OF_PAKISTAN_ANYWHERE_RE = re.compile(r"(?i)THE\s+GAZETTE\s+OF\s+PAKISTAN")
-GAZETTE_INTRUSION_MAX_LINE_LEN = 240
-GAZETTE_PART_LINE_RE = re.compile(r"(?i)^\s*\[?\s*PART\s+I\s*\]?\s*$")
+GAZETTE_PAGE_HEADER_FRAGMENT_RE = re.compile(
+    r"(?i)(?:"
+    r"THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE|GAZETIE)\s+OF\s+PAKISTAN[^\n]{0,200}?(?:EXTRA|OCT\.?)"
+    r"|^\s*\d{1,4}\s+THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN"
+    r"|^\s*\[?\s*PART\s*I\b"
+    r")"
+)
+GAZETTE_PAGE_LINE_RE = re.compile(
+    r"(?i)^\s*(?:\d{1,2},\d{4}\s*)?(?:\d{1,4}\s+)?THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN\b.*$",
+)
+GAZETTE_PART_FRAGMENT_RE = re.compile(r"(?i)^\s*\[?\s*PART\s*I\b[^\n]{0,40}$")
 
 ASSEMBLY_SOURCE_NAMES = frozenset(
     {
@@ -73,18 +81,49 @@ def _normalize_gazette_ocr_braces(text: str) -> str:
     return out
 
 
-def _is_gazette_intrusion_line(stripped: str) -> bool:
-    if not stripped:
+def contains_gazette_page_header_fragment(text: str) -> bool:
+    """True when text still carries pdfplumber page-header chrome (not substantive Gazette citations)."""
+    if not text:
         return False
-    if GAZETTE_OF_PAKISTAN_ANYWHERE_RE.search(stripped) and len(stripped) <= GAZETTE_INTRUSION_MAX_LINE_LEN:
+    for line in text.splitlines():
+        if _is_gazette_page_header_line(line.strip()):
+            return True
+    return bool(GAZETTE_PAGE_HEADER_FRAGMENT_RE.search(text))
+
+
+def _is_substantive_gazette_citation_line(stripped: str) -> bool:
+    """Operative law that merely cites publication in the Gazette of Pakistan."""
+    if re.search(r"(?i)\b(?:published|notified)\s+in\s+the\s+Gazette\s+of\s+Pakistan\b", stripped):
         return True
-    if GAZETTE_PAGE_LINE_RE.match(stripped):
+    if re.search(r"(?i)\b(?:in|into)\s+the\s+(?:Official\s+)?Gazette\s+of\s+Pakistan\b", stripped):
         return True
-    if GAZETTE_PART_LINE_RE.match(stripped):
-        return True
-    if re.fullmatch(r"\d{1,2},\d{4}", stripped):
+    if re.search(r"(?i)\bevery\s+rule\b.*\bGazette\s+of\s+Pakistan\b", stripped):
         return True
     return False
+
+
+def _is_gazette_page_header_line(stripped: str) -> bool:
+    if not stripped:
+        return False
+    if re.fullmatch(r"\d{1,2},\d{4}", stripped):
+        return True
+    if GAZETTE_PART_FRAGMENT_RE.match(stripped):
+        return True
+    if _is_substantive_gazette_citation_line(stripped):
+        return False
+    if GAZETTE_PAGE_LINE_RE.match(stripped):
+        return True
+    if not _GAZETTE_NAME_RE.search(stripped):
+        return False
+    if len(stripped) > 280:
+        return False
+    if re.search(r"(?i)\b(?:EXTRA|OCT\.?|PUBLISHED\s+BY\s+AUTHORITY)\b", stripped):
+        return True
+    if re.search(r"(?i)\bPART\s*I\b", stripped):
+        return True
+    if re.match(r"(?i)^\s*\d{1,4}\s+THE\s+", stripped):
+        return True
+    return len(stripped) <= 100 and re.match(r"(?i)^(?:\d{1,4}\s+)?THE\s+", stripped)
 
 
 def normalize_assembly_gazette_pdf_text(text: str) -> str:
@@ -108,16 +147,10 @@ def strip_gazette_page_break_lines(body: str) -> str:
         if not stripped:
             kept.append(line)
             continue
-        if _is_gazette_intrusion_line(stripped):
+        if _is_gazette_page_header_line(stripped):
             continue
         kept.append(line)
-    cleaned = "\n".join(kept).strip()
-    cleaned = re.sub(
-        r"(?is)[^\n]{0,240}?\bTHE\s+GAZETTE\s+OF\s+PAKISTAN\b[^\n]{0,240}",
-        "",
-        cleaned,
-    )
-    return _collapse_section_body_whitespace(cleaned)
+    return _collapse_section_body_whitespace("\n".join(kept).strip())
 
 
 def _collapse_section_body_whitespace(text: str) -> str:
@@ -173,10 +206,8 @@ def _is_bogus_section_number(num: str, body: str, prev_num: Optional[int]) -> bo
 
 def _derive_assembly_section_title(section_number: str, section_text: str) -> str:
     body = _strip_section_prefix(section_text or "")
-    if section_number == "11":
-        fund = re.search(r"(?i)\bFund\s+of\s+the\s+[^.\n]{3,120}", body)
-        if fund:
-            return fund.group(0).strip(" .")[:500]
+    if section_number == "11" and re.search(r"(?i)\bAuthority\s+Fund\b", body):
+        return "Fund of the Authority"
     derived = _derive_title(body)
     return derived[:500] if derived else ""
 

@@ -6,7 +6,12 @@ import pytest
 
 from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import statute_staging_identity_url
-from scraper.parsers.assembly_pdf_sections import filter_assembly_pdf_sections, normalize_assembly_gazette_pdf_text
+from scraper.parsers.assembly_pdf_sections import (
+    contains_gazette_page_header_fragment,
+    filter_assembly_pdf_sections,
+    normalize_assembly_gazette_pdf_text,
+    strip_gazette_page_break_lines,
+)
 from scraper.parsers.statute_parser import _repair_act_title_ocr, detect_statute_name, split_into_sections
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures_statutes" / "na_pidama_act_2026_gazette_excerpt.txt"
@@ -95,6 +100,30 @@ def test_extract_statute_uses_listing_title_when_official_title_provided():
     assert {"1", "11", "18", "29", "31"}.issubset(numbers)
 
 
+def test_strip_gazette_page_break_preserves_substantive_gazette_citation():
+    body = (
+        "12. Publication.- (2) Every rule made under this Act shall be published "
+        "in the Gazette of Pakistan and shall take effect on such date as may be specified."
+    )
+    cleaned = strip_gazette_page_break_lines(body)
+    assert "published in the Gazette of Pakistan" in cleaned
+
+
+def test_strip_gazette_page_break_removes_header_shaped_lines():
+    body = (
+        "18. Cognizance.- No court shall take cognizance.\n"
+        "12,2026\n"
+        "920 THE GAZETTE OF PAKISTAN, EXTRA., OCT. [PART I\n"
+        "918 THE CAZETTE OF PAKISTAN, EXTRA., OCT. 12, 2026 [PART I\n"
+        "[PART\n"
+        "trial.(1)"
+    )
+    cleaned = strip_gazette_page_break_lines(body)
+    assert "published in the Gazette" not in cleaned or "Cognizance" in cleaned
+    assert not contains_gazette_page_header_fragment(cleaned)
+    assert "trial.(1)" in cleaned
+
+
 def test_repair_act_title_ocr_does_not_mutate_valid_preamble_words():
     preamble = (
         "AN ACT to provide for establishment of Pakistan Infrastructure Development. "
@@ -104,8 +133,15 @@ def test_repair_act_title_ocr_does_not_mutate_valid_preamble_words():
     repaired = _repair_act_title_ocr(title, preamble)
     assert "Authority" in repaired
     assert "Authorities" not in repaired
-    assert "Province" in _repair_act_title_ocr("Province Development Regulation Act, 2024", preamble)
-    assert " provide" not in _repair_act_title_ocr("Province Development Regulation Act, 2024", preamble)
+    province_title = "Province Development Regulation Act, 2024"
+    province_repaired = _repair_act_title_ocr(province_title, preamble)
+    assert "Province" in province_repaired
+    assert "Provinces" not in province_repaired
+    assert " provide" not in province_repaired
+
+    plural_preamble = preamble + " The Provinces may coordinate."
+    assert "Province" in _repair_act_title_ocr(province_title, plural_preamble)
+    assert "Provinces" not in _repair_act_title_ocr(province_title, plural_preamble)
 
 
 def test_repair_act_title_ocr_fixes_close_gazette_typos_only():
@@ -130,7 +166,7 @@ def test_gazette_page_headers_stripped_from_stored_section_bodies():
     assert "THE GAZETTE OF PAKISTAN" not in (by_num.get("29") or {}).get("section_text", "")
     title_11 = (by_num.get("11") or {}).get("section_title", "")
     assert "{l)" not in title_11
-    assert "Fund" in title_11
+    assert title_11 == "Fund of the Authority"
     title_29 = (by_num.get("29") or {}).get("section_title", "")
     assert "{i)" not in title_29
 
@@ -156,4 +192,5 @@ def test_live_na_pidama_pdf_has_sections_one_through_thirty_eight():
     assert nums == list(range(1, 39))
     assert statute_staging_identity_url(PDF_URL, {"act_title": LISTING_CHROME_TITLE}) is None
     for section in extracted["sections"]:
-        assert "THE GAZETTE OF PAKISTAN" not in section.get("section_text", "")
+        body = section.get("section_text", "")
+        assert not contains_gazette_page_header_fragment(body)

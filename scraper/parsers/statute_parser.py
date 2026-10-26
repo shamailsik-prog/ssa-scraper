@@ -268,9 +268,19 @@ def _edit_distance(a: str, b: str) -> int:
 
 def _looks_like_gazette_act_text(text: str) -> bool:
     head = (text or "")[:12000]
-    return bool(re.search(r"(?i)THE\s+GAZETTE\s+OF\s+PAKISTAN", head)) and bool(
+    return bool(re.search(r"(?i)THE\s+(?:G[A-Z]{0,2}ZET{1,2}E|CAZETTE)\s+OF\s+PAKISTAN", head)) and bool(
         re.search(r"(?i)\bact\s+no\.?", head)
     )
+
+
+def _is_plural_suffix_swap(a: str, b: str) -> bool:
+    al, bl = a.lower(), b.lower()
+    if al == bl:
+        return False
+    for shorter, longer in ((al, bl), (bl, al)):
+        if longer == shorter + "s" or longer == shorter + "es":
+            return True
+    return False
 
 
 def _repair_act_title_ocr(title: str, preamble: str) -> str:
@@ -313,6 +323,8 @@ def _repair_act_title_ocr(title: str, preamble: str) -> str:
                 if dist < 1 or dist > 2:
                     continue
                 if SequenceMatcher(None, low, pl).ratio() < 0.84:
+                    continue
+                if _is_plural_suffix_swap(low, pl):
                     continue
                 if dist < best_d:
                     best_d = dist
