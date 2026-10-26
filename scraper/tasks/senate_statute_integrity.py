@@ -267,27 +267,11 @@ async def _apply_verdict(
     now: datetime,
     refetch_snapshot: List[Dict[str, Any]],
 ) -> str:
-    """Quarantine or flag one visible row. Returns the write kind, or ``unchanged``."""
-    if verdict.action not in {ACTION_QUARANTINE, ACTION_NEEDS_REEXTRACT}:
-        return "unchanged"
-    exists = (
-        await db.execute(
-            select(DocumentQuarantine).where(
-                DocumentQuarantine.doc_type == "statute",
-                DocumentQuarantine.doc_id == statute.id,
-            )
-        )
-    ).scalars().first()
-    if exists is None and verdict.reason:
-        db.add(
-            DocumentQuarantine(
-                doc_type="statute",
-                doc_id=statute.id,
-                reason=verdict.reason,
-                run_id=run_id,
-                quarantined_at=now,
-            )
-        )
+    """Quarantine a visible mismatch, or flag a repairable partial. Returns the write kind.
+
+    Repairable PARTIAL rows stay servable. ``needs_section_refetch`` is only a marker;
+    this sweep does not rewrite the name or the section text.
+    """
     if verdict.action == ACTION_NEEDS_REEXTRACT:
         refetch_snapshot.append(
             {
@@ -297,11 +281,36 @@ async def _apply_verdict(
         )
         statute.needs_section_refetch = True
         return "reextract"
+    if verdict.action != ACTION_QUARANTINE or not verdict.reason:
+        return "unchanged"
+    exists = (
+        await db.execute(
+            select(DocumentQuarantine).where(
+                DocumentQuarantine.doc_type == "statute",
+                DocumentQuarantine.doc_id == statute.id,
+            )
+        )
+    ).scalars().first()
+    if exists is None:
+        db.add(
+            DocumentQuarantine(
+                doc_type="statute",
+                doc_id=statute.id,
+                reason=verdict.reason,
+                run_id=run_id,
+                quarantined_at=now,
+            )
+        )
     return "quarantine"
 
 
 async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
-    result = await db.execute(delete(DocumentQuarantine).where(DocumentQuarantine.run_id == run_id))
+    result = await db.execute(
+        delete(DocumentQuarantine).where(
+            DocumentQuarantine.run_id == run_id,
+            DocumentQuarantine.reason.like("senate_integrity:%"),
+        )
+    )
     removed = int(result.rowcount or 0)
     restored = 0
     snap = (

@@ -7,15 +7,24 @@ Population:
 - `source_url` host `senate.gov.pk` (any Senate upload)
 - `source_url` host `pcp.gov.pk` when `source_name` is `Senate` or `GazetteOfPakistan`
 
-On 2026-10-26 the droplet held about 4,016 such rows on MAIN (3,931 senate.gov.pk + 85 Gazette) and 3,824 senate.gov.pk rows on FREE-SITES. Most are already in `document_quarantine`. The common quarantined shell is a body-fragment name, a `|Bill title` label, and zero sections. The sweep counts those shells and does not fetch or relabel them.
+On 2026-10-26 the read-only droplet counts were:
 
-## Dry-run (default)
+| Corpus | Senate-sourced rows | Already quarantined | Still visible |
+| --- | --- | --- | --- |
+| MAIN | 4,016 (3,931 `senate.gov.pk` + 85 `pcp.gov.pk` Gazette) | 3,622 | 394 |
+| FREE-SITES | 3,824 `senate.gov.pk` | 3,337 | 487 |
+
+Most quarantined rows are bill shells: a body-fragment name, a `|Bill title` label, and zero sections. The sweep counts those shells and does not fetch or relabel them.
+
+## Dry-run first
+
+Run a dry-run on each corpus and record the JSON `counts` (`MATCH`, `MISMATCH`, `PARTIAL`, `FETCH_FAIL`, `SKIPPED_SHELL`) plus `deferred_quarantined` and `population` before any `--apply`. Compare those counts with the table above: `population` should be near 4,016 on MAIN and 3,824 on FREE-SITES, and `SKIPPED_SHELL` plus `deferred_quarantined` should account for the already-quarantined majority. Apply only after those counts are written down.
 
 ```bash
 python -m scraper.tasks.senate_statute_integrity
 ```
 
-Reads visible Senate-sourced rows, fetches the PDF (or recorded bytes if the fetch fails), and prints JSON. It does not write.
+The default reads visible Senate-sourced rows, fetches the PDF (or recorded bytes if the fetch fails), and prints JSON. It does not write. A Gazette PDF that contains several acts is scored against the segment whose act number or short title matches the pipe label or the stored name. A row is `MISMATCH` only when no segment matches and the stored sections are not in the PDF.
 
 Useful limits:
 
@@ -33,8 +42,8 @@ Verdicts:
 | Verdict | Meaning |
 | --- | --- |
 | `MATCH` | PDF short title agrees with the stored act, and spot-checked section text appears in the PDF. |
-| `MISMATCH` | The PDF is a different act, or the `\|XIII of 1985` label disagrees with `ACT No.` in the PDF. |
-| `PARTIAL` | Identity is corrupt but the PDF is still the same instrument: preamble or definitions fragment, newline/truncated title, wrong year, year parsed as a section number, or a gazette running header such as `President's Orders and Regulations`. |
+| `MISMATCH` | No Gazette segment matches the pipe label or stored name, and the stored sections are not in the PDF. An incoherent name plus missing sections is a mismatch. |
+| `PARTIAL` | The matching PDF segment is the same instrument, but the stored name or a section is corrupt: preamble or definitions fragment, newline title, wrong year, year parsed as a section number, or a gazette running header such as `President's Orders and Regulations`. |
 | `FETCH_FAIL` | No live PDF and no recorded PDF bytes. |
 | `SKIPPED_SHELL` | Already quarantined, fragment name, pipe label, no sections. Not fetched. |
 
@@ -46,14 +55,14 @@ Verdicts:
 python -m scraper.tasks.senate_statute_integrity --apply
 ```
 
-Only visible rows are written:
+Record the dry-run counts for MAIN and FREE-SITES first. Only visible rows are written:
 
 - `MISMATCH` inserts `document_quarantine` with reason `senate_integrity:url_act_mismatch`. `needs_section_refetch` stays false, because re-extracting would copy the wrong act into this row.
-- Repairable `PARTIAL` inserts `document_quarantine` with reason `senate_integrity:partial_needs_reextract` and sets `needs_section_refetch`. That is the re-extract flag. The sweep does not replace the name or section text.
+- Repairable `PARTIAL` sets `needs_section_refetch` and does not quarantine. The row stays servable. Nothing in this sweep rewrites the name or the section text; the flag marks the row for a later re-extract.
 - A gazette header with no coherent act title is quarantined as `senate_integrity:partial_identity` and is not flagged for re-extract.
 - `FETCH_FAIL`, `MATCH`, and shells are left unchanged.
 
-Quarantine hides the row from search and corpus reads. The statute row, sections, and source URL remain as evidence.
+Quarantine hides a mismatch from search and corpus reads. The statute row, sections, and source URL remain as evidence.
 
 ## Undo
 
@@ -61,4 +70,4 @@ Quarantine hides the row from search and corpus reads. The statute row, sections
 python -m scraper.tasks.senate_statute_integrity --undo <run_id>
 ```
 
-`run_id` is in the `--apply` JSON. Undo deletes quarantine rows from that run and restores `needs_section_refetch` to the value saved before the run. It does not delete statute or section rows.
+`run_id` is in the `--apply` JSON. Undo deletes quarantine rows from that run whose reason starts with `senate_integrity:`, and restores `needs_section_refetch` to the value saved before the run. Other quarantine reasons that share the run id are left in place. Undo does not delete statute or section rows.

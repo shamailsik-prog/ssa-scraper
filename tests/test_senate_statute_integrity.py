@@ -156,6 +156,43 @@ def test_three_way_mismatch_b6869d7b():
     assert "bar councils" in result.pdf_title.lower()
 
 
+def test_shared_gazette_second_act_is_not_quarantined():
+    """A later act in one Gazette PDF must not be judged against the first ACT No."""
+    pdf = """
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+
+    ACT No. IX of 2020
+    An Act to regulate coastal trade.
+    1. Short title.—This Act may be called the Alpha Trading Act, 2020.
+    2. Alpha duty.—Every trader shall keep a register of coastal consignments and report them to the customs collector each quarter without fail.
+
+    ACT No. X of 2020
+    An Act to regulate fishing craft.
+    1. Short title.—This Act may be called the Beta Fisheries Act, 2020.
+    2. Fishing craft.—The owner of a fishing craft shall mark the hull and report the voyage to the fisheries officer before leaving harbour.
+    """
+    result = classify_senate_identity(
+        stored_name="Beta Fisheries Act, 2020",
+        year_enacted=2020,
+        source_url="https://senate.gov.pk/uploads/documents/shared-gazette.pdf|X of 2020",
+        sections=[
+            _section(
+                "2",
+                "The owner of a fishing craft shall mark the hull and report the voyage to the fisheries officer before leaving harbour.",
+            )
+        ],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert "act_number_disagrees" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert result.pdf_title
+    assert "beta fisheries" in result.pdf_title.lower()
+
+
 def test_fc201e56_preamble_name_and_act_number_xiii_vs_ix():
     pdf = """
     THE GAZETTE OF PAKISTAN
@@ -182,11 +219,75 @@ def test_fc201e56_preamble_name_and_act_number_xiii_vs_ix():
         pdf_text=pdf,
         pdf_available=True,
     )
+    # The stored section is the text of ACT No. IX, so the XIII label does not
+    # quarantine the row. The preamble name stays a repairable partial.
+    assert result.verdict == VERDICT_PARTIAL
+    assert result.action == ACTION_NEEDS_REEXTRACT
+    assert "act_number_disagrees" not in result.signals
+    assert "preamble_junk_name" in result.signals
+    assert result.needs_reextract is True
+
+
+def test_act_number_mismatch_when_no_segment_matches_and_sections_absent():
+    pdf = """
+    THE GAZETTE OF PAKISTAN
+    ACT No. IX of 1985
+    An Act to regulate a public authority.
+    1. Short title.—This Act may be called the Public Authorities Regulation Act, 1985.
+    2. Application.—This Act applies to every public authority established by the Federal Government
+    and requires each authority to publish an annual report of its functions and expenditure
+    together with the auditor report for the preceding financial year.
+    """
+    result = classify_senate_identity(
+        stored_name=(
+            "WHEREAS it is expedient to provide for the regulation of public authorities "
+            "and for matters connected therewith"
+        ),
+        year_enacted=1985,
+        source_url="https://www.senate.gov.pk/uploads/documents/fc201e56.pdf|XIII of 1985",
+        sections=[_section("12", FISHING_SECTION)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
     assert result.verdict == VERDICT_MISMATCH
     assert result.action == ACTION_QUARANTINE
     assert "act_number_disagrees" in result.signals
-    assert "preamble_junk_name" in result.signals
+    assert "section_absent_from_pdf" in result.signals
     assert result.needs_reextract is False
+
+
+def test_thin_pdf_does_not_treat_missing_sections_as_absence():
+    pdf = "This Act may be called the Capital Development Authority (Abatement of Arbitration Proceedings) Act, 1975."
+    result = classify_senate_identity(
+        stored_name=CDA_NAME,
+        year_enacted=1975,
+        source_url="https://senate.gov.pk/uploads/documents/thin.pdf|LX of 1975",
+        sections=[
+            _section(
+                "2",
+                "The owner of a fishing craft shall mark the hull and report the voyage to the fisheries officer before leaving harbour.",
+            )
+        ],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert "section_absent_from_pdf" not in result.signals
+    assert result.verdict != VERDICT_MISMATCH
+
+
+def test_section_absent_with_incoherent_name_is_mismatch_not_reextract():
+    result = classify_senate_identity(
+        stored_name="means the Board established under section 3 of this Act",
+        source_url="https://senate.gov.pk/uploads/documents/incoherent.pdf|Example Bill, 1973",
+        sections=[_section("12", FISHING_SECTION)],
+        pdf_text=BAR_PDF,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.needs_reextract is False
+    assert "section_absent_from_pdf" in result.signals
+    assert "definitions_fragment_name" in result.signals
 
 
 def test_f274804f_definitions_clause_fragment_name():
@@ -479,6 +580,16 @@ async def test_apply_quarantines_visible_mismatch_without_overwriting(db):
     ).scalars().one()
     assert shell_q.reason == "statute_quality:no_valid_sections"
     assert shell_q.run_id == "prior-shell"
+    other_id = uuid4()
+    db.add(
+        DocumentQuarantine(
+            doc_type="statute",
+            doc_id=other_id,
+            reason="b7_bad_document:no_parseable_sections",
+            run_id=run_id,
+        )
+    )
+    await db.commit()
 
     undone = await run_senate_statute_integrity(undo=run_id)
     assert undone["undone"]["quarantine_rows_removed"] == 1
@@ -487,6 +598,10 @@ async def test_apply_quarantines_visible_mismatch_without_overwriting(db):
         await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == visible_id))
     ).scalars().first()
     assert gone is None
+    kept = (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == other_id))
+    ).scalars().one()
+    assert kept.reason == "b7_bad_document:no_parseable_sections"
 
 
 @pytest.mark.asyncio
@@ -543,8 +658,10 @@ async def test_apply_partial_flags_reextract_and_keeps_text(db):
     assert text == body
     q = (
         await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == sid))
-    ).scalars().one()
-    assert q.reason == "senate_integrity:partial_needs_reextract"
+    ).scalars().first()
+    assert q is None
+    assert report["applied"]["flagged_reextract"] == 1
+    assert report["applied"]["quarantined"] == 0
 
     await run_senate_statute_integrity(undo=run_id)
     db.expire_all()
