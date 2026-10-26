@@ -12,7 +12,7 @@ On 2026-10-26 the read-only droplet counts for this host were about 2,674 rows o
 
 | Reason | When |
 | --- | --- |
-| `multi_act_pdf_bleed:law.gok.pk` | A second act title in the stored text, a document-order restart of section numbering, or a run of headings about a body (Authority, Tribunal, and similar) that the stored act never names or defines. An act name on its own line inside amending or repealing text is a citation, not a second act, unless a new section 1, `1. Short title`, or `may be called` follows it, or the previous line is a finished sentence. |
+| `multi_act_pdf_bleed:law.gok.pk` | A second act absorbed into the row: a different instrument's title, a numbering drop back to section 1 or 2 that names another instrument or is a Short-title heading that does not name the stored act, or a run of headings about a body (Authority, Tribunal, and similar) that the stored act never names or defines. The stored act's own short title, a date or schedule row stored as section `01`, and a revised-volume tail in front of that act are not bleed. A wrapped line ending `this Act`, and `shall be called in question`, are not a new short title. `amended` in an earlier sentence does not hide the next act's called title. A `may be called` in the same sentence as `substituted` or `namely` is a citation. |
 | `name_pdf_mismatch:law.gok.pk` | The PDF filename is a different instrument from the stored name. Parenthetical act numbers such as `(Act II of 1962)` and a `\|II` source-url label are ignored. |
 
 A year used as a section number (1800–2030), or a year/junk number that only sits before section 1, is reported and is not quarantined. Those patterns are too common on this host to quarantine in bulk (hundreds of year-like section numbers; about 22 rows per host are only a year before section 1).
@@ -50,20 +50,22 @@ Rows already contained on the droplets (do not expect a new write):
 | MAIN | `e0db6058` | Constitution 1973; PDF is the AJK Legislative Assembly Elections Amendment Ordinance, 1980 | `name_pdf_mismatch:law.gok.pk` |
 | FREE-SITES | `8a07a5ad` | Constitution 1973; PDF is the AJK Courts and Laws Code, 1949 | `name_pdf_mismatch:law.gok.pk` |
 
-Visible restart candidates to look for in the dry-run (`numbering_restart`, not already quarantined):
+Same-instrument rows stay `MATCH` when the stored name matches the PDF filename. A 2026-10-26 dry-run on `a810c958` flagged many of these as `multi_act_pdf_bleed`; that was a false positive. Do not quarantine them for a numbering drop or a cited title alone:
 
-| Corpus | Id prefix | Name |
-| --- | --- | --- |
-| MAIN | `d16bce19` | Ulma-o-Mushaikh 1997 |
-| MAIN | `32bfe59b` | Extra-Territorial Offences |
-| MAIN | `d56d0c99` | Law Officers |
-| MAIN | `eaacc59b` | Regulation of Services (junk section 2591, then a real restart) |
-| FREE-SITES | `a4e7d610`, `06d76131`, `41b4d195` | Twins of the MAIN restart rows |
+| Corpus | Id prefix | Name | Why it is the same instrument |
+| --- | --- | --- | --- |
+| MAIN | `d16bce19` | Ulma-o-Mushaikh 1997 | Name matches the PDF. A numbering drop without another act's title. |
+| MAIN | `32bfe59b` | Extra-Territorial Offences 1962 | Volume tail, then this act's own short title. |
+| MAIN | `d56d0c99` | Law Officers 2014 | A date (`01.07.2014`) parsed as section `01`. |
+| FREE-SITES | `a4e7d610`, `06d76131`, `41b4d195` | Twins of Ulma, Extra-Territorial, and Law Officers | Same shapes. |
 
-Closer rows to read in the same dry-run output before deciding they are the same defect. They were still visible on 2026-10-26 and are not assumed quarantined:
+The same class, name matching filename, includes Presidential Election 1974, Finance 2012 and 1998 (schedule rows such as `01. Middle Classes`), Wildlife, Ehtesab Bureau 2001, Essential Articles 2016 (`shall be called in question`), Payment of Wages 1967, Zakat and Ushr 1985, Rahamat-Ul-Aalameen, Finance Supplementary 1974, Islamic Tazirati Quaneen Nafaz Amendment 1995, Press Foundation 2003, Criminal Law 3rd Amendment 2020, Interim Constitution 1st Amendment 1975, and Bhimbher University 2023.
 
-- MAIN `89de4e53` LG Amend, `8b292efe` Penal Code Amend 1993, `f257a105` Ehtesab Amend 1998, `b21e2057` Finance 2023
-- FREE-SITES `7b76f260`, `590ea26d`, `cb509ba3` University AJK 1985, `985e6d1a` Finance 1998, `b3e2ee30`, `d0569a54`
+`eaacc59b` Regulation of Services (junk section `2591`, then lower numbers) is not bleed unless the restarted text opens a different instrument. A bare drop after `2591` stays `MATCH`.
+
+Name mismatches that must still quarantine: Cabinet Order against `AZAD-KASHMIR-OLD-LIABILITIES`; an Elections Act against `Election-Comission` (those tokens do not intersect); Constitution 1973 against the Courts and Laws Code or the Legislative Assembly ordinance.
+
+Amendment rows that only cite another act stay `MATCH` as well: MAIN `89de4e53` LG Amend, `8b292efe` Penal Code Amend 1993, `f257a105` Ehtesab Amend 1998, `b21e2057` Finance 2023, and FREE-SITES `7b76f260`, `590ea26d`, `cb509ba3` University AJK 1985, `985e6d1a` Finance 1998, `b3e2ee30`, `d0569a54`. Quarantine one of these only when the stored text opens a different instrument or a foreign body run, as Conciliation Courts does with Mirpur.
 
 Mirpur Town Development Authority's own statute rows are a one-way control: the bleed runs into Conciliation Courts, not back into Mirpur. A Mirpur row whose name and definitions establish the Authority and the Tribunal should stay `MATCH`.
 
