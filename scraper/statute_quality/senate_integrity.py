@@ -8,13 +8,14 @@ already-quarantined fragment-name / bill-title / no-section rows.
 
 An act-number gap is ignored only when the significant words agree in both
 directions under OCR equivalence, both titles carry the same year, and the
-act numbers share that year and differ by one (roman 30 against 31). That
-agreement also treats one ``n``/``r`` slip in a word of nine or more letters
-as the same word (``scientific`` / ``sciertific``), including when it stacks
-on an ``i``/``l`` slip. Shorter words stay strict, so ``national`` /
-``rational`` do not agree. Amendment and ordinal words stay significant. A
-year stored as a section number stays on the row and does not leave MATCH
-when that wording already agrees.
+act numbers share that year and are either one apart (roman 30 against 31)
+or the same X-run with its final X read as III (roman 30 against 23, roman
+20 against 13). That agreement also treats one ``n``/``r`` slip in a word of
+nine or more letters as the same word (``scientific`` / ``sciertific``),
+including when it stacks on an ``i``/``l`` slip. Shorter words stay strict,
+so ``national`` / ``rational`` do not agree. Amendment and ordinal words stay
+significant. A year stored as a section number stays on the row and does not
+leave MATCH when that wording already agrees.
 """
 
 from __future__ import annotations
@@ -523,6 +524,67 @@ def _one_roman_act_misread(left: tuple[int, int], right: tuple[int, int]) -> boo
     return left[1] == right[1] and abs(left[0] - right[0]) == 1
 
 
+_ROMAN_GLYPHS = (
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+)
+
+
+def _canonical_roman(number: int) -> str:
+    """Standard subtractive roman spelling, or empty when ``number`` is not a positive act number."""
+    if number <= 0 or number >= 4000:
+        return ""
+    remaining = number
+    parts: list[str] = []
+    for value, glyph in _ROMAN_GLYPHS:
+        while remaining >= value:
+            parts.append(glyph)
+            remaining -= value
+    return "".join(parts)
+
+
+def _final_x_of_run_read_as_iii(source: str, scanned: str) -> bool:
+    """The last X in a run of at least two was scanned as III."""
+    for index, char in enumerate(source):
+        if char != "X":
+            continue
+        if index == 0 or source[index - 1] != "X":
+            continue
+        if index + 1 < len(source) and source[index + 1] == "X":
+            continue
+        if source[:index] + "III" + source[index + 1 :] == scanned:
+            return True
+    return False
+
+
+def _x_run_act_misread(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    """Same act-number year, and one roman is the other with a trailing X-run read as III.
+
+    Roman 30 against 23, and roman 20 against 13. A lone X, a dropped X, or
+    any other gap stays a disagreement.
+    """
+    if left[1] != right[1]:
+        return False
+    left_roman = _canonical_roman(left[0])
+    right_roman = _canonical_roman(right[0])
+    if not left_roman or not right_roman:
+        return False
+    return _final_x_of_run_read_as_iii(left_roman, right_roman) or _final_x_of_run_read_as_iii(
+        right_roman, left_roman
+    )
+
+
 @dataclass(frozen=True)
 class _ActSegment:
     act_number: Optional[tuple[int, int]]
@@ -940,14 +1002,19 @@ def classify_senate_identity(
         and _bidirectional_ocr_titles(stored_name, pdf_title)
         and _titles_share_enactment_year(stored_name, pdf_title)
     )
-    # Drop the act-number signal only for a one-numeral misread on that title.
-    # A wider gap, a missing year, or an extra amendment/ordinal word still disagrees.
-    act_number_is_one_roman_misread = bool(
+    # Drop the act-number signal only for a one-numeral misread, or for the
+    # final X of an X-run scanned as III, on a title that already agrees.
+    # Any other gap, a different act-number year, or an extra amendment or
+    # ordinal word still disagrees.
+    act_number_is_ocr_misread = bool(
         title_agrees
         and pipe_act
         and chosen is not None
         and chosen.act_number
-        and _one_roman_act_misread(pipe_act, chosen.act_number)
+        and (
+            _one_roman_act_misread(pipe_act, chosen.act_number)
+            or _x_run_act_misread(pipe_act, chosen.act_number)
+        )
     )
 
     def _note_title_relation(title: Optional[str]) -> None:
@@ -970,7 +1037,7 @@ def classify_senate_identity(
             pipe_act
             and chosen.act_number
             and pipe_act != chosen.act_number
-            and not act_number_is_one_roman_misread
+            and not act_number_is_ocr_misread
         ):
             signals.append("act_number_disagrees")
         _note_title_relation(pdf_title)
