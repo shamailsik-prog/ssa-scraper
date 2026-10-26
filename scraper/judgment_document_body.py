@@ -54,16 +54,14 @@ _HTML_SHC_CASE_NO_RE = re.compile(
     r"\b(?:1st|2nd|3rd|\d+th)\s+criminal\s+bail\s+application\s+no\.?\s*[a-z0-9./-]+"
     r")"
 )
-# Cause lists, rosters, and adjournment notices (not dispositive order sheets).
+# Cause lists and adjournment notices (short/strong paths only — not the 200-word judgment path).
 _HTML_NON_JUDGMENT_PROBE_RE = re.compile(
     r"(?i)(?:"
     r"\bcause\s*list\b|"
     r"\bdaily\s+cause\b|"
-    r"\broster\b|"
-    r"\bfor\s+(?:hearing|adjournment)\b|"
     r"\badjournment\s+notice\b|"
-    r"\blahore\s+high\s+court\b|"
-    r"\bin the high court of punjab\b"
+    r"\broster\s+published\b|"
+    r"\bin the high court of punjab\b.*\broster\b"
     r")"
 )
 
@@ -106,6 +104,35 @@ def _html_has_order_sheet_surface(text: str) -> bool:
     )
 
 
+def _html_sindh_header_without_order_sheet_surface(text: str) -> bool:
+    if not re.search(r"\bin the high court of sindh\b", text, flags=re.I):
+        return False
+    return not bool(
+        _HTML_ORDER_SHEET_SURFACE_RE.search(text)
+        or re.search(r"\bpresent:\s*", text, flags=re.I)
+    )
+
+
+def _html_matches_strong_court_document(text: str) -> bool:
+    if _HTML_STRONG_COURT_DOCUMENT_RE.search(text):
+        return True
+    if not re.search(r"\bin the high court of\b", text, flags=re.I):
+        return False
+    if _html_sindh_header_without_order_sheet_surface(text):
+        return False
+    return True
+
+
+def _short_order_sheet_gates_met(text: str) -> bool:
+    if _html_body_is_non_judgment_probe(text):
+        return False
+    return (
+        _html_has_order_sheet_surface(text)
+        and bool(_HTML_SHC_HEADER_RE.search(text))
+        and bool(_HTML_SHC_CASE_NO_RE.search(text))
+    )
+
+
 def frontier_http_status_action(status_code: int) -> str:
     """How to treat a document fetch HTTP status before body classification."""
     if status_code < 400:
@@ -129,31 +156,24 @@ def html_judgment_word_count(html: str) -> int:
 
 
 def html_body_has_short_order_sheet_marker(html: str) -> bool:
-    text = _html_text_for_markers(html)
-    if _html_body_is_non_judgment_probe(text):
-        return False
-    return (
-        _html_has_order_sheet_surface(text)
-        and bool(_HTML_SHC_HEADER_RE.search(text))
-        and bool(_HTML_SHC_CASE_NO_RE.search(text))
-    )
+    return _short_order_sheet_gates_met(_html_text_for_markers(html))
 
 
 def html_body_has_strong_court_document_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
     if _html_body_is_non_judgment_probe(text):
         return False
-    return bool(_HTML_STRONG_COURT_DOCUMENT_RE.search(text))
+    return _html_matches_strong_court_document(text)
 
 
 def html_body_has_judgment_marker(html: str) -> bool:
     text = _html_text_for_markers(html)
+    if _HTML_JUDGMENT_MARKER_RE.search(text):
+        return True
     if _html_body_is_non_judgment_probe(text):
         return False
     return bool(
-        _HTML_JUDGMENT_MARKER_RE.search(text)
-        or _HTML_STRONG_COURT_DOCUMENT_RE.search(text)
-        or html_body_has_short_order_sheet_marker(html)
+        _html_matches_strong_court_document(text) or _short_order_sheet_gates_met(text)
     )
 
 

@@ -284,6 +284,70 @@ def test_classify_hyderabad_ordersheet_one_word():
     assert classify_pdf_endpoint_body(_fetch_result_for_word_html(html, "48aac4be")) == "html_judgment"
 
 
+def _balochistan_hc_html_judgment_body() -> str:
+    """~60-word HTML judgment body (#347 Balochistan HC strong-court path)."""
+    return """
+    <html><body>
+    IN THE HIGH COURT OF BALOCHISTAN AT QUETTA
+    Constitution Petition No. 123 of 2024
+    Muhammad Ali Versus Government of Balochistan and others
+    Heard. For reasons to be recorded separately, this petition is dismissed with costs.
+    The impugned notification is set aside and the respondents are directed to decide afresh
+    within sixty days in accordance with law after hearing the petitioner.
+    Office is directed to communicate this order to the parties and to the trial court.
+    </body></html>
+    """
+
+
+def _long_html_judgment_with_hearing_roster_citations() -> str:
+    """Full judgment (200+ words) citing hearings, rosters, and Lahore HC precedent."""
+    padding = (
+        "The petitioner argued that the impugned order violated settled principles of natural justice "
+        "and that the record did not support the findings returned by the trial court. "
+        "Learned counsel relied upon the roster practice of this court and noted that the matter was "
+        "earlier fixed for hearing before a division bench. Reference was made to cause list entries "
+        "in an allied case and to the Lahore High Court judgment reported as PLD 2010 Lahore 100. "
+    ) * 4
+    body = f"""
+    IN THE HIGH COURT OF SINDH AT KARACHI
+    Constitution Petition No. D-999 of 2024
+    ABC Industries Versus Federation of Pakistan and others
+    Judgment
+    {padding}
+    For the foregoing reasons, the petition is disposed of with directions to the respondents.
+    """
+    return f"<html><body>{body.replace(chr(10), '<br/>')}</body></html>"
+
+
+def test_classify_balochistan_hc_body_via_in_the_high_court_of_strong_marker():
+    html = _balochistan_hc_html_judgment_body()
+    wc = html_judgment_word_count(html)
+    assert 50 <= wc < 200
+    assert html_body_has_judgment_marker(html)
+    res = FetchResult(
+        url="https://example.test/view-file/balochistan-hc",
+        final_url="https://example.test/view-file/balochistan-hc",
+        status_code=200,
+        content=html.encode("utf-8"),
+        content_type="application/pdf",
+    )
+    assert classify_pdf_endpoint_body(res) == "html_judgment"
+
+
+def test_long_judgment_with_hearing_roster_and_lahore_citation_still_accepts():
+    html = _long_html_judgment_with_hearing_roster_citations()
+    assert html_judgment_word_count(html) >= 200
+    assert html_body_has_judgment_marker(html)
+    res = FetchResult(
+        url="https://caselaw.shc.gov.pk/caselaw/view-file/LONG-JUDG",
+        final_url="https://caselaw.shc.gov.pk/caselaw/view-file/LONG-JUDG",
+        status_code=200,
+        content=html.encode("utf-8"),
+        content_type="application/pdf",
+    )
+    assert classify_pdf_endpoint_body(res) == "html_judgment"
+
+
 def test_auditor_probes_defer_not_html_judgment():
     """Cause lists, adjournment notices, Lahore rosters, and SHC header filler must not pass."""
     probes = {
