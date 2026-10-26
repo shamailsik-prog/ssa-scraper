@@ -32,7 +32,7 @@ python -m scraper.tasks.ocr_section_mash --statute-id <uuid>
 | Verdict | Meaning |
 | --- | --- |
 | `MATCH` | Stored headings are not far above the stored section numbers, and the row is not a scanned few-section suspect. |
-| `MISMATCH` | A stored section's operative text carries two or more `N.` headings at least 8 above that section's number. Headings on a quoted line, or after `namely` / `following … inserted`, `substituted`, or `added`, are amendment text and are not counted. A section whose own heading was stripped before storage is still a match when nothing else remains. The same verdict is used when those operative headings outnumber the stored sections by 8 or more. Quarantine candidate. |
+| `MISMATCH` | A stored section's operative text carries two or more `N.` headings at least 8 above that section's number. Quoted lines are not counted. An amending verb (`inserted`, `substituted`, or `added`) skips headings only until that quoted or unquoted insert ends; `namely` by itself does not open a skip. Headings after a schedule, annex, or appendix marker are not counted, including a numbering run that starts again at 1. A section whose own heading was stripped before storage is still a match when nothing else remains. The same verdict is used when those operative headings outnumber the stored sections by 8 or more. Quarantine candidate. |
 | `SUSPECT` | Five or fewer stored sections, and a preserved PDF has no text layer. The headings do not show a mash. Re-extract candidate, not a quarantine. |
 
 ## Reasons

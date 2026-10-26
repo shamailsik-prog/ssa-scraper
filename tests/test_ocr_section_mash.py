@@ -274,6 +274,181 @@ def test_quoted_and_substituted_insertions_are_not_headings():
     assert reason == ""
 
 
+def test_bare_namely_does_not_hide_later_operative_headings():
+    """Auditor probe: ``following, namely:-`` plus ``(a) grants`` is a list, not an insert.
+
+    Stored s.11 still holds ss.28–30. That stays a mismatch, and the save gate rejects it.
+    """
+    mashed = "\n".join(
+        [
+            "11",
+            "Page 11 of 12",
+            "The Fund shall consist of the following, namely:-",
+            "(a) grants made by the Government;",
+            "28. Functions of the Institute.—(1) The Institute shall provide child health services in Quetta.",
+            "29. Power to make rules.—The Government may make rules to carry out the purposes of this Act.",
+            "30. Repeal and savings.—The Ordinance is hereby repealed and anything done under it shall continue.",
+        ]
+    )
+    sections = [
+        {"section_number": "3", "section_text": "Page 3 of 12\n3\n"},
+        {"section_number": "8", "section_text": "- 8 -\n8.\n"},
+        {"section_number": "10", "section_text": "10\nPage 10 of 12\n"},
+        {"section_number": "11", "section_text": mashed},
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url=BICHQ_URL,
+        source_name="BalochistanAssembly",
+        scanned_source=True,
+    )
+    assert verdict.verdict == VERDICT_MISMATCH
+    assert verdict.action == ACTION_QUARANTINE
+    assert verdict.reason == REASON_HEADINGS_ABOVE_STORED
+    assert verdict.embedded_headings == (28, 29, 30)
+    assert "ignored_page_or_line_numbers" in verdict.signals
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": BICHQ_NAME, "sections": sections},
+        raw_text="",
+        source_name="BalochistanAssembly",
+        source_url=BICHQ_URL,
+    )
+    assert ok is False
+    assert reason == REASON_HEADINGS_ABOVE_STORED
+
+
+def test_board_namely_list_does_not_hide_later_headings():
+    """Auditor probe: a Board ``namely`` list must not swallow later section headings."""
+    sections = [
+        {
+            "section_number": "4",
+            "section_text": "\n".join(
+                [
+                    "The Board shall consist of the following, namely:-",
+                    "(a) the Chief Secretary, who shall be the Chairperson;",
+                    "(b) the Secretary of the Department;",
+                    "12. Meetings of the Board.—The Board shall meet at least twice in a year.",
+                    "20. Fund of the Board.—The Fund shall be kept in a scheduled bank.",
+                    "28. Functions of the Institute.—(1) The Institute shall provide child health services.",
+                    "30. Repeal and savings.—The Ordinance is hereby repealed and savings shall apply.",
+                ]
+            ),
+        }
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url=BICHQ_URL,
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MISMATCH
+    assert verdict.reason == REASON_HEADINGS_ABOVE_STORED
+    assert verdict.embedded_headings == (12, 20, 28, 30)
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": "The Sample Board Act, 2024", "sections": sections},
+        raw_text="",
+        source_name="BalochistanAssembly",
+        source_url=BICHQ_URL,
+    )
+    assert ok is False
+    assert reason == REASON_HEADINGS_ABOVE_STORED
+
+
+def test_skipping_ends_when_the_quoted_insert_closes():
+    """An amending verb skips only the quoted block. Later unquoted headings are operative."""
+    sections = [
+        {
+            "section_number": "11",
+            "section_text": "\n".join(
+                [
+                    "In the said Act, after section 4, the following shall be inserted, namely:-",
+                    '"5. Transitional provision.—Anything done before commencement shall',
+                    '6. Saving of appointments.—Appointments made before commencement shall continue."',
+                    "28. Functions of the Institute.—(1) The Institute shall provide child health services.",
+                    "29. Power to make rules.—The Government may make rules to carry out this Act.",
+                    "30. Repeal and savings.—The Ordinance is hereby repealed and savings shall apply.",
+                ]
+            ),
+        }
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url=BICHQ_URL,
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MISMATCH
+    assert verdict.embedded_headings == (28, 29, 30)
+    assert 5 not in verdict.embedded_headings
+    assert 6 not in verdict.embedded_headings
+
+
+def test_skipping_ends_when_the_unquoted_insert_block_ends():
+    """Unquoted inserted headings stop at the blank line that returns to the host section."""
+    sections = [
+        {
+            "section_number": "11",
+            "section_text": "\n".join(
+                [
+                    "In the said Act, the following new section shall be inserted, namely:-",
+                    "5. Transitional provision.—Anything done before commencement shall continue in force.",
+                    "",
+                    "The Fund shall consist of grants made by the Government each year and kept in a bank.",
+                    "28. Functions of the Institute.—(1) The Institute shall provide child health services.",
+                    "29. Power to make rules.—The Government may make rules to carry out this Act.",
+                    "30. Repeal and savings.—The Ordinance is hereby repealed and savings shall apply.",
+                ]
+            ),
+        }
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url=BICHQ_URL,
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MISMATCH
+    assert verdict.embedded_headings == (28, 29, 30)
+    assert 5 not in verdict.embedded_headings
+
+
+@pytest.mark.parametrize("marker", ["SCHEDULE", "ANNEX"])
+def test_headingless_schedule_items_are_not_operative_headings(marker: str):
+    """Auditor probe: a heading-less section may end in a numbered schedule without a mismatch."""
+    sections = [
+        {
+            "section_number": "1",
+            "section_text": "\n".join(
+                [
+                    "This Act may be called the Sample Institute Act, 2024 and it extends to the whole of Balochistan.",
+                    marker,
+                    "1. Name of the post.—Director of the Institute.",
+                    "2. Qualifications.—A degree in the relevant discipline.",
+                    "4. Age.—Not less than twenty five years.",
+                    "10. Pay scale.—As notified by the Government from time to time.",
+                    "12. Allowances.—As the Government may prescribe by rules.",
+                ]
+            ),
+        }
+    ]
+    verdict = classify_ocr_section_mash(
+        sections,
+        source_url="https://www.pabalochistan.gov.pk/acts/sample-institute-2024.pdf",
+        source_name="BalochistanAssembly",
+    )
+    assert verdict.verdict == VERDICT_MATCH
+    assert verdict.action == ACTION_NONE
+    assert REASON_HEADINGS_ABOVE_STORED not in verdict.reasons
+    assert 10 not in verdict.embedded_headings
+    assert 12 not in verdict.embedded_headings
+    assert 4 not in verdict.embedded_headings
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": "The Sample Institute Act, 2024", "sections": sections},
+        raw_text="",
+        source_name="BalochistanAssembly",
+        source_url="https://www.pabalochistan.gov.pk/acts/sample-institute-2024.pdf",
+    )
+    assert ok is True
+    assert reason == ""
+
+
 def test_one_higher_heading_is_not_a_wide_margin():
     sections = [
         {

@@ -62,14 +62,24 @@ _SENTENCE_START_RE = re.compile(
     r"notwithstanding|on|under|for|no|the|a|an)\b"
 )
 _QUOTE_CHARS = "\"'“”‘’«»"
-# Inserted or substituted text is the other Act's sections, not this row's numbering.
-_AMENDMENT_INTRO_RE = re.compile(
+# An amending verb opens an insert. Bare "namely" is only a list and does not.
+_AMENDMENT_CUE_RE = re.compile(
     r"(?i)(?:"
-    r"\bnamely\b"
-    r"|\bfollowing\b[^.\n]{0,180}?\b(?:inserted|substituted|added)\b"
+    r"\bfollowing\b[^.\n]{0,180}?\b(?:inserted|substituted|added)\b"
     r"|\b(?:shall\s+be|hereby)\s+(?:inserted|substituted|added)\b"
+    r"|\b(?:inserted|substituted|added)\b[^.\n]{0,40}?\bnamely\b"
     r")"
 )
+# A schedule line, not a sentence that merely mentions a schedule.
+_SCHEDULE_MARKER_RE = re.compile(
+    r"(?i)^(?:the\s+)?"
+    r"(?:(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+)?"
+    r"(?:schedules?|annex(?:ure)?s?|appendices|appendix)"
+    r"(?:\s*[-—–.]?\s*(?:[ivxlcdm]+|\d{1,3}|[a-z]))?"
+    r"(?:\s*\([^)\n]{0,80}\))?"
+    r"\s*\.?\s*$"
+)
+_SUBSECTION_RE = re.compile(r"(?i)^\((?:\d{1,3}|[a-z]|[ivxlcdm]{1,6})\)")
 
 
 @dataclass(frozen=True)
@@ -105,9 +115,12 @@ def _prepare_line(line: str) -> str:
     return (line or "").strip()
 
 
-def _is_quoted_line(line: str) -> bool:
-    text = (line or "").lstrip()
-    return bool(text) and text[0] in _QUOTE_CHARS
+def _starts_with_quote(line: str) -> bool:
+    return bool(line) and line[0] in _QUOTE_CHARS
+
+
+def _ends_with_quote(line: str) -> bool:
+    return bool(line) and line[-1] in _QUOTE_CHARS
 
 
 def _heading_on_line(line: str) -> Optional[int]:
@@ -143,37 +156,70 @@ def embedded_section_headings(text: str) -> tuple[tuple[int, ...], bool]:
     """Return operative ``N.`` / ``Section N.`` headings and whether page noise was skipped.
 
     A line that is only a page number, ``Page N of M``, ``- N -``, or ``N.``
-    is not a section heading. Quoted lines, and headings after amendment
-    scaffolding (``namely``, ``following … inserted|substituted|added``), are
-    the text being inserted into another Act. They are not headings of this row.
-    ``statute_contents`` strips a section's own ``N.`` heading before storage,
-    so a missing own heading is not itself a mash.
+    is not a section heading. Quoted lines are not headings. An amending verb
+    (``inserted``, ``substituted``, or ``added``) skips the quoted block, or the
+    unquoted inserted headings, and detection resumes when that block ends.
+    ``namely`` by itself does not start a skip. Headings after a schedule,
+    annex, or appendix marker are schedule items, including a run that starts
+    again at 1. ``statute_contents`` strips a section's own ``N.`` heading
+    before storage, so a missing own heading is not itself a mash.
     """
     found: list[int] = []
     ignored = False
-    in_amendment = False
+    quote_open = False
+    awaiting_insert = False
+    insert_run = False
+    insert_saw_blank = False
+    in_schedule = False
     for raw_line in (text or "").splitlines():
         line = _prepare_line(raw_line)
         if not line:
+            if insert_run:
+                insert_saw_blank = True
             continue
         if _PAGE_OR_LINE_RE.match(line):
             ignored = True
             continue
-        if _is_quoted_line(line):
-            if _AMENDMENT_INTRO_RE.search(line):
-                in_amendment = True
+        if quote_open:
+            if _ends_with_quote(line):
+                quote_open = False
             continue
-        cue = _AMENDMENT_INTRO_RE.search(line)
+        if _starts_with_quote(line):
+            if not (_ends_with_quote(line) and len(line) > 1):
+                quote_open = True
+            awaiting_insert = False
+            continue
+        if insert_run:
+            resumed = (
+                insert_saw_blank
+                and _heading_on_line(line) is None
+                and _SUBSECTION_RE.match(line) is None
+            )
+            if not resumed:
+                insert_saw_blank = False
+                continue
+            insert_run = False
+            insert_saw_blank = False
+        if in_schedule or _SCHEDULE_MARKER_RE.match(line):
+            in_schedule = True
+            awaiting_insert = False
+            continue
+        cue = _AMENDMENT_CUE_RE.search(line)
         if cue is not None:
             prefix = line[: cue.start()].strip()
             if prefix:
                 number = _heading_on_line(prefix)
                 if number is not None:
                     found.append(number)
-            in_amendment = True
+            awaiting_insert = True
+            insert_saw_blank = False
             continue
-        if in_amendment:
-            continue
+        if awaiting_insert:
+            if _heading_on_line(line) is not None:
+                insert_run = True
+                awaiting_insert = False
+                continue
+            awaiting_insert = False
         match = _HEADING_RE.match(line)
         if match is None:
             continue
