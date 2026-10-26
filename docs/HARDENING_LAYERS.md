@@ -11,6 +11,7 @@ Judgment-content and PLS quality layers default to **on** (same policy as B3 sta
 | Search harvest Postgres advisory lock (per slot) | `SSA_HARVEST_PG_LOCK` | Revert commit; `SSA_HARVEST_PG_LOCK=0` |
 | Document save validation + document_quarantine CLI | `SSA_DOCUMENT_SAVE_VALIDATION`, migration **027** (`document_quarantine` side table), `python -m scraper.tasks.quarantine_bad_documents` | Revert commit; `SSA_DOCUMENT_SAVE_VALIDATION=0`; `--undo RUN_ID` on quarantine CLI |
 | Senate statute identity sweep | `python -m scraper.tasks.senate_statute_integrity` (dry-run). `--apply` quarantines visible mismatches only; repairable partials set `needs_section_refetch` and stay servable | `--undo RUN_ID` removes that run's `senate_integrity:%` quarantine rows and restores `needs_section_refetch`. See `docs/SENATE_STATUTE_INTEGRITY.md` |
+| law.gok.pk multi-act PDF bleed sweep | `python -m scraper.tasks.gok_multi_act_bleed` (dry-run). `--apply` inserts `document_quarantine` only | Revert commit; `--undo RUN_ID` removes that run's `multi_act_pdf_bleed:law.gok.pk` and `name_pdf_mismatch:law.gok.pk` rows |
 
 **Deferred (out of scope for B4):** harvest lock clear on worker start (`SSA_CLEAR_HARVEST_LOCKS_ON_START`) and harvest lock heartbeat (`SSA_HARVEST_LOCK_HEARTBEAT`) — tracked separately; not shipped on this branch (no runtime code).
 

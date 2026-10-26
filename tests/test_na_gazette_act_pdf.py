@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import ssl
 from pathlib import Path
 
 import pytest
@@ -214,7 +215,11 @@ def test_live_na_pidama_pdf_has_sections_one_through_thirty_eight():
     httpx = pytest.importorskip("httpx")
     from scraper.parsers.pdf_extractor import extract_pdf_text
 
-    pdf = httpx.get(PDF_URL, follow_redirects=True, timeout=60).content
+    try:
+        pdf = httpx.get(PDF_URL, follow_redirects=True, timeout=60).content
+    except (httpx.TransportError, ssl.SSLError) as exc:
+        # TransportError includes ConnectError (CI: SSL CERTIFICATE_VERIFY_FAILED).
+        pytest.skip(f"live NA PDF fetch failed ({type(exc).__name__}): {exc}")
     text = extract_pdf_text(pdf)
     extracted = extract_statute_deterministic(
         html=None,

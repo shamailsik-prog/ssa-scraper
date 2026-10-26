@@ -287,9 +287,17 @@ class HybridExtractor:
 
     async def extract_statute(self, *, html=None, text=None, source_meta=None, content_hash=None) -> ExtractionOutcome:
         from scraper.parsers.text_cleaner import clean_html
+        from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source, truncate_at_second_act_heading
 
+        source_meta = source_meta or {}
         raw_text = text or (clean_html(html) if html else "")
         deterministic = det.extract_statute_deterministic(html=html, text=raw_text, source_meta=source_meta)
+        # A second act in one law.gok.pk PDF must not be re-attached from the uncut text.
+        if source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(str(source_meta.get("url") or "")):
+            anchor = str(deterministic.get("statute_name") or source_meta.get("act_title") or "")
+            raw_text = truncate_at_second_act_heading(raw_text, anchor)
+            if html:
+                html = truncate_at_second_act_heading(html, anchor)
         inp = self._input(html=html, text=raw_text, source_meta=source_meta, content_hash=content_hash)
         return await self._run("statute", inp, deterministic, MANDATORY_STATUTE_FIELDS, lambda d, a: reconcile_statute(deterministic=d, ai=a, raw_text=raw_text, min_confidence=self.min_confidence))
 
