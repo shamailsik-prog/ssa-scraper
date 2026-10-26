@@ -70,6 +70,46 @@ def test_not_configured_lists_blank_firm_values():
     assert "DEPLOY_REGION" in nc and "PLS_SUBSCRIBED_REPORTERS" in nc and "SGAI_API_KEY" in nc
 
 
+def test_subscribed_reporters_accept_parenthetical_journal_codes():
+    """PLC(CS) and PLC(CS)N are real Pakistan Law Site journal codes."""
+    raw = "PTD, GBLR, PLC(CS), PLC(CS)N"
+    s = Settings(**BASE, PLS_SUBSCRIBED_REPORTERS=raw)
+    assert s.PLS_SUBSCRIBED_REPORTERS == "PTD,GBLR,PLC(CS),PLC(CS)N"
+    assert s.subscribed_reporters == ["PTD", "GBLR", "PLC(CS)", "PLC(CS)N"]
+
+
+@pytest.mark.parametrize("field", ["PLS_SUBSCRIBED_REPORTERS", "PLS_JOURNALS", "PLS_JOURNALS_B"])
+@pytest.mark.parametrize("code", ["PLC(CS)", "PLC(CS)N", "PLC (C.S.)", "PCrLJ"])
+def test_reporter_lists_accept_site_journal_codes(field, code):
+    s = Settings(**BASE, **{field: f"PLD,{code}"})
+    assert getattr(s, field) == f"PLD,{code}"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "A",
+        "ABCDEFGHI",
+        "PLC(CS",
+        "PLC()",
+        "(CS)",
+        "PLC(CS)NOTE",
+        "PLC(CS)(N)",
+        "PLD SCMR",
+        "P.L.D",
+        "../PLC",
+        "PLD;drop",
+        "PLC<CS>",
+        "1234",
+        "PLC( CS)",
+        "hello-world",
+    ],
+)
+def test_subscribed_reporters_reject_invalid_tokens(bad):
+    with pytest.raises(ValidationError):
+        Settings(**BASE, PLS_SUBSCRIBED_REPORTERS=f"PLD,{bad}")
+
+
 # --------------------------------------------------------------------------- roles
 def _dsn(user: str, pw: str) -> str:
     url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "")
