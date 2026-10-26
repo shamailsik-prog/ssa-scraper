@@ -286,21 +286,117 @@ def test_wrapped_short_title_selects_the_middle_act_without_a_pipe_label():
     assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
 
 
-def test_real_service_tribunals_ocr_is_not_treated_as_an_unresolved_bundle():
-    from pathlib import Path
+def test_scanned_act_number_and_year_on_the_next_line_are_three_boundaries():
+    """A scan may wrap the year, drop 'of', or print r97J for 1973."""
+    from scraper.statute_quality.senate_integrity import act_segments
 
+    text = """
+ACT No. LXVII oF r97J
+An Act to amend the Life Insurance (Nationalisation) Order, 1972.
+1. Short title.—This Act may be called the Life Insurance (Nationalisation) (Amendment) Act, 1973.
+2. Amendment.—In the Life Insurance (Nationalisation) Order, 1972, for the words Central Government the words Federal Government shall be substituted.
+
+ACT No LXX oF
+1973
+An Act to provide for the establishment of Service Tribunals.
+1. Short title.—This Act may be called the Service Tribunals Act, 1973.
+2. Definitions.—Tribunal means a Service Tribunal established under this Act.
+
+ACT No. LXXI
+1973
+An Act to regulate the service of Pakistan.
+1. Short title.—This Act may be called the Civil Servants Act, 1973.
+2. Definitions.—Civil servant means a member of a civil service of the Federation.
+"""
+    segments = act_segments(text)
+    assert [segment.act_number for segment in segments] == [(67, 1973), (70, 1973), (71, 1973)]
+
+
+def test_garbled_year_uses_the_neighbouring_heading_or_the_pipe():
+    """An unreadable year token takes the year the other headings, or the pipe, already have."""
+    from scraper.statute_quality.senate_integrity import act_segments
+
+    text = """
+ACT No. LXVII oF qqqq
+An Act to amend the Life Insurance (Nationalisation) Order, 1972.
+1. Short title.—This Act may be called the Life Insurance (Nationalisation) (Amendment) Act, 1973.
+
+ACT No. LXX of 1973
+An Act to provide for the establishment of Service Tribunals.
+1. Short title.—This Act may be called the Service Tribunals Act, 1973.
+
+ACT No. LXXI of qqqq
+An Act to regulate the service of Pakistan.
+1. Short title.—This Act may be called the Civil Servants Act, 1973.
+"""
+    segments = act_segments(text)
+    assert [segment.act_number for segment in segments] == [(67, 1973), (70, 1973), (71, 1973)]
+
+    only_pipe = """
+ACT No. LXVII oF qqqq
+An Act to amend the Life Insurance (Nationalisation) Order, 1972.
+1. Short title.—This Act may be called the Life Insurance (Nationalisation) (Amendment) Act, 1973.
+
+ACT No. LXX oF qqqq
+An Act to provide for the establishment of Service Tribunals.
+1. Short title.—This Act may be called the Service Tribunals Act, 1973.
+2. Definitions.—Tribunal means a Service Tribunal established under this Act to hear appeals.
+"""
     from scraper.statute_quality.bundled_gazette import isolate_bundled_act
 
+    isolation = isolate_bundled_act(only_pipe, target_name=SERVICE_TRIBUNALS, source_url=PIPE_URL)
+    assert isolation.status == "isolated"
+    assert isolation.act_label == "LXX of 1973"
+    assert isolation.act_year == 1973
+
+
+def test_real_service_tribunals_scan_isolates_lxx_and_flags_act_bleed():
+    from pathlib import Path
+
+    from scraper.statute_quality.bundled_gazette import (
+        REASON_BLEED,
+        VERDICT_MISMATCH,
+        classify_bundled_gazette,
+        isolate_bundled_act,
+    )
+
     text = Path("tests/fixtures/statute_quality/senate_1660540467_508.txt").read_text()
-    isolation = isolate_bundled_act(text, target_name=SERVICE_TRIBUNALS, source_url=PDF_URL)
-    assert isolation.status != "unresolved"
+    isolation = isolate_bundled_act(text, target_name=SERVICE_TRIBUNALS, source_url=PIPE_URL)
+    assert isolation.status == "isolated"
+    assert isolation.act_label == "LXX of 1973"
+    assert "Life Insurance" not in isolation.text
+    assert "Insurancc" not in isolation.text
+
     extracted = extract_statute_deterministic(
         html=None,
         text=text,
-        source_meta={"source_name": "Senate", "url": PDF_URL, "act_title": SERVICE_TRIBUNALS},
+        source_meta={"source_name": "Senate", "url": PIPE_URL, "act_title": SERVICE_TRIBUNALS},
     )
+    blob = _blob(extracted)
+    assert "Life Insurance" not in blob
+    assert "Insurancc" not in blob
+    assert "Federal Government shall be substituted" not in blob
+    assert "59" not in _numbers(extracted)
     assert "bundled_gazette_unresolved" not in extracted["field_evidence"]
     assert extracted["sections"]
+
+    def _slice(marker: str) -> str:
+        at = text.index(marker)
+        return text[at : at + 280]
+
+    mixed = classify_bundled_gazette(
+        stored_name=SERVICE_TRIBUNALS,
+        source_url=PIPE_URL,
+        sections=[
+            {"section_number": "2", "section_text": _slice("Life Insurance (Nationalisation) Order")},
+            {"section_number": "9", "section_text": _slice("Service Tribunals Ordinance")},
+            {"section_number": "1", "section_text": _slice("the Civil Servants Act, 1973")},
+        ],
+        pdf_text=text,
+        pdf_available=True,
+    )
+    assert mixed.verdict == VERDICT_MISMATCH
+    assert mixed.reason == REASON_BLEED
 
 
 def test_conciliation_courts_fixture_still_cuts_at_the_later_act_heading():

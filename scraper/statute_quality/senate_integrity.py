@@ -84,8 +84,36 @@ _CITATION_FOLLOW_RE = re.compile(r"(?i)^(?:\.-|\.\s*-|,\s*in\s+section\b|in\s+th
 _ACT_NO_LABELED_RE = re.compile(
     r"(?i)\bact\s+no\.?\s*([IVXLCDM]+|\d{1,4})\s+of\s+((?:18|19|20)\d{2})\b"
 )
+# A scanned year may be ``r97J`` (r/l/I → 1, J → 3) or sit on the next line.
+_YEAR_TOKEN = r"[0-9rRlLiIjJoOsSbBgGqQzZ]{4}"
+_YEAR_OCR = str.maketrans(
+    {
+        "r": "1",
+        "R": "1",
+        "l": "1",
+        "L": "1",
+        "I": "1",
+        "i": "1",
+        "J": "3",
+        "j": "3",
+        "O": "0",
+        "o": "0",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "b": "8",
+        "G": "6",
+        "g": "6",
+        "q": "9",
+        "Q": "9",
+        "Z": "2",
+        "z": "2",
+    }
+)
 _ACT_NO_HEADING_RE = re.compile(
-    r"(?im)^[ \t]*act\s+no\.?\s*([IVXLCDM]+|\d{1,4})\s+of\s+((?:18|19|20)\d{2})\b"
+    rf"(?im)^[ \t]*act\s+no\.?\s*([IVXLCDM]+|\d{{1,4}})"
+    rf"(?:[ \t]+of\b)?"
+    rf"(?:[ \t]+({_YEAR_TOKEN})\b|[ \t]*\n[ \t]*({_YEAR_TOKEN})\b)"
 )
 # Short extracts must not be treated as proof that stored sections are missing.
 MIN_PDF_WORDS_FOR_ABSENCE = 50
@@ -563,13 +591,60 @@ def _is_act_boundary(text: str, match: re.Match) -> bool:
     return _heading_opens_act(text, match)
 
 
-def act_segments(pdf_text: str) -> list[_ActSegment]:
+def _year_token(match: re.Match) -> str:
+    return (match.group(2) or match.group(3) or "").strip()
+
+
+def _plausible_year(token: str) -> Optional[int]:
+    if re.fullmatch(r"(?:18|19|20)\d{2}", token or ""):
+        return int(token)
+    return None
+
+
+def _repair_year(token: str) -> Optional[int]:
+    """Turn a one-character scan slip such as ``r97J`` into 1973."""
+    if not token:
+        return None
+    return _plausible_year(token.translate(_YEAR_OCR))
+
+
+def _heading_years(
+    headings: Sequence[re.Match],
+    pipe_act: Optional[tuple[int, int]],
+) -> list[Optional[int]]:
+    """A clean ``1973`` stands. A garbled token takes the shared neighbour year, else the pipe."""
+    tokens = [_year_token(heading) for heading in headings]
+    clean = [_plausible_year(token) for token in tokens]
+    known = [year for year in clean if year is not None]
+    neighbour = known[0] if known and all(year == known[0] for year in known) else None
+    pipe_year = pipe_act[1] if pipe_act else None
+    years: list[Optional[int]] = []
+    for token, year in zip(tokens, clean):
+        if year is not None:
+            years.append(year)
+        elif neighbour is not None:
+            years.append(neighbour)
+        elif pipe_year is not None:
+            years.append(pipe_year)
+        else:
+            years.append(_repair_year(token))
+    return years
+
+
+def act_segments(
+    pdf_text: str,
+    *,
+    pipe_act: Optional[tuple[int, int]] = None,
+) -> list[_ActSegment]:
     """Split a Gazette that prints several acts. A single act stays one segment.
 
     A line-start ``Act No.`` is a boundary only when an ``An Act`` preamble or
-    ``1. Short title`` follows within four lines. A citation tail (``.-``,
-    ``In the``, ``, in section``) is not a boundary, so an amending Act that
-    quotes an earlier Act number keeps the sections that follow the quotation.
+    ``1. Short title`` follows within four lines. The year may be the next
+    line, and a token such as ``r97J`` still counts: its year is the year the
+    neighbouring headings share, or the pipe label's year when none of them
+    print a readable year. A citation tail (``.-``, ``In the``, ``, in
+    section``) is not a boundary, so an amending Act that quotes an earlier
+    Act number keeps the sections that follow the quotation.
     """
     text = pdf_text or ""
     if not text.strip():
@@ -577,11 +652,13 @@ def act_segments(pdf_text: str) -> list[_ActSegment]:
     headings = [match for match in _ACT_NO_HEADING_RE.finditer(text) if _is_act_boundary(text, match)]
     if len(headings) >= 2:
         segments: list[_ActSegment] = []
+        years = _heading_years(headings, pipe_act)
         for index, heading in enumerate(headings):
             start = 0 if index == 0 else heading.start()
             end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
             number = _roman_or_int(heading.group(1))
-            act = (number, int(heading.group(2))) if number is not None else None
+            year = years[index]
+            act = (number, year) if number is not None and year is not None else None
             title_scope = text[heading.start() : end]
             segments.append(_ActSegment(act, _called_title_in(title_scope), text[start:end]))
         return segments
@@ -851,8 +928,8 @@ def classify_senate_identity(
     if _year_as_section(body_sections):
         signals.append("year_as_section_number")
 
-    segments = act_segments(text)
     pipe_act = parse_act_number(pipe_label or "", pipe_label=True) if pipe_label else None
+    segments = act_segments(text, pipe_act=pipe_act)
     chosen = _choose_segment(segments, stored_name=stored_name, pipe_label=pipe_label, pipe_act=pipe_act)
     pdf_title = chosen.title if chosen is not None else (segments[0].title if segments else None)
     compare_text = chosen.text if chosen is not None else text

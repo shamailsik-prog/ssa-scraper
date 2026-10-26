@@ -114,10 +114,11 @@ def isolate_bundled_act(text: str, *, target_name: str = "", source_url: str = "
     so a caller does not split the mixture.
     """
     raw = text or ""
-    segments = act_segments(raw)
+    _fetch_url, pipe_label = split_statute_source_url(source_url)
+    pipe_act = parse_act_number(pipe_label, pipe_label=True) if pipe_label else None
+    segments = act_segments(raw, pipe_act=pipe_act)
     if len(segments) < 2:
         return BundleIsolation(status="single", text=raw, segment_count=len(segments))
-    _fetch_url, pipe_label = split_statute_source_url(source_url)
     chosen = select_target_segment(segments, target_name=target_name or "", pipe_label=pipe_label)
     if chosen is None:
         return BundleIsolation(status="unresolved", text="", segment_count=len(segments))
@@ -172,7 +173,9 @@ def classify_bundled_gazette(
     """
     if not pdf_available:
         return BundledGazetteVerdict(VERDICT_FETCH_FAIL, ACTION_NONE, None, ("pdf_unavailable",), 0)
-    segments = act_segments(pdf_text or "")
+    _fetch_url, pipe_label = split_statute_source_url(source_url)
+    pipe_act = parse_act_number(pipe_label, pipe_label=True) if pipe_label else None
+    segments = act_segments(pdf_text or "", pipe_act=pipe_act)
     if len(segments) < 2:
         return BundledGazetteVerdict(VERDICT_NOT_BUNDLED, ACTION_NONE, None, ("not_bundled",), len(segments))
     folded_segments = [_fold(segment.text) for segment in segments]
@@ -182,7 +185,6 @@ def classify_bundled_gazette(
             hits = [index for index, folded in enumerate(folded_segments) if window in folded]
             if len(hits) == 1:
                 located.add(hits[0])
-    _fetch_url, pipe_label = split_statute_source_url(source_url)
     chosen = select_target_segment(segments, target_name=stored_name or "", pipe_label=pipe_label)
     target_index = next((index for index, segment in enumerate(segments) if segment is chosen), None)
     signals = tuple(_segment_signal(segments[index], index) for index in sorted(located))
