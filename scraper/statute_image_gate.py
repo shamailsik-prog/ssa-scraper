@@ -22,6 +22,11 @@ _PDF_MAGIC = b"%PDF"
 # Latin-1 supplement is intentionally excluded: JPEG bytes decoded as latin-1
 # look like letters (À–ÿ) and would otherwise pass a plain isalpha() check.
 _EXTRA_PROSE = set("\u00a0\u2013\u2014\u2018\u2019\u201c\u201d\u2022\u00b7")
+# InPage legacy Urdu stores letterforms in the BMP Private Use Area. Those
+# code points are category Co, so str.isprintable() is false. Latin-1 decode
+# of a JPEG never produces them (it stays inside U+0000–U+00FF).
+_INPAGE_PUA_START = 0xE000
+_INPAGE_PUA_END = 0xF8FF
 
 
 def statute_url_is_image(url: str) -> bool:
@@ -83,6 +88,10 @@ def image_statute_reject_reason(
     return f"image statute source rejected for {kind} document URL"
 
 
+def _is_inpage_private_use(ch: str) -> bool:
+    return _INPAGE_PUA_START <= ord(ch) <= _INPAGE_PUA_END
+
+
 def _allowed_statute_char(ch: str) -> bool:
     code = ord(ch)
     if ch in "\t\r\n" or 0x20 <= code <= 0x7E:
@@ -94,6 +103,8 @@ def _allowed_statute_char(ch: str) -> bool:
         or 0xFE70 <= code <= 0xFEFF
     ):
         return True
+    if _is_inpage_private_use(ch):
+        return True
     return ch in _EXTRA_PROSE
 
 
@@ -101,6 +112,8 @@ def is_binary_garbage_text(text: str) -> bool:
     """True when a statute name or section body is mostly non-text (JPEG/JFIF leftovers).
 
     Empty text is a different gate. A prose sentence that merely mentions JFIF stays.
+    InPage private-use characters (U+E000–U+F8FF) count as Urdu prose. Latin-1
+    supplement does not.
     """
     raw = text or ""
     if not raw.strip():
@@ -115,7 +128,8 @@ def is_binary_garbage_text(text: str) -> bool:
     if ratio < 0.85 and any(sig in raw for sig in ("JFIF", "ICC_PROFILE", "\x00")):
         return True
     if total >= 32:
-        nonprint = sum(1 for ch in raw if not ch.isprintable())
+        # Co private-use is not printable, but InPage letterforms are prose.
+        nonprint = sum(1 for ch in raw if not ch.isprintable() and not _is_inpage_private_use(ch))
         if nonprint / total > 0.20:
             return True
     return False

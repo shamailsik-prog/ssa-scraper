@@ -108,6 +108,67 @@ def test_validator_rejects_clean_name_when_section_text_is_binary():
     assert reason == "binary_statute_text"
 
 
+def _latin1_nonprose_junk() -> str:
+    """High bytes with no JPEG SOI, JFIF, or ICC_PROFILE marker."""
+    return bytes(range(1, 256)).decode("latin-1") * 2
+
+
+def _urdu_with_inpage_private_use() -> tuple[str, str]:
+    """Urdu prose that also carries InPage BMP private-use letterforms.
+
+    ``sprinkled`` is still mostly Arabic, but more than 20% of its characters
+    are U+E000–U+F8FF, so ``str.isprintable()`` used to call it binary.
+    ``inpage_body`` is the legacy shape: the letterforms themselves are
+    private-use, with a short Urdu frame, so the allowed-character ratio
+    used to fall under one half.
+    """
+    urdu = "دفعہ ۱۔ یہ ایکٹ سندھ میں نافذ ہوگا اور حکومت قواعد بنا سکے گی۔ "
+    # Four copies of the private-use run: about a quarter of the string, so the
+    # allowed-character ratio stays above one half and the non-printable check
+    # is what rejects it. Endpoints U+E000 and U+F8FF are both present.
+    pua = "\uE000\uE001\uE0A0\uF000\uF8FF"
+    sprinkled = urdu + (pua * 4)
+    inpage_body = "سندھ " + "".join(chr(0xE000 + i) for i in range(40)) + "\uF8FF ایکٹ "
+    return sprinkled, inpage_body
+
+
+def test_validator_rejects_latin1_junk_without_jfif_marker():
+    raw = _latin1_nonprose_junk()
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "Not A Statute",
+            "sections": [{"section_number": "1", "section_text": raw}],
+        },
+        raw_text=raw,
+    )
+    assert not ok
+    assert reason == "binary_statute_text"
+
+
+def test_validator_accepts_urdu_text_with_inpage_private_use():
+    from scraper.statute_image_gate import is_binary_garbage_text
+
+    sprinkled, inpage_body = _urdu_with_inpage_private_use()
+    assert "\uE000" in sprinkled and "\uF8FF" in sprinkled
+    assert "\uE000" in inpage_body and "\uF8FF" in inpage_body
+    assert not is_binary_garbage_text(sprinkled)
+    assert not is_binary_garbage_text(inpage_body)
+
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "سندھ لوکل گورنمنٹ (ترمیمی) ایکٹ، 2023",
+            "year_enacted": 2023,
+            "sections": [
+                {"section_number": "1", "section_text": sprinkled},
+                {"section_number": "2", "section_text": inpage_body},
+            ],
+        },
+        raw_text=sprinkled + "\n" + inpage_body,
+    )
+    assert ok
+    assert reason == ""
+
+
 def test_validator_still_accepts_a_normal_statute():
     ok, reason = validate_statute_reconciled_json(
         {
