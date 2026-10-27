@@ -9,8 +9,9 @@ does not name the stored act. The stored act's own short title, including one
 that differs only by a scan confusion or a single extra or missing letter, a
 date or schedule row stored as section 01, and a called title in the same
 sentence as ``substituted`` or ``namely`` are not bleed. A one- or two-letter
-margin stamp in front of ``the`` (``ay) the ... University of Bhimber``) is
-not a second act. ``amended`` in an earlier sentence does not hide the next
+margin stamp, or a signature read as a symbol and a digit, in front of
+``the`` (``ay) the`` or ``¥ 2 the ... University of Bhimber``) is not a
+second act. ``amended`` in an earlier sentence does not hide the next
 act. A Board or Council the act itself constitutes is not a foreign body, and
 ``the commission of an offence`` is not a Commission.
 """
@@ -92,11 +93,16 @@ _CALLED_TITLE = re.compile(
     r"(?i)\bthis\s+(?:act|ordinance|order|code)\s+(?:may|shall)\s+be\s+called\s+(?:the\s+)?"
     r"(.{6,180}?\b(?:act|ordinance|order|code)\b(?:,?\s+(?:18|19|20)\d{2})?)"
 )
-# A margin stamp on a scan becomes one or two letters, sometimes with a
-# closing paren, glued to the front of "the". "New the ..." is a real word
-# and stays. "ay) the University of Bhimber Act" is this act.
+# A margin stamp or signature on a scan becomes junk glued in front of "the".
+# One or two letters ("ay", "ZS"), a short fragment ending in punctuation
+# ("ay)"), or a token with no ASCII letters (a yen sign, then a digit:
+# "¥ 2"). "New the ..." is a real word and stays.
 _CALLED_TITLE_STAMP = re.compile(
-    r"^(?:(?:[a-z0-9]{1,2}|[a-z0-9]{1,4}[^a-z0-9\s]+)\s+)+(?=the\s+)",
+    r"^(?:(?:"
+    r"[a-z0-9]{1,2}"
+    r"|[a-z0-9]{1,4}[^a-z0-9\s]+"
+    r"|[^\sa-z0-9]+"
+    r")\s+)+(?=the\s+)",
     re.IGNORECASE,
 )
 _PROSE_HEADING = re.compile(r"(?i)\b(shall|means|provided|whereas|amended|substituted|inserted)\b")
