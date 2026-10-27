@@ -51,10 +51,12 @@ Verdicts:
 
 ## Sole-act name and year
 
-law.gok.pk reads the instrument out of the PDF filename. Senate upload names are numeric (`1656581759_353.pdf`), so this sweep reads the gazette instead. A PDF with one act is `name_pdf_mismatch` when either of these is true:
+law.gok.pk reads the instrument out of the PDF filename. Senate upload names are numeric (`1656581759_353.pdf`), so this sweep reads the gazette instead. A PDF with one act is `name_pdf_mismatch` when one of these is true:
 
-- The stored name is a coherent act title and the short-title line (`This Act may be called …`) names a different instrument. `pdf_title_disagrees` is set as well.
+- The stored name is a coherent act title and the short-title line (`This Act may be called …`) names a different instrument. `pdf_title_disagrees` is set as well. `called` still matches when one letter is a scan slip (`celled`), a euro sign stands in for `e`, the instrument word is glued on (`BureausAct`), or the comma before the year was read as a period.
 - No short title was read, and the year in the stored name (or `year_enacted` when the name has no year) disagrees with `Act No. … of YYYY`. `gazette_act_year_disagrees` is set as well.
+
+A definitions line (`'term' means the Companies Ordinance, 1984`) is not the short title. It does not agree with the stored name, and it does not block the act-number year check.
 
 The stored sections being the PDF's own text does not clear the signal. Quarantine reason stays `senate_integrity:url_act_mismatch`. `--apply` is unchanged: it inserts that reason and does not rewrite the name or the sections. `needs_section_refetch` stays false.
 
@@ -70,13 +72,13 @@ An amendment whose significant words are a superset of the stored title (`Credit
 
 ### Re-prove MAIN 12977c9f without --apply
 
-Stored name `Companies Ordinance, 1984`, year 1984, source `https://senate.gov.pk/uploads/documents/1656581759_353.pdf`. The gazette is Act No. XI of 2015, short title Credit Bureaus Act, 2015. Sections 2–42 are that Act's text. Ops quarantine of this row is outside this change.
+Stored name `Companies Ordinance, 1984`, year 1984, source `https://senate.gov.pk/uploads/documents/1656581759_353.pdf`. The gazette is the Credit Bureaus Act, 2015. Sections 2–42 are that Act's text. The fetched text layer prints the short title as `celled the Cr€dit BureausAct. 2015` and a definitions line `'aomprnies Ordinanc€'means the Companies Ordinance, 1984`. `Act No. XI of 2015` is printed `Acr No. xt or 2015`, so that line is not a year signal. Ops quarantine of this row is outside this change. The row is already quarantined, so the dry-run has to pass `--include-quarantined` or the sweep defers it.
 
 ```bash
-python -m scraper.tasks.senate_statute_integrity --statute-id 12977c9f-9d72-4f85-b5ae-14997b22859f
+python -m scraper.tasks.senate_statute_integrity --statute-id 12977c9f-9d72-4f85-b5ae-14997b22859f --include-quarantined
 ```
 
-Do not pass `--apply`. Expect `dry_run` true, `applied` null, `verdict` `MISMATCH`, `reason` `senate_integrity:url_act_mismatch`, and `signals` containing `name_pdf_mismatch`, `pdf_title_disagrees`, and `gazette_act_year_disagrees`. `needs_reextract` is false.
+Do not pass `--apply`. Expect `dry_run` true, `applied` null, `verdict` `MISMATCH`, `reason` `senate_integrity:url_act_mismatch`, `pdf_title` `Credit Bureaus Act, 2015`, and `signals` containing `name_pdf_mismatch` and `pdf_title_disagrees`. `needs_reextract` is false. `gazette_act_year_disagrees` is the signal when `Act No. … of YYYY` itself is readable, including when the only title-shaped line is a definitions entry.
 
 ## Apply
 
