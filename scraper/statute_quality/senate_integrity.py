@@ -16,6 +16,14 @@ including when it stacks on an ``i``/``l`` slip. Shorter words stay strict,
 so ``national`` / ``rational`` do not agree. Amendment and ordinal words stay
 significant. A year stored as a section number stays on the row and does not
 leave MATCH when that wording already agrees.
+
+A Senate PDF that prints one act is also compared to the stored name and
+year. The gazette ``Act No. … of YYYY`` and the short-title line (``may be
+called``) have to name that act. Section text that is present in the PDF
+does not excuse a different instrument: the body can be right while the
+stored name is wrong. Two different act numbers are a bundled gazette and
+stay on the segment path. An OCR-same title, including PCSIR, is not this
+signal. A year stored as a section number is still a separate sweep.
 """
 
 from __future__ import annotations
@@ -862,8 +870,14 @@ def _verdict(
 ) -> SenateIntegrityVerdict:
     signal_tuple = tuple(dict.fromkeys(signals))
     repairable = bool(pdf_title) and not is_gazette_non_act_title(pdf_title)
-    if "act_number_disagrees" in signal_tuple or "pdf_title_disagrees" in signal_tuple or (
-        "section_absent_from_pdf" in signal_tuple and _INCOHERENT_NAME_SIGNALS.intersection(signal_tuple)
+    if (
+        "act_number_disagrees" in signal_tuple
+        or "pdf_title_disagrees" in signal_tuple
+        or "name_pdf_mismatch" in signal_tuple
+        or (
+            "section_absent_from_pdf" in signal_tuple
+            and _INCOHERENT_NAME_SIGNALS.intersection(signal_tuple)
+        )
     ):
         return SenateIntegrityVerdict(
             VERDICT_MISMATCH,
@@ -932,6 +946,53 @@ def _verdict(
         fetch_url,
         False,
     )
+
+
+def _instrument_year(stored_name: str, year_enacted: Optional[int]) -> Optional[int]:
+    """Year printed in the stored name, or ``year_enacted`` when the name has none."""
+    named = _years(stored_name)
+    if len(named) == 1:
+        return next(iter(named))
+    if not named and year_enacted and 1800 <= int(year_enacted) <= 2100:
+        return int(year_enacted)
+    return None
+
+
+def _sole_act_name_pdf_signals(
+    *,
+    stored_name: str,
+    year_enacted: Optional[int],
+    segments: Sequence[_ActSegment],
+) -> list[str]:
+    """Stored name and year against the one act a Senate gazette actually prints.
+
+    law.gok.pk compares the PDF filename with the stored name
+    (``name_pdf_mismatch``). Senate upload names are numeric, so the gazette
+    ``Act No. … of YYYY`` and the short-title line are the same check. A PDF
+    with two different act numbers is a bundled gazette and is not judged here.
+    """
+    if len(segments) != 1 or not is_coherent_act_title(stored_name):
+        return []
+    segment = segments[0]
+    relation = title_relation(stored_name, segment.title) if segment.title else "unknown"
+    signals: list[str] = []
+    if relation == "different":
+        signals.append("name_pdf_mismatch")
+        signals.append("pdf_title_disagrees")
+    act_year = segment.act_number[1] if segment.act_number else None
+    stored_year = _instrument_year(stored_name, year_enacted)
+    # ``same`` keeps an OCR title such as PCSIR. ``year_differs`` stays on the
+    # existing year path (Finance Act, 2015 against 2016) and is not this signal.
+    if (
+        act_year
+        and stored_year
+        and act_year != stored_year
+        and relation not in {"same", "year_differs"}
+    ):
+        if "name_pdf_mismatch" not in signals:
+            signals.append("name_pdf_mismatch")
+        signals.append("gazette_act_year_disagrees")
+    return signals
 
 
 def classify_senate_identity(
@@ -1044,13 +1105,22 @@ def classify_senate_identity(
     else:
         # No act segment matches the pipe label or stored name. Disagree only when
         # the stored sections are also absent, so a later act in a shared Gazette
-        # is not quarantined for the first act's number.
+        # is not quarantined for the first act's number. A PDF that prints one
+        # act is judged below even when those sections are present.
         substantial_support = _substantial_section_support(body_sections, text)
         unsupported = substantial_support is False and _pdf_word_count(text) >= MIN_PDF_WORDS_FOR_ABSENCE
         if unsupported:
             if pipe_act and not any(segment.act_number == pipe_act for segment in segments):
                 signals.append("act_number_disagrees")
             _note_title_relation(pdf_title)
+
+    signals.extend(
+        _sole_act_name_pdf_signals(
+            stored_name=stored_name,
+            year_enacted=year_enacted,
+            segments=segments,
+        )
+    )
 
     if compare_text.strip():
         signals.extend(

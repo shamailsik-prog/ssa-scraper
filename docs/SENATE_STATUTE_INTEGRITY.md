@@ -42,12 +42,41 @@ Verdicts:
 | Verdict | Meaning |
 | --- | --- |
 | `MATCH` | PDF short title agrees with the stored act, including a scanned title that differs only by OCR confusions (`i`/`l`/`1`, `c`/`e`, digit lookalikes, `m`/`rn` in a longer word). An act-number gap is ignored only when three things are all true: the significant words match in both directions under those OCR confusions (not a subset or a 0.55 overlap), both titles carry the same year, and the act numbers share that year and are either one apart (roman 30 against 31) or the same X-run with its final X read as III (roman 30 against 23, roman 20 against 13). That both-directions check also treats an `n`/`r` slip in a word of nine or more letters as the same word (`scientific` / `sciertific`, including `sclertific`), so a garbled PCSIR title with an agreeing year stays `MATCH`. An 8-letter pair such as `national` / `rational` does not. `Amendment` and ordinal words such as `Second` stay significant, so a principal Act against its Amendment stays `MISMATCH`. `year_as_section_number` is still reported and does not change `MATCH` when that wording already agrees. Renaming those section numbers is a separate sweep. |
-| `MISMATCH` | Forced by `pdf_title_disagrees`, by `act_number_disagrees` unless the one-numeral or X-run exception above applies, or by `section_absent_from_pdf` together with an incoherent stored name. A missing year (`Finance Act` against `Finance Act, 2016`), a different year (`Finance Act, 2015` against `2016`), a different act-number year, or any other act-number gap on an otherwise identical title still forces `MISMATCH`. `year_as_section_number` does not force `MISMATCH`. |
+| `MISMATCH` | Forced by `pdf_title_disagrees`, by `name_pdf_mismatch`, by `act_number_disagrees` unless the one-numeral or X-run exception above applies, or by `section_absent_from_pdf` together with an incoherent stored name. A missing year (`Finance Act` against `Finance Act, 2016`), a different year (`Finance Act, 2015` against `2016`), a different act-number year, or any other act-number gap on an otherwise identical title still forces `MISMATCH`. `name_pdf_mismatch` is the Senate form of `name_pdf_mismatch:law.gok.pk`: on a PDF that prints one act, the stored name is a different instrument from the short-title line, or no short title was read and the stored year disagrees with `Act No. … of YYYY`. Section text that is present in that PDF does not keep the row `MATCH`. `year_as_section_number` does not force `MISMATCH`. |
 | `PARTIAL` | The stored name or a section is corrupt and the short title does not already agree: preamble or definitions fragment, newline title, wrong year, year parsed as a section number with no agreeing title, or a gazette running header such as `President's Orders and Regulations`. |
 | `FETCH_FAIL` | No live PDF and no recorded PDF bytes. |
 | `SKIPPED_SHELL` | Already quarantined, fragment name, pipe label, no sections. Not fetched. |
 
 `deferred_quarantined` counts other already-quarantined rows skipped unless `--include-quarantined` is set.
+
+## Sole-act name and year
+
+law.gok.pk reads the instrument out of the PDF filename. Senate upload names are numeric (`1656581759_353.pdf`), so this sweep reads the gazette instead. A PDF with one act is `name_pdf_mismatch` when either of these is true:
+
+- The stored name is a coherent act title and the short-title line (`This Act may be called …`) names a different instrument. `pdf_title_disagrees` is set as well.
+- No short title was read, and the year in the stored name (or `year_enacted` when the name has no year) disagrees with `Act No. … of YYYY`. `gazette_act_year_disagrees` is set as well.
+
+The stored sections being the PDF's own text does not clear the signal. Quarantine reason stays `senate_integrity:url_act_mismatch`. `--apply` is unchanged: it inserts that reason and does not rewrite the name or the sections. `needs_section_refetch` stays false.
+
+These stay off this signal:
+
+- A bundled gazette, two different `Act No.` years or numbers. That sweep is `python -m scraper.tasks.bundled_gazette_acts`. See `docs/BUNDLED_GAZETTE_ACTS.md`.
+- An OCR-same short title, including a garbled PCSIR title whose year agrees. A one-numeral or X-run act-number misread on that title stays `MATCH`.
+- A year stored as a section number. Renaming it is the year-section sweep.
+- GoK filename bleed, including the Bhimber short-title OCR case, which stays on `python -m scraper.tasks.gok_multi_act_bleed`.
+- OCR section mash, and a `DD.MM.YYYY` heading stored as a section number.
+
+An amendment whose significant words are a superset of the stored title (`Credit Bureaus Act` inside `Credit Bureaus (Amendment) Act`) is not `name_pdf_mismatch`. It stays on the existing act-number path. Do not treat a particular amendment-bill UUID as a victim of this check without reading that PDF.
+
+### Re-prove MAIN 12977c9f without --apply
+
+Stored name `Companies Ordinance, 1984`, year 1984, source `https://senate.gov.pk/uploads/documents/1656581759_353.pdf`. The gazette is Act No. XI of 2015, short title Credit Bureaus Act, 2015. Sections 2–42 are that Act's text. Ops quarantine of this row is outside this change.
+
+```bash
+python -m scraper.tasks.senate_statute_integrity --statute-id 12977c9f-9d72-4f85-b5ae-14997b22859f
+```
+
+Do not pass `--apply`. Expect `dry_run` true, `applied` null, `verdict` `MISMATCH`, `reason` `senate_integrity:url_act_mismatch`, and `signals` containing `name_pdf_mismatch`, `pdf_title_disagrees`, and `gazette_act_year_disagrees`. `needs_reextract` is false.
 
 ## Apply
 
