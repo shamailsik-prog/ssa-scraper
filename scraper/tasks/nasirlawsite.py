@@ -509,15 +509,20 @@ class NasirLawSitePipeline(PublicPipeline):
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"
             else:
-                if kind == "judgment":
-                    await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
-                elif kind in ("statute", "instrument"):
-                    await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
-                elif kind == "listing":
-                    await self.handle_listing(res, fr)
-                fr.status = "done"
-                fr.last_error = None
-                fr.last_run_at = datetime.now(timezone.utc)
+                image_reason = self._image_statute_reject_reason(kind, url, res)
+                if image_reason:
+                    fr.status = "retired"
+                    fr.last_error = image_reason
+                else:
+                    if kind == "judgment":
+                        await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
+                    elif kind in ("statute", "instrument"):
+                        await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
+                    elif kind == "listing":
+                        await self.handle_listing(res, fr)
+                    fr.status = "done"
+                    fr.last_error = None
+                    fr.last_run_at = datetime.now(timezone.utc)
         except URLPolicyError as exc:
             fr.status = "retired"
             fr.last_error = str(exc)[:1000]
