@@ -770,6 +770,176 @@ def test_act_number_year_mismatches_when_short_title_line_is_missing():
     assert "pdf_title_disagrees" not in result.signals
 
 
+# Text layer of senate.gov.pk/uploads/documents/1656581759_353.pdf.
+# "called" is "celled", "Credit" is "Cr€dit", "Bureaus Act" is glued, and the
+# comma before 2015 is a period. Act No. XI of 2015 is "Acr No. xt or 2015".
+# The first line that looks like a title is the definitions entry for the
+# Companies Ordinance, which is the stored name on MAIN 12977c9f.
+_CREDIT_BUREAUS_OCR_TEXT_LAYER = f"""
+THE GAZETTE OF PAKISTAN
+EXTRAORDINARY
+PUBLISHED BY AUTHORITY
+ISLAMABAD, TUESDAY, AUGUST 25, 2015
+
+Acr No. xt or 2015
+
+An Act to provide for the incorporation and functioning of credit bureaus
+
+1. Short title, extent and commencement.—(1) This Act may be
+celled the Cr€dit BureausAct. 2015.
+(2) It extends to the whole of Pakistan.
+
+2. Definitions.—(1) In this Act, unless there is anything repugnant in the subject or context,—
+(e) 'aomprnies Ordinanc€'means the Companies Ordinance, 1984
+(XLVII of 1984);
+
+3. Records.—{_CREDIT_BUREAUS_BODY}
+"""
+
+
+def test_definitions_line_does_not_match_companies_ordinance_on_credit_bureaus_ocr():
+    """MAIN 12977c9f: the Companies Ordinance definitions line is not the short title.
+
+    The fetched text layer has no readable ``may be called`` and no readable
+    ``Act No. … of YYYY``. Title fallback was the definitions entry that names
+    the stored ordinance, so the sole-act check stayed MATCH. The short title
+    is still the Credit Bureaus Act.
+    """
+    result = classify_senate_identity(
+        stored_name="Companies Ordinance, 1984",
+        year_enacted=1984,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("3", _CREDIT_BUREAUS_BODY)],
+        pdf_text=_CREDIT_BUREAUS_OCR_TEXT_LAYER,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "name_pdf_mismatch" in result.signals
+    assert "pdf_title_disagrees" in result.signals
+    assert "year_as_section_number" not in result.signals
+    assert result.pdf_title
+    assert "credit bureaus" in result.pdf_title.lower()
+    assert "means the" not in result.pdf_title.lower()
+
+
+def test_credit_bureaus_ocr_text_layer_matches_its_own_name():
+    """The same OCR text layer stays MATCH when the stored name is the Act."""
+    result = classify_senate_identity(
+        stored_name="Credit Bureaus Act, 2015",
+        year_enacted=2015,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("3", _CREDIT_BUREAUS_BODY)],
+        pdf_text=_CREDIT_BUREAUS_OCR_TEXT_LAYER,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert "name_pdf_mismatch" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert "gazette_act_year_disagrees" not in result.signals
+    assert result.pdf_title
+    assert "credit bureaus" in result.pdf_title.lower()
+
+
+def test_definition_mention_does_not_hide_act_number_year():
+    """A definitions line that ends on a year is not a short title.
+
+    With no ``may be called`` line, the stored year still has to match
+    ``Act No. … of YYYY``. The mention must not count as agreement.
+    """
+    pdf = f"""
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+    PUBLISHED BY AUTHORITY
+
+    ACT NO. XI OF 2015
+
+    An Act to provide for the incorporation and functioning of credit bureaus
+
+    2. Definitions.—(1) In this Act, unless there is anything repugnant in the subject or context,—
+    (e) 'aomprnies Ordinanc€'means the Companies Ordinance, 1984
+
+    3. Records.—{_CREDIT_BUREAUS_BODY}
+    """
+    result = classify_senate_identity(
+        stored_name="Companies Ordinance, 1984",
+        year_enacted=1984,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("3", _CREDIT_BUREAUS_BODY)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "name_pdf_mismatch" in result.signals
+    assert "gazette_act_year_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert result.pdf_title is None or "means the" not in result.pdf_title.lower()
+
+
+def test_definition_mention_with_the_same_act_year_stays_match():
+    """Ignoring a definitions line does not quarantine an act whose year agrees."""
+    pdf = f"""
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+
+    ACT NO. XLVII OF 1984
+
+    2. Definitions.—In this Ordinance, unless there is anything repugnant in the subject or context,—
+    (a) 'aomprnies Ordinanc€'means the Companies Ordinance, 1984
+
+    3. Records.—{_CREDIT_BUREAUS_BODY}
+    """
+    result = classify_senate_identity(
+        stored_name="Companies Ordinance, 1984",
+        year_enacted=1984,
+        source_url="https://senate.gov.pk/uploads/documents/companies-ordinance.pdf",
+        sections=[_section("3", _CREDIT_BUREAUS_BODY)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert "name_pdf_mismatch" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert "gazette_act_year_disagrees" not in result.signals
+    assert result.pdf_title is None or "means the" not in (result.pdf_title or "").lower()
+
+
+def test_definition_of_another_act_does_not_mismatch_an_agreeing_act_year():
+    """A definitions mention of a different ordinance is not the instrument title."""
+    pdf = f"""
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+
+    ACT NO. XI OF 2015
+
+    2. Definitions.—(1) In this Act, unless there is anything repugnant in the subject or context,—
+    (e) 'aomprnies Ordinanc€'means the Companies Ordinance, 1984
+
+    3. Records.—{_CREDIT_BUREAUS_BODY}
+    """
+    result = classify_senate_identity(
+        stored_name="Credit Bureaus Act, 2015",
+        year_enacted=2015,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("3", _CREDIT_BUREAUS_BODY)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert "name_pdf_mismatch" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert "gazette_act_year_disagrees" not in result.signals
+
+
 def test_shared_gazette_second_act_is_not_quarantined():
     """A later act in one Gazette PDF must not be judged against the first ACT No."""
     pdf = """

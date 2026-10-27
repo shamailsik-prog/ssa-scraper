@@ -24,6 +24,13 @@ does not excuse a different instrument: the body can be right while the
 stored name is wrong. Two different act numbers are a bundled gazette and
 stay on the segment path. An OCR-same title, including PCSIR, is not this
 signal. A year stored as a section number is still a separate sweep.
+
+A definitions line (``'term' means the Companies Ordinance, 1984``) is not
+that short title. It does not agree with the stored name, and it does not
+block the act-number year check. ``may be called`` still matches when one
+letter of ``called`` is a scan slip (``celled``), a euro sign stands in for
+``e``, the instrument word is glued to the word before it (``BureausAct``),
+or the comma before the year was read as a period.
 """
 
 from __future__ import annotations
@@ -82,11 +89,20 @@ _TOKEN_STOP = frozenset(
     }
 )
 
+# ``called`` is often ``celled`` (a→e). Only this verb is widened; title words
+# stay on the ordinary OCR table.
 _CALLED_TITLE_RE = re.compile(
-    r"(?is)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+called\s+(?:the\s+)?"
+    r"(?is)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+"
+    r"c[a-z]lled\s+(?:the\s+)?"
     r"(?P<title>(?:[^.;\n]|[ \t]*\n[ \t]*){6,240}?"
     r"\b(?:act|ordinance|order|rules|regulations)\b[^.;\n]{0,48})"
 )
+_TITLE_GLYPHS = str.maketrans({"€": "e"})
+_GLUED_INSTRUMENT_RE = re.compile(r"([a-z])(?=(?:Act|Ordinance|Order|Rules|Regulations)\b)")
+_OCR_PERIOD_YEAR_RE = re.compile(
+    r"(\b(?:Act|Ordinance|Order|Rules|Regulations))\.\s+((?:18|19|20)\d{2})\b"
+)
+_DEFINITION_CLAUSE_RE = re.compile(r"(?i)\bmeans\s+the\b")
 _AN_ACT_OPENING_RE = re.compile(r"(?i)^an\s+act\b")
 _SHORT_TITLE_OPENING_RE = re.compile(r"(?i)^1\s*[\.\)\-]\s*short\s+title\b")
 _CITATION_FOLLOW_RE = re.compile(r"(?i)^(?:\.-|\.\s*-|,\s*in\s+section\b|in\s+the\b)")
@@ -600,14 +616,31 @@ class _ActSegment:
     text: str
 
 
+def _prepare_title_scan(text: str) -> str:
+    """Title-scan copy. Section comparison keeps the original PDF text.
+
+    A euro sign is ``e``. ``BureausAct`` is split only before a capitalised
+    instrument word, so ``Contract`` stays one word. ``Act. 2015`` is the
+    comma that a scan turned into a period.
+    """
+    scan = (text or "").translate(_TITLE_GLYPHS)
+    scan = _GLUED_INSTRUMENT_RE.sub(r"\1 ", scan)
+    return _OCR_PERIOD_YEAR_RE.sub(r"\1, \2", scan)
+
+
+def _is_definition_clause_title(title: str) -> bool:
+    """``'term' means the Companies Ordinance, 1984`` names a defined term, not this instrument."""
+    return bool(_DEFINITION_CLAUSE_RE.search(_collapse(title or "")))
+
+
 def _called_title_in(chunk: str) -> Optional[str]:
-    match = _CALLED_TITLE_RE.search(chunk or "")
-    if not match:
-        return None
-    title = _collapse(match.group("title")).strip(" .")
-    if not title or is_gazette_non_act_title(title):
-        return None
-    return title
+    scan = _prepare_title_scan(chunk or "")
+    for match in _CALLED_TITLE_RE.finditer(scan):
+        title = _collapse(match.group("title")).strip(" .")
+        if not title or is_gazette_non_act_title(title) or _is_definition_clause_title(title):
+            continue
+        return title
+    return None
 
 
 def _pdf_word_count(text: str) -> int:
@@ -775,17 +808,20 @@ def _choose_segment(
 
 
 def extract_pdf_act_title(pdf_text: str) -> Optional[str]:
-    """First real act/ordinance short title, ignoring gazette running headers."""
+    """First real act/ordinance short title, ignoring gazette running headers.
+
+    A definitions line that mentions another instrument is not a title. The
+    line-ending fallback is dropped when that is all it found.
+    """
     head = pdf_text or ""
-    match = _CALLED_TITLE_RE.search(head[:16000])
-    title = _collapse(match.group("title")) if match else ""
-    if title and not is_gazette_non_act_title(title):
-        return title.strip(" .")
+    called = _called_title_in(head[:16000])
+    if called:
+        return called
     extracted = extract_gazette_title_year(head, source_name="Senate")
     if not extracted:
         return None
     fallback = _collapse(extracted[0])
-    if not fallback or is_gazette_non_act_title(fallback):
+    if not fallback or is_gazette_non_act_title(fallback) or _is_definition_clause_title(fallback):
         return None
     return fallback.strip(" .")
 
@@ -968,13 +1004,15 @@ def _sole_act_name_pdf_signals(
 
     law.gok.pk compares the PDF filename with the stored name
     (``name_pdf_mismatch``). Senate upload names are numeric, so the gazette
-    ``Act No. … of YYYY`` and the short-title line are the same check. A PDF
-    with two different act numbers is a bundled gazette and is not judged here.
+    ``Act No. … of YYYY`` and the short-title line are the same check. A
+    definitions line is not the short title. A PDF with two different act
+    numbers is a bundled gazette and is not judged here.
     """
     if len(segments) != 1 or not is_coherent_act_title(stored_name):
         return []
     segment = segments[0]
-    relation = title_relation(stored_name, segment.title) if segment.title else "unknown"
+    title = segment.title if segment.title and not _is_definition_clause_title(segment.title) else None
+    relation = title_relation(stored_name, title) if title else "unknown"
     signals: list[str] = []
     if relation == "different":
         signals.append("name_pdf_mismatch")
