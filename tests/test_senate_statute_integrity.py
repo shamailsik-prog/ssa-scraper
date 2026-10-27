@@ -12,7 +12,7 @@ Auditor cases:
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -654,6 +654,122 @@ def test_wrong_pdf_title_and_act_number_stay_mismatch():
     assert "act_number_disagrees" in result.signals
 
 
+# Miniature of senate.gov.pk/uploads/documents/1656581759_353.pdf.
+# Page 1 is the 25 Aug 2015 Gazette of Act No. XI of 2015. The stored
+# sections are that Act's own text, under the wrong statute name.
+_CREDIT_BUREAUS_BODY = (
+    "A credit bureau shall maintain records of credit information and shall "
+    "provide a credit report to a credit institution upon a written request."
+)
+_CREDIT_BUREAUS_GAZETTE = f"""
+THE GAZETTE OF PAKISTAN
+EXTRAORDINARY
+PUBLISHED BY AUTHORITY
+ISLAMABAD, TUESDAY, AUGUST 25, 2015
+PART I
+Acts, Ordinances, President's Orders and Regulations
+SENATE SECRETARIAT
+Islamabad, the 25th August, 2015
+No. F. 9(31)/2015-Legis.—The following Act of Majlis-e-Shoora (Parliament)
+received the assent of the President on the 21st August, 2015 and is hereby
+published for general information:—
+
+ACT NO. XI OF 2015
+
+An Act to provide for the incorporation and functioning of credit bureaus
+
+WHEREAS it is expedient to provide for the incorporation, regulation and
+functioning of credit bureaus and for matters connected therewith;
+
+It is hereby enacted as follows:—
+
+1. Short title, extent and commencement.—(1) This Act may be called the Credit Bureaus Act, 2015.
+(2) It extends to the whole of Pakistan.
+(3) It shall come into force at once.
+
+2. Incorporation.—{_CREDIT_BUREAUS_BODY}
+"""
+_CREDIT_BUREAUS_SOURCE = "https://senate.gov.pk/uploads/documents/1656581759_353.pdf"
+
+
+def test_companies_ordinance_name_on_credit_bureaus_gazette_is_mismatch():
+    """MAIN 12977c9f: Companies Ordinance, 1984 stored on the Credit Bureaus Act PDF.
+
+    The section text is the PDF's own text, so absence-from-PDF does not fire.
+    A sole-act Senate gazette still has to match the stored name and year to
+    ``Act No. … of YYYY`` and the short-title line. This is the Senate form of
+    ``name_pdf_mismatch`` on law.gok.pk. It is not a bundled gazette, a PCSIR
+    OCR title, a year stored as a section number, or an OCR section mash.
+    """
+    result = classify_senate_identity(
+        stored_name="Companies Ordinance, 1984",
+        year_enacted=1984,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("2", _CREDIT_BUREAUS_BODY)],
+        pdf_text=_CREDIT_BUREAUS_GAZETTE,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "name_pdf_mismatch" in result.signals
+    assert "pdf_title_disagrees" in result.signals
+    assert "gazette_act_year_disagrees" in result.signals
+    assert "year_as_section_number" not in result.signals
+    assert result.pdf_title
+    assert "credit bureaus" in result.pdf_title.lower()
+
+
+def test_credit_bureaus_name_on_the_same_gazette_is_match():
+    """The same PDF is MATCH when the stored name and year are the Act itself."""
+    result = classify_senate_identity(
+        stored_name="Credit Bureaus Act, 2015",
+        year_enacted=2015,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("2", _CREDIT_BUREAUS_BODY)],
+        pdf_text=_CREDIT_BUREAUS_GAZETTE,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
+    assert result.reason is None
+    assert "name_pdf_mismatch" not in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+    assert "gazette_act_year_disagrees" not in result.signals
+
+
+def test_act_number_year_mismatches_when_short_title_line_is_missing():
+    """Stored year must still match ``Act No. … of YYYY`` when no short title was read."""
+    pdf = f"""
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+    PUBLISHED BY AUTHORITY
+    ISLAMABAD, TUESDAY, AUGUST 25, 2015
+
+    ACT NO. XI OF 2015
+
+    An Act to provide for the incorporation and functioning of credit bureaus
+
+    2. Incorporation.—{_CREDIT_BUREAUS_BODY}
+    """
+    result = classify_senate_identity(
+        stored_name="Companies Ordinance, 1984",
+        year_enacted=1984,
+        source_url=_CREDIT_BUREAUS_SOURCE,
+        sections=[_section("2", _CREDIT_BUREAUS_BODY)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.action == ACTION_QUARANTINE
+    assert result.reason == "senate_integrity:url_act_mismatch"
+    assert result.needs_reextract is False
+    assert "name_pdf_mismatch" in result.signals
+    assert "gazette_act_year_disagrees" in result.signals
+    assert "pdf_title_disagrees" not in result.signals
+
+
 def test_shared_gazette_second_act_is_not_quarantined():
     """A later act in one Gazette PDF must not be judged against the first ACT No."""
     pdf = """
@@ -961,6 +1077,54 @@ async def _add_section(db, statute_id, num: str, text: str) -> None:
     await db.flush()
     sec.current_version_id = ver.id
     await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_credit_bureaus_name_mismatch_dry_run_does_not_write(db):
+    """Inventory path for MAIN 12977c9f. Dry-run reports the signal and writes nothing."""
+    sid = UUID("12977c9f-9d72-4f85-b5ae-14997b22859f")
+    db.add(
+        Statute(
+            id=sid,
+            name="Companies Ordinance, 1984",
+            jurisdiction="Federal",
+            year_enacted=1984,
+            source_name="Senate",
+            source_url=_CREDIT_BUREAUS_SOURCE,
+        )
+    )
+    await db.commit()
+    await _add_section(db, sid, "2", _CREDIT_BUREAUS_BODY)
+    await db.commit()
+
+    report = await run_senate_statute_integrity(
+        apply=False,
+        statute_id=sid,
+        fetch_pdf=lambda url: _async_pdf(),
+        extract_text=lambda data: _CREDIT_BUREAUS_GAZETTE,
+    )
+    assert report["dry_run"] is True
+    assert report["applied"] is None
+    assert report["counts"][VERDICT_MISMATCH] == 1
+    row = report["rows"][0]
+    assert row["statute_id"] == str(sid)
+    assert row["verdict"] == VERDICT_MISMATCH
+    assert row["reason"] == "senate_integrity:url_act_mismatch"
+    assert row["needs_reextract"] is False
+    assert "name_pdf_mismatch" in row["signals"]
+    assert "pdf_title_disagrees" in row["signals"]
+    assert "gazette_act_year_disagrees" in row["signals"]
+    kept = await db.get(Statute, sid)
+    assert kept.name == "Companies Ordinance, 1984"
+    assert kept.needs_section_refetch is False
+    quarantine = (
+        await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == sid))
+    ).scalars().first()
+    assert quarantine is None
+
+
+async def _async_pdf():
+    return b"%PDF-1.4 credit-bureaus"
 
 
 @pytest.mark.asyncio

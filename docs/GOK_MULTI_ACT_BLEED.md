@@ -4,7 +4,7 @@ Some `law.gok.pk` statute rows were built from a revised-volume PDF that contain
 
 This sweep reads stored sections and the PDF filename. It does not download PDFs. It does not rewrite `statute.name` or section text. `--apply` only inserts `document_quarantine` rows for visible mismatches.
 
-Scope is `law.gok.pk` (and `www.law.gok.pk`). Other hosts, including Senate, are not classified.
+Scope is `law.gok.pk` (and `www.law.gok.pk`). Other hosts, including Senate, are not classified. The Senate equivalent compares the stored name and year with the gazette `Act No. … of YYYY` and the short-title line. That signal is `name_pdf_mismatch` on `python -m scraper.tasks.senate_statute_integrity`. See `docs/SENATE_STATUTE_INTEGRITY.md`.
 
 On 2026-10-26 the read-only droplet counts for this host were about 2,674 rows on MAIN (786 visible, all AJK) and about 2,609 on FREE-SITES (787 visible).
 
