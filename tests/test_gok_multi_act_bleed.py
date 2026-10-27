@@ -905,6 +905,65 @@ def test_ocr_garbled_bhimbher_short_title_is_the_same_act():
     assert "name_pdf_mismatch" not in result.signals
 
 
+@pytest.mark.parametrize("stored_name", [
+    "The Bhimbher Universty Act, 2023",
+    "The Bhimbher Unlversity Act, 2023",
+])
+def test_bhimbher_called_title_with_margin_stamp_is_the_same_act(stored_name: str):
+    """A margin stamp OCRs as ``ay)`` in front of this act's own called title.
+
+    MAIN ``f70e23ad`` and FREE-SITES ``9aa67f0c``. The cover-letter distribution
+    list is stored as sections 1–11, and the real short title sits in that text.
+    ``ay)`` is an extra word, so equal-length OCR pairing misses ``Bhimbher`` /
+    ``Bhimber`` and ``Universty`` / ``University``.
+    """
+    sections = _restart_sections(["8", "9", "10"])
+    sections.append(
+        _section(
+            "11",
+            "11. Master File.\n"
+            "‘ 1. Short title, Extent and Commencement.-(1) This Act may be called\n"
+            "ay) the Azad Jammu and Kashmir University of Bhimber Act, 2023.\n"
+            "(2) It shall extend to the whole of Azad Jammu and Kashmir.\n"
+            "(3) It shall come into force at once.",
+            "Master File",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=stored_name,
+        source_url=BHIMBHER_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert "second_act_title" not in result.signals
+    assert "numbering_restart" not in result.signals
+    assert "name_pdf_mismatch" not in result.signals
+
+
+def test_margin_stamp_does_not_hide_a_different_called_title():
+    """``ay) the`` is noise. The Mirpur title that follows it is still another act."""
+    sections = _court_sections()
+    sections.append(
+        _section(
+            "21",
+            "1. Short title.—This Act may be called\n"
+            "ay) the New Mirpur Town Development Authority Act, 1962.",
+            "Following instrument",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_BLEED
+    assert "second_act_title" in result.signals
+
+
 def test_presidential_volume_that_continues_into_privileges_act_stays_mismatch():
     """The 7-page Presidential Election volume prints the Privileges Act next. That is real bleed."""
     sections = [
