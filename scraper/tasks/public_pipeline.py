@@ -33,6 +33,7 @@ from scraper.extractors.hybrid_extractor import HybridExtractor
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
 from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute, statute_staging_identity_url
+from scraper.statute_image_gate import image_statute_reject_reason, statute_url_is_image
 from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -127,6 +128,9 @@ class PublicPipeline:
         out: List[str] = []
         for a in soup.find_all("a", href=True):
             href = urljoin(base_url, a["href"].strip())
+            if statute_url_is_image(href):
+                self.stats["rejected_urls"] += 1
+                continue
             label = a.get_text(" ", strip=True)
             if hint.search(href) or hint.search(label):
                 try:
@@ -139,6 +143,9 @@ class PublicPipeline:
         """Write discovered URLs into crawl_frontier (tier 0 = public document frontier)."""
         added = 0
         for url in urls:
+            if kind in ("statute", "instrument") and statute_url_is_image(url):
+                self.stats["rejected_urls"] += 1
+                continue
             key = f"{kind}:{url}"
             exists = (await self.db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == self.source.source_name, CrawlFrontier.tier == 0, CrawlFrontier.query_key == key))).scalars().first()
             if exists:
@@ -333,7 +340,21 @@ class PublicPipeline:
             request_promotion_after_commit(self.db, self.source.source_name)
         return "staged"
 
+    def _image_statute_reject_reason(self, kind: str, url: Optional[str], res: FetchResult) -> Optional[str]:
+        return image_statute_reject_reason(
+            kind=kind,
+            url=url or "",
+            final_url=res.final_url or "",
+            content_type=res.content_type or "",
+            content=res.content or b"",
+        )
+
     async def ingest_statute(self, res: FetchResult, *, route: Dict[str, Any], kind: str = "statute", meta: Optional[Dict[str, Any]] = None) -> str:
+        image_reason = self._image_statute_reject_reason(kind, res.final_url or res.url, res)
+        if image_reason:
+            self.stats["rejected_urls"] += 1
+            logger.warning("%s: %s %s", self.source.source_name, image_reason, res.final_url or res.url)
+            return "rejected_image"
         meta = dict(meta or {})
         for key in ("act_title", "detail_title", "act_no", "act_year", "detail_url", "source_section", "jurisdiction"):
             if not meta.get(key) and route.get(key):
@@ -619,15 +640,20 @@ class PublicPipeline:
             elif self._judgment_pdf_endpoint_miss(fr, url, res):
                 await self._handle_judgment_pdf_endpoint_miss(fr, res, url=url, route=route)
             else:
-                if kind == "judgment":
-                    await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
-                elif kind in ("statute", "instrument"):
-                    await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
-                elif kind == "listing":
-                    await self.handle_listing(res, fr)
-                fr.status = "done"
-                fr.last_error = None
-                fr.last_run_at = datetime.now(timezone.utc)
+                image_reason = self._image_statute_reject_reason(kind, url, res)
+                if image_reason:
+                    fr.status = "retired"
+                    fr.last_error = image_reason
+                else:
+                    if kind == "judgment":
+                        await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
+                    elif kind in ("statute", "instrument"):
+                        await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
+                    elif kind == "listing":
+                        await self.handle_listing(res, fr)
+                    fr.status = "done"
+                    fr.last_error = None
+                    fr.last_run_at = datetime.now(timezone.utc)
         except URLPolicyError as exc:
             fr.status = "retired"
             fr.last_error = str(exc)[:1000]

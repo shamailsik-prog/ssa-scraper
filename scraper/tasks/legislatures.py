@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.fetchers import has_pdf_signature
+from scraper.statute_image_gate import statute_url_is_image
 from scraper.models import CrawlFrontier, ScraperSource
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
 from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, _url_looks_like_pdf, run_public_source
@@ -1181,6 +1182,9 @@ class BalochistanAssemblyPipeline(PublicPipeline):
     ) -> int:
         added = 0
         for url, meta in docs.items():
+            if statute_url_is_image(url):
+                self.stats["rejected_urls"] += 1
+                continue
             kind = str(meta.get("target_kind") or default_target_kind)
             key = f"{kind}:{url}"
             exists = (
@@ -1266,15 +1270,20 @@ class BalochistanAssemblyPipeline(PublicPipeline):
                 fr.status = "retired" if res.status_code in (404, 410) else "pending"
                 fr.last_error = f"HTTP {res.status_code}"
             else:
-                if kind == "judgment":
-                    await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
-                elif kind in ("statute", "instrument"):
-                    await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
-                elif kind == "listing":
-                    await self.handle_listing(res, fr)
-                fr.status = "done"
-                fr.last_error = None
-                fr.last_run_at = datetime.now(timezone.utc)
+                image_reason = self._image_statute_reject_reason(kind, url, res)
+                if image_reason:
+                    fr.status = "retired"
+                    fr.last_error = image_reason
+                else:
+                    if kind == "judgment":
+                        await self.ingest_judgment(res, route=route, row_meta=fr.query_json.get("meta") or {})
+                    elif kind in ("statute", "instrument"):
+                        await self.ingest_statute(res, route=route, kind=kind, meta=fr.query_json.get("meta") or {})
+                    elif kind == "listing":
+                        await self.handle_listing(res, fr)
+                    fr.status = "done"
+                    fr.last_error = None
+                    fr.last_run_at = datetime.now(timezone.utc)
         except URLPolicyError as exc:
             fr.status = "retired"
             fr.last_error = str(exc)[:1000]
@@ -2264,6 +2273,12 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
     ) -> None:
         normalized = normalize_pas_public_url(raw, base_url=base_url)
         if not normalized:
+            return
+        # GalleryImages/*.jpeg (WhatsApp scans) are not statute documents. The
+        # setup/publications classifier already ignores them; count the reject
+        # so a gazette table row cannot be ingested as text.
+        if statute_url_is_image(normalized):
+            self.stats["rejected_urls"] += 1
             return
         try:
             safe = check_url_policy(
