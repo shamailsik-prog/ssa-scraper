@@ -661,7 +661,19 @@ PRESS_URL = (
     "The-Azad-Jammu-and-Kashmir-Press-Foundation-Act-2003-ACT-XVII-OF-2003.pdf"
 )
 BHIMBHER_GARBLED_NAME = "The Bhimbher Universty Act, 2023"
+BHIMBHER_STORED_NAME = (
+    "The Azad Jammu and Kashmir Universty of Bhimbher Act, 2023 (Act VIII of 2023)"
+)
 BHIMBHER_URL = "https://law.gok.pk/wp-content/uploads/2023/12/The-Bhimbher-University-Act-2023.pdf"
+BHIMBHER_PIPE_URL = BHIMBHER_URL + "|VIII"
+# 300 DPI psm 6 on the act's first page. The signature is U+00A5 then a digit,
+# not the ASCII ``ay)`` stamp #373 strips.
+BHIMBHER_SIGNATURE_CALLED = (
+    "‘ Ly Short title, Extent and Commencement.-(1) This Act may be called\n"
+    "¥ 2 the Azad Jammu and Kashmir University of Bhimber Act, 2023.\n"
+    "(2) It shall extend to the whole of Azad Jammu and Kashmir.\n"
+    "(3) It shall come into force at once."
+)
 PRESIDENTIAL_NAME = "The Azad Jammu and Kashmir Presidential Election Act, 1974"
 PRESIDENTIAL_VOLUME_URL = (
     "https://law.gok.pk/wp-content/uploads/2023/05/"
@@ -940,6 +952,57 @@ def test_bhimbher_called_title_with_margin_stamp_is_the_same_act(stored_name: st
     assert "second_act_title" not in result.signals
     assert "numbering_restart" not in result.signals
     assert "name_pdf_mismatch" not in result.signals
+
+
+def test_bhimbher_signature_glyph_and_digit_before_the_is_the_same_act():
+    """The scan signature OCRs as a yen sign and a digit in front of ``the``.
+
+    MAIN ``f70e23ad-1554-4330-be5a-7e5524ed7454`` and FREE-SITES
+    ``9aa67f0c-6bf7-47d2-aa31-9b4b154e16e3``. Stored name is
+    ``Universty of Bhimbher``. The project's 300 DPI OCR reads the called
+    title as ``¥ 2 the ... University of Bhimber``. ``¥`` is not an ASCII
+    stamp, so ``2`` stays a third word and equal-length pairing misses
+    ``Universty`` / ``University`` and ``Bhimbher`` / ``Bhimber``.
+    The dry-run signal is only ``second_act_title``.
+    """
+    sections = [
+        _section(
+            "1",
+            BHIMBHER_SIGNATURE_CALLED,
+            "Short title, Extent and Commencement",
+            0,
+        )
+    ]
+    result = classify_gok_multi_act(
+        stored_name=BHIMBHER_STORED_NAME,
+        source_url=BHIMBHER_PIPE_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MATCH
+    assert result.reason is None
+    assert result.signals == ()
+
+
+def test_signature_glyph_does_not_hide_a_different_called_title():
+    """``¥ 2 the`` is noise. The Mirpur title after it is still another act."""
+    sections = _court_sections()
+    sections.append(
+        _section(
+            "21",
+            "1. Short title.—This Act may be called\n"
+            "¥ 2 the New Mirpur Town Development Authority Act, 1962.",
+            "Following instrument",
+            len(sections),
+        )
+    )
+    result = classify_gok_multi_act(
+        stored_name=CONCILIATION_NAME,
+        source_url=CONCILIATION_URL,
+        sections=sections,
+    )
+    assert result.verdict == VERDICT_MISMATCH
+    assert result.reason == REASON_BLEED
+    assert "second_act_title" in result.signals
 
 
 def test_margin_stamp_does_not_hide_a_different_called_title():
