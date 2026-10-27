@@ -101,6 +101,10 @@ SECTION_RANGE_FOOTNOTE_RE = re.compile(
 TRAILING_AND_SECTION_RE = re.compile(r'(?i)^\s*(?:and|or)\s+\d+[A-Z]?\.?\s*$')
 # Auditor 2026-10-26: section_number values that are years, not headings.
 EXACT_YEAR_SECTION_RE = re.compile(r"^(1[89]|20)\d{2}$")
+# Auditor 2026-10-27: a footnote/amendment date at the start of a line is not a
+# heading. The day is a small number (11.10.2018) and collides with a real
+# section, so the 1800–2099 year rule does not catch it. Separate from that class.
+AMENDMENT_DATE_LINE_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}\.(?:19|20)\d{2}\b")
 # assembly_pdf_sections treats a jump of more than 120 as a bogus heading.
 YEAR_SECTION_SEQUENCE_GAP = 120
 _YEAR_CITATION_BEFORE_RE = re.compile(r"(?i)(?:\(|\bof)\s*$")
@@ -211,6 +215,17 @@ def _parse_numeric_section_number(raw_section_number: str) -> Optional[int]:
 def is_exact_year_section_number(raw_section_number: str) -> bool:
     """True for a 4-digit token 1800–2099 (``^(1[89]|20)\\d{2}$``)."""
     return bool(EXACT_YEAR_SECTION_RE.fullmatch((raw_section_number or "").strip()))
+
+
+def section_text_starts_with_amendment_date(text: str) -> bool:
+    """True when the first line is a footnote date ``DD.MM.YYYY``, not a heading.
+
+    ``11.10.2018. 278 Volume XI`` is an amendment note. It must not occupy
+    section 11. A wrapped year on the next line (``2018.``) is the separate
+    1800–2099 class and is not decided here.
+    """
+    first = (text or "").split("\n", 1)[0]
+    return bool(AMENDMENT_DATE_LINE_RE.match(first))
 
 
 def year_section_fits_sequence(number: int, siblings: Sequence[Tuple[str, int]]) -> bool:
@@ -559,11 +574,21 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
     pending_year_text = ""
     for s in sections:
         key = s.get("section_number", "").strip().lower()
+        token = (s.get("section_number") or "").strip()
+        text = s.get("section_text") or ""
+        # Date lines are not headings. Park the note on the previous real section
+        # before the duplicate-number and footnote filters. A leading note is
+        # dropped rather than pasted onto the next section, which would make that
+        # section open with DD.MM.YYYY. Gluing the note on at the match would make
+        # the previous section look like a footnote when the note says "substituted
+        # by", and the first copy of a colliding number would hide the real heading.
+        if section_text_starts_with_amendment_date(text):
+            if text.strip() and out:
+                _append_section_text(out[-1], text)
+            continue
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue
-        token = (s.get("section_number") or "").strip()
-        text = s.get("section_text") or ""
         num_int = _parse_numeric_section_number(token)
         # Year citations and off-sequence years are not headings. Keep their text on the
         # previous real section instead of dropping the tail (Auditor 2026-10-26).
@@ -742,6 +767,12 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         if len(matches) < 2:
             # try alternative without newline requirement
             matches = list(re.finditer(r'(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])', plain))
+        # A line opening ``11.10.2018`` matches the day as a heading. Leave the
+        # match in place so the note stays its own chunk. ``_deduplicate_sections``
+        # refuses that chunk as a heading and parks the text on the neighbouring
+        # real section. Dropping the match here would fold "substituted by" into
+        # the previous section and the footnote filter would discard that section.
+        # A year token on its own line (``2018.``) is the separate 1800–2099 class.
         matches = _filter_year_heading_matches(plain, matches)
         sections = []
         if len(matches) >= 2:
