@@ -150,6 +150,115 @@ def test_real_act_that_mentions_a_secretary_is_not_gutted():
     assert strip_distribution_list_footer(SECRETARY_IN_BODY) == SECRETARY_IN_BODY
 
 
+ONLY_SECTION_ONE = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+8. The Board shall manage and control the affairs of the Bureau.
+1. The Principal Secretary to Governor Balochistan, Quetta.
+"""
+
+ONLY_SECTIONS_FIVE_AND_SIX = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act.
+Copy for information to:-
+5. The Director General, Public Relations, Balochistan, Quetta.
+6. The System Analyst, Balochistan Provincial Assembly.
+"""
+
+GLUED_ON_FINAL_SECTION = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act. Copy forwarded to the Principal Secretary to Governor Balochistan, Quetta and the System Analyst, Balochistan Provincial Assembly.
+"""
+
+
+def test_strip_removes_a_single_trailing_addressee_at_section_1():
+    stripped = strip_distribution_list_footer(ONLY_SECTION_ONE)
+    assert "establish a Board" in stripped
+    assert "manage and control the affairs" in stripped
+    assert "Principal Secretary" not in stripped
+    sections = split_into_sections(ONLY_SECTION_ONE, "The Example Act, 2024")
+    blob = _joined(sections)
+    assert "establish a Board" in blob
+    assert "Principal Secretary" not in blob
+    assert "1" not in [s["section_number"] for s in sections]
+
+
+LONE_DESIGNATIONS = (
+    "1. The Chief Secretary, Balochistan, Quetta.",
+    "1. The Secretary to the Governor Balochistan, Quetta.",
+    "21. The Secretary, Government of Balochistan, Law Department, Quetta.",
+)
+
+
+def test_strip_removes_any_single_trailing_designation():
+    for line in LONE_DESIGNATIONS:
+        text = (
+            "4. The Government shall, by notification, establish a Board to carry out this Act.\n"
+            + line
+            + "\n"
+        )
+        stripped = strip_distribution_list_footer(text)
+        assert "establish a Board" in stripped
+        assert line not in stripped
+        assert "Quetta" not in stripped
+
+
+def test_strip_removes_only_sections_5_and_6():
+    stripped = strip_distribution_list_footer(ONLY_SECTIONS_FIVE_AND_SIX)
+    assert "make regulations" in stripped
+    assert "Director General, Public Relations" not in stripped
+    assert "System Analyst" not in stripped
+    sections = split_into_sections(ONLY_SECTIONS_FIVE_AND_SIX, "The Example Act, 2024")
+    numbers = [s["section_number"] for s in sections]
+    assert "4" in numbers
+    assert "12" in numbers
+    assert "5" not in numbers
+    assert "6" not in numbers
+    assert "System Analyst" not in _joined(sections)
+
+
+GLUED_ON_ITS_OWN_TRAILING_LINES = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act.
+Copy forwarded to the Principal Secretary to Governor Balochistan, Quetta and the System Analyst, Balochistan Provincial Assembly.
+"""
+
+COPY_FORWARDED_INSIDE_AN_OPERATIVE_SENTENCE = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. A copy forwarded to the Secretary shall be kept with the rules the Board may make.
+"""
+
+
+def test_strip_removes_copy_forwarded_glued_onto_the_final_section():
+    stripped = strip_distribution_list_footer(GLUED_ON_FINAL_SECTION)
+    assert "establish a Board" in stripped
+    assert "make regulations" in stripped
+    assert "Copy forwarded" not in stripped
+    assert "Principal Secretary" not in stripped
+    assert "System Analyst" not in stripped
+    sections = split_into_sections(GLUED_ON_FINAL_SECTION, "The Example Act, 2024")
+    by_num = {s["section_number"]: s["section_text"] for s in sections}
+    assert "12" in by_num
+    assert "make regulations" in by_num["12"]
+    assert "copy forwarded" not in by_num["12"].lower()
+    assert "Principal Secretary" not in by_num["12"]
+    assert "System Analyst" not in by_num["12"]
+
+
+def test_strip_removes_copy_forwarded_appended_on_following_lines():
+    stripped = strip_distribution_list_footer(GLUED_ON_ITS_OWN_TRAILING_LINES)
+    assert "make regulations" in stripped
+    assert "Copy forwarded" not in stripped
+    assert "Principal Secretary" not in stripped
+    assert "System Analyst" not in stripped
+
+
+def test_copy_forwarded_inside_an_operative_sentence_stays():
+    assert (
+        strip_distribution_list_footer(COPY_FORWARDED_INSIDE_AN_OPERATIVE_SENTENCE)
+        == COPY_FORWARDED_INSIDE_AN_OPERATIVE_SENTENCE
+    )
+
+
 def test_validation_rejects_addressee_only_sections():
     payload = {
         "statute_name": "The Balochistan Cadet Colleges Act, 2020",
@@ -190,6 +299,29 @@ def test_validation_rejects_a_mixed_statute_that_still_has_an_addressee_section(
     ok, reason = validate_statute_reconciled_json(payload, raw_text="x" * 200)
     assert not ok
     assert reason == "distribution_list_footer_as_sections"
+
+
+def test_validation_rejects_a_designation_only_section_at_any_number():
+    real = {
+        "section_number": "4",
+        "section_text": "4. The Government shall establish a Board to carry out the purposes of this Act.",
+    }
+    cases = (
+        ("1", "1. The Principal Secretary to Governor Balochistan, Quetta."),
+        ("5", "5. The Director General, Public Relations, Balochistan, Quetta."),
+        ("6", "6. The System Analyst, Balochistan Provincial Assembly."),
+        ("21", "21. The Secretary, Government of Balochistan, Law Department, Quetta."),
+    )
+    for number, text in cases:
+        ok, reason = validate_statute_reconciled_json(
+            {
+                "statute_name": "The Example Act, 2024",
+                "sections": [real, {"section_number": number, "section_text": text}],
+            },
+            raw_text="x" * 200,
+        )
+        assert not ok, number
+        assert reason == "distribution_list_footer_as_sections"
 
 
 def test_validation_accepts_an_operative_section_that_mentions_a_secretary():

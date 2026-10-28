@@ -6,7 +6,9 @@ numbered like sections:
     1. The Principal Secretary to Governor Balochistan, Quetta.
     6. The System Analyst, Balochistan Provincial Assembly.
 
-Those lines were stored as sections 1–6. Defect class:
+Those lines were stored as sections. The number is not always 1–6: the
+footer can be only s.1, or only s.5 and s.6, or the same addressees glued
+onto the final section after "Copy forwarded". Defect class:
 ``distribution_list_footer_as_sections``.
 
 The block is a suffix of the extracted text. A secretary named inside an
@@ -95,16 +97,6 @@ def _line_kind(stripped: str) -> str:
     return "act"
 
 
-def _has_distribution_cue(block: list[str]) -> bool:
-    for line in block:
-        kind = _line_kind(line.strip())
-        if kind in {"header", "reference"}:
-            return True
-        if re.search(r"(?i)system\s+analyst|public\s+relations|p\.?\s*s\.?\s+to\s+(?:the\s+)?secretary", line):
-            return True
-    return False
-
-
 def _distribution_block_start(lines: list[str]) -> int | None:
     """Line index where a trailing distribution block begins, or None."""
     i = len(lines) - 1
@@ -124,24 +116,55 @@ def _distribution_block_start(lines: list[str]) -> int | None:
         if kind == "addressee":
             addressees += 1
         i -= 1
-    start = i + 1
-    if addressees < 2:
+    # One designation line is enough, at any number (only s.1, or only s.5–s.6).
+    # The line is already an addressee, so it does not need a second cue.
+    if addressees < 1:
         return None
-    block = lines[start:]
-    if not _has_distribution_cue(block):
-        return None
-    return start
+    return i + 1
+
+
+def _tail_after_header_is_distribution(tail: str) -> bool:
+    """True when text that begins at a copy-forwarded header is only the footer."""
+    if not tail or len(tail) > 3500 or re.search(r"(?i)\bshall\b", tail):
+        return False
+    saw_header = False
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _HEADER_RE.search(stripped) and not re.search(r"(?i)\bshall\b", stripped):
+            saw_header = True
+            continue
+        if _line_kind(stripped) == "act":
+            return False
+    return saw_header
+
+
+def _cut_glued_copy_forwarded(text: str) -> str:
+    """Cut a 'Copy forwarded…' suffix that shares a line with the last real section."""
+    cut_at = None
+    for match in _HEADER_RE.finditer(text):
+        tail = text[match.start() :]
+        if _tail_after_header_is_distribution(tail):
+            cut_at = match.start()
+    if cut_at is None:
+        return text
+    return text[:cut_at].rstrip()
 
 
 def strip_distribution_list_footer(text: str) -> str:
-    """Remove a trailing copy-forwarded addressee block. Leave other text unchanged."""
+    """Remove a trailing copy-forwarded addressee block. Leave other text unchanged.
+
+    Catches a block of its own lines and the same block glued onto the final
+    section. A single trailing designation (s.1, or s.5 and s.6) is enough.
+    """
     if not text:
         return text or ""
     lines = text.splitlines()
     start = _distribution_block_start(lines)
-    if start is None:
-        return text
-    return "\n".join(lines[:start]).rstrip()
+    if start is not None:
+        text = "\n".join(lines[:start]).rstrip()
+    return _cut_glued_copy_forwarded(text)
 
 
 def is_distribution_addressee_section(text: str) -> bool:
