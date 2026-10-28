@@ -430,7 +430,44 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         await _quarantine(db, st, "full_text hash changed between staging and promotion", "judgment")
         return "quarantined"
     prov = (await db.execute(select(SourceProvenance).where(SourceProvenance.id == st.provenance_id))).scalars().first()
+    india_locked = False
+    india_grid_court = None
+    if st.source_name == "PakistanLawSite":
+        from scraper.parsers.pls_india_courts import resolve_displayed_court
+
+        india_grid_court = data.get("court_canonical") or data.get("court")
+        resolved_court, india_locked = resolve_displayed_court(
+            grid_court=india_grid_court,
+            source_url=st.source_url or data.get("source_url"),
+            text=full_text,
+        )
+        if india_locked:
+            # CaseName/URL says INDIA: keep the Indian court, never the grid's Pakistani one.
+            data["court"] = resolved_court
+            data["court_canonical"] = resolved_court
     court = await _court_by_name(db, data.get("court_canonical") or data.get("court"))
+    if st.source_name == "PakistanLawSite":
+        from scraper.parsers.pls_india_courts import (
+            case_name_indicates_india,
+            india_case_rejects_pakistani_court,
+        )
+
+        stored_court_name = court.name if court else data.get("court")
+        if india_case_rejects_pakistani_court(st.source_url, stored_court_name) or (
+            india_locked and case_name_indicates_india(st.source_url) and not stored_court_name
+        ):
+            await _quarantine(
+                db,
+                st,
+                "india_case_pakistani_court: CaseName indicates INDIA",
+                "judgment",
+                {
+                    "source_url": st.source_url,
+                    "court": stored_court_name,
+                    "grid_court": india_grid_court,
+                },
+            )
+            return "quarantined"
     if court is None and st.source_name in SOURCE_COURT_CODE:
         court = await _court_by_name(db, SOURCE_COURT_CODE[st.source_name])
     dd = data.get("decision_date")

@@ -230,8 +230,15 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     if title_ev:
         evidence["case_title"] = title_ev
     court = source_meta.get("court")
+    from scraper.parsers.pls_india_courts import resolve_displayed_court
+
+    court, india_locked = resolve_displayed_court(
+        grid_court=court,
+        source_url=source_meta.get("url"),
+        text=raw_text,
+    )
     hint_court = None
-    if not court and hint:
+    if not court and not india_locked and hint:
         # the result row's own citation names its court ("2025 SHC KHI 608", "PLD 2025 SC 1"); a case the
         # judgment cites must not decide it
         hint_hits = extract_citations(hint)
@@ -244,24 +251,28 @@ def extract_judgment_deterministic(*, html: Optional[str], text: Optional[str], 
     from scraper.config import settings
     from scraper.parsers.pls_court_resolution import is_default_supreme_court_of_pakistan, resolve_pls_court
 
-    if settings.SSA_PLS_COURT_RESOLUTION and is_default_supreme_court_of_pakistan(court):
+    if (
+        not india_locked
+        and settings.SSA_PLS_COURT_RESOLUTION
+        and is_default_supreme_court_of_pakistan(court)
+    ):
         resolved = resolve_pls_court(court, raw_text, citation_end=own_end)
         if resolved and resolved != court:
             evidence["court"] = (evidence.get("court") or "") + f" -> resolved: {resolved}"
             court = resolved
-    if not court and own_end is not None:
+    if not court and not india_locked and own_end is not None:
         # year-first reporters print the court in brackets after the citation: "1983 P Cr. L J 2056 [Karachi]";
         # that bracket is this judgment's court, ahead of the court of a case it cites further down
         court = court_from_bracket(raw_text, own_end)
         if court:
             evidence["court"] = raw_text[own_end : own_end + 80].strip()
-    if not court:
+    if not court and not india_locked:
         for c in cits[:3]:
             if c.get("court"):
                 court = c["court"]
                 evidence["court"] = c["raw"]
                 break
-    if not court:
+    if not court and not india_locked:
         m = re.search(r"(?i)\b(supreme court of pakistan|lahore high court|high court of sindh|sindh high court|peshawar high court|balochistan high court|high court of balochistan|islamabad high court|federal shariat court)\b", raw_text[:5000])
         if m:
             court = m.group(1)

@@ -303,6 +303,11 @@ STATUTE_NAME_WITH_YEAR_PATTERN = re.compile(
 def canonical_court(raw_court: Optional[str]) -> Optional[str]:
     if not raw_court:
         return None
+    from scraper.parsers.pls_india_courts import indian_court_from_label
+
+    indian = indian_court_from_label(raw_court)
+    if indian:
+        return indian
     key = re.sub(r"\s+", " ", raw_court.strip()).upper()
     key = re.sub(r"\.", "", key)
     # Whitespace is already single spaces here, so " ?" does what "\s*" did, in linear time (CodeQL

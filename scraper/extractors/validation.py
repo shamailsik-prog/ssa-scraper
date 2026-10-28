@@ -66,6 +66,15 @@ def court_in_directory(court: Optional[str], directory: Dict[str, str]) -> Optio
     """Map a court string through the directory of {alias_lower: canonical_name}. None when unknown."""
     if not court:
         return None
+    from scraper.parsers.pls_india_courts import indian_court_from_label, case_name_indicates_india
+
+    indian = indian_court_from_label(court)
+    if indian:
+        return indian
+    # "lah" inside Allahabad and "supreme court" inside "Supreme Court of India" must not
+    # fall through to a Pakistani alias.
+    if case_name_indicates_india(court):
+        return None
     key = _norm_ws(court).replace(".", "")
     if key in directory:
         return directory[key]
@@ -161,7 +170,18 @@ def reconcile_judgment(
 
     # court via directory
     court_raw = out.get("court")
-    if ai and ai.get("court") and not court_raw:
+    india_locked = False
+    if source_url or source_name == "PakistanLawSite":
+        from scraper.parsers.pls_india_courts import resolve_displayed_court
+
+        resolved_court, india_locked = resolve_displayed_court(
+            grid_court=court_raw,
+            source_url=source_url,
+            text=raw_text,
+        )
+        if india_locked:
+            court_raw = resolved_court
+    if ai and ai.get("court") and not court_raw and not india_locked:
         cand = str(ai["court"])
         if _norm_ws(cand) in _norm_ws(raw_text):
             court_raw = cand
