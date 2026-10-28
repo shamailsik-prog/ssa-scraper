@@ -243,13 +243,17 @@ def _ocr_extract_with_pdfplumber_images(pdf_bytes: bytes) -> str:
                     elif pil_image.mode != "L":
                         pil_image = pil_image.convert("L")
 
-                    # Try combined eng+urd first, fallback to eng if urdu traineddata missing
+                    # eng+urd first. A short Urdu reading stays; English-only is the
+                    # second pass for a thin Latin result or missing urd data.
+                    # Image-only Nastaliq is not detected from the bitmap here.
+                    # route_urdu_script_pdf is the hook for a dedicated -l urd
+                    # pass. Latin noise from this fallback is refused later by
+                    # the garbled_ocr_unreadable_sections gate.
                     try:
                         txt = ocr(pil_image, TESSERACT_CONFIG_URDU)
-                        if len(txt.strip()) < 50:
+                        if len(txt.strip()) < 50 and not _urdu_ocr_text(txt):
                             txt = ocr(pil_image, TESSERACT_CONFIG)
                     except Exception as e:
-                        # Tesseract might not have urd, fallback
                         logger.debug("tesseract urd fallback triggered: %s", e)
                         txt = ocr(pil_image, TESSERACT_CONFIG)
 
@@ -295,15 +299,40 @@ def _validate_pdf_bytes(data: bytes, url: str = "") -> None:
 # ---------------------------------------------------------------------------
 # Public API per spec Section 15
 # ---------------------------------------------------------------------------
+def _urdu_ocr_text(text: str, *, min_letters: int = 8) -> bool:
+    from scraper.statute_quality.garbled_ocr import text_is_urdu_script
+
+    return text_is_urdu_script(text or "", min_letters=min_letters)
+
+
+def route_urdu_script_pdf(text_layer: str) -> Optional[str]:
+    """Keep an Urdu text layer instead of running English OCR over it.
+
+    Returns the stripped text layer when its letters are Urdu or InPage
+    script. Returns None when the layer is Latin or too short to judge, and
+    the caller may OCR. A dedicated Urdu pass for image-only Nastaliq pages
+    belongs in this function once ``-l urd`` traineddata is on the image;
+    this hook does not add that engine. An empty layer still reaches the
+    existing eng+urd attempt, and Latin noise from that attempt is refused
+    by the garbled-section gate.
+    """
+    cleaned = (text_layer or "").strip()
+    if _urdu_ocr_text(cleaned, min_letters=20):
+        return cleaned
+    return None
+
+
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     """
     Extract text from Pakistan legal judgment PDF bytes.
     
     Strategy:
       1. Primary: pdfplumber extract_text() for digital PDFs.
-      2. If extracted length < 200 chars or >60% pages look scanned,
+      2. An Urdu or InPage text layer is kept. English OCR is not applied over it.
+      3. If extracted length < 200 chars or >60% pages look scanned,
          fallback to pytesseract OCR via pdfplumber page.to_image().
-      3. Return cleaned, normalized text. Empty string if truly unreadable.
+         English OCR noise does not replace a text layer that already reads.
+      4. Return cleaned, normalized text. Empty string if truly unreadable.
 
     Args:
         pdf_bytes: Raw PDF file content.
@@ -333,6 +362,14 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         )
         return cleaned_primary
 
+    routed = route_urdu_script_pdf(cleaned_primary)
+    if routed:
+        logger.info(
+            "Urdu-script text layer (%d chars); skipping English OCR",
+            len(routed),
+        )
+        return routed
+
     # --- Fallback: OCR ---
     logger.info(
         "pdfplumber text too short (%d chars, scanned_hint=%s, pages=%d), falling back to OCR",
@@ -350,6 +387,11 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
             logger.error("%s; document left without OCR text", exc)
             return cleaned_primary if len(cleaned_primary.strip()) >= 50 else ""
         ocr_cleaned = _clean_text(ocr_raw)
+        from scraper.statute_quality.garbled_ocr import ocr_noise_should_yield_to_text_layer
+
+        if ocr_noise_should_yield_to_text_layer(cleaned_primary, ocr_cleaned):
+            logger.warning("English OCR produced unreadable text; keeping the text layer")
+            ocr_cleaned = ""
 
         # Choose best of primary vs OCR
         if len(ocr_cleaned.strip()) > len(cleaned_primary.strip()):

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from scraper.config import settings
 from scraper.statute_image_gate import is_binary_garbage_text
+from scraper.statute_quality.garbled_ocr import garbled_ocr_unreadable_reason
 from scraper.statute_quality.ocr_section_mash import VERDICT_MISMATCH, classify_ocr_section_mash
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,13 @@ def validate_statute_reconciled_json(
             blobs.append(str(section.get("section_text") or ""))
     if any(is_binary_garbage_text(blob) for blob in blobs):
         return False, "binary_statute_text"
+    garbled_reason = garbled_ocr_unreadable_reason(
+        name=str(payload.get("statute_name") or ""),
+        sections=payload.get("sections") or [],
+        raw_text=raw_text or "",
+    )
+    if garbled_reason:
+        return False, garbled_reason
     sections = payload.get("sections") or []
     dict_sections = [s for s in sections if isinstance(s, dict)]
     parseable = _parseable_sections(sections)
