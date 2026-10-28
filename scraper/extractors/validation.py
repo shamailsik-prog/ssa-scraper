@@ -431,6 +431,14 @@ def reconcile_statute(*, deterministic: Dict[str, Any], ai: Optional[Dict[str, A
                     det_secs[num] = s
                 else:
                     conflicts.append({"field": "sections", "ai": num, "reason": "section not verifiable in raw"})
+    from scraper.statute_quality.distribution_list import is_distribution_addressee_section
+
+    if out.get("sections"):
+        out["sections"] = [
+            s
+            for s in out["sections"]
+            if not is_distribution_addressee_section(str((s or {}).get("section_text") or ""))
+        ]
     for s in out.get("sections") or []:
         if s.get("section_text") and _norm_ws(s["section_text"])[:60] not in norm_raw:
             errors.append(f"section {s.get('section_number')} text not found in raw")

@@ -376,6 +376,10 @@ def _is_false_section_candidate(section_text: str) -> bool:
         return True
     if SECTION_RANGE_FOOTNOTE_RE.search(body) and len(body) < 260:
         return True
+    from scraper.statute_quality.distribution_list import is_distribution_addressee_section
+
+    if is_distribution_addressee_section(section_text or ""):
+        return True
     return False
 
 def is_short_title_clause(name: str) -> bool:
@@ -878,6 +882,9 @@ def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[D
     if not text or not isinstance(text, str):
         logger.warning("split_into_sections received empty/non-str input")
         return []
+    from scraper.statute_quality.distribution_list import strip_distribution_list_footer
+
+    text = strip_distribution_list_footer(text)
     if len(text.strip()) < 10:
         return []
 

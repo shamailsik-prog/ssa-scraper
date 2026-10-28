@@ -63,6 +63,10 @@ def validate_statute_reconciled_json(
         return False, "empty_statute_sections"
     if dict_sections and len(parseable) < len(dict_sections):
         return False, "empty_statute_sections"
+    from scraper.statute_quality.distribution_list import is_distribution_addressee_section
+
+    if any(is_distribution_addressee_section(str(s.get("section_text") or "")) for s in parseable):
+        return False, "distribution_list_footer_as_sections"
     verdict = classify_ocr_section_mash(
         parseable,
         source_url=source_url or str(payload.get("source_url") or ""),
