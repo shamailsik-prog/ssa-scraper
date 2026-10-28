@@ -75,6 +75,8 @@ def _line_kind(stripped: str) -> str:
     # Forwarding letters say "a copy is forwarded" and "may please be supplied".
     # Those are furniture even though they contain "is" or "be". A line that
     # still says "shall" is operative text and stops the walk.
+    # "extra-ordinary issue" also appears in a real final provision
+    # ("must publish …"). Printing wins only when the line is not operative.
     shall = bool(re.search(r"(?i)\bshall\b", stripped))
     if not shall and _HEADER_RE.search(stripped):
         return "header"
@@ -86,9 +88,10 @@ def _line_kind(stripped: str) -> str:
         return "signature"
     if _PAGE_RE.fullmatch(stripped):
         return "page"
-    if not shall and _PRINTING_RE.search(stripped):
+    operative = _operative(stripped)
+    if not operative and _PRINTING_RE.search(stripped):
         return "printing"
-    if _operative(stripped):
+    if operative:
         return "act"
     if _ADDRESSEE_RE.match(stripped):
         return "addressee"
