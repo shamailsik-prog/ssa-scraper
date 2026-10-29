@@ -377,8 +377,11 @@ def _is_false_section_candidate(section_text: str) -> bool:
     if SECTION_RANGE_FOOTNOTE_RE.search(body) and len(body) < 260:
         return True
     from scraper.statute_quality.distribution_list import is_distribution_addressee_section
+    from scraper.statute_quality.garbled_ocr import section_is_garbled_ocr
 
     if is_distribution_addressee_section(section_text or ""):
+        return True
+    if section_is_garbled_ocr(section_text or ""):
         return True
     return False
 
