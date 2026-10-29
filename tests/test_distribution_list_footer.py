@@ -259,6 +259,29 @@ def test_copy_forwarded_inside_an_operative_sentence_stays():
     )
 
 
+EXTRAORDINARY_ISSUE = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Government must publish the notification in an extra-ordinary issue of the official Gazette.
+1. The Principal Secretary to Governor Balochistan, Quetta.
+6. The System Analyst, Balochistan Provincial Assembly.
+"""
+
+
+def test_operative_extraordinary_issue_above_addressees_is_kept():
+    """A final provision that says must/publish in an extra-ordinary issue is not printing furniture."""
+    stripped = strip_distribution_list_footer(EXTRAORDINARY_ISSUE)
+    assert "must publish the notification in an extra-ordinary issue" in stripped
+    assert "Principal Secretary" not in stripped
+    assert "System Analyst" not in stripped
+    sections = split_into_sections(EXTRAORDINARY_ISSUE, "The Example Act, 2024")
+    by_num = {s["section_number"]: s["section_text"] for s in sections}
+    assert "12" in by_num
+    assert "extra-ordinary issue" in by_num["12"]
+    assert "must publish" in by_num["12"]
+    assert "1" not in by_num
+    assert "6" not in by_num
+
+
 def test_validation_rejects_addressee_only_sections():
     payload = {
         "statute_name": "The Balochistan Cadet Colleges Act, 2020",
