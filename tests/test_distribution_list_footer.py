@@ -282,6 +282,230 @@ def test_operative_extraordinary_issue_above_addressees_is_kept():
     assert "6" not in by_num
 
 
+# Pilot shapes that still failed after #380/#381. The printing letter wraps, so
+# "be sent" / "may please" land on their own lines and were kept as Act text.
+FAIL_FINAL_GLUED_COPY_FORWARDED = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act.
+(TAHIR SHAH KAKAR)
+Secretary.
+No.PAB/Legis:V(05)/2022/7727. Dated Quetta, the 08th March, 2022.
+A copy is forwarded to the Chief Controller, Government
+Printing Press, Balochistan, Quetta for favour of publication in the next issue of Balochistan Gazette. Before final printing, a copy
+thereof be sent to this Secretariat for proof reading. Fifty copies of the
+Act may please be supplied to this Secretariat for record.
+(ABDUL REHMAN)
+Special Secretary (Legis:)
+No.PAB/Legis: V (18)/2025/ Dated: Quetta, the 05th June, 2025.
+A copy is forwarded to the Chief Controller, Government
+Printing Press, Balochistan Quetta for favor of publication in Extra –
+ordinary issue of Gazette of Balochistan. Before final printing, a copy
+thereof be sent to this Secretariat for Proof reading. Fifty copies of the
+Act may please be supplied to this Secretariat for record.
+No.PAB/Legis:V(05)/2022/7727. Dated Quetta, the 08th March, 2022.
+A Copy is forwarded for information and necessary action to:-
+1. The Principal Secretary to Governor Balochistan, Quetta.
+6. The System Analyst, Balochistan Provincial Assembly.
+"""
+
+FAIL_SAME_LINE_FORWARDING = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act. No.PAB/Legis:V(05)/2022/7727. Dated Quetta, the 08th March, 2022. A copy is forwarded to the Chief Controller, Government Printing Press, Balochistan, Quetta for favour of publication in the next issue of Balochistan Gazette. Before final printing, a copy thereof be sent to this Secretariat for proof reading. Fifty copies of the Act may please be supplied to this Secretariat for record.
+"""
+
+FAIL_FIFTY_COPIES_ON_OPERATIVE_LINE = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act. Fifty copies of the Act may please be supplied to this Secretariat for record.
+"""
+
+FAIL_ADDRESSEE_SECTIONS = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act.
+1. The Principal Secretary to Governor Balochistan, Quetta.
+2. The Principal Secretary to Chief Minister Balochistan, Quetta.
+5. The Director General, Public Relations, Balochistan, Quetta for favour of publication.
+6. The System Analyst, Balochistan Provincial Assembly.
+Fifty copies of the Act may please be supplied to this Secretariat for record.
+"""
+
+FAIL_PRINTING_LETTER_ONLY = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Bureau may make regulations for carrying out the purposes of this Act.
+No.PAB/Legis:V(05)/2022/7727. Dated Quetta, the 08th March, 2022.
+A copy is forwarded to the Chief Controller, Government Printing Press, Balochistan, Quetta for favour of publication in the next issue of Balochistan Gazette.
+Before final printing, a copy thereof be sent to this Secretariat for proof reading.
+After proof reading fifty copies of the said Act may please be provided to this Secretariat for record.
+"""
+
+MED1_THEN_FIFTY_COPIES = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Government must publish the notification in an extra-ordinary issue of the official Gazette. Fifty copies of the Act may please be supplied to this Secretariat for record.
+1. The Principal Secretary to Governor Balochistan, Quetta.
+"""
+
+_FORWARDING_PHRASES = (
+    "No.PAB",
+    "Chief Controller",
+    "Printing Press",
+    "Fifty copies",
+    "fifty copies",
+    "proof reading",
+    "Proof reading",
+    "may please",
+    "Principal Secretary",
+    "System Analyst",
+    "Copy is forwarded",
+    "copy is forwarded",
+    "Copy forwarded",
+)
+
+
+def _assert_forwarding_gone(text: str) -> None:
+    lowered = text.lower()
+    for phrase in _FORWARDING_PHRASES:
+        assert phrase.lower() not in lowered, phrase
+
+
+def test_fail_final_glued_copy_forwarded_strips_wrapped_printing_letter():
+    """Wrapped Chief Controller / Fifty copies lines must leave the last operative section."""
+    stripped = strip_distribution_list_footer(FAIL_FINAL_GLUED_COPY_FORWARDED)
+    assert "make regulations" in stripped
+    assert "establish a Board" in stripped
+    _assert_forwarding_gone(stripped)
+    sections = split_into_sections(FAIL_FINAL_GLUED_COPY_FORWARDED, "The Example Act, 2022")
+    blob = _joined(sections)
+    assert "make regulations" in blob
+    _assert_forwarding_gone(blob)
+    by_num = {s["section_number"]: s["section_text"] for s in sections}
+    assert "12" in by_num
+    assert "may make regulations" in by_num["12"]
+    assert "1" not in by_num
+    assert "6" not in by_num
+
+
+def test_fail_final_glued_copy_forwarded_strips_same_line_reference_and_copy_count():
+    for text in (FAIL_SAME_LINE_FORWARDING, FAIL_FIFTY_COPIES_ON_OPERATIVE_LINE):
+        stripped = strip_distribution_list_footer(text)
+        assert "make regulations" in stripped
+        _assert_forwarding_gone(stripped)
+        sections = split_into_sections(text, "The Example Act, 2022")
+        by_num = {s["section_number"]: s["section_text"] for s in sections}
+        assert "12" in by_num
+        assert "make regulations" in by_num["12"]
+        _assert_forwarding_gone(by_num["12"])
+
+
+def test_fail_addressee_sections_when_copy_count_follows_the_list():
+    """A trailing copy-count line must not keep the numbered addressees as sections."""
+    stripped = strip_distribution_list_footer(FAIL_ADDRESSEE_SECTIONS)
+    assert "make regulations" in stripped
+    _assert_forwarding_gone(stripped)
+    sections = split_into_sections(FAIL_ADDRESSEE_SECTIONS, "The Example Act, 2022")
+    blob = _joined(sections)
+    assert "establish a Board" in blob
+    assert "make regulations" in blob
+    _assert_forwarding_gone(blob)
+    numbers = [s["section_number"] for s in sections]
+    assert "4" in numbers
+    assert "12" in numbers
+    assert "1" not in numbers
+    assert "2" not in numbers
+    assert "5" not in numbers
+    assert "6" not in numbers
+    ok, reason = validate_statute_reconciled_json(
+        {"statute_name": "The Example Act, 2022", "sections": sections},
+        raw_text="x" * 200,
+    )
+    assert ok, reason
+
+
+def test_printing_letter_without_addressees_is_stripped_from_the_last_section():
+    stripped = strip_distribution_list_footer(FAIL_PRINTING_LETTER_ONLY)
+    assert "make regulations" in stripped
+    _assert_forwarding_gone(stripped)
+    sections = split_into_sections(FAIL_PRINTING_LETTER_ONLY, "The Example Act, 2022")
+    by_num = {s["section_number"]: s["section_text"] for s in sections}
+    assert "12" in by_num
+    _assert_forwarding_gone(_joined(sections))
+
+
+MED1_WRAPPED = """
+4. The Government shall, by notification, establish a Board to carry out this Act.
+12. The Government must publish the notification in an extra-
+ordinary issue of the official Gazette.
+1. The Principal Secretary to Governor Balochistan, Quetta.
+6. The System Analyst, Balochistan Provincial Assembly.
+"""
+
+
+def test_wrapped_operative_extra_ordinary_issue_is_kept():
+    """A line break inside 'extra-ordinary issue' is still the final provision."""
+    stripped = strip_distribution_list_footer(MED1_WRAPPED)
+    assert "must publish the notification in an extra-" in stripped
+    assert "ordinary issue of the official Gazette" in stripped
+    assert "Principal Secretary" not in stripped
+    assert "System Analyst" not in stripped
+    sections = split_into_sections(MED1_WRAPPED, "The Example Act, 2024")
+    blob = _joined(sections)
+    assert "must publish the notification" in blob
+    assert "ordinary issue of the official Gazette" in blob
+    assert "Principal Secretary" not in blob
+    numbers = [s["section_number"] for s in sections]
+    assert "1" not in numbers
+    assert "6" not in numbers
+
+
+def test_operative_extra_ordinary_line_keeps_text_when_fifty_copies_follows():
+    stripped = strip_distribution_list_footer(MED1_THEN_FIFTY_COPIES)
+    assert "must publish the notification in an extra-ordinary issue" in stripped
+    _assert_forwarding_gone(stripped)
+    sections = split_into_sections(MED1_THEN_FIFTY_COPIES, "The Example Act, 2024")
+    by_num = {s["section_number"]: s["section_text"] for s in sections}
+    assert "must publish the notification in an extra-ordinary issue" in by_num["12"]
+    assert "Fifty copies" not in by_num["12"]
+    assert "1" not in by_num
+
+
+def test_validation_rejects_a_printing_forwarding_block_without_an_addressee():
+    letter = (
+        "No.PAB/Legis:V(05)/2022/7727. Dated Quetta, the 08th March, 2022.\n"
+        "A copy is forwarded to the Chief Controller, Government Printing Press, "
+        "Balochistan, Quetta for favour of publication.\n"
+        "Before final printing, a copy thereof be sent to this Secretariat for proof reading.\n"
+        "Fifty copies of the Act may please be supplied to this Secretariat for record."
+    )
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "The Example Act, 2022",
+            "sections": [
+                {
+                    "section_number": "12",
+                    "section_text": "12. The Bureau may make regulations for carrying out the purposes of this Act.",
+                },
+                {"section_number": "6", "section_text": letter},
+            ],
+        },
+        raw_text="x" * 200,
+    )
+    assert not ok
+    assert reason == "distribution_list_footer_as_sections"
+    kept = {
+        "statute_name": "The Example Act, 2024",
+        "sections": [
+            {
+                "section_number": "12",
+                "section_text": (
+                    "12. The Government must publish the notification in an "
+                    "extra-ordinary issue of the official Gazette."
+                ),
+            }
+        ],
+    }
+    ok, reason = validate_statute_reconciled_json(kept, raw_text="x" * 200)
+    assert ok
+    assert reason == ""
+
+
 def test_validation_rejects_addressee_only_sections():
     payload = {
         "statute_name": "The Balochistan Cadet Colleges Act, 2020",
