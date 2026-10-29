@@ -9,6 +9,10 @@ label or the target title.
 
 A pipe label and a title that name two different segments are unresolved.
 Unresolved text is not split: storing a mixture is worse than storing nothing.
+
+An ``ACT No.`` glued into the middle of a section is a boundary when ``An Act``
+follows it, including when that next act's section 1 was not read. A citation
+tail (``Act No. ….- In the``) stays with the amending act.
 """
 
 from __future__ import annotations
