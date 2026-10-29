@@ -42,9 +42,9 @@ Verdicts:
 | Verdict | Meaning |
 | --- | --- |
 | `MATCH` | PDF short title agrees with the stored act, including a scanned title that differs only by OCR confusions (`i`/`l`/`1`, `c`/`e`, digit lookalikes, `m`/`rn` in a longer word). An act-number gap is ignored only when three things are all true: the significant words match in both directions under those OCR confusions (not a subset or a 0.55 overlap), both titles carry the same year, and the act numbers share that year and are either one apart (roman 30 against 31) or the same X-run with its final X read as III (roman 30 against 23, roman 20 against 13). That both-directions check also treats an `n`/`r` slip in a word of nine or more letters as the same word (`scientific` / `sciertific`, including `sclertific`), so a garbled PCSIR title with an agreeing year stays `MATCH`. An 8-letter pair such as `national` / `rational` does not. `Amendment` and ordinal words such as `Second` stay significant, so a principal Act against its Amendment stays `MISMATCH`. `year_as_section_number` is still reported and does not change `MATCH` when that wording already agrees. Renaming those section numbers is a separate sweep. |
-| `MISMATCH` | Forced by `pdf_title_disagrees`, by `name_pdf_mismatch`, by `act_number_disagrees` unless the one-numeral or X-run exception above applies, or by `section_absent_from_pdf` together with an incoherent stored name. A missing year (`Finance Act` against `Finance Act, 2016`), a different year (`Finance Act, 2015` against `2016`), a different act-number year, or any other act-number gap on an otherwise identical title still forces `MISMATCH`. `name_pdf_mismatch` is the Senate form of `name_pdf_mismatch:law.gok.pk`: on a PDF that prints one act, the stored name is a different instrument from the short-title line, or no short title was read and the stored year disagrees with `Act No. … of YYYY`. Section text that is present in that PDF does not keep the row `MATCH`. `year_as_section_number` does not force `MISMATCH`. |
+| `MISMATCH` | Forced by `name_s1_mismatch`, by `pdf_title_disagrees`, by `name_pdf_mismatch`, by `act_number_disagrees` unless the one-numeral or X-run exception above applies, or by `section_absent_from_pdf` together with an incoherent stored name. `name_s1_mismatch` is the reason when stored section 1's `may be called` title is a different instrument from the stored name, including on a bundled gazette and when the PDF could not be fetched. The other signals still use `senate_integrity:url_act_mismatch`. A missing year (`Finance Act` against `Finance Act, 2016`), a different year (`Finance Act, 2015` against `2016`), a different act-number year, or any other act-number gap on an otherwise identical title still forces `MISMATCH`. `name_pdf_mismatch` is the Senate form of `name_pdf_mismatch:law.gok.pk`: on a PDF that prints one act, the stored name is a different instrument from the short-title line, or no short title was read and the stored year disagrees with `Act No. … of YYYY`. Section text that is present in that PDF does not keep the row `MATCH`. `year_as_section_number` does not force `MISMATCH`. |
 | `PARTIAL` | The stored name or a section is corrupt and the short title does not already agree: preamble or definitions fragment, newline title, wrong year, year parsed as a section number with no agreeing title, or a gazette running header such as `President's Orders and Regulations`. |
-| `FETCH_FAIL` | No live PDF and no recorded PDF bytes. |
+| `FETCH_FAIL` | No live PDF and no recorded PDF bytes, and stored section 1 does not already name a different instrument. |
 | `SKIPPED_SHELL` | Already quarantined, fragment name, pipe label, no sections. Not fetched. |
 
 `deferred_quarantined` counts other already-quarantined rows skipped unless `--include-quarantined` is set.
@@ -53,16 +53,18 @@ Verdicts:
 
 law.gok.pk reads the instrument out of the PDF filename. Senate upload names are numeric (`1656581759_353.pdf`), so this sweep reads the gazette instead. A PDF with one act is `name_pdf_mismatch` when one of these is true:
 
-- The stored name is a coherent act title and the short-title line (`This Act may be called …`) names a different instrument. `pdf_title_disagrees` is set as well. `called` still matches when one letter is a scan slip (`celled`), a euro sign stands in for `e`, the instrument word is glued on (`BureausAct`), or the comma before the year was read as a period.
+- The stored name is a coherent act title and the short-title line (`This Act may be called …`) names a different instrument. `pdf_title_disagrees` is set as well. `called` still matches when one letter is a scan slip (`celled`), a euro sign stands in for `e`, the instrument word is glued on (`BureausAct`), the comma before the year was read as a period, or the formula is `called as`.
 - No short title was read, and the year in the stored name (or `year_enacted` when the name has no year) disagrees with `Act No. … of YYYY`. `gazette_act_year_disagrees` is set as well.
 
 A definitions line (`'term' means the Companies Ordinance, 1984`) is not the short title. It does not agree with the stored name, and it does not block the act-number year check.
 
-The stored sections being the PDF's own text does not clear the signal. Quarantine reason stays `senate_integrity:url_act_mismatch`. `--apply` is unchanged: it inserts that reason and does not rewrite the name or the sections. `needs_section_refetch` stays false.
+The stored sections being the PDF's own text does not clear `name_pdf_mismatch`. Quarantine reason for that signal stays `senate_integrity:url_act_mismatch`. `--apply` inserts that reason and does not rewrite the name or the sections. `needs_section_refetch` stays false.
 
-These stay off this signal:
+Stored section 1 is a separate check. When it says `may be called X` or `called as X`, and `X` is a different instrument from the stored name, the reason is `name_s1_mismatch`. That includes a bundled gazette whose section text is present in the PDF. A heading that only says `Short title` does not make `The Short Titles Act, 1973` agree with `the Service Tribunals Act, 1973`. An OCR-same called title is not this signal. An amendment whose significant words are a superset of the stored title is not this signal either. `--apply` quarantines the row and does not rewrite the name or the sections. Undo removes `name_s1_mismatch` rows from that run along with `senate_integrity:` rows.
 
-- A bundled gazette, two different `Act No.` years or numbers. That sweep is `python -m scraper.tasks.bundled_gazette_acts`. See `docs/BUNDLED_GAZETTE_ACTS.md`.
+These stay off `name_pdf_mismatch`:
+
+- A bundled gazette, two different `Act No.` years or numbers, when stored section 1 does not itself name a different instrument. Bleed across those acts is `python -m scraper.tasks.bundled_gazette_acts`. See `docs/BUNDLED_GAZETTE_ACTS.md`. `name_s1_mismatch` still applies when stored section 1 names a different instrument.
 - An OCR-same short title, including a garbled PCSIR title whose year agrees. A one-numeral or X-run act-number misread on that title stays `MATCH`.
 - A year stored as a section number. Renaming it is the year-section sweep.
 - GoK filename bleed, including the Bhimber short-title OCR case, which stays on `python -m scraper.tasks.gok_multi_act_bleed`.
@@ -102,4 +104,4 @@ Quarantine hides a mismatch from search and corpus reads. The statute row, secti
 python -m scraper.tasks.senate_statute_integrity --undo <run_id>
 ```
 
-`run_id` is in the `--apply` JSON. Undo deletes quarantine rows from that run whose reason starts with `senate_integrity:`, and restores `needs_section_refetch` to the value saved before the run. Other quarantine reasons that share the run id are left in place. Undo does not delete statute or section rows.
+`run_id` is in the `--apply` JSON. Undo deletes quarantine rows from that run whose reason starts with `senate_integrity:` or is `name_s1_mismatch`, and restores `needs_section_refetch` to the value saved before the run. Other quarantine reasons that share the run id are left in place. Undo does not delete statute or section rows.
