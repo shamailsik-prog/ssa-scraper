@@ -34,6 +34,39 @@ KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "M
 # optional trailing letter. PLC(CS), PLC(CS)N and the printed PLC (C.S.) are real
 # dropdown codes; digits and other punctuation are not.
 _JOURNAL_CODE_RE = re.compile(r"[A-Za-z]{2,8}(?: ?\([A-Za-z](?:\.?[A-Za-z]){0,5}\.?\)[A-Za-z]?)?")
+# Moore's Indian Appeals is not a PakistanLawSite journal. KNOWN_REPORTERS is the
+# search-harvest fallback for that site, so MIA is not added there. The canonical
+# code is letters-only, the same rule _JOURNAL_CODE_RE enforces. Alias lookup
+# strips every non-letter: the same fold as normalise_reporter (spaces and dots)
+# plus apostrophes, so "Moore's Indian Appeals" and "M.I.A." are one code.
+REPORTER_ALIASES = {
+    "MIA": "MIA",
+    "MOOREIA": "MIA",
+    "MOOINDAPP": "MIA",
+    "MOORESINDIANAPPEALS": "MIA",
+    "MOOREINDIANAPPEALS": "MIA",
+}
+
+
+def reporter_letters(value: Any) -> str:
+    """Letters only, uppercased. "M.I.A." and "Moore IA" become MIA and MOOREIA."""
+    return re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
+
+
+def canonical_reporter(value: Any) -> str:
+    """Canonical reporter code for a printed name or citation.
+
+    Moore IA, Moo Ind App, M.I.A. and Moore's Indian Appeals resolve to MIA.
+    A PakistanLawSite code keeps the spelling in KNOWN_REPORTERS (PCrLJ, not PCRLJ).
+    """
+    key = reporter_letters(value)
+    aliased = REPORTER_ALIASES.get(key)
+    if aliased:
+        return aliased
+    for known in KNOWN_REPORTERS:
+        if reporter_letters(known) == key:
+            return known
+    return key
 ARCHIVE_TARGET_TYPES = ("google_drive", "dropbox", "onedrive", "s3_compatible", "sftp", "smb", "local_path")
 EXTRACTION_MODES = ("deterministic", "hybrid", "scrapegraph_managed", "scrapegraph_local")
 LOGIN_SESSION_SOURCE_NAMES = ("PakistanLawSite",)
