@@ -62,7 +62,7 @@ ASSEMBLY_SOURCE_NAMES = frozenset(
 )
 
 MIN_ASSEMBLY_BODY_CHARS = 60
-TOC_HEADING_RE = re.compile(r"(?i)\b(table\s+of\s+contents|contents)\b")
+TOC_HEADING_RE = re.compile(r"(?i)^\s*(?:table\s+of\s+contents|contents)\s*[:\-–—]?\s*$")
 TOC_LINE_RE = re.compile(r"(?i)^\s*\d+[A-Z]?\s*[\.\)]\s+.+\s+\d{1,4}\s*$")
 YEAR_ONLY_RE = re.compile(r"^\s*(19|20)\d{2}\s*\.?\s*$")
 PAGE_NUMBER_BODY_RE = re.compile(r"^\s*\d{1,4}\s*\.?\s*$")
@@ -198,7 +198,9 @@ def is_table_of_contents_chunk(text: str) -> bool:
     chunk = (text or "").strip()
     if not chunk:
         return True
-    if TOC_HEADING_RE.search(chunk[:400]):
+    # A statutory provision may discuss the "contents" of a register or document.
+    # Only a standalone heading, not an occurrence inside substantive text, is TOC evidence.
+    if any(TOC_HEADING_RE.fullmatch(line.strip()) for line in chunk.splitlines()[:6]):
         return True
     lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
     if len(lines) >= 4:
