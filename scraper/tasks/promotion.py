@@ -69,12 +69,14 @@ from scraper.parsers.citation_extractor import (
     extract_citations,
     normalise_citation,
 )
+from scraper.parsers.kpcode_sections import KP_JURISDICTION, kpcode_toc_stub_quarantine_reason
 from scraper.parsers.statute_parser import (
     is_short_title_clause,
     looks_like_clause_fragment,
     looks_like_fragment_name,
     looks_like_garbage_name,
 )
+from scraper.statute_quality_jurisdiction import jurisdiction_for_source
 from scraper.unreported import (
     SOURCE_COURT_CODE,
     find_case_number,
@@ -2354,12 +2356,33 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             {"reason_code": val_reason, "statute_name": name[:280], "validation_errors": st.validation_errors},
         )
         return "quarantined"
+    stub_reason = kpcode_toc_stub_quarantine_reason(
+        source_name=st.source_name,
+        source_url=st.source_url,
+        sections=parseable_sections,
+    )
+    if stub_reason:
+        await _quarantine(
+            db,
+            st,
+            stub_reason,
+            "statute",
+            {
+                "reason_code": "kpcode_toc_stub",
+                "statute_name": name[:280],
+                "section_count": len(parseable_sections),
+            },
+        )
+        return "quarantined"
     if created_new_statute:
+        stored_jurisdiction = (data.get("jurisdiction") or "").strip()
+        if st.source_name == "KPAssembly" and stored_jurisdiction in ("", "Federal"):
+            stored_jurisdiction = jurisdiction_for_source("KPAssembly") or KP_JURISDICTION
         statute = Statute(
             name=name,
             canonical_name_key=_statute_canonical_name_key_for_name(name),
             short_name=data.get("short_name"),
-            jurisdiction=data.get("jurisdiction") or "Federal",
+            jurisdiction=stored_jurisdiction or "Federal",
             statute_type=data.get("statute_type"),
             year_enacted=incoming_year,
             source_name=st.source_name,
