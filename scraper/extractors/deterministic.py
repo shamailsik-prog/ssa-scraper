@@ -451,7 +451,26 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     mt = re.search(r"(?i)\b(act|ordinance|constitution|rules|regulations|order)\b", name or "")
     if mt:
         stype = mt.group(1).lower()
-    jurisdiction = source_meta.get("jurisdiction") or ("Federal" if source_meta.get("source_name") in ("PakistanCode", "NationalAssembly", "Senate", "GazetteOfPakistan") else None)
+    from scraper.parsers.kpcode_sections import KP_JURISDICTION, extract_kpcode_statute_sections, is_kpcode_statute_source
+    from scraper.statute_quality_jurisdiction import jurisdiction_for_source
+
+    explicit_jurisdiction = (source_meta.get("jurisdiction") or "").strip()
+    if source_meta.get("source_name") == "KPAssembly":
+        # kpcode and pakp are both KPAssembly. A missing or Federal label is the
+        # column default, not the province. Pakistan Code is not this branch.
+        if not explicit_jurisdiction or explicit_jurisdiction == "Federal":
+            jurisdiction = jurisdiction_for_source("KPAssembly") or KP_JURISDICTION
+        else:
+            jurisdiction = explicit_jurisdiction
+    else:
+        jurisdiction = explicit_jurisdiction or (
+            "Federal" if source_meta.get("source_name") in ("PakistanCode", "NationalAssembly", "Senate", "GazetteOfPakistan") else None
+        )
+    kpcode_sections = None
+    if is_kpcode_statute_source(source_meta):
+        kpcode_sections = extract_kpcode_statute_sections(html=html, text=raw_text, statute_name=name)
+    if kpcode_sections is not None:
+        sections = kpcode_sections
     sec_models = []
     for s in sections:
         txt = s.get("section_text") or ""

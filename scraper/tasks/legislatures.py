@@ -3404,6 +3404,18 @@ class KPAssemblyPipeline(BalochistanAssemblyPipeline):
             category=base_meta.get("detail_category", ""),
         )
 
+        from scraper.parsers.kpcode_sections import kpcode_detail_html_has_operative_body
+
+        if kpcode_detail_html_has_operative_body(html_text, statute_name=str(base_meta.get("act_title") or "")):
+            # The act text is in #content. Ingest this page; ingest follows the
+            # /uploads PDF only when that HTML body is still a contents list.
+            html_meta = dict(base_meta)
+            html_meta["discovery_channel"] = "kpcode-detail-html-body"
+            html_meta["detail_fetch"] = "kpcode_detail_html"
+            docs[base_url] = html_meta
+            logger.info("kpcode detail has operative HTML body; ingesting %s", base_url)
+            return
+
         for a in soup.select("a[href]"):
             route_meta = dict(base_meta)
             route_meta["discovery_channel"] = "kpcode-detail-file-link"
