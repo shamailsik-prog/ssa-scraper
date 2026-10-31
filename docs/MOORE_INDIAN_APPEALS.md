@@ -21,10 +21,11 @@ python -m scraper.tasks.archive_moore_ia --volume 6 --dry-run
 ```
 
 On the volume 6 grea OCR (`reportsofcaseshe06grea_djvu.txt`, about 1.2 MB, not stored in
-this repo) that command splits about 20 captions and pages 16 of them. Nusserwanjee
+this repo) that command splits 20 captions: 16 with a page, 4 unpaged. Nusserwanjee
 Pestonjee is `MIA:6:134`, decided 1855-06-19, on appeal from the Sudder Dewanny Adawlut
-at Bombay. Running heads in that scan are noisy, so a caption with no Table of Cases
-match stays unpaged rather than inventing a page.
+at Bombay. A caption with no Table of Cases match stays unpaged rather than inventing a
+page. If two captions share a page, the longer text is kept and the other is listed under
+`dropped_duplicates` (and logged) instead of disappearing.
 
 Offline, with a file you already have:
 

@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -279,12 +279,21 @@ def is_bare_page(line: str) -> bool:
 
 
 def is_boilerplate(line: str) -> bool:
-    low = line.strip().lower()
-    if "digitized by" in low:
+    """Digitization credits and a line whose host is archive.org itself.
+
+    The host comes from urlparse, compared in full. A prefix check would treat
+    ``https://archive.org.evil.com/...`` as this site.
+    """
+    if "digitized by" in line.lower():
         return True
-    if low.startswith("http://www.archive.org") or low.startswith("https://archive.org"):
-        return True
-    return False
+    parsed = urlparse(line.strip())
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    return host == "archive.org" or host == "www.archive.org"
 
 
 def is_caption(line: str) -> bool:
@@ -493,11 +502,21 @@ def dedup_key(volume: int, page: Optional[int]) -> Optional[str]:
     return f"{REPORTER}:{int(volume)}:{int(page)}"
 
 
-def dedupe_judgments(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """One record per (MIA, volume, page). The longer text wins. Unpaged rows are kept."""
+def _dropped_duplicate(row: Dict[str, Any]) -> Dict[str, Any]:
+    record = {"dedup_key": row.get("dedup_key"), "parties": row.get("parties")}
+    logger.warning("MIA dedupe dropped duplicate %s parties=%s", record["dedup_key"], record["parties"])
+    return record
+
+
+def dedupe_judgments(rows: Sequence[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """One record per (MIA, volume, page). The longer text wins. Unpaged rows are kept.
+
+    The second list is every paged row that lost a collision, with its key and parties.
+    """
     chosen: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     unpaged: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
     for row in rows:
         key = row.get("dedup_key")
         if not key:
@@ -509,11 +528,14 @@ def dedupe_judgments(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             order.append(key)
             continue
         if len(row.get("full_text") or "") > len(previous.get("full_text") or ""):
+            dropped.append(_dropped_duplicate(previous))
             chosen[key] = row
-    return [chosen[key] for key in order] + unpaged
+        else:
+            dropped.append(_dropped_duplicate(row))
+    return [chosen[key] for key in order] + unpaged, dropped
 
 
-def split_moore_ia_volume(
+def split_moore_ia_report(
     text: str,
     *,
     volume: int,
@@ -521,8 +543,8 @@ def split_moore_ia_volume(
     year_from: int,
     year_to: int,
     ocr_source: str,
-) -> List[Dict[str, Any]]:
-    """Split one volume's OCR into judgment records. Does not fetch or store anything."""
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split one volume's OCR. Returns kept judgments and the duplicates dedupe dropped."""
     lines = collapse_ocr_lines(text)
     captions = [index for index, line in enumerate(lines) if is_caption(line)]
     toc_end = captions[0] if captions else len(lines)
@@ -556,6 +578,27 @@ def split_moore_ia_volume(
             }
         )
     return dedupe_judgments(raw_rows)
+
+
+def split_moore_ia_volume(
+    text: str,
+    *,
+    volume: int,
+    item_id: Optional[str],
+    year_from: int,
+    year_to: int,
+    ocr_source: str,
+) -> List[Dict[str, Any]]:
+    """Kept judgments from one volume. Dropped duplicates are logged and omitted here."""
+    kept, _dropped = split_moore_ia_report(
+        text,
+        volume=volume,
+        item_id=item_id,
+        year_from=year_from,
+        year_to=year_to,
+        ocr_source=ocr_source,
+    )
+    return kept
 
 
 def _http_client() -> httpx.Client:
@@ -624,7 +667,7 @@ def dry_run_volume(volume: int, *, ocr_path: Optional[str] = None, text: Optiona
         ocr_source = f"local:{ocr_path}" if ocr_path else f"archive.org:{entry.ocr_filename}"
     else:
         ocr_source = f"local:{ocr_path}" if ocr_path else ""
-    rows = split_moore_ia_volume(
+    rows, dropped = split_moore_ia_report(
         text,
         volume=volume,
         item_id=entry.item_id,
@@ -632,13 +675,23 @@ def dry_run_volume(volume: int, *, ocr_path: Optional[str] = None, text: Optiona
         year_to=entry.year_to,
         ocr_source=ocr_source,
     )
-    logger.info("MIA volume %s dry-run: %s cases (database not written)", volume, len(rows))
+    unpaged = sum(1 for row in rows if not row.get("page"))
+    logger.info(
+        "MIA volume %s dry-run: %s cases, %s unpaged, %s duplicates dropped (database not written)",
+        volume,
+        len(rows),
+        unpaged,
+        len(dropped),
+    )
     return {
         "reporter": REPORTER,
         "volume": volume,
         "item_id": entry.item_id,
         "fetched": fetched,
         "cases": len(rows),
+        "unpaged_count": unpaged,
+        "dropped_duplicate_count": len(dropped),
+        "dropped_duplicates": dropped,
         "wrote_database": False,
         "missing_volume": entry.item_id is None,
         "note": entry.note,

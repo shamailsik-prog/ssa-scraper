@@ -16,7 +16,9 @@ from scraper.tasks.archive_moore_ia import (
     VolumeNotOnArchive,
     dedupe_judgments,
     download_url,
+    dry_run_volume,
     fetch_volume_ocr,
+    is_boilerplate,
     main,
     ocr_filename_from_metadata,
     split_moore_ia_volume,
@@ -156,14 +158,35 @@ The appeal was allowed.
     assert set(BAILII_SECONDARY_URLS) == {(8, 379), (9, 307), (10, 203)}
 
 
-def test_same_volume_and_page_collapses_to_one_record():
-    short = {"reporter": "MIA", "volume": 4, "page": 431, "dedup_key": "MIA:4:431", "full_text": "short"}
-    longer = {"reporter": "MIA", "volume": 4, "page": 431, "dedup_key": "MIA:4:431", "full_text": "much longer text"}
-    other = {"reporter": "MIA", "volume": 4, "page": 339, "dedup_key": "MIA:4:339", "full_text": "other"}
-    unpaged = {"reporter": "MIA", "volume": 4, "page": None, "dedup_key": None, "full_text": "no page"}
-    rows = dedupe_judgments([short, other, longer, unpaged])
+def test_same_volume_and_page_collapses_to_one_record(caplog):
+    short = {
+        "reporter": "MIA",
+        "volume": 4,
+        "page": 431,
+        "parties": "Short Appellant v. Short Respondent",
+        "dedup_key": "MIA:4:431",
+        "full_text": "short",
+    }
+    longer = {
+        "reporter": "MIA",
+        "volume": 4,
+        "page": 431,
+        "parties": "Long Appellant v. Long Respondent",
+        "dedup_key": "MIA:4:431",
+        "full_text": "much longer text",
+    }
+    other = {"reporter": "MIA", "volume": 4, "page": 339, "parties": "Other v. Name", "dedup_key": "MIA:4:339", "full_text": "other"}
+    unpaged = {"reporter": "MIA", "volume": 4, "page": None, "parties": "No Page v. Nobody", "dedup_key": None, "full_text": "no page"}
+    with caplog.at_level("WARNING", logger="scraper.tasks.archive_moore_ia"):
+        rows, dropped = dedupe_judgments([short, other, longer, unpaged])
     assert [row["dedup_key"] for row in rows] == ["MIA:4:431", "MIA:4:339", None]
     assert rows[0]["full_text"] == "much longer text"
+    assert rows[0]["parties"] == "Long Appellant v. Long Respondent"
+    assert dropped == [{"dedup_key": "MIA:4:431", "parties": "Short Appellant v. Short Respondent"}]
+    assert any(
+        "MIA:4:431" in record.message and "Short Appellant v. Short Respondent" in record.message
+        for record in caplog.records
+    )
 
 
 def test_volume_13_is_refused_before_any_download():
@@ -260,16 +283,57 @@ def test_dry_run_reads_a_local_file_and_prints_cases(capsys):
     assert payload["volume"] == 6
     assert payload["fetched"] is False
     assert payload["cases"] == 2
+    assert payload["unpaged_count"] == 0
+    assert payload["dropped_duplicate_count"] == 0
+    assert payload["dropped_duplicates"] == []
     assert payload["judgments"][0]["dedup_key"] == "MIA:6:27"
     assert payload["wrote_database"] is False
+
+
+def test_a_shared_page_is_listed_as_a_dropped_duplicate():
+    text = """
+TABLE OF THE CASES REPORTED IN THIS VOLUME.
+Alphaaaaa Partyname v. Betaaaaa Othername . . 10
+
+ON APPEAL FROM THE EAST INDIES. 10
+Alphaaaaa Partyname - Appellant.
+AND
+Betaaaaa Othername - Respondent.
+On appeal from the Supreme Court at Madras.
+Short decree.
+
+ON APPEAL FROM THE EAST INDIES. 10
+Alphaaaaa Partyname - Appellant.
+AND
+Betaaaaa Othername - Respondent.
+On appeal from the Supreme Court at Madras.
+This second text is much longer than the short decree above so the longer case is kept.
+"""
+    payload = dry_run_volume(6, text=text)
+    assert payload["cases"] == 1
+    assert payload["unpaged_count"] == 0
+    assert payload["dropped_duplicate_count"] == 1
+    assert payload["dropped_duplicates"] == [
+        {"dedup_key": "MIA:6:10", "parties": "Alphaaaaa Partyname v. Betaaaaa Othername"}
+    ]
+    assert "much longer" in payload["judgments"][0]["full_text"]
+    assert "Short decree" not in payload["judgments"][0]["full_text"]
+
+
+def test_archive_org_boilerplate_is_the_parsed_host_only():
+    assert is_boilerplate("https://archive.org/details/reportsofcaseshe06grea")
+    assert is_boilerplate("http://www.archive.org/details/reportsofcaseshe06grea")
+    assert is_boilerplate("Digitized by the Internet Archive")
+    assert not is_boilerplate("https://archive.org.evil.com/details/reportsofcaseshe06grea")
+    assert not is_boilerplate("https://evil.example/archive.org/details/x")
+    assert not is_boilerplate("Their Lordships advised that the appeal be dismissed.")
 
 
 def test_dry_run_volume_13_reports_the_gap(capsys):
     code = main(["--volume", "13", "--dry-run"])
     assert code == 2
-    err = capsys.readouterr().err
-    assert "13" in err
-    assert "archive.org" in err
+    err = capsys.readouterr().err.strip()
+    assert err == "MIA volume 13 is not on archive.org; tracked as a follow-up."
 
 
 def test_moore_ia_is_not_a_celery_job():
