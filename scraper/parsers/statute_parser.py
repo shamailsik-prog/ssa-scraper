@@ -1108,6 +1108,134 @@ def _strategy_3_p_filtered_digit_start(soup: BeautifulSoup, statute_name: str) -
         logger.warning(f"Strategy3 failed: {e}")
         return []
 
+# A period heading the line-start splitter already accepts. The lookahead
+# keeps a gazette date ``12.1975`` from being read as section 12.
+_PERIOD_LINE_HEADING_RE = re.compile(r"(?m)^[ \t]*(\d{1,3})[ \t]*\.(?!\d)")
+_MARGINAL_DASH_RE = re.compile(r"(?:\.-|--|—|–)")
+# ``Committees.--The Board`` and ``Finality of determination.-The``.
+_MARGINAL_NOTE_LINE_RE = re.compile(
+    r"^[ \t]*[A-Za-z][A-Za-z,'’\-]{0,40}"
+    r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,14}"
+    r"(?:\.-|--|—|–)"
+)
+
+
+def _apply_span_replacements(text: str, spans: Sequence[Tuple[int, int, str]]) -> str:
+    for start, end, replacement in sorted(spans, key=lambda item: item[0], reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _renumber_duplicate_ocr_heading(text: str) -> str:
+    """A second ``35.`` whose next heading is ``37.`` is section 36.
+
+    The 6 was read as 5, so the row collides with the real section 35 and
+    ``_deduplicate_sections`` drops it. The following heading being exactly
+    two ahead is the gap. A repeated number whose neighbour is the next
+    integer stays a repeat.
+    """
+    matches = list(_PERIOD_LINE_HEADING_RE.finditer(text))
+    spans: List[Tuple[int, int, str]] = []
+    for index, match in enumerate(matches):
+        if index == 0 or index + 1 >= len(matches):
+            continue
+        current = int(match.group(1))
+        previous = int(matches[index - 1].group(1))
+        following = int(matches[index + 1].group(1))
+        if previous != current or following != current + 2 or current >= 400:
+            continue
+        window = text[match.end() : match.end() + 200]
+        if not _MARGINAL_DASH_RE.search(window):
+            continue
+        spans.append((match.start(1), match.end(1), str(current + 1)))
+    return _apply_span_replacements(text, spans)
+
+
+def _next_content_line(text: str, after: int) -> str:
+    for line in text[after:].splitlines():
+        if line.strip():
+            return line
+    return ""
+
+
+def _repair_one_heading_gap(slice_text: str, missing: int) -> str:
+    """Rewrite one swallowed heading inside the text between ``N.`` and ``N+2.``.
+
+    Readable forms win: ``22, Title`` and ``. 5.``. An unreadable stub
+    (``t.`` or ``rt4.``) is used only when the next line is a marginal note.
+    Junk glued to that note (``i-'Ft+. Other functions ….-``) is the same
+    repair. An ordinary word, or more than one candidate, is left alone.
+    """
+    comma = re.compile(
+        rf"(?m)^(?P<indent>[ \t]*){missing}(?P<gap>[ \t]*),(?P<rest>[ \t]+[A-Z][A-Za-z]{{3,}})"
+    )
+    found = comma.search(slice_text)
+    if found:
+        repaired = f"{found.group('indent')}{missing}.{found.group('rest')}"
+        return slice_text[: found.start()] + repaired + slice_text[found.end() :]
+    stray = re.compile(rf"(?m)^[ \t]*[^\w\n]{{0,6}}{missing}[ \t]*\.[ \t]*$")
+    found = stray.search(slice_text)
+    if found:
+        return slice_text[: found.start()] + f"{missing}." + slice_text[found.end() :]
+
+    stub_re = re.compile(r"(?m)^[ \t]*(?P<tok>\S{1,8})[ \t]*\.[ \t]*$")
+    stubs: List[Match[str]] = []
+    for match in stub_re.finditer(slice_text):
+        token = match.group("tok")
+        if token.isdigit():
+            continue
+        single_letter = bool(re.fullmatch(r"[A-Za-z]", token))
+        has_digit = any(char.isdigit() for char in token)
+        has_punct = any(not char.isalnum() for char in token)
+        if not (single_letter or has_digit or has_punct):
+            continue
+        if not _MARGINAL_NOTE_LINE_RE.match(_next_content_line(slice_text, match.end())):
+            continue
+        stubs.append(match)
+    if len(stubs) == 1:
+        match = stubs[0]
+        return slice_text[: match.start()] + f"{missing}." + slice_text[match.end() :]
+
+    inline_re = re.compile(
+        r"(?m)^(?P<prefix>[ \t]*[^\s\d][^\n]{0,16})\.[ \t]+"
+        r"(?P<title>[A-Z][A-Za-z,'’\-]*(?:[ \t]+[A-Za-z][A-Za-z,'’\-]*){0,14})"
+        r"(?:\.-|--|—|–)"
+    )
+    inlines: List[Match[str]] = []
+    for match in inline_re.finditer(slice_text):
+        prefix = match.group("prefix").strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z'’\-]*", prefix) or re.fullmatch(r"\d{1,3}", prefix):
+            continue
+        inlines.append(match)
+    if len(inlines) == 1:
+        match = inlines[0]
+        return slice_text[: match.start()] + f"{missing}." + slice_text[match.end("prefix") + 1 :]
+    return slice_text
+
+
+def _repair_ocr_swallowed_section_headings(text: str) -> str:
+    """Restore headings that OCR hid between two period headings one number apart.
+
+    Runs of ``N.`` with no gap are unchanged. ``5l . Power`` has no marginal
+    dash of the ``.-`` / ``--`` form, so it is not promoted over a later
+    ``51. Repeal``.
+    """
+    text = _renumber_duplicate_ocr_heading(text)
+    matches = list(_PERIOD_LINE_HEADING_RE.finditer(text))
+    spans: List[Tuple[int, int, str]] = []
+    for index in range(len(matches) - 1):
+        current = int(matches[index].group(1))
+        following = int(matches[index + 1].group(1))
+        if following != current + 2 or current >= 400:
+            continue
+        start = matches[index].end()
+        end = matches[index + 1].start()
+        repaired = _repair_one_heading_gap(text[start:end], current + 1)
+        if repaired != text[start:end]:
+            spans.append((start, end, repaired))
+    return _apply_span_replacements(text, spans)
+
+
 def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, str]]:
     """
     Strategy 4: re.split digit
@@ -1116,7 +1244,9 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     """
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
-        plain = _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        plain = _repair_ocr_swallowed_section_headings(
+            _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        )
         # Line-start headings ("2. In this Act") plus marginal-note headings
         # ("Short title, 1. (1) This Act"). The second form is how a two-column
         # gazette extract places every section except the one whose note wrapped.
