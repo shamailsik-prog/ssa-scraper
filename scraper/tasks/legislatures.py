@@ -22,6 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.fetchers import has_pdf_signature
 from scraper.statute_image_gate import statute_url_is_image
+from scraper.statute_non_legislation_gate import (
+    sindhlaws_html_statute_reject_reason,
+    sindhlaws_non_statute_html_url,
+)
 from scraper.models import CrawlFrontier, ScraperSource
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
 from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, _url_looks_like_pdf, run_public_source
@@ -1182,7 +1186,7 @@ class BalochistanAssemblyPipeline(PublicPipeline):
     ) -> int:
         added = 0
         for url, meta in docs.items():
-            if statute_url_is_image(url):
+            if statute_url_is_image(url) or sindhlaws_non_statute_html_url(url):
                 self.stats["rejected_urls"] += 1
                 continue
             kind = str(meta.get("target_kind") or default_target_kind)
@@ -1256,6 +1260,13 @@ class BalochistanAssemblyPipeline(PublicPipeline):
         url = fr.query_json.get("url")
         route = {**(fr.query_json.get("route") or {}), "frontier": fr.query_key}
         expect_pdf = bool(fr.query_json.get("expect_pdf"))
+        html_reason = sindhlaws_html_statute_reject_reason(kind=str(kind or ""), url=str(url or ""))
+        if html_reason:
+            fr.status = "retired"
+            fr.last_error = html_reason[:1000]
+            self.stats["rejected_urls"] += 1
+            await self.db.flush()
+            return "ok"
         try:
             res = await self.fetch(url)
             if res.verdict.kind in ("verification", "login"):
@@ -2277,7 +2288,7 @@ class SindhAssemblyPipeline(BalochistanAssemblyPipeline):
         # GalleryImages/*.jpeg (WhatsApp scans) are not statute documents. The
         # setup/publications classifier already ignores them; count the reject
         # so a gazette table row cannot be ingested as text.
-        if statute_url_is_image(normalized):
+        if statute_url_is_image(normalized) or sindhlaws_non_statute_html_url(normalized):
             self.stats["rejected_urls"] += 1
             return
         try:

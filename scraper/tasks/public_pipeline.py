@@ -34,6 +34,10 @@ from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.extractors.scrapegraph_managed import ManagedScrapeGraphEngine
 from scraper.fetchers import FetchResult, HttpFetcher, has_pdf_signature, pdf_text_with_ocr, record_provenance, stage_judgment, stage_statute, statute_staging_identity_url
 from scraper.statute_image_gate import image_statute_reject_reason, statute_url_is_image
+from scraper.statute_non_legislation_gate import (
+    sindhlaws_html_statute_reject_reason,
+    sindhlaws_non_statute_html_url,
+)
 from scraper.models import CrawlFrontier, ScraperJob, ScraperSource
 from scraper.notify import notify
 from scraper.parsers.text_cleaner import clean_html
@@ -128,7 +132,7 @@ class PublicPipeline:
         out: List[str] = []
         for a in soup.find_all("a", href=True):
             href = urljoin(base_url, a["href"].strip())
-            if statute_url_is_image(href):
+            if statute_url_is_image(href) or sindhlaws_non_statute_html_url(href):
                 self.stats["rejected_urls"] += 1
                 continue
             label = a.get_text(" ", strip=True)
@@ -143,7 +147,9 @@ class PublicPipeline:
         """Write discovered URLs into crawl_frontier (tier 0 = public document frontier)."""
         added = 0
         for url in urls:
-            if kind in ("statute", "instrument") and statute_url_is_image(url):
+            if kind in ("statute", "instrument") and (
+                statute_url_is_image(url) or sindhlaws_non_statute_html_url(url)
+            ):
                 self.stats["rejected_urls"] += 1
                 continue
             key = f"{kind}:{url}"
@@ -355,6 +361,16 @@ class PublicPipeline:
             self.stats["rejected_urls"] += 1
             logger.warning("%s: %s %s", self.source.source_name, image_reason, res.final_url or res.url)
             return "rejected_image"
+        html_reason = sindhlaws_html_statute_reject_reason(
+            kind=kind,
+            url=res.final_url or res.url or "",
+        )
+        if html_reason is None and res.url:
+            html_reason = sindhlaws_html_statute_reject_reason(kind=kind, url=res.url)
+        if html_reason:
+            self.stats["rejected_urls"] += 1
+            logger.warning("%s: %s %s", self.source.source_name, html_reason, res.final_url or res.url)
+            return "rejected_non_statute_html"
         meta = dict(meta or {})
         for key in ("act_title", "detail_title", "act_no", "act_year", "detail_url", "source_section", "jurisdiction"):
             if not meta.get(key) and route.get(key):
@@ -611,6 +627,13 @@ class PublicPipeline:
         kind = fr.query_json.get("kind", "judgment")
         url = fr.query_json.get("url")
         route = {**(fr.query_json.get("route") or {}), "frontier": fr.query_key}
+        html_reason = sindhlaws_html_statute_reject_reason(kind=str(kind or ""), url=str(url or ""))
+        if html_reason:
+            fr.status = "retired"
+            fr.last_error = html_reason[:1000]
+            self.stats["rejected_urls"] += 1
+            await self.db.flush()
+            return "ok"
         try:
             res = await self.fetch(url)
             if res.verdict.kind in ("verification", "login"):

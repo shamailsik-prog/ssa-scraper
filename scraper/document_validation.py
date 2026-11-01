@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from scraper.config import settings
 from scraper.statute_image_gate import is_binary_garbage_text
+from scraper.statute_non_legislation_gate import BARE_NAME_REASON, title_lacks_legislative_word
 from scraper.statute_quality.garbled_ocr import garbled_ocr_unreadable_reason
 from scraper.statute_quality.ocr_section_mash import VERDICT_MISMATCH, classify_ocr_section_mash
 
@@ -88,6 +89,9 @@ def validate_statute_reconciled_json(
     )
     if verdict.verdict == VERDICT_MISMATCH:
         return False, verdict.reason
+    name = str(payload.get("statute_name") or "").strip()
+    if name and title_lacks_legislative_word(name):
+        return False, BARE_NAME_REASON
     return True, ""
 
 
