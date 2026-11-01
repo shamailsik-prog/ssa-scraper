@@ -19,6 +19,7 @@ from scraper.fetchers import canonical_text_hash
 from scraper.parsers.bench_parser import bench_type_for_size, normalise_judge_name
 from scraper.config import settings
 from scraper.parsers.citation_extractor import extract_citations, normalise_citation
+from scraper.parsers.statute_parser import is_tariff_schedule_section
 from scraper.unreported import SOURCE_COURT_CODE, court_website_unreported_enabled, unreported_hold_reason
 
 MANDATORY_JUDGMENT_FIELDS = ("citations", "court", "year", "full_text_candidate")
@@ -424,6 +425,9 @@ def reconcile_statute(*, deterministic: Dict[str, Any], ai: Optional[Dict[str, A
                         tgt[k] = ev
             else:
                 txt = str(s.get("section_text") or "")
+                if is_tariff_schedule_section(num, txt):
+                    conflicts.append({"field": "sections", "ai": num, "reason": "tariff schedule row"})
+                    continue
                 if txt and _norm_ws(txt)[:80] in norm_raw and re.search(rf"(?m)^\s*{re.escape(num)}\b", raw_text):
                     s = dict(s)
                     s["section_text"] = txt
