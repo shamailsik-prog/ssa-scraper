@@ -463,6 +463,114 @@ def _select_heading_matches(
     return kept
 
 
+# ``(2)`` read with the opening parenthesis as a digit: ``12) "Board" means``.
+# The ``1`` is the parenthesis, not a tens place. A period heading (``12.``)
+# is a real section and is not this pattern.
+_DEFINITIONS_CONTEXT_RE = re.compile(
+    r"(?is)\b(?:defi\w{3,16}\b|in\s+this\s+act\s*,?\s*unless\b)"
+)
+_PAREN_DEF_CLAUSE_RE = re.compile(r"\(\s*(\d{1,2}|[lI])\s*\)")
+_OCR_QUOTED_CLAUSE_RE = re.compile(
+    r"(?m)(?<![\d(])1(\d{1,2})\)[ \t]*[\"'“”‘’:]"
+)
+_QUOTED_DEFINITION_START_RE = re.compile(r"""(?s)^\s*["'“”‘’:]""")
+
+
+def _heading_closer(text: str, match: Match[str]) -> str:
+    for char in text[match.end(1) : match.end()]:
+        if char in ".-):]":
+            return char
+    return ""
+
+
+def _next_definition_clause(text: str, start: int, end: int) -> int:
+    """Clause number that should follow the markers already seen in this block."""
+    last = 0
+    for match in _PAREN_DEF_CLAUSE_RE.finditer(text, start, end):
+        raw = match.group(1)
+        number = 1 if raw in "lI" else int(raw)
+        if 1 <= number <= 40:
+            last = max(last, number)
+    for match in _OCR_QUOTED_CLAUSE_RE.finditer(text, start, end):
+        number = int(match.group(1))
+        if 1 <= number <= 40:
+            last = max(last, number)
+    return last + 1
+
+
+def _is_ocr_definition_clause(text: str, match: Match[str], block_start: int) -> bool:
+    """True for ``12)`` when it continues ``(1)`` as clause 2 inside definitions."""
+    if _heading_closer(text, match) != ")":
+        return False
+    expected = _next_definition_clause(text, block_start, match.start())
+    if not 1 <= expected <= 40:
+        return False
+    token = (match.group(1) or "").strip()
+    if token != f"1{expected}":
+        return False
+    return bool(_QUOTED_DEFINITION_START_RE.match(text[match.end() : match.end() + 40]))
+
+
+def _is_shadowed_paren_subsection(text: str, matches: Sequence[Match[str]], index: int) -> bool:
+    """``12)`` after a real ``12.`` when ``(1)`` precedes it and ``(3)`` follows.
+
+    The digit is the parenthesis. Dropping the split keeps the subsection on
+    the section that contains it. A ``12)`` with no earlier ``12.`` stays a heading.
+    """
+    match = matches[index]
+    if _heading_closer(text, match) != ")":
+        return False
+    token = (match.group(1) or "").strip()
+    earlier_period = any(
+        _heading_closer(text, prior) == "." and (prior.group(1) or "").strip() == token
+        for prior in matches[:index]
+    )
+    if not earlier_period:
+        return False
+    previous_end = matches[index - 1].end() if index else 0
+    expected = _next_definition_clause(text, previous_end, match.start())
+    if token != f"1{expected}":
+        return False
+    next_period = next(
+        (later for later in matches[index + 1 :] if _heading_closer(text, later) == "."),
+        None,
+    )
+    span_end = next_period.start() if next_period is not None else len(text)
+    following = re.compile(rf"\(\s*{expected + 1}\s*\)")
+    return bool(following.search(text, match.end(), span_end))
+
+
+def _drop_shadowed_paren_ocr_subsections(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
+    return [
+        match
+        for index, match in enumerate(matches)
+        if not _is_shadowed_paren_subsection(text, matches, index)
+    ]
+
+
+def _drop_ocr_definition_clause_headings(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
+    """Keep a parenthesis-as-1 definition clause inside the section that opened it.
+
+    The block opens on a definitions heading and closes at the next heading
+    that is not itself one of these clauses. ``12. Regulation`` stays a
+    section. ``12) Penalties`` outside that block stays a section.
+    """
+    kept: List[Match[str]] = []
+    in_definitions = False
+    block_start = 0
+    for match in matches:
+        if in_definitions and _is_ocr_definition_clause(text, match, block_start):
+            continue
+        kept.append(match)
+        window = text[match.start() : match.start() + 320]
+        if _DEFINITIONS_CONTEXT_RE.search(window):
+            in_definitions = True
+            block_start = match.end()
+        else:
+            in_definitions = False
+    return kept
+
+
 def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
     """Drop split points that are year citations ('of 1860)', '2001) dt.').
 
@@ -935,6 +1043,8 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         # the previous section and the footnote filter would discard that section.
         # A year token on its own line (``2018.``) is the separate 1800–2099 class.
         matches = _filter_year_heading_matches(plain, matches)
+        matches = _drop_ocr_definition_clause_headings(plain, matches)
+        matches = _drop_shadowed_paren_ocr_subsections(plain, matches)
         sections = []
         if len(matches) >= 2:
             for i, m in enumerate(matches):
