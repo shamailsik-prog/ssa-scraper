@@ -100,6 +100,18 @@ _MARGINAL_SECTION_HEAD_RE = re.compile(
     r")"
     r"(?=(?:[\(\[\{]\s*\d|@\)|[A-Z]))"
 )
+# The word immediately before a marginal number. "Section 5. The" and
+# "under section 12. (1)" are cross-references, not headings.
+_CROSS_REF_PRIOR_RE = re.compile(
+    r"(?i)(?:sub-?sections?|sections?|clauses?|rules?|articles?|schedules?)\s*$"
+)
+_LINE_START_SECTION_RE = re.compile(
+    r"(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*",
+    re.MULTILINE,
+)
+# Used only when line-start and marginal headings together find fewer than two
+# sections. Same cross-reference and sequence rules as a marginal heading.
+_LOOSE_SECTION_RE = re.compile(r"(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])")
 SHORT_TITLE_CLAUSE_RE = re.compile(
     r'^\s*(?:section\s+\d+[A-Z]?\s*[\.\-\)\:]\s*)?(?:short\s+title[^.:\n]*[:\-\.\)]\s*)?(?:this|the)\s+'
     r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
@@ -187,7 +199,7 @@ def _extract_number_title_from_chunk(chunk: str) -> Tuple[Optional[str], str, st
     marginal = _MARGINAL_SECTION_HEAD_RE.match(chunk_clean)
     if marginal:
         num = marginal.group(1).strip()
-        note = chunk_clean[: marginal.start(1)].strip(" .,:;-–—")
+        note = _usable_marginal_title(chunk_clean[: marginal.start(1)])
         rest = chunk_clean[marginal.end() :].strip()
         title = note or _derive_title(rest)
         return num, title, chunk_clean
@@ -388,6 +400,66 @@ def _merge_heading_matches(*groups: Sequence[Match[str]]) -> List[Match[str]]:
             continue
         kept.append(match)
         covered_until = match.end()
+    return kept
+
+
+def _usable_marginal_title(note: str) -> str:
+    """Drop an OCR scrap such as ``ONS ine`` and keep ``Short title`` or ``Definitions``.
+
+    A real marginal note is title case. A word with no lowercase letter is scanner junk.
+    """
+    words = re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)*", note or "")
+    if not words or any(word == word.upper() for word in words):
+        return ""
+    return (note or "").strip(" .,:;-–—")
+
+
+def _heading_parts(token: str) -> Tuple[Optional[int], str]:
+    match = re.fullmatch(r"(\d+)([A-Za-z]*)", (token or "").strip())
+    if not match:
+        return None, ""
+    return int(match.group(1)), match.group(2).upper()
+
+
+def _heading_continues(token: str, previous: Optional[str]) -> bool:
+    """A marginal heading may be the next integer, or 2A after 2 / 2B after 2A."""
+    number, letter = _heading_parts(token)
+    if number is None or is_exact_year_section_number(token):
+        return False
+    if previous is None:
+        return True
+    prev_number, prev_letter = _heading_parts(previous)
+    if prev_number is None:
+        return True
+    if letter == "" and number == prev_number + 1:
+        return True
+    return bool(letter) and number == prev_number and letter != prev_letter
+
+
+def _cross_ref_prior(text: str, match: Match[str]) -> bool:
+    return bool(_CROSS_REF_PRIOR_RE.search(text[: match.start(1)]))
+
+
+def _select_heading_matches(
+    text: str,
+    line_start: Sequence[Match[str]],
+    extras: Sequence[Match[str]],
+) -> List[Match[str]]:
+    """Keep line-start headings. Keep a marginal or loose heading only when it is not a cross-reference and it continues the previous number."""
+    line_pos = {match.start(1) for match in line_start}
+    previous: Optional[str] = None
+    kept: List[Match[str]] = []
+    for match in _merge_heading_matches(line_start, extras):
+        token = (match.group(1) or "").strip()
+        if match.start(1) in line_pos:
+            kept.append(match)
+            if not is_exact_year_section_number(token):
+                previous = token
+            continue
+        if _cross_ref_prior(text, match) or not _heading_continues(token, previous):
+            continue
+        kept.append(match)
+        previous = token
     return kept
 
 
@@ -847,12 +919,15 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         # Line-start headings ("2. In this Act") plus marginal-note headings
         # ("Short title, 1. (1) This Act"). The second form is how a two-column
         # gazette extract places every section except the one whose note wrapped.
-        line_start = list(re.finditer(r'(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*', plain, re.MULTILINE))
+        line_start = list(_LINE_START_SECTION_RE.finditer(plain))
         marginal = list(_MARGINAL_SECTION_HEAD_RE.finditer(plain))
-        matches = _merge_heading_matches(line_start, marginal)
+        # Marginal headings are not a Baloch-only path: the same matcher used to
+        # turn "Section 5. The" into a section in any plain-text act. Cross-reference
+        # words and the previous+1 rule apply here and to the loose fallback.
+        matches = _select_heading_matches(plain, line_start, marginal)
         if len(matches) < 2:
-            # try alternative without newline requirement
-            matches = list(re.finditer(r'(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])', plain))
+            loose = list(_LOOSE_SECTION_RE.finditer(plain))
+            matches = _select_heading_matches(plain, line_start, [*marginal, *loose])
         # A line opening ``11.10.2018`` matches the day as a heading. Leave the
         # match in place so the note stays its own chunk. ``_deduplicate_sections``
         # refuses that chunk as a heading and parks the text on the neighbouring

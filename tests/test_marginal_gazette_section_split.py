@@ -9,7 +9,9 @@ Control Act that heading is section 2, and sections 1 and 3–15 stay inside it
 A normal line-start act still loses only its distribution-list footer.
 """
 
-from scraper.parsers.statute_parser import split_into_sections
+import re
+
+from scraper.parsers.statute_parser import _merge_heading_matches, split_into_sections
 from scraper.statute_quality.distribution_list import strip_distribution_list_footer
 from scraper.statute_quality.section_reextract import gate_section_reextract
 
@@ -124,6 +126,7 @@ Establishment 3. (1) The Government shall establish an Institute under this Act.
 """
     sections = split_into_sections(text, "The Example Institute Act, 2025")
     bodies = _by_number(sections)
+    assert "ONS" not in sections[0]["section_title"]
     assert "may be called" in bodies["1"]
     assert "extend to the whole" in bodies["1"]
     assert "unless the context otherwise requires" in bodies["2"]
@@ -155,3 +158,72 @@ def test_line_start_act_still_strips_distribution_footer_only():
     gate = gate_section_reextract(before, before[:6])
     assert gate.verdict == "PASS"
     assert gate.reason == ""
+
+
+def test_cross_reference_lines_do_not_invent_sections_5_and_12():
+    """Auditor shape: 'Section 5. The offence' and 'under section 12. (1)' stay inside s.2."""
+    text = """
+1. Short title. This Act may be called the Example Offences Act and it extends to the whole Province.
+2. Penalty. The penalty provisions of
+Section 5. The offence is punishable with imprisonment or with fine.
+Anything done under section 12. (1) of the Code shall continue to apply.
+3. Savings. Anything duly done under this Act shall continue in force.
+"""
+    sections = split_into_sections(text, "The Example Offences Act")
+    assert [section["section_number"] for section in sections] == ["1", "2", "3"]
+    bodies = _by_number(sections)
+    assert "Section 5. The offence" in bodies["2"]
+    assert "section 12. (1)" in bodies["2"]
+    assert "continue in force" in bodies["3"]
+
+
+def test_next_numbered_section_word_does_not_steal_the_real_section():
+    """'Section 5.' is the next integer and still is not a heading. The real s.5 follows."""
+    text = """
+1. Short title. This Act may be called the Example Act and it extends to the Province.
+2. Scope. This Act applies throughout the Province from the appointed day.
+3. Definitions. In this Act Board means the Board established under this Act.
+4. Powers. The Board shall exercise the powers in
+Section 5. The offence of obstruction is punishable with fine.
+5. Appeal. Any person aggrieved may appeal within thirty days.
+"""
+    sections = split_into_sections(text, "The Example Act")
+    bodies = _by_number(sections)
+    assert [section["section_number"] for section in sections] == ["1", "2", "3", "4", "5"]
+    assert "offence of obstruction" in bodies["4"]
+    assert "may appeal within thirty days" in bodies["5"]
+
+
+def test_out_of_sequence_marginal_note_stays_inside_the_previous_section():
+    text = """
+1. Short title. This Act may be called the Example Act and it extends to the Province.
+2. Scope. This Act applies to every person in the Province.
+Penalty 5. The offence is punishable with fine only.
+Power 12. (1) The court may award compensation to the complainant.
+3. Savings. Anything duly done under this Act shall continue in force.
+"""
+    sections = split_into_sections(text, "The Example Act")
+    assert [section["section_number"] for section in sections] == ["1", "2", "3"]
+    bodies = _by_number(sections)
+    assert "punishable with fine only" in bodies["2"]
+    assert "award compensation" in bodies["2"]
+    assert "continue in force" in bodies["3"]
+
+
+def test_lettered_marginal_variant_continues_the_previous_number():
+    text = """
+1. Short title. This Act may be called the Example Act and it extends to the Province.
+2. Scope. This Act applies to every person in the Province.
+Inserted 2A. This inserted provision shall apply to the special case and to no other person.
+3. Savings. Anything duly done under this Act shall continue in force.
+"""
+    sections = split_into_sections(text, "The Example Act")
+    assert [section["section_number"] for section in sections] == ["1", "2", "2A", "3"]
+
+
+def test_overlapping_heading_matches_keep_the_earliest_number():
+    text = "12. Section 3. The later number sits inside the first heading span."
+    wide = list(re.finditer(r"(12)\.\s+Section\s+3\.", text))
+    later = list(re.finditer(r"(3)\.\s+The", text))
+    kept = _merge_heading_matches(later, wide)
+    assert [match.group(1) for match in kept] == ["12"]
