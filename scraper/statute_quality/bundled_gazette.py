@@ -13,6 +13,11 @@ Unresolved text is not split: storing a mixture is worse than storing nothing.
 An ``ACT No.`` glued into the middle of a section is a boundary when ``An Act``
 follows it, including when that next act's section 1 was not read. A citation
 tail (``Act No. ….- In the``) stays with the amending act.
+
+A scanned heading still counts when ``ACT`` is ``AC_l`` or ``{-CT``, ``of`` is
+``on``, ``or``, or missing, ``T`` in the roman numeral is ``I``,
+or the preamble is ``.4 Act``. ``Acr No. xt`` is not a heading. See
+``docs/BUNDLED_GAZETTE_ACTS.md``.
 """
 
 from __future__ import annotations
