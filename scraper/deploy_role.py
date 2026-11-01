@@ -21,7 +21,8 @@ from scraper.config import settings
 LOGIN_ONLY_BEAT_ENTRIES = frozenset(
     {
         "recover-login-slots", "pls-keepalive", "pls-stall-watchdog", "spot-check-judgments",
-        "pls-search-harvest", "pls-search-harvest-s2", "pls-caseid-walk", "pls-caseid-walk-p1",
+        "pls-search-harvest", "pls-search-harvest-s2", "pls-seed-snowball",
+        "pls-caseid-walk", "pls-caseid-walk-p1",
     }
 )
 # Beat entries that only make sense where the free sites are harvested (statutes come from them).

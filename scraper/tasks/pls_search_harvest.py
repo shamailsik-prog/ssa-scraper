@@ -232,7 +232,13 @@ async def seed_extended_plan(
     return {("would_insert" if dry_run else "inserted"): len(to_add), "courts": len(courts), "judges": len(judges), "statutes": len(statutes), "years": len(years)}
 
 
-async def seed_snowball(db: AsyncSession, *, limit: int = 2000, dry_run: bool = False) -> Dict[str, Any]:
+async def seed_snowball(
+    db: AsyncSession,
+    *,
+    limit: int = 2000,
+    dry_run: bool = False,
+    max_queries: Optional[int] = None,
+) -> Dict[str, Any]:
     """Phase 5: citations that appear inside downloaded PLS judgments but are not in the corpus become citation
     lookups. A round that adds no new query means the snowball has converged."""
     from scraper.models import Judgment
@@ -257,9 +263,20 @@ async def seed_snowball(db: AsyncSession, *, limit: int = 2000, dry_run: bool = 
         added += 1
         if not dry_run:
             db.add(PlsSearchHarvestQuery(source_name=SOURCE_NAME, query_key=key, query_json=q, status="pending", priority=200))
+        if max_queries is not None and added >= max_queries:
+            break
     if not dry_run:
         await db.flush()
-    return {"judgments_scanned": len(rows), "distinct_cited": len(cited), "not_in_corpus": len(fresh), "queries_added": added, "converged": added == 0}
+    out = {
+        "judgments_scanned": len(rows),
+        "distinct_cited": len(cited),
+        "not_in_corpus": len(fresh),
+        "queries_added": added,
+        "converged": added == 0,
+    }
+    if max_queries is not None and added >= max_queries and len(fresh) > added:
+        out["truncated_at_max_queries"] = max_queries
+    return out
 
 
 async def completeness_report(db: AsyncSession, *, known_sample: int = 200) -> Dict[str, Any]:
@@ -1171,6 +1188,23 @@ def _continue_slot(result: Dict[str, Any]) -> Optional[int]:
         return None
     slot = result.get("slot")
     return int(slot) if slot in SEARCH_HARVEST_SLOTS else None
+
+
+SEED_SNOWBALL_TICK_HARD_CAP = 200
+
+
+@shared_task(name="scraper.tasks.pls_search_harvest.pls_seed_snowball_tick")
+def pls_seed_snowball_tick(limit: int = SEED_SNOWBALL_TICK_HARD_CAP) -> Dict[str, Any]:
+    """Daily maintenance tick: insert citation lookups from promoted judgment text (DB-only, no login)."""
+    capped = min(int(limit), SEED_SNOWBALL_TICK_HARD_CAP)
+
+    async def _inner() -> Dict[str, Any]:
+        async with SessionLocal() as db:
+            out = await seed_snowball(db, dry_run=False, max_queries=capped)
+            await db.commit()
+            return out
+
+    return run_async(_inner())
 
 
 def queue_search_harvest_ticks(app, *, slots=SEARCH_HARVEST_SLOTS) -> List[int]:

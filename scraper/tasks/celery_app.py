@@ -65,6 +65,7 @@ app.conf.update(
         "scraper.tasks.pls_self_healing.pls_keepalive_hourly": {"queue": "login_session"},
         "scraper.tasks.pls_self_healing.pls_stall_watchdog": {"queue": "login_session"},
         "scraper.tasks.pls_search_harvest.pls_search_harvest_tick": {"queue": "login_session"},
+        "scraper.tasks.pls_search_harvest.pls_seed_snowball_tick": {"queue": "maintenance"},
         "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
@@ -141,8 +142,22 @@ def search_harvest_beat_entries() -> dict:
     }
 
 
+def pls_seed_snowball_beat_entry() -> dict:
+    """One capped snowball seed per day while search harvest is enabled (DB-only on maintenance)."""
+    from scraper.tasks.pls_search_harvest import SEED_SNOWBALL_TICK_HARD_CAP
+
+    return {
+        "pls-seed-snowball": {
+            "task": "scraper.tasks.pls_search_harvest.pls_seed_snowball_tick",
+            "schedule": 86400,
+            "kwargs": {"limit": SEED_SNOWBALL_TICK_HARD_CAP},
+        }
+    }
+
+
 if settings.PLS_SEARCH_HARVEST_ENABLED:
     app.conf.beat_schedule.update(search_harvest_beat_entries())
+    app.conf.beat_schedule.update(pls_seed_snowball_beat_entry())
 if settings.PLS_CASEID_WALK_ENABLED:
     # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
     for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):
