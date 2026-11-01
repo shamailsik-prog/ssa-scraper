@@ -308,7 +308,10 @@ async def undo_run(db: AsyncSession, run_id: str) -> Dict[str, int]:
     result = await db.execute(
         delete(DocumentQuarantine).where(
             DocumentQuarantine.run_id == run_id,
-            DocumentQuarantine.reason.like("senate_integrity:%"),
+            or_(
+                DocumentQuarantine.reason.like("senate_integrity:%"),
+                DocumentQuarantine.reason == "name_s1_mismatch",
+            ),
         )
     )
     removed = int(result.rowcount or 0)

@@ -25,6 +25,13 @@ stored name is wrong. Two different act numbers are a bundled gazette and
 stay on the segment path. An OCR-same title, including PCSIR, is not this
 signal. A year stored as a section number is still a separate sweep.
 
+Stored section 1 is compared with the stored name on its own. ``This Act may
+be called X`` (including ``called as``) that names a different instrument is
+``name_s1_mismatch``, including when the PDF prints several acts and the
+section text is present in one of them. A heading that only says ``Short
+title`` does not agree with that called title. An OCR-same called title is
+not this signal. ``--apply`` quarantines it and does not rewrite the name.
+
 A definitions line (``'term' means the Companies Ordinance, 1984``) is not
 that short title. It does not agree with the stored name, and it does not
 block the act-number year check. ``may be called`` still matches when one
@@ -60,6 +67,7 @@ ACTION_QUARANTINE = "quarantine"
 ACTION_NEEDS_REEXTRACT = "needs_reextract"
 
 REASON_URL_MISMATCH = "senate_integrity:url_act_mismatch"
+REASON_NAME_S1 = "name_s1_mismatch"
 REASON_PARTIAL_REEXTRACT = "senate_integrity:partial_needs_reextract"
 REASON_PARTIAL_IDENTITY = "senate_integrity:partial_identity"
 
@@ -93,10 +101,11 @@ _TOKEN_STOP = frozenset(
 # stay on the ordinary OCR table.
 _CALLED_TITLE_RE = re.compile(
     r"(?is)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+"
-    r"c[a-z]lled\s+(?:the\s+)?"
+    r"c[a-z]lled(?:\s+as)?\s+(?:the\s+)?"
     r"(?P<title>(?:[^.;\n]|[ \t]*\n[ \t]*){6,240}?"
     r"\b(?:act|ordinance|order|rules|regulations)\b[^.;\n]{0,48})"
 )
+_SECTION_ONE_RE = re.compile(r"1\.?")
 _TITLE_GLYPHS = str.maketrans({"€": "e"})
 _GLUED_INSTRUMENT_RE = re.compile(r"([a-z])(?=(?:Act|Ordinance|Order|Rules|Regulations)\b)")
 _OCR_PERIOD_YEAR_RE = re.compile(
@@ -135,8 +144,11 @@ _YEAR_OCR = str.maketrans(
         "z": "2",
     }
 )
+# Not only at line start. A later act is sometimes glued into the preceding
+# section (``...roll. ACT No. XLII of 1975 An Act further to amend...``).
+# ``_is_act_boundary`` still rejects a citation tail.
 _ACT_NO_HEADING_RE = re.compile(
-    rf"(?im)^[ \t]*act\s+no\.?\s*([IVXLCDM]+|\d{{1,4}})"
+    rf"(?i)(?<![A-Za-z])act\s+no\.?\s*([IVXLCDM]+|\d{{1,4}})"
     rf"(?:[ \t]+of\b)?"
     rf"(?:[ \t]+({_YEAR_TOKEN})\b|[ \t]*\n[ \t]*({_YEAR_TOKEN})\b)"
 )
@@ -633,14 +645,57 @@ def _is_definition_clause_title(title: str) -> bool:
     return bool(_DEFINITION_CLAUSE_RE.search(_collapse(title or "")))
 
 
-def _called_title_in(chunk: str) -> Optional[str]:
+def called_titles_in(chunk: str) -> list[str]:
+    """Short titles from ``may be called`` / ``shall be called``, including ``called as``."""
     scan = _prepare_title_scan(chunk or "")
+    titles: list[str] = []
     for match in _CALLED_TITLE_RE.finditer(scan):
         title = _collapse(match.group("title")).strip(" .")
         if not title or is_gazette_non_act_title(title) or _is_definition_clause_title(title):
             continue
-        return title
-    return None
+        titles.append(title)
+    return titles
+
+
+def _called_title_in(chunk: str) -> Optional[str]:
+    titles = called_titles_in(chunk)
+    return titles[0] if titles else None
+
+
+def _is_section_one(number: str) -> bool:
+    return _SECTION_ONE_RE.fullmatch((number or "").strip()) is not None
+
+
+def name_s1_mismatch(stored_name: str, sections: Sequence[dict]) -> bool:
+    """True when section 1's called title is a different instrument from ``stored_name``.
+
+    The words ``Short title`` in the heading are not the instrument. An
+    OCR-same title, including one letter, is the same instrument. A called
+    title that merely adds ``Amendment`` stays on the act-number path, the
+    same way ``title_relation`` already treats that subset. No called title
+    in section 1 is not a mismatch.
+    """
+    if not is_coherent_act_title(stored_name):
+        return False
+    titles: list[str] = []
+    for section in sections or []:
+        if not _is_section_one(str(section.get("section_number") or "")):
+            continue
+        blob = "\n".join(
+            part
+            for part in (
+                str(section.get("section_title") or ""),
+                str(section.get("section_text") or ""),
+            )
+            if part
+        )
+        titles.extend(called_titles_in(blob))
+    if not titles:
+        return False
+    relations = [title_relation(stored_name, title) for title in titles]
+    if any(relation == "same" for relation in relations):
+        return False
+    return any(relation in {"different", "year_differs"} for relation in relations)
 
 
 def _pdf_word_count(text: str) -> int:
@@ -688,10 +743,40 @@ def _heading_opens_act(text: str, match: re.Match) -> bool:
     return False
 
 
+def _at_line_start(text: str, match: re.Match) -> bool:
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    return text[line_start : match.start()].strip() == ""
+
+
+def _opens_with_an_act(text: str, match: re.Match) -> bool:
+    """True when ``An Act`` is the first text after this ``ACT No.`` heading."""
+    opened = _opening_lines(text, match.end(), limit=1)
+    return bool(opened) and _AN_ACT_OPENING_RE.match(opened[0]) is not None
+
+
 def _is_act_boundary(text: str, match: re.Match) -> bool:
     if _is_citation_act_heading(text, match):
         return False
-    return _heading_opens_act(text, match)
+    if _at_line_start(text, match):
+        return _heading_opens_act(text, match)
+    # Glued into a section tail. Require the preamble immediately. A later
+    # ``1. Short title`` of the same act must not turn a citation into a cut.
+    return _opens_with_an_act(text, match)
+
+
+def section_embeds_next_act(text: str) -> bool:
+    """True when operative text runs into a later ``ACT No.`` / ``An Act`` header.
+
+    A citation (``Act No. LXX of 1973.- In the …``) is not that header. A
+    section that itself opens with ``ACT No.`` is not a tail.
+    """
+    raw = text or ""
+    for match in _ACT_NO_HEADING_RE.finditer(raw):
+        if not _is_act_boundary(raw, match):
+            continue
+        if len(_PDF_WORD_RE.findall(raw[: match.start()])) >= 8:
+            return True
+    return False
 
 
 def _year_token(match: re.Match) -> str:
@@ -742,7 +827,9 @@ def act_segments(
     """Split a Gazette that prints several acts. A single act stays one segment.
 
     A line-start ``Act No.`` is a boundary only when an ``An Act`` preamble or
-    ``1. Short title`` follows within four lines. The year may be the next
+    ``1. Short title`` follows within four lines. An ``Act No.`` glued into a
+    section tail is also a boundary when ``An Act`` is the next text, even
+    when that next act's own section 1 was not read. The year may be the next
     line, and a token such as ``r97J`` still counts: its year is the year the
     neighbouring headings share, or the pipe label's year when none of them
     print a readable year. A citation tail (``.-``, ``In the``, ``, in
@@ -907,7 +994,8 @@ def _verdict(
     signal_tuple = tuple(dict.fromkeys(signals))
     repairable = bool(pdf_title) and not is_gazette_non_act_title(pdf_title)
     if (
-        "act_number_disagrees" in signal_tuple
+        "name_s1_mismatch" in signal_tuple
+        or "act_number_disagrees" in signal_tuple
         or "pdf_title_disagrees" in signal_tuple
         or "name_pdf_mismatch" in signal_tuple
         or (
@@ -915,10 +1003,11 @@ def _verdict(
             and _INCOHERENT_NAME_SIGNALS.intersection(signal_tuple)
         )
     ):
+        reason = REASON_NAME_S1 if "name_s1_mismatch" in signal_tuple else REASON_URL_MISMATCH
         return SenateIntegrityVerdict(
             VERDICT_MISMATCH,
             ACTION_QUARANTINE,
-            REASON_URL_MISMATCH,
+            reason,
             signal_tuple,
             pdf_title,
             pipe_label,
@@ -1064,7 +1153,17 @@ def classify_senate_identity(
             fetch_url,
             False,
         )
+    signals: list[str] = []
+    if name_s1_mismatch(stored_name, body_sections):
+        signals.append("name_s1_mismatch")
     if not pdf_available:
+        if "name_s1_mismatch" in signals:
+            return _verdict(
+                signals=signals,
+                pdf_title=None,
+                pipe_label=pipe_label,
+                fetch_url=fetch_url,
+            )
         return SenateIntegrityVerdict(
             VERDICT_FETCH_FAIL,
             ACTION_NONE,
@@ -1077,7 +1176,6 @@ def classify_senate_identity(
         )
 
     text = pdf_text or ""
-    signals: list[str] = []
     if is_gazette_non_act_title(stored_name):
         signals.append("gazette_header_not_act")
     if is_preamble_junk_name(stored_name):
