@@ -269,6 +269,90 @@ def section_text_starts_with_amendment_date(text: str) -> bool:
     return bool(AMENDMENT_DATE_LINE_RE.match(first))
 
 
+# HS / PCT and Balochistan-AJK services rows: 1–2 digits, a dot, exactly two
+# digits, then a commodity or services word (``08.05 Nuts``, ``98.01 hotels``).
+# OCR reads chapter 08 as ``0E`` and chapter 01 as ``0I``. A clock (``7.30 p.m.``)
+# and a footnote date (``11.10.2018``) use the same NN.NN shape and are not rows.
+_TARIFF_CLOCK_RE = re.compile(r"(?i)^[ap](?:\.?\s*m\.?)(?!\w)")
+_TARIFF_CODE_HEAD_RE = re.compile(
+    r"(?i)^(?P<head>(?:\d{1,2}|0[EI])\.\d{2})(?!\.\d)\.?\s+(?P<rest>\S.*)$"
+)
+_TARIFF_OCR_TOKEN_RE = re.compile(
+    r"(?i)^0[EI]\.?\s+(?P<rest>(?:\d{1,2}|0[EI])\.\d{2}(?!\.\d)\.?\s+\S.*)$"
+)
+_TARIFF_CODE_ONLY_RE = re.compile(r"(?i)^(?:\d{1,2}|0[EI])\.\d{2}\.?$")
+_COMMODITY_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def _tariff_commodity_rest(rest: str) -> str:
+    """Words after the heading code. A second code (``0E. 08.05 Nuts``) is peeled once."""
+    nested = _TARIFF_CODE_HEAD_RE.match((rest or "").strip())
+    if nested:
+        return nested.group("rest")
+    return (rest or "").strip()
+
+
+def _rest_is_commodity_line(rest: str) -> bool:
+    body = _tariff_commodity_rest(rest)
+    if not body or _TARIFF_CLOCK_RE.match(body):
+        return False
+    return bool(_COMMODITY_WORD_RE.match(body))
+
+
+def _line_is_tariff_schedule_heading(line: str) -> bool:
+    raw = (line or "").strip()
+    if not raw:
+        return False
+    ocr = _TARIFF_OCR_TOKEN_RE.match(raw)
+    if ocr:
+        return _rest_is_commodity_line(ocr.group("rest"))
+    match = _TARIFF_CODE_HEAD_RE.match(raw)
+    if not match:
+        return False
+    return _rest_is_commodity_line(match.group("rest"))
+
+
+def section_text_starts_with_tariff_schedule_row(text: str) -> bool:
+    """True when the chunk opens on an HS or services schedule row, not a heading.
+
+    ``08.05 Nuts``, ``32.03 Synthetic organic…``, and ``98.01 hotels`` are
+    schedule lines, including OCR chapter tokens ``0E`` / ``0I``. ``7.`` and
+    ``32.`` stay headings. ``7.30 p.m.`` and ``11.10.2018`` are not schedule rows.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    if _line_is_tariff_schedule_heading(lines[0]):
+        return True
+    if len(lines) >= 2 and _TARIFF_CODE_ONLY_RE.match(lines[0]):
+        return _rest_is_commodity_line(lines[1])
+    return False
+
+
+_HS_SECTION_NUMBER_RE = re.compile(r"(?i)^\d{1,2}\.\d{2}$")
+_OCR_HS_SECTION_NUMBER_RE = re.compile(r"(?i)^0[EI]$")
+
+
+def is_tariff_schedule_section(number: str, text: str) -> bool:
+    """True when this id/text pair is a schedule row rather than an Act section.
+
+    The splitter stores the chapter (``32``) and leaves ``32.03`` at the start
+    of the text. A later pass can store the heading token itself as the id
+    and the commodity words as the text. ``7.30`` with ``p.m.`` is a clock.
+    """
+    if section_text_starts_with_tariff_schedule_row(text):
+        return True
+    num = (number or "").strip()
+    body = (text or "").strip()
+    if _HS_SECTION_NUMBER_RE.fullmatch(num):
+        if _rest_is_commodity_line(body):
+            return True
+        return section_text_starts_with_tariff_schedule_row(f"{num} {body}".strip())
+    if _OCR_HS_SECTION_NUMBER_RE.fullmatch(num):
+        return section_text_starts_with_tariff_schedule_row(body)
+    return False
+
+
 def year_section_fits_sequence(number: int, siblings: Sequence[Tuple[str, int]]) -> bool:
     """A year-shaped heading is real only when it continues this act's section numbers.
 
@@ -850,6 +934,15 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
             if text.strip() and out:
                 _append_section_text(out[-1], text)
             continue
+        # HS / services rows (``08.05 Nuts``, ``98.01 hotels``, OCR ``0E`` / ``0I``)
+        # are schedule text. Park them on the previous real section. A leading row
+        # has no section to join and is not numbered. Checked before the 20-character
+        # floor so a short ``98.01 hotels`` is kept, and before the duplicate-number
+        # drop so the row cannot take the place of a later ``32. Definitions``.
+        if section_text_starts_with_tariff_schedule_row(text):
+            if text.strip() and out:
+                _append_section_text(out[-1], text)
+            continue
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue
@@ -1051,7 +1144,9 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
                 start = m.start()
                 end = matches[i + 1].start() if i + 1 < len(matches) else len(plain)
                 chunk = plain[start:end].strip()
-                if len(chunk) < 15:
+                # A short HS row (``98.01 hotels``) is still schedule text. The
+                # 15-character floor would drop it between two longer headings.
+                if len(chunk) < 15 and not section_text_starts_with_tariff_schedule_row(chunk):
                     continue
                 num, title, body = _extract_number_title_from_chunk(chunk)
                 if num:
