@@ -211,6 +211,7 @@ def test_defer_pls_grid_when_stalled_for_search_harvest():
     from scraper.pls_grid_health import pls_search_harvest_may_run
 
     old = settings.PLS_SEARCH_HARVEST_ENABLED
+    old_rotation = settings.PLS_GRID_JOURNAL_ROTATION
     try:
         settings.PLS_SEARCH_HARVEST_ENABLED = False
         assert defer_pls_grid_for_search_harvest(cfg) is True
@@ -220,10 +221,19 @@ def test_defer_pls_grid_when_stalled_for_search_harvest():
         assert defer_pls_grid_for_search_harvest({"pls_stall_watchdog": {"stalled": True, "stalled_reason": "grid_saturated"}}) is True
         assert defer_pls_grid_for_search_harvest({}, stall_reason="grid_saturated") is True
         assert pls_search_harvest_may_run({}, pending_gaps=2, stall_reason="grid_saturated") is True
+        saturated_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        saturated = {
+            "citation_grid_cursor_shard_0": {"saturated_at": saturated_at},
+            "citation_grid_cursor_shard_1": {"saturated_at": saturated_at},
+        }
+        settings.PLS_GRID_JOURNAL_ROTATION = False
+        assert pls_search_harvest_may_run(saturated, pending_gaps=2, reporter_shard=0) is True
+        assert pls_search_harvest_may_run(saturated, pending_gaps=0, reporter_shard=0) is False
         settings.PLS_SEARCH_HARVEST_ENABLED = True
         assert pls_search_harvest_may_run({}, pending_gaps=0) is True
     finally:
         settings.PLS_SEARCH_HARVEST_ENABLED = old
+        settings.PLS_GRID_JOURNAL_ROTATION = old_rotation
 
 
 def test_preempt_zero_output_grid_job_when_stalled_with_gaps():

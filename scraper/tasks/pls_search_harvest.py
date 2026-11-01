@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import false, func, select, true
+from sqlalchemy import false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -187,6 +187,124 @@ async def seed_search_harvest_plan(
         db.add(row)
     await db.flush()
     return {"inserted": len(to_add), "reporters": len(reporters), "years": len(years)}
+
+
+GAPPED_REOPEN_LIMIT = 24
+REPORTER_YEAR_REOPEN_LIMIT = 4
+GAPPED_REOPEN_COOLDOWN = timedelta(hours=6)
+
+
+async def reopen_gapped_search_harvest_queries(
+    db: AsyncSession,
+    *,
+    reporter_shard: Optional[int] = None,
+    limit: int = GAPPED_REOPEN_LIMIT,
+    now: Optional[datetime] = None,
+) -> int:
+    """Return done queries that still record a gap to pending, after a cooldown so a saturated grid
+    does not reopen the same row on every dispatch."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - GAPPED_REOPEN_COOLDOWN
+    stmt = select(PlsSearchHarvestQuery).where(
+        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+        PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
+        PlsSearchHarvestQuery.gap_size > 0,
+        or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff),
+    )
+    if reporter_shard in (0, 1):
+        stmt = stmt.where(_share_filter(int(reporter_shard) + 1))
+    rows = (
+        await db.execute(stmt.order_by(PlsSearchHarvestQuery.gap_size.desc(), PlsSearchHarvestQuery.last_run_at.asc().nullsfirst()).limit(limit))
+    ).scalars().all()
+    for row in rows:
+        row.status = "pending"
+        row.last_error = "reopened: citation grid saturated while this query still has a gap"
+    if rows:
+        await db.flush()
+    return len(rows)
+
+
+def _base_reporter_year(query_json: Any) -> bool:
+    body = dict(query_json or {})
+    if not body.get("reporter") or body.get("year") in (None, ""):
+        return False
+    return set(body) <= {"reporter", "year"}
+
+
+async def reopen_finished_reporter_year_queries(
+    db: AsyncSession,
+    *,
+    reporter_shard: Optional[int] = None,
+    limit: int = REPORTER_YEAR_REOPEN_LIMIT,
+    now: Optional[datetime] = None,
+) -> int:
+    """Re-queue the oldest finished reporter×year searches from page 1.
+
+    A citation-grid lap that staged nothing does not mean those reporter-years have no new judgments
+    on the search form. The cooldown stops a query that finishes immediately from being reopened on
+    the next dispatch.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - GAPPED_REOPEN_COOLDOWN
+    stmt = select(PlsSearchHarvestQuery).where(
+        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+        PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
+        or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff),
+    )
+    if reporter_shard in (0, 1):
+        stmt = stmt.where(_share_filter(int(reporter_shard) + 1))
+    rows = (
+        await db.execute(
+            stmt.order_by(PlsSearchHarvestQuery.last_run_at.asc().nullsfirst(), PlsSearchHarvestQuery.created_at.asc()).limit(80)
+        )
+    ).scalars().all()
+    reopened = 0
+    for row in rows:
+        if not _base_reporter_year(row.query_json):
+            continue
+        row.status = "pending"
+        row.pages_enumerated = 0
+        row.rows_seen = 0
+        row.rows_known = 0
+        row.rows_new = 0
+        row.gap_size = 0
+        row.cursor_json = {"page": 1, "row_index": 0}
+        row.last_error = "reopened: citation grid saturated; reporter-year search walked again"
+        reopened += 1
+        if reopened >= limit:
+            break
+    if reopened:
+        await db.flush()
+    return reopened
+
+
+async def ensure_search_harvest_frontier(
+    db: AsyncSession,
+    *,
+    reporter_shard: Optional[int] = None,
+) -> Dict[str, int]:
+    """Make sure a saturated citation-grid shard has claimable search-harvest rows.
+
+    Missing base reporter×year queries are inserted. Done queries that still record a gap are
+    reopened, then the oldest finished reporter×year searches are walked again from page 1.
+    When none of those yield a claimable row the caller walks case serials.
+    """
+    from scraper.pls_grid_health import pls_pending_search_harvest_count
+
+    pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+    inserted = 0
+    reopened = 0
+    if pending <= 0:
+        seeded = await seed_search_harvest_plan(db, dry_run=False)
+        inserted = int(seeded.get("inserted") or 0)
+        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+    if pending <= 0:
+        reopened = await reopen_gapped_search_harvest_queries(db, reporter_shard=reporter_shard)
+        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+    if pending <= 0:
+        reopened += await reopen_finished_reporter_year_queries(db, reporter_shard=reporter_shard)
+        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+    return {"pending": int(pending), "inserted": inserted, "reopened": reopened}
 
 
 async def seed_extended_plan(
@@ -1270,7 +1388,14 @@ def _pls_search_harvest_tick_body(**kwargs) -> Dict[str, Any]:
                         source_state=source.state,
                     )
                 ).get("stalled_reason")
-            if not pls_search_harvest_may_run(cfg, pending_gaps=pending, stall_reason=stall_reason):
+            slot = kwargs.get("slot")
+            reporter_shard = int(slot) - 1 if slot in (1, 2) else None
+            if not pls_search_harvest_may_run(
+                cfg,
+                pending_gaps=pending,
+                stall_reason=stall_reason,
+                reporter_shard=reporter_shard,
+            ):
                 return {"skipped": True, "reason": "PLS_SEARCH_HARVEST_ENABLED is not set and harvest is not stalled"}
             return await run_search_harvest(db, **kwargs)
 

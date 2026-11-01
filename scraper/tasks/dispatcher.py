@@ -36,6 +36,7 @@ from scraper.pls_grid_health import (
     defer_pls_grid_for_search_harvest,
     dispatch_saturated,
     pls_last_judgment_at,
+    pls_grid_cap_lap_grace_active,
     pls_grid_yield_cap_reached,
     pls_note_search_harvest_grid_yield,
     pls_pending_search_harvest_count,
@@ -542,6 +543,35 @@ async def _public_backlog_dispatch_allowed(
     return (now - last_at) >= cadence
 
 
+async def _queue_frontier_for_saturated_grid(db, app, *, reporter_shard: Optional[int]) -> str:
+    """When a citation-grid lap staged nothing, open the next surface instead of waiting out the recheck.
+
+    Search-harvest runs when the ledger has claimable rows (missing reporter×year rows are seeded,
+    and done rows that still have a gap are reopened). Otherwise the case-serial walk is queued.
+    Returns ``search_harvest``, ``caseid_walk``, or ``none``.
+    """
+    from scraper.tasks.pls_search_harvest import ensure_search_harvest_frontier, queue_search_harvest_ticks
+
+    opened = await ensure_search_harvest_frontier(db, reporter_shard=reporter_shard)
+    if int(opened.get("pending") or 0) <= 0:
+        if not settings.PLS_CASEID_WALK_ENABLED:
+            return "none"
+        partitions = (int(reporter_shard),) if reporter_shard in (0, 1) else (0, 1)
+        for partition in partitions:
+            app.send_task(
+                "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick",
+                kwargs={"partition": int(partition)},
+                queue="login_session",
+            )
+        return "caseid_walk"
+    if reporter_shard in (0, 1):
+        slots = (int(reporter_shard) + 1,)
+    else:
+        slots = (1, 2)
+    queue_search_harvest_ticks(app, slots=slots)
+    return "search_harvest"
+
+
 def _next_public_scrape_at(source: ScraperSource, mode: str, now: datetime, *, backlog_dispatch: bool) -> datetime:
     """When backlog dispatch is allowed, recheck soon instead of the full updates cadence."""
     if mode == "updates" and backlog_dispatch:
@@ -755,7 +785,24 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                             s.source_name == "PakistanLawSite"
                             and dispatch_saturated(dict(s.config_json or {}), shard, now=now)
                             and not pls_grid_yield_cap_reached(cfg, shard, now=now)
+                            and not pls_grid_cap_lap_grace_active(cfg, shard)
                         ):
+                            frontier = await _queue_frontier_for_saturated_grid(db, app, reporter_shard=shard)
+                            if frontier in ("search_harvest", "caseid_walk"):
+                                logger.info(
+                                    "skip enqueue %s shard %s: its grid lap staged nothing new (saturated); queued %s",
+                                    s.source_name,
+                                    shard,
+                                    frontier,
+                                )
+                                skipped_saturated.append(f"{s.source_name}:shard{shard}")
+                                queued.append(
+                                    f"{s.source_name}:search_harvest_tick"
+                                    if frontier == "search_harvest"
+                                    else f"{s.source_name}:caseid_walk"
+                                )
+                                this_source_saturated = True
+                                continue
                             logger.info("skip enqueue %s shard %s: its grid lap staged nothing new (saturated); recheck later", s.source_name, shard)
                             skipped_saturated.append(f"{s.source_name}:shard{shard}")
                             this_source_saturated = True
@@ -780,7 +827,23 @@ async def dispatch_due_sources() -> Dict[str, Any]:
                         s.source_name == "PakistanLawSite"
                         and dispatch_saturated(dict(s.config_json or {}), None, now=now)
                         and not pls_grid_yield_cap_reached(cfg, None, now=now)
+                        and not pls_grid_cap_lap_grace_active(cfg, None)
                     ):
+                        frontier = await _queue_frontier_for_saturated_grid(db, app, reporter_shard=None)
+                        if frontier in ("search_harvest", "caseid_walk"):
+                            logger.info(
+                                "skip enqueue %s: the unsharded grid walk is saturated; queued %s",
+                                s.source_name,
+                                frontier,
+                            )
+                            skipped_saturated.append(s.source_name)
+                            queued.append(
+                                f"{s.source_name}:search_harvest_tick"
+                                if frontier == "search_harvest"
+                                else f"{s.source_name}:caseid_walk"
+                            )
+                            s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
+                            continue
                         logger.info("skip enqueue %s: the unsharded grid walk is saturated; recheck later", s.source_name)
                         skipped_saturated.append(s.source_name)
                         s.next_scrape_at = now + timedelta(minutes=cadence_for_source(s, mode))
