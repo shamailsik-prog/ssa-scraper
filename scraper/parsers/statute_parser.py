@@ -80,6 +80,26 @@ ACT_WITH_YEAR_PATTERN = re.compile(
 )
 SECTION_DIGIT_START_RE = re.compile(r'^\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)', re.DOTALL)
 SECTION_KEYWORD_RE = re.compile(r'^\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*(.*)', re.IGNORECASE | re.DOTALL)
+# Balochistan gazette PDFs put the marginal note in the left column and the
+# section number in the right. pdfplumber joins them onto one line
+# ("Short title, 1. (1) This Act may be called…"). A line-start split then
+# sees only the heading whose note wrapped onto the previous line, and the
+# rest of the act is glued into that one row.
+_MARGINAL_SECTION_HEAD_RE = re.compile(
+    r"(?m)^[ \t]*"
+    r"[A-Z][A-Za-z][A-Za-z,'’\-]{0,40}"
+    r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,6}"
+    r"\.?[ \t]+"
+    r"(\d{1,3}[A-Z]?)"
+    # "1. (1)" / "7. The" on a text layer. OCR also drops the period ("2 (1)")
+    # or reads the subsection mark as "@)".
+    r"(?:"
+    r"\s*\.(?:\s*[-–—]\s*|\s+)"
+    r"|"
+    r"\s+(?=\()"
+    r")"
+    r"(?=(?:[\(\[\{]\s*\d|@\)|[A-Z]))"
+)
 SHORT_TITLE_CLAUSE_RE = re.compile(
     r'^\s*(?:section\s+\d+[A-Z]?\s*[\.\-\)\:]\s*)?(?:short\s+title[^.:\n]*[:\-\.\)]\s*)?(?:this|the)\s+'
     r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
@@ -161,6 +181,15 @@ def _extract_number_title_from_chunk(chunk: str) -> Tuple[Optional[str], str, st
         num = m2.group(1).strip()
         rest = m2.group(2).strip() if m2.group(2) else ""
         title = _derive_title(rest)
+        return num, title, chunk_clean
+
+    # Marginal note, then the number: "Short title, 1. (1) This Act…"
+    marginal = _MARGINAL_SECTION_HEAD_RE.match(chunk_clean)
+    if marginal:
+        num = marginal.group(1).strip()
+        note = chunk_clean[: marginal.start(1)].strip(" .,:;-–—")
+        rest = chunk_clean[marginal.end() :].strip()
+        title = note or _derive_title(rest)
         return num, title, chunk_clean
 
     return None, "", chunk_clean
@@ -312,6 +341,54 @@ def year_section_is_bogus_heading(
     """Same citation and sequence rule the splitter uses, for one stored section."""
     citation = _section_text_is_year_citation(token, text) or _previous_tail_marks_year_citation(previous_text or "")
     return reject_year_section_heading(token, _sibling_number_pairs(sibling_tokens), citation=citation)
+
+
+_WRAPPED_MARGINAL_NOTE_RE = re.compile(
+    r"^[A-Z][A-Za-z]+(?:[ \t]+[A-Za-z][A-Za-z]*){0,5}\.?$"
+)
+_FOLLOWING_SECTION_HEAD_RE = re.compile(
+    r"^\d{1,3}[A-Z]?\.\s+(?:\(\d+\)|[A-Z])"
+)
+
+
+def _join_wrapped_marginal_notes(text: str) -> str:
+    """Join a marginal label that landed on its own line onto the heading below.
+
+    Two-column extracts sometimes wrap the note above the number::
+
+        Definitions.
+        2. In this Act, unless the context otherwise requires
+
+    That label belongs to section 2. A line with a comma, a digit, or no
+    following ``N.`` heading is left where it is (footer continuations such as
+    ``Department, Quetta.`` and the wrapped year ``2025.``).
+    """
+    lines = text.splitlines()
+    joined: List[str] = []
+    index = 0
+    while index < len(lines):
+        current = lines[index]
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        if _WRAPPED_MARGINAL_NOTE_RE.match(current.strip()) and _FOLLOWING_SECTION_HEAD_RE.match(nxt.strip()):
+            joined.append(f"{current.strip()} {nxt.strip()}")
+            index += 2
+            continue
+        joined.append(current)
+        index += 1
+    return "\n".join(joined)
+
+
+def _merge_heading_matches(*groups: Sequence[Match[str]]) -> List[Match[str]]:
+    """Keep the earliest heading when a line-start match and a marginal match overlap."""
+    ordered = sorted((match for group in groups for match in group), key=lambda match: match.start(1))
+    kept: List[Match[str]] = []
+    covered_until = -1
+    for match in ordered:
+        if match.start(1) < covered_until:
+            continue
+        kept.append(match)
+        covered_until = match.end()
+    return kept
 
 
 def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
@@ -766,11 +843,13 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     """
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
-        plain = _normalize_whitespace(plain)
-        # Pattern: line start with number + delimiter, ensure lookahead for content
-        split_pattern = re.compile(r'(?:\n|^)\s*(?=\d+[A-Z]?\s*[\.\-\)\:\]]\s+[A-Za-z])', re.MULTILINE)
-        # Instead of split losing delimiter, use finditer to slice
-        matches = list(re.finditer(r'(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*', plain, re.MULTILINE))
+        plain = _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        # Line-start headings ("2. In this Act") plus marginal-note headings
+        # ("Short title, 1. (1) This Act"). The second form is how a two-column
+        # gazette extract places every section except the one whose note wrapped.
+        line_start = list(re.finditer(r'(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*', plain, re.MULTILINE))
+        marginal = list(_MARGINAL_SECTION_HEAD_RE.finditer(plain))
+        matches = _merge_heading_matches(line_start, marginal)
         if len(matches) < 2:
             # try alternative without newline requirement
             matches = list(re.finditer(r'(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])', plain))
