@@ -229,6 +229,64 @@ def test_definitions_that_swallowed_a_later_section_still_fail():
     assert decision.reason == "reextract_mega_section"
 
 
+def test_definitions_that_swallowed_a_heading_without_a_period_still_fail():
+    """``3 Establishment`` with no period is still a later section inside section 2."""
+    swallowed = _definition_catalogue(
+        "\n3 Establishment.—The Government shall establish the Board to perform the functions of this Act.\n"
+    )
+    assert len(swallowed) >= REEXTRACT_MEGA_SECTION_CHARS
+    assert "3 Establishment" in swallowed
+    decision = gate_section_reextract(
+        [_real(1), _real(2), _real(3)],
+        [_real(1), _section("2", swallowed), _real(12)],
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_mega_section"
+
+
+def _dense_definition_catalogue(minimum_chars: int) -> str:
+    """Definitions clauses repeated until the body reaches ``minimum_chars``.
+
+    Repeating clauses keeps the quoted-clause density legal, so a failure is
+    the size cap and not a thin catalogue.
+    """
+    block = "\n".join(
+        f'({number}) "term{number}" means the meaning this Act assigns to term {number};'
+        for number in range(1, 24)
+    )
+    block = block.replace(
+        '(2) "term2" means the meaning this Act assigns to term 2;',
+        '12) "term2" means the meaning this Act assigns to term 2;',
+        1,
+    )
+    body = (
+        "2. Definitions.—In this Act, unless there is anything repugnant in the subject "
+        "or context,—\n"
+        + block
+    )
+    extra = 0
+    while len(body) < minimum_chars:
+        extra += 1
+        body += "\n" + block.replace('"term', f'"extra{extra}term')
+    return body
+
+
+def test_definition_catalogue_around_twelve_thousand_chars_fails_the_size_cap():
+    """A pure definitions section past the catalogue cap is still a mega section."""
+    catalogue = _dense_definition_catalogue(12_000)
+    assert len(catalogue) >= 12_000
+    decision = gate_section_reextract(
+        [_real(1), _real(2), _real(3)],
+        [
+            _real(1, "This Act may be called the Example Urban Planning Act, 1975."),
+            _section("2", catalogue),
+            _real(3, "The Government shall establish the Board under this Act."),
+        ],
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_mega_section"
+
+
 async def test_promote_does_not_apply_or_unquarantine_a_collapsed_reextract(db):
     """Stored 9-section act must stay quarantined when the candidate is one mega row."""
     from sqlalchemy import func, select

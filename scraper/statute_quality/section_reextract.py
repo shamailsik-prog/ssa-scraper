@@ -21,15 +21,21 @@ Thresholds, and why:
 * ``REEXTRACT_MEGA_SECTION_CHARS`` is 5000. Any stored re-extract row whose
   stripped text is at least that long fails, including a single section that
   holds extent through repeal. A section 2 that is only a definitions
-  catalogue may be longer: the opening formula plus a run of quoted clauses,
-  and no later section heading or repeal. The North-West Frontier Province
-  Urban Planning Act, 1975 definitions are about 8000 characters once clause
-  ``(2)`` is no longer split off as a fake section 12. That same text stored
-  under number 12 still fails. The first ingest of a statute has no stored
+  catalogue may pass that 5000 cut and still fail above
+  ``REEXTRACT_DEFINITION_CATALOGUE_MAX_CHARS`` (10000). The catalogue needs
+  the opening formula, at least one quoted clause marker per
+  ``REEXTRACT_DEFINITION_CLAUSE_DENSITY_CHARS`` (600) characters, and no
+  later section heading or repeal. A heading may omit its period
+  (``3 Establishment``). A definition clause ``1N) "`` is not a heading.
+  The North-West Frontier Province Urban Planning Act, 1975 definitions are
+  about 8000 characters once clause ``(2)`` is no longer split off as a
+  fake section 12, so they stay inside the catalogue cap. That same text
+  stored under number 12 still fails. The first ingest of a statute has no stored
   body (``before`` empty) and is not this gate: there is nothing to collapse
   and nothing to un-quarantine. Deleting stored rows and then promoting is
   not a first ingest. Pass those rows through ``reextract_before_sections``
-  so this function still sees them. Thresholds above are unchanged.
+  so this function still sees them. The 5000-character cut, the half-count
+  cut, and the footer-strip allowance are unchanged.
 * A real section 1 (not a distribution-list designation) that is present
   before and absent after fails. A footer-only ``1. The Principal Secretary…``
   may disappear.
@@ -46,6 +52,11 @@ from scraper.statute_quality.distribution_list import is_distribution_addressee_
 REEXTRACT_COLLAPSE_RATIO = 0.5
 REEXTRACT_FOOTER_STRIP_MAX_DROP = 3
 REEXTRACT_MEGA_SECTION_CHARS = 5000
+# A pure definitions section may pass the 5000 cut. Past this length it is a
+# mega section even when every other catalogue check holds.
+REEXTRACT_DEFINITION_CATALOGUE_MAX_CHARS = 10_000
+# One quoted clause marker per this many characters. Thinner text is not a catalogue.
+REEXTRACT_DEFINITION_CLAUSE_DENSITY_CHARS = 600
 
 REASON_COLLAPSE_COUNT = "reextract_collapse_count"
 REASON_MEGA_SECTION = "reextract_mega_section"
@@ -114,8 +125,13 @@ _DEFINITIONS_SECTION_RE = re.compile(
     r"(?is)^\s*(?:section\s+|s\.\s*)?2\s*[\.\)\-:]\s*.{0,180}?"
     r"(?:\bdefi\w{3,16}\b|\bin\s+this\s+act\s*,?\s*unless\b)"
 )
+# Period optional, so ``3 Establishment`` is a heading. ``1N) "term"`` is a
+# definition clause and is excluded below, not by this pattern.
 _EMBEDDED_SECTION_HEADING_RE = re.compile(
-    r"(?m)^[ \t]*(\d{1,3})[A-Z]?[ \t]*\.[ \t]+(?=[A-Za-z])"
+    r"(?m)^[ \t]*\d{1,3}[A-Z]?[ \t]*[.,:\-)]?[ \t]+[A-Z][a-z]{2,}"
+)
+_DEFINITION_CLAUSE_LINE_RE = re.compile(
+    r"^[ \t]*(?:\(\s*(?:\d{1,2}|[lI])\s*\)|1\d{1,2}\))[ \t]+[\"'“”‘’:]"
 )
 _REPEAL_OPERATIVE_RE = re.compile(r"(?i)\bhereby\s+repealed\b")
 _DEFINITION_CLAUSE_RE = re.compile(
@@ -129,21 +145,44 @@ def _is_section_two(number: str) -> bool:
     return cleaned in {"2", "02"}
 
 
+def _has_embedded_section_heading(body: str) -> bool:
+    """True when a later line reads as a section heading, including a missing period.
+
+    The opening ``2. Definitions`` line is skipped. A definition clause
+    ``(2) "term"`` or ``12) "term"`` is not a heading.
+    """
+    for match in _EMBEDDED_SECTION_HEADING_RE.finditer(body):
+        if match.start() <= 40:
+            continue
+        line_start = body.rfind("\n", 0, match.start()) + 1
+        if _DEFINITION_CLAUSE_LINE_RE.match(body[line_start:]):
+            continue
+        return True
+    return False
+
+
 def _is_definition_catalogue(number: str, text: str) -> bool:
-    """True when a long section 2 is the definitions list and not the rest of the act.
+    """True when a long section 2 is only the definitions list.
 
     Clause ``(2)`` OCR'd as ``12)`` used to be its own mega row. Folding it
-    back leaves one definitions section over the character cap. A row that
-    also carries a later heading or a repeal is still a collapsed act.
+    back leaves one definitions section over 5000 characters. The catalogue
+    may pass that cut up to ``REEXTRACT_DEFINITION_CATALOGUE_MAX_CHARS``.
+    It needs about one quoted clause per 600 characters. A later heading,
+    including ``3 Establishment`` with no period, or a repeal, is a collapsed act.
     """
     body = text or ""
+    if len(body) > REEXTRACT_DEFINITION_CATALOGUE_MAX_CHARS:
+        return False
     if not _is_section_two(number) or not _DEFINITIONS_SECTION_RE.search(body):
         return False
-    if len(_DEFINITION_CLAUSE_RE.findall(body)) < 4:
+    clauses = _DEFINITION_CLAUSE_RE.findall(body)
+    if len(clauses) < 4:
+        return False
+    if len(clauses) * REEXTRACT_DEFINITION_CLAUSE_DENSITY_CHARS < len(body):
         return False
     if _REPEAL_OPERATIVE_RE.search(body):
         return False
-    return not any(match.start() > 40 for match in _EMBEDDED_SECTION_HEADING_RE.finditer(body))
+    return not _has_embedded_section_heading(body)
 
 
 def _has_mega_section(rows: Sequence[tuple[str, str]]) -> bool:
