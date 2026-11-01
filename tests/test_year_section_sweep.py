@@ -237,6 +237,16 @@ async def test_sweep_apply_merges_text_and_does_not_unquarantine(db):
     ).scalars().all()
     assert "1860" not in numbers
     assert set(numbers) >= {"25", "26"}
+    from scraper.models import StatuteSectionReextractPrior
+
+    captured = (
+        await db.execute(
+            select(StatuteSectionReextractPrior).where(
+                StatuteSectionReextractPrior.section_id == seeded["year"].id
+            )
+        )
+    ).scalars().first()
+    assert captured is None
 
     target = (
         await db.execute(

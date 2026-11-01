@@ -10,6 +10,7 @@ CONTRACT TABLES (Layer 17 Annex A; the only tables `sikander_reader` may SELECT)
 INTERNAL TABLES (never granted to the reader role):
     scraper_sources, scraper_jobs, scraper_staging, statutes_staging, quarantine_queue,
     embedding_queue, browser_session_slots, search_form_map, crawl_frontier, crawl_coverage,
+    statute_section_reextract_prior,
     pls_search_harvest_query, extraction_audit, scrapegraph_cache, instrument_relation, instrument_section_relation, archive_targets, archive_objects, sgai_usage_daily,
     notifications, schema_migrations
 
@@ -399,6 +400,23 @@ class StatuteSectionVersion(Base):
     created_at: Mapped[datetime] = _created()
 
     section: Mapped["StatuteSection"] = relationship("StatuteSection", back_populates="versions")
+
+
+class StatuteSectionReextractPrior(Base):
+    """Pre-delete section text so a re-extract gate still sees a wiped body.
+
+    Internal. Filled by the delete triggers in migration 028. Not served.
+    """
+
+    __tablename__ = "statute_section_reextract_prior"
+    __table_args__ = (Index("ix_statute_section_reextract_prior_statute_id", "statute_id"),)
+
+    section_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    statute_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    section_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    section_text: Mapped[str] = mapped_column(Text, nullable=False)
+    sort_key: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Instrument(Base):
