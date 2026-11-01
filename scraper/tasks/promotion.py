@@ -31,6 +31,7 @@ from scraper.document_validation import (
     validate_judgment_reconciled_json,
     validate_statute_reconciled_json,
 )
+from scraper.statute_quality.section_reextract import gate_section_reextract
 from scraper.extractors.judgment_guards import (
     detect_headnote_only_no_body,
     detect_headnotes_only,
@@ -2374,6 +2375,33 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
             },
         )
         return "quarantined"
+    if not created_new_statute and statute is not None:
+        # Re-extract onto a stored body. FAIL leaves sections and document_quarantine alone.
+        existing_rows = (
+            await db.execute(
+                select(StatuteSection.section_number, StatuteSectionVersion.section_text)
+                .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+                .where(StatuteSection.statute_id == statute.id)
+            )
+        ).all()
+        decision = gate_section_reextract(
+            [{"section_number": num, "section_text": txt or ""} for num, txt in existing_rows],
+            parseable_sections,
+        )
+        if not decision.may_apply:
+            await _quarantine(
+                db,
+                st,
+                f"section_reextract:{decision.reason}",
+                "statute",
+                {
+                    "reason_code": decision.reason,
+                    "statute_name": name[:280],
+                    "section_count_before": decision.section_count_before,
+                    "section_count_after": decision.section_count_after,
+                },
+            )
+            return "quarantined"
     if created_new_statute:
         stored_jurisdiction = (data.get("jurisdiction") or "").strip()
         if st.source_name == "KPAssembly" and stored_jurisdiction in ("", "Federal"):
