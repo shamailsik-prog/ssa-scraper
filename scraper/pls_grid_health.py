@@ -481,12 +481,22 @@ def defer_pls_grid_for_search_harvest(cfg: Dict[str, Any], *, stall_reason: Opti
 
 
 def pls_search_harvest_may_run(
-    cfg: Dict[str, Any], *, pending_gaps: int, stall_reason: Optional[str] = None
+    cfg: Dict[str, Any],
+    *,
+    pending_gaps: int,
+    stall_reason: Optional[str] = None,
+    reporter_shard: Optional[int] = None,
 ) -> bool:
-    """Beat may schedule ticks when enabled; during a promotion stall, one gap query may run anyway."""
+    """Beat may schedule ticks when enabled. A saturated citation grid, or a promotion stall, may run
+    pending search-harvest rows even when the beat flag is off — otherwise a full grid lap that staged
+    nothing leaves the login idle until the next recheck."""
     if getattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False):
         return True
-    return pending_gaps > 0 and defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason)
+    if pending_gaps <= 0:
+        return False
+    if defer_pls_grid_for_search_harvest(cfg, stall_reason=stall_reason):
+        return True
+    return dispatch_saturated(cfg, reporter_shard)
 
 
 PLS_PREEMPT_GRID_JOB_FOR_SEARCH_HARVEST_AFTER = timedelta(

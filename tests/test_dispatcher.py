@@ -873,3 +873,281 @@ async def test_dispatch_skips_a_source_row_another_transaction_holds(db, monkeyp
         result = await asyncio.wait_for(dispatch_due_sources(), timeout=20)
         await holder.rollback()
     assert "PakistanCode" in result["queued"] and "PakistanLawSite" not in result["queued"]
+
+
+def _saturated_journal_cursor(now: datetime) -> dict:
+    return {
+        "saturated_at": (now - timedelta(hours=1)).isoformat(),
+        "row_offset": 458,
+        "last_total_rows": 458,
+        "saturated_reason": "full lap of 458 rows staged 0 new",
+    }
+
+
+async def test_dispatch_queues_search_harvest_when_saturated_grid_ledger_is_empty(db, monkeypatch):
+    """A citation-grid lap that staged nothing must not only push next_scrape_at.
+
+    Production (2026-11-01) logged "skip enqueue PLS shard … saturated" and went quiet
+    because the search-harvest ledger had no claimable rows. The dispatcher seeds the
+    reporter×year plan and queues search-harvest ticks instead of idling.
+    """
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.pls_grid_health import journal_cursor_key
+    from scraper.tasks.celery_app import app
+
+    now = datetime.now(timezone.utc)
+    target = await _prepare_pls_due(db, (1, 2))
+    journals = ("CLC", "PLC", "MLD")
+    target.config_json = {
+        **dict(target.config_json or {}),
+        **{journal_cursor_key(name): _saturated_journal_cursor(now) for name in journals},
+    }
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False)
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNAL_ROTATION", True)
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNALS", "CLC,PLC,MLD")
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "CLC,PLC,MLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", now.year)
+    monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="saturated grid frontier")
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    assert harvest_ticks, result
+    assert {item[1].get("slot") for item in harvest_ticks} >= {1, 2}
+    assert grid_jobs == []
+    assert "PakistanLawSite:search_harvest_tick" in result["queued"]
+    pending = (
+        await db.execute(
+            select(func.count())
+            .select_from(PlsSearchHarvestQuery)
+            .where(
+                PlsSearchHarvestQuery.source_name == "PakistanLawSite",
+                PlsSearchHarvestQuery.status == "pending",
+            )
+        )
+    ).scalar()
+    assert int(pending or 0) >= 3
+
+
+async def _saturated_journal_pls(db, monkeypatch, *, slots=(1, 2)):
+    """PakistanLawSite due, with CLC/PLC/MLD citation-grid journals saturated."""
+    from scraper.harvest_mode import set_harvest_mode
+    from scraper.pls_grid_health import journal_cursor_key
+
+    now = datetime.now(timezone.utc)
+    target = await _prepare_pls_due(db, slots)
+    journals = ("CLC", "PLC", "MLD")
+    target.config_json = {
+        **dict(target.config_json or {}),
+        **{journal_cursor_key(name): _saturated_journal_cursor(now) for name in journals},
+    }
+    monkeypatch.setattr(settings, "HARVEST_AUTO_SWITCH", False)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_ENABLED", False)
+    monkeypatch.setattr(settings, "PLS_CASEID_WALK_ENABLED", True)
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNAL_ROTATION", True)
+    monkeypatch.setattr(settings, "PLS_GRID_JOURNALS", "CLC,PLC,MLD")
+    monkeypatch.setattr(settings, "PLS_SUBSCRIBED_REPORTERS", "CLC,PLC,MLD")
+    monkeypatch.setattr(settings, "PLS_EARLIEST_YEAR", now.year)
+    monkeypatch.setattr(settings, "LOGIN_SESSION_CONCURRENCY", 2)
+    monkeypatch.setattr(settings, "BACKFILL_LOGIN_SESSION_CONCURRENCY", 2)
+    await set_harvest_mode(db, "backfill", changed_by="qa", reason="saturated grid frontier")
+    return target, now
+
+
+async def test_dispatch_reopens_gapped_search_harvest_when_grid_is_saturated(db, monkeypatch):
+    """Done reporter×year rows that still have a gap are the search frontier once the grid is saturated."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+    from scraper.tasks.pls_search_harvest import seed_search_harvest_plan
+
+    target, now = await _saturated_journal_pls(db, monkeypatch)
+    await seed_search_harvest_plan(db, dry_run=False)
+    rows = (await db.execute(select(PlsSearchHarvestQuery))).scalars().all()
+    assert rows
+    for row in rows:
+        row.status = "done"
+        row.gap_size = 12
+        row.last_run_at = now - timedelta(hours=7)
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    assert harvest_ticks, result
+    assert grid_jobs == []
+    await db.commit()
+    reopened = (
+        await db.execute(
+            select(func.count())
+            .select_from(PlsSearchHarvestQuery)
+            .where(
+                PlsSearchHarvestQuery.source_name == "PakistanLawSite",
+                PlsSearchHarvestQuery.status == "pending",
+                PlsSearchHarvestQuery.gap_size > 0,
+            )
+        )
+    ).scalar()
+    assert int(reopened or 0) >= 1
+
+
+async def test_dispatch_queues_caseid_walk_when_saturated_grid_and_search_plan_are_exhausted(db, monkeypatch):
+    """When the grid is saturated and every search row is done with no gap, walk case serials."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+    from scraper.tasks.pls_search_harvest import seed_search_harvest_plan
+
+    _target, now = await _saturated_journal_pls(db, monkeypatch)
+    await seed_search_harvest_plan(db, dry_run=False)
+    rows = (await db.execute(select(PlsSearchHarvestQuery))).scalars().all()
+    assert rows
+    for row in rows:
+        row.status = "done"
+        row.gap_size = 0
+        row.last_run_at = now
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    caseid = [item for item in sent if item[0] == "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick"]
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    assert caseid, result
+    assert {item[1].get("partition") for item in caseid} >= {0, 1}
+    assert grid_jobs == []
+    assert harvest_ticks == []
+    assert "PakistanLawSite:caseid_walk" in result["queued"]
+
+
+async def test_dispatch_rewalks_old_reporter_year_queries_when_grid_is_saturated(db, monkeypatch):
+    """Finished reporter×year searches are walked again once they have aged, so a saturated grid
+    does not sit idle when case-serial walk is the only other idea and the plan has no gaps."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.tasks.celery_app import app
+    from scraper.tasks.pls_search_harvest import seed_search_harvest_plan
+
+    _target, now = await _saturated_journal_pls(db, monkeypatch)
+    await seed_search_harvest_plan(db, dry_run=False)
+    rows = (await db.execute(select(PlsSearchHarvestQuery))).scalars().all()
+    assert rows
+    for row in rows:
+        row.status = "done"
+        row.gap_size = 0
+        row.pages_enumerated = 3
+        row.cursor_json = {"page": 3, "row_index": 0}
+        row.last_run_at = now - timedelta(hours=7)
+    await db.commit()
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    assert harvest_ticks, result
+    assert grid_jobs == []
+    db.expire_all()
+    reopened = (
+        await db.execute(
+            select(PlsSearchHarvestQuery).where(
+                PlsSearchHarvestQuery.source_name == "PakistanLawSite",
+                PlsSearchHarvestQuery.status == "pending",
+            )
+        )
+    ).scalars().all()
+    assert reopened, "no pending rows"
+    assert all((row.cursor_json or {}).get("page") == 1 for row in reopened), [
+        (row.query_key, row.cursor_json, row.pages_enumerated, row.last_error) for row in reopened
+    ]
+    assert all(int(row.pages_enumerated or 0) == 0 for row in reopened)
+
+
+async def test_dispatch_unsharded_saturated_grid_queues_search_harvest(db, monkeypatch):
+    """One ACTIVE login still leaves the saturated grid for search-harvest instead of idling."""
+    from scraper.tasks.celery_app import app
+
+    await _saturated_journal_pls(db, monkeypatch, slots=(1,))
+    await db.commit()
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    assert harvest_ticks, result
+    assert grid_jobs == []
+    assert "PakistanLawSite:search_harvest_tick" in result["queued"]
+
+
+async def test_dispatch_cap_lap_grace_still_runs_saturated_grid(db, monkeypatch):
+    """A cap-bypass recovery window must run even when the journals are saturated and search rows exist."""
+    from scraper.models import PlsSearchHarvestQuery
+    from scraper.pls_grid_health import GRID_CAP_LAP_AT_KEY, grid_yield_since_key
+    from scraper.tasks.celery_app import app
+
+    target, now = await _saturated_journal_pls(db, monkeypatch)
+    lap = now.isoformat()
+    target.config_json = {
+        **dict(target.config_json or {}),
+        GRID_CAP_LAP_AT_KEY: lap,
+        grid_yield_since_key(0): lap,
+        grid_yield_since_key(1): lap,
+    }
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=CLC|year=2020",
+            query_json={"reporter": "CLC", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:reporter=PLC|year=2020",
+            query_json={"reporter": "PLC", "year": 2020},
+            status="pending",
+            priority=100,
+        )
+    )
+    await db.commit()
+    sent: list[tuple] = []
+    monkeypatch.setattr(
+        app,
+        "send_task",
+        lambda name, args=(), kwargs=None, queue=None, **_: sent.append((name, kwargs or {})),
+    )
+    result = await dispatch_due_sources()
+    grid_jobs = [item for item in sent if item[0] == "scraper.tasks.dispatcher.run_login_session_job"]
+    harvest_ticks = [item for item in sent if item[0] == "scraper.tasks.pls_search_harvest.pls_search_harvest_tick"]
+    assert grid_jobs, result
+    assert harvest_ticks == []
+    assert "PakistanLawSite:shard0" in result["queued"]
