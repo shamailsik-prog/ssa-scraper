@@ -22,7 +22,9 @@ Thresholds, and why:
   stripped text is at least that long fails, including a single section that
   holds extent through repeal. The first ingest of a statute has no stored
   body (``before`` empty) and is not this gate: there is nothing to collapse
-  and nothing to un-quarantine.
+  and nothing to un-quarantine. Deleting stored rows and then promoting is
+  not a first ingest. Pass those rows through ``reextract_before_sections``
+  so this function still sees them. Thresholds above are unchanged.
 * A real section 1 (not a distribution-list designation) that is present
   before and absent after fails. A footer-only ``1. The Principal Secretary…``
   may disappear.
@@ -105,6 +107,57 @@ def _count_collapsed(before_count: int, after_count: int) -> bool:
 
 def _has_mega_section(rows: Sequence[tuple[str, str]]) -> bool:
     return any(len(text) >= REEXTRACT_MEGA_SECTION_CHARS for _, text in rows)
+
+
+def _merge_row(item: Any) -> dict[str, Any] | None:
+    parsed = _parseable_rows([item])
+    if not parsed:
+        return None
+    number, text = parsed[0]
+    row: dict[str, Any] = {"section_number": number, "section_text": text}
+    if isinstance(item, dict) and item.get("sort_key") is not None:
+        row["sort_key"] = item["sort_key"]
+    return row
+
+
+def merge_reextract_rows(*groups: Sequence[Any] | None) -> list[dict[str, Any]]:
+    """Merge section rows by ``section_number``. Later groups win on text.
+
+    A number that appears only in an earlier group stays. ``sort_key`` from
+    an earlier group is kept when the winner does not carry one.
+    """
+    ordered: list[str] = []
+    by_number: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group or []:
+            row = _merge_row(item)
+            if row is None:
+                continue
+            number = str(row["section_number"])
+            if number not in by_number:
+                ordered.append(number)
+                by_number[number] = row
+                continue
+            previous = by_number[number]
+            if "sort_key" not in row and "sort_key" in previous:
+                row["sort_key"] = previous["sort_key"]
+            by_number[number] = row
+    return [by_number[number] for number in ordered]
+
+
+def reextract_before_sections(
+    stored_sections: Sequence[Any] | None,
+    prior_sections: Sequence[Any] | None = None,
+    snapshot_sections: Sequence[Any] | None = None,
+) -> list[Any]:
+    """Rows the gate must compare against.
+
+    Capture, explicit pre-delete rows, and live rows are merged by section
+    number. Live text wins. Explicit prior wins over the capture. A partial
+    delete that leaves section 1 in place still counts the captured sections.
+    An empty result is a first fill, which ``gate_section_reextract`` PASSes.
+    """
+    return merge_reextract_rows(snapshot_sections, prior_sections, stored_sections)
 
 
 def gate_section_reextract(
