@@ -28,6 +28,7 @@ from scraper.statute_quality.senate_integrity import (
     VERDICT_PARTIAL,
     VERDICT_SKIPPED_SHELL,
     classify_senate_identity,
+    is_gazette_non_act_title,
     is_senate_sourced,
     parse_act_number,
     split_statute_source_url,
@@ -1154,6 +1155,123 @@ def test_fe3f02bd_gazette_header_is_not_an_act():
     assert "gazette_header_not_act" in result.signals
     assert result.needs_reextract is False
     assert result.reason == "senate_integrity:partial_identity"
+
+
+def test_ocr_preside_ts_otders_header_is_chrome_not_an_act():
+    """MAIN 125ae7a4: ``Preside t's Otders and Regulations`` is the running header.
+
+    The ``n`` in President was read as a space and ``Orders`` as ``Otders``.
+    year_enacted is null and the short-title line need not parse. The body can
+    still be the Plant Breeders' Rights Act. That name is gazette chrome.
+    """
+    pdf = """
+    THE GAZETTE OF PAKISTAN
+    EXTRAORDINARY
+    PART I
+    1. Short title, extent and commencement. This Act extends to the whole of Pakistan and applies to plant varieties.
+    2. A breeder may apply for registration of a new plant variety under this Act and the Registrar shall examine the application.
+    """
+    assert is_gazette_non_act_title("Preside t's Otders and Regulations") is True
+    assert is_gazette_non_act_title("Acts, Ordinances, Preside t's Otders and Regulations") is True
+    result = classify_senate_identity(
+        stored_name="Preside t's Otders and Regulations",
+        year_enacted=None,
+        source_url="https://senate.gov.pk/uploads/documents/125ae7a4.pdf",
+        sections=[
+            _section(
+                "1",
+                "This Act extends to the whole of Pakistan and applies to plant varieties.",
+            )
+        ],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_PARTIAL
+    assert result.action == ACTION_QUARANTINE
+    assert "gazette_header_not_act" in result.signals
+    assert "name_pdf_mismatch" not in result.signals
+    assert result.needs_reextract is False
+    assert result.reason == "senate_integrity:partial_identity"
+    called = classify_senate_identity(
+        stored_name="Preside t's Otders and Regulations",
+        year_enacted=None,
+        source_url="https://senate.gov.pk/uploads/documents/125ae7a4.pdf",
+        sections=[
+            _section(
+                "1",
+                "This Act may be called the Plant Breeders' Rights Act, 2016. "
+                "It extends to the whole of Pakistan.",
+            )
+        ],
+        pdf_text=(
+            "ACT NO. XXIV OF 2016\n"
+            "1. Short title.—This Act may be called the Plant Breeders' Rights Act, 2016.\n"
+            "2. It extends to the whole of Pakistan and applies to plant varieties.\n"
+        ),
+        pdf_available=True,
+    )
+    assert called.verdict == VERDICT_PARTIAL
+    assert called.action == ACTION_QUARANTINE
+    assert "gazette_header_not_act" in called.signals
+    assert called.needs_reextract is False
+    assert called.pdf_title == "Plant Breeders' Rights Act, 2016"
+
+
+def test_digit_and_missing_letter_presidents_orders_header_is_chrome():
+    """Digit swaps and dropped letters are the same running header, not an act name."""
+    assert is_gazette_non_act_title("Pres1dent's 0rders and Regu1ations") is True
+    assert is_gazette_non_act_title("Presidents Oders and Regulatons") is True
+    result = classify_senate_identity(
+        stored_name="Pres1dent's 0rders and Regu1ations",
+        year_enacted=None,
+        source_url="https://senate.gov.pk/uploads/documents/ocr-orders.pdf",
+        sections=[
+            _section(
+                "1",
+                "This Act extends to the whole of Pakistan and applies to plant varieties.",
+            )
+        ],
+        pdf_text=(
+            "1. Short title. This Act extends to the whole of Pakistan and applies to plant varieties. "
+            "A breeder may apply for registration of a new plant variety under this Act."
+        ),
+        pdf_available=True,
+    )
+    assert result.verdict == VERDICT_PARTIAL
+    assert result.action == ACTION_QUARANTINE
+    assert "gazette_header_not_act" in result.signals
+    assert result.needs_reextract is False
+
+
+def test_law_officers_ordinance_is_not_presidents_orders_chrome():
+    """MAIN b213c568 stays a Law Officers ordinance. ``Olncers`` is not ``Orders``."""
+    assert is_gazette_non_act_title("Olncers Ordinance, 1970") is False
+    assert is_gazette_non_act_title("The Law Officers Ordinance, 1970") is False
+    assert is_gazette_non_act_title("Law Officers (Amendment) Ordinance, 1972") is False
+    assert is_gazette_non_act_title("The Officers Ordinance, 1970") is False
+    assert is_gazette_non_act_title("President's Officers and Regulations") is False
+    pdf = """
+    THE GAZETTE OF PAKISTAN
+    LAW OFFICERS ORDINANCE, 1970
+    1. Short title.—This Ordinance may be called the Law Officers Ordinance, 1970.
+    2. Appointment.—The Government may appoint law officers on the terms stated in this Ordinance,
+    including an Additional Attorney-General and a Deputy Attorney-General.
+    """
+    body = (
+        "The Government may appoint law officers on the terms stated in this Ordinance, "
+        "including an Additional Attorney-General and a Deputy Attorney-General."
+    )
+    result = classify_senate_identity(
+        stored_name="The Law Officers Ordinance, 1970",
+        year_enacted=1970,
+        source_url="https://senate.gov.pk/uploads/documents/b213c568.pdf",
+        sections=[_section("2", body)],
+        pdf_text=pdf,
+        pdf_available=True,
+    )
+    assert "gazette_header_not_act" not in result.signals
+    assert result.verdict == VERDICT_MATCH
+    assert result.action == ACTION_NONE
 
 
 def test_year_parsed_as_section_number_does_not_override_matching_title():

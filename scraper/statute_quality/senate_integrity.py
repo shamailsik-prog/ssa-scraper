@@ -38,6 +38,14 @@ block the act-number year check. ``may be called`` still matches when one
 letter of ``called`` is a scan slip (``celled``), a euro sign stands in for
 ``e``, the instrument word is glued to the word before it (``BureausAct``),
 or the comma before the year was read as a period.
+
+A gazette running header stored as the name is not an act. That includes
+``President's Orders and Regulations`` and the longer ``Acts, Ordinances,
+President's Orders and Regulations`` line, including when a scan breaks a
+word (``Preside t's``), drops letters (``Oders``, ``Regulatons``), or swaps
+a digit for a letter (``Pres1dent``, ``0rders``, ``Regu1ations``). The whole
+name has to sit within two edits of that header. A Law Officers or Officers
+Ordinance title, including a garbled ``Olncers Ordinance, 1970``, does not.
 """
 
 from __future__ import annotations
@@ -163,13 +171,34 @@ _PIPE_ACT_NO_RE = re.compile(
 )
 _GAZETTE_NON_ACT_RE = re.compile(
     r"(?i)^(?:the\s+)?(?:"
-    r"president'?s\s+orders\s+and\s+regulations"
-    r"|acts?,?\s+ordinances?,?\s+president'?s\s+orders\s+and\s+regulations"
-    r"|gazette\s+of\s+pakistan(?:\s+extraordinary)?"
+    r"gazette\s+of\s+pakistan(?:\s+extraordinary)?"
     r"|published\s+by\s+authority"
     r"|registered\s+no\.?"
     r")\.?$"
 )
+# Whole-name skeletons of the President's Orders running header. Spaces,
+# apostrophes, and other punctuation are removed before the compare, so a
+# broken word such as ``Preside t's`` still lines up. Optional singular
+# ``act`` / ``ordinance`` covers the same header the old exact pattern did.
+_PRESIDENTS_ORDERS_CORE = "presidentsordersandregulations"
+_PRESIDENTS_ORDERS_SKELETONS = frozenset(
+    prefix + _PRESIDENTS_ORDERS_CORE
+    for prefix in (
+        "",
+        "actsordinances",
+        "actordinances",
+        "actsordinance",
+        "actordinance",
+    )
+)
+# Digit lookalikes and the euro-for-e scan slip. Other confusions, including
+# ``c``/``e`` and ``l``/``i``, spend the two-edit budget instead of being folded.
+_CHROME_LETTER_FOLD = str.maketrans({"0": "o", "1": "i", "5": "s", "€": "e"})
+# ``Preside t's Otders and Regulations`` is two edits after spaces are
+# removed (the ``n`` was a space, ``r`` was read as ``t``). Two dropped
+# letters land on the same budget. Officers ordinance names, including
+# ``Olncers Ordinance, 1970``, stay many edits away.
+_PRESIDENTS_ORDERS_OCR_BUDGET = 2
 _PREAMBLE_RE = re.compile(
     r"(?i)^(?:whereas\b|an act to\b|an ordinance to\b|be it enacted\b|it is hereby enacted\b)"
 )
@@ -266,11 +295,64 @@ def _collapse(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
 
 
+def _ocr_edits_within(left: str, right: str, budget: int) -> bool:
+    """True when ``left`` and ``right`` differ by at most ``budget`` edits."""
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > budget:
+        return False
+    previous = list(range(len(right) + 1))
+    for index, left_char in enumerate(left, 1):
+        current = [index]
+        row_min = index
+        for right_index, right_char in enumerate(right, 1):
+            substitution = 0 if left_char == right_char else 1
+            value = min(
+                current[-1] + 1,
+                previous[right_index] + 1,
+                previous[right_index - 1] + substitution,
+            )
+            current.append(value)
+            if value < row_min:
+                row_min = value
+        if row_min > budget:
+            return False
+        previous = current
+    return previous[-1] <= budget
+
+
+def _presidents_orders_skeletons(name: str) -> list[str]:
+    """Letter skeletons of a stored name, plus the same name without a leading ``the``."""
+    flat = _collapse(name).lower().translate(_CHROME_LETTER_FOLD)
+    skeleton = re.sub(r"[^a-z]", "", flat)
+    if not skeleton:
+        return []
+    skeletons = [skeleton]
+    if skeleton.startswith("the") and len(skeleton) > 3:
+        skeletons.append(skeleton[3:])
+    return skeletons
+
+
+def _is_ocr_presidents_orders_chrome(name: str) -> bool:
+    """True when the whole name is the President's Orders running header, OCR included.
+
+    Compared as one string, not token by token, so ``Officers`` cannot satisfy
+    ``Orders`` and a real Law Officers ordinance cannot satisfy this header.
+    """
+    for skeleton in _presidents_orders_skeletons(name):
+        for canonical in _PRESIDENTS_ORDERS_SKELETONS:
+            if _ocr_edits_within(skeleton, canonical, _PRESIDENTS_ORDERS_OCR_BUDGET):
+                return True
+    return False
+
+
 def is_gazette_non_act_title(name: str) -> bool:
     flat = _collapse(name).strip(" .")
     if not flat:
         return False
-    return bool(_GAZETTE_NON_ACT_RE.match(flat))
+    if _GAZETTE_NON_ACT_RE.match(flat):
+        return True
+    return _is_ocr_presidents_orders_chrome(flat)
 
 
 def is_preamble_junk_name(name: str) -> bool:
