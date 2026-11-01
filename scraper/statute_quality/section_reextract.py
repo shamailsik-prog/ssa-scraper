@@ -39,6 +39,13 @@ Thresholds, and why:
 * A real section 1 (not a distribution-list designation) that is present
   before and absent after fails. A footer-only ``1. The Principal Secretary…``
   may disappear.
+* Tariff schedule rows, income-tax rate rows, and unheaded sub-rows such as
+  ``4. Rolled…`` are not part of the collapse baseline. Finance Act 1985's
+  stored body is eleven of those rows. A five-section re-extract is not a
+  collapse against that set. An amending or surcharge section that carries
+  the schedule in its body may pass the 5000-character cut. A later real
+  heading inside that body still fails. An amending Finance Act has no
+  Definitions section, and this gate does not require one.
 """
 
 from __future__ import annotations
@@ -47,6 +54,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from scraper.parsers.statute_parser import (
+    is_tariff_schedule_section,
+    section_text_opens_unheaded_tariff_subrow,
+    section_text_starts_with_tariff_schedule_row,
+)
 from scraper.statute_quality.distribution_list import is_distribution_addressee_section
 
 REEXTRACT_COLLAPSE_RATIO = 0.5
@@ -185,11 +197,82 @@ def _is_definition_catalogue(number: str, text: str) -> bool:
     return not _has_embedded_section_heading(body)
 
 
+# Amendment, or a short marginal note that names a surcharge, closed by the
+# statute dash. A later mention of either word does not qualify.
+_AMENDING_SCHEDULE_HEADING_RE = re.compile(
+    r"(?is)^\s*\d{1,3}[A-Z]?\s*[\.\)\]]\s*"
+    r"(?:amendment\b|(?:\S+\s+){0,6}\bsurcharge\b)"
+    r".{0,180}?(?:\.—|\.--|—|–|\.-|--)"
+)
+
+
+def _body_contains_schedule_row(body: str) -> bool:
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if section_text_starts_with_tariff_schedule_row(stripped):
+            return True
+        if section_text_opens_unheaded_tariff_subrow(stripped):
+            return True
+    return False
+
+
+def _has_later_real_heading(body: str) -> bool:
+    """A later section heading. Schedule rows and tariff sub-rows are not one."""
+    for match in _EMBEDDED_SECTION_HEADING_RE.finditer(body):
+        if match.start() <= 40:
+            continue
+        line_start = body.rfind("\n", 0, match.start()) + 1
+        if _DEFINITION_CLAUSE_LINE_RE.match(body[line_start:]):
+            continue
+        line_end = body.find("\n", match.start())
+        line = body[line_start: line_end if line_end != -1 else len(body)].strip()
+        if section_text_starts_with_tariff_schedule_row(line):
+            continue
+        if section_text_opens_unheaded_tariff_subrow(line):
+            continue
+        return True
+    return False
+
+
+def _is_schedule_bearing_amending_section(number: str, text: str) -> bool:
+    """An Amendment or surcharge section may hold its schedule and pass 5000.
+
+    The opening line has to be that heading, closed by a marginal dash.
+    A rate row or an HS row inside explains the length. A later real heading
+    means the section swallowed the next one.
+    """
+    if not str(number or "").strip():
+        return False
+    body = text or ""
+    if not _AMENDING_SCHEDULE_HEADING_RE.match(body.strip()):
+        return False
+    if not _body_contains_schedule_row(body):
+        return False
+    return not _has_later_real_heading(body)
+
+
+def _row_is_tariff_baseline_noise(number: str, text: str) -> bool:
+    """A stored schedule row is not a section the collapse ratio should defend."""
+    if section_text_starts_with_tariff_schedule_row(text):
+        return True
+    if is_tariff_schedule_section(number, text):
+        return True
+    return section_text_opens_unheaded_tariff_subrow(text)
+
+
+def _collapse_baseline(rows: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [row for row in rows if not _row_is_tariff_baseline_noise(row[0], row[1])]
+
+
 def _has_mega_section(rows: Sequence[tuple[str, str]]) -> bool:
     for number, text in rows:
         if len(text) < REEXTRACT_MEGA_SECTION_CHARS:
             continue
         if _is_definition_catalogue(number, text):
+            continue
+        if _is_schedule_bearing_amending_section(number, text):
             continue
         return True
     return False
@@ -256,9 +339,13 @@ def gate_section_reextract(
     """
     before_rows = _parseable_rows(before_sections)
     after_rows = _parseable_rows(after_sections)
-    before_count = len(before_rows)
+    # An empty stored body is a first ingest. Schedule rows left over from a
+    # tariff-polluted parse are not that body: they drop out of the baseline
+    # and the mega check still runs.
+    raw_before = len(before_rows)
+    before_count = len(_collapse_baseline(before_rows))
     after_count = len(after_rows)
-    if before_count == 0:
+    if raw_before == 0:
         return SectionReextractGate("PASS", "", before_count, after_count)
 
     reason = ""

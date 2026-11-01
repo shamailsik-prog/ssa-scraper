@@ -295,9 +295,25 @@ _TARIFF_OCR_MANGLED_HS_RE = re.compile(
 _TARIFF_ZERO_PAD_PAREN_RE = re.compile(
     r"(?i)^0\d{1,2}\)\s+(?P<word>[A-Za-z]{4,})\b"
 )
+# A column header glued on the same line (``Rate 1. Where…``) is still the
+# rate row. ``_join_wrapped_marginal_notes`` used to do that glue.
 _TARIFF_INCOME_RATE_RE = re.compile(
-    r"(?i)^\d{1,3}[A-Z]?\s*[\.\)\]]\s+Where the taxable income\b"
+    r"(?i)^(?:(?:rates?\s+of\s+tax|rates?|rs\.?|per\s+cent)\s+)?"
+    r"\d{1,3}[A-Z]?\s*[\.\)\]]\s+Where the taxable income\b"
 )
+_COLUMN_HEADER_LINE_RE = re.compile(
+    r"(?i)^(?:rates?\s+of\s+tax|rates?|rs\.?|per\s+cent)\.?$"
+)
+# ``4. Rolled but not further worked`` is a tariff sub-item with no HS code.
+# ``4. Other provisions.—`` keeps the marginal dash and is a heading.
+_TARIFF_SUBROW_RE = re.compile(
+    r"(?i)^\d{1,2}\.\s+(?P<opener>Rolled|Hot|Cold|Other|Containing|Of)\b"
+)
+_TARIFF_SUBROW_CUE_RE = re.compile(
+    r"(?i)\b(?:thickness|millimetres?|millimeters?|metric\s+tons?|per\s+kg|"
+    r"per\s+cent|percent|worked|by\s+weight)\b"
+)
+_HEADING_TERMINATOR_RE = re.compile(r"(?:\.—|\.--|—|–|--|\.-)")
 _ZERO_PAD_STATUTORY_OPENER = frozenset({
     "short",
     "definitions",
@@ -374,6 +390,29 @@ def _line_is_tariff_schedule_heading(line: str) -> bool:
     return _line_is_zero_padded_chemical_row(raw)
 
 
+def _line_is_tariff_subrow(line: str) -> bool:
+    """True for ``4. Rolled…`` / ``4. Of … thickness`` with no marginal dash.
+
+    ``Rolled``, ``Hot`` and ``Cold`` are commodity openers. ``Other``,
+    ``Containing`` and ``Of`` need a schedule word such as ``thickness`` so
+    ``4. Other provisions.—`` is not a sub-row. The caller still requires the
+    previous chunk to be tariff-like before folding the line.
+    """
+    raw = (line or "").strip()
+    match = _TARIFF_SUBROW_RE.match(raw)
+    if not match or _HEADING_TERMINATOR_RE.search(raw):
+        return False
+    if match.group("opener").lower() in {"rolled", "hot", "cold"}:
+        return True
+    return bool(_TARIFF_SUBROW_CUE_RE.search(raw))
+
+
+def section_text_opens_unheaded_tariff_subrow(text: str) -> bool:
+    """True when the chunk's first line is an unheaded tariff sub-row."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return bool(lines) and _line_is_tariff_subrow(lines[0])
+
+
 def section_text_starts_with_tariff_schedule_row(text: str) -> bool:
     """True when the chunk opens on a schedule row, not an Act heading.
 
@@ -383,11 +422,17 @@ def section_text_starts_with_tariff_schedule_row(text: str) -> bool:
     chemical row. ``1. Where the taxable income…`` is an income-tax rate-table
     row. ``7.``, ``32.``, ``1) Short title``, and ``12) Penalties`` stay
     headings. ``7.30 p.m.`` and ``11.10.2018`` are not schedule rows.
+    A leading column header (``Rate``, ``Rs.``, ``Per cent``) does not hide
+    the row under it.
     """
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if not lines:
         return False
     if _line_is_tariff_schedule_heading(lines[0]):
+        return True
+    if _COLUMN_HEADER_LINE_RE.match(lines[0]) and len(lines) >= 2 and (
+        _line_is_tariff_schedule_heading(lines[1]) or _line_is_tariff_subrow(lines[1])
+    ):
         return True
     if len(lines) >= 2 and _TARIFF_CODE_ONLY_RE.match(lines[0]):
         return _rest_is_commodity_line(lines[1])
@@ -530,8 +575,19 @@ def _join_wrapped_marginal_notes(text: str) -> str:
     while index < len(lines):
         current = lines[index]
         nxt = lines[index + 1] if index + 1 < len(lines) else ""
-        if _WRAPPED_MARGINAL_NOTE_RE.match(current.strip()) and _FOLLOWING_SECTION_HEAD_RE.match(nxt.strip()):
-            joined.append(f"{current.strip()} {nxt.strip()}")
+        note = current.strip()
+        following = nxt.strip()
+        # ``Rate`` over ``1. Where the taxable income`` is a column header,
+        # not a marginal note. Joining it hides the rate row from the
+        # anchored schedule check.
+        if (
+            _WRAPPED_MARGINAL_NOTE_RE.match(note)
+            and _FOLLOWING_SECTION_HEAD_RE.match(following)
+            and not _COLUMN_HEADER_LINE_RE.match(note)
+            and not _line_is_tariff_schedule_heading(following)
+            and not _line_is_tariff_subrow(following)
+        ):
+            joined.append(f"{note} {following}")
             index += 2
             continue
         joined.append(current)
@@ -986,6 +1042,10 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
     out = []
     pending_year_text = ""
     pending_schedule_text = ""
+    # A tariff sub-row (``4. Rolled…``) folds only when the previous raw chunk
+    # was itself a schedule row. A following ``4. Other provisions.—`` is not
+    # a sub-row, so the flag never reaches it.
+    previous_raw_was_tariff = False
     for s in sections:
         key = s.get("section_number", "").strip().lower()
         token = (s.get("section_number") or "").strip()
@@ -997,6 +1057,7 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
         # the previous section look like a footnote when the note says "substituted
         # by", and the first copy of a colliding number would hide the real heading.
         if section_text_starts_with_amendment_date(text):
+            previous_raw_was_tariff = False
             if text.strip() and out:
                 _append_section_text(out[-1], text)
             continue
@@ -1007,12 +1068,17 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
         # the opening line and the row cannot take its number. Checked before the
         # 20-character floor so a short ``98.01 hotels`` is kept, and before the
         # duplicate-number drop so the row cannot hide a later ``32. Definitions``.
-        if section_text_starts_with_tariff_schedule_row(text):
+        # ``4. Rolled…`` has no HS code. It folds only after a schedule row.
+        opens_tariff = section_text_starts_with_tariff_schedule_row(text)
+        opens_subrow = section_text_opens_unheaded_tariff_subrow(text)
+        if opens_tariff or (opens_subrow and previous_raw_was_tariff):
+            previous_raw_was_tariff = True
             if text.strip() and out:
                 _append_section_text(out[-1], text)
             elif text.strip():
                 pending_schedule_text = (pending_schedule_text + "\n" + text).strip()
             continue
+        previous_raw_was_tariff = False
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue
@@ -1289,6 +1355,74 @@ def _repair_one_heading_gap(slice_text: str, missing: int) -> str:
     return slice_text
 
 
+# ``L, Short title and extent.—`` and ``3, Amendment of Act IV of 1969.—``.
+# The dash (em dash, ``.--``, or ``.-``) is what keeps a prose comma out.
+_OCR_COMMA_HEADING_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<n>\d{1,3}|[LIl|])(?P<sep>[ \t]*,[ \t]+)"
+    r"(?P<title>[A-Z][^\n]{2,80}?)"
+    r"(?=(?:[ \t]*\.[ \t]*(?:—|–|--|-){1,2}|[ \t]*(?:—|–|--)))"
+)
+_STRUCTURAL_COMMA_TITLE_RE = re.compile(r"(?i)^(?:amendment|short\s+title|repeal)\b")
+_ENACTED_AS_FOLLOWS_RE = re.compile(r"(?i)\benacted\s+as\s+follows\b[ \t:.\-—–]*")
+
+
+def _repair_ocr_comma_section_headings(text: str) -> str:
+    """Turn an OCR comma heading into a period heading the splitter already accepts.
+
+    ``L``, ``I``, ``l`` and ``|`` map to 1 only when they are the first heading.
+    A later letter stays put. When the printed number repeats, goes backwards,
+    or jumps by exactly two, and the title starts with Amendment, Short title
+    or Repeal, the heading takes the next integer. Finance Act 1985 reads
+    section 2 as ``3,`` and then prints ``3,`` again; the jump of two is that
+    misread. A wider gap keeps the printed number. ``12, Penalties.—`` stays 12.
+    """
+    events: List[Tuple[str, int, Match[str]]] = []
+    for match in _OCR_COMMA_HEADING_RE.finditer(text):
+        events.append(("comma", match.start(), match))
+    for match in _PERIOD_LINE_HEADING_RE.finditer(text):
+        events.append(("period", match.start(), match))
+    events.sort(key=lambda item: (item[1], 0 if item[0] == "period" else 1))
+    last: Optional[int] = None
+    spans: List[Tuple[int, int, str]] = []
+    for kind, _start, match in events:
+        if kind == "period":
+            line_end = text.find("\n", match.start())
+            line = text[match.start() : line_end if line_end != -1 else None]
+            stripped = line.strip()
+            if (
+                _line_is_tariff_schedule_heading(stripped)
+                or _line_is_tariff_subrow(stripped)
+                or section_text_starts_with_amendment_date(stripped)
+            ):
+                continue
+            last = int(match.group(1))
+            continue
+        raw = match.group("n")
+        title = (match.group("title") or "").strip()
+        if raw.isdigit():
+            number = int(raw)
+        elif last is None:
+            number = 1
+        else:
+            continue
+        if last is not None and _STRUCTURAL_COMMA_TITLE_RE.match(title) and (
+            number <= last or number == last + 2
+        ):
+            number = last + 1
+        last = number
+        spans.append((match.start("n"), match.end("sep"), f"{number}. "))
+    return _apply_span_replacements(text, spans)
+
+
+def _operative_text_before_first_heading(text: str, first_start: int) -> str:
+    """Words after ``enacted as follows`` and before the first heading match."""
+    head = text[:first_start]
+    enacted = _ENACTED_AS_FOLLOWS_RE.search(head)
+    if not enacted:
+        return ""
+    return head[enacted.end() :].strip()
+
+
 def _repair_ocr_swallowed_section_headings(text: str) -> str:
     """Restore headings that OCR hid between two period headings one number apart.
 
@@ -1321,7 +1455,9 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
         plain = _repair_ocr_swallowed_section_headings(
-            _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+            _repair_ocr_comma_section_headings(
+                _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+            )
         )
         # Line-start headings ("2. In this Act") plus marginal-note headings
         # ("Short title, 1. (1) This Act"). The second form is how a two-column
@@ -1346,6 +1482,20 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         matches = _drop_shadowed_paren_ocr_subsections(plain, matches)
         sections = []
         if len(matches) >= 2:
+            first_end = matches[1].start() if len(matches) > 1 else len(plain)
+            first_chunk = plain[matches[0].start() : first_end]
+            first_token = (matches[0].group(1) or "").strip()
+            first_num = int(first_token) if first_token.isdigit() else None
+            prefix = _operative_text_before_first_heading(plain, matches[0].start())
+            # The real short-title line was not a heading, or the first heading
+            # is a schedule row. The words after ``enacted as follows`` are
+            # section text. The recital before that formula stays dropped.
+            if prefix and len(prefix) >= 20 and (
+                (first_num is not None and first_num > 1)
+                or section_text_starts_with_tariff_schedule_row(first_chunk)
+                or section_text_opens_unheaded_tariff_subrow(first_chunk)
+            ):
+                sections.append(_make_section_dict("1", "", prefix, statute_name))
             for i, m in enumerate(matches):
                 start = m.start()
                 end = matches[i + 1].start() if i + 1 < len(matches) else len(plain)
