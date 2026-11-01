@@ -320,6 +320,25 @@ def test_cleared_stored_body_uses_snapshot_or_explicit_prior_rows():
     assert reextract_before_sections(_nine_real(), None, []) == _nine_real()
 
 
+def test_partial_live_rows_merge_with_capture_and_prior():
+    """Leaving section 1 in place must not hide captured sections 2–9."""
+    from scraper.statute_quality.section_reextract import reextract_before_sections
+
+    live = [_section("1", "1. Live short title stays.")]
+    snapshot = [_section("1", "1. Captured short title."), *[_real(n) for n in range(2, 10)]]
+    merged = reextract_before_sections(live, None, snapshot)
+    by_number = {row["section_number"]: row["section_text"] for row in merged}
+    assert set(by_number) == {str(n) for n in range(1, 10)}
+    assert by_number["1"] == "1. Live short title stays."
+
+    prior = [_section("2", "2. Prior text wins over the capture.")]
+    with_prior = reextract_before_sections(live, prior, snapshot)
+    prior_by_number = {row["section_number"]: row["section_text"] for row in with_prior}
+    assert prior_by_number["1"] == "1. Live short title stays."
+    assert prior_by_number["2"] == "2. Prior text wins over the capture."
+    assert prior_by_number["3"].startswith("3.")
+
+
 async def _seed_baloch_sections(db, statute, texts: dict[str, str]):
     from tests.test_year_section_sweep import _add_section
 
@@ -533,9 +552,15 @@ async def test_delete_before_promote_with_prior_rows_nine_to_one_fails(db):
 
 async def test_delete_before_promote_stable_footer_strip_passes(db):
     """A 9→7 footer strip still passes when the gate sees the pre-delete rows."""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
-    from scraper.models import DocumentQuarantine, Statute, StatuteSection, StatuteSectionVersion
+    from scraper.models import (
+        DocumentQuarantine,
+        Statute,
+        StatuteSection,
+        StatuteSectionReextractPrior,
+        StatuteSectionVersion,
+    )
     from scraper.statute_quality.section_reextract import gate_section_reextract, reextract_before_sections
     from scraper.tasks.promotion import promote_statute_staging
     from tests.test_b3_statute_promotion import _make_statute_staging
@@ -574,7 +599,7 @@ async def test_delete_before_promote_stable_footer_strip_passes(db):
         )
     )
     await db.flush()
-    await _delete_sections(db, statute.id, clear_snapshot=True)
+    await _delete_sections(db, statute.id, clear_snapshot=False)
     staging = await _make_statute_staging(
         db,
         {
@@ -606,3 +631,134 @@ async def test_delete_before_promote_stable_footer_strip_passes(db):
     by_number = {num: text for num, text in stored}
     assert set(by_number) == {"1", "2", "3", "4", "7", "8", "9"}
     assert "as re-read" in by_number["1"]
+    leftover = (
+        await db.execute(
+            select(func.count())
+            .select_from(StatuteSectionReextractPrior)
+            .where(StatuteSectionReextractPrior.statute_id == statute.id)
+        )
+    ).scalar()
+    assert leftover == 0
+
+
+async def test_partial_delete_before_promote_still_fails_collapse(db):
+    """Deleting 8 of 9 sections must not shrink the gate's before count to the survivor."""
+    from sqlalchemy import func, select, text
+
+    from scraper.models import (
+        DocumentQuarantine,
+        QuarantineQueue,
+        Statute,
+        StatuteSection,
+        StatuteSectionVersion,
+    )
+    from scraper.tasks.promotion import promote_statute_staging
+    from tests.test_b3_statute_promotion import _make_statute_staging
+
+    name = "THE BALOCHISTAN ANIMAL SLAUGHTER CONTROL ACT, 2025 PARTIAL"
+    originals = _real_act_texts()
+    statute = Statute(
+        name=name,
+        jurisdiction="Balochistan",
+        year_enacted=2025,
+        needs_section_refetch=True,
+        source_name="BalochistanAssembly",
+    )
+    db.add(statute)
+    await db.flush()
+    await _seed_baloch_sections(db, statute, originals)
+    db.add(
+        DocumentQuarantine(
+            doc_type="statute",
+            doc_id=statute.id,
+            reason="distribution_list_footer_as_sections",
+            run_id="reextract-partial-delete",
+        )
+    )
+    await db.flush()
+    await db.execute(
+        text("DELETE FROM statute_section WHERE statute_id = :id AND section_number <> '1'"),
+        {"id": statute.id},
+    )
+    await db.flush()
+    db.expire_all()
+    mega = "2. Extent through repeal and savings. " + ("The remaining provisions of this Act. " * 400)
+    staging = await _make_statute_staging(
+        db,
+        {
+            "statute_name": name,
+            "year_enacted": 2025,
+            "jurisdiction": "Balochistan",
+            "sections": [_section("2", mega)],
+        },
+    )
+    assert await promote_statute_staging(db, staging) == "quarantined"
+    assert staging.quarantine_reason == "section_reextract:reextract_collapse_count"
+    details = (
+        await db.execute(select(QuarantineQueue).where(QuarantineQueue.statutes_staging_id == staging.id))
+    ).scalars().one()
+    assert (details.details or {}).get("section_count_before") == 9
+    assert (details.details or {}).get("section_count_after") == 1
+    await db.refresh(statute)
+    assert statute.needs_section_refetch is True
+    still_hidden = (
+        await db.execute(
+            select(DocumentQuarantine).where(
+                DocumentQuarantine.doc_type == "statute",
+                DocumentQuarantine.doc_id == statute.id,
+            )
+        )
+    ).scalars().one()
+    assert still_hidden.reason == "distribution_list_footer_as_sections"
+    stored = (
+        await db.execute(
+            select(StatuteSection.section_number, StatuteSectionVersion.section_text, StatuteSection.sort_key)
+            .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
+            .where(StatuteSection.statute_id == statute.id)
+        )
+    ).all()
+    assert {num: text for num, text, _sort in stored} == originals
+    assert {num: sort for num, _text, sort in stored} == {str(n): n for n in range(1, 10)}
+
+
+async def test_orphan_reextract_capture_is_purged_and_live_statute_capture_stays(db):
+    """Captures for a deleted statute go away. A time-to-live sweep of the rest is deferred."""
+    import uuid
+
+    from sqlalchemy import func, select
+
+    from scraper.models import Statute, StatuteSectionReextractPrior
+    from scraper.statute_quality.section_reextract_apply import purge_orphan_reextract_captures
+
+    statute = Statute(name="Capture Keep Act, 2024", jurisdiction="Balochistan", year_enacted=2024)
+    db.add(statute)
+    await db.flush()
+    kept_id = uuid.uuid4()
+    orphan_id = uuid.uuid4()
+    db.add(
+        StatuteSectionReextractPrior(
+            section_id=kept_id,
+            statute_id=statute.id,
+            section_number="1",
+            section_text="1. This capture still belongs to a statute.",
+            sort_key=1,
+        )
+    )
+    db.add(
+        StatuteSectionReextractPrior(
+            section_id=orphan_id,
+            statute_id=uuid.uuid4(),
+            section_number="2",
+            section_text="2. The statute row is already gone.",
+            sort_key=2,
+        )
+    )
+    await db.flush()
+    await purge_orphan_reextract_captures(db)
+    remaining = (
+        await db.execute(select(StatuteSectionReextractPrior.section_id))
+    ).scalars().all()
+    assert remaining == [kept_id]
+    assert (
+        await db.execute(select(func.count()).select_from(StatuteSectionReextractPrior))
+    ).scalar() == 1

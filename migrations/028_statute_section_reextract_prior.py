@@ -21,6 +21,7 @@ async def upgrade(conn) -> None:
                 statute_id UUID NOT NULL,
                 section_number VARCHAR(100) NOT NULL,
                 section_text TEXT NOT NULL,
+                sort_key INTEGER,
                 captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
@@ -43,7 +44,7 @@ async def upgrade(conn) -> None:
             AS $$
             BEGIN
                 INSERT INTO statute_section_reextract_prior (
-                    section_id, statute_id, section_number, section_text
+                    section_id, statute_id, section_number, section_text, sort_key
                 )
                 SELECT OLD.id,
                        OLD.statute_id,
@@ -55,7 +56,8 @@ async def upgrade(conn) -> None:
                                WHERE id = OLD.current_version_id
                            ),
                            ''
-                       )
+                       ),
+                       OLD.sort_key
                 ON CONFLICT (section_id) DO NOTHING;
                 RETURN OLD;
             END;
@@ -74,9 +76,10 @@ async def upgrade(conn) -> None:
                 sid uuid;
                 snum varchar(100);
                 stid uuid;
+                skey integer;
             BEGIN
-                SELECT s.id, s.section_number, s.statute_id
-                  INTO sid, snum, stid
+                SELECT s.id, s.section_number, s.statute_id, s.sort_key
+                  INTO sid, snum, stid, skey
                 FROM statute_section s
                 WHERE s.id = OLD.section_id
                   AND s.current_version_id = OLD.id;
@@ -84,9 +87,9 @@ async def upgrade(conn) -> None:
                     RETURN OLD;
                 END IF;
                 INSERT INTO statute_section_reextract_prior (
-                    section_id, statute_id, section_number, section_text
+                    section_id, statute_id, section_number, section_text, sort_key
                 )
-                VALUES (sid, stid, snum, OLD.section_text)
+                VALUES (sid, stid, snum, OLD.section_text, skey)
                 ON CONFLICT (section_id) DO NOTHING;
                 RETURN OLD;
             END;

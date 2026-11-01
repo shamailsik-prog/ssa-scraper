@@ -35,7 +35,7 @@ from scraper.statute_quality.section_reextract import _parseable_rows, gate_sect
 from scraper.statute_quality.section_reextract_apply import (
     before_rows_for_promote,
     clear_reextract_snapshot,
-    restore_section_rows,
+    restore_missing_section_rows,
 )
 from scraper.extractors.judgment_guards import (
     detect_headnote_only_no_body,
@@ -2387,14 +2387,14 @@ async def promote_statute_staging(
         )
         return "quarantined"
     if not created_new_statute and statute is not None:
-        # Re-extract onto a stored body. A delete that already ran is still a
-        # re-extract: prior_sections or the delete capture is the before body.
-        # FAIL does not write the candidate and does not clear document_quarantine.
+        # Re-extract onto a stored body. Live rows and the delete capture are
+        # merged, so a partial delete still counts the missing sections.
+        # FAIL restores those missing numbers and does not clear document_quarantine.
         live_rows, before_rows = await before_rows_for_promote(db, statute.id, prior_sections)
         decision = gate_section_reextract(before_rows, parseable_sections)
         if not decision.may_apply:
-            if not _parseable_rows(live_rows) and _parseable_rows(before_rows):
-                await restore_section_rows(db, statute.id, before_rows)
+            if _parseable_rows(before_rows):
+                await restore_missing_section_rows(db, statute.id, before_rows, live_rows)
                 await clear_reextract_snapshot(db, statute.id)
             await _quarantine(
                 db,

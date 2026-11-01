@@ -415,6 +415,7 @@ class StatuteSectionReextractPrior(Base):
     statute_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     section_number: Mapped[str] = mapped_column(String(100), nullable=False)
     section_text: Mapped[str] = mapped_column(Text, nullable=False)
+    sort_key: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     captured_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
 
 
