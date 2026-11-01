@@ -15,14 +15,42 @@ from scraper.tasks.promotion import promote_statute_staging
 from tests.test_b3_statute_promotion import _make_statute_staging
 
 TEAM_URL = "https://sindhlaws.gov.pk/Team.aspx"
+SINDH_PDF = "https://sindhlaws.gov.pk/setup/publications/PUB-26-000048.pdf"
+OTHER_HOST = "https://punjablaws.gov.pk/laws/finance.html"
 BARE_NAME = "GOVERNMENT OF SINDH"
 DEPARTMENT_NAME = (
     "Law, Parliamentary Affairs & Criminal Prosecution Department, Government of Sindh"
 )
 REAL_ACT = "The Limitation Act, 1908"
+# One visible row per shape. These are real legislative forms that do not say Act.
+OTHER_JURISDICTION_TITLES = (
+    "(Amendment)",
+    "The Finance (Amendment)",
+    "Karachi Municipal Bye-laws, 1972",
+    "Cantonment Byelaws, 1960",
+    "Finance Bill, 2024",
+    "Proclamation of Emergency, 2007",
+    "Notification No. SO(Judl)1/2020",
+    "S.R.O. 123(I)/2024",
+    "The Sindh Laws Enactment, 1950",
+    "The Housing Scheme, 2015",
+)
 _OFFICE = (
     "The Secretary shall keep the staff roster and the office telephone list for internal routing."
 )
+
+
+def _one_section(name: str) -> dict:
+    return {
+        "statute_name": name,
+        "year_enacted": 2024,
+        "sections": [
+            {
+                "section_number": "1",
+                "section_text": "This instrument shall come into force at once and shall apply as stated.",
+            }
+        ],
+    }
 
 
 def _office_payload(name: str) -> dict:
@@ -78,16 +106,32 @@ def test_bare_government_name_is_rejected():
     assert title_lacks_legislative_word(DEPARTMENT_NAME)
     assert title_lacks_legislative_word("Law and Order Department, Government of Sindh")
 
-    ok, reason = validate_statute_reconciled_json(_office_payload(BARE_NAME), raw_text=_OFFICE)
+    ok, reason = validate_statute_reconciled_json(
+        _office_payload(BARE_NAME),
+        raw_text=_OFFICE,
+        source_url=SINDH_PDF,
+        source_name="SindhAssembly",
+    )
     assert ok is False
     assert reason == BARE_NAME_REASON
 
     ok, reason = validate_statute_reconciled_json(
         _office_payload(DEPARTMENT_NAME),
         raw_text=_OFFICE,
+        source_url=SINDH_PDF,
+        source_name="SindhAssembly",
     )
     assert ok is False
     assert reason == BARE_NAME_REASON
+
+    ok, reason = validate_statute_reconciled_json(
+        _office_payload(BARE_NAME),
+        raw_text=_OFFICE,
+        source_url=OTHER_HOST,
+        source_name="PunjabAssembly",
+    )
+    assert ok is True
+    assert reason == ""
 
 
 def test_real_act_title_still_passes():
@@ -124,11 +168,81 @@ def test_real_act_title_still_passes():
     assert reason == ""
 
 
+def test_other_jurisdiction_short_titles_pass_when_the_host_is_not_sindhlaws():
+    """Bye-laws, bills, proclamations, notifications, SROs, enactments, and schemes stay.
+
+    The word list is unchanged. Those titles still fail only when the source
+    host is sindhlaws.gov.pk. A non-Sindh host does not.
+    """
+    from scraper.statute_non_legislation_gate import BARE_NAME_REASON, title_lacks_legislative_word
+
+    body = "This instrument shall come into force at once and shall apply as stated."
+    old_global_failures = 0
+    scoped_failures_off_sindh = []
+    scoped_failures_on_sindh = []
+    for title in OTHER_JURISDICTION_TITLES:
+        if title_lacks_legislative_word(title):
+            old_global_failures += 1
+        ok, reason = validate_statute_reconciled_json(
+            _one_section(title),
+            raw_text=body,
+            source_url=OTHER_HOST,
+            source_name="PunjabAssembly",
+        )
+        if not ok:
+            scoped_failures_off_sindh.append((title, reason))
+        ok_sindh, reason_sindh = validate_statute_reconciled_json(
+            _one_section(title),
+            raw_text=body,
+            source_url=SINDH_PDF,
+            source_name="SindhAssembly",
+        )
+        if (not ok_sindh) and reason_sindh == BARE_NAME_REASON:
+            scoped_failures_on_sindh.append(title)
+
+    # Fixture dry-count: one visible row per shape per host (10 x 2 = 20).
+    assert old_global_failures == len(OTHER_JURISDICTION_TITLES)
+    assert old_global_failures * 2 == 20
+    assert scoped_failures_off_sindh == []
+    assert scoped_failures_on_sindh == list(OTHER_JURISDICTION_TITLES)
+
+    # SindhAssembly also crawls pas.gov.pk. That host is not Sindh Laws.
+    ok, reason = validate_statute_reconciled_json(
+        _one_section("Finance Bill, 2024"),
+        raw_text=body,
+        source_url="https://pas.gov.pk/uploads/acts/finance-bill.html",
+        source_name="SindhAssembly",
+    )
+    assert ok is True
+    assert reason == ""
+
+    # A present non-Sindh host wins over a Sindh Laws source label.
+    ok, reason = validate_statute_reconciled_json(
+        _one_section("Finance Bill, 2024"),
+        raw_text=body,
+        source_url=OTHER_HOST,
+        source_name="SindhLaws",
+    )
+    assert ok is True
+    assert reason == ""
+
+    # Equivalent provenance when the URL host is missing.
+    ok, reason = validate_statute_reconciled_json(
+        _office_payload(BARE_NAME),
+        raw_text=_OFFICE,
+        source_url="",
+        source_name="SindhLaws",
+    )
+    assert ok is False
+    assert reason == BARE_NAME_REASON
+
+
 @pytest.mark.asyncio
 async def test_promotion_writes_no_statute_for_bare_government_name(db):
     from scraper.statute_non_legislation_gate import BARE_NAME_REASON
 
     st = await _make_statute_staging(db, _office_payload(BARE_NAME))
+    st.source_url = SINDH_PDF
     assert await promote_statute_staging(db, st) == "quarantined"
     assert BARE_NAME_REASON in (st.quarantine_reason or "")
     assert (await db.execute(select(func.count()).select_from(Statute))).scalar() == 0

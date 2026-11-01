@@ -5,9 +5,12 @@ Two rows on main were accepted, then quarantined by hand:
 * ``c6c40abd`` — ``Team.aspx`` on sindhlaws.gov.pk, a staff and phone page.
 * ``5e575644`` — PDF ``PUB-26-000048.pdf`` titled only ``GOVERNMENT OF SINDH``.
 
-Gazette listings and PDF publications stay. A short title that names an Act,
-Ordinance, Rules, Regulation, Order, Statute, Code, or the Constitution stays.
-A department masthead stays out even when it says ``Law and Order``.
+Gazette listings and PDF publications stay. The title gate runs only when the
+source host is sindhlaws.gov.pk. Other legislatures keep Bye-laws, Bills,
+Proclamations, Notifications, S.R.O.s, Enactments, Schemes, and "(Amendment)"
+short titles. On Sindh Laws, a title still needs an Act, Ordinance, Rules,
+Regulation, Order, Statute, Code, or Constitution word. A department masthead
+stays out even when it says ``Law and Order``.
 """
 
 from __future__ import annotations
@@ -66,6 +69,23 @@ def sindhlaws_non_statute_html_url(url: str) -> bool:
     if path.endswith(_DOCUMENT_SUFFIXES):
         return False
     return path.endswith(_HTML_SUFFIXES)
+
+
+def sindhlaws_statute_source(
+    source_url: Optional[str] = None, source_name: Optional[str] = None
+) -> bool:
+    """True only for the Sindh Laws portal, not for every Sindh statute.
+
+    ``SindhAssembly`` also harvests pas.gov.pk. Those rows are not this gate.
+    A source name of ``SindhLaws`` counts when the URL host is missing.
+    """
+    host = (urlsplit((source_url or "").strip()).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host:
+        return host == _SINDHLAWS_HOST
+    label = re.sub(r"[\s._-]+", "", (source_name or "").strip().lower())
+    return label in {"sindhlaws", "sindhlawsgovpk"}
 
 
 def sindhlaws_html_statute_reject_reason(*, kind: str, url: str) -> Optional[str]:
