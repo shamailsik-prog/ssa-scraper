@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 from uuid import UUID
 
 from celery import shared_task
@@ -31,7 +31,12 @@ from scraper.document_validation import (
     validate_judgment_reconciled_json,
     validate_statute_reconciled_json,
 )
-from scraper.statute_quality.section_reextract import gate_section_reextract
+from scraper.statute_quality.section_reextract import _parseable_rows, gate_section_reextract
+from scraper.statute_quality.section_reextract_apply import (
+    before_rows_for_promote,
+    clear_reextract_snapshot,
+    restore_section_rows,
+)
 from scraper.extractors.judgment_guards import (
     detect_headnote_only_no_body,
     detect_headnotes_only,
@@ -2009,7 +2014,13 @@ async def reconcile_citation_statute_residual_smoke(
     return result
 
 
-async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, force: bool = False) -> str:
+async def promote_statute_staging(
+    db: AsyncSession,
+    st: StatutesStaging,
+    *,
+    force: bool = False,
+    prior_sections: Optional[Sequence[Any]] = None,
+) -> str:
     data = st.reconciled_json or {}
     if st.status == "quarantined" and not force:
         await _quarantine(db, st, st.quarantine_reason or "below confidence threshold", st.kind)
@@ -2376,19 +2387,15 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         )
         return "quarantined"
     if not created_new_statute and statute is not None:
-        # Re-extract onto a stored body. FAIL leaves sections and document_quarantine alone.
-        existing_rows = (
-            await db.execute(
-                select(StatuteSection.section_number, StatuteSectionVersion.section_text)
-                .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
-                .where(StatuteSection.statute_id == statute.id)
-            )
-        ).all()
-        decision = gate_section_reextract(
-            [{"section_number": num, "section_text": txt or ""} for num, txt in existing_rows],
-            parseable_sections,
-        )
+        # Re-extract onto a stored body. A delete that already ran is still a
+        # re-extract: prior_sections or the delete capture is the before body.
+        # FAIL does not write the candidate and does not clear document_quarantine.
+        live_rows, before_rows = await before_rows_for_promote(db, statute.id, prior_sections)
+        decision = gate_section_reextract(before_rows, parseable_sections)
         if not decision.may_apply:
+            if not _parseable_rows(live_rows) and _parseable_rows(before_rows):
+                await restore_section_rows(db, statute.id, before_rows)
+                await clear_reextract_snapshot(db, statute.id)
             await _quarantine(
                 db,
                 st,
@@ -2488,6 +2495,7 @@ async def promote_statute_staging(db: AsyncSession, st: StatutesStaging, *, forc
         prov.promoted_table, prov.promoted_id = "statute", statute.id
     st.status = "promoted" if new_versions else "duplicate"
     st.promoted_to_id = statute.id
+    await clear_reextract_snapshot(db, statute.id)
     await db.flush()
     return st.status
 

@@ -22,7 +22,9 @@ Thresholds, and why:
   stripped text is at least that long fails, including a single section that
   holds extent through repeal. The first ingest of a statute has no stored
   body (``before`` empty) and is not this gate: there is nothing to collapse
-  and nothing to un-quarantine.
+  and nothing to un-quarantine. Deleting stored rows and then promoting is
+  not a first ingest. Pass those rows through ``reextract_before_sections``
+  so this function still sees them. Thresholds above are unchanged.
 * A real section 1 (not a distribution-list designation) that is present
   before and absent after fails. A footer-only ``1. The Principal Secretary…``
   may disappear.
@@ -105,6 +107,28 @@ def _count_collapsed(before_count: int, after_count: int) -> bool:
 
 def _has_mega_section(rows: Sequence[tuple[str, str]]) -> bool:
     return any(len(text) >= REEXTRACT_MEGA_SECTION_CHARS for _, text in rows)
+
+
+def reextract_before_sections(
+    stored_sections: Sequence[Any] | None,
+    prior_sections: Sequence[Any] | None = None,
+    snapshot_sections: Sequence[Any] | None = None,
+) -> list[Any]:
+    """Rows the gate must compare against.
+
+    Explicit pre-delete rows win. Otherwise the live stored rows. If those
+    were cleared, ``snapshot_sections`` is the body captured at delete. An
+    empty result is a first fill, which ``gate_section_reextract`` PASSes.
+    """
+    if _parseable_rows(prior_sections):
+        return list(prior_sections)
+    if _parseable_rows(stored_sections):
+        return list(stored_sections)
+    if _parseable_rows(snapshot_sections):
+        return list(snapshot_sections)
+    if stored_sections:
+        return list(stored_sections)
+    return []
 
 
 def gate_section_reextract(

@@ -27,6 +27,7 @@ from scraper.models import (
     InstrumentSectionRelation,
     Statute,
     StatuteSection,
+    StatuteSectionReextractPrior,
     StatuteSectionVersion,
 )
 from scraper.statute_quality.year_section_merge import (
@@ -165,6 +166,12 @@ async def _apply_plan(db: AsyncSession, plan: Dict[str, Any]) -> None:
         )
     )
     await db.execute(delete(StatuteSection).where(StatuteSection.id.in_(year_ids)))
+    # The delete trigger captured these rows for the re-extract gate. The text
+    # now lives on the previous section, so the capture must not count as a
+    # stored body later.
+    await db.execute(
+        delete(StatuteSectionReextractPrior).where(StatuteSectionReextractPrior.section_id.in_(year_ids))
+    )
     for target_id in {item["into_section_id"] for item in plan["merged"]}:
         await _requeue_section_embedding(db, UUID(target_id))
 
