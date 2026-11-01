@@ -20,7 +20,12 @@ Thresholds, and why:
   addressee lines). 9→1 drops 8, so it still fails.
 * ``REEXTRACT_MEGA_SECTION_CHARS`` is 5000. Any stored re-extract row whose
   stripped text is at least that long fails, including a single section that
-  holds extent through repeal. The first ingest of a statute has no stored
+  holds extent through repeal. A section 2 that is only a definitions
+  catalogue may be longer: the opening formula plus a run of quoted clauses,
+  and no later section heading or repeal. The North-West Frontier Province
+  Urban Planning Act, 1975 definitions are about 8000 characters once clause
+  ``(2)`` is no longer split off as a fake section 12. That same text stored
+  under number 12 still fails. The first ingest of a statute has no stored
   body (``before`` empty) and is not this gate: there is nothing to collapse
   and nothing to un-quarantine. Deleting stored rows and then promoting is
   not a first ingest. Pass those rows through ``reextract_before_sections``
@@ -105,8 +110,50 @@ def _count_collapsed(before_count: int, after_count: int) -> bool:
     return after_count < before_count * REEXTRACT_COLLAPSE_RATIO
 
 
+_DEFINITIONS_SECTION_RE = re.compile(
+    r"(?is)^\s*(?:section\s+|s\.\s*)?2\s*[\.\)\-:]\s*.{0,180}?"
+    r"(?:\bdefi\w{3,16}\b|\bin\s+this\s+act\s*,?\s*unless\b)"
+)
+_EMBEDDED_SECTION_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*(\d{1,3})[A-Z]?[ \t]*\.[ \t]+(?=[A-Za-z])"
+)
+_REPEAL_OPERATIVE_RE = re.compile(r"(?i)\bhereby\s+repealed\b")
+_DEFINITION_CLAUSE_RE = re.compile(
+    r"(?m)(?:\(\s*(?:\d{1,2}|[lI])\s*\)|(?<![\d(])1\d{1,2}\))[ \t]+[\"'“”‘’:]"
+)
+
+
+def _is_section_two(number: str) -> bool:
+    cleaned = _SECTION_ONE_PREFIX_RE.sub("", (number or "").strip())
+    cleaned = cleaned.rstrip(".").strip()
+    return cleaned in {"2", "02"}
+
+
+def _is_definition_catalogue(number: str, text: str) -> bool:
+    """True when a long section 2 is the definitions list and not the rest of the act.
+
+    Clause ``(2)`` OCR'd as ``12)`` used to be its own mega row. Folding it
+    back leaves one definitions section over the character cap. A row that
+    also carries a later heading or a repeal is still a collapsed act.
+    """
+    body = text or ""
+    if not _is_section_two(number) or not _DEFINITIONS_SECTION_RE.search(body):
+        return False
+    if len(_DEFINITION_CLAUSE_RE.findall(body)) < 4:
+        return False
+    if _REPEAL_OPERATIVE_RE.search(body):
+        return False
+    return not any(match.start() > 40 for match in _EMBEDDED_SECTION_HEADING_RE.finditer(body))
+
+
 def _has_mega_section(rows: Sequence[tuple[str, str]]) -> bool:
-    return any(len(text) >= REEXTRACT_MEGA_SECTION_CHARS for _, text in rows)
+    for number, text in rows:
+        if len(text) < REEXTRACT_MEGA_SECTION_CHARS:
+            continue
+        if _is_definition_catalogue(number, text):
+            continue
+        return True
+    return False
 
 
 def _merge_row(item: Any) -> dict[str, Any] | None:

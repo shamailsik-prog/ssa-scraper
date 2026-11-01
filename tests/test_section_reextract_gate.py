@@ -159,6 +159,76 @@ def test_more_sections_than_stored_passes():
     assert decision.verdict == "PASS"
 
 
+def _definition_catalogue(extra: str = "") -> str:
+    """Section 2 as a run of definition clauses, padded past the mega-section cap."""
+    clauses = "\n".join(
+        f'({number}) "term{number}" means the meaning this Act assigns to term {number};'
+        for number in range(1, 24)
+    )
+    # Clause (2) printed with the opening parenthesis read as a digit.
+    clauses = clauses.replace(
+        '(2) "term2" means the meaning this Act assigns to term 2;',
+        '12) "term2" means the meaning this Act assigns to term 2;',
+        1,
+    )
+    body = (
+        "2. Definitions.—In this Act, unless there is anything repugnant in the subject "
+        "or context,—\n"
+        + clauses
+        + "\n"
+        + extra
+    )
+    if len(body) < REEXTRACT_MEGA_SECTION_CHARS:
+        body += "\n" + ("The same meaning applies for the rest of this definition. " * 80)
+    return body
+
+
+def test_definition_catalogue_over_the_cap_is_not_a_mega_section():
+    """A real definitions section can pass 5000 characters without swallowing the act."""
+    catalogue = _definition_catalogue()
+    assert len(catalogue) >= REEXTRACT_MEGA_SECTION_CHARS
+    after = [
+        _real(1, "This Act may be called the Example Urban Planning Act, 1975."),
+        _section("2", catalogue),
+        _real(3, "The Government shall establish the Board under this Act."),
+        _real(12, "The Board may regulate development in a provincial control area."),
+    ]
+    decision = gate_section_reextract([_real(1), _real(2), _real(3)], after)
+    assert decision.verdict == "PASS"
+    assert decision.reason == ""
+    assert decision.may_apply is True
+
+
+def test_definition_clauses_stored_as_section_12_still_fail_the_mega_gate():
+    """The same catalogue under number 12 is the OCR split, not section 2."""
+    catalogue = _definition_catalogue().replace("2. Definitions", "12) ", 1)
+    assert len(catalogue) >= REEXTRACT_MEGA_SECTION_CHARS
+    after = [
+        _real(1),
+        _section("2", "2. Definitions.—In this Act, unless the context otherwise requires,—"),
+        _section("12", catalogue),
+        _real(3),
+    ]
+    decision = gate_section_reextract([_real(1), _real(2), _real(3), _real(12)], after)
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_mega_section"
+
+
+def test_definitions_that_swallowed_a_later_section_still_fail():
+    """Extent-through-repeal glued onto section 2 is still a mega section."""
+    swallowed = _definition_catalogue(
+        "\n3. Establishment.—The Government shall establish the Board.\n"
+        "51. Repeal.—The earlier Ordinance is hereby repealed.\n"
+    )
+    assert len(swallowed) >= REEXTRACT_MEGA_SECTION_CHARS
+    decision = gate_section_reextract(
+        [_real(1), _real(2), _real(3)],
+        [_real(1), _section("2", swallowed)],
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_mega_section"
+
+
 async def test_promote_does_not_apply_or_unquarantine_a_collapsed_reextract(db):
     """Stored 9-section act must stay quarantined when the candidate is one mega row."""
     from sqlalchemy import func, select
