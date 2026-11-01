@@ -120,7 +120,10 @@ _OCR_PERIOD_YEAR_RE = re.compile(
     r"(\b(?:Act|Ordinance|Order|Rules|Regulations))\.\s+((?:18|19|20)\d{2})\b"
 )
 _DEFINITION_CLAUSE_RE = re.compile(r"(?i)\bmeans\s+the\b")
-_AN_ACT_OPENING_RE = re.compile(r"(?i)^an\s+act\b")
+# ``An Act``, or the same preamble when ``An`` was read as a dot plus one
+# digit (``.4 Act`` on the NWFP Urban Planning page). A bare digit is not
+# enough: ``4 Act`` in a numbered list is not this preamble.
+_AN_ACT_OPENING_RE = re.compile(r"(?i)^(?:an|\.\s*\d)\s+act\b")
 _SHORT_TITLE_OPENING_RE = re.compile(r"(?i)^1\s*[\.\)\-]\s*short\s+title\b")
 _CITATION_FOLLOW_RE = re.compile(r"(?i)^(?:\.-|\.\s*-|,\s*in\s+section\b|in\s+the\b)")
 _ACT_NO_LABELED_RE = re.compile(
@@ -155,9 +158,31 @@ _YEAR_OCR = str.maketrans(
 # Not only at line start. A later act is sometimes glued into the preceding
 # section (``...roll. ACT No. XLII of 1975 An Act further to amend...``).
 # ``_is_act_boundary`` still rejects a citation tail.
+#
+# senate.gov.pk 1661312733_937.pdf (Rangers 34, then NWFP Urban Planning
+# 35, then the Public Service Commission amendment 36) never prints a
+# clean ``ACT No. … of YYYY``. Accepted slips, and why:
+#
+# * ``ACT`` may be ``AC_l`` / ``ACl`` (T read as l, optional underscore where
+#   the glyph broke) or ``{-CT`` (the leading A replaced by 1–4 punctuation
+#   marks, not deleted). A bare ``CT No.`` does not match.
+# * ``of`` may be ``on`` (f/n, same line) or ``or`` (f/r, same line). It may
+#   also be missing, because the text layer often leaves that word on the
+#   previous line and puts the year against the numeral.
+# * The roman numeral may use ``T`` for ``I`` (a trailing ``TV`` is ``IV``).
+#   That repair is applied only to this heading's numeral.
+#
+# Not accepted: ``Acr No. xt or 2015`` (Credit Bureaus). ``Acr`` is not
+# ``AC`` plus a T/l slip, and ``xt`` is not a roman numeral with T standing
+# for I. A citation tail (``.-``, ``In the``) is still not a boundary.
+# Punctuation, not whitespace: a newline must not turn a bare ``CT No.`` into ``ACT``.
+_ACT_WORD = r"(?:ac[\W_]{0,3}[tli1]|[^\w\s]{1,4}ct)"
+_OF_WORD = r"(?:of|on|or)"
+_ROMAN_HEADING = r"[IVXLCDMT]+"
 _ACT_NO_HEADING_RE = re.compile(
-    rf"(?i)(?<![A-Za-z])act\s+no\.?\s*([IVXLCDM]+|\d{{1,4}})"
-    rf"(?:[ \t]+of\b)?"
+    rf"(?i)(?<![A-Za-z]){_ACT_WORD}[\W_]{{0,3}}\s*no\.?\s*"
+    rf"({_ROMAN_HEADING}|\d{{1,4}})"
+    rf"(?:[ \t]+{_OF_WORD}\b)?"
     rf"(?:[ \t]+({_YEAR_TOKEN})\b|[ \t]*\n[ \t]*({_YEAR_TOKEN})\b)"
 )
 # Short extracts must not be treated as proof that stored sections are missing.
@@ -411,6 +436,16 @@ def is_quarantined_bill_shell(
     ):
         return True
     return not is_coherent_act_title(name)
+
+
+def _heading_act_number(token: str) -> Optional[int]:
+    """Numeral from an ``ACT No.`` heading. ``T`` is ``I`` (a trailing ``TV`` is ``IV``).
+
+    Roman numerals do not use ``T``. Pipe labels and citation text do not
+    come through here, so this repair does not apply to them.
+    """
+    raw = (token or "").strip().upper().replace("T", "I")
+    return _roman_or_int(raw)
 
 
 def _roman_or_int(token: str) -> Optional[int]:
@@ -909,14 +944,17 @@ def act_segments(
     """Split a Gazette that prints several acts. A single act stays one segment.
 
     A line-start ``Act No.`` is a boundary only when an ``An Act`` preamble or
-    ``1. Short title`` follows within four lines. An ``Act No.`` glued into a
+    ``1. Short title`` follows within four lines. ``.4 Act`` counts as that
+    preamble (``An`` read as a dot plus one digit). An ``Act No.`` glued into a
     section tail is also a boundary when ``An Act`` is the next text, even
     when that next act's own section 1 was not read. The year may be the next
     line, and a token such as ``r97J`` still counts: its year is the year the
     neighbouring headings share, or the pipe label's year when none of them
-    print a readable year. A citation tail (``.-``, ``In the``, ``, in
-    section``) is not a boundary, so an amending Act that quotes an earlier
-    Act number keeps the sections that follow the quotation.
+    print a readable year. ``ACT`` may be ``AC_l`` or ``{-CT``, ``of`` may be
+    ``on``, ``or``, or absent, and ``T`` in the roman numeral is ``I``.
+    ``Acr No. xt`` is not a heading. A citation tail (``.-``,
+    ``In the``, ``, in section``) is not a boundary, so an amending Act that
+    quotes an earlier Act number keeps the sections that follow the quotation.
     """
     text = pdf_text or ""
     if not text.strip():
@@ -928,7 +966,7 @@ def act_segments(
         for index, heading in enumerate(headings):
             start = 0 if index == 0 else heading.start()
             end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
-            number = _roman_or_int(heading.group(1))
+            number = _heading_act_number(heading.group(1))
             year = years[index]
             act = (number, year) if number is not None and year is not None else None
             title_scope = text[heading.start() : end]

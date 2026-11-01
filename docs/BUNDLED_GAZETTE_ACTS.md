@@ -12,6 +12,20 @@ That PDF is three Acts: LXVII of 1973 (Life Insurance (Nationalisation) (Amendme
 
 New ingest isolates the segment whose act number matches the pipe label, or whose short title matches the target title, and splits only that segment. A line-start `Act No.` is a boundary only when `An Act` or `1. Short title` follows within four lines. An `Act No.` glued into a section tail is also a boundary when `An Act` is the next text, even if that next act's own section 1 is missing. The cut drops the later act from the earlier act's sections. A stored section that still runs across that header is `bundled_gazette_act_bleed`. The year may be the next line (`ACT No. LXXI` then `1973`), and a one-character garble such as `r97J` still counts: that year is the year the neighbouring headings share, or the pipe label's year when none of them print a readable year. A citation tail (`.-`, `In the`, `, in section`), including `Act No. LXX of 1973.- In the …`, is not a boundary, so the sections after that quotation stay with the amending Act. `may be called` and `shall be called` both supply the short title, including when the title breaks onto the next line. If the label and the title name two different segments, or neither matches, the extract stores no sections and promotion quarantines the staging row with `bundled_gazette_unresolved`. It does not set `needs_section_refetch`.
 
+A scanned bundle does not have to print a clean `ACT No. … of YYYY`. senate.gov.pk `1661312733_937.pdf` (Pakistan Rangers (Amendment) Act, 1975, then the North-West Frontier Province Urban Planning Act, 1975, then the Public Service Commission amendment) is three acts, and the text layer matches none of the clean form:
+
+| What was printed | What the scan shows | Why it still splits |
+| --- | --- | --- |
+| `ACT` | `AC_l` or `ACl` | T read as l, with an optional underscore where the glyph broke |
+| `ACT` | `{-CT` | The leading A replaced by one to four punctuation marks. A bare `CT No.` does not match |
+| `of` | `on` | f read as n, on the same line (`ACT No. XXXV on 1975`) |
+| `of` | `or` | f read as r, on the same line (`XXXTV or 1975`) |
+| `of` | absent | The text layer left `or` on the previous line, so the year sits against the numeral (`XXXTV 1975`) |
+| `IV` | `TV` | T stands for I. `XXXTV` is XXXIV. The repair applies only to this heading's numeral |
+| `An Act` | `.4 Act` | `An` read as a dot plus one digit. A bare `4 Act` is not a preamble |
+
+`Acr No. xt or 2015` is not one of these slips. `Acr` is not `AC` plus a T/l break, and `xt` is not a roman numeral with T standing for I. A citation tail (`.-`, `In the`, `, in section`) is still not a boundary.
+
 The same cut runs for Senate, the National Assembly, law.gok.pk, and any other text that has two or more `ACT No.` lines. A law.gok.pk PDF that has no second `ACT No.` line still uses the existing title-heading cut, which drops a later act and does not pull a middle act out of an earlier one.
 
 ## Already stored
