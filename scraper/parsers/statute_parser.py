@@ -282,6 +282,51 @@ _TARIFF_OCR_TOKEN_RE = re.compile(
 )
 _TARIFF_CODE_ONLY_RE = re.compile(r"(?i)^(?:\d{1,2}|0[EI])\.\d{2}\.?$")
 _COMMODITY_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+# ``78. 38BO5 Chromite``: the dot of HS ``38.05`` was read as B and the 0 as O.
+# The token keeps two chapter digits, then 2–4 OCR digits, and at least one
+# mangled letter. A plain ``3805`` is not this class.
+_TARIFF_OCR_MANGLED_HS_RE = re.compile(
+    r"(?i)^(?:\d{1,3}[A-Z]?\s*[\.\)\]]\s+)?"
+    r"(?P<code>\d{2}[0-9OIB]{2,4})"
+    r"\s+(?P<rest>[A-Za-z].*)$"
+)
+# ``03) Cuprammonium``: a zero-padded schedule row with no decimal. ``1) Short
+# title`` and ``12) Penalties`` are not zero-padded and stay headings.
+_TARIFF_ZERO_PAD_PAREN_RE = re.compile(
+    r"(?i)^0\d{1,2}\)\s+(?P<word>[A-Za-z]{4,})\b"
+)
+_TARIFF_INCOME_RATE_RE = re.compile(
+    r"(?i)^\d{1,3}[A-Z]?\s*[\.\)\]]\s+Where the taxable income\b"
+)
+_ZERO_PAD_STATUTORY_OPENER = frozenset({
+    "short",
+    "definitions",
+    "definition",
+    "this",
+    "amendment",
+    "income",
+    "subject",
+    "provided",
+    "notwithstanding",
+    "powers",
+    "penalties",
+    "penalty",
+    "hours",
+    "weekly",
+    "overtime",
+    "commencement",
+    "extent",
+    "preliminary",
+    "title",
+    "interpretation",
+    "application",
+    "repeal",
+    "savings",
+    "saving",
+    "where",
+    "every",
+    "whoever",
+})
 
 
 def _tariff_commodity_rest(rest: str) -> str:
@@ -299,25 +344,45 @@ def _rest_is_commodity_line(rest: str) -> bool:
     return bool(_COMMODITY_WORD_RE.match(body))
 
 
+def _ocr_mangled_hs_code(code: str) -> bool:
+    token = code or ""
+    return bool(re.search(r"[OIBoib]", token))
+
+
+def _line_is_zero_padded_chemical_row(line: str) -> bool:
+    match = _TARIFF_ZERO_PAD_PAREN_RE.match(line)
+    if not match:
+        return False
+    return match.group("word").lower() not in _ZERO_PAD_STATUTORY_OPENER
+
+
 def _line_is_tariff_schedule_heading(line: str) -> bool:
     raw = (line or "").strip()
     if not raw:
         return False
+    if _TARIFF_INCOME_RATE_RE.match(raw):
+        return True
     ocr = _TARIFF_OCR_TOKEN_RE.match(raw)
     if ocr:
         return _rest_is_commodity_line(ocr.group("rest"))
     match = _TARIFF_CODE_HEAD_RE.match(raw)
-    if not match:
-        return False
-    return _rest_is_commodity_line(match.group("rest"))
+    if match and _rest_is_commodity_line(match.group("rest")):
+        return True
+    mangled = _TARIFF_OCR_MANGLED_HS_RE.match(raw)
+    if mangled and _ocr_mangled_hs_code(mangled.group("code")) and _rest_is_commodity_line(mangled.group("rest")):
+        return True
+    return _line_is_zero_padded_chemical_row(raw)
 
 
 def section_text_starts_with_tariff_schedule_row(text: str) -> bool:
-    """True when the chunk opens on an HS or services schedule row, not a heading.
+    """True when the chunk opens on a schedule row, not an Act heading.
 
     ``08.05 Nuts``, ``32.03 Synthetic organic…``, and ``98.01 hotels`` are
-    schedule lines, including OCR chapter tokens ``0E`` / ``0I``. ``7.`` and
-    ``32.`` stay headings. ``7.30 p.m.`` and ``11.10.2018`` are not schedule rows.
+    schedule lines, including OCR chapter tokens ``0E`` / ``0I`` and a mangled
+    code such as ``78. 38BO5 Chromite``. ``03) Cuprammonium`` is a zero-padded
+    chemical row. ``1. Where the taxable income…`` is an income-tax rate-table
+    row. ``7.``, ``32.``, ``1) Short title``, and ``12) Penalties`` stay
+    headings. ``7.30 p.m.`` and ``11.10.2018`` are not schedule rows.
     """
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if not lines:
@@ -920,6 +985,7 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
     seen = set()
     out = []
     pending_year_text = ""
+    pending_schedule_text = ""
     for s in sections:
         key = s.get("section_number", "").strip().lower()
         token = (s.get("section_number") or "").strip()
@@ -934,14 +1000,18 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
             if text.strip() and out:
                 _append_section_text(out[-1], text)
             continue
-        # HS / services rows (``08.05 Nuts``, ``98.01 hotels``, OCR ``0E`` / ``0I``)
-        # are schedule text. Park them on the previous real section. A leading row
-        # has no section to join and is not numbered. Checked before the 20-character
-        # floor so a short ``98.01 hotels`` is kept, and before the duplicate-number
-        # drop so the row cannot take the place of a later ``32. Definitions``.
+        # HS / services rows, OCR chemical rows (``78. 38BO5``, ``03) Cuprammonium``),
+        # and income-tax rate lines (``1. Where the taxable income``) are schedule
+        # text. Park them on the previous real section. A leading row waits and is
+        # appended after the first real heading is accepted, so Short title stays
+        # the opening line and the row cannot take its number. Checked before the
+        # 20-character floor so a short ``98.01 hotels`` is kept, and before the
+        # duplicate-number drop so the row cannot hide a later ``32. Definitions``.
         if section_text_starts_with_tariff_schedule_row(text):
             if text.strip() and out:
                 _append_section_text(out[-1], text)
+            elif text.strip():
+                pending_schedule_text = (pending_schedule_text + "\n" + text).strip()
             continue
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
@@ -985,10 +1055,16 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
                 # but allow if number is e.g., 511
                 if num_int > 5000:
                     continue
-        if pending_year_text:
+        if pending_year_text or pending_schedule_text:
             s = dict(s)
-            s["section_text"] = pending_year_text + "\n" + (s.get("section_text") or "")
-            pending_year_text = ""
+            body = s.get("section_text") or ""
+            if pending_year_text:
+                body = pending_year_text + "\n" + body
+                pending_year_text = ""
+            if pending_schedule_text:
+                body = (body + "\n" + pending_schedule_text).strip()
+                pending_schedule_text = ""
+            s["section_text"] = body
         seen.add(key)
         out.append(s)
     return out
