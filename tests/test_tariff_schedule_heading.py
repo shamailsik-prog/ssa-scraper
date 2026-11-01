@@ -176,6 +176,100 @@ def test_reconcile_does_not_store_an_hs_code_as_a_section_number():
     assert "Synthetic organic" not in outcome.data["sections"][0]["section_text"]
 
 
+def test_ocr_mangled_hs_serial_is_schedule_content_not_a_section():
+    """``78. 38BO5 Chromite`` is an OCR reading of HS ``38.05``, not section 78.
+
+    Finance Act 1985 re-extract on tip 231a9875 still stored this chemical row
+    as section 78. The commodity stays on the schedule section that preceded it.
+    """
+    line = (
+        "78. 38BO5 Chromite sulphate used in the dyeing and tanning process "
+        "under this schedule of the Act."
+    )
+    assert section_text_starts_with_tariff_schedule_row(line) is True
+    text = f"""
+1. Short title.— This Act may be called the Finance Act, 1985 and it extends to the whole of Pakistan.
+2. Amendment of the First Schedule.— In the Customs Act, 1969, the First Schedule shall be amended as set out below.
+{line}
+3. Income tax.— The rate of income tax shall be the rate specified in this section of the Act.
+"""
+    bodies = _by_number(text, FINANCE)
+    assert "78" not in bodies
+    assert "Chromite sulphate" in bodies["2"]
+    assert "Amendment of the First Schedule" in bodies["2"][:80]
+    assert "Income tax" in bodies["3"]
+
+
+def test_zero_padded_paren_chemical_row_is_schedule_content_not_a_section():
+    """``03) Cuprammonium`` is a schedule row, not section 03.
+
+    A parenthesis heading without a decimal still splits today. ``1) Short title``
+    and ``12) Penalties`` stay real headings.
+    """
+    line = (
+        "03) Cuprammonium hydroxide solution used in the manufacture of "
+        "cuprammonium rayon under this schedule of the Act."
+    )
+    assert section_text_starts_with_tariff_schedule_row(line) is True
+    assert section_text_starts_with_tariff_schedule_row(
+        "1) Short title. This Act may be called the Example Penalties Act, 1975 and it extends to the Province."
+    ) is False
+    assert section_text_starts_with_tariff_schedule_row(
+        "12) Penalties. Whoever contravenes this Act shall be punished with fine which may extend to ten thousand rupees."
+    ) is False
+    text = f"""
+1. Short title.— This Act may be called the Finance Act, 1985 and it extends to the whole of Pakistan.
+2. Amendment of the First Schedule.— In the Customs Act, 1969, the First Schedule shall be amended as set out below.
+{line}
+3. Income tax.— The rate of income tax shall be the rate specified in this section of the Act.
+"""
+    bodies = _by_number(text, FINANCE)
+    assert "03" not in bodies
+    assert "Cuprammonium hydroxide" in bodies["2"]
+    assert "Amendment of the First Schedule" in bodies["2"][:80]
+    assert "Income tax" in bodies["3"]
+
+
+def test_income_tax_rate_table_rows_do_not_replace_short_title_or_definitions():
+    """``1. Where the taxable income…`` is a rate-table row, not section 1.
+
+    On the Finance Act 1985 re-extract those rows occupied 1, 2, 4 and 5, so
+    Short title and Definitions never came back. They stay schedule text, and
+    the real headings keep those numbers. The stored section still opens on
+    the heading, not on the rate line.
+    """
+    rates = [
+        "1. Where the taxable income does not exceed Rs 25,000 the tax shall be five percent of the income.",
+        "2. Where the taxable income exceeds Rs 25,000 but does not exceed Rs 50,000 the tax shall be the amount specified.",
+        "4. Where the taxable income exceeds Rs 50,000 but does not exceed Rs 100,000 the tax shall be computed under this clause.",
+        "5. Where the taxable income exceeds Rs 100,000 the tax shall be the amount set out in this rate of the schedule.",
+    ]
+    for line in rates:
+        assert section_text_starts_with_tariff_schedule_row(line) is True
+    assert section_text_starts_with_tariff_schedule_row(
+        "1. Short title, extent and commencement.— (1) This Act may be called the Finance Act, 1985."
+    ) is False
+    assert section_text_starts_with_tariff_schedule_row(
+        "2. Definitions.— In this Act, unless there is anything repugnant, tax means the tax chargeable under this Act."
+    ) is False
+    assert section_text_starts_with_tariff_schedule_row(
+        "7. Income tax.— (1) The tax shall be charged in the manner provided in this section of the Act."
+    ) is False
+    text = "\n".join(rates) + """
+1. Short title, extent and commencement.— (1) This Act may be called the Finance Act, 1985. (2) It extends to the whole of Pakistan.
+2. Definitions.— In this Act, unless there is anything repugnant in the subject or context, tax means the tax chargeable under this Act.
+"""
+    bodies = _by_number(text, FINANCE)
+    assert "Short title" in bodies["1"]
+    assert bodies["1"].lstrip().startswith("1. Short title")
+    assert "Definitions" in bodies["2"]
+    assert "tax means the tax" in bodies["2"]
+    assert "4" not in bodies
+    assert "5" not in bodies
+    assert "does not exceed Rs 25,000" in bodies["1"]
+    assert "exceeds Rs 100,000" in bodies["1"]
+
+
 def test_amendment_date_is_not_a_tariff_schedule_row():
     line = "11.10.2018. Substituted by the Finance Act note in the official gazette volume of this amending instrument."
     assert section_text_starts_with_tariff_schedule_row(line) is False
