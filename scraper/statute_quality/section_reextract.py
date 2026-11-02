@@ -44,7 +44,10 @@ Thresholds, and why:
   stored body is eleven of those rows. A five-section re-extract is not a
   collapse against that set. An amending or surcharge section that carries
   the schedule in its body may pass the 5000-character cut. A later real
-  heading inside that body still fails. An amending Finance Act has no
+  heading inside that body still fails. Inside that exemption, an embedded
+  heading counts only when its number has no leading zero and is the next
+  section number, such as 6 or 6A after section 5. A schedule line that
+  ends in a rate is not that heading. An amending Finance Act has no
   Definitions section, and this gate does not require one.
 """
 
@@ -218,8 +221,62 @@ def _body_contains_schedule_row(body: str) -> bool:
     return False
 
 
-def _has_later_real_heading(body: str) -> bool:
-    """A later section heading. Schedule rows and tariff sub-rows are not one."""
+# ``02 Polyester`` is a schedule item. A leading zero is never a section number.
+_LEADING_ZERO_SECTION_RE = re.compile(r"0\d")
+_LATER_HEADING_NUMBER_RE = re.compile(r"^(\d{1,3})([A-Z]?)")
+# A real heading closes with a marginal dash. A schedule rate line does not.
+_MARGINAL_DASH_RE = re.compile(r"(?:\.—|\.--|—|–|--|\.-)")
+# OCR rate tails: ``Rs. 30.00``, ``Rs, 30,00``, ``Ra, 30.00``, ``per kg``.
+_SCHEDULE_RATE_TAIL_RE = re.compile(
+    r"(?i)(?:\b(?:R[se5a]s?|Bs|Fts)[\.,]?\s*[\d,\.]+|\bper\s+(?:kg|ke|metric)\b|\bad\s*val\b)"
+    r"(?:\s+\w+){0,3}\s*[,.]?\s*$"
+)
+
+
+def _own_section_ordinal(number: str) -> int | None:
+    cleaned = _SECTION_ONE_PREFIX_RE.sub("", (number or "").strip())
+    cleaned = cleaned.rstrip(".").strip()
+    match = re.match(r"(\d{1,3})", cleaned)
+    if not match or _LEADING_ZERO_SECTION_RE.match(match.group(1)):
+        return None
+    return int(match.group(1))
+
+
+def _line_ends_in_schedule_rate(line: str) -> bool:
+    """A First Schedule sub-item ends in a rate and has no marginal dash."""
+    if _MARGINAL_DASH_RE.search(line):
+        return False
+    return _SCHEDULE_RATE_TAIL_RE.search(line) is not None
+
+
+def _embedded_line_is_next_section(line: str, own_number: str) -> bool:
+    """True when this line is the next section, not a schedule sub-item.
+
+    The number has no leading zero. It is the section's own number plus one,
+    with an optional letter (``6`` or ``6A`` after section 5). A smaller or
+    skipped number is a schedule item. A line that ends in a rate is one too.
+    """
+    match = _LATER_HEADING_NUMBER_RE.match(line.strip())
+    if not match:
+        return False
+    digits = match.group(1)
+    if _LEADING_ZERO_SECTION_RE.match(digits):
+        return False
+    if _line_ends_in_schedule_rate(line):
+        return False
+    own = _own_section_ordinal(own_number)
+    if own is None:
+        # No numeric section to step from. Keep the old guard.
+        return True
+    return int(digits) == own + 1
+
+
+def _has_later_real_heading(body: str, number: str) -> bool:
+    """A later section heading. Schedule rows and tariff sub-rows are not one.
+
+    Used only by the amending-schedule exemption. An embedded match counts
+    when its number is the next section number.
+    """
     for match in _EMBEDDED_SECTION_HEADING_RE.finditer(body):
         if match.start() <= 40:
             continue
@@ -232,6 +289,8 @@ def _has_later_real_heading(body: str) -> bool:
             continue
         if section_text_opens_unheaded_tariff_subrow(line):
             continue
+        if not _embedded_line_is_next_section(line, number):
+            continue
         return True
     return False
 
@@ -240,8 +299,8 @@ def _is_schedule_bearing_amending_section(number: str, text: str) -> bool:
     """An Amendment or surcharge section may hold its schedule and pass 5000.
 
     The opening line has to be that heading, closed by a marginal dash.
-    A rate row or an HS row inside explains the length. A later real heading
-    means the section swallowed the next one.
+    A rate row or an HS row inside explains the length. The next section
+    heading (6 or 6A after section 5) means this section swallowed it.
     """
     if not str(number or "").strip():
         return False
@@ -250,7 +309,7 @@ def _is_schedule_bearing_amending_section(number: str, text: str) -> bool:
         return False
     if not _body_contains_schedule_row(body):
         return False
-    return not _has_later_real_heading(body)
+    return not _has_later_real_heading(body, number)
 
 
 def _row_is_tariff_baseline_noise(number: str, text: str) -> bool:

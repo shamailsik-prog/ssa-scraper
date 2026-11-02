@@ -955,17 +955,87 @@ def test_tariff_only_before_set_still_rejects_a_mega_section_without_a_schedule(
 
 
 def test_schedule_inside_an_amending_section_may_pass_the_mega_cut():
-    """The rate schedule lives in the amending section. A later real heading still fails."""
+    """The rate schedule lives in the amending section. The next heading still fails.
+
+    Section 4's next heading is 5. A skipped number is a schedule item, so the
+    swallowed line has to be that next heading.
+    """
     before = _tariff_polluted_finance_act_before()
     after = _finance_act_without_definitions()
     decision = gate_section_reextract(before, after)
     assert decision.verdict == "PASS"
 
     swallowed = after[3]["section_text"] + (
-        "\n6. Short title of the next Act.— This Act may be called the Other Finance Act, 1986 "
+        "\n5. Short title of the next Act.— This Act may be called the Other Finance Act, 1986 "
         "and it extends to the whole of Pakistan.\n"
     )
     assert len(swallowed) >= REEXTRACT_MEGA_SECTION_CHARS
     glued = gate_section_reextract(before, [_section("4", swallowed)])
     assert glued.verdict == "FAIL"
     assert glued.reason == "reextract_mega_section"
+
+
+# OCR lines from the Finance Act 1985 First Schedule inside section 5.
+# ``6 Other… per kg.`` is that same rate shape at the next section number.
+_FIN85_S5_FIRST_SCHEDULE = """
+02 Polyester. Rs. 30.00 per kg.
+03 Other. Ra, 30.00 per ke,
+1 Cuprammonium rayon, Rs. 30,00 per ke.
+4 Other. Rs, 30,00 per kg.
+02 Other.
+02 Cold-rolled. Rs. 4720.00 per metric tor.
+6 Other. Rs. 30.00 per kg.
+08.05 Nuts, fresh or dried, whether or not shelled or peeled.
+"""
+
+
+def _fin85_s5_first_schedule_body(*extra_lines: str) -> str:
+    heading = (
+        "5. lara surcharge on imported goods.— A surcharge to be called the Iqra surcharge "
+        "shall be levied on goods imported into Pakistan at the rate notified under this section.\n"
+    )
+    body = heading + _FIN85_S5_FIRST_SCHEDULE
+    if extra_lines:
+        body += "\n" + "\n".join(extra_lines) + "\n"
+    filler = "The duty shown against this sub-item applies to the goods of the year. "
+    while len(body.strip()) < REEXTRACT_MEGA_SECTION_CHARS:
+        body += filler
+    return body
+
+
+def test_fin85_s5_first_schedule_excerpt_is_exempt():
+    """Section 5 holds the First Schedule. Sub-item lines are not a later section.
+
+    ``02 Polyester`` and ``4 Other`` match the embedded-heading pattern and the
+    tariff helpers do not recognise them. The section is still one surcharge
+    section. A skipped number and a leading zero are schedule items. The
+    5000-character cut stays.
+    """
+    assert REEXTRACT_MEGA_SECTION_CHARS == 5000
+    before = _tariff_polluted_finance_act_before()
+    after = _finance_act_without_definitions()
+    body = _fin85_s5_first_schedule_body(
+        "06. Repeal.—",
+        "7. Customs.— A skipped number inside this schedule is not the next section.",
+    )
+    assert len(body) >= REEXTRACT_MEGA_SECTION_CHARS
+    after[4] = _section("5", body)
+    decision = gate_section_reextract(before, after)
+    assert decision.verdict == "PASS"
+    assert decision.reason == ""
+    assert decision.may_apply is True
+    assert decision.section_count_after == 5
+
+
+def test_amending_section_that_swallows_the_next_repeal_stays_mega():
+    """The next heading, 6 or 6A, inside the surcharge section is still mega."""
+    before = _tariff_polluted_finance_act_before()
+    for heading in ("6. Repeal.—", "6A. Repeal.—"):
+        after = _finance_act_without_definitions()
+        body = _fin85_s5_first_schedule_body(heading)
+        assert len(body.strip()) >= REEXTRACT_MEGA_SECTION_CHARS
+        after[4] = _section("5", body)
+        decision = gate_section_reextract(before, after)
+        assert decision.verdict == "FAIL", heading
+        assert decision.reason == "reextract_mega_section", heading
+        assert decision.may_apply is False
