@@ -368,6 +368,7 @@ def unlinked_gap_credit(rows_seen: int, rows_known: int, rows_unlinked: int) -> 
 
 
 UNRESOLVED_LINKED_GAP_PREFIX = "unresolved linked gap"
+UNRESOLVED_SITE_TOTAL_GAP_PREFIX = "unresolved site total gap"
 
 
 def is_citation_only_query(query_json: Any) -> bool:
@@ -377,6 +378,26 @@ def is_citation_only_query(query_json: Any) -> bool:
     if not citation:
         return False
     return set(body.keys()) <= {"citation"}
+
+
+def citation_only_sql_clause():
+    """SQL form of is_citation_only_query: a non-empty citation and no other query key.
+
+    A citation plus a year, reporter, court, or any other field is a structured search.
+    Shared by claim and by the pending-harvest count so those two cannot disagree.
+    """
+    from sqlalchemy import and_, func, or_
+
+    from scraper.models import PlsSearchHarvestQuery
+
+    body = PlsSearchHarvestQuery.query_json
+    citation = func.trim(body["citation"].astext)
+    no_other_key = [
+        or_(body[key].astext.is_(None), func.trim(body[key].astext) == "")
+        for key in _QUERY_KEY_ORDER
+        if key != "citation"
+    ]
+    return and_(citation.isnot(None), citation != "", *no_other_key)
 
 
 def refreshed_rows_known(

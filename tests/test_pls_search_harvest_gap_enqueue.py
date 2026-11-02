@@ -58,6 +58,7 @@ def test_citation_only_query_is_the_empty_lookup_shape():
     assert is_citation_only_query({"citation": "1967 PTD 139"})
     assert not is_citation_only_query({"reporter": "CLD", "year": 2005})
     assert not is_citation_only_query({"citation": "1967 PTD 139", "reporter": "PTD"})
+    assert not is_citation_only_query({"citation": "1967 PTD 139", "year": 1967})
 
 
 def _runner(monkeypatch, db, pages, *, known=None, preserve="staged"):
@@ -303,6 +304,26 @@ async def test_automatic_claim_skips_citation_keys_when_no_reporter_year_is_pend
     await db.rollback()
 
 
+@pytest.mark.asyncio
+async def test_claim_keeps_citation_plus_year_as_a_structured_search(db):
+    """A citation together with a year is a structured search, not a snowball lookup."""
+    structured = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:year=1967|citation=1967 PTD 139",
+        query_json={"citation": "1967 PTD 139", "year": 1967},
+        status="pending",
+        priority=200,
+    )
+    db.add(structured)
+    await db.flush()
+
+    row, lock = await harvest.claim_next_query(db, 2, redis_client=None)
+    assert row is not None and row.query_key == structured.query_key
+    if lock is not None:
+        await lock.release()
+    await db.rollback()
+
+
 async def _no_seed(db, dry_run=False, search_map=None):
     return {"inserted": 0}
 
@@ -415,4 +436,51 @@ async def test_frontier_rewalks_newest_cooled_reporter_year_before_citations(db,
     assert (recent.cursor_json or {}).get("page") == 1
     assert old.status == "done"
     assert citation.status == "pending"
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_site_total_only_gap_is_not_reopened_inside_cooldown_after_two_finishes(db, monkeypatch):
+    """A site total above rows_seen, with every seen row already known, must not reopen forever.
+
+    The first confirming finish may be searched again immediately. The second finish records a
+    terminal marker, and the next reopen inside the cooldown leaves the row done.
+    """
+    monkeypatch.setattr(harvest.settings, "PLS_SEARCH_HARVEST_SLOT1_REPORTERS", "CLD,PLD")
+    runner = _runner(monkeypatch, db, {"page1": ([], None)})
+    now = datetime.now(timezone.utc)
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=CLD|year=2001",
+        query_json={"reporter": "CLD", "year": 2001},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=10,
+        rows_known=10,
+        rows_new=10,
+        gap_size=30,
+        site_total_results=40,
+        last_run_at=now,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    first = await runner.run_query(q, {})
+    assert first["status"] == "done"
+    assert first["gap_size"] == 30
+    assert first["rows_seen"] == 10
+    assert first["rows_known"] == 10
+
+    opened = await harvest.reopen_gapped_search_harvest_queries(db, reporter_shard=0)
+    assert opened == 1
+    assert q.status == "pending"
+
+    second = await runner.run_query(q, {})
+    assert second["status"] == "done"
+    assert second["gap_size"] == 30
+
+    again = await harvest.reopen_gapped_search_harvest_queries(db, reporter_shard=0)
+    assert again == 0
+    assert q.status == "done"
     await db.rollback()

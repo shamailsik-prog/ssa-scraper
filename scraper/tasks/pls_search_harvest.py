@@ -44,8 +44,10 @@ from scraper.pls_search_harvest_core import (
     citation_keys_for_row,
     append_gap_sample,
     compute_gap_size,
+    citation_only_sql_clause,
     refreshed_rows_known,
     UNRESOLVED_LINKED_GAP_PREFIX,
+    UNRESOLVED_SITE_TOTAL_GAP_PREFIX,
     gap_report_sort_key,
     row_gap_diagnostics,
     cursor_reset_for_done,
@@ -205,18 +207,19 @@ async def reopen_gapped_search_harvest_queries(
 ) -> int:
     """Return done queries that still record a gap to pending.
 
-    A gap that has not been marked unresolved is reopened immediately, including inside the
+    A linked gap that has not been marked unresolved is reopened immediately, including inside the
     cooldown, so a reporter-year that just finished with rows_known short of rows_seen is searched
-    again on the next tick. A query that already reported an unresolved linked gap waits out the
-    cooldown instead of occupying every tick.
+    again on the next tick. A query that already reported an unresolved linked gap, or an unresolved
+    site-total gap, waits out the cooldown instead of occupying every tick.
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - GAPPED_REOPEN_COOLDOWN
     cooled = or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff)
-    fresh_gap = or_(
-        PlsSearchHarvestQuery.last_error.is_(None),
-        ~PlsSearchHarvestQuery.last_error.ilike(f"{UNRESOLVED_LINKED_GAP_PREFIX}%"),
+    terminal_gap = or_(
+        PlsSearchHarvestQuery.last_error.ilike(f"{UNRESOLVED_LINKED_GAP_PREFIX}%"),
+        PlsSearchHarvestQuery.last_error.ilike(f"{UNRESOLVED_SITE_TOTAL_GAP_PREFIX}%"),
     )
+    fresh_gap = or_(PlsSearchHarvestQuery.last_error.is_(None), ~terminal_gap)
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
@@ -295,13 +298,7 @@ async def reopen_finished_reporter_year_queries(
 
 def _citation_only_clause():
     """Ledger rows whose only constraint is a citation string (snowball lookups)."""
-    citation = PlsSearchHarvestQuery.query_json["citation"].astext
-    reporter = PlsSearchHarvestQuery.query_json["reporter"].astext
-    return and_(
-        citation.isnot(None),
-        citation != "",
-        or_(reporter.is_(None), reporter == ""),
-    )
+    return citation_only_sql_clause()
 
 
 async def _structured_pending_count(db: AsyncSession, reporter_shard: Optional[int]) -> int:
@@ -831,6 +828,7 @@ class SearchHarvestRunner:
         while True:
             confirming_single_page = bool(rereading and pages_done <= 1 and page_idx == 1)
             prior_gap_attempts = int(cursor.get("linked_gap_attempts") or 0)
+            prior_site_total_attempts = int(cursor.get("site_total_gap_attempts") or 0)
             unlinked_keys_snapshot = list(cursor.get("unlinked_keys") or [])
 
             from scraper.extractors.hybrid_extractor import HybridExtractor
@@ -1122,6 +1120,7 @@ class SearchHarvestRunner:
                     rows_known=rows_known,
                     rows_unlinked=rows_unlinked,
                     prior_attempts=prior_gap_attempts,
+                    prior_site_total_attempts=prior_site_total_attempts,
                 )
                 break
             page_idx += 1
@@ -1172,19 +1171,34 @@ class SearchHarvestRunner:
         rows_known: int,
         rows_unlinked: int,
         prior_attempts: int,
+        prior_site_total_attempts: int = 0,
     ) -> None:
         """A confirming reread used to mark the query done while linked rows were still unknown.
 
         Retry that page once. A second miss is recorded as an unresolved linked gap so the
         cooldown can let other reporter-years run instead of parking the slot on one page.
+        A site-total gap with nothing left to fetch gets the same one retry, then a terminal
+        marker, because that gap never produces an unresolved linked-row error.
         """
         if self.dry_run or query_row.status not in ("done", "done_unlinked"):
             return
         linked_unseen = max(0, int(rows_seen) - int(rows_known) - int(rows_unlinked or 0))
         if linked_unseen <= 0:
             kept = dict(query_row.cursor_json or {})
-            if kept.pop("linked_gap_attempts", None) is not None:
-                query_row.cursor_json = kept
+            popped_linked = kept.pop("linked_gap_attempts", None) is not None
+            gap = int(query_row.gap_size or 0)
+            if gap <= 0:
+                kept.pop("site_total_gap_attempts", None)
+                if popped_linked or query_row.cursor_json != kept:
+                    query_row.cursor_json = kept
+                return
+            attempts = int(prior_site_total_attempts) + 1
+            kept["site_total_gap_attempts"] = attempts
+            query_row.cursor_json = kept
+            if attempts >= 2:
+                query_row.last_error = (
+                    f"{UNRESOLVED_SITE_TOTAL_GAP_PREFIX}: site total exceeds enumerated rows by {gap}"
+                )[:1000]
             return
         attempts = int(prior_attempts) + 1
         kept = dict(query_row.cursor_json or cursor)
