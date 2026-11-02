@@ -116,6 +116,55 @@ def test_unsharded_grid_yield_cap_when_either_shard_past_limit():
 
 
 @pytest.mark.asyncio
+async def test_citation_only_backlog_does_not_yield_the_citation_grid(db, monkeypatch):
+    """Claim skips citation-only rows, so they must not look like harvest work that yields the grid."""
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False)
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:citation=1967 PTD 139",
+            query_json={"citation": "1967 PTD 139"},
+            status="pending",
+            priority=200,
+        )
+    )
+    await db.flush()
+    now = datetime.now(timezone.utc)
+    pending = await pls_pending_search_harvest_count(db, slot=2, now=now)
+    cfg = {
+        "citation_grid_cursor_shard_1": {
+            "saturated_at": (now - timedelta(hours=1)).isoformat(),
+            "row_offset": 200,
+            "last_total_rows": 500,
+        }
+    }
+    assert pending == 0
+    assert pls_yield_citation_grid_to_search_harvest(cfg, 1, pending, now=now) is None
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_citation_plus_year_still_counts_as_pending_harvest(db, monkeypatch):
+    from scraper.config import settings
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False)
+    db.add(
+        PlsSearchHarvestQuery(
+            source_name="PakistanLawSite",
+            query_key="search:year=1967|citation=1967 PTD 139",
+            query_json={"citation": "1967 PTD 139", "year": 1967},
+            status="pending",
+            priority=200,
+        )
+    )
+    await db.flush()
+    assert await pls_pending_search_harvest_count(db, slot=2) == 1
+    await db.rollback()
+
+
+@pytest.mark.asyncio
 async def test_pending_count_slot2_only_not_counted_for_slot1(db, monkeypatch):
     from scraper.config import settings
 

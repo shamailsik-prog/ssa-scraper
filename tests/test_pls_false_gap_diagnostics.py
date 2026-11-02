@@ -301,7 +301,7 @@ async def test_run_query_logs_unmatched_and_done_unlinked(db, monkeypatch, caplo
     assert len(samples) == 2
     assert any(s["citation"] == "PLD 2018 SC 99" for s in samples)
     assert any("unmatched row" in r.message for r in caplog.records)
-    assert q.gap_size == 1
+    assert q.gap_size == 0
     assert q.status == "done"
     assert q.rows_new == 1
     await db.rollback()

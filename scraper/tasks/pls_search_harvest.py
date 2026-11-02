@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import false, func, or_, select, true
+from sqlalchemy import and_, false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -44,6 +44,10 @@ from scraper.pls_search_harvest_core import (
     citation_keys_for_row,
     append_gap_sample,
     compute_gap_size,
+    citation_only_sql_clause,
+    refreshed_rows_known,
+    UNRESOLVED_LINKED_GAP_PREFIX,
+    UNRESOLVED_SITE_TOTAL_GAP_PREFIX,
     gap_report_sort_key,
     row_gap_diagnostics,
     cursor_reset_for_done,
@@ -201,15 +205,26 @@ async def reopen_gapped_search_harvest_queries(
     limit: int = GAPPED_REOPEN_LIMIT,
     now: Optional[datetime] = None,
 ) -> int:
-    """Return done queries that still record a gap to pending, after a cooldown so a saturated grid
-    does not reopen the same row on every dispatch."""
+    """Return done queries that still record a gap to pending.
+
+    A linked gap that has not been marked unresolved is reopened immediately, including inside the
+    cooldown, so a reporter-year that just finished with rows_known short of rows_seen is searched
+    again on the next tick. A query that already reported an unresolved linked gap, or an unresolved
+    site-total gap, waits out the cooldown instead of occupying every tick.
+    """
     now = now or datetime.now(timezone.utc)
     cutoff = now - GAPPED_REOPEN_COOLDOWN
+    cooled = or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff)
+    terminal_gap = or_(
+        PlsSearchHarvestQuery.last_error.ilike(f"{UNRESOLVED_LINKED_GAP_PREFIX}%"),
+        PlsSearchHarvestQuery.last_error.ilike(f"{UNRESOLVED_SITE_TOTAL_GAP_PREFIX}%"),
+    )
+    fresh_gap = or_(PlsSearchHarvestQuery.last_error.is_(None), ~terminal_gap)
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
         PlsSearchHarvestQuery.gap_size > 0,
-        or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff),
+        or_(cooled, fresh_gap),
     )
     if reporter_shard in (0, 1):
         stmt = stmt.where(_share_filter(int(reporter_shard) + 1))
@@ -235,17 +250,20 @@ async def reopen_finished_reporter_year_queries(
     db: AsyncSession,
     *,
     reporter_shard: Optional[int] = None,
-    limit: int = REPORTER_YEAR_REOPEN_LIMIT,
+    limit: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> int:
-    """Re-queue the oldest finished reporter×year searches from page 1.
+    """Re-queue finished reporter×year searches from page 1, newest year first.
 
     A citation-grid lap that staged nothing does not mean those reporter-years have no new judgments
     on the search form. The cooldown stops a query that finishes immediately from being reopened on
-    the next dispatch.
+    the next dispatch. Newer years are the productive frontier; empty citation lookups are not.
     """
+    if limit is None:
+        limit = REPORTER_YEAR_REOPEN_LIMIT
     now = now or datetime.now(timezone.utc)
     cutoff = now - GAPPED_REOPEN_COOLDOWN
+    year_text = PlsSearchHarvestQuery.query_json["year"].astext
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("done", "done_unlinked")),
@@ -255,7 +273,7 @@ async def reopen_finished_reporter_year_queries(
         stmt = stmt.where(_share_filter(int(reporter_shard) + 1))
     rows = (
         await db.execute(
-            stmt.order_by(PlsSearchHarvestQuery.last_run_at.asc().nullsfirst(), PlsSearchHarvestQuery.created_at.asc()).limit(80)
+            stmt.order_by(year_text.desc().nullslast(), PlsSearchHarvestQuery.last_run_at.asc().nullsfirst()).limit(200)
         )
     ).scalars().all()
     reopened = 0
@@ -278,6 +296,28 @@ async def reopen_finished_reporter_year_queries(
     return reopened
 
 
+def _citation_only_clause():
+    """Ledger rows whose only constraint is a citation string (snowball lookups)."""
+    return citation_only_sql_clause()
+
+
+async def _structured_pending_count(db: AsyncSession, reporter_shard: Optional[int]) -> int:
+    """Pending rows a tick should actually run. Citation-only lookups do not count: a backlog of
+    them (1967 PTD, 1979 SCMR, …) used to look like work and blocked reporter-year reopens."""
+    stmt = (
+        select(func.count())
+        .select_from(PlsSearchHarvestQuery)
+        .where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+            ~_citation_only_clause(),
+        )
+    )
+    if reporter_shard in (0, 1):
+        stmt = stmt.where(_share_filter(int(reporter_shard) + 1))
+    return int((await db.execute(stmt)).scalar() or 0)
+
+
 async def ensure_search_harvest_frontier(
     db: AsyncSession,
     *,
@@ -285,25 +325,23 @@ async def ensure_search_harvest_frontier(
 ) -> Dict[str, int]:
     """Make sure a saturated citation-grid shard has claimable search-harvest rows.
 
-    Missing base reporter×year queries are inserted. Done queries that still record a gap are
-    reopened, then the oldest finished reporter×year searches are walked again from page 1.
-    When none of those yield a claimable row the caller walks case serials.
+    Done queries that still record a gap are reopened first, even when citation-only lookups are
+    pending and even inside the cooldown, unless that gap was already marked unresolved. Missing
+    base reporter×year queries are inserted only when nothing structured is claimable. Then the
+    newest finished reporter×year searches are walked again from page 1. ``pending`` counts
+    structured rows only, so a citation backlog does not keep the caller off case-serial walk
+    once the reporter-year frontier is idle.
     """
-    from scraper.pls_grid_health import pls_pending_search_harvest_count
-
-    pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+    reopened = await reopen_gapped_search_harvest_queries(db, reporter_shard=reporter_shard)
+    pending = await _structured_pending_count(db, reporter_shard)
     inserted = 0
-    reopened = 0
     if pending <= 0:
         seeded = await seed_search_harvest_plan(db, dry_run=False)
         inserted = int(seeded.get("inserted") or 0)
-        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
-    if pending <= 0:
-        reopened = await reopen_gapped_search_harvest_queries(db, reporter_shard=reporter_shard)
-        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+        pending = await _structured_pending_count(db, reporter_shard)
     if pending <= 0:
         reopened += await reopen_finished_reporter_year_queries(db, reporter_shard=reporter_shard)
-        pending = await pls_pending_search_harvest_count(db, reporter_shard=reporter_shard)
+        pending = await _structured_pending_count(db, reporter_shard)
     return {"pending": int(pending), "inserted": inserted, "reopened": reopened}
 
 
@@ -523,9 +561,11 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
 
 
 def _pick_order(stmt):
-    # Priority first (lower is sooner), then the row that has waited longest since its last run: a row whose site
-    # total is unknown keeps its planned priority instead of sinking to the back (13 October 2026).
+    # Structured searches (reporter×year and the other planned families) come before citation-only
+    # lookups, even when a citation row was given a higher priority. Within that, priority first
+    # (lower is sooner), then the row that has waited longest since its last run.
     return stmt.order_by(
+        _citation_only_clause().asc(),
         PlsSearchHarvestQuery.priority.asc(),
         PlsSearchHarvestQuery.last_run_at.asc().nulls_first(),
         PlsSearchHarvestQuery.created_at.asc(),
@@ -602,6 +642,7 @@ async def claim_next_query(
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+        ~_citation_only_clause(),
     )
     if not take_over:
         stmt = stmt.where(_share_filter(slot))
@@ -761,6 +802,7 @@ class SearchHarvestRunner:
         budget = int(getattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0) or 0)
         deadline = time.monotonic() + budget if budget > 0 else None
         out_of_time = False
+        staged_this_tick = 0
 
         # Judgments already met on an earlier page of this run: the site has served page 1's rows again as page 2,
         # and a repeated row is neither opened nor counted a second time.
@@ -784,6 +826,9 @@ class SearchHarvestRunner:
         await self._maybe_recycle_browser()
 
         while True:
+            confirming_single_page = bool(rereading and pages_done <= 1 and page_idx == 1)
+            prior_gap_attempts = int(cursor.get("linked_gap_attempts") or 0)
+            prior_site_total_attempts = int(cursor.get("site_total_gap_attempts") or 0)
             unlinked_keys_snapshot = list(cursor.get("unlinked_keys") or [])
 
             from scraper.extractors.hybrid_extractor import HybridExtractor
@@ -827,6 +872,7 @@ class SearchHarvestRunner:
                 rows_counted, known_counted = len(fresh_rows), known_on_page
             rows_seen += rows_counted
             rows_known += known_counted
+            detail_resolved = 0
 
             for row in fresh_rows:
                 if row.get("detail_url") or row.get("pdf_url"):
@@ -845,6 +891,10 @@ class SearchHarvestRunner:
                 }
                 for idx, row in enumerate(rows):
                     if idx < start_row_index:
+                        # Resumed mid-page: these rows were already fetched on the previous tick.
+                        # Count them resolved so a short rows_known does not look like a new gap.
+                        if id(row) in fresh_ids and (row.get("detail_url") or row.get("pdf_url")):
+                            detail_resolved += 1
                         continue
                     detail_url = row.get("detail_url") or row.get("pdf_url")
                     keys = citation_keys_for_row(row)
@@ -860,8 +910,14 @@ class SearchHarvestRunner:
                         {**route_base, "cursor": dict(cursor), "row_index": idx},
                         row,
                     )
+                    if result in ("staged", "duplicate"):
+                        # A body we already hold does not match citation keys often enough
+                        # (grid text vs canonical citation). Counting it known closes the gap
+                        # instead of leaving rows_seen - rows_known for the next reopen.
+                        detail_resolved += 1
                     if result == "staged":
                         rows_new += 1
+                        staged_this_tick += 1
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change
@@ -901,6 +957,13 @@ class SearchHarvestRunner:
             if not rereading:
                 pages_done += 1
             rereading = False
+            rows_known = refreshed_rows_known(
+                rows_seen=rows_seen,
+                rows_known=rows_known,
+                known_on_page=known_on_page,
+                detail_resolved=detail_resolved,
+                confirming_single_page=confirming_single_page,
+            )
             start_row_index = 0
             cursor["row_index"] = 0
             nxt = outcome.data.get("next_page")
@@ -1050,6 +1113,15 @@ class SearchHarvestRunner:
                         cursor["page"] = page_idx
                     cursor["row_index"] = 0
                     query_row.cursor_json = dict(cursor)
+                self._hold_unresolved_linked_gap(
+                    query_row,
+                    cursor,
+                    rows_seen=rows_seen,
+                    rows_known=rows_known,
+                    rows_unlinked=rows_unlinked,
+                    prior_attempts=prior_gap_attempts,
+                    prior_site_total_attempts=prior_site_total_attempts,
+                )
                 break
             page_idx += 1
             cursor = {"page": page_idx, "row_index": 0, "next_url": nxt, **gap_diagnostics_slice(cursor)}
@@ -1085,9 +1157,61 @@ class SearchHarvestRunner:
             "rows_known": rows_known,
             "rows_new": rows_new,
             "gap_size": query_row.gap_size,
+            "staged_this_tick": staged_this_tick,
             "dry_run": self.dry_run,
             "out_of_time": out_of_time,
         }
+
+    def _hold_unresolved_linked_gap(
+        self,
+        query_row: PlsSearchHarvestQuery,
+        cursor: Dict[str, Any],
+        *,
+        rows_seen: int,
+        rows_known: int,
+        rows_unlinked: int,
+        prior_attempts: int,
+        prior_site_total_attempts: int = 0,
+    ) -> None:
+        """A confirming reread used to mark the query done while linked rows were still unknown.
+
+        Retry that page once. A second miss is recorded as an unresolved linked gap so the
+        cooldown can let other reporter-years run instead of parking the slot on one page.
+        A site-total gap with nothing left to fetch gets the same one retry, then a terminal
+        marker, because that gap never produces an unresolved linked-row error.
+        """
+        if self.dry_run or query_row.status not in ("done", "done_unlinked"):
+            return
+        linked_unseen = max(0, int(rows_seen) - int(rows_known) - int(rows_unlinked or 0))
+        if linked_unseen <= 0:
+            kept = dict(query_row.cursor_json or {})
+            popped_linked = kept.pop("linked_gap_attempts", None) is not None
+            gap = int(query_row.gap_size or 0)
+            if gap <= 0:
+                kept.pop("site_total_gap_attempts", None)
+                if popped_linked or query_row.cursor_json != kept:
+                    query_row.cursor_json = kept
+                return
+            attempts = int(prior_site_total_attempts) + 1
+            kept["site_total_gap_attempts"] = attempts
+            query_row.cursor_json = kept
+            if attempts >= 2:
+                query_row.last_error = (
+                    f"{UNRESOLVED_SITE_TOTAL_GAP_PREFIX}: site total exceeds enumerated rows by {gap}"
+                )[:1000]
+            return
+        attempts = int(prior_attempts) + 1
+        kept = dict(query_row.cursor_json or cursor)
+        kept["linked_gap_attempts"] = attempts
+        query_row.cursor_json = kept
+        if attempts < 2:
+            query_row.status = "in_progress"
+            query_row.last_error = f"linked rows still unmatched ({linked_unseen}); will retry detail fetch"[:1000]
+            return
+        query_row.status = "done"
+        query_row.last_error = (
+            f"{UNRESOLVED_LINKED_GAP_PREFIX}: {linked_unseen} row(s) still unmatched after detail fetch"
+        )[:1000]
 
     async def _enqueue_split_children(
         self,
@@ -1218,6 +1342,14 @@ async def _run_search_harvest_locked(
     cross_slot_claim = False
     source = await _source_row(db)
     try:
+        if query_key is None:
+            # Reopen reporter-year work before claiming. Do not seed the plan here: seeding belongs
+            # to the saturated-grid dispatcher, and a tick that only holds one slot must not insert
+            # the other slot's reporters.
+            shard = chosen - 1
+            await reopen_gapped_search_harvest_queries(db, reporter_shard=shard)
+            if await _structured_pending_count(db, shard) <= 0:
+                await reopen_finished_reporter_year_queries(db, reporter_shard=shard)
         if query_key:
             query_row = await pick_next_query(db, query_key=query_key)
             if query_row is not None:

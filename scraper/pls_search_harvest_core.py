@@ -367,6 +367,65 @@ def unlinked_gap_credit(rows_seen: int, rows_known: int, rows_unlinked: int) -> 
     return min(max(0, int(rows_unlinked or 0)), seen_unknown)
 
 
+UNRESOLVED_LINKED_GAP_PREFIX = "unresolved linked gap"
+UNRESOLVED_SITE_TOTAL_GAP_PREFIX = "unresolved site total gap"
+
+
+def is_citation_only_query(query_json: Any) -> bool:
+    """A snowball citation lookup, not a reporter/year (or other structured) search."""
+    body = dict(query_json or {})
+    citation = str(body.get("citation") or "").strip()
+    if not citation:
+        return False
+    return set(body.keys()) <= {"citation"}
+
+
+def citation_only_sql_clause():
+    """SQL form of is_citation_only_query: a non-empty citation and no other query key.
+
+    A citation plus a year, reporter, court, or any other field is a structured search.
+    Shared by claim and by the pending-harvest count so those two cannot disagree.
+    """
+    from sqlalchemy import and_, func, or_
+
+    from scraper.models import PlsSearchHarvestQuery
+
+    body = PlsSearchHarvestQuery.query_json
+    citation = func.trim(body["citation"].astext)
+    no_other_key = [
+        or_(body[key].astext.is_(None), func.trim(body[key].astext) == "")
+        for key in _QUERY_KEY_ORDER
+        if key != "citation"
+    ]
+    return and_(citation.isnot(None), citation != "", *no_other_key)
+
+
+def refreshed_rows_known(
+    *,
+    rows_seen: int,
+    rows_known: int,
+    known_on_page: int,
+    detail_resolved: int,
+    confirming_single_page: bool,
+) -> int:
+    """Known rows after this page, including detail fetches that staged or matched an existing body.
+
+    A confirming reread of a one-page result must replace a stale ``rows_known`` (the CLD|2005
+    tick kept 335 known of 372 seen). Later pages only add rows resolved on this page, because
+    ``rows_known`` already includes earlier pages.
+    """
+    seen = max(0, int(rows_seen))
+    resolved = max(0, int(detail_resolved))
+    stored = max(0, int(rows_known))
+    page_known = max(0, int(known_on_page)) + resolved
+    if confirming_single_page and page_known >= stored:
+        return min(seen, page_known)
+    if confirming_single_page:
+        # This read is shorter than the stored enumeration; do not wipe rows_known.
+        return min(seen, stored)
+    return min(seen, stored + resolved)
+
+
 def compute_gap_size(
     site_total: Optional[int],
     rows_known: int,

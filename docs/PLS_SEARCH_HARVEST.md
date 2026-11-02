@@ -68,3 +68,7 @@ HTTP gap report (read-only, same as `/status`):
 ## Celery
 
 Task: `scraper.tasks.pls_search_harvest.pls_search_harvest_tick` on the `login_session` queue. Beat entry `pls-search-harvest` is registered only when `PLS_SEARCH_HARVEST_ENABLED=1`.
+
+## Citation-only lookups
+
+A ledger row whose query is only a citation string (a snowball miss such as `1967 PTD 139`) is not claimed by the automatic tick and does not count as pending harvest work, so a backlog of empty citation keys cannot yield the citation grid or block reporter-year searches. A citation plus any other field (year, reporter, court, and the rest of the planned keys) is a structured search and is claimed normally. An explicit `--query-key` still runs a citation-only row. When no structured row is pending, the tick reopens gapped reporter-years and cooled reporter-year searches instead of draining the citation backlog.

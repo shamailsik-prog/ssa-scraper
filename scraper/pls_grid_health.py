@@ -350,6 +350,7 @@ async def pls_pending_search_harvest_count(
 ) -> int:
     """Rows this login slot may claim: own reporter share, plus the other share when cross-slot claim is on."""
     from scraper.models import PlsSearchHarvestQuery
+    from scraper.pls_search_harvest_core import citation_only_sql_clause
     from scraper.tasks.pls_search_harvest import _share_filter
 
     if reporter_shard in (0, 1):
@@ -358,7 +359,11 @@ async def pls_pending_search_harvest_count(
     stmt = (
         select(func.count())
         .select_from(PlsSearchHarvestQuery)
-        .where(PlsSearchHarvestQuery.source_name == SOURCE_NAME, *_pending_harvest_filters(stall_reason=stall_reason, now=now))
+        .where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            ~citation_only_sql_clause(),
+            *_pending_harvest_filters(stall_reason=stall_reason, now=now),
+        )
     )
     if slot in (1, 2):
         own = _share_filter(slot)
