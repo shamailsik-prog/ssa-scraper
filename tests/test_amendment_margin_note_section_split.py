@@ -205,6 +205,70 @@ def test_edu_ocr_wrapped_margin_notes_are_not_sections_4_and_8():
     assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
 
 
+def test_own_line_ocr_clause_numbers_stay_monotonic():
+    """CamScanner puts ``l.`` and ``2`` on their own lines, apart from the clause.
+
+    That is the cotton collapse: the margin notes drop, then the Act's own
+    numbers never become headings, and the rest of the Act falls into section 2.
+    """
+    text = """
+Short title and
+l.
+(1) This Act may be called the Balochistan Cotton Control (Amendment) Act, 2004.
+(2) It shall come into force at once.
+2
+In the said Ordinance, in section 2, for the word cotton the word lint shall be substituted and the Board shall notify the change.
+3
+In the principal Act, in section 5, the collector shall record the mutation and publish it in the Gazette.
+"""
+    sections = split_into_sections(text, COTTON)
+    numbers = [section["section_number"] for section in sections]
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+
+    assert numbers == ["1", "2", "3"]
+    assert "may be called" in bodies["1"]
+    assert "come into force" in bodies["1"]
+    assert "word lint shall be substituted" in bodies["2"]
+    assert "record the mutation" in bodies["3"]
+    assert "word lint" not in bodies["1"]
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+
+
+def test_inline_l_dot_short_title_is_section_one():
+    """``Short title and l. (1)`` is section 1, and the next bare digit is clause 2."""
+    text = """
+Short title and l. (1) This Act may be called the Balochistan Cotton Control (Amendment) Act, 2004.
+(2) It shall come into force at once.
+2
+In the said Ordinance, in section 9, for the word cotton the word lint shall be substituted and the Board shall notify the change.
+"""
+    bodies = _bodies(text)
+
+    assert list(bodies) == ["1", "2"]
+    assert "may be called" in bodies["1"]
+    assert "come into force" in bodies["1"]
+    assert bodies["2"].lstrip().startswith("2")
+    assert "word lint shall be substituted" in bodies["2"]
+
+
+def test_page_number_does_not_split_a_clause_that_already_has_its_number():
+    """A CamScanner page number sits above the next line of the same clause."""
+    text = """
+2
+Short title and 1. (1) This Act may be called the Balochistan Cotton Control (Amendment) Act, 2004 and it shall come into force at once.
+3
+"(5) An Inspector appointed under this Ordinance shall record the seizure and report it to the Board within seven days.
+4.. In the said Ordinance, in section 7, for the word cotton the word lint shall be substituted and the Board shall notify the change.
+"""
+    bodies = _bodies(text)
+
+    assert list(bodies) == ["1", "2"]
+    assert "may be called" in bodies["1"]
+    assert "record the seizure" in bodies["1"]
+    assert "word lint shall be substituted" in bodies["2"]
+
+
 def test_cotton_ocr_bare_and_garbled_clause_numbers_do_not_collapse():
     """Margin notes are ignored. ``3 In the said`` and ``4..`` and ``ve`` still split.
 
@@ -220,6 +284,12 @@ def test_cotton_ocr_bare_and_garbled_clause_numbers_do_not_collapse():
     assert len(numbers) >= 15
     assert "may be called" in joined
     assert "section 5" in joined.lower()
+    # ``15. Inthe said`` is the clause for principal section 17. It must not
+    # stay glued to the previous clause (the variety/seed amendment).
+    moisture = next(
+        section["section_text"] for section in sections if re.search(r"(?i)section\s+17\b", section["section_text"])
+    )
+    assert "variety" not in moisture.lower()
     assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
     assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
     before = [
@@ -279,6 +349,7 @@ def test_wages_principal_act_is_not_split_as_an_amendment():
     joined = "\n".join(section["section_text"] for section in sections)
 
     assert "|" not in joined
+    assert "Short title" in joined
     assert "may be called" in joined
     assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
     before = [

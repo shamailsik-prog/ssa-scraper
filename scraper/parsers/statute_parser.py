@@ -1506,39 +1506,139 @@ _AMEND_BARE_CLAUSE_RE = re.compile(
 )
 
 
+# ``Short title and l. (1)`` — the letter is not at the start of the line.
+_AMEND_OCR_ONE_INLINE_RE = re.compile(
+    r"(?i)(^|[ \t])[lI][ \t]*\.[ \t]+(?=\(\s*1\s*\)|This[ \t]+Act\b)"
+)
+# ``15. Inthe said Ordinance`` — the space in ``In the`` was dropped.
+_AMEND_INTHE_RE = re.compile(r"(?i)\bIn(?=the[ \t]+(?:said|principal|Balochistan)\b)")
+# A clause number on its own line: ``l.`` or ``2``, optionally with a period.
+_BARE_CLAUSE_NUMBER_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?P<letter>[lI])[ \t]*\.|(?P<digit>\d{1,2})[ \t]*\.?)[ \t]*$"
+)
+_UNNUMBERED_CLAUSE_LINE_RE = re.compile(
+    r"(?ix)^(?P<pre>.{0,80}?)"
+    r"(?:\(\s*\d+\s*\)[ \t]*)?"
+    r"(?:this[ \t]+act,?[ \t]+may[ \t]+be[ \t]+called"
+    r"|in[ \t]+the[ \t]+(?:said|principal|balochistan)\b)"
+)
+_OWN_CLAUSE_NUMBER_RE = re.compile(r"(?i)(?:^|\s)(?:\d{1,2}|[lI])[ \t]*\.(?!\d)")
+
+
+def _line_is_unnumbered_amendment_clause(line: str) -> bool:
+    """A clause formula that does not already carry ``N.`` or ``l.``."""
+    match = _UNNUMBERED_CLAUSE_LINE_RE.match((line or "").strip())
+    if not match:
+        return False
+    pre = match.group("pre") or ""
+    if re.search(r"\d", pre) or _OWN_CLAUSE_NUMBER_RE.search(pre):
+        return False
+    return True
+
+
+def _join_own_line_amendment_clause_numbers(text: str) -> str:
+    """Pull ``l.`` / ``2`` down onto the clause line they were split from.
+
+    A page number above a line that already has its clause number stays put.
+    One blank line between the number and the clause is the page break.
+    """
+    lines = text.split("\n")
+    joined: List[str] = []
+    index = 0
+    while index < len(lines):
+        match = _BARE_CLAUSE_NUMBER_LINE_RE.match(lines[index])
+        if match is None:
+            joined.append(lines[index])
+            index += 1
+            continue
+        number = "1" if match.group("letter") else match.group("digit")
+        follow = index + 1
+        if follow < len(lines) and not lines[follow].strip() and follow + 1 < len(lines):
+            follow += 1
+        if follow < len(lines) and _line_is_unnumbered_amendment_clause(lines[follow]):
+            indent = re.match(r"^[ \t]*", lines[index]).group(0)
+            joined.append(f"{indent}{number}. {lines[follow].strip()}")
+            index = follow + 1
+            continue
+        joined.append(lines[index])
+        index += 1
+    return "\n".join(joined)
+
+
 def _repair_amendment_ocr_clause_heads(text: str) -> str:
     """Normalise OCR clause numbers on an amendment Act only.
 
-    ``l. (1) This Act`` becomes ``1.``. ``3 In the said`` and ``4.. In the said``
-    become the period heading the clause splitter accepts. A principal Act is
-    not passed through here.
+    ``l. (1) This Act`` and a lone ``l.`` above ``(1) This Act`` become ``1.``.
+    ``2`` above ``In the said``, ``3 In the said`` and ``4.. In the said``
+    become the period heading the clause splitter accepts. ``Inthe said``
+    regains its space. A principal Act is not passed through here.
     """
+    text = _AMEND_OCR_ONE_INLINE_RE.sub(lambda match: f"{match.group(1)}1. ", text)
     text = _AMEND_OCR_ONE_RE.sub(r"\g<indent>1. ", text)
     text = _AMEND_OCR_DOUBLE_DOT_RE.sub(r"\g<indent>\g<n>. ", text)
     text = _AMEND_OCR_S_PERIOD_RE.sub(r"\g<indent>\g<n>. ", text)
     text = _AMEND_BARE_CLAUSE_RE.sub(r"\g<indent>\g<n>. ", text)
-    return _repair_amending_clause_comma_headings(text)
+    text = _AMEND_INTHE_RE.sub("In ", text)
+    text = _repair_amending_clause_comma_headings(text)
+    return _join_own_line_amendment_clause_numbers(text)
+
+
+# A two-letter stub such as ``Sh`` above ``ort title`` is one word. ``No`` /
+# ``In`` / ``Be`` above the next line are real words and stay separate.
+_COLUMN_SPLIT_STOP_RE = re.compile(
+    r"(?i)^(?:am|an|as|at|be|by|do|go|he|if|in|is|it|me|my|no|of|on|or|so|to|up|we|and|the|for|not|any|all|may|act|its|his|her|was|are|but)$"
+)
+
+
+def _rejoin_column_split_heading(text: str) -> str:
+    """Join ``Sh i }?`` / ``ort title`` back into ``Short title``.
+
+    The stub is two or three letters, not a word on its own, and the rest of
+    its line is column junk. The next line continues in lowercase.
+    """
+    lines = text.split("\n")
+    joined: List[str] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^([A-Z][a-z]{1,2})\b(.*)$", lines[index])
+        if match and index + 1 < len(lines):
+            fragment, rest = match.group(1), match.group(2)
+            continuation = re.match(r"^([a-z]{2,})(.*)$", lines[index + 1])
+            if (
+                continuation
+                and not _COLUMN_SPLIT_STOP_RE.match(fragment)
+                and not re.search(r"[A-Za-z]{3,}", rest)
+            ):
+                joined.append(fragment + continuation.group(1) + continuation.group(2))
+                index += 2
+                continue
+        joined.append(lines[index])
+        index += 1
+    return "\n".join(joined)
 
 
 def _strip_ocr_column_pipes(text: str) -> str:
-    """Drop scanner column rules and join a word split by a line-end hyphen.
+    """Drop scanner column rules and join a word the columns split.
 
-    Payment of Wages OCR prints ``|`` down the margin and breaks ``Pay-`` /
-    ``ment``. A line-start ``|, Short title`` is the OCR of section 1 and stays
-    so the comma-heading repair can read it.
+    Payment of Wages OCR prints ``|`` down the margin, breaks ``Pay-`` /
+    ``ment``, and prints ``Sh`` above ``ort title``. A line-start
+    ``|, Short title`` is the OCR of section 1 and stays so the comma-heading
+    repair can read it.
     """
-    if not text or "|" not in text and not re.search(r"-\n[a-z]", text):
+    if not text:
         return text
-    kept: List[str] = []
-    for line in text.split("\n"):
-        if re.match(r"[ \t]*\|[ \t]*,", line):
-            kept.append(line)
-            continue
-        cleaned = re.sub(r"^[ \t]*\|[ \t]*", "", line)
-        cleaned = re.sub(r"[ \t]*\|[ \t]*$", "", cleaned)
-        cleaned = cleaned.replace("|", "")
-        kept.append(cleaned)
-    return re.sub(r"-\n(?=[a-z])", "", "\n".join(kept))
+    if "|" in text or re.search(r"-\n[a-z]", text):
+        kept: List[str] = []
+        for line in text.split("\n"):
+            if re.match(r"[ \t]*\|[ \t]*,", line):
+                kept.append(line)
+                continue
+            cleaned = re.sub(r"^[ \t]*\|[ \t]*", "", line)
+            cleaned = re.sub(r"[ \t]*\|[ \t]*$", "", cleaned)
+            cleaned = cleaned.replace("|", "")
+            kept.append(cleaned)
+        text = re.sub(r"-\n(?=[a-z])", "", "\n".join(kept))
+    return _rejoin_column_split_heading(text)
 
 
 _AMENDMENT_CLAUSE_OPEN_RE = re.compile(
