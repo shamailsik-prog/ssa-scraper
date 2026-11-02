@@ -10,10 +10,19 @@ Act`` (a comma is the OCR of that period).
 """
 
 import re
+from pathlib import Path
 
 from scraper.parsers.statute_parser import split_into_sections
+from scraper.statute_quality.section_reextract import (
+    REEXTRACT_MEGA_SECTION_CHARS,
+    gate_section_reextract,
+)
 
 COTTON = "The Balochistan Cotton Control (Amendment) Act, 2004"
+EDU = "The Balochistan Government Educational and Training Institutions (Amendment) Act No. III of 2007"
+LAND = "The Balochistan Land Revenue (Amendment) Act No. XXV of 2022"
+WAGES = "The Balochistan Payment of Wages Act, 2021"
+_FIXTURES = Path(__file__).resolve().parents[0] / "fixtures" / "statute_quality"
 _MARGIN_BODY = re.compile(r"(?i)^\s*(?:section|sec\.|s\.)\s+\d")
 
 
@@ -159,3 +168,127 @@ def test_amendment_heading_keeps_the_amending_acts_number():
     assert list(bodies) == ["1", "2", "3"]
     assert "for the word thirty the word sixty" in bodies["2"]
     assert "hereby repealed" in bodies["3"]
+
+
+def _fixture(name: str) -> str:
+    return (_FIXTURES / name).read_text()
+
+
+def _monotonic_from_one(numbers: list[str]) -> bool:
+    try:
+        ints = [int(number) for number in numbers]
+    except ValueError:
+        return False
+    return ints == list(range(1, len(ints) + 1))
+
+
+def test_edu_ocr_wrapped_margin_notes_are_not_sections_4_and_8():
+    """Instrument name wraps past the next line, and ``1.`` OCR'd as ``t (1)``.
+
+    The keyword splitter used to keep principal sections 4 and 8 and drop the
+    short title. The Board list inside the substituted section 4 stays in that
+    clause. It is not an amending-act section.
+    """
+    sections = split_into_sections(_fixture("edu_institutions_amendment_2007_ocr.txt"), EDU)
+    numbers = [section["section_number"] for section in sections]
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+
+    assert _monotonic_from_one(numbers)
+    assert numbers[0] == "1"
+    assert "may be called" in bodies["1"]
+    assert "come into force" in bodies["1"]
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    board = next(body for body in bodies.values() if "Board shall consist" in body)
+    assert "for Section 4" in board or "for section 4" in board.lower()
+    assert "Section 6 shall be omitted" in " ".join(bodies.values())
+    assert "Vice-Chairman" in " ".join(bodies.values())
+    assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+
+
+def test_cotton_ocr_bare_and_garbled_clause_numbers_do_not_collapse():
+    """Margin notes are ignored. ``3 In the said`` and ``4..`` and ``ve`` still split.
+
+    Stored cotton was 18 margin-note rows. A two-row re-extract is a collapse
+    and section 2 holds the rest of the Act.
+    """
+    text = _fixture("cotton_amendment_2004_ocr.txt")
+    sections = split_into_sections(text, COTTON)
+    numbers = [section["section_number"] for section in sections]
+    joined = "\n".join(section["section_text"] for section in sections)
+
+    assert _monotonic_from_one(numbers)
+    assert len(numbers) >= 15
+    assert "may be called" in joined
+    assert "section 5" in joined.lower()
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+    before = [
+        {"section_number": str(n), "section_text": f"section {n} of W.P. Ordinance XX of 1966. Operative words."}
+        for n in (2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 26, 27)
+    ]
+    gate = gate_section_reextract(before, sections)
+    assert gate.verdict == "PASS"
+    assert gate.may_apply is True
+
+
+def test_land_text_layer_parenthetical_clauses_stay_sequential():
+    """pdfplumber glues the marginal note to ``(N) In the said Act`` and drops ``N.``.
+
+    Page numbers and the distribution list must not become the section numbers.
+    """
+    sections = split_into_sections(_fixture("land_revenue_amendment_2022_pdfplumber.txt"), LAND)
+    numbers = [section["section_number"] for section in sections]
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+    joined = "\n".join(bodies.values())
+
+    assert _monotonic_from_one(numbers)
+    assert len(numbers) >= 8
+    assert "may be called" in bodies["1"]
+    assert "come into force" in bodies["1"]
+    assert "Digitized periodical records" in joined
+    assert "41" not in numbers
+    assert "Senior Member" not in joined
+    assert "Principal Secretary" not in joined
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+
+
+def test_land_ocr_layer_finds_the_short_title_not_principal_section_numbers():
+    """The same PDF's OCR layer must not store principal sections 4, 41 and 39."""
+    sections = split_into_sections(_fixture("land_revenue_amendment_2022_ocr.txt"), LAND)
+    numbers = [section["section_number"] for section in sections]
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+
+    assert numbers[0] == "1"
+    assert _monotonic_from_one(numbers)
+    assert "may be called" in bodies["1"]
+    assert "4" not in numbers or "may be called" in bodies.get("1", "")
+    assert not any(number in numbers for number in ("39", "41"))
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+
+
+def test_wages_principal_act_is_not_split_as_an_amendment():
+    """Payment of Wages is the principal Act. Cross-refs and ``|`` are OCR noise.
+
+    A short re-extract stays quarantined as ``ocr_heading_noise`` until the
+    sections are a long monotonic run. It is not an amendment-margin split.
+    """
+    text = _fixture("payment_of_wages_2021_ocr.txt")
+    sections = split_into_sections(text, WAGES)
+    numbers = [section["section_number"] for section in sections]
+    joined = "\n".join(section["section_text"] for section in sections)
+
+    assert "|" not in joined
+    assert "may be called" in joined
+    assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    before = [
+        {"section_number": str(n), "section_text": f"section {n} of the Factories Act, 1934. Cross reference only."}
+        for n in range(1, 6)
+    ]
+    gate = gate_section_reextract(before, sections)
+    if len(numbers) >= 20 and _monotonic_from_one(numbers):
+        assert gate.verdict == "PASS"
+    else:
+        assert gate.verdict == "FAIL"
+        assert gate.reason == "ocr_heading_noise"
+        assert gate.may_apply is False
