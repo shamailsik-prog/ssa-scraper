@@ -890,3 +890,82 @@ async def test_orphan_reextract_capture_is_purged_and_live_statute_capture_stays
     assert (
         await db.execute(select(func.count()).select_from(StatuteSectionReextractPrior))
     ).scalar() == 1
+
+
+def _tariff_polluted_finance_act_before() -> list[dict]:
+    """The eleven Finance Act 1985 rows: rate lines and HS rows, no real section."""
+    return [
+        _section("1", "1. Where the taxable income does not exceed Rs. 25,000 the tax shall be five percent of the income."),
+        _section("2", "2. Where the taxable income exceeds Rs. 25,000 but does not exceed Rs. 50,000 the tax shall be the amount specified."),
+        _section("4", "4. Where the taxable income exceeds Rs. 50,000 but does not exceed Rs. 100,000 the tax shall be computed under this clause."),
+        _section("33", "33.03 Synthetic organic colouring matter, whether or not chemically defined, and preparations."),
+        _section("78", "78. 38BO5 Chromite sulphate used in the dyeing and tanning process under this schedule of the Act."),
+        _section("32", "32.03 Synthetic organic colouring matter and preparations based on the colouring matter."),
+        _section("40", "40.11 New pneumatic tyres, of rubber, of a kind used on motor cars under this schedule."),
+        _section("51", "51.07 Yarn of combed wool, not put up for retail sale, containing eighty five percent of wool."),
+        _section("56", "56.01 Synthetic staple fibres, not carded, combed or otherwise processed for spinning."),
+        _section("03", "03) Cuprammonium hydroxide solution used in the manufacture of cuprammonium rayon under this schedule."),
+        _section("73", "73.15 Chain and parts thereof, of iron or steel, per metric ton under this schedule of the Act."),
+    ]
+
+
+def _finance_act_without_definitions() -> list[dict]:
+    rate = "1. Where the taxable income does not exceed Rs. 25,000 the tax shall be five percent of the income.\n"
+    amendment = (
+        "4. Amendment of Ordinance XXXI of 1979.— In the Income Tax Ordinance, 1979 "
+        "the following further amendment shall be made, namely the rate schedule hereunder.\n"
+        + rate
+        + ("The rate in this schedule applies to the income of the year. " * 80)
+    )
+    assert len(amendment) >= REEXTRACT_MEGA_SECTION_CHARS
+    return [
+        _section("1", "1. Short title and extent.— This Act may be called the Finance Act, 1985."),
+        _section("2", "2. Amendment of Act XV of 1963.— In the Wealth Tax Act, 1963 the following further amendment shall be made."),
+        _section("3", "3. Amendment of Act IV of 1969.— In the Customs Act, 1969 the First Schedule shall be amended."),
+        _section("4", amendment),
+        _section("5", "5. Iqra surcharge on imported goods.— A surcharge to be called the Iqra surcharge shall be levied on imported goods."),
+    ]
+
+
+def test_tariff_rows_are_not_the_collapse_baseline_for_a_finance_act():
+    """A correct five-section amending Act must not fail against eleven schedule rows.
+
+    Finance Act 1985 has no Definitions section. That absence is not a failure.
+    """
+    before = _tariff_polluted_finance_act_before()
+    after = _finance_act_without_definitions()
+    assert all("Definitions" not in row["section_text"] for row in after)
+    decision = gate_section_reextract(before, after)
+    assert decision.verdict == "PASS"
+    assert decision.reason == ""
+    assert decision.may_apply is True
+    assert decision.section_count_before == 0
+    assert decision.section_count_after == 5
+
+
+def test_tariff_only_before_set_still_rejects_a_mega_section_without_a_schedule():
+    """Ignoring schedule rows does not let one long non-schedule section through."""
+    before = _tariff_polluted_finance_act_before()
+    mega = "2. Extent through repeal and savings. " + ("The remaining provisions of this Act. " * 400)
+    assert len(mega) >= REEXTRACT_MEGA_SECTION_CHARS
+    decision = gate_section_reextract(before, [_section("2", mega)])
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_mega_section"
+    assert decision.section_count_before == 0
+
+
+def test_schedule_inside_an_amending_section_may_pass_the_mega_cut():
+    """The rate schedule lives in the amending section. A later real heading still fails."""
+    before = _tariff_polluted_finance_act_before()
+    after = _finance_act_without_definitions()
+    decision = gate_section_reextract(before, after)
+    assert decision.verdict == "PASS"
+
+    swallowed = after[3]["section_text"] + (
+        "\n6. Short title of the next Act.— This Act may be called the Other Finance Act, 1986 "
+        "and it extends to the whole of Pakistan.\n"
+    )
+    assert len(swallowed) >= REEXTRACT_MEGA_SECTION_CHARS
+    glued = gate_section_reextract(before, [_section("4", swallowed)])
+    assert glued.verdict == "FAIL"
+    assert glued.reason == "reextract_mega_section"
