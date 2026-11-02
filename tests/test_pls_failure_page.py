@@ -171,6 +171,61 @@ async def test_real_short_judgment_still_passes_the_harvest_path(db, login_sourc
     assert staged.status in ("extracted", "quarantined")
 
 
+async def test_search_gap_empty_modal_is_empty_not_staged(db, login_source):
+    from sqlalchemy import select
+
+    from scraper.auth.session_manager import PageResult
+    from scraper.models import ScraperStaging
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from tests.fixtures import BrowserScript
+    from tests.test_auth_playwright import _activate, _nosleep
+
+    await _activate(db, login_source)
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2026CLD2"
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    page = PageResult(
+        url=detail_url,
+        html="<html><body><p>Citation Name: 2026 CLD 2</p></body></html>",
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_text": "",
+        },
+    )
+    row = {"citation": "2026 CLD 2", "detail_url": detail_url}
+    assert await pipeline.preserve_and_extract(page, {"harvest": "search_gap"}, row) == "empty"
+    assert (await db.execute(select(ScraperStaging))).scalars().all() == []
+
+
+async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source):
+    from sqlalchemy import select
+
+    from scraper.auth.session_manager import PageResult
+    from scraper.models import ScraperStaging
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from tests.fixtures import BrowserScript
+    from tests.test_auth_playwright import _activate, _nosleep, _notes_only_detail_html
+
+    await _activate(db, login_source)
+    citation = "2026 CLD 9"
+    detail_url = "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2026CLD9"
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    page = PageResult(
+        url=detail_url,
+        html=_notes_only_detail_html(citation, "Notes Only"),
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": False,
+            "case_description_modal_text": None,
+        },
+    )
+    row = {"citation": citation, "title": "Notes Only", "detail_url": detail_url}
+    assert await pipeline.preserve_and_extract(page, {"harvest": "search_gap"}, row) == "non_judgment"
+    assert (await db.execute(select(ScraperStaging))).scalars().all() == []
+
+
 def test_citation_grid_refetches_fetch_error_then_skips_when_capped():
     from scraper.tasks.pakistanlawsite import staged_citation_disposition
 

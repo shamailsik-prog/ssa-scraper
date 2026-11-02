@@ -63,6 +63,7 @@ from scraper.extractors.judgment_guards import (
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.pls_failure_page import detect_pls_case_detail_failure
+from scraper.pls_search_harvest_core import search_gap_detail_result
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -1577,8 +1578,10 @@ class PakistanLawSitePipeline:
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
         """Raw-first: provenance → staging → extraction.
 
-        Returns 'staged', 'duplicate', or 'fetch_error'. A PLS error page is
-        marked fetch_error and is not staged as a judgment body.
+        Returns 'staged', 'duplicate', 'fetch_error', 'non_judgment', or 'empty'.
+        A PLS error page is marked fetch_error and is not staged as a judgment body.
+        Search-harvest details that are headnotes or empty case text return
+        'non_judgment' or 'empty' and are not queued as judgments.
         """
         html = page.html
         html_prov = await record_provenance(
@@ -1640,6 +1643,22 @@ class PakistanLawSitePipeline:
         failure = detect_pls_case_detail_failure(text)
         if failure:
             return await self._mark_case_detail_fetch_error(page, route, row, failure, html_prov)
+        if str((route or {}).get("harvest") or "") == "search_gap":
+            # An empty case-description modal is an empty body even when the page shell
+            # has chrome. A PDF can still be the judgment; classify that text instead.
+            modal_for_class = modal_text
+            if row.get("pdf_url") and str(text or "").strip() and not str(modal_text or "").strip():
+                modal_for_class = text
+            kind, reason = self._classify_document_type(
+                page=page,
+                selected_text=text,
+                modal_text=modal_for_class,
+            )
+            body_for_result = "" if reason == "case_description_modal_empty" else text
+            gap_result = search_gap_detail_result(kind, reason, body_for_result)
+            if gap_result:
+                return gap_result
+            document_type, document_type_reason = kind, reason
         staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=False)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.

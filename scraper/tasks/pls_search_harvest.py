@@ -43,7 +43,9 @@ from scraper.pls_search_harvest_core import (
     CASE_NAME_URL_SUBSTRING_PATTERN,
     citation_keys_for_row,
     append_gap_sample,
+    append_unresolved_sample,
     compute_gap_size,
+    detail_result_counts_as_known,
     citation_only_sql_clause,
     refreshed_rows_known,
     UNRESOLVED_LINKED_GAP_PREFIX,
@@ -910,14 +912,33 @@ class SearchHarvestRunner:
                         {**route_base, "cursor": dict(cursor), "row_index": idx},
                         row,
                     )
-                    if result in ("staged", "duplicate"):
+                    if result in ("staged", "duplicate") or detail_result_counts_as_known(result):
                         # A body we already hold does not match citation keys often enough
                         # (grid text vs canonical citation). Counting it known closes the gap
                         # instead of leaving rows_seen - rows_known for the next reopen.
+                        # A non-judgment or empty body is finished the same way, without
+                        # counting as a staged judgment. fetch_error is not resolved here.
                         detail_resolved += 1
                     if result == "staged":
                         rows_new += 1
                         staged_this_tick += 1
+                    elif result not in ("duplicate",):
+                        logger.info(
+                            "PLS search harvest %s page %s detail result %s citation=%r url=%s",
+                            query_row.query_key,
+                            page_idx,
+                            result,
+                            row.get("citation"),
+                            detail_url,
+                        )
+                        append_unresolved_sample(
+                            cursor,
+                            {
+                                "result": result,
+                                "citation": row.get("citation"),
+                                "detail_url": detail_url,
+                            },
+                        )
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change

@@ -250,10 +250,76 @@ async def test_confirming_reread_retries_unresolved_linked_row_instead_of_finish
     assert "unmatched" in (q.last_error or "")
     assert runner.fetched == ["https://example.test/2"]
 
+    samples = (q.cursor_json or {}).get("unresolved_samples") or []
+    assert samples and samples[0]["result"] == "fetch_error"
+    assert samples[0]["citation"] == "2005 CLD 2"
+    assert samples[0]["detail_url"] == "https://example.test/2"
+
     second = await runner.run_query(q, {})
     assert q.status == "done"
     assert (q.last_error or "").startswith("unresolved linked gap")
     assert second["gap_size"] == 1
+    assert second["staged_this_tick"] == 0
+    assert (q.cursor_json or {}).get("unresolved_samples")
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_result", ["non_judgment", "empty"])
+async def test_non_judgment_or_empty_detail_closes_gap_without_staging(db, monkeypatch, caplog, preserve_result):
+    """CLD|2026 finished seen=102 known=101 gap=1 staged=0 after two detail fetches.
+
+    preserve_and_extract returned neither staged nor duplicate. A non-judgment or empty
+    body is not a missing judgment: count it known, keep staged_this_tick at 0, and
+    record the result. fetch_error stays on the two-try path (see the test above).
+    """
+    import logging
+
+    caplog.set_level(logging.INFO)
+    rows = [
+        _row("2026 CLD 1", "https://example.test/1"),
+        _row("2026 CLD 2", "https://example.test/2"),
+    ]
+    runner = _runner(
+        monkeypatch,
+        db,
+        {"page1": (rows, None)},
+        known={"2026 CLD 1"},
+        preserve=preserve_result,
+    )
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=CLD|year=2026",
+        query_json={"reporter": "CLD", "year": 2026},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=2,
+        rows_known=1,
+        rows_new=1,
+        gap_size=1,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    result = await runner.run_query(q, {})
+    assert runner.fetched == ["https://example.test/2"]
+    assert result["staged_this_tick"] == 0
+    assert result["rows_seen"] == 2
+    assert result["rows_known"] == 2
+    assert result["rows_new"] == 1
+    assert result["gap_size"] == 0
+    assert result["status"] == "done"
+    assert not (q.last_error or "").startswith("unresolved linked gap")
+    samples = (q.cursor_json or {}).get("unresolved_samples") or []
+    assert len(samples) == 1
+    assert samples[0]["result"] == preserve_result
+    assert samples[0]["citation"] == "2026 CLD 2"
+    assert samples[0]["detail_url"] == "https://example.test/2"
+    assert any(
+        preserve_result in r.message and "2026 CLD 2" in r.message and "https://example.test/2" in r.message
+        for r in caplog.records
+    )
     await db.rollback()
 
 
