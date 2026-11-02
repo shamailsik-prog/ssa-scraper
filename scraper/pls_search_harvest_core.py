@@ -7,12 +7,14 @@ import json
 import logging
 import re
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
 from scraper.config import KNOWN_REPORTERS
 from scraper.keys import fit_key
 from scraper.parsers.citation_extractor import normalise_citation
+from scraper.pls_quality_guards import SHORT_TEXT_MIN_CHARS
 
 _QUERY_KEY_ORDER = ("reporter", "year", "month", "court", "bench", "party_initial", "category", "keyword", "judge", "party", "statute", "section", "citation", "page_from", "page_to")
 
@@ -347,8 +349,17 @@ def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
 
 UNRESOLVED_SAMPLES_LIMIT = 20
 # A detail fetch that is not a missing judgment. Counting these known closes the gap.
-# fetch_error (including Error Code 700) is not in this set.
+# fetch_error (including Error Code 700) is not in this set. A narrow annexure stub
+# is rewritten to non_judgment_annexure, which this set then counts as known, only
+# after two qualifying misses on an active slot.
 _DETAIL_KNOWN_RESULTS = frozenset({"non_judgment", "empty", "empty_body", "headnote"})
+# Same wording as the short-text quarantine, so a short annexure body and a 700
+# page can share one attempt counter.
+ANNEXURE_SHORT_TEXT_REASON = f"judgment text shorter than {SHORT_TEXT_MIN_CHARS} characters"
+_ANNEXURE_CASE_RE = re.compile(r"^\d{4}(SC|HC)-A\d{1,2}$")
+_CASE_NAME_PARAM_RE = re.compile(r"(?i)(?:^|[?&#])CaseName=([^&#]*)")
+_ANNEXURE_CURSOR_KEYS = ("annexure_stub_attempts", "non_judgment_annexures")
+_LEGACY_FETCH_ERROR = "fetch_error"
 
 
 def detail_result_counts_as_known(result: str) -> bool:
@@ -379,12 +390,149 @@ def search_gap_detail_result(
     return None
 
 
+def _case_name_param(url: Optional[str]) -> str:
+    match = _CASE_NAME_PARAM_RE.search(url or "")
+    if not match:
+        return ""
+    return unquote(match.group(1)).strip().upper()
+
+
+def is_annexure_stub_row(row: Dict[str, Any]) -> Optional[str]:
+    """CaseName when every narrow annexure-stub condition holds, else None.
+
+    The case name is a 1-2 digit ``YYYY(SC|HC)-A`` index. Real AJK judgments use
+    a longer suffix (``1990HC-A2001``) and are not this shape. Title, citation,
+    pdf, and keys must all say the row is an empty "Versus" stub.
+    """
+    name = _case_name_param(row.get("detail_url"))
+    if not _ANNEXURE_CASE_RE.match(name):
+        return None
+    if str(row.get("title") or "").strip() != "Versus":
+        return None
+    if str(row.get("citation") or "").strip():
+        return None
+    if str(row.get("pdf_url") or "").strip():
+        return None
+    if citation_keys_for_row(row):
+        return None
+    return name
+
+
+def annexure_short_text_reason(text: str) -> Optional[str]:
+    """The short-text signal for a non-empty annexure body under 500 characters."""
+    stripped = str(text or "").strip()
+    if stripped and len(stripped) < SHORT_TEXT_MIN_CHARS:
+        return ANNEXURE_SHORT_TEXT_REASON
+    return None
+
+
+def detail_is_annexure_failure(result: str, failure: Optional[str]) -> bool:
+    """True for Error 700 or judgment text shorter than 500 characters."""
+    blob = f"{result or ''}\n{failure or ''}".lower()
+    if "pls_error_code_700" in blob:
+        return True
+    return ANNEXURE_SHORT_TEXT_REASON.lower() in blob
+
+
+def mapped_annexure_names(cursor: Optional[Dict[str, Any]]) -> Set[str]:
+    return {str(name) for name in ((cursor or {}).get("non_judgment_annexures") or [])}
+
+
+def _remember_mapped_annexure(cursor: Dict[str, Any], case_name: str) -> None:
+    names = [str(name) for name in (cursor.get("non_judgment_annexures") or [])]
+    if case_name not in names:
+        names.append(case_name)
+    cursor["non_judgment_annexures"] = names
+
+
+def _sample_counts_as_prior_annexure_attempt(sample: Dict[str, Any], detail_url: str) -> bool:
+    if str(sample.get("detail_url") or "") != detail_url:
+        return False
+    result = str(sample.get("result") or "")
+    failure = sample.get("failure")
+    if failure:
+        return detail_is_annexure_failure(result, str(failure))
+    # Harvest stored Error 700 as result=fetch_error before it kept the reason.
+    if result.strip().lower() == _LEGACY_FETCH_ERROR:
+        return True
+    return detail_is_annexure_failure(result, None)
+
+
+def _record_annexure_attempt(cursor: Dict[str, Any], case_name: str, detail_url: str) -> int:
+    attempts = dict(cursor.get("annexure_stub_attempts") or {})
+    stored = int(attempts.get(case_name) or 0)
+    legacy = 0
+    if stored == 0:
+        for sample in cursor.get("unresolved_samples") or []:
+            if _sample_counts_as_prior_annexure_attempt(sample, detail_url):
+                legacy = 1
+                break
+    count = stored + legacy + 1
+    attempts[case_name] = count
+    cursor["annexure_stub_attempts"] = attempts
+    return count
+
+
+def classify_persistent_annexure_stub(
+    cursor: Dict[str, Any],
+    row: Dict[str, Any],
+    *,
+    result: str,
+    failure: Optional[str] = None,
+    slot_active: bool = False,
+) -> Optional[str]:
+    """Map a linked-gap row to non_judgment_annexure on its second qualifying miss.
+
+    The miss must be Error 700 or short judgment text, on an active slot, and the
+    row must be the narrow annexure stub. One miss stays on the two-try path.
+    A query-level linked_gap_attempts value does not by itself qualify a row.
+    """
+    if not slot_active:
+        return None
+    name = is_annexure_stub_row(row)
+    if not name or not detail_is_annexure_failure(result, failure):
+        return None
+    if _record_annexure_attempt(cursor, name, str(row.get("detail_url") or "")) < 2:
+        return None
+    _remember_mapped_annexure(cursor, name)
+    return "non_judgment_annexure"
+
+
+def annexure_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    body = dict(cursor or {})
+    return {key: body[key] for key in _ANNEXURE_CURSOR_KEYS if body.get(key)}
+
+
+def fresh_cursor_keeping_annexure_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Page-1 cursor that still remembers annexure stubs already classified."""
+    return {"page": 1, "row_index": 0, **annexure_cursor_state(cursor)}
+
+
 def append_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> None:
     samples = list(cursor.get("unresolved_samples") or [])
     if len(samples) >= UNRESOLVED_SAMPLES_LIMIT:
         return
     samples.append(dict(sample))
     cursor["unresolved_samples"] = samples
+
+
+def stamp_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> None:
+    """Record one sample for this detail URL, replacing any earlier sample of it."""
+    samples = list(cursor.get("unresolved_samples") or [])
+    url = sample.get("detail_url")
+    kept: List[Dict[str, Any]] = []
+    replaced = False
+    for existing in samples:
+        if url and existing.get("detail_url") == url:
+            if not replaced:
+                kept.append(dict(sample))
+                replaced = True
+            continue
+        kept.append(existing)
+    if not replaced:
+        append_unresolved_sample(cursor, sample)
+        return
+    cursor["unresolved_samples"] = kept
 
 
 def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
@@ -397,6 +545,7 @@ def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
         out["rows_unlinked"] = cursor["rows_unlinked"]
     if cursor.get("unresolved_samples"):
         out["unresolved_samples"] = cursor["unresolved_samples"]
+    out.update(annexure_cursor_state(cursor))
     return out
 
 

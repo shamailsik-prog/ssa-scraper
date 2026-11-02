@@ -226,6 +226,111 @@ async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source):
     assert (await db.execute(select(ScraperStaging))).scalars().all() == []
 
 
+async def test_search_gap_annexure_short_text_is_not_staged(db, login_source):
+    """A 1-2 digit annexure whose body is only "Versus" is not a judgment to stage."""
+    from sqlalchemy import select
+
+    from scraper.auth.session_manager import PageResult
+    from scraper.models import ScraperStaging
+    from scraper.pls_search_harvest_core import ANNEXURE_SHORT_TEXT_REASON
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from tests.fixtures import BrowserScript
+    from tests.test_auth_playwright import _activate, _nosleep
+
+    await _activate(db, login_source)
+    detail_url = (
+        "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
+        "?CaseName=1990HC-A1&court=&Row=0&bookName=undefined"
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    page = PageResult(
+        url=detail_url,
+        html="<html><body><p>Versus</p></body></html>",
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_found": True,
+            "case_description_modal_text": "Versus",
+            "case_description_modal_text_length": len("Versus"),
+        },
+    )
+    row = {"citation": None, "title": "Versus", "pdf_url": None, "detail_url": detail_url}
+    route = {"harvest": "search_gap", "row_index": 0}
+    assert await pipeline.preserve_and_extract(page, route, row) == ANNEXURE_SHORT_TEXT_REASON
+    assert route["pls_detail_failure"] == ANNEXURE_SHORT_TEXT_REASON
+    assert (await db.execute(select(ScraperStaging))).scalars().all() == []
+
+
+async def test_search_gap_ajk_short_body_with_citation_is_not_an_annexure_signal(db, login_source):
+    from scraper.auth.session_manager import PageResult
+    from scraper.pls_search_harvest_core import ANNEXURE_SHORT_TEXT_REASON
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from tests.fixtures import BrowserScript
+    from tests.test_auth_playwright import _activate, _nosleep
+
+    await _activate(db, login_source)
+    detail_url = (
+        "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
+        "?CaseName=1990HC-A2001&court=&Row=0&bookName=undefined"
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    page = PageResult(
+        url=detail_url,
+        html="<html><body><p>Versus</p></body></html>",
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_found": True,
+            "case_description_modal_text": "Versus",
+            "case_description_modal_text_length": len("Versus"),
+        },
+    )
+    row = {
+        "citation": "1990 PLC (CS) 733",
+        "title": "Versus",
+        "pdf_url": None,
+        "detail_url": detail_url,
+    }
+    route = {"harvest": "search_gap"}
+    result = await pipeline.preserve_and_extract(page, route, row)
+    assert result != ANNEXURE_SHORT_TEXT_REASON
+    assert result != "non_judgment_annexure"
+    assert "pls_detail_failure" not in route
+
+
+async def test_search_gap_700_records_the_failure_reason_on_the_route(db, login_source):
+    from scraper.auth.session_manager import PageResult
+    from scraper.extractors.pls_failure_page import FETCH_ERROR_700
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+    from tests.fixtures import BrowserScript
+    from tests.test_auth_playwright import _activate, _nosleep
+
+    await _activate(db, login_source)
+    detail_url = (
+        "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch"
+        "?CaseName=1990HC-A1&court=&Row=0&bookName=undefined"
+    )
+    pipeline = PakistanLawSitePipeline(db, login_source, browser_factory=BrowserScript().factory(), sleep=_nosleep)
+    page = PageResult(
+        url=detail_url,
+        html=f"<html><body>{STUB}</body></html>",
+        metadata={
+            "requested_url": detail_url,
+            "final_url": detail_url,
+            "case_description_selector_found": True,
+            "case_description_modal_found": True,
+            "case_description_modal_text": STUB,
+            "case_description_modal_text_length": len(STUB),
+        },
+    )
+    row = {"citation": None, "title": "Versus", "pdf_url": None, "detail_url": detail_url}
+    route = {"harvest": "search_gap", "row_index": 0}
+    assert await pipeline.preserve_and_extract(page, route, row) == "fetch_error"
+    assert route["pls_detail_failure"] == FETCH_ERROR_700
+
+
 def test_citation_grid_refetches_fetch_error_then_skips_when_capped():
     from scraper.tasks.pakistanlawsite import staged_citation_disposition
 

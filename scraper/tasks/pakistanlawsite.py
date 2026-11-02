@@ -63,7 +63,11 @@ from scraper.extractors.judgment_guards import (
     strip_leading_judgment_chrome,
 )
 from scraper.extractors.pls_failure_page import detect_pls_case_detail_failure
-from scraper.pls_search_harvest_core import search_gap_detail_result
+from scraper.pls_search_harvest_core import (
+    annexure_short_text_reason,
+    is_annexure_stub_row,
+    search_gap_detail_result,
+)
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -1573,6 +1577,8 @@ class PakistanLawSitePipeline:
             citation or citation_raw or None,
             safe_url_for_record(page.url),
         )
+        if isinstance(route, dict):
+            route["pls_detail_failure"] = reason
         return "fetch_error"
 
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
@@ -1644,6 +1650,14 @@ class PakistanLawSitePipeline:
         if failure:
             return await self._mark_case_detail_fetch_error(page, route, row, failure, html_prov)
         if str((route or {}).get("harvest") or "") == "search_gap":
+            # A 1-2 digit annexure whose body is only a short "Versus" stub is not
+            # staged. The harvester counts it known only after a second miss.
+            if is_annexure_stub_row(row):
+                short_reason = annexure_short_text_reason(text)
+                if short_reason:
+                    if isinstance(route, dict):
+                        route["pls_detail_failure"] = short_reason
+                    return short_reason
             # An empty case-description modal is an empty body even when the page shell
             # has chrome. A PDF can still be the judgment; classify that text instead.
             modal_for_class = modal_text
