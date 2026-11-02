@@ -44,8 +44,13 @@ from scraper.pls_search_harvest_core import (
     citation_keys_for_row,
     append_gap_sample,
     append_unresolved_sample,
+    classify_persistent_annexure_stub,
     compute_gap_size,
     detail_result_counts_as_known,
+    fresh_cursor_keeping_annexure_state,
+    is_annexure_stub_row,
+    mapped_annexure_names,
+    stamp_unresolved_sample,
     citation_only_sql_clause,
     refreshed_rows_known,
     UNRESOLVED_LINKED_GAP_PREFIX,
@@ -288,7 +293,7 @@ async def reopen_finished_reporter_year_queries(
         row.rows_known = 0
         row.rows_new = 0
         row.gap_size = 0
-        row.cursor_json = {"page": 1, "row_index": 0}
+        row.cursor_json = fresh_cursor_keeping_annexure_state(row.cursor_json)
         row.last_error = "reopened: citation grid saturated; reporter-year search walked again"
         reopened += 1
         if reopened >= limit:
@@ -518,7 +523,7 @@ async def reopen_premature_done_queries(
         row.rows_known = 0
         row.rows_new = 0
         row.gap_size = 0
-        row.cursor_json = {"page": 1, "row_index": 0}
+        row.cursor_json = fresh_cursor_keeping_annexure_state(row.cursor_json)
         row.last_error = reopen_reason
     await db.flush()
     return {"reopened": len(rows)}
@@ -737,6 +742,9 @@ class SearchHarvestRunner:
         self.pacing_profile = login_pacing_profile("updates")
         # the 30-minute spot check of three promoted judgments runs between this run's pages, on its login
         self.spot_check_between_pages = True
+        # Error-700 annexure attempts count only after run_search_harvest has
+        # confirmed this tick's login slot is ACTIVE.
+        self.slot_is_active = False
 
     async def _pace_sleep(self) -> None:
         lo = float(self.pacing_profile["login_delay_min"])
@@ -906,22 +914,51 @@ class SearchHarvestRunner:
                         continue
                     if id(row) not in fresh_ids:
                         continue
+                    annexure_name = is_annexure_stub_row(row)
+                    if annexure_name and annexure_name in mapped_annexure_names(cursor):
+                        # Already classified. Do not open the dead link again.
+                        detail_resolved += 1
+                        continue
+                    route = {**route_base, "cursor": dict(cursor), "row_index": idx}
                     detail = await self.pipeline.fetch_detail(detail_url)
-                    result = await self.pipeline.preserve_and_extract(
-                        detail,
-                        {**route_base, "cursor": dict(cursor), "row_index": idx},
+                    result = await self.pipeline.preserve_and_extract(detail, route, row)
+                    failure = route.get("pls_detail_failure") if isinstance(route, dict) else None
+                    if classify_persistent_annexure_stub(
+                        cursor,
                         row,
-                    )
+                        result=str(result or ""),
+                        failure=str(failure) if failure else None,
+                        slot_active=bool(getattr(self, "slot_is_active", False)),
+                    ):
+                        result = "non_judgment_annexure"
                     if result in ("staged", "duplicate") or detail_result_counts_as_known(result):
                         # A body we already hold does not match citation keys often enough
                         # (grid text vs canonical citation). Counting it known closes the gap
                         # instead of leaving rows_seen - rows_known for the next reopen.
                         # A non-judgment or empty body is finished the same way, without
                         # counting as a staged judgment. fetch_error is not resolved here.
+                        # non_judgment_annexure is the same known path for a persistent
+                        # 1-2 digit annexure stub; it does not stage a judgment.
                         detail_resolved += 1
                     if result == "staged":
                         rows_new += 1
                         staged_this_tick += 1
+                    elif result == "non_judgment_annexure":
+                        logger.info(
+                            "PLS search harvest %s mapped non_judgment_annexure case=%s url=%s",
+                            query_row.query_key,
+                            annexure_name,
+                            detail_url,
+                        )
+                        stamp_unresolved_sample(
+                            cursor,
+                            {
+                                "result": result,
+                                "citation": row.get("citation"),
+                                "detail_url": detail_url,
+                                "case_name": annexure_name,
+                            },
+                        )
                     elif result not in ("duplicate",):
                         logger.info(
                             "PLS search harvest %s page %s detail result %s citation=%r url=%s",
@@ -931,14 +968,14 @@ class SearchHarvestRunner:
                             row.get("citation"),
                             detail_url,
                         )
-                        append_unresolved_sample(
-                            cursor,
-                            {
-                                "result": result,
-                                "citation": row.get("citation"),
-                                "detail_url": detail_url,
-                            },
-                        )
+                        sample = {
+                            "result": result,
+                            "citation": row.get("citation"),
+                            "detail_url": detail_url,
+                        }
+                        if failure:
+                            sample["failure"] = failure
+                        append_unresolved_sample(cursor, sample)
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change
@@ -1425,6 +1462,8 @@ async def _run_search_harvest_locked(
         runner.pipeline.runner.exclusive_slot = True
         runner.pipeline._run_locks.extend([harvest_lock, query_lock])
         runner.pipeline._assert_permitted()
+        # This tick already required the slot state to be ACTIVE.
+        runner.slot_is_active = True
         if not dashboard_harvest:
             await runner.pipeline.ensure_search_map()
             m = await active_map(db, SOURCE_NAME)
