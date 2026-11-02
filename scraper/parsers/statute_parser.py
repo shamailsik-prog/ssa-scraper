@@ -1478,13 +1478,21 @@ def _repair_amending_clause_comma_headings(text: str) -> str:
 def _is_amendment_statute(name: str, text: str = "") -> bool:
     """An amending Act, not a principal Act that merely cites another instrument.
 
-    The name carries ``Amendment``. A gazette whose opening lines say
-    ``further to amend`` is the same class when the stored name dropped the word.
-    ``Constitutional Amendment`` inside a principal wages preamble is not.
+    The name carries ``Amendment``, or the Act's own short title does
+    (``may be called the … (Amendment) Act``) when the stored name dropped
+    the word. A named principal Act whose recital says ``further to amend``
+    stays a principal Act. An unnamed extract still uses that recital.
+    ``Constitutional Amendment`` inside a principal wages preamble is not
+    this class.
     """
     if re.search(r"(?i)\bamendments?\b", name or ""):
         return True
     head = (text or "")[:5000]
+    called = re.search(r"(?is)\b(?:this|the)\s+act\s+may\s+be\s+called\b.{0,240}", head)
+    if called and re.search(r"(?i)\bamendments?\b", called.group(0)):
+        return True
+    if (name or "").strip() and not re.fullmatch(r"(?i)unidentified(?:\s+statute)?", name.strip()):
+        return False
     return bool(re.search(r"(?i)\bfurther(?:\s+to)?\s+amend\b|\bto\s+further\s+amend\b", head))
 
 
@@ -1527,11 +1535,19 @@ _OWN_CLAUSE_NUMBER_RE = re.compile(r"(?i)(?:^|\s)(?:\d{1,2}|[lI])[ \t]*\.(?!\d)"
 
 def _line_is_unnumbered_amendment_clause(line: str) -> bool:
     """A clause formula that does not already carry ``N.`` or ``l.``."""
-    match = _UNNUMBERED_CLAUSE_LINE_RE.match((line or "").strip())
+    stripped = (line or "").strip()
+    match = _UNNUMBERED_CLAUSE_LINE_RE.match(stripped)
     if not match:
         return False
     pre = match.group("pre") or ""
     if re.search(r"\d", pre) or _OWN_CLAUSE_NUMBER_RE.search(pre):
+        return False
+    # ``(3) In the said`` already has its clause number. ``(1) This Act may
+    # be called`` does not: that parenthesis is the short-title subsection.
+    if re.search(
+        r"(?i)\(\s*\d+\s*\)[ \t]*in[ \t]+the[ \t]+(?:said|principal|balochistan)\b",
+        stripped,
+    ):
         return False
     return True
 
@@ -1539,8 +1555,8 @@ def _line_is_unnumbered_amendment_clause(line: str) -> bool:
 def _join_own_line_amendment_clause_numbers(text: str) -> str:
     """Pull ``l.`` / ``2`` down onto the clause line they were split from.
 
-    A page number above a line that already has its clause number stays put.
-    One blank line between the number and the clause is the page break.
+    A page number stays a page number when a blank line, or an already
+    numbered ``(3) In the said``, sits between it and the clause.
     """
     lines = text.split("\n")
     joined: List[str] = []
@@ -1553,8 +1569,6 @@ def _join_own_line_amendment_clause_numbers(text: str) -> str:
             continue
         number = "1" if match.group("letter") else match.group("digit")
         follow = index + 1
-        if follow < len(lines) and not lines[follow].strip() and follow + 1 < len(lines):
-            follow += 1
         if follow < len(lines) and _line_is_unnumbered_amendment_clause(lines[follow]):
             indent = re.match(r"^[ \t]*", lines[index]).group(0)
             joined.append(f"{indent}{number}. {lines[follow].strip()}")
@@ -1615,6 +1629,25 @@ def _rejoin_column_split_heading(text: str) -> str:
         joined.append(lines[index])
         index += 1
     return "\n".join(joined)
+
+
+def _ocr_column_cleanup_applies(text: str, statute_name: Optional[str] = None) -> bool:
+    """True only for scanned column OCR, not for a clean principal Act.
+
+    Two or more column pipes, a CamScanner banner, an amending Act, or the
+    Payment of Wages Act. A single pipe, or ``sub-`` at a line end in the
+    Finance Act, is not this class.
+    """
+    if not text or _is_html(text):
+        return False
+    if text.count("|") >= 2:
+        return True
+    if re.search(r"(?i)scanned with camscanner", text):
+        return True
+    name = statute_name or ""
+    if re.search(r"(?i)\bpayment of wages\b", name):
+        return True
+    return _is_amendment_statute(name, text)
 
 
 def _strip_ocr_column_pipes(text: str) -> str:
@@ -2031,9 +2064,9 @@ def _split_into_sections_strategies(text: str, statute_name: Optional[str] = Non
     from scraper.statute_quality.distribution_list import strip_distribution_list_footer
 
     text = strip_distribution_list_footer(text)
-    # Column rules in a scanned principal Act ("|") are not statute text.
-    # Amendment clause repair stays inside the amendment path.
-    if not _is_html(text):
+    # Column rules are scanner noise. A clean principal Act is left byte for
+    # byte, including a real ``sub-`` line break and a ``Sch`` stub.
+    if _ocr_column_cleanup_applies(text, statute_name):
         text = _strip_ocr_column_pipes(text)
     if len(text.strip()) < 10:
         return []

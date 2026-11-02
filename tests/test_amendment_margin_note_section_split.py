@@ -12,7 +12,11 @@ Act`` (a comma is the OCR of that period).
 import re
 from pathlib import Path
 
-from scraper.parsers.statute_parser import split_into_sections
+from scraper.parsers.statute_parser import (
+    _is_amendment_statute,
+    _ocr_column_cleanup_applies,
+    split_into_sections,
+)
 from scraper.statute_quality.section_reextract import (
     REEXTRACT_MEGA_SECTION_CHARS,
     gate_section_reextract,
@@ -174,14 +178,6 @@ def _fixture(name: str) -> str:
     return (_FIXTURES / name).read_text()
 
 
-def _monotonic_from_one(numbers: list[str]) -> bool:
-    try:
-        ints = [int(number) for number in numbers]
-    except ValueError:
-        return False
-    return ints == list(range(1, len(ints) + 1))
-
-
 def test_edu_ocr_wrapped_margin_notes_are_not_sections_4_and_8():
     """Instrument name wraps past the next line, and ``1.`` OCR'd as ``t (1)``.
 
@@ -193,16 +189,24 @@ def test_edu_ocr_wrapped_margin_notes_are_not_sections_4_and_8():
     numbers = [section["section_number"] for section in sections]
     bodies = {section["section_number"]: section["section_text"] for section in sections}
 
-    assert _monotonic_from_one(numbers)
-    assert numbers[0] == "1"
+    assert numbers == [str(n) for n in range(1, 6)]
     assert "may be called" in bodies["1"]
     assert "come into force" in bodies["1"]
+    assert "Ordinsace" in bodies["3"]
+    assert "Board shall consist" in bodies["3"]
     assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
-    board = next(body for body in bodies.values() if "Board shall consist" in body)
-    assert "for Section 4" in board or "for section 4" in board.lower()
     assert "Section 6 shall be omitted" in " ".join(bodies.values())
     assert "Vice-Chairman" in " ".join(bodies.values())
     assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+    gate = gate_section_reextract(
+        [
+            {"section_number": str(n), "section_text": f"section {n} of Ordinance XI of 1960. Margin note."}
+            for n in (4, 6, 8)
+        ],
+        sections,
+    )
+    assert gate.verdict == "PASS"
+    assert gate.may_apply is True
 
 
 def test_own_line_ocr_clause_numbers_stay_monotonic():
@@ -252,6 +256,88 @@ In the said Ordinance, in section 9, for the word cotton the word lint shall be 
     assert "word lint shall be substituted" in bodies["2"]
 
 
+def test_inthe_said_is_its_own_clause():
+    """``15. Inthe said`` is the section 17 clause, not the tail of the clause above it."""
+    text = """
+1. (1) This Act may be called the Balochistan Cotton Control (Amendment) Act, 2004 and it shall come into force at once.
+14. In the said Ordinance, in section 16, no variety except the one allowed shall be grown and the Inspector shall record it.
+15. Inthe said Ordinance, in section 17, for the figures 10 percent the figures 8.5 percent shall be substituted and the Board shall notify the change.
+16. In the said Ordinance, in section 19, the offences shall be cognizable and the Inspector shall prosecute them.
+"""
+    bodies = _bodies(text)
+    host = next(body for body in bodies.values() if "8.5 percent" in body)
+    assert "section 17" in host.lower()
+    assert "variety" not in host.lower()
+    assert "cognizable" not in host.lower()
+
+
+def test_page_number_above_a_numbered_in_the_said_line_stays_a_page_number():
+    """A scanned page digit above ``(3) In the said`` is not clause 1 of the next page."""
+    text = """
+1. (1) This Act may be called the Balochistan Land Revenue (Amendment) Act, 2022 and it shall come into force at once.
+Amendment of (2) In the Balochistan Land Revenue Act, 1967, in section 4, the collector shall record the mutation and publish it in the Gazette.
+1
+
+Insertion of new (3) In the said Act, after section 41, the following new section shall be inserted and the Board shall notify the digitized record.
+"""
+    bodies = _bodies(text, LAND)
+    assert list(bodies) == ["1", "2", "3"]
+    assert "record the mutation" in bodies["2"]
+    assert "section 41" in bodies["3"]
+    assert not bodies["3"].lstrip().startswith("1.")
+
+
+def test_named_principal_preamble_does_not_take_the_amendment_path():
+    """``An Act to further amend`` in a named principal Act is the recital."""
+    text = """
+An Act to further amend certain laws relating to income tax.
+1. Short title. This Act may be called the Finance Act, 1985 and it extends to the whole of Pakistan.
+2. Rates. The schedule applies to every person and the tax shall be collected as provided in this Act and notified in the Gazette.
+"""
+    assert _is_amendment_statute("Finance Act, 1985", text) is False
+    assert _is_amendment_statute(
+        "The Balochistan Cotton Control Act, 2004",
+        "1. (1) This Act may be called the Balochistan Cotton Control (Amendment) Act, 2004 and it shall come into force at once.",
+    ) is True
+
+
+def test_clean_principal_act_is_byte_identical_when_ocr_cleanup_is_off(monkeypatch):
+    """A clean Finance Act must not lose ``sub-`` / ``Sch`` to the column cleanup.
+
+    With the gate off, the public split matches a split that never runs the
+    cleanup. Forcing the cleanup on the same text joins those lines.
+    """
+    import scraper.parsers.statute_parser as parser
+
+    text = """
+1. Short title, extent and commencement.— (1) This Act may be called the Finance Act, 1985. (2) It extends to the whole of Pakistan.
+2. Definitions.— In this Act, sub-
+section means a numbered part of a section and the Board shall notify that meaning in the Gazette.
+3. Rates.— The schedule applies to every person and the tax shall be collected as provided in this Act.
+Sch
+eduled rates are published with this Act and shall remain in force for the tax year.
+"""
+    name = "Finance Act, 1985"
+    assert _ocr_column_cleanup_applies(text, name) is False
+
+    def rows(sections):
+        return [(section["section_number"], section["section_text"]) for section in sections]
+
+    published = rows(split_into_sections(text, name))
+    monkeypatch.setattr(parser, "_ocr_column_cleanup_applies", lambda *_args, **_kwargs: False)
+    baseline = rows(parser.split_into_sections(text, name))
+    assert published == baseline
+    blob = "\n".join(body for _number, body in published)
+    assert "sub-\nsection" in blob
+    assert "Scheduled" not in blob
+
+    monkeypatch.setattr(parser, "_ocr_column_cleanup_applies", lambda *_args, **_kwargs: True)
+    forced = "\n".join(body for _number, body in rows(parser.split_into_sections(text, name)))
+    assert "subsection" in forced
+    assert "Scheduled" in forced
+    assert forced != blob
+
+
 def test_page_number_does_not_split_a_clause_that_already_has_its_number():
     """A CamScanner page number sits above the next line of the same clause."""
     text = """
@@ -280,8 +366,7 @@ def test_cotton_ocr_bare_and_garbled_clause_numbers_do_not_collapse():
     numbers = [section["section_number"] for section in sections]
     joined = "\n".join(section["section_text"] for section in sections)
 
-    assert _monotonic_from_one(numbers)
-    assert len(numbers) >= 15
+    assert numbers == [str(n) for n in range(1, 24)]
     assert "may be called" in joined
     assert "section 5" in joined.lower()
     # ``15. Inthe said`` is the clause for principal section 17. It must not
@@ -311,8 +396,7 @@ def test_land_text_layer_parenthetical_clauses_stay_sequential():
     bodies = {section["section_number"]: section["section_text"] for section in sections}
     joined = "\n".join(bodies.values())
 
-    assert _monotonic_from_one(numbers)
-    assert len(numbers) >= 8
+    assert numbers == [str(n) for n in range(1, 11)]
     assert "may be called" in bodies["1"]
     assert "come into force" in bodies["1"]
     assert "Digitized periodical records" in joined
@@ -321,6 +405,15 @@ def test_land_text_layer_parenthetical_clauses_stay_sequential():
     assert "Principal Secretary" not in joined
     assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
     assert all(len(section["section_text"]) < REEXTRACT_MEGA_SECTION_CHARS for section in sections)
+    gate = gate_section_reextract(
+        [
+            {"section_number": str(n), "section_text": f"section {n} of the Act No. XVII of 1967. Margin note."}
+            for n in (4, 41, 39, 42)
+        ],
+        sections,
+    )
+    assert gate.verdict == "PASS"
+    assert gate.may_apply is True
 
 
 def test_land_ocr_layer_finds_the_short_title_not_principal_section_numbers():
@@ -329,12 +422,19 @@ def test_land_ocr_layer_finds_the_short_title_not_principal_section_numbers():
     numbers = [section["section_number"] for section in sections]
     bodies = {section["section_number"]: section["section_text"] for section in sections}
 
-    assert numbers[0] == "1"
-    assert _monotonic_from_one(numbers)
+    assert numbers == [str(n) for n in range(1, 5)]
     assert "may be called" in bodies["1"]
-    assert "4" not in numbers or "may be called" in bodies.get("1", "")
-    assert not any(number in numbers for number in ("39", "41"))
+    assert not any(number in numbers for number in ("39", "41", "42"))
     assert not any(_MARGIN_BODY.match(section["section_text"]) for section in sections)
+    gate = gate_section_reextract(
+        [
+            {"section_number": str(n), "section_text": f"section {n} of the Act No. XVII of 1967. Margin note."}
+            for n in (4, 41, 42)
+        ],
+        sections,
+    )
+    assert gate.verdict == "PASS"
+    assert gate.may_apply is True
 
 
 def test_wages_principal_act_is_not_split_as_an_amendment():
@@ -357,9 +457,7 @@ def test_wages_principal_act_is_not_split_as_an_amendment():
         for n in range(1, 6)
     ]
     gate = gate_section_reextract(before, sections)
-    if len(numbers) >= 20 and _monotonic_from_one(numbers):
-        assert gate.verdict == "PASS"
-    else:
-        assert gate.verdict == "FAIL"
-        assert gate.reason == "ocr_heading_noise"
-        assert gate.may_apply is False
+    assert numbers == ["1", "2", "3", "5", "6", "7"]
+    assert gate.verdict == "FAIL"
+    assert gate.reason == "ocr_heading_noise"
+    assert gate.may_apply is False

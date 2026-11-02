@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from scraper.parsers.statute_parser import (
+    _MARGIN_BODY_START_RE,
     is_tariff_schedule_section,
     section_text_opens_unheaded_tariff_subrow,
     section_text_starts_with_tariff_schedule_row,
@@ -95,7 +96,6 @@ REASON_OCR_HEADING_NOISE = "ocr_heading_noise"
 OCR_HEADING_NOISE_MIN_SECTIONS = 20
 
 _SECTION_ONE_PREFIX_RE = re.compile(r"(?i)^(?:section|sec\.?|s\.?|article|art\.?)\s+")
-_MARGIN_BODY_START_RE = re.compile(r"(?i)^\s*(?:section|sec\.|s\.)\s+\d")
 _IN_THIS_ACT_UNLESS_RE = re.compile(r"(?i)\bin this act,?\s+unless\b")
 _IN_THE_SAID_OR_PRINCIPAL_RE = re.compile(r"(?i)\bin the (?:said|principal)\b")
 _CAMSCANNER_RE = re.compile(r"(?i)scanned with camscanner")
