@@ -110,6 +110,46 @@ def test_drop_of_at_most_footer_allowance_does_not_fail_on_count():
     assert decision.section_count_before - decision.section_count_after == REEXTRACT_FOOTER_STRIP_MAX_DROP
 
 
+def test_margin_body_sections_fail_even_when_stored_body_has_no_section_one():
+    """Education re-extract was PASS with sections 4 and 8 and clean=false.
+
+    The stored rows were the margin notes, so the missing-section-1 check
+    never ran. A body that still opens on ``section N of`` must not pass.
+    """
+    before = [
+        _section("4", "section 4 of Ordinance XI of 1960. The Board shall consist of the Governor."),
+        _section("8", "section 8 of Ordinance XI of 1960. The word Vice-Chairman shall be added."),
+        _section("2", "section 2 of Ordinance XI of 1960. Vice Chairman means the Vice Chairman."),
+    ]
+    after = [
+        _section("4", "Section 4 of substituted namely: Ordinance XI of 1960. 4. The Board shall consist of."),
+        _section("8", "Section 8 of Chairman the word Vice-Chairman shall be added. Ordinance XI of 1960."),
+    ]
+    decision = gate_section_reextract(before, after)
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "reextract_margin_body"
+    assert decision.may_apply is False
+
+
+def test_principal_act_ocr_noise_is_not_a_mega_amendment_failure():
+    """A long principal Act with a pipe-broken heading stays ``ocr_heading_noise``."""
+    body = (
+        "| Definitions. 2. In this Act, unless there is anything repugnant |\n"
+        "in the subject or context, Factory means a factory as defined in section 2 of the Factories Act, 1934.\n"
+        + ("The remaining wages provision applies to every employer. " * 120)
+    )
+    after = [
+        _section("2", body),
+        _section("5", "5. (3) In the case of persons employed otherwise than by a contractor."),
+        _section("7", "7. The employer shall pay equal wages for equal work in the establishment."),
+    ]
+    before = [_real(n) for n in range(1, 6)]
+    decision = gate_section_reextract(before, after)
+    assert decision.verdict == "FAIL"
+    assert decision.reason == "ocr_heading_noise"
+    assert len(body) >= REEXTRACT_MEGA_SECTION_CHARS
+
+
 def test_real_section_one_disappearing_fails_even_when_count_stays_near():
     before = [_real(n) for n in range(1, 5)]
     after = [_real(n) for n in range(2, 5)]

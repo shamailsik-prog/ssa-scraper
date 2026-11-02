@@ -68,6 +68,7 @@ _ADDRESSEE_RE = re.compile(
     r"|secretary\s+to\s+(?:the\s+)?(?:government|governor|chief\s+minister)\b"
     r"|director[\s-]*general\b[^.\n]{0,120}?\b(?:public\s+relations|press\s+information)\b"
     r"|system\s+analyst\b"
+    r"|senior\s+member\s+board\s+of\s+revenue\b"
     r"|(?:p\.?\s*s\.?|private\s+secretary)\s+to\s+(?:the\s+)?secretary\b"
     r")"
 )

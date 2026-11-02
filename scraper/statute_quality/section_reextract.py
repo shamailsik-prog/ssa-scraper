@@ -39,6 +39,19 @@ Thresholds, and why:
 * A real section 1 (not a distribution-list designation) that is present
   before and absent after fails. A footer-only ``1. The Principal Secretary…``
   may disappear.
+* A row whose text opens on ``section N of`` (a principal-instrument margin
+  note stored as the amending Act's section) fails as
+  ``reextract_margin_body``, including when the stored body also had no
+  real section 1. An amendment-shaped extract (``In the said`` / ``In the
+  principal``) that still has no section 1 fails as
+  ``reextract_missing_section_1``.
+* A principal Act whose headings are still OCR noise fails as
+  ``ocr_heading_noise`` rather than as a mega section. Column pipes, a
+  ``Scanned with CamScanner`` banner, or a short run that never reaches
+  about twenty monotonic sections, together with ``In this Act, unless``,
+  is that noise. A clean monotonic run of that length is not. An
+  ``In the said`` amendment extract is not this failure, and a definitions
+  catalogue keeps its own mega-section reason.
 * Tariff schedule rows, income-tax rate rows, and unheaded sub-rows such as
   ``4. Rolled…`` are not part of the collapse baseline. Finance Act 1985's
   stored body is eleven of those rows. A five-section re-extract is not a
@@ -58,6 +71,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from scraper.parsers.statute_parser import (
+    _MARGIN_BODY_START_RE,
     is_tariff_schedule_section,
     section_text_opens_unheaded_tariff_subrow,
     section_text_starts_with_tariff_schedule_row,
@@ -76,8 +90,15 @@ REEXTRACT_DEFINITION_CLAUSE_DENSITY_CHARS = 600
 REASON_COLLAPSE_COUNT = "reextract_collapse_count"
 REASON_MEGA_SECTION = "reextract_mega_section"
 REASON_MISSING_SECTION_1 = "reextract_missing_section_1"
+REASON_MARGIN_BODY = "reextract_margin_body"
+REASON_OCR_HEADING_NOISE = "ocr_heading_noise"
+# Payment of Wages OCR stays quarantined until the headings are a real run.
+OCR_HEADING_NOISE_MIN_SECTIONS = 20
 
 _SECTION_ONE_PREFIX_RE = re.compile(r"(?i)^(?:section|sec\.?|s\.?|article|art\.?)\s+")
+_IN_THIS_ACT_UNLESS_RE = re.compile(r"(?i)\bin this act,?\s+unless\b")
+_IN_THE_SAID_OR_PRINCIPAL_RE = re.compile(r"(?i)\bin the (?:said|principal)\b")
+_CAMSCANNER_RE = re.compile(r"(?i)scanned with camscanner")
 
 
 @dataclass(frozen=True)
@@ -112,6 +133,79 @@ def _is_section_one(number: str) -> bool:
     cleaned = _SECTION_ONE_PREFIX_RE.sub("", (number or "").strip())
     cleaned = cleaned.rstrip(".").strip()
     return cleaned in {"1", "01"}
+
+
+def _plain_section_int(number: str) -> int | None:
+    cleaned = _SECTION_ONE_PREFIX_RE.sub("", (number or "").strip()).rstrip(".").strip()
+    if re.fullmatch(r"\d+", cleaned):
+        return int(cleaned)
+    return None
+
+
+def _monotonic_from_one(rows: Sequence[tuple[str, str]]) -> bool:
+    ints: list[int] = []
+    for number, _text in rows:
+        value = _plain_section_int(number)
+        if value is None:
+            return False
+        ints.append(value)
+    return bool(ints) and ints == list(range(1, len(ints) + 1))
+
+
+def _margin_body_rows(rows: Sequence[tuple[str, str]]) -> bool:
+    return any(_MARGIN_BODY_START_RE.match(text) for _number, text in rows)
+
+
+def _principal_ocr_heading_noise(rows: Sequence[tuple[str, str]]) -> bool:
+    """True when a principal Act's headings are still scanner noise.
+
+    Payment of Wages is not an amendment. Its stored numbers were cross-references,
+    and the OCR heading run stays quarantined until it is a long monotonic
+    sequence. Column pipes and a CamScanner banner are the same failure.
+    ``In the said`` amendment clauses are not. A definitions catalogue that
+    merely exceeds 5000 characters keeps the mega-section reason.
+    """
+    if (
+        len(rows) >= OCR_HEADING_NOISE_MIN_SECTIONS
+        and _monotonic_from_one(rows)
+        and not _has_mega_section(rows)
+    ):
+        return False
+    if _margin_body_rows(rows):
+        return False
+    blob = "\n".join(text for _number, text in rows)
+    has_unless = bool(_IN_THIS_ACT_UNLESS_RE.search(blob))
+    pipes = blob.count("|")
+    if _IN_THE_SAID_OR_PRINCIPAL_RE.search(blob) and not has_unless:
+        return False
+    if len(rows) >= OCR_HEADING_NOISE_MIN_SECTIONS:
+        return False
+    if pipes < 2 and not has_unless and not _CAMSCANNER_RE.search(blob):
+        return False
+    broken = (
+        pipes >= 2
+        or bool(_CAMSCANNER_RE.search(blob))
+        or not _monotonic_from_one(rows)
+        or _has_mega_section(rows)
+        or not _has_real_section_one(rows)
+    )
+    if not broken:
+        return False
+    if pipes >= 2 or _CAMSCANNER_RE.search(blob):
+        return True
+    if not _has_real_section_one(rows) and (
+        not _monotonic_from_one(rows) or _has_mega_section(rows)
+    ):
+        return True
+    return False
+
+
+def _amendment_extract_missing_section_one(rows: Sequence[tuple[str, str]]) -> bool:
+    """An amending Act that still has no short-title section."""
+    if _has_real_section_one(rows):
+        return False
+    blob = "\n".join(text for _number, text in rows)
+    return bool(_IN_THE_SAID_OR_PRINCIPAL_RE.search(blob))
 
 
 def _has_real_section_one(rows: Sequence[tuple[str, str]]) -> bool:
@@ -410,9 +504,15 @@ def gate_section_reextract(
     reason = ""
     if _count_collapsed(before_count, after_count):
         reason = REASON_COLLAPSE_COUNT
+    elif _principal_ocr_heading_noise(after_rows):
+        reason = REASON_OCR_HEADING_NOISE
     elif _has_mega_section(after_rows):
         reason = REASON_MEGA_SECTION
     elif _has_real_section_one(before_rows) and not _has_real_section_one(after_rows):
+        reason = REASON_MISSING_SECTION_1
+    elif _margin_body_rows(after_rows):
+        reason = REASON_MARGIN_BODY
+    elif _amendment_extract_missing_section_one(after_rows):
         reason = REASON_MISSING_SECTION_1
     if reason:
         return SectionReextractGate("FAIL", reason, before_count, after_count)

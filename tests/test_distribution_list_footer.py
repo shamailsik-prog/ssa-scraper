@@ -150,6 +150,21 @@ def test_real_act_that_mentions_a_secretary_is_not_gutted():
     assert strip_distribution_list_footer(SECRETARY_IN_BODY) == SECRETARY_IN_BODY
 
 
+SENIOR_MEMBER_IN_BODY = """
+1. (1) This Act may be called the Balochistan Land Revenue (Amendment) Act, 2022 and it shall come into force at once.
+2. The Senior Member Board of Revenue shall cause the digitized record to be prepared and shall notify it in the official Gazette.
+Senior Member Board of Revenue, Balochistan, Quetta.
+"""
+
+
+def test_senior_member_in_an_operative_sentence_is_kept():
+    """The addressee line drops. The same words inside a section stay."""
+    stripped = strip_distribution_list_footer(SENIOR_MEMBER_IN_BODY)
+    assert "shall cause the digitized record" in stripped
+    assert "Senior Member Board of Revenue shall" in stripped
+    assert "Balochistan, Quetta." not in stripped
+
+
 ONLY_SECTION_ONE = """
 4. The Government shall, by notification, establish a Board to carry out this Act.
 8. The Board shall manage and control the affairs of the Bureau.

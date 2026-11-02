@@ -192,19 +192,41 @@ def _clean_section_text(raw: str) -> str:
     raw = raw.replace("—", "-").replace("–", "-")
     return raw.strip()
 
-def _line_is_principal_section_margin_note(line: str, following: str = "") -> bool:
-    """True for ``section 9 of W.P. Ordinance`` and the wrapped ``section 9 of`` line.
+# ``section 4 of`` / ``of the`` / ``of W.P.`` with the instrument on a later line.
+# ``of the following shall`` is a sentence, not this fragment.
+_BARE_MARGIN_OF_TAIL_RE = re.compile(
+    r"(?i)^(?:the|said|principal|w[ \t]*\.[ \t]*p\b\.?|wp)?[ \t]*\.?$"
+)
+_MARGIN_OPERATIVE_TAIL_RE = re.compile(
+    r"(?i)\b(?:shall|means|provided|whereas|substituted|inserted|omitted)\b"
+)
 
-    ``Section 2. Definitions`` is a heading and is not this note. The instrument
-    may sit on the next line when the note wraps after ``of``.
+
+def _line_is_principal_section_margin_note(line: str, following: str = "") -> bool:
+    """True for ``section 9 of W.P. Ordinance`` and a note whose instrument wraps.
+
+    ``Section 2. Definitions`` is a heading and is not this note. A scanned
+    margin wraps the instrument across the next three lines (``section 4 of`` /
+    ``Ordinsace XI of`` / ``1960``). A line that ends at ``of``, ``of the`` or
+    ``of W.P.`` is the same note. ``of the following shall`` is not.
     """
     lead = _PRINCIPAL_MARGIN_NOTE_LEAD_RE.match(line or "")
     if not lead:
         return False
     tail = (lead.group("tail") or "").strip()
-    if tail:
-        return bool(_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match(tail))
-    return bool(_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match((following or "").strip()))
+    if tail and _PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match(tail):
+        return True
+    if tail and _MARGIN_OPERATIVE_TAIL_RE.search(tail):
+        return False
+    if tail and len(tail.split()) > 6:
+        return False
+    if not tail or _BARE_MARGIN_OF_TAIL_RE.match(tail):
+        return True
+    next_lines = [item.strip() for item in (following or "").splitlines() if item.strip()][:3]
+    if any(_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match(item) for item in next_lines):
+        return True
+    joined = " ".join([tail, *next_lines]).strip()
+    return bool(joined and _PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match(joined))
 
 
 def _match_is_principal_section_margin_note(text: str, pos: int) -> bool:
@@ -214,11 +236,15 @@ def _match_is_principal_section_margin_note(text: str, pos: int) -> bool:
     start = text.rfind("\n", 0, pos) + 1
     end = text.find("\n", start)
     line = text[start: end if end != -1 else None]
-    following = ""
-    if end != -1:
-        next_end = text.find("\n", end + 1)
-        following = text[end + 1: next_end if next_end != -1 else None]
-    return _line_is_principal_section_margin_note(line, following)
+    parts: List[str] = []
+    cursor = end
+    for _ in range(3):
+        if cursor == -1:
+            break
+        next_end = text.find("\n", cursor + 1)
+        parts.append(text[cursor + 1: next_end if next_end != -1 else None])
+        cursor = next_end
+    return _line_is_principal_section_margin_note(line, "\n".join(parts))
 
 
 def _chunk_is_principal_margin_note(chunk: str) -> bool:
@@ -230,12 +256,11 @@ def _chunk_is_principal_margin_note(chunk: str) -> bool:
     lines = [line for line in (chunk or "").splitlines() if line.strip()]
     if not lines or re.match(r"^[ \t]*\d", lines[0]):
         return False
-    following = lines[1] if len(lines) > 1 else ""
+    following = "\n".join(lines[1:4])
     if _line_is_principal_section_margin_note(lines[0], following):
         return True
     if re.match(r"(?i)^[ \t]*amendment\s+of\b", lines[0]) and len(lines) > 1:
-        after = lines[2] if len(lines) > 2 else ""
-        return _line_is_principal_section_margin_note(lines[1], after)
+        return _line_is_principal_section_margin_note(lines[1], "\n".join(lines[2:5]))
     return False
 
 
@@ -1450,6 +1475,315 @@ def _repair_amending_clause_comma_headings(text: str) -> str:
     return _AMENDING_CLAUSE_COMMA_RE.sub(r"\g<indent>\g<n>. ", text)
 
 
+def _is_amendment_statute(name: str, text: str = "") -> bool:
+    """An amending Act, not a principal Act that merely cites another instrument.
+
+    The name carries ``Amendment``, or the Act's own short title does
+    (``may be called the … (Amendment) Act``) when the stored name dropped
+    the word. A named principal Act whose recital says ``further to amend``
+    stays a principal Act. An unnamed extract still uses that recital.
+    ``Constitutional Amendment`` inside a principal wages preamble is not
+    this class.
+    """
+    if re.search(r"(?i)\bamendments?\b", name or ""):
+        return True
+    head = (text or "")[:5000]
+    called = re.search(r"(?is)\b(?:this|the)\s+act\s+may\s+be\s+called\b.{0,240}", head)
+    if called and re.search(r"(?i)\bamendments?\b", called.group(0)):
+        return True
+    if (name or "").strip() and not re.fullmatch(r"(?i)unidentified(?:\s+statute)?", name.strip()):
+        return False
+    return bool(re.search(r"(?i)\bfurther(?:\s+to)?\s+amend\b|\bto\s+further\s+amend\b", head))
+
+
+# ``l.`` / ``I.`` for section 1, ``4..`` for a doubled period, ``3s`` for a
+# period read as s, and ``3 In the said`` with the period missing.
+_AMEND_OCR_ONE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)[lI][ \t]*\.[ \t]+"
+    r"(?=(?:\(\s*1\s*\)|This[ \t]+Act\b|In[ \t]+the\b))"
+)
+_AMEND_OCR_DOUBLE_DOT_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<n>\d{1,2})[ \t]*\.{2,}[ \t]*"
+)
+_AMEND_OCR_S_PERIOD_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<n>\d{1,2})[sS][ \t]+(?=In[ \t]+the\b)"
+)
+_AMEND_BARE_CLAUSE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<n>\d{1,2})[ \t]+"
+    r"(?=In[ \t]+the[ \t]+(?:said|principal|Balochistan)\b)"
+)
+
+
+# ``Short title and l. (1)`` — the letter is not at the start of the line.
+_AMEND_OCR_ONE_INLINE_RE = re.compile(
+    r"(?i)(^|[ \t])[lI][ \t]*\.[ \t]+(?=\(\s*1\s*\)|This[ \t]+Act\b)"
+)
+# ``15. Inthe said Ordinance`` — the space in ``In the`` was dropped.
+_AMEND_INTHE_RE = re.compile(r"(?i)\bIn(?=the[ \t]+(?:said|principal|Balochistan)\b)")
+# A clause number on its own line: ``l.`` or ``2``, optionally with a period.
+_BARE_CLAUSE_NUMBER_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?P<letter>[lI])[ \t]*\.|(?P<digit>\d{1,2})[ \t]*\.?)[ \t]*$"
+)
+_UNNUMBERED_CLAUSE_LINE_RE = re.compile(
+    r"(?ix)^(?P<pre>.{0,80}?)"
+    r"(?:\(\s*\d+\s*\)[ \t]*)?"
+    r"(?:this[ \t]+act,?[ \t]+may[ \t]+be[ \t]+called"
+    r"|in[ \t]+the[ \t]+(?:said|principal|balochistan)\b)"
+)
+_OWN_CLAUSE_NUMBER_RE = re.compile(r"(?i)(?:^|\s)(?:\d{1,2}|[lI])[ \t]*\.(?!\d)")
+
+
+def _line_is_unnumbered_amendment_clause(line: str) -> bool:
+    """A clause formula that does not already carry ``N.`` or ``l.``."""
+    stripped = (line or "").strip()
+    match = _UNNUMBERED_CLAUSE_LINE_RE.match(stripped)
+    if not match:
+        return False
+    pre = match.group("pre") or ""
+    if re.search(r"\d", pre) or _OWN_CLAUSE_NUMBER_RE.search(pre):
+        return False
+    # ``(3) In the said`` already has its clause number. ``(1) This Act may
+    # be called`` does not: that parenthesis is the short-title subsection.
+    if re.search(
+        r"(?i)\(\s*\d+\s*\)[ \t]*in[ \t]+the[ \t]+(?:said|principal|balochistan)\b",
+        stripped,
+    ):
+        return False
+    return True
+
+
+def _join_own_line_amendment_clause_numbers(text: str) -> str:
+    """Pull ``l.`` / ``2`` down onto the clause line they were split from.
+
+    A page number stays a page number when a blank line, or an already
+    numbered ``(3) In the said``, sits between it and the clause.
+    """
+    lines = text.split("\n")
+    joined: List[str] = []
+    index = 0
+    while index < len(lines):
+        match = _BARE_CLAUSE_NUMBER_LINE_RE.match(lines[index])
+        if match is None:
+            joined.append(lines[index])
+            index += 1
+            continue
+        number = "1" if match.group("letter") else match.group("digit")
+        follow = index + 1
+        if follow < len(lines) and _line_is_unnumbered_amendment_clause(lines[follow]):
+            indent = re.match(r"^[ \t]*", lines[index]).group(0)
+            joined.append(f"{indent}{number}. {lines[follow].strip()}")
+            index = follow + 1
+            continue
+        joined.append(lines[index])
+        index += 1
+    return "\n".join(joined)
+
+
+def _repair_amendment_ocr_clause_heads(text: str) -> str:
+    """Normalise OCR clause numbers on an amendment Act only.
+
+    ``l. (1) This Act`` and a lone ``l.`` above ``(1) This Act`` become ``1.``.
+    ``2`` above ``In the said``, ``3 In the said`` and ``4.. In the said``
+    become the period heading the clause splitter accepts. ``Inthe said``
+    regains its space. A principal Act is not passed through here.
+    """
+    text = _AMEND_OCR_ONE_INLINE_RE.sub(lambda match: f"{match.group(1)}1. ", text)
+    text = _AMEND_OCR_ONE_RE.sub(r"\g<indent>1. ", text)
+    text = _AMEND_OCR_DOUBLE_DOT_RE.sub(r"\g<indent>\g<n>. ", text)
+    text = _AMEND_OCR_S_PERIOD_RE.sub(r"\g<indent>\g<n>. ", text)
+    text = _AMEND_BARE_CLAUSE_RE.sub(r"\g<indent>\g<n>. ", text)
+    text = _AMEND_INTHE_RE.sub("In ", text)
+    text = _repair_amending_clause_comma_headings(text)
+    return _join_own_line_amendment_clause_numbers(text)
+
+
+# A two-letter stub such as ``Sh`` above ``ort title`` is one word. ``No`` /
+# ``In`` / ``Be`` above the next line are real words and stay separate.
+_COLUMN_SPLIT_STOP_RE = re.compile(
+    r"(?i)^(?:am|an|as|at|be|by|do|go|he|if|in|is|it|me|my|no|of|on|or|so|to|up|we|and|the|for|not|any|all|may|act|its|his|her|was|are|but)$"
+)
+
+
+def _rejoin_column_split_heading(text: str) -> str:
+    """Join ``Sh i }?`` / ``ort title`` back into ``Short title``.
+
+    The stub is two or three letters, not a word on its own, and the rest of
+    its line is column junk. The next line continues in lowercase.
+    """
+    lines = text.split("\n")
+    joined: List[str] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^([A-Z][a-z]{1,2})\b(.*)$", lines[index])
+        if match and index + 1 < len(lines):
+            fragment, rest = match.group(1), match.group(2)
+            continuation = re.match(r"^([a-z]{2,})(.*)$", lines[index + 1])
+            if (
+                continuation
+                and not _COLUMN_SPLIT_STOP_RE.match(fragment)
+                and not re.search(r"[A-Za-z]{3,}", rest)
+            ):
+                joined.append(fragment + continuation.group(1) + continuation.group(2))
+                index += 2
+                continue
+        joined.append(lines[index])
+        index += 1
+    return "\n".join(joined)
+
+
+def _ocr_column_cleanup_applies(text: str, statute_name: Optional[str] = None) -> bool:
+    """True only for scanned column OCR, not for a clean principal Act.
+
+    Two or more column pipes, a CamScanner banner, an amending Act, or the
+    Payment of Wages Act. A single pipe, or ``sub-`` at a line end in the
+    Finance Act, is not this class.
+    """
+    if not text or _is_html(text):
+        return False
+    if text.count("|") >= 2:
+        return True
+    if re.search(r"(?i)scanned with camscanner", text):
+        return True
+    name = statute_name or ""
+    if re.search(r"(?i)\bpayment of wages\b", name):
+        return True
+    return _is_amendment_statute(name, text)
+
+
+def _strip_ocr_column_pipes(text: str) -> str:
+    """Drop scanner column rules and join a word the columns split.
+
+    Payment of Wages OCR prints ``|`` down the margin, breaks ``Pay-`` /
+    ``ment``, and prints ``Sh`` above ``ort title``. A line-start
+    ``|, Short title`` is the OCR of section 1 and stays so the comma-heading
+    repair can read it.
+    """
+    if not text:
+        return text
+    if "|" in text or re.search(r"-\n[a-z]", text):
+        kept: List[str] = []
+        for line in text.split("\n"):
+            if re.match(r"[ \t]*\|[ \t]*,", line):
+                kept.append(line)
+                continue
+            cleaned = re.sub(r"^[ \t]*\|[ \t]*", "", line)
+            cleaned = re.sub(r"[ \t]*\|[ \t]*$", "", cleaned)
+            cleaned = cleaned.replace("|", "")
+            kept.append(cleaned)
+        text = re.sub(r"-\n(?=[a-z])", "", "\n".join(kept))
+    return _rejoin_column_split_heading(text)
+
+
+_AMENDMENT_CLAUSE_OPEN_RE = re.compile(
+    r"(?im)^(?P<prefix>[^\n]{0,80}?)"
+    r"[ \t_.:\-]*"
+    r"(?P<op>this[ \t]+act,?[ \t]+may[ \t]+be[ \t]+called"
+    r"|in[ \t]+the[ \t]+(?:said|principal)\b"
+    r"|in[ \t]+the[ \t]+balochistan\b)"
+)
+_MARGIN_BODY_START_RE = re.compile(r"(?i)^\s*(?:section|sec\.|s\.)\s+\d")
+
+
+_AMENDMENT_MARGINAL_LABEL_RE = re.compile(
+    r"(?i)^(?:amendment|insertion|omission|substitution|addition|short\s+title|repeal)\b"
+)
+
+
+def _amendment_clause_prefix_ok(prefix: str) -> bool:
+    """A clause number or a short marginal label may sit in front of the opener.
+
+    ``In the said`` alone is the sentence under a margin note, not a new
+    clause. ``section 9 of W.P. Ordinance`` on the same line is that note.
+    ``Amendment of ve`` is the note whose number OCR lost. A sentence that
+    already says ``shall`` or opens a quotation is the inserted text.
+    """
+    token = (prefix or "").strip()
+    if not token:
+        return False
+    if len(token) > 80 or len(token.split()) > 12:
+        return False
+    if token[0] in "\"'“”‘’":
+        return False
+    if re.search(r"(?i)\b(?:shall|means|provided|whereas|substituted|inserted|omitted)\b", token):
+        return False
+    if _PRINCIPAL_MARGIN_NOTE_LEAD_RE.match(token):
+        return False
+    if re.search(r"\d", token):
+        return True
+    return bool(_AMENDMENT_MARGINAL_LABEL_RE.match(token))
+
+
+def _split_amendment_clauses(text: str, statute_name: str) -> List[Dict[str, str]]:
+    """Number an amendment Act 1..N from its own clauses.
+
+    The short title (``This Act may be called``) is section 1, including
+    ``It shall come into force``. Each later ``In the said`` / ``In the
+    principal`` / ``In the Balochistan`` line is the next clause, even when
+    OCR printed ``3 In``, ``4..``, ``ve`` or ``(2)``. The principal's section
+    number inside the margin, and a substituted ``4. The Board shall``, are
+    not clauses.
+    """
+    from scraper.statute_quality.distribution_list import strip_distribution_list_footer
+
+    prepared = _repair_amendment_ocr_clause_heads(text)
+    matches: List[Match[str]] = []
+    for match in _AMENDMENT_CLAUSE_OPEN_RE.finditer(prepared):
+        if not _amendment_clause_prefix_ok(match.group("prefix") or ""):
+            continue
+        op = match.group("op") or ""
+        if re.match(r"(?i)this[ \t]+act\b", op) and any(
+            re.match(r"(?i)this[ \t]+act\b", item.group("op") or "") for item in matches
+        ):
+            continue
+        matches.append(match)
+    if len(matches) < 2:
+        return []
+    sections: List[Dict[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(prepared)
+        chunk = prepared[match.start() : end].strip()
+        if index + 1 == len(matches):
+            chunk = strip_distribution_list_footer(chunk).strip()
+        if len(chunk) < 15:
+            continue
+        sections.append(_make_section_dict(str(len(sections) + 1), "", chunk, statute_name))
+    return sections
+
+
+def _split_result_is_bad(sections: List[Dict[str, str]]) -> bool:
+    """A collapse, a missing short title, a margin-note number, or a gap."""
+    if len(sections) < 2:
+        return True
+    numbers = [str(section.get("section_number") or "").strip() for section in sections]
+    if not numbers or numbers[0] != "1":
+        return True
+    if any(_MARGIN_BODY_START_RE.match(section.get("section_text") or "") for section in sections):
+        return True
+    if any(len(section.get("section_text") or "") >= 5000 for section in sections):
+        return True
+    try:
+        ints = [int(number) for number in numbers]
+    except ValueError:
+        return True
+    return ints != list(range(1, len(ints) + 1))
+
+
+def _prefer_amendment_split(
+    generic: List[Dict[str, str]],
+    clauses: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Use the clause split when the ordinary split collapsed or mis-numbered.
+
+    A clean ``1. / 2. Amendment / 3. Repeal`` result stays. The clause split
+    does not know ``Repeal`` and must not replace that result with a shorter one.
+    """
+    if not clauses or _split_result_is_bad(clauses):
+        return generic
+    if _split_result_is_bad(generic) or len(clauses) > len(generic):
+        return clauses
+    return generic
+
+
 def _repair_ocr_comma_section_headings(text: str) -> str:
     """Turn an OCR comma heading into a period heading the splitter already accepts.
 
@@ -1507,6 +1841,24 @@ def _operative_text_before_first_heading(text: str, first_start: int) -> str:
     return head[enacted.end() :].strip()
 
 
+_MAY_BE_CALLED_RE = re.compile(r"(?i)\bthis[ \t]+act,?[ \t]+may[ \t]+be[ \t]+called\b")
+
+
+def _short_title_before_first_heading(text: str, first_start: int) -> str:
+    """Short title that never became a heading, even without ``enacted as follows``.
+
+    OCR leaves ``1. (1)`` in the middle of the marginal-note line, so the
+    heading scan starts at section 2. The call formula and the commencement
+    lines under it are still section 1. The recital above that formula stays out.
+    """
+    head = text[:first_start]
+    match = _MAY_BE_CALLED_RE.search(head)
+    if not match:
+        return ""
+    line_start = head.rfind("\n", 0, match.start()) + 1
+    return head[line_start:].strip()
+
+
 def _repair_ocr_swallowed_section_headings(text: str) -> str:
     """Restore headings that OCR hid between two period headings one number apart.
 
@@ -1538,11 +1890,12 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     """
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
+        plain = _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        if _is_amendment_statute(statute_name, plain):
+            plain = _repair_amendment_ocr_clause_heads(plain)
         plain = _repair_ocr_swallowed_section_headings(
             _repair_ocr_comma_section_headings(
-                _repair_amending_clause_comma_headings(
-                    _join_wrapped_marginal_notes(_normalize_whitespace(plain))
-                )
+                _repair_amending_clause_comma_headings(plain)
             )
         )
         # Line-start headings ("2. In this Act") plus marginal-note headings
@@ -1576,6 +1929,8 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
             # The real short-title line was not a heading, or the first heading
             # is a schedule row. The words after ``enacted as follows`` are
             # section text. The recital before that formula stays dropped.
+            if not prefix and first_num is not None and first_num > 1:
+                prefix = _short_title_before_first_heading(plain, matches[0].start())
             if prefix and len(prefix) >= 20 and (
                 (first_num is not None and first_num > 1)
                 or section_text_starts_with_tariff_schedule_row(first_chunk)
@@ -1681,7 +2036,7 @@ def _strategy_5_resplit_section_keyword(text: str, statute_name: str) -> List[Di
 # Public API
 # ---------------------------------------------------------------------------
 
-def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[Dict[str, str]]:
+def _split_into_sections_strategies(text: str, statute_name: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Split statute text into sections using 5 progressive strategies.
 
@@ -1709,6 +2064,10 @@ def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[D
     from scraper.statute_quality.distribution_list import strip_distribution_list_footer
 
     text = strip_distribution_list_footer(text)
+    # Column rules are scanner noise. A clean principal Act is left byte for
+    # byte, including a real ``sub-`` line break and a ``Sch`` stub.
+    if _ocr_column_cleanup_applies(text, statute_name):
+        text = _strip_ocr_column_pipes(text)
     if len(text.strip()) < 10:
         return []
 
@@ -1800,6 +2159,23 @@ def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[D
             }
         ]
     return []
+
+
+def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[Dict[str, str]]:
+    """Split a statute, preferring an amendment Act's own clauses when the
+    ordinary heading scan collapsed or numbered the principal's sections.
+    """
+    sections = _split_into_sections_strategies(text, statute_name)
+    if not isinstance(text, str) or not text or _is_html(text):
+        return sections
+    name = (statute_name or "Unidentified Statute").strip()
+    if not _is_amendment_statute(name, text):
+        return sections
+    from scraper.statute_quality.distribution_list import strip_distribution_list_footer
+
+    prepared = _strip_ocr_column_pipes(strip_distribution_list_footer(text))
+    return _prefer_amendment_split(sections, _split_amendment_clauses(prepared, name))
+
 
 def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) -> str:
     """
