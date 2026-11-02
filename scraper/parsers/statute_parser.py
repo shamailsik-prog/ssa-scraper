@@ -105,6 +105,28 @@ _MARGINAL_SECTION_HEAD_RE = re.compile(
 _CROSS_REF_PRIOR_RE = re.compile(
     r"(?i)(?:sub-?sections?|sections?|clauses?|rules?|articles?|schedules?)\s*$"
 )
+# Scanned amendment gazettes put "Amendment of section N of W.P. Ordinance…"
+# in the margin. OCR lifts that note onto its own line ("section 9 of W.P.
+# Ordinance", "S. 11 of W. P. Ordinance", "Sec. 4 of the Land Revenue Act",
+# "section 16O ofthe said Act"). The number is the principal instrument's,
+# not the amending act's. A real keyword heading is "Section 2. Definitions".
+_PRINCIPAL_MARGIN_NOTE_LEAD_RE = re.compile(
+    r"(?i)^[ \t]*(?:amendment\s+of\s+)?"
+    r"(?:sections?|sec\.|s\.)\s+"
+    r"\d+[A-Za-z]{0,2}"
+    r"(?:[ \t]*(?:,|and)[ \t]+\d+[A-Za-z]{0,2})*"
+    r"[ \t]*[:.\-)]*[ \t]+"
+    r"of(?:[ \t]*the)?"
+    r"(?:[ \t]+(?P<tail>\S.*)|[ \t]*)$"
+)
+_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE = re.compile(
+    r"(?i)^(?:the[ \t]+)?(?:"
+    r"said|principal|west[ \t]+pakistan|w[ \t]*\.[ \t]*p\b\.?|wp"
+    r")\b"
+    r"|^(?:the[ \t]+)?"
+    r"(?:[A-Za-z][A-Za-z'’.\-]*[ \t]+){0,4}"
+    r"(?:act|ordinance|order|code|rules|regulations)\b"
+)
 _LINE_START_SECTION_RE = re.compile(
     r"(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*",
     re.MULTILINE,
@@ -170,6 +192,53 @@ def _clean_section_text(raw: str) -> str:
     raw = raw.replace("—", "-").replace("–", "-")
     return raw.strip()
 
+def _line_is_principal_section_margin_note(line: str, following: str = "") -> bool:
+    """True for ``section 9 of W.P. Ordinance`` and the wrapped ``section 9 of`` line.
+
+    ``Section 2. Definitions`` is a heading and is not this note. The instrument
+    may sit on the next line when the note wraps after ``of``.
+    """
+    lead = _PRINCIPAL_MARGIN_NOTE_LEAD_RE.match(line or "")
+    if not lead:
+        return False
+    tail = (lead.group("tail") or "").strip()
+    if tail:
+        return bool(_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match(tail))
+    return bool(_PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE.match((following or "").strip()))
+
+
+def _match_is_principal_section_margin_note(text: str, pos: int) -> bool:
+    # The keyword match includes the newline that opens the line.
+    while pos < len(text) and text[pos] in "\r\n":
+        pos += 1
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", start)
+    line = text[start: end if end != -1 else None]
+    following = ""
+    if end != -1:
+        next_end = text.find("\n", end + 1)
+        following = text[end + 1: next_end if next_end != -1 else None]
+    return _line_is_principal_section_margin_note(line, following)
+
+
+def _chunk_is_principal_margin_note(chunk: str) -> bool:
+    """A paragraph that is only the margin note (and the clause under it).
+
+    A line that already starts with the amending act's own number is a heading.
+    ``Amendment of`` wrapped above ``section N of`` is the same note.
+    """
+    lines = [line for line in (chunk or "").splitlines() if line.strip()]
+    if not lines or re.match(r"^[ \t]*\d", lines[0]):
+        return False
+    following = lines[1] if len(lines) > 1 else ""
+    if _line_is_principal_section_margin_note(lines[0], following):
+        return True
+    if re.match(r"(?i)^[ \t]*amendment\s+of\b", lines[0]) and len(lines) > 1:
+        after = lines[2] if len(lines) > 2 else ""
+        return _line_is_principal_section_margin_note(lines[1], after)
+    return False
+
+
 def _extract_number_title_from_chunk(chunk: str) -> Tuple[Optional[str], str, str]:
     """
     Returns (section_number, section_title, section_text_body)
@@ -180,8 +249,10 @@ def _extract_number_title_from_chunk(chunk: str) -> Tuple[Optional[str], str, st
         return None, "", ""
 
     # Try keyword form first: Section 3 ...
+    # "section 9 of W.P. Ordinance" is a margin note, not "Section 3. Title".
     m = SECTION_KEYWORD_RE.match(chunk_clean)
-    if m:
+    first_line, _, rest_lines = chunk_clean.partition("\n")
+    if m and not _line_is_principal_section_margin_note(first_line, rest_lines):
         num = m.group(1).strip()
         rest = m.group(2).strip() if m.group(2) else ""
         title = _derive_title(rest)
@@ -1366,6 +1437,19 @@ _STRUCTURAL_COMMA_TITLE_RE = re.compile(r"(?i)^(?:amendment|short\s+title|repeal
 _ENACTED_AS_FOLLOWS_RE = re.compile(r"(?i)\benacted\s+as\s+follows\b[ \t:.\-—–]*")
 
 
+# ``2, In the said Ordinance`` / ``3, In the principal Act``. The comma is the
+# OCR of the period. The dash form ``3, Amendment ….—`` is a different repair.
+_AMENDING_CLAUSE_COMMA_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<n>\d{1,3})[ \t]*,[ \t]+"
+    r"(?=In[ \t]+the[ \t]+(?:said|principal)[ \t]+(?:Act|Ordinance|Order|Code)\b)"
+)
+
+
+def _repair_amending_clause_comma_headings(text: str) -> str:
+    """Turn ``2, In the said Ordinance`` into the period heading the splitter accepts."""
+    return _AMENDING_CLAUSE_COMMA_RE.sub(r"\g<indent>\g<n>. ", text)
+
+
 def _repair_ocr_comma_section_headings(text: str) -> str:
     """Turn an OCR comma heading into a period heading the splitter already accepts.
 
@@ -1456,7 +1540,9 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
         plain = _repair_ocr_swallowed_section_headings(
             _repair_ocr_comma_section_headings(
-                _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+                _repair_amending_clause_comma_headings(
+                    _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+                )
             )
         )
         # Line-start headings ("2. In this Act") plus marginal-note headings
@@ -1512,10 +1598,24 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         else:
             # fallback naive split by double newline and filter
             chunks = re.split(r'\n{2,}', plain)
+            pending_margin = ""
             for chunk in chunks:
+                # "section 9 of W.P. Ordinance…" is the margin note. Keep its
+                # words on the neighbouring real section. Do not number it 9.
+                if _chunk_is_principal_margin_note(chunk):
+                    if sections:
+                        _append_section_text(sections[-1], chunk)
+                    else:
+                        pending_margin = (pending_margin + "\n" + chunk).strip()
+                    continue
+                if pending_margin:
+                    chunk = pending_margin + "\n" + chunk
+                    pending_margin = ""
                 num, title, body = _extract_number_title_from_chunk(chunk)
                 if num:
                     sections.append(_make_section_dict(num, title, chunk, statute_name))
+            if pending_margin and sections:
+                _append_section_text(sections[-1], pending_margin)
             logger.debug(f"Strategy4 fallback chunks found {len(sections)}")
             return _deduplicate_sections(sections, statute_name)
     except Exception as e:
@@ -1532,7 +1632,13 @@ def _strategy_5_resplit_section_keyword(text: str, statute_name: str) -> List[Di
         plain = _normalize_whitespace(plain)
         # Pattern that matches Section 2, Sec. 2, S. 2 etc.
         pattern = re.compile(r'(?:\n|^)\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*', re.IGNORECASE | re.MULTILINE)
-        matches = list(pattern.finditer(plain))
+        # "section 9 of W.P. Ordinance" matches this pattern and would store
+        # the principal's number. "Section 2. Definitions" does not cite an Act.
+        matches = [
+            match
+            for match in pattern.finditer(plain)
+            if not _match_is_principal_section_margin_note(plain, match.start())
+        ]
         sections = []
         if len(matches) >= 1:
             for i, m in enumerate(matches):
