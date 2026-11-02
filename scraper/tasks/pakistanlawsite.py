@@ -41,6 +41,7 @@ from scraper.auth.session_manager import (
     SessionManager,
     playwright_browser_factory,
     raise_for_verdict,
+    safe_url_for_record,
 )
 from scraper.config import KNOWN_REPORTERS, settings
 from scraper.extractors.hybrid_extractor import HybridExtractor
@@ -61,6 +62,7 @@ from scraper.extractors.judgment_guards import (
     judgment_is_full_ready,
     strip_leading_judgment_chrome,
 )
+from scraper.extractors.pls_failure_page import detect_pls_case_detail_failure
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.fetchers import record_provenance, stage_judgment
 from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
@@ -123,9 +125,30 @@ def quarantined_capture_retryable(reason: Optional[str], text_len: Optional[int]
         return False
     if _FINAL_QUARANTINE.search(reason or ""):
         return False
+    if (reason or "").startswith("fetch_error"):
+        return True
     if (text_len or 0) < PLS_STUB_PAGE_MAX_BYTES and _ERROR_PAGE.search(head or ""):
         return True
     return bool(_RETRYABLE_QUARANTINE.search(reason or ""))
+
+
+def staged_citation_disposition(
+    status: Optional[str],
+    reason: Optional[str],
+    text_len: Optional[int],
+    route_json: Any,
+    head: Optional[str] = None,
+) -> str:
+    """How the citation-grid walk treats one existing staging row.
+
+    'refetch' opens the detail again, 'skip' leaves the citation, 'ignore' does
+    not let this row decide (a failed row that is not a case-detail fetch_error).
+    """
+    if status == "failed" and not (reason or "").startswith("fetch_error"):
+        return "ignore"
+    if status in ("quarantined", "failed") and quarantined_capture_retryable(reason, text_len, route_json, head):
+        return "refetch"
+    return "skip"
 
 
 def reporter_from_citation(citation: str) -> str:
@@ -1112,7 +1135,8 @@ class PakistanLawSitePipeline:
             if bool(getattr(settings, "PLS_CITATION_GRID_SKIP_STAGED", True)):
                 # Pages already preserved and staged (waiting for promotion, promoted, duplicate or
                 # quarantined on the merits) are not downloaded again when the cursor wraps. A quarantined
-                # bad page (quarantined_capture_retryable) is fetched again, at most QUARANTINE_REFETCH_MAX times.
+                # bad page, and a case-detail fetch_error, is fetched again at most QUARANTINE_REFETCH_MAX
+                # times (quarantined_capture_retryable / staged_citation_disposition).
                 staged_rows = (
                     await self.db.execute(
                         select(
@@ -1126,14 +1150,17 @@ class PakistanLawSitePipeline:
                         ).where(
                             ScraperStaging.source_name == SOURCE_NAME,
                             ScraperStaging.extracted_citation.in_(list(lookup_keys)),
-                            ScraperStaging.status.in_(["extracted", "promoted", "duplicate", "quarantined"]),
+                            ScraperStaging.status.in_(["extracted", "promoted", "duplicate", "quarantined", "failed"]),
                         )
                     )
                 ).all()
                 for st_id, citation_string, st_status, st_reason, st_len, st_route, st_head in staged_rows:
                     if not citation_string:
                         continue
-                    if st_status == "quarantined" and quarantined_capture_retryable(st_reason, st_len, st_route, st_head):
+                    disposition = staged_citation_disposition(st_status, st_reason, st_len, st_route, st_head)
+                    if disposition == "ignore":
+                        continue
+                    if disposition == "refetch":
                         refetch_staging_ids.setdefault(str(citation_string), []).append(st_id)
                         continue
                     staged_citations.add(str(citation_string))
@@ -1488,8 +1515,71 @@ class PakistanLawSitePipeline:
 
         return await self.runner.run(op)
 
+    async def _mark_case_detail_fetch_error(
+        self,
+        page: PageResult,
+        route: Dict[str, Any],
+        row: Dict[str, Any],
+        reason: str,
+        html_prov,
+    ) -> str:
+        """Record a case-detail failure without staging the error page as a judgment body.
+
+        The row is status failed, keyed by URL plus reason, so a later real body still
+        stages and a repeat of the same failure does not add another stub.
+        """
+        citation_raw = str(row.get("citation") or "").strip()
+        citation = normalise_citation(citation_raw) if citation_raw else ""
+        identity = f"fetch_error\n{page.url}\n{reason}".encode("utf-8")
+        marker_route = {**dict(route or {}), "fetch_error": reason}
+        prov = await record_provenance(
+            self.db,
+            source=self.source,
+            url=page.url,
+            content=identity,
+            content_kind="text",
+            route=marker_route,
+            http_status=page.status,
+            document_kind="fetch_error",
+            parent=html_prov,
+        )
+        staging = await stage_judgment(
+            self.db,
+            source=self.source,
+            prov=prov,
+            raw_html=None,
+            raw_text=reason,
+            url=page.url,
+            route=marker_route,
+            job_id=self.job_id,
+            ocr_applied=False,
+        )
+        if staging.status == "pending" and staging.reconciled_json is None:
+            staging.status = "failed"
+            staging.quarantine_reason = reason[:1000]
+            staging.validation_errors = [reason]
+            staging.extracted_citation = citation or None
+            title = str(row.get("title") or "").strip()
+            court = str(row.get("court") or "").strip()
+            staging.extracted_title = title or None
+            staging.extracted_court = court or None
+            staging.confidence_score = 0.0
+            await self.db.flush()
+        self.stats["fetch_errors"] = int(self.stats.get("fetch_errors") or 0) + 1
+        logger.warning(
+            "PakistanLawSite case detail %s citation=%r url=%s",
+            reason,
+            citation or citation_raw or None,
+            safe_url_for_record(page.url),
+        )
+        return "fetch_error"
+
     async def preserve_and_extract(self, page: PageResult, route: Dict[str, Any], row: Dict[str, Any]) -> str:
-        """Raw-first: provenance → staging → extraction. Returns 'staged' or 'duplicate'."""
+        """Raw-first: provenance → staging → extraction.
+
+        Returns 'staged', 'duplicate', or 'fetch_error'. A PLS error page is
+        marked fetch_error and is not staged as a judgment body.
+        """
         html = page.html
         html_prov = await record_provenance(
             self.db,
@@ -1504,6 +1594,13 @@ class PakistanLawSitePipeline:
         modal_text = strip_leading_judgment_chrome((page.metadata or {}).get("case_description_modal_text"))
         if modal_text:
             text = modal_text
+        # Case-detail body is known now. Reject a PLS failure page before
+        # classification, staging, or promotion. A PDF attachment can still
+        # replace this body; that path is checked again after the download.
+        if not row.get("pdf_url"):
+            failure = detect_pls_case_detail_failure(text)
+            if failure:
+                return await self._mark_case_detail_fetch_error(page, route, row, failure, html_prov)
         document_type, document_type_reason = self._classify_document_type(
             page=page,
             selected_text=text,
@@ -1540,6 +1637,9 @@ class PakistanLawSitePipeline:
             except Exception as exc:
                 logger.warning("PDF download failed for %s: %s", row.get("pdf_url"), exc)
         text = strip_leading_judgment_chrome(text)
+        failure = detect_pls_case_detail_failure(text)
+        if failure:
+            return await self._mark_case_detail_fetch_error(page, route, row, failure, html_prov)
         staging = await stage_judgment(self.db, source=self.source, prov=content_prov, raw_html=html, raw_text=text, url=page.url, route=route, job_id=self.job_id, pdf_prov=pdf_prov, ocr_applied=False)
         if staging.status != "pending" or staging.reconciled_json is not None:
             # Already seen via another route: provenance kept the new route; nothing to re-extract.
