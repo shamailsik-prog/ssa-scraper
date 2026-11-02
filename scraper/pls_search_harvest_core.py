@@ -345,6 +345,48 @@ def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
     return int(cursor.get("rows_unlinked") or 0)
 
 
+UNRESOLVED_SAMPLES_LIMIT = 20
+# A detail fetch that is not a missing judgment. Counting these known closes the gap.
+# fetch_error (including Error Code 700) is not in this set.
+_DETAIL_KNOWN_RESULTS = frozenset({"non_judgment", "empty", "empty_body", "headnote"})
+
+
+def detail_result_counts_as_known(result: str) -> bool:
+    """True when a non-staged detail is a non-judgment or an empty body.
+
+    Those rows are finished for search harvest. A fetch error is not: the
+    two-try unresolved stamp still applies.
+    """
+    text = str(result or "").strip().lower()
+    if text in _DETAIL_KNOWN_RESULTS:
+        return True
+    return text.startswith("non_judgment") or text.startswith("empty")
+
+
+def search_gap_detail_result(
+    document_type: str,
+    document_type_reason: Optional[str],
+    text: str,
+) -> Optional[str]:
+    """Result preserve_and_extract should return instead of staging, or None to stage.
+
+    Empty case text and headnotes are not judgments the search harvester is missing.
+    """
+    if not str(text or "").strip() or document_type_reason == "case_description_modal_empty":
+        return "empty"
+    if str(document_type or "").strip().lower() == "headnote":
+        return "non_judgment"
+    return None
+
+
+def append_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> None:
+    samples = list(cursor.get("unresolved_samples") or [])
+    if len(samples) >= UNRESOLVED_SAMPLES_LIMIT:
+        return
+    samples.append(dict(sample))
+    cursor["unresolved_samples"] = samples
+
+
 def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if cursor.get("gap_samples"):
@@ -353,6 +395,8 @@ def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
         out["unlinked_keys"] = cursor["unlinked_keys"]
     if cursor.get("rows_unlinked"):
         out["rows_unlinked"] = cursor["rows_unlinked"]
+    if cursor.get("unresolved_samples"):
+        out["unresolved_samples"] = cursor["unresolved_samples"]
     return out
 
 
