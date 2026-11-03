@@ -347,7 +347,8 @@ def rows_unlinked_from_cursor(cursor: Optional[Dict[str, Any]]) -> int:
     return int(cursor.get("rows_unlinked") or 0)
 
 
-UNRESOLVED_SAMPLES_LIMIT = 20
+# A linked gap the size of PLC|2017 (40 unmatched rows) has to fit. 20 dropped half of them.
+UNRESOLVED_SAMPLES_LIMIT = 50
 # A detail fetch that is not a missing judgment. Counting these known closes the gap.
 # fetch_error (including Error Code 700) is not in this set. A narrow annexure stub
 # is rewritten to non_judgment_annexure, which this set then counts as known, only
@@ -504,8 +505,83 @@ def annexure_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def fresh_cursor_keeping_annexure_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Page-1 cursor that still remembers annexure stubs already classified."""
-    return {"page": 1, "row_index": 0, **annexure_cursor_state(cursor)}
+    """Page-1 cursor that still remembers annexure stubs and unmatched row identity."""
+    kept = {"page": 1, "row_index": 0, **annexure_cursor_state(cursor)}
+    samples = list((cursor or {}).get("unresolved_samples") or [])
+    if samples:
+        kept["unresolved_samples"] = samples
+    return kept
+
+
+def remember_unmatched_gap_row(
+    cursor: Dict[str, Any],
+    row: Dict[str, Any],
+    *,
+    page: int,
+    row_index: int,
+    query_key: str,
+    attempt: int,
+    result: Optional[str] = None,
+    failure: Optional[str] = None,
+) -> None:
+    """Upsert one unmatched search row into ``unresolved_samples``.
+
+    CaseName, citation, page, row index, query key, and attempt are written as
+    soon as the row is seen. A later call that does not yet know the detail
+    result must leave a result already stored for that detail URL in place.
+    """
+    url = row.get("detail_url") or row.get("pdf_url")
+    case_name = _case_name_param(url) or case_name_from_url(url) or None
+    identity: Dict[str, Any] = {
+        "citation": row.get("citation"),
+        "detail_url": url,
+        "page": int(page),
+        "row_index": int(row_index),
+        "query_key": query_key,
+        "attempt": int(attempt),
+    }
+    if case_name:
+        identity["case_name"] = case_name
+    if result is not None:
+        identity["result"] = result
+    if failure:
+        identity["failure"] = failure
+
+    samples = list(cursor.get("unresolved_samples") or [])
+    match_at: Optional[int] = None
+    for index, existing in enumerate(samples):
+        same_url = bool(url) and existing.get("detail_url") == url
+        same_place = (
+            not url
+            and case_name
+            and existing.get("case_name") == case_name
+            and existing.get("query_key") == query_key
+            and existing.get("page") == int(page)
+            and existing.get("row_index") == int(row_index)
+        )
+        if same_url or same_place:
+            match_at = index
+            break
+    if match_at is None:
+        if len(samples) >= UNRESOLVED_SAMPLES_LIMIT:
+            return
+        samples.append(identity)
+    else:
+        merged = dict(samples[match_at])
+        merged.update(identity)
+        samples[match_at] = merged
+    cursor["unresolved_samples"] = samples
+
+
+def drop_unmatched_gap_row(cursor: Dict[str, Any], detail_url: Optional[str]) -> None:
+    """A staged or duplicate detail is not an unmatched gap row."""
+    if not detail_url:
+        return
+    kept = [sample for sample in (cursor.get("unresolved_samples") or []) if sample.get("detail_url") != detail_url]
+    if kept:
+        cursor["unresolved_samples"] = kept
+    else:
+        cursor.pop("unresolved_samples", None)
 
 
 def append_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> None:
@@ -573,17 +649,18 @@ def is_citation_only_query(query_json: Any) -> bool:
     return set(body.keys()) <= {"citation"}
 
 
-def citation_only_sql_clause():
+def citation_only_sql_clause(model=None):
     """SQL form of is_citation_only_query: a non-empty citation and no other query key.
 
     A citation plus a year, reporter, court, or any other field is a structured search.
     Shared by claim and by the pending-harvest count so those two cannot disagree.
+    ``model`` is the entity or alias whose ``query_json`` is tested.
     """
     from sqlalchemy import and_, func, or_
 
     from scraper.models import PlsSearchHarvestQuery
 
-    body = PlsSearchHarvestQuery.query_json
+    body = (model or PlsSearchHarvestQuery).query_json
     citation = func.trim(body["citation"].astext)
     no_other_key = [
         or_(body[key].astext.is_(None), func.trim(body[key].astext) == "")
