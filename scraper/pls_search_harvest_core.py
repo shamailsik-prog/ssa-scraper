@@ -621,6 +621,8 @@ def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
         out["rows_unlinked"] = cursor["rows_unlinked"]
     if cursor.get("unresolved_samples"):
         out["unresolved_samples"] = cursor["unresolved_samples"]
+    if cursor.get("count_only_gap"):
+        out["count_only_gap"] = cursor["count_only_gap"]
     out.update(annexure_cursor_state(cursor))
     return out
 
@@ -694,6 +696,53 @@ def refreshed_rows_known(
         # This read is shorter than the stored enumeration; do not wipe rows_known.
         return min(seen, stored)
     return min(seen, stored + resolved)
+
+
+def close_phantom_linked_gap(
+    cursor: Dict[str, Any],
+    *,
+    rows_seen: int,
+    rows_known: int,
+    rows_unlinked: int,
+    rows_seen_stored: int,
+    fresh_rows: int,
+    repeated: int,
+    confirming_single_page: bool,
+) -> Tuple[int, int, bool]:
+    """Remember a count-only gap and clear a linked gap that names no unmatched row.
+
+    A confirming one-page reread used to keep a stale ``rows_seen`` after repeated
+    citation keys were dropped. Every fresh row was already known, so nothing was
+    written to ``unresolved_samples``, and the ledger finished "unresolved linked
+    gap" (SCMR|2017|keyword=b gap 2, PLD|2017|keyword=i gap 12, 2026-11-03).
+
+    Real unmatched samples are left in place. An empty fresh read is left in place
+    so a blank page cannot close a site-total gap. The caller recomputes gap size.
+    A site total still above the stored enumeration stays a site-total gap.
+
+    Returns rows_seen, rows_known, and whether a count-only diagnostic was stored.
+    """
+    seen = max(0, int(rows_seen))
+    known = max(0, int(rows_known))
+    fresh = int(fresh_rows)
+    if not confirming_single_page or fresh <= 0:
+        return seen, known, False
+    if cursor.get("unresolved_samples"):
+        return seen, known, False
+    unlinked = max(0, int(rows_unlinked or 0))
+    linked_unseen = max(0, seen - known - unlinked)
+    stale_high = int(rows_seen_stored) > fresh
+    if linked_unseen <= 0 and not stale_high:
+        return seen, known, False
+    cursor["count_only_gap"] = {
+        "reason": "count_only_gap",
+        "rows_seen_stored": int(rows_seen_stored),
+        "fresh_rows": fresh,
+        "repeated": int(repeated),
+    }
+    if linked_unseen > 0:
+        known = seen - unlinked
+    return seen, known, True
 
 
 def compute_gap_size(

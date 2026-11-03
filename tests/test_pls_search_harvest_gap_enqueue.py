@@ -550,3 +550,103 @@ async def test_site_total_only_gap_is_not_reopened_inside_cooldown_after_two_fin
     assert again == 0
     assert q.status == "done"
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_confirming_reread_closes_phantom_gap_when_stored_rows_seen_exceeds_fresh_rows(db, monkeypatch):
+    """SCMR|2017|b and PLD|2017|i on tip c50c4df (2026-11-03, GAP_FOCUS live).
+
+    A one-page confirming reread kept the stored rows_seen (238 / 259) after
+    repeated citation keys were dropped, so gap stayed 2 / 12 with an empty
+    unresolved_samples list and last_error "unresolved linked gap". A site
+    total equal to that stale rows_seen must not keep the gap open either.
+    """
+    rows = [
+        _row("2017 SCMR 1", "https://example.test/1"),
+        _row("2017 SCMR 2", "https://example.test/2"),
+        _row("2017 SCMR 1", "https://example.test/1-repeat"),
+    ]
+    runner = _runner(
+        monkeypatch,
+        db,
+        {"page1": (rows, None)},
+        known={"2017 SCMR 1", "2017 SCMR 2"},
+    )
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=SCMR|year=2017|keyword=b",
+        query_json={"reporter": "SCMR", "year": 2017, "keyword": "b"},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=4,
+        rows_known=2,
+        rows_new=2,
+        gap_size=2,
+        site_total_results=4,
+        cursor_json={"page": 1, "row_index": 0, "linked_gap_attempts": 4},
+    )
+    db.add(q)
+    await db.flush()
+
+    result = await runner.run_query(q, {})
+
+    assert runner.fetched == []
+    assert result["rows_seen"] == 2
+    assert result["rows_known"] == 2
+    assert result["gap_size"] == 0
+    assert result["status"] == "done"
+    assert q.rows_seen == 2
+    assert q.gap_size == 0
+    assert not (q.last_error or "").startswith("unresolved linked gap")
+    diagnostic = (q.cursor_json or {}).get("count_only_gap") or {}
+    assert diagnostic.get("reason") == "count_only_gap"
+    assert diagnostic.get("rows_seen_stored") == 4
+    assert diagnostic.get("fresh_rows") == 2
+    assert diagnostic.get("repeated") == 1
+    assert not (q.cursor_json or {}).get("unresolved_samples")
+    await db.rollback()
+
+
+def test_harvest_module_info_reaches_the_celery_task_logger():
+    """Worker logs on tip c50c4df had Celery task results and zero harvest INFO lines.
+
+    The login worker configures celery.task with its own handler and
+    propagate=False. Harvest INFO has to be emitted on that logger so a live
+    miss (unmatched row, repeated drop, phantom close) is visible.
+    """
+    import logging
+
+    from celery.utils.log import get_logger
+
+    task_logger = get_logger("celery.task")
+    previous_handlers = list(task_logger.handlers)
+    previous_level = task_logger.level
+    previous_propagate = task_logger.propagate
+    captured: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    handler = _Capture()
+    handler.setLevel(logging.INFO)
+    try:
+        task_logger.handlers = [handler]
+        task_logger.setLevel(logging.INFO)
+        task_logger.propagate = False
+        harvest.logger.info(
+            "PLS search harvest %s confirming reread closed phantom linked gap: stored=%s fresh=%s repeated=%s",
+            "search:reporter=SCMR|year=2017|keyword=b",
+            238,
+            236,
+            2,
+        )
+    finally:
+        task_logger.handlers = previous_handlers
+        task_logger.setLevel(previous_level)
+        task_logger.propagate = previous_propagate
+
+    assert any(
+        "closed phantom linked gap" in record.getMessage() and "238" in record.getMessage()
+        for record in captured
+    )
