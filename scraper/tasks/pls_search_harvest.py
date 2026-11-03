@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
-from sqlalchemy import and_, false, func, or_, select, true
+from sqlalchemy import and_, exists, false, func, or_, select, true
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
@@ -43,14 +44,14 @@ from scraper.pls_search_harvest_core import (
     CASE_NAME_URL_SUBSTRING_PATTERN,
     citation_keys_for_row,
     append_gap_sample,
-    append_unresolved_sample,
     classify_persistent_annexure_stub,
+    drop_unmatched_gap_row,
+    remember_unmatched_gap_row,
     compute_gap_size,
     detail_result_counts_as_known,
     fresh_cursor_keeping_annexure_state,
     is_annexure_stub_row,
     mapped_annexure_names,
-    stamp_unresolved_sample,
     citation_only_sql_clause,
     refreshed_rows_known,
     UNRESOLVED_LINKED_GAP_PREFIX,
@@ -579,15 +580,119 @@ def _pick_order(stmt):
     )
 
 
-def _reporter_sql():
-    return func.upper(func.regexp_replace(func.coalesce(PlsSearchHarvestQuery.query_json["reporter"].astext, ""), r"[\s.]", "", "g"))
+def _reporter_sql(model=None):
+    body = (model or PlsSearchHarvestQuery).query_json
+    return func.upper(func.regexp_replace(func.coalesce(body["reporter"].astext, ""), r"[\s.]", "", "g"))
 
 
-def _share_filter(slot: int):
+def _share_filter(slot: int, model=None):
     share = sorted(slot1_reporter_share(settings.PLS_SEARCH_HARVEST_SLOT1_REPORTERS))
+    reporter = _reporter_sql(model)
     if slot == 1:
-        return _reporter_sql().in_(share) if share else false()
-    return _reporter_sql().notin_(share) if share else true()
+        return reporter.in_(share) if share else false()
+    return reporter.notin_(share) if share else true()
+
+
+def _has_harvest_children(parent):
+    """True when this ledger row already has keyword (or other) shards."""
+    child = aliased(PlsSearchHarvestQuery)
+    return exists(
+        select(child.id).where(
+            child.source_name == SOURCE_NAME,
+            child.parent_id == parent.id,
+        )
+    )
+
+
+def _gap_focus_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - GAPPED_REOPEN_COOLDOWN
+
+
+def _scoped(stmt, model, *, slot: Optional[int], take_over: bool):
+    if slot in SEARCH_HARVEST_SLOTS and not take_over:
+        return stmt.where(_share_filter(slot, model))
+    return stmt
+
+
+def _due_positive_gap_exists(cutoff: datetime, *, slot: Optional[int], take_over: bool):
+    """A gap>0 row this tick should still work: an open one, or a cooled done/split shard."""
+    other = aliased(PlsSearchHarvestQuery)
+    cooled = or_(other.last_run_at.is_(None), other.last_run_at < cutoff)
+    stmt = select(other.id).where(
+        other.source_name == SOURCE_NAME,
+        other.gap_size > 0,
+        ~citation_only_sql_clause(other),
+        or_(
+            other.status.in_(("pending", "in_progress")),
+            and_(
+                other.status.in_(("done", "split")),
+                cooled,
+                ~_has_harvest_children(other),
+            ),
+        ),
+    )
+    return exists(_scoped(stmt, other, slot=slot, take_over=take_over))
+
+
+def _recent_open_gap0_exists(cutoff: datetime, *, slot: Optional[int], take_over: bool):
+    """An open gap-0 row already took a tick inside the cooldown window."""
+    recent = aliased(PlsSearchHarvestQuery)
+    stmt = select(recent.id).where(
+        recent.source_name == SOURCE_NAME,
+        recent.status.in_(("pending", "in_progress")),
+        func.coalesce(recent.gap_size, 0) <= 0,
+        recent.last_run_at.is_not(None),
+        recent.last_run_at >= cutoff,
+        ~citation_only_sql_clause(recent),
+    )
+    return exists(_scoped(stmt, recent, slot=slot, take_over=take_over))
+
+
+def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
+    """Largest remaining gaps first. Open gap-0 rows wait until that pass cools.
+
+    Done and split rows with a gap are eligible once the gapped-reopen cooldown
+    has elapsed. A split parent that already has shards is not: the shard with
+    the gap is the row to claim. Open gap-0 rows run only when no positive gap
+    is due, the row itself has cooled, and no other open gap-0 row has run
+    inside the same window.
+    """
+    cutoff = _gap_focus_cutoff()
+    cooled = or_(
+        PlsSearchHarvestQuery.last_run_at.is_(None),
+        PlsSearchHarvestQuery.last_run_at < cutoff,
+    )
+    gap_positive = and_(
+        PlsSearchHarvestQuery.gap_size > 0,
+        ~_citation_only_clause(),
+        or_(
+            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+            and_(
+                PlsSearchHarvestQuery.status.in_(("done", "split")),
+                cooled,
+                ~_has_harvest_children(PlsSearchHarvestQuery),
+            ),
+        ),
+    )
+    gap0 = and_(
+        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+        func.coalesce(PlsSearchHarvestQuery.gap_size, 0) <= 0,
+        ~_citation_only_clause(),
+        cooled,
+        ~_due_positive_gap_exists(cutoff, slot=slot, take_over=take_over),
+        ~_recent_open_gap0_exists(cutoff, slot=slot, take_over=take_over),
+    )
+    return or_(gap_positive, gap0)
+
+
+def _gap_focus_order(stmt):
+    return stmt.order_by(
+        PlsSearchHarvestQuery.gap_size.desc(),
+        _citation_only_clause().asc(),
+        PlsSearchHarvestQuery.priority.asc(),
+        PlsSearchHarvestQuery.last_run_at.asc().nulls_first(),
+        PlsSearchHarvestQuery.created_at.asc(),
+    )
 
 
 async def pick_next_query(
@@ -600,7 +705,8 @@ async def pick_next_query(
 ) -> Optional[PlsSearchHarvestQuery]:
     """The next ledger row to work, without taking it (see claim_next_query). `priority_gaps` is accepted from
     ticks queued before 13 October 2026 and no longer changes the order: gap-first put every row with an unknown
-    site total (gap 0) last."""
+    site total (gap 0) last. PLS_SEARCH_HARVEST_GAP_FOCUS is the switch that ranks by gap_size and admits
+    done/split rows that still have a gap."""
     if query_key:
         return (
             await db.execute(
@@ -610,6 +716,14 @@ async def pick_next_query(
                 )
             )
         ).scalars().first()
+    if settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            _gap_focus_eligibility(slot=slot, take_over=take_over),
+        )
+        if slot in SEARCH_HARVEST_SLOTS and not take_over:
+            stmt = stmt.where(_share_filter(slot))
+        return (await db.execute(_gap_focus_order(stmt).limit(1))).scalars().first()
     stmt = select(PlsSearchHarvestQuery).where(
         PlsSearchHarvestQuery.source_name == SOURCE_NAME,
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
@@ -645,15 +759,27 @@ async def claim_next_query(
     """Take the next ledger row of `slot`'s share (both shares when it has taken over the other slot's) for this
     tick. The candidates are read with SELECT ... FOR UPDATE SKIP LOCKED, so two ticks picking at the same moment
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
-    after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None)."""
-    stmt = select(PlsSearchHarvestQuery).where(
-        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-        PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-        ~_citation_only_clause(),
-    )
+    after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None).
+
+    Claiming a done or split row with a gap marks it in_progress and stamps last_run_at. It does not reset the
+    cursor, the page and row counters, or last_error.
+    """
+    if settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            _gap_focus_eligibility(slot=slot, take_over=take_over),
+        )
+        order = _gap_focus_order
+    else:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+            ~_citation_only_clause(),
+        )
+        order = _pick_order
     if not take_over:
         stmt = stmt.where(_share_filter(slot))
-    rows = (await db.execute(_pick_order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
+    rows = (await db.execute(order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
     for row in rows:
         lock = _query_lock(row.id, redis_client)
         try:
@@ -663,7 +789,8 @@ async def claim_next_query(
             continue
         row.status = "in_progress"
         row.slot = slot
-        # stamped at once, so a row that ends its run early (an interrupted page) goes behind its equals
+        # stamped at once, so a row that ends its run early (an interrupted page) goes behind its equals.
+        # cursor_json, counters, and last_error stay so a done/split gap can resume without a reopen wipe.
         row.last_run_at = datetime.now(timezone.utc)
         await db.commit()
         return row, lock
@@ -867,6 +994,8 @@ class SearchHarvestRunner:
                 lookup_keys.update(citation_keys_for_row(row))
             known_set = await load_known_citation_keys(self.db, lookup_keys)
             known_on_page, new_rows = partition_rows_by_known(fresh_rows, known_set)
+            index_of = {id(row): idx for idx, row in enumerate(rows)}
+            unmatched_attempt = int(prior_gap_attempts) + 1
             for row in new_rows:
                 diag = row_gap_diagnostics(row)
                 logger.info(
@@ -876,6 +1005,17 @@ class SearchHarvestRunner:
                     diag,
                 )
                 append_gap_sample(cursor, row)
+                already_mapped = is_annexure_stub_row(row)
+                if already_mapped and already_mapped in mapped_annexure_names(cursor):
+                    continue
+                remember_unmatched_gap_row(
+                    cursor,
+                    row,
+                    page=page_idx,
+                    row_index=index_of.get(id(row), 0),
+                    query_key=query_row.query_key,
+                    attempt=unmatched_attempt,
+                )
             if rereading:
                 rows_counted, known_counted = 0, 0
             else:
@@ -892,6 +1032,11 @@ class SearchHarvestRunner:
                     continue
                 note_unlinked_row(cursor, row)
             rows_unlinked = rows_unlinked_from_cursor(cursor)
+            # Identity is committed before any detail fetch, reopen, or cooldown so a
+            # worker bounce cannot leave the gap unnamed.
+            if new_rows and not self.dry_run:
+                query_row.cursor_json = dict(cursor)
+                await self.db.commit()
 
             if not self.dry_run:
                 route_base = {
@@ -931,6 +1076,8 @@ class SearchHarvestRunner:
                         slot_active=bool(getattr(self, "slot_is_active", False)),
                     ):
                         result = "non_judgment_annexure"
+                    if result in ("staged", "duplicate"):
+                        drop_unmatched_gap_row(cursor, detail_url)
                     if result in ("staged", "duplicate") or detail_result_counts_as_known(result):
                         # A body we already hold does not match citation keys often enough
                         # (grid text vs canonical citation). Counting it known closes the gap
@@ -950,14 +1097,14 @@ class SearchHarvestRunner:
                             annexure_name,
                             detail_url,
                         )
-                        stamp_unresolved_sample(
+                        remember_unmatched_gap_row(
                             cursor,
-                            {
-                                "result": result,
-                                "citation": row.get("citation"),
-                                "detail_url": detail_url,
-                                "case_name": annexure_name,
-                            },
+                            row,
+                            page=page_idx,
+                            row_index=idx,
+                            query_key=query_row.query_key,
+                            attempt=unmatched_attempt,
+                            result=result,
                         )
                     elif result not in ("duplicate",):
                         logger.info(
@@ -968,14 +1115,16 @@ class SearchHarvestRunner:
                             row.get("citation"),
                             detail_url,
                         )
-                        sample = {
-                            "result": result,
-                            "citation": row.get("citation"),
-                            "detail_url": detail_url,
-                        }
-                        if failure:
-                            sample["failure"] = failure
-                        append_unresolved_sample(cursor, sample)
+                        remember_unmatched_gap_row(
+                            cursor,
+                            row,
+                            page=page_idx,
+                            row_index=idx,
+                            query_key=query_row.query_key,
+                            attempt=unmatched_attempt,
+                            result=None if result is None else str(result),
+                            failure=str(failure) if failure else None,
+                        )
                     release_page_result(detail)
                     cursor["row_index"] = idx + 1
                     # A new dict every time: the same dict changed in place and assigned back is not seen as a change
@@ -1237,7 +1386,15 @@ class SearchHarvestRunner:
         cooldown can let other reporter-years run instead of parking the slot on one page.
         A site-total gap with nothing left to fetch gets the same one retry, then a terminal
         marker, because that gap never produces an unresolved linked-row error.
+
+        Unmatched row identity is copied onto the ledger row before this method
+        changes status or writes the cooldown marker.
         """
+        samples = list((cursor or {}).get("unresolved_samples") or [])
+        if samples:
+            base = dict(query_row.cursor_json or {})
+            base["unresolved_samples"] = samples
+            query_row.cursor_json = base
         if self.dry_run or query_row.status not in ("done", "done_unlinked"):
             return
         linked_unseen = max(0, int(rows_seen) - int(rows_known) - int(rows_unlinked or 0))
