@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
+from celery.utils.log import get_task_logger
 from sqlalchemy import and_, exists, false, func, or_, select, true
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,7 @@ from scraper.pls_search_harvest_core import (
     classify_persistent_annexure_stub,
     drop_unmatched_gap_row,
     remember_unmatched_gap_row,
+    close_phantom_linked_gap,
     compute_gap_size,
     detail_result_counts_as_known,
     fresh_cursor_keeping_annexure_state,
@@ -89,7 +91,12 @@ from scraper.tasks.pakistanlawsite import (
 )
 from scraper.tasks.search_map import active_map, map_as_dict
 
-logger = logging.getLogger(__name__)
+# Celery's task logger owns the worker handler and does not propagate. A plain
+# module logger's INFO never reached worker-scraper (zero "PLS search harvest"
+# lines on the 2026-11-03 tip), so unmatched rows and phantom-gap closes were
+# invisible next to the task result.
+logger = get_task_logger(__name__)
+logger.setLevel(logging.INFO)
 
 
 async def _source_row(db: AsyncSession) -> ScraperSource:
@@ -948,9 +955,10 @@ class SearchHarvestRunner:
 
         resume_url = cursor.get("next_url") if pages_done > 0 else None
         # The run opens on a page an earlier run already finished: a page that showed no next link and no site
-        # total is read once more to confirm it is the last. Its rows were counted then and are not counted again,
-        # so the confirming read can neither inflate rows_seen into a false cap split nor loop for ever
-        # (12 October 2026: SCMR, CLC and PCrLJ 2017 re-read page 1 every tick).
+        # total is read once more to confirm it is the last. A matching fresh count is not added again, so the
+        # confirming read can neither inflate rows_seen into a false cap split nor loop for ever
+        # (12 October 2026: SCMR, CLC and PCrLJ 2017 re-read page 1 every tick). A one-page reread whose fresh
+        # count differs replaces the stored rows_seen instead of keeping the stale higher value.
         rereading = not resume_url and pages_done > 0 and pages_done >= page_idx
         if page_idx == 1 and start_row_index == 0:
             reset_lap_gap_diagnostics(cursor)
@@ -1016,11 +1024,28 @@ class SearchHarvestRunner:
                     query_key=query_row.query_key,
                     attempt=unmatched_attempt,
                 )
-            if rereading:
+            stored_rows_seen = rows_seen
+            stored_rows_known = rows_known
+            fresh_count = len(fresh_rows)
+            every_fresh_known = fresh_count > 0 and not new_rows
+            # A confirming one-page reread replaces a stale rows_seen with this run's
+            # fresh count when every fresh row is already known. Keeping the stored
+            # value left a phantom linked gap after repeated citation keys were
+            # dropped and no unmatched row was saved (SCMR|2017|b 238/236,
+            # PLD|2017|i 259/247, 2026-11-03). An unmatched or fetch_error row skips
+            # the shrink: refreshed_rows_known would otherwise clamp known up to the
+            # new seen and finish gap 0 while the sample is still stored. An empty
+            # read keeps the stored count. Both deltas roll back if the tick stops
+            # mid-page.
+            if confirming_single_page and every_fresh_known and fresh_count != stored_rows_seen:
+                rows_seen = fresh_count
+                rows_counted = fresh_count - stored_rows_seen
+                known_counted = known_on_page - stored_rows_known
+            elif rereading:
                 rows_counted, known_counted = 0, 0
             else:
-                rows_counted, known_counted = len(fresh_rows), known_on_page
-            rows_seen += rows_counted
+                rows_counted, known_counted = fresh_count, known_on_page
+                rows_seen += rows_counted
             rows_known += known_counted
             detail_resolved = 0
 
@@ -1171,6 +1196,36 @@ class SearchHarvestRunner:
                 detail_resolved=detail_resolved,
                 confirming_single_page=confirming_single_page,
             )
+            closed_phantom = False
+            if confirming_single_page and not outcome.data.get("next_page"):
+                rows_seen, rows_known, closed_phantom = close_phantom_linked_gap(
+                    cursor,
+                    rows_seen=rows_seen,
+                    rows_known=rows_known,
+                    rows_unlinked=rows_unlinked,
+                    rows_seen_stored=stored_rows_seen,
+                    fresh_rows=fresh_count,
+                    known_on_page=known_on_page,
+                    repeated=repeated,
+                    confirming_single_page=confirming_single_page,
+                )
+                # Snap a site total down only when the close above accepted repeat
+                # evidence. A shorter page with repeated=0 keeps the real total.
+                if (
+                    closed_phantom
+                    and site_total is not None
+                    and rows_seen < int(site_total) <= stored_rows_seen
+                ):
+                    site_total = rows_seen
+                if closed_phantom:
+                    logger.info(
+                        "PLS search harvest %s confirming reread closed phantom linked gap: "
+                        "stored=%s fresh=%s repeated=%s",
+                        query_row.query_key,
+                        stored_rows_seen,
+                        fresh_count,
+                        repeated,
+                    )
             start_row_index = 0
             cursor["row_index"] = 0
             nxt = outcome.data.get("next_page")
