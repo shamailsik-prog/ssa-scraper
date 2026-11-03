@@ -1025,17 +1025,22 @@ class SearchHarvestRunner:
                     attempt=unmatched_attempt,
                 )
             stored_rows_seen = rows_seen
+            stored_rows_known = rows_known
             fresh_count = len(fresh_rows)
+            every_fresh_known = fresh_count > 0 and not new_rows
             # A confirming one-page reread replaces a stale rows_seen with this run's
-            # fresh count. Keeping the stored value left a phantom linked gap after
-            # repeated citation keys were dropped and no unmatched row was saved
-            # (SCMR|2017|b 238/236, PLD|2017|i 259/247, 2026-11-03). An empty read
-            # keeps the stored count so a blank page cannot wipe the enumeration.
-            # rows_counted is the delta an out-of-time rollback subtracts.
-            if confirming_single_page and fresh_count > 0 and fresh_count != stored_rows_seen:
+            # fresh count when every fresh row is already known. Keeping the stored
+            # value left a phantom linked gap after repeated citation keys were
+            # dropped and no unmatched row was saved (SCMR|2017|b 238/236,
+            # PLD|2017|i 259/247, 2026-11-03). An unmatched or fetch_error row skips
+            # the shrink: refreshed_rows_known would otherwise clamp known up to the
+            # new seen and finish gap 0 while the sample is still stored. An empty
+            # read keeps the stored count. Both deltas roll back if the tick stops
+            # mid-page.
+            if confirming_single_page and every_fresh_known and fresh_count != stored_rows_seen:
                 rows_seen = fresh_count
                 rows_counted = fresh_count - stored_rows_seen
-                known_counted = 0
+                known_counted = known_on_page - stored_rows_known
             elif rereading:
                 rows_counted, known_counted = 0, 0
             else:
@@ -1200,12 +1205,12 @@ class SearchHarvestRunner:
                     rows_unlinked=rows_unlinked,
                     rows_seen_stored=stored_rows_seen,
                     fresh_rows=fresh_count,
+                    known_on_page=known_on_page,
                     repeated=repeated,
                     confirming_single_page=confirming_single_page,
                 )
-                # A site total that only repeats the stale enumeration (stored rows_seen)
-                # would keep gap > 0 after the fresh count is known. Snap it to this run.
-                # A total above the stored enumeration is a real shortfall and stays.
+                # Snap a site total down only when the close above accepted repeat
+                # evidence. A shorter page with repeated=0 keeps the real total.
                 if (
                     closed_phantom
                     and site_total is not None

@@ -706,6 +706,7 @@ def close_phantom_linked_gap(
     rows_unlinked: int,
     rows_seen_stored: int,
     fresh_rows: int,
+    known_on_page: int,
     repeated: int,
     confirming_single_page: bool,
 ) -> Tuple[int, int, bool]:
@@ -716,9 +717,11 @@ def close_phantom_linked_gap(
     written to ``unresolved_samples``, and the ledger finished "unresolved linked
     gap" (SCMR|2017|keyword=b gap 2, PLD|2017|keyword=i gap 12, 2026-11-03).
 
-    Real unmatched samples are left in place. An empty fresh read is left in place
-    so a blank page cannot close a site-total gap. The caller recomputes gap size.
-    A site total still above the stored enumeration stays a site-total gap.
+    Close only when this page saved no unmatched sample, every fresh row is already
+    known, and the excess over the fresh count has repeat evidence (at least one
+    repeated citation, or the whole excess is within that repeat count). A short
+    page with ``repeated == 0`` keeps a real site-total gap. An empty read is left
+    alone so a blank page cannot wipe an enumeration.
 
     Returns rows_seen, rows_known, and whether a count-only diagnostic was stored.
     """
@@ -729,16 +732,21 @@ def close_phantom_linked_gap(
         return seen, known, False
     if cursor.get("unresolved_samples"):
         return seen, known, False
+    if int(known_on_page) < fresh:
+        return seen, known, False
+    excess = int(rows_seen_stored) - fresh
+    repeated_n = max(0, int(repeated))
+    # excess > 0 keeps a stable reread (excess 0) from looking stale when repeated is 0.
+    stale_evidence = excess > 0 and (repeated_n > 0 or excess <= repeated_n)
+    if not stale_evidence:
+        return seen, known, False
     unlinked = max(0, int(rows_unlinked or 0))
     linked_unseen = max(0, seen - known - unlinked)
-    stale_high = int(rows_seen_stored) > fresh
-    if linked_unseen <= 0 and not stale_high:
-        return seen, known, False
     cursor["count_only_gap"] = {
         "reason": "count_only_gap",
         "rows_seen_stored": int(rows_seen_stored),
         "fresh_rows": fresh,
-        "repeated": int(repeated),
+        "repeated": repeated_n,
     }
     if linked_unseen > 0:
         known = seen - unlinked

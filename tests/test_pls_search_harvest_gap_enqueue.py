@@ -607,6 +607,95 @@ async def test_confirming_reread_closes_phantom_gap_when_stored_rows_seen_exceed
     await db.rollback()
 
 
+@pytest.mark.asyncio
+async def test_confirming_reread_keeps_gap_when_a_fresh_row_fetch_fails(db, monkeypatch):
+    """Stored 4 seen / 3 known. The reread is 1 known row plus 1 fetch_error.
+
+    Shrinking rows_seen without leaving the failed row unknown finished done
+    with gap 0 while unresolved_samples still held that row (PR #408 review).
+    """
+    rows = [
+        _row("2017 SCMR 1", "https://example.test/1"),
+        _row("2017 SCMR 9", "https://example.test/9"),
+    ]
+    runner = _runner(
+        monkeypatch,
+        db,
+        {"page1": (rows, None)},
+        known={"2017 SCMR 1"},
+        preserve="fetch_error",
+    )
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=SCMR|year=2017|keyword=c",
+        query_json={"reporter": "SCMR", "year": 2017, "keyword": "c"},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=4,
+        rows_known=3,
+        rows_new=1,
+        gap_size=1,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    result = await runner.run_query(q, {})
+
+    assert result["gap_size"] > 0
+    assert result["rows_seen"] > result["rows_known"]
+    assert not (result["status"] == "done" and result["gap_size"] == 0)
+    assert q.gap_size > 0
+    assert q.status == "in_progress"
+    samples = (q.cursor_json or {}).get("unresolved_samples") or []
+    assert samples and samples[0]["result"] == "fetch_error"
+    assert samples[0]["citation"] == "2017 SCMR 9"
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_confirming_reread_without_repeats_keeps_the_site_total_gap(db, monkeypatch):
+    """A shorter all-known page with repeated=0 is not proof the old total was stale.
+
+    stored 4/4 and site_total 4, reread two distinct known rows: keep the site-total gap.
+    """
+    rows = [
+        _row("2017 PLD 1", "https://example.test/1"),
+        _row("2017 PLD 2", "https://example.test/2"),
+    ]
+    runner = _runner(
+        monkeypatch,
+        db,
+        {"page1": (rows, None)},
+        known={"2017 PLD 1", "2017 PLD 2"},
+    )
+    q = PlsSearchHarvestQuery(
+        source_name="PakistanLawSite",
+        query_key="search:reporter=PLD|year=2017|keyword=i",
+        query_json={"reporter": "PLD", "year": 2017, "keyword": "i"},
+        status="in_progress",
+        pages_enumerated=1,
+        rows_seen=4,
+        rows_known=4,
+        rows_new=0,
+        gap_size=0,
+        site_total_results=4,
+        cursor_json={"page": 1, "row_index": 0},
+    )
+    db.add(q)
+    await db.flush()
+
+    result = await runner.run_query(q, {})
+
+    assert runner.fetched == []
+    assert result["rows_seen"] == 2
+    assert q.site_total_results == 4
+    assert result["gap_size"] == 2
+    assert q.gap_size == 2
+    assert not (q.cursor_json or {}).get("count_only_gap")
+    await db.rollback()
+
+
 def test_harvest_module_info_reaches_the_celery_task_logger():
     """Worker logs on tip c50c4df had Celery task results and zero harvest INFO lines.
 
