@@ -340,6 +340,32 @@ def _pending_harvest_filters(
     )
 
 
+def _priority_share_clause(*, slot: int, cross_slot: bool):
+    """Own reporter share, plus the other share when cross-slot claim is on.
+
+    With GAP_FOCUS, a pending or in-progress row counts only when that claim would
+    accept it. An open gap-0 inside the cooldown then does not look like harvest work.
+    """
+    from sqlalchemy import and_
+
+    from scraper.tasks.pls_search_harvest import _gap_focus_eligibility, _share_filter
+
+    own = _share_filter(slot)
+    other_slot = 2 if slot == 1 else 1
+    if not settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+        if not cross_slot:
+            return own
+        return or_(own, _share_filter(other_slot))
+    own_ok = and_(own, _gap_focus_eligibility(slot=slot, take_over=False))
+    if not cross_slot:
+        return own_ok
+    other_ok = and_(
+        _share_filter(other_slot),
+        _gap_focus_eligibility(slot=None, take_over=True),
+    )
+    return or_(own_ok, other_ok)
+
+
 async def pls_pending_search_harvest_count(
     db: AsyncSession,
     *,
@@ -351,7 +377,6 @@ async def pls_pending_search_harvest_count(
     """Rows this login slot may claim: own reporter share, plus the other share when cross-slot claim is on."""
     from scraper.models import PlsSearchHarvestQuery
     from scraper.pls_search_harvest_core import citation_only_sql_clause
-    from scraper.tasks.pls_search_harvest import _share_filter
 
     if reporter_shard in (0, 1):
         slot = reporter_shard + 1
@@ -366,12 +391,16 @@ async def pls_pending_search_harvest_count(
         )
     )
     if slot in (1, 2):
-        own = _share_filter(slot)
-        if getattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False):
-            other = _share_filter(2 if slot == 1 else 1)
-            stmt = stmt.where(or_(own, other))
-        else:
-            stmt = stmt.where(own)
+        stmt = stmt.where(
+            _priority_share_clause(
+                slot=slot,
+                cross_slot=bool(getattr(settings, "PLS_SEARCH_HARVEST_CROSS_SLOT_CLAIM", False)),
+            )
+        )
+    elif settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+        from scraper.tasks.pls_search_harvest import _gap_focus_eligibility
+
+        stmt = stmt.where(_gap_focus_eligibility(slot=None, take_over=True))
     return int((await db.execute(stmt)).scalar() or 0)
 
 
