@@ -50,6 +50,7 @@ from scraper.pls_search_harvest_core import (
     remember_unmatched_gap_row,
     close_phantom_linked_gap,
     compute_gap_size,
+    stamp_multi_page_linked_gap,
     detail_result_counts_as_known,
     fresh_cursor_keeping_annexure_state,
     is_annexure_stub_row,
@@ -1260,6 +1261,25 @@ class SearchHarvestRunner:
                 query_row.status = "in_progress"
                 break
             if not nxt:
+                linked_unseen_now = max(0, int(rows_seen) - int(rows_known) - int(rows_unlinked or 0))
+                if stamp_multi_page_linked_gap(
+                    cursor,
+                    pages_enumerated=pages_done,
+                    linked_unseen=linked_unseen_now,
+                    query_key=str(query_row.query_key or ""),
+                    attempt=int(prior_gap_attempts) + 1,
+                    rows_seen=rows_seen,
+                    rows_known=rows_known,
+                    page=page_idx,
+                ):
+                    logger.info(
+                        "PLS search harvest %s multi-page linked gap has no row identity: "
+                        "pages=%s linked_unseen=%s page=%s",
+                        query_row.query_key,
+                        pages_done,
+                        linked_unseen_now,
+                        page_idx,
+                    )
                 if query_json.get("keyword") and query_row.parent_id:
                     parent = await self.db.get(PlsSearchHarvestQuery, query_row.parent_id)
                     if parent is not None:

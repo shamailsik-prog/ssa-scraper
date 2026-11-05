@@ -640,6 +640,65 @@ def unlinked_gap_credit(rows_seen: int, rows_known: int, rows_unlinked: int) -> 
 
 UNRESOLVED_LINKED_GAP_PREFIX = "unresolved linked gap"
 UNRESOLVED_SITE_TOTAL_GAP_PREFIX = "unresolved site total gap"
+# A multi-page linked gap whose confirming reread did not see the unmatched rows.
+# Not a CaseName sample and not a phantom close (PLC|2017, pages_enumerated=3).
+MULTI_PAGE_UNMATCHED_RESULT = "multi_page_unmatched"
+
+
+def _is_row_identity_sample(sample: Dict[str, Any]) -> bool:
+    """True when a sample names a search row, not the multi-page count marker."""
+    if sample.get("detail_url") or sample.get("case_name") or sample.get("citation"):
+        return True
+    return str(sample.get("result") or "") not in ("", MULTI_PAGE_UNMATCHED_RESULT)
+
+
+def stamp_multi_page_linked_gap(
+    cursor: Dict[str, Any],
+    *,
+    pages_enumerated: int,
+    linked_unseen: int,
+    query_key: str,
+    attempt: int,
+    rows_seen: int,
+    rows_known: int,
+    page: int,
+) -> bool:
+    """Stamp durable evidence for a multi-page linked gap with no row identity.
+
+    A one-page confirming reread either stores CaseName samples or, when every
+    fresh row is known and repeats explain the excess, closes a phantom gap.
+    A multi-page ledger can finish that reread without observing the unmatched
+    rows (PLC|2017: 3 pages, gap 40, ``unresolved_samples`` null). Leaving the
+    list null makes every later attempt look the same. One marker records the
+    unseen linked count. Real row samples are kept and the marker is removed.
+    A single page, or a linked unseen of zero, never gains this marker.
+
+    Returns True when the marker was written.
+    """
+    samples = [dict(sample) for sample in (cursor.get("unresolved_samples") or [])]
+    real = [sample for sample in samples if _is_row_identity_sample(sample)]
+    unseen = max(0, int(linked_unseen))
+    if int(pages_enumerated) <= 1 or unseen <= 0 or real:
+        if real:
+            if len(real) != len(samples):
+                cursor["unresolved_samples"] = real
+        elif samples:
+            cursor.pop("unresolved_samples", None)
+        return False
+    cursor["unresolved_samples"] = [
+        {
+            "result": MULTI_PAGE_UNMATCHED_RESULT,
+            "reason": "confirming_reread_did_not_observe_row_identity",
+            "query_key": query_key,
+            "attempt": int(attempt),
+            "page": int(page),
+            "pages_enumerated": int(pages_enumerated),
+            "linked_unseen": unseen,
+            "rows_seen": int(rows_seen),
+            "rows_known": int(rows_known),
+        }
+    ]
+    return True
 
 
 def is_citation_only_query(query_json: Any) -> bool:
