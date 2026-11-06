@@ -417,3 +417,33 @@ async def test_long_nav_html_without_judgment_marker_not_ingested(db, source, mo
     assert row.status == "pending"
     pipeline.ingest_judgment.assert_not_awaited()
     assert PDF_MISS_DEFER_ERROR in (row.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_pdf_header_html_judgment_records_html_not_original_pdf(db, source):
+    """An accepted HTML judgment with application/pdf must not become a fake original PDF."""
+    from scraper.fetchers import read_raw
+    from scraper.judgment_document_body import classify_pdf_endpoint_body
+    from scraper.models import ScraperStaging, SourceProvenance
+
+    url = "http://127.0.0.1:9/caselaw/view-file/HTML-MISLABEL-PROVENANCE"
+    html = judgment_html("PLD 2026 SC 987654", title="Provenance Alpha versus Beta")
+    html = html.replace("</body>", "<p>" + ("Further reasons and analysis. " * 45) + "</p></body>")
+    response = _pdf_shaped_result(html, url=url, content_type="application/pdf")
+    assert response.is_pdf and response.content_kind == "pdf"
+    assert classify_pdf_endpoint_body(response) == "html_judgment"
+
+    pipeline = PublicPipeline(db, source, fetcher=None)
+    await pipeline.ingest_judgment(response, route={"frontier": "mislabel-provenance-test"})
+
+    prov = (await db.execute(
+        select(SourceProvenance).where(SourceProvenance.content_hash == response.content_hash)
+    )).scalars().one()
+    assert prov.content_kind == "html"
+    assert prov.document_kind == "html_text"
+    assert prov.is_original_document is False
+    assert read_raw(prov.raw_ref) == response.content
+    staging = (await db.execute(
+        select(ScraperStaging).where(ScraperStaging.provenance_id == prov.id)
+    )).scalars().one()
+    assert staging.pdf_provenance_id is None
