@@ -407,6 +407,12 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     if not unresolved and (source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url)):
         body = truncate_at_second_act_heading(body or "", name)
         raw_text = truncate_at_second_act_heading(raw_text or "", name)
+    from scraper.statute_quality.bundled_gazette import is_federal_gazette_source, strip_gazette_imprint_lines
+
+    gazette_source = is_federal_gazette_source(source_url, source_meta.get("source_name"))
+    if gazette_source and not unresolved:
+        body = strip_gazette_imprint_lines(body or "")
+        raw_text = strip_gazette_imprint_lines(raw_text or "")
     sections = [] if unresolved else split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -432,6 +438,8 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         sections = clean_assembly_section_records(sections)
     evidence: Dict[str, str] = {}
     if unresolved:
+        if isolation.marker_absent:
+            evidence["bundled_gazette_marker_absent"] = "marker act is not in this pdf"
         evidence["bundled_gazette_unresolved"] = f"{isolation.segment_count} ACT No. boundaries"
     elif isolation.status == "isolated" and isolation.act_label:
         evidence["bundled_gazette_isolated"] = isolation.act_label
@@ -471,6 +479,14 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         kpcode_sections = extract_kpcode_statute_sections(html=html, text=raw_text, statute_name=name)
     if kpcode_sections is not None:
         sections = kpcode_sections
+    if gazette_source:
+        from scraper.statute_quality.bundled_gazette import prepare_gazette_sections
+        from scraper.statute_quality.senate_integrity import is_gazette_non_act_title
+
+        sections = [] if unresolved else prepare_gazette_sections(sections)
+        if is_gazette_non_act_title(name or ""):
+            sections = []
+            evidence["gazette_chrome_title"] = (name or "")[:160]
     sec_models = []
     for s in sections:
         txt = s.get("section_text") or ""

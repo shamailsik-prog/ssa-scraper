@@ -1079,6 +1079,10 @@ def _is_plausible_act_title(name: str) -> bool:
         return False
     if LISTING_CHROME_TITLE_RE.search(candidate):
         return False
+    from scraper.statute_quality.senate_integrity import is_gazette_non_act_title
+
+    if is_gazette_non_act_title(candidate):
+        return False
     if looks_like_fragment_name(candidate):
         return False
     if not (6 <= len(candidate) <= 180):

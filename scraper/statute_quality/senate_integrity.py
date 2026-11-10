@@ -176,12 +176,18 @@ _YEAR_OCR = str.maketrans(
 # ``AC`` plus a T/l slip, and ``xt`` is not a roman numeral with T standing
 # for I. A citation tail (``.-``, ``In the``) is still not a boundary.
 # Punctuation, not whitespace: a newline must not turn a bare ``CT No.`` into ``ACT``.
+#
+# A collapsed ``XX`` is ``)O(`` (the two strokes read as parentheses around
+# an O). ``)O(X`` is XXX and ``)O(Vlt`` is an unclean XXVII. ``l`` in that
+# numeral is I. The clean roman on the same page stays the one a pipe
+# label selects when both repair to the same number.
 _ACT_WORD = r"(?:ac[\W_]{0,3}[tli1]|[^\w\s]{1,4}ct)"
 _OF_WORD = r"(?:of|on|or)"
 _ROMAN_HEADING = r"[IVXLCDMT]+"
+_COLLAPSED_XX_NUMERAL = r"[()O0o]{2,3}[IVXLCDMTl1]*"
 _ACT_NO_HEADING_RE = re.compile(
     rf"(?i)(?<![A-Za-z]){_ACT_WORD}[\W_]{{0,3}}\s*no\.?\s*"
-    rf"({_ROMAN_HEADING}|\d{{1,4}})"
+    rf"({_ROMAN_HEADING}|{_COLLAPSED_XX_NUMERAL}|\d{{1,4}})"
     rf"(?:[ \t]+{_OF_WORD}\b)?"
     rf"(?:[ \t]+({_YEAR_TOKEN})\b|[ \t]*\n[ \t]*({_YEAR_TOKEN})\b)"
 )
@@ -199,6 +205,7 @@ _GAZETTE_NON_ACT_RE = re.compile(
     r"gazette\s+of\s+pakistan(?:\s+extraordinary)?"
     r"|published\s+by\s+authority"
     r"|registered\s+no\.?"
+    r"|following\s+act"
     r")\.?$"
 )
 # Whole-name skeletons of the President's Orders running header. Spaces,
@@ -438,14 +445,40 @@ def is_quarantined_bill_shell(
     return not is_coherent_act_title(name)
 
 
-def _heading_act_number(token: str) -> Optional[int]:
-    """Numeral from an ``ACT No.`` heading. ``T`` is ``I`` (a trailing ``TV`` is ``IV``).
+def _heading_numeral_detail(token: str) -> tuple[Optional[int], bool]:
+    """``(number, clean)`` for an ``ACT No.`` heading numeral.
 
-    Roman numerals do not use ``T``. Pipe labels and citation text do not
-    come through here, so this repair does not apply to them.
+    ``T`` is ``I`` (a trailing ``TV`` is ``IV``) and that repair stays clean.
+    ``)O(`` is a collapsed ``XX`` and a lowercase ``l`` or ``1`` inside that
+    token is ``I``. Either of those is unclean, so a pipe label prefers the
+    clean heading when both come out as the same number. Pipe labels and
+    citation text do not come through here.
     """
-    raw = (token or "").strip().upper().replace("T", "I")
-    return _roman_or_int(raw)
+    raw = (token or "").strip()
+    if not raw:
+        return None, True
+    collapsed = re.sub(r"[)(][O0o][)(]", "XX", raw)
+    used_collapse = collapsed != raw
+    chars: list[str] = []
+    used_lookalike = False
+    for ch in collapsed:
+        if ch in "()":
+            used_lookalike = True
+            continue
+        if ch in "l1":
+            chars.append("I")
+            used_lookalike = True
+        elif ch in "tT":
+            chars.append("I")
+        else:
+            chars.append(ch.upper())
+    return _roman_or_int("".join(chars)), not used_collapse and not used_lookalike
+
+
+def _heading_act_number(token: str) -> Optional[int]:
+    """Numeral from an ``ACT No.`` heading. See ``_heading_numeral_detail``."""
+    number, _clean = _heading_numeral_detail(token)
+    return number
 
 
 def _roman_or_int(token: str) -> Optional[int]:
@@ -743,6 +776,8 @@ class _ActSegment:
     act_number: Optional[tuple[int, int]]
     title: Optional[str]
     text: str
+    # False when the numeral needed the collapsed-XX or l/1 repair.
+    number_clean: bool = True
 
 
 def _prepare_title_scan(text: str) -> str:
@@ -966,11 +1001,13 @@ def act_segments(
         for index, heading in enumerate(headings):
             start = 0 if index == 0 else heading.start()
             end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
-            number = _heading_act_number(heading.group(1))
+            number, number_clean = _heading_numeral_detail(heading.group(1))
             year = years[index]
             act = (number, year) if number is not None and year is not None else None
             title_scope = text[heading.start() : end]
-            segments.append(_ActSegment(act, _called_title_in(title_scope), text[start:end]))
+            segments.append(
+                _ActSegment(act, _called_title_in(title_scope), text[start:end], number_clean and act is not None)
+            )
         return segments
     return [_ActSegment(parse_act_number(text), extract_pdf_act_title(text), text)]
 

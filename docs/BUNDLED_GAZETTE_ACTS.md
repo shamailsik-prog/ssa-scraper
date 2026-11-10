@@ -41,6 +41,20 @@ Population: `senate.gov.pk`, `pcp.gov.pk` when `source_name` is Senate or Gazett
 
 A PDF with one `ACT No.` line is `NOT_BUNDLED`. A bundled PDF whose located sections all sit in the target segment is `MATCH`.
 
+A scanned ``XX`` is sometimes ``)O(``. ``)O(X of 1976`` is Act XXX. ``)O(Vlt`` is an unclean repair of the same shape. When that repair lands on the same number as a clean heading in the same file, the pipe label keeps the clean heading and the unclean one only closes the previous Act. A section is cut at the next Act header, and a ``Price Rs.`` / ``[2940 Ex. Gaz.]`` line (including ``Prlce``) is not stored as a section.
+
+``The following Act``, ``President's Orders and Regulations``, and a ``|Share Print Acts of Parliament Filter by`` suffix are not act titles. A Federal gazette extract whose payload sets ``year_enacted`` to null, a section 1 short title that names a different instrument from the ``|marker``, a section that still contains a second Act header, or a footer stored as a section is rejected at validation and is not saved. A validation call that omits the year field is not that case.
+
+If the URL marker's Act number is not a heading in the file, the extract has no sections. The current PDF is not replaced with a different source.
+
+## Dry-run re-extract (writes nothing)
+
+```bash
+python -m scraper.tasks.bundled_gazette_acts --preview-reextract --skip-fetch
+```
+
+This reads the confirmed bundled-gazette rows and prints what a fresh extract would contain. It does not insert, update, or delete. ``--skip-fetch`` uses recorded PDF bytes only. Without ``--skip-fetch`` the command GETs the public PDF and still writes nothing. A marker that is not in that PDF is reported with ``section_count`` 0. Do not add ``--apply``.
+
 ## Dry-run first
 
 ```bash
