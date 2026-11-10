@@ -1135,6 +1135,15 @@ def prefer_official_statute_title(detected_name: Optional[str], official_title: 
         return official
     return detected
 
+_SCHEDULE_TAIL_RE = re.compile(r"(?im)^[ \t]*schedules?\b[^\n]*$")
+
+
+def _schedule_tail_is_open(text: str) -> bool:
+    """True when a Schedule heading is still the tail of this section."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return any(_SCHEDULE_TAIL_RE.match(line) for line in lines[-4:])
+
+
 def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional[str] = None) -> List[Dict[str, str]]:
     sanity_cap = _section_cap_for_statute(statute_name or "")
     siblings = _sibling_number_pairs([s.get("section_number", "") for s in sections])
@@ -1179,6 +1188,13 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
                 pending_schedule_text = (pending_schedule_text + "\n" + text).strip()
             continue
         previous_raw_was_tariff = False
+        # A Schedule after the last section is not a fresh set of section
+        # numbers. ``1. The first item…`` used to be dropped as a duplicate
+        # section 1, which deleted the schedule body.
+        if out and _schedule_tail_is_open(out[-1].get("section_text") or ""):
+            if text.strip():
+                _append_section_text(out[-1], text)
+            continue
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue

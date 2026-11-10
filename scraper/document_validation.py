@@ -85,7 +85,6 @@ def validate_statute_reconciled_json(
     hold = gazette_bundle_hold_reason(
         statute_name=str(payload.get("statute_name") or ""),
         year_enacted=payload.get("year_enacted"),
-        year_enacted_supplied="year_enacted" in payload,
         jurisdiction=payload.get("jurisdiction"),
         source_url=source_url or str(payload.get("source_url") or ""),
         source_name=source_name or str(payload.get("source_name") or ""),

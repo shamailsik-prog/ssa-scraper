@@ -123,14 +123,16 @@ _DEFINITION_CLAUSE_RE = re.compile(r"(?i)\bmeans\s+the\b")
 # ``An Act``, or the same preamble when ``An`` was read as a dot plus one
 # digit (``.4 Act`` on the NWFP Urban Planning page). A bare digit is not
 # enough: ``4 Act`` in a numbered list is not this preamble.
-_AN_ACT_OPENING_RE = re.compile(r"(?i)^(?:an|\.\s*\d)\s+act\b")
+# ``t`` may be ``l`` or ``1`` (``An Acl``, ``An Ac1``). ``.4 Act`` stays the
+# NWFP preamble. A bare ``4 Act`` is still not this line.
+_AN_ACT_OPENING_RE = re.compile(r"(?i)^(?:an|\.\s*\d)\s+ac[tl1]\b")
 _SHORT_TITLE_OPENING_RE = re.compile(r"(?i)^1\s*[\.\)\-]\s*short\s+title\b")
 _CITATION_FOLLOW_RE = re.compile(r"(?i)^(?:\.-|\.\s*-|,\s*in\s+section\b|in\s+the\b)")
 _ACT_NO_LABELED_RE = re.compile(
     r"(?i)\bact\s+no\.?\s*([IVXLCDM]+|\d{1,4})\s+of\s+((?:18|19|20)\d{2})\b"
 )
-# A scanned year may be ``r97J`` (r/l/I → 1, J → 3) or sit on the next line.
-_YEAR_TOKEN = r"[0-9rRlLiIjJoOsSbBgGqQzZ]{4}"
+# A scanned year may be ``r97J`` (r/l/I → 1, J → 3), ``I`` then ``975``,
+# or the whole token on the next line. The heading pattern is ``_YEAR_TOKEN``.
 _YEAR_OCR = str.maketrans(
     {
         "r": "1",
@@ -178,19 +180,30 @@ _YEAR_OCR = str.maketrans(
 # Punctuation, not whitespace: a newline must not turn a bare ``CT No.`` into ``ACT``.
 #
 # A collapsed ``XX`` is ``)O(`` (the two strokes read as parentheses around
-# an O). ``)O(X`` is XXX and ``)O(Vlt`` is an unclean XXVII. ``l`` in that
-# numeral is I. The clean roman on the same page stays the one a pipe
-# label selects when both repair to the same number.
+# an O). ``)O(X`` is 30. ``)O(Vlt`` repairs to 27 and stays unclean, so a
+# pipe label does not select it. ``l`` in that numeral is I. A clean heading
+# is the only one a pipe label may select.
 _ACT_WORD = r"(?:ac[\W_]{0,3}[tli1]|[^\w\s]{1,4}ct)"
-_OF_WORD = r"(?:of|on|or)"
+# ``f`` may be ``n``, ``r``, or ``l`` (``on``, ``or``, ``ol``).
+_OF_WORD = r"(?:of|on|or|ol)"
 _ROMAN_HEADING = r"[IVXLCDMT]+"
-_COLLAPSED_XX_NUMERAL = r"[()O0o]{2,3}[IVXLCDMTl1]*"
+# A collapsed ``XX`` may sit at the start (``)O(X``) or inside (``L)O(XI``).
+# ``LX\,'`` keeps the comma, backslash, and quote the scan left in the numeral.
+_NUMERAL_ATOM = r"(?:[IVXLCDMTl1]|[\\,'’\"])"
+_COLLAPSED_XX = r"[()O0o]{2,3}"
+_NUMERAL = (
+    rf"(?:{_NUMERAL_ATOM}*{_COLLAPSED_XX}{_NUMERAL_ATOM}*|{_NUMERAL_ATOM}{{1,16}}|\d{{1,4}})"
+)
+# Four year glyphs, or one glyph, a break, and the other three (``I`` / ``975``).
+_YEAR_CHAR = r"[0-9rRlLiIjJoOsSbBgGqQzZ]"
+_YEAR_TOKEN = rf"{_YEAR_CHAR}(?:{_YEAR_CHAR}{{3}}|[ \t\n]+{_YEAR_CHAR}{{3}})"
 _ACT_NO_HEADING_RE = re.compile(
     rf"(?i)(?<![A-Za-z]){_ACT_WORD}[\W_]{{0,3}}\s*no\.?\s*"
-    rf"({_ROMAN_HEADING}|{_COLLAPSED_XX_NUMERAL}|\d{{1,4}})"
-    rf"(?:[ \t]+{_OF_WORD}\b)?"
-    rf"(?:[ \t]+({_YEAR_TOKEN})\b|[ \t]*\n[ \t]*({_YEAR_TOKEN})\b)"
+    rf"(?:({_NUMERAL})\s*)?"
+    rf"(?:{_OF_WORD}\b\s*)?"
+    rf"({_YEAR_TOKEN})\b"
 )
+_ABOVE_NUMERAL_RE = re.compile(rf"(?i)^{_NUMERAL}$")
 # Short extracts must not be treated as proof that stored sections are missing.
 MIN_PDF_WORDS_FOR_ABSENCE = 50
 _PDF_WORD_RE = re.compile(r"[A-Za-z]{3,}")
@@ -449,19 +462,29 @@ def _heading_numeral_detail(token: str) -> tuple[Optional[int], bool]:
     """``(number, clean)`` for an ``ACT No.`` heading numeral.
 
     ``T`` is ``I`` (a trailing ``TV`` is ``IV``) and that repair stays clean.
-    ``)O(`` is a collapsed ``XX`` and a lowercase ``l`` or ``1`` inside that
-    token is ``I``. Either of those is unclean, so a pipe label prefers the
-    clean heading when both come out as the same number. Pipe labels and
-    citation text do not come through here.
+    ``)O(`` is a collapsed ``XX`` and stays clean when the rest of the numeral
+    is already roman (``)O(X`` is 30, ``L)O(XI`` is 81). A lowercase ``l`` or
+    ``1``, a leading ``1`` standing for ``L`` (``1XIV``), and the shard
+    ``LX\\,'`` are unclean. A pipe label never selects an unclean numeral.
     """
     raw = (token or "").strip()
     if not raw:
         return None, True
+    used_shard = False
+    if re.search(r"(?i)lx\\,'?", raw):
+        raw = re.sub(r"(?i)lx\\,'?", "LXVI", raw)
+        used_shard = True
     collapsed = re.sub(r"[)(][O0o][)(]", "XX", raw)
-    used_collapse = collapsed != raw
+    without_noise = re.sub(r"[\\,'’\"]", "", collapsed)
+    used_noise = without_noise != collapsed
+    body = without_noise
+    used_leading_one = False
+    if re.fullmatch(r"1[IVXLCDMTl1]+", body):
+        body = "L" + body[1:]
+        used_leading_one = True
     chars: list[str] = []
     used_lookalike = False
-    for ch in collapsed:
+    for ch in body:
         if ch in "()":
             used_lookalike = True
             continue
@@ -472,7 +495,9 @@ def _heading_numeral_detail(token: str) -> tuple[Optional[int], bool]:
             chars.append("I")
         else:
             chars.append(ch.upper())
-    return _roman_or_int("".join(chars)), not used_collapse and not used_lookalike
+    number = _roman_or_int("".join(chars))
+    clean = not (used_shard or used_noise or used_leading_one or used_lookalike)
+    return number, bool(number is not None and clean)
 
 
 def _heading_act_number(token: str) -> Optional[int]:
@@ -932,20 +957,38 @@ def section_embeds_next_act(text: str) -> bool:
 
 
 def _year_token(match: re.Match) -> str:
-    return (match.group(2) or match.group(3) or "").strip()
+    return re.sub(r"\s+", "", match.group(2) or "")
 
 
 def _plausible_year(token: str) -> Optional[int]:
-    if re.fullmatch(r"(?:18|19|20)\d{2}", token or ""):
-        return int(token)
+    flat = re.sub(r"\s+", "", token or "")
+    if re.fullmatch(r"(?:18|19|20)\d{2}", flat):
+        return int(flat)
     return None
 
 
 def _repair_year(token: str) -> Optional[int]:
-    """Turn a one-character scan slip such as ``r97J`` into 1973."""
-    if not token:
+    """Turn a one-character scan slip such as ``r97J`` or ``I975`` into a year."""
+    flat = re.sub(r"\s+", "", token or "")
+    if not flat:
         return None
-    return _plausible_year(token.translate(_YEAR_OCR))
+    return _plausible_year(flat.translate(_YEAR_OCR))
+
+
+def _numeral_above(text: str, start: int) -> str:
+    """The numeral a scan put on the line above ``ACT No. oF`` (``xxvll``)."""
+    for line in reversed(text[:start].splitlines()):
+        stripped = line.strip().strip("'\"“”‘’`")
+        if not stripped:
+            continue
+        if _ABOVE_NUMERAL_RE.fullmatch(stripped):
+            return stripped
+        return ""
+    return ""
+
+
+def _heading_token(text: str, match: re.Match) -> str:
+    return (match.group(1) or _numeral_above(text, match.start()) or "").strip()
 
 
 def _heading_years(
@@ -971,6 +1014,55 @@ def _heading_years(
     return years
 
 
+def _segment_at(
+    text: str,
+    heading: re.Match,
+    *,
+    year: Optional[int],
+    start: int,
+    end: int,
+) -> _ActSegment:
+    number, number_clean = _heading_numeral_detail(_heading_token(text, heading))
+    act = (number, year) if number is not None and year is not None else None
+    scope_start = heading.start()
+    title_scope = text[scope_start:end]
+    return _ActSegment(
+        act,
+        _called_title_in(title_scope),
+        text[start:end],
+        bool(number_clean and act is not None),
+    )
+
+
+def marker_number_in_text(text: str, pipe_act: tuple[int, int]) -> tuple[bool, bool]:
+    """Whether any ``ACT No.`` hit repairs to this act, and whether a clean one does.
+
+    A hit counts even when it is not a boundary. ``present`` is the number
+    (the year must agree when the hit has a year). ``clean`` is a boundary-quality
+    numeral with no ``l`` / ``1`` / shard repair.
+    """
+    present = False
+    clean = False
+    for match in _ACT_NO_HEADING_RE.finditer(text or ""):
+        number, number_clean = _heading_numeral_detail(_heading_token(text, match))
+        if number != pipe_act[0]:
+            continue
+        year = _plausible_year(_year_token(match)) or _repair_year(_year_token(match))
+        if year is not None and year != pipe_act[1]:
+            continue
+        present = True
+        if number_clean and year == pipe_act[1]:
+            clean = True
+    return present, clean
+
+
+def _prefix_is_unread_act(prefix: str) -> bool:
+    """A gazette banner is not another Act. ``An Acl`` or ``may be called`` is."""
+    if re.search(r"(?im)^[ \t]*(?:an|\.\s*\d)\s+ac[tl1]\b", prefix or ""):
+        return True
+    return bool(re.search(r"(?i)\bmay be called the\b", prefix or ""))
+
+
 def act_segments(
     pdf_text: str,
     *,
@@ -979,17 +1071,20 @@ def act_segments(
     """Split a Gazette that prints several acts. A single act stays one segment.
 
     A line-start ``Act No.`` is a boundary only when an ``An Act`` preamble or
-    ``1. Short title`` follows within four lines. ``.4 Act`` counts as that
-    preamble (``An`` read as a dot plus one digit). An ``Act No.`` glued into a
-    section tail is also a boundary when ``An Act`` is the next text, even
-    when that next act's own section 1 was not read. The year may be the next
-    line, and a token such as ``r97J`` still counts: its year is the year the
-    neighbouring headings share, or the pipe label's year when none of them
-    print a readable year. ``ACT`` may be ``AC_l`` or ``{-CT``, ``of`` may be
-    ``on``, ``or``, or absent, and ``T`` in the roman numeral is ``I``.
-    ``Acr No. xt`` is not a heading. A citation tail (``.-``,
-    ``In the``, ``, in section``) is not a boundary, so an amending Act that
-    quotes an earlier Act number keeps the sections that follow the quotation.
+    ``1. Short title`` follows within four lines. ``An Acl`` counts as that
+    preamble. ``.4 Act`` counts as well (``An`` read as a dot plus one digit).
+    An ``Act No.`` glued into a section tail is also a boundary when ``An Act``
+    is the next text, even when that next act's own section 1 was not read.
+    The year may be the next line, split as ``I`` then ``975``, and a token
+    such as ``r97J`` still counts: its year is the year the neighbouring
+    headings share, or the pipe label's year when none of them print a readable
+    year. ``ACT`` may be ``AC_l`` or ``{-CT``, ``of`` may be ``on``, ``or``,
+    ``ol``, or absent, and ``T`` in the roman numeral is ``I``. A numeral may
+    sit on the line above ``ACT No. oF``. ``Acr No. xt`` is not a heading. A
+    citation tail (``.-``, ``In the``, ``, in section``) is not a boundary, so
+    an amending Act that quotes an earlier Act number keeps the sections that
+    follow the quotation. One boundary that is not at the start of the file is
+    still its own segment: the words before it are not given that act's number.
     """
     text = pdf_text or ""
     if not text.strip():
@@ -999,16 +1094,21 @@ def act_segments(
         segments: list[_ActSegment] = []
         years = _heading_years(headings, pipe_act)
         for index, heading in enumerate(headings):
-            start = 0 if index == 0 else heading.start()
+            # Start at the heading. A previous act whose heading was not read,
+            # or the gazette banner, is not part of this act.
+            start = heading.start()
             end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
-            number, number_clean = _heading_numeral_detail(heading.group(1))
-            year = years[index]
-            act = (number, year) if number is not None and year is not None else None
-            title_scope = text[heading.start() : end]
-            segments.append(
-                _ActSegment(act, _called_title_in(title_scope), text[start:end], number_clean and act is not None)
-            )
+            segments.append(_segment_at(text, heading, year=years[index], start=start, end=end))
         return segments
+    if len(headings) == 1 and _prefix_is_unread_act(text[: headings[0].start()]):
+        heading = headings[0]
+        year = _heading_years(headings, pipe_act)[0]
+        prefix = _ActSegment(None, extract_pdf_act_title(text[: heading.start()]), text[: heading.start()], True)
+        return [prefix, _segment_at(text, heading, year=year, start=heading.start(), end=len(text))]
+    if len(headings) == 1:
+        heading = headings[0]
+        year = _heading_years(headings, pipe_act)[0]
+        return [_segment_at(text, heading, year=year, start=0, end=len(text))]
     return [_ActSegment(parse_act_number(text), extract_pdf_act_title(text), text)]
 
 

@@ -527,7 +527,11 @@ def test_validation_gate_rejects_bichq_shape_and_accepts_aligned_text():
 
 def test_validation_gate_does_not_reject_senate_sources():
     ok, reason = validate_statute_reconciled_json(
-        {"statute_name": "Pakistan Council of Scientific and Industrial Research Act, 1973", "sections": bichq_sections()},
+        {
+            "statute_name": "Pakistan Council of Scientific and Industrial Research Act, 1973",
+            "year_enacted": 1973,
+            "sections": bichq_sections(),
+        },
         raw_text="",
         source_name="Senate",
         source_url="https://www.senate.gov.pk/uploads/documents/pcsir-act-1973.pdf",

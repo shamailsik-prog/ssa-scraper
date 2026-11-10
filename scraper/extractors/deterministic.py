@@ -404,6 +404,11 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source, truncate_at_second_act_heading
 
     unresolved = isolation.status == "unresolved"
+    if unresolved and official_title:
+        # The heading on the page may belong to a neighbouring Act. Keep the
+        # listed title and do not take that neighbour's year.
+        name = official_title
+        gazette_year = None
     if not unresolved and (source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url)):
         body = truncate_at_second_act_heading(body or "", name)
         raw_text = truncate_at_second_act_heading(raw_text or "", name)

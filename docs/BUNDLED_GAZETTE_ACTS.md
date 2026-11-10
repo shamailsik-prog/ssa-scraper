@@ -41,9 +41,9 @@ Population: `senate.gov.pk`, `pcp.gov.pk` when `source_name` is Senate or Gazett
 
 A PDF with one `ACT No.` line is `NOT_BUNDLED`. A bundled PDF whose located sections all sit in the target segment is `MATCH`.
 
-A scanned ``XX`` is sometimes ``)O(``. ``)O(X of 1976`` is Act XXX. ``)O(Vlt`` is an unclean repair of the same shape. When that repair lands on the same number as a clean heading in the same file, the pipe label keeps the clean heading and the unclean one only closes the previous Act. A section is cut at the next Act header, and a ``Price Rs.`` / ``[2940 Ex. Gaz.]`` line (including ``Prlce``) is not stored as a section.
+A scanned ``XX`` is sometimes ``)O(``. ``)O(X of 1976`` is Act 30 and that repair is clean, as is ``L)O(XI`` for 81. ``)O(Vlt``, ``xxvll``, a leading ``1`` standing for ``L`` (``1XIV``), and the shard ``LX\,'`` repair to a number and stay unclean. A pipe label never selects an unclean heading. If the clean header is missing, the extract is no sections and a hold, even when an unclean heading repairs to the marker. ``An Acl`` counts as the act-intro line. ``of`` may be ``ol``. The year may be split as ``I`` then ``975``. ``Acr No.`` is still not a heading, so those files stay fail-closed. A section is cut at the next Act header, and a ``Price Rs.`` / ``[2940 Ex. Gaz.]`` line (including ``Prlce``) is not stored as a section. A Schedule that follows the last section stays in that section.
 
-``The following Act``, ``President's Orders and Regulations``, and a ``|Share Print Acts of Parliament Filter by`` suffix are not act titles. A Federal gazette extract whose payload sets ``year_enacted`` to null, a section 1 short title that names a different instrument from the ``|marker``, a section that still contains a second Act header, or a footer stored as a section is rejected at validation and is not saved. A validation call that omits the year field is not that case.
+``The following Act``, ``President's Orders and Regulations``, and a ``|Share Print Acts of Parliament Filter by`` suffix are not act titles. A Federal gazette extract whose ``year_enacted`` is null or whose payload omits the key, a section 1 short title that names a different instrument from the ``|marker``, a section that still contains a second Act header, or a footer stored as a section is rejected at validation and is not saved. Preview compares the PDF bytes with the recorded sha. A mismatch, or a confirmed row with no authentic sha, is a hold with no sections and does not adopt the live file's short title.
 
 If the URL marker's Act number is not a heading in the file, the extract has no sections. The current PDF is not replaced with a different source.
 
@@ -53,7 +53,9 @@ If the URL marker's Act number is not a heading in the file, the extract has no 
 python -m scraper.tasks.bundled_gazette_acts --preview-reextract --skip-fetch
 ```
 
-This reads the confirmed bundled-gazette rows and prints what a fresh extract would contain. It does not insert, update, or delete. ``--skip-fetch`` uses recorded PDF bytes only. Without ``--skip-fetch`` the command GETs the public PDF and still writes nothing. A marker that is not in that PDF is reported with ``section_count`` 0. Do not add ``--apply``.
+This reads the confirmed bundled-gazette rows and prints what a fresh extract would contain. It does not insert, update, or delete. ``--skip-fetch`` uses recorded PDF bytes only, and those bytes must match the pinned sha. Without ``--skip-fetch`` the command GETs the public PDF and still writes nothing. A live file whose sha is not the pin, a confirmed row with no authentic sha, or a marker that is not a clean heading in that PDF is reported with ``section_count`` 0. Do not add ``--apply``.
+
+Eight audit rows are known by prefix only (`eef57038`, `d7d3187e`, `17f283f3`, `65c5b7b3`, and the FREE-SITES twins `eb8f8ae0`, `f700f160`, `df206e70`, `768e086d`). The audit did not publish their full UUIDs, so they are registered in `CONFIRMED_BLEED_PREFIX_ROWS` with the public URL and sha. They are not guessed into `CONFIRMED_BLEED_STATUTE_IDS`.
 
 ## Dry-run first
 

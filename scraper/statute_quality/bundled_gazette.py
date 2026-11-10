@@ -36,6 +36,7 @@ from scraper.statute_quality.senate_integrity import (
     called_titles_in,
     is_coherent_act_title,
     is_gazette_non_act_title,
+    marker_number_in_text,
     name_s1_mismatch,
     parse_act_number,
     section_embeds_next_act,
@@ -99,20 +100,33 @@ def select_target_segment(segments: Sequence, *, target_name: str, pipe_label: O
     if len(segments) < 2:
         return None
     pipe_act = parse_act_number(pipe_label, pipe_label=True) if pipe_label else None
-    numbered = [segment for segment in segments if pipe_act and segment.act_number == pipe_act]
-    if len(numbered) > 1:
-        clean = [segment for segment in numbered if segment.number_clean]
-        # A collapsed ``)O(`` can repair to the same number as the real heading.
-        numbered = clean if len(clean) == 1 else []
+    # An unclean repair (``)O(Vlt``, ``xxvll``, ``1XIV``, ``LX\,'``) is not the
+    # marked Act. Missing the clean header means no sections, not the neighbour.
+    numbered = [
+        segment
+        for segment in segments
+        if pipe_act and segment.act_number == pipe_act and segment.number_clean
+    ]
     titled = _title_matches(segments, target_name)
+    # A title may confirm a numeral-less header. It may not adopt a different
+    # act number, and it may not adopt an unclean repair.
+    titled_for_selection = [
+        segment
+        for segment in titled
+        if pipe_act is None
+        or (
+            segment.act_number in (None, pipe_act)
+            and (segment.number_clean or segment.act_number is None)
+        )
+    ]
     if len(numbered) == 1 and len(titled) == 1 and numbered[0] is not titled[0]:
         return None
     if len(numbered) == 1:
         return numbered[0]
     if len(numbered) > 1:
         return None
-    if len(titled) == 1:
-        return titled[0]
+    if len(titled_for_selection) == 1:
+        return titled_for_selection[0]
     if pipe_label and pipe_act is None:
         labeled = _title_matches(segments, pipe_label)
         if len(labeled) == 1:
@@ -144,13 +158,29 @@ def isolate_bundled_act(text: str, *, target_name: str = "", source_url: str = "
         pipe_label = None
     pipe_act = parse_act_number(pipe_label, pipe_label=True) if pipe_label else None
     segments = act_segments(raw, pipe_act=pipe_act)
-    if pipe_act and not any(segment.act_number == pipe_act for segment in segments):
+    present = False
+    clean_present = False
+    clean_segment = False
+    if pipe_act:
+        present, clean_present = marker_number_in_text(raw, pipe_act)
+        clean_segment = any(
+            segment.act_number == pipe_act and segment.number_clean for segment in segments
+        )
+    if pipe_act and not present and not clean_segment:
         # The file at this URL is not the marked Act. Do not emit a different one.
         return BundleIsolation(
             status="unresolved",
             text="",
             segment_count=len(segments),
             marker_absent=True,
+        )
+    if pipe_act and not clean_present and not clean_segment:
+        # The only hits are OCR repairs. Do not adopt one of them.
+        return BundleIsolation(
+            status="unresolved",
+            text="",
+            segment_count=len(segments),
+            marker_absent=False,
         )
     if len(segments) < 2:
         return BundleIsolation(status="single", text=raw, segment_count=len(segments))
@@ -387,13 +417,12 @@ def gazette_bundle_hold_reason(
     source_url: Optional[str],
     source_name: Optional[str],
     sections: Sequence[dict],
-    year_enacted_supplied: bool = False,
 ) -> Optional[str]:
     """Reject a senate/NA gazette extract that is chrome, yearless, or still bleeding.
 
     Returns a reason code, or None when this record is not that case. Callers
-    hold the row and do not write it. A missing ``year_enacted`` key is not a
-    null year: only a payload that sets the field to null is.
+    hold the row and do not write it. A missing ``year_enacted`` key is the
+    same as null.
     """
     if not is_federal_gazette_source(source_url, source_name):
         return None
@@ -406,7 +435,7 @@ def gazette_bundle_hold_reason(
         return "gazette_chrome_title"
     jurisdiction_flat = (jurisdiction or "").strip().lower()
     federal = jurisdiction_flat in {"", "federal"}
-    if federal and year_enacted_supplied and year_enacted is None:
+    if federal and year_enacted is None:
         return "federal_null_year"
     if _marker_s1_disagrees(statute_name, source_url, sections):
         return "marker_s1_mismatch"

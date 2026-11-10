@@ -426,10 +426,189 @@ def test_a_clean_marked_act_still_passes_validation():
 
 
 def test_preview_reextract_command_defaults_to_writing_nothing():
-    from scraper.tasks.bundled_gazette_acts import CONFIRMED_BLEED_STATUTE_IDS, build_parser
+    from scraper.tasks.bundled_gazette_acts import (
+        CONFIRMED_BLEED_PREFIX_ROWS,
+        CONFIRMED_BLEED_STATUTE_IDS,
+        build_parser,
+    )
 
     args = build_parser().parse_args(["--preview-reextract", "--skip-fetch"])
     assert args.preview_reextract is True
     assert args.apply is False
     assert args.undo is None
     assert len(CONFIRMED_BLEED_STATUTE_IDS) >= 5
+    prefixes = {row["prefix"] for row in CONFIRMED_BLEED_PREFIX_ROWS}
+    assert {
+        "eef57038",
+        "d7d3187e",
+        "17f283f3",
+        "65c5b7b3",
+        "eb8f8ae0",
+        "f700f160",
+        "df206e70",
+        "768e086d",
+    } <= prefixes
+
+
+def _fixture(name: str) -> str:
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent / "fixtures" / "bundled_gazette" / name).read_text(encoding="utf-8")
+
+
+def test_real_s217_text_does_not_yield_university_sections_for_xxvii():
+    text = _fixture("s217.txt")
+    url = "https://senate.gov.pk/uploads/documents/1660546032_217.pdf|XXVII of 1973"
+    extracted = _extract(text, url=url, title=TRIBAL_AREAS)
+    blob = _blob(extracted)
+    assert extracted["sections"] == []
+    assert "University of Islamabad" not in blob
+    assert "Academic Council" not in blob
+    evidence = extracted["field_evidence"]
+    assert not evidence.get("bundled_gazette_marker_absent")
+    assert evidence.get("bundled_gazette_unresolved")
+
+
+def test_real_s710_text_keeps_legal_advisers_and_not_the_neighbours():
+    text = _fixture("s710.txt")
+    url = "https://senate.gov.pk/uploads/documents/1661160371_710.pdf|LXXXI of 1975"
+    extracted = _extract(text, url=url, title=LEGAL_ADVISERS)
+    blob = _blob(extracted)
+    assert extracted["sections"]
+    assert "Legal Advisers" in blob
+    assert "five lakh" in blob
+    assert "House Building" not in blob
+    assert "Airports" not in blob
+
+
+def test_real_travel_agencies_file_is_not_tourist_guides():
+    text = _fixture("s441.txt")
+    url = "https://senate.gov.pk/uploads/documents/1660626546_441.pdf|XXX of 1976"
+    extracted = _extract(text, url=url, title="The Travel Agencies Act, 1976")
+    blob = _blob(extracted)
+    assert "Travel Agencies Act" in (extracted["statute_name"] or "")
+    assert "Travel Agencies Act" in blob
+    assert "Tourist Guides Act" not in blob
+    assert "Seed Analyst" not in blob
+    assert not (extracted["field_evidence"] or {}).get("bundled_gazette_marker_absent")
+
+
+def test_real_lxvi_shard_is_present_and_not_selected():
+    text = _fixture("s685.txt")
+    url = "https://senate.gov.pk/uploads/documents/1661143800_685.pdf|LXVI of 1976"
+    extracted = _extract(text, url=url, title="Criminal Law Amendment")
+    assert extracted["sections"] == []
+    assert "Defence of Pakistan" not in _blob(extracted)
+    evidence = extracted["field_evidence"]
+    assert not evidence.get("bundled_gazette_marker_absent")
+    assert evidence.get("bundled_gazette_unresolved")
+
+
+def test_real_xvi_file_does_not_emit_a_different_act():
+    text = _fixture("s678.txt")
+    url = "https://senate.gov.pk/uploads/documents/1660629226_678.pdf|XVI of 1976"
+    extracted = _extract(text, url=url, title="Legal Practitioners and Bar Councils (Amendment) Act, 1976")
+    assert extracted["sections"] == []
+    assert "Old-Age" not in _blob(extracted)
+    assert extracted["field_evidence"].get("bundled_gazette_marker_absent")
+
+
+def test_malaria_scan_with_only_an_unclean_lxiv_emits_nothing():
+    text = _fixture("s476.txt")
+    url = "https://senate.gov.pk/uploads/documents/1661162484_476.pdf|LXIV of 1975"
+    extracted = _extract(text, url=url, title=MALARIA)
+    assert extracted["sections"] == []
+    assert "Cost of Living" not in _blob(extracted)
+    assert not extracted["field_evidence"].get("bundled_gazette_marker_absent")
+
+
+def test_schedule_items_after_the_last_section_are_kept():
+    text = """
+ACT No. IV of 1974
+An Act to provide for a short demonstration.
+1. Short title.—This Act may be called the Demonstration Act, 1974.
+2. Extent.—This Act extends to the districts named in the Schedule.
+3. Power.—The Federal Government may notify the districts in the Schedule.
+SCHEDULE
+(See section 2)
+1. The first item in the schedule lists the districts of Chitral and Dir.
+2. The second item in the schedule lists the district of Swat.
+"""
+    extracted = _extract(
+        text,
+        url="https://senate.gov.pk/uploads/documents/demo.pdf|IV of 1974",
+        title="The Demonstration Act, 1974",
+    )
+    blob = _blob(extracted)
+    assert "Chitral and Dir" in blob
+    assert "district of Swat" in blob
+    assert "SCHEDULE" in blob
+
+
+def test_federal_gazette_omitted_year_key_is_held():
+    payload = {
+        "statute_name": TRIBAL_AREAS,
+        "jurisdiction": "Federal",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_text": "1. Short title.—This Act may be called the Supreme Court and High Court Act, 1973.",
+            }
+        ],
+    }
+    ok, reason = validate_statute_reconciled_json(
+        payload,
+        raw_text=TRIBAL_GAZETTE,
+        source_name="Senate",
+        source_url=TRIBAL_URL,
+    )
+    assert not ok
+    assert reason == "federal_null_year"
+    ok, reason = validate_statute_reconciled_json(
+        payload,
+        raw_text="1. Short title.",
+        source_name="PakistanCode",
+        source_url="https://pakistancode.gov.pk/english/sample",
+    )
+    assert reason != "federal_null_year"
+
+
+def test_main_337584d6_replacement_pdf_is_not_adopted():
+    import hashlib
+    from uuid import UUID
+
+    from scraper.tasks.bundled_gazette_acts import (
+        CONFIRMED_PDF_SHA256,
+        LIVE_NA_320_SHA,
+        PIN_UNTRUSTED,
+        accept_pinned_pdf,
+    )
+
+    text = _fixture("na320.txt")
+    url = "https://na.gov.pk/uploads/documents/6a87f616e19a1_320.pdf"
+    extracted = _extract(text, url=url, title="President's Orders and Regulations", source_name="NationalAssembly")
+    assert "Financial Institutions" in (extracted["statute_name"] or "")
+    assert _numbers(extracted) == {"420", "2", "3", "4"}
+    main_id = UUID("337584d6-c37a-4cfb-99bd-6e933f5b195b")
+    twin_id = UUID("bbc0bfca-6a0e-4eef-b771-532f4f3a4041")
+    assert CONFIRMED_PDF_SHA256[main_id] == PIN_UNTRUSTED
+    assert CONFIRMED_PDF_SHA256[twin_id] == PIN_UNTRUSTED
+    assert LIVE_NA_320_SHA not in set(CONFIRMED_PDF_SHA256.values())
+    live = b"%PDF-1.4\n" + text.encode("utf-8")
+    overwritten = hashlib.sha256(live).hexdigest()
+    data, origin = accept_pinned_pdf(
+        (("fetched", live), ("recorded", live)),
+        pinned_sha=PIN_UNTRUSTED,
+        recorded_sha=overwritten,
+    )
+    assert data is None
+    assert origin == "sha_mismatch"
+    authentic = b"%PDF-1.4\ntribal areas bytes"
+    pin = hashlib.sha256(authentic).hexdigest()
+    other = b"%PDF-1.4\nfinancial institutions"
+    kept, kept_origin = accept_pinned_pdf((("fetched", other), ("recorded", authentic)), pinned_sha=pin)
+    assert kept == authentic
+    assert kept_origin == "recorded"
+    rejected, rejected_origin = accept_pinned_pdf((("fetched", other),), pinned_sha=pin, recorded_sha=pin)
+    assert rejected is None
+    assert rejected_origin == "sha_mismatch"
