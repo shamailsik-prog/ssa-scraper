@@ -409,6 +409,16 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         # listed title and do not take that neighbour's year.
         name = official_title
         gazette_year = None
+    from scraper.statute_quality.bundled_gazette import (
+        amendment_short_title_from_called_line,
+        is_numeral_heading_name,
+    )
+
+    if not unresolved and is_numeral_heading_name(name or ""):
+        # An ``Act No. … An Act`` line is the heading, not the short title.
+        repaired = amendment_short_title_from_called_line(raw_text or "")
+        if repaired:
+            name = repaired
     if not unresolved and (source_meta.get("source_name") == "AJKAssembly" or is_law_gok_source(source_url)):
         body = truncate_at_second_act_heading(body or "", name)
         raw_text = truncate_at_second_act_heading(raw_text or "", name)

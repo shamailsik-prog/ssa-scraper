@@ -144,6 +144,21 @@ def _act_label(segment, pipe_label: Optional[str]) -> str:
     return (segment.title or "").strip() or "matched"
 
 
+def _unique_above_line_segment(segments: Sequence, pipe_act: Optional[tuple[int, int]]):
+    """The one ``xxvll`` above ``ACT No. oF`` when nothing else repairs to that number.
+
+    ``)O(Vlt`` repairs to the same number and is not this segment. If both are
+    in the file, neither is returned.
+    """
+    if not pipe_act:
+        return None
+    same = [segment for segment in segments if segment.act_number == pipe_act]
+    above = [segment for segment in same if getattr(segment, "above_line_unclean", False)]
+    if len(above) == 1 and len(same) == 1:
+        return above[0]
+    return None
+
+
 def isolate_bundled_act(text: str, *, target_name: str = "", source_url: str = "") -> BundleIsolation:
     """Return the target act's text when the document prints two or more ACT No. lines.
 
@@ -161,12 +176,13 @@ def isolate_bundled_act(text: str, *, target_name: str = "", source_url: str = "
     present = False
     clean_present = False
     clean_segment = False
+    above = _unique_above_line_segment(segments, pipe_act)
     if pipe_act:
         present, clean_present = marker_number_in_text(raw, pipe_act)
         clean_segment = any(
             segment.act_number == pipe_act and segment.number_clean for segment in segments
         )
-    if pipe_act and not present and not clean_segment:
+    if pipe_act and not present and not clean_segment and above is None:
         # The file at this URL is not the marked Act. Do not emit a different one.
         return BundleIsolation(
             status="unresolved",
@@ -174,17 +190,20 @@ def isolate_bundled_act(text: str, *, target_name: str = "", source_url: str = "
             segment_count=len(segments),
             marker_absent=True,
         )
-    if pipe_act and not clean_present and not clean_segment:
-        # The only hits are OCR repairs. Do not adopt one of them.
+    if pipe_act and not clean_present and not clean_segment and above is None:
+        # ``)O(Vlt``, ``1XIV``, and ``LX\,'`` stay unresolved. A lone ``xxvll``
+        # above ``ACT No. oF`` is the exception, and only when it is unique.
         return BundleIsolation(
             status="unresolved",
             text="",
             segment_count=len(segments),
             marker_absent=False,
         )
-    if len(segments) < 2:
+    if len(segments) < 2 and above is None:
         return BundleIsolation(status="single", text=raw, segment_count=len(segments))
     chosen = select_target_segment(segments, target_name=target_name or "", pipe_label=pipe_label)
+    if chosen is None:
+        chosen = above
     if chosen is None:
         return BundleIsolation(status="unresolved", text="", segment_count=len(segments))
     year = chosen.act_number[1] if chosen.act_number else None
@@ -409,6 +428,100 @@ def _marker_s1_disagrees(statute_name: str, source_url: Optional[str], sections:
     return False
 
 
+_NUMERAL_HEADING_NAME_RE = re.compile(
+    r"(?i)^(?:act\s+no\.?\s+)?"
+    r"[0-9ivxlcdm()\\',.]{1,24}\s+"
+    r"(?:of|ol|on|or)\s+"
+    r"(?:1[89]|20)\d{2}"
+    r"(?:\s+an\s+ac[tl1])?$"
+)
+_FURTHER_TO_AMEND_RE = re.compile(
+    r"(?is)\bfurther\s+to\s+amend\s+the\s+"
+    r"(?P<title>.{8,220}?)"
+    r",\s*(?P<year>(?:18|19|20)\d{2})\b"
+)
+_OCR_CALLED_SPAN_RE = re.compile(
+    r"(?is)\bthis\s+ac[tl1]\s+(?:may|shall)\s+b[ce]\s+c[a-z]lled\s+th[ce]\s+(?P<title>.{0,400})"
+)
+
+
+def is_numeral_heading_name(name: str) -> bool:
+    """True for an act-number heading such as ``39 ol 1976 An Act``."""
+    flat = re.sub(r"\s+", " ", (name or "")).strip(" .")
+    return bool(_NUMERAL_HEADING_NAME_RE.fullmatch(flat))
+
+
+def _title_glyphs(text: str) -> str:
+    """Light scan fixes used only to compare a called line with a preamble name."""
+    cleaned = (text or "").replace("€", "e")
+    cleaned = re.sub(r"(?<=\s)\]\.", "L", cleaned)
+    cleaned = re.sub(r"(?<=\s)@", "B", cleaned)
+    return cleaned.replace("|", "")
+
+
+def _edit_within_one(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    previous = list(range(len(right) + 1))
+    for index, left_char in enumerate(left, 1):
+        current = [index]
+        best = index
+        for right_index, right_char in enumerate(right, 1):
+            cost = 0 if left_char == right_char else 1
+            value = min(current[-1] + 1, previous[right_index] + 1, previous[right_index - 1] + cost)
+            current.append(value)
+            if value < best:
+                best = value
+        if best > 1:
+            return False
+        previous = current
+    return previous[-1] <= 1
+
+
+def _called_agrees(called: str, parent: str) -> bool:
+    words = re.findall(r"[A-Za-z]{5,}", parent or "")
+    if not words:
+        return False
+    blob = [word.lower() for word in re.findall(r"[A-Za-z]{4,}", _title_glyphs(called))]
+    hits = 0
+    for word in words:
+        low = word.lower()
+        if any(_edit_within_one(low, other) for other in blob):
+            hits += 1
+    need = len(words) if len(words) < 3 else max(3, (len(words) + 1) // 2)
+    return hits >= need
+
+
+def amendment_short_title_from_called_line(text: str) -> Optional[str]:
+    """Short title of an amending Act when the called line is too damaged to publish.
+
+    The preamble's ``further to amend the X, YEAR`` supplies the clean parent
+    name. The called line must agree with that name and carry a later year.
+    A parent that already ends in ``Act`` drops that word, so the result is
+    ``X (Amendment) Act, YEAR`` rather than ``Act (Amendment) Act``.
+    """
+    called = _OCR_CALLED_SPAN_RE.search(text or "")
+    if not called:
+        return None
+    called_years = re.findall(r"(?:18|19|20)\d{2}", called.group("title") or "")
+    if not called_years:
+        return None
+    called_year = called_years[-1]
+    for amend in _FURTHER_TO_AMEND_RE.finditer(text or ""):
+        if amend.group("year") == called_year:
+            continue
+        parent = re.sub(r"\s+", " ", amend.group("title") or "").strip(" .,")
+        if not _called_agrees(called.group("title") or "", parent):
+            continue
+        stem = re.sub(r"(?i)\s+act$", "", parent).strip()
+        if not stem:
+            continue
+        return f"{stem} (Amendment) Act, {called_year}"
+    return None
+
+
 def gazette_bundle_hold_reason(
     *,
     statute_name: str,
@@ -437,6 +550,8 @@ def gazette_bundle_hold_reason(
     federal = jurisdiction_flat in {"", "federal"}
     if federal and year_enacted is None:
         return "federal_null_year"
+    if is_numeral_heading_name(statute_name):
+        return "numeral_heading_name"
     if _marker_s1_disagrees(statute_name, source_url, sections):
         return "marker_s1_mismatch"
     if any(section_embeds_next_act(str(section.get("section_text") or "")) for section in sections or []):

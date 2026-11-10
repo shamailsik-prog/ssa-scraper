@@ -174,16 +174,19 @@ _YEAR_OCR = str.maketrans(
 # * The roman numeral may use ``T`` for ``I`` (a trailing ``TV`` is ``IV``).
 #   That repair is applied only to this heading's numeral.
 #
-# Not accepted: ``Acr No. xt or 2015`` (Credit Bureaus). ``Acr`` is not
-# ``AC`` plus a T/l slip, and ``xt`` is not a roman numeral with T standing
-# for I. A citation tail (``.-``, ``In the``) is still not a boundary.
+# ``Acr No.`` is ``ACT No.`` when the numeral is already a roman or an
+# integer (``Acr No. XXII``). ``Acr No. xt or 2015`` (Credit Bureaus) is not:
+# ``xt`` is not that numeral. A citation tail (``.-``, ``In the``) is still
+# not a boundary. A year may hide one dot (``197.5``).
 # Punctuation, not whitespace: a newline must not turn a bare ``CT No.`` into ``ACT``.
 #
 # A collapsed ``XX`` is ``)O(`` (the two strokes read as parentheses around
 # an O). ``)O(X`` is 30. ``)O(Vlt`` repairs to 27 and stays unclean, so a
 # pipe label does not select it. ``l`` in that numeral is I. A clean heading
 # is the only one a pipe label may select.
-_ACT_WORD = r"(?:ac[\W_]{0,3}[tli1]|[^\w\s]{1,4}ct)"
+# ``acr`` is the ACT slip. It is a heading only when the numeral is plain
+# roman or an integer; ``_is_act_boundary`` rejects ``Acr No. xt``.
+_ACT_WORD = r"(?:ac[\W_]{0,3}[tli1]|acr|[^\w\s]{1,4}ct)"
 # ``f`` may be ``n``, ``r``, or ``l`` (``on``, ``or``, ``ol``).
 _OF_WORD = r"(?:of|on|or|ol)"
 _ROMAN_HEADING = r"[IVXLCDMT]+"
@@ -194,9 +197,14 @@ _COLLAPSED_XX = r"[()O0o]{2,3}"
 _NUMERAL = (
     rf"(?:{_NUMERAL_ATOM}*{_COLLAPSED_XX}{_NUMERAL_ATOM}*|{_NUMERAL_ATOM}{{1,16}}|\d{{1,4}})"
 )
-# Four year glyphs, or one glyph, a break, and the other three (``I`` / ``975``).
+# Four year glyphs, three glyphs and a dot (``197.5``), or one glyph, a
+# break, and the other three (``I`` / ``975``).
 _YEAR_CHAR = r"[0-9rRlLiIjJoOsSbBgGqQzZ]"
-_YEAR_TOKEN = rf"{_YEAR_CHAR}(?:{_YEAR_CHAR}{{3}}|[ \t\n]+{_YEAR_CHAR}{{3}})"
+_YEAR_TOKEN = (
+    rf"(?:{_YEAR_CHAR}{{4}}"
+    rf"|{_YEAR_CHAR}{{3}}\.{_YEAR_CHAR}"
+    rf"|{_YEAR_CHAR}[ \t\n]+{_YEAR_CHAR}{{3}})"
+)
 _ACT_NO_HEADING_RE = re.compile(
     rf"(?i)(?<![A-Za-z]){_ACT_WORD}[\W_]{{0,3}}\s*no\.?\s*"
     rf"(?:({_NUMERAL})\s*)?"
@@ -803,6 +811,9 @@ class _ActSegment:
     text: str
     # False when the numeral needed the collapsed-XX or l/1 repair.
     number_clean: bool = True
+    # True only for an unclean ``xxvll`` sitting on the line above ``ACT No.``.
+    # ``)O(Vlt`` is the same number and is never this flag.
+    above_line_unclean: bool = False
 
 
 def _prepare_title_scan(text: str) -> str:
@@ -931,7 +942,21 @@ def _opens_with_an_act(text: str, match: re.Match) -> bool:
     return bool(opened) and _AN_ACT_OPENING_RE.match(opened[0]) is not None
 
 
+def _acr_numeral_rejected(match: re.Match) -> bool:
+    """``Acr No.`` counts only with a plain roman or integer. ``xt`` does not."""
+    if not re.match(r"(?i)acr(?![A-Za-z])", match.group(0) or ""):
+        return False
+    token = (match.group(1) or "").strip()
+    if not token or re.fullmatch(r"(?i)xt", token):
+        return True
+    if not re.fullmatch(r"(?i)(?:[IVXLCDM]+|\d{1,4})", token):
+        return True
+    return _roman_or_int(token) is None
+
+
 def _is_act_boundary(text: str, match: re.Match) -> bool:
+    if _acr_numeral_rejected(match):
+        return False
     if _is_citation_act_heading(text, match):
         return False
     if _at_line_start(text, match):
@@ -968,8 +993,8 @@ def _plausible_year(token: str) -> Optional[int]:
 
 
 def _repair_year(token: str) -> Optional[int]:
-    """Turn a one-character scan slip such as ``r97J`` or ``I975`` into a year."""
-    flat = re.sub(r"\s+", "", token or "")
+    """Turn a one-character scan slip such as ``r97J``, ``I975``, or ``197.5`` into a year."""
+    flat = re.sub(r"[\s.]+", "", token or "")
     if not flat:
         return None
     return _plausible_year(flat.translate(_YEAR_OCR))
@@ -1022,8 +1047,19 @@ def _segment_at(
     start: int,
     end: int,
 ) -> _ActSegment:
-    number, number_clean = _heading_numeral_detail(_heading_token(text, heading))
+    inline = (heading.group(1) or "").strip()
+    above = "" if inline else _numeral_above(text, heading.start())
+    token = inline or above
+    number, number_clean = _heading_numeral_detail(token)
     act = (number, year) if number is not None and year is not None else None
+    # ``xxvll`` above ``ACT No. oF`` may be selected when it is the only 27.
+    # ``)O(Vlt`` is inline, so this flag stays false and it is never selected.
+    above_line = bool(
+        not inline
+        and re.fullmatch(r"(?i)x+vll", above or "")
+        and number is not None
+        and not number_clean
+    )
     scope_start = heading.start()
     title_scope = text[scope_start:end]
     return _ActSegment(
@@ -1031,6 +1067,7 @@ def _segment_at(
         _called_title_in(title_scope),
         text[start:end],
         bool(number_clean and act is not None),
+        above_line,
     )
 
 
@@ -1057,10 +1094,11 @@ def marker_number_in_text(text: str, pipe_act: tuple[int, int]) -> tuple[bool, b
 
 
 def _prefix_is_unread_act(prefix: str) -> bool:
-    """A gazette banner is not another Act. ``An Acl`` or ``may be called`` is."""
+    """A gazette banner is not another Act. ``An Acl`` or ``may bc called`` is."""
     if re.search(r"(?im)^[ \t]*(?:an|\.\s*\d)\s+ac[tl1]\b", prefix or ""):
         return True
-    return bool(re.search(r"(?i)\bmay be called the\b", prefix or ""))
+    # ``the`` may be ``thc`` or ``tlc``. ``be`` may be ``bc``.
+    return bool(re.search(r"(?i)\bmay b[ce]\s+c[a-z]lled\b", prefix or ""))
 
 
 def act_segments(

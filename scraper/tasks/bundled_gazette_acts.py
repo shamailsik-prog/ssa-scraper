@@ -76,6 +76,14 @@ CONFIRMED_BLEED_STATUTE_IDS = (
     UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"),
     UUID("bbc0bfca-6a0e-4eef-b771-532f4f3a4041"),
     UUID("337584d6-c37a-4cfb-99bd-6e933f5b195b"),
+    UUID("eef57038-13dc-4b4d-b050-14cb7d490e44"),
+    UUID("eb8f8ae0-727a-464b-9786-db0247eca896"),
+    UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96"),
+    UUID("f700f160-4bf3-41df-9ec5-b052b5627f77"),
+    UUID("17f283f3-b875-4c5d-b3ed-6a235d9ebd21"),
+    UUID("df206e70-1114-4676-8eec-c77fa051f268"),
+    UUID("65c5b7b3-674c-4726-8372-b068527cea90"),
+    UUID("768e086d-329e-42d9-ade3-01900badfb8e"),
 )
 
 # Empty string: the URL no longer serves the harvested file, and no authentic
@@ -88,6 +96,10 @@ _S441 = "320370bfdbe1631332ab60457c17ab1f79fed7e57102269413fe27e5963b51a7"
 _S605 = "5bc250481cb702b5565b7091e1b5720d4b657567bfcb60af1aec9a076d0afd34"
 _S478 = "d90008a3b35e0ad5b9d2056f0b69462e5fc55d6fb3428049e348fc06754e90a4"
 _S171 = "6e9dbba7f60a4265543521a4084565d150c9c29747cb6d860a993d6a1bc37636"
+_S685 = "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22"
+_S133 = "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616"
+_S678 = "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d"
+_S402 = "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe"
 CONFIRMED_PDF_SHA256 = {
     UUID("df10d129-fd7b-4c25-9a38-828878466e6a"): _S217,
     UUID("b535370b-a524-4d2b-8e72-562984904397"): _S217,
@@ -107,20 +119,15 @@ CONFIRMED_PDF_SHA256 = {
     UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"): _S171,
     UUID("bbc0bfca-6a0e-4eef-b771-532f4f3a4041"): PIN_UNTRUSTED,
     UUID("337584d6-c37a-4cfb-99bd-6e933f5b195b"): PIN_UNTRUSTED,
+    UUID("eef57038-13dc-4b4d-b050-14cb7d490e44"): _S685,
+    UUID("eb8f8ae0-727a-464b-9786-db0247eca896"): _S685,
+    UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96"): _S133,
+    UUID("f700f160-4bf3-41df-9ec5-b052b5627f77"): _S133,
+    UUID("17f283f3-b875-4c5d-b3ed-6a235d9ebd21"): _S678,
+    UUID("df206e70-1114-4676-8eec-c77fa051f268"): _S678,
+    UUID("65c5b7b3-674c-4726-8372-b068527cea90"): _S402,
+    UUID("768e086d-329e-42d9-ade3-01900badfb8e"): _S402,
 }
-
-# The audit names these eight by prefix. Their full UUIDs are not in that
-# text. Preview uses the URL and the sha; it does not invent an id.
-CONFIRMED_BLEED_PREFIX_ROWS = (
-    {"prefix": "eef57038", "host": "MAIN", "marker": "LXVI of 1976", "url": "https://senate.gov.pk/uploads/documents/1661143800_685.pdf", "sha256": "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22"},
-    {"prefix": "eb8f8ae0", "host": "FS", "marker": "LXVI of 1976", "url": "https://senate.gov.pk/uploads/documents/1661143800_685.pdf", "sha256": "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22"},
-    {"prefix": "d7d3187e", "host": "MAIN", "marker": "LXVII of 1976", "url": "https://senate.gov.pk/uploads/documents/1661143497_133.pdf", "sha256": "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616"},
-    {"prefix": "f700f160", "host": "FS", "marker": "LXVII of 1976", "url": "https://senate.gov.pk/uploads/documents/1661143497_133.pdf", "sha256": "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616"},
-    {"prefix": "17f283f3", "host": "MAIN", "marker": "XVI of 1976", "url": "https://senate.gov.pk/uploads/documents/1660629226_678.pdf", "sha256": "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d"},
-    {"prefix": "df206e70", "host": "FS", "marker": "XVI of 1976", "url": "https://senate.gov.pk/uploads/documents/1660629226_678.pdf", "sha256": "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d"},
-    {"prefix": "65c5b7b3", "host": "MAIN", "marker": "32 of 1997", "url": "https://senate.gov.pk/uploads/documents/1658382879_402.pdf", "sha256": "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe"},
-    {"prefix": "768e086d", "host": "FS", "marker": "32 of 1997", "url": "https://senate.gov.pk/uploads/documents/1658382879_402.pdf", "sha256": "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe"},
-)
 LIVE_NA_320_SHA = "83236f6eeedc4bcfd96d3beea0402e3a147ca56393c053fda9fa3a34c238b19d"
 _FETCH_HOSTS = frozenset(
     {

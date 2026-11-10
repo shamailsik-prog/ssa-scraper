@@ -426,9 +426,11 @@ def test_a_clean_marked_act_still_passes_validation():
 
 
 def test_preview_reextract_command_defaults_to_writing_nothing():
+    from uuid import UUID
+
     from scraper.tasks.bundled_gazette_acts import (
-        CONFIRMED_BLEED_PREFIX_ROWS,
         CONFIRMED_BLEED_STATUTE_IDS,
+        CONFIRMED_PDF_SHA256,
         build_parser,
     )
 
@@ -437,17 +439,19 @@ def test_preview_reextract_command_defaults_to_writing_nothing():
     assert args.apply is False
     assert args.undo is None
     assert len(CONFIRMED_BLEED_STATUTE_IDS) >= 5
-    prefixes = {row["prefix"] for row in CONFIRMED_BLEED_PREFIX_ROWS}
-    assert {
-        "eef57038",
-        "d7d3187e",
-        "17f283f3",
-        "65c5b7b3",
-        "eb8f8ae0",
-        "f700f160",
-        "df206e70",
-        "768e086d",
-    } <= prefixes
+    full_ids = {
+        UUID("eef57038-13dc-4b4d-b050-14cb7d490e44"): "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22",
+        UUID("eb8f8ae0-727a-464b-9786-db0247eca896"): "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22",
+        UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96"): "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616",
+        UUID("f700f160-4bf3-41df-9ec5-b052b5627f77"): "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616",
+        UUID("17f283f3-b875-4c5d-b3ed-6a235d9ebd21"): "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d",
+        UUID("df206e70-1114-4676-8eec-c77fa051f268"): "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d",
+        UUID("65c5b7b3-674c-4726-8372-b068527cea90"): "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe",
+        UUID("768e086d-329e-42d9-ade3-01900badfb8e"): "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe",
+    }
+    assert set(full_ids) <= set(CONFIRMED_BLEED_STATUTE_IDS)
+    for statute_id, sha in full_ids.items():
+        assert CONFIRMED_PDF_SHA256[statute_id] == sha
 
 
 def _fixture(name: str) -> str:
@@ -474,8 +478,12 @@ def test_real_s710_text_keeps_legal_advisers_and_not_the_neighbours():
     url = "https://senate.gov.pk/uploads/documents/1661160371_710.pdf|LXXXI of 1975"
     extracted = _extract(text, url=url, title=LEGAL_ADVISERS)
     blob = _blob(extracted)
-    assert extracted["sections"]
-    assert "Legal Advisers" in blob
+    numbers = [str(section["section_number"]) for section in extracted["sections"]]
+    assert numbers == ["1", "2", "3"]
+    section_one = extracted["sections"][0]["section_text"]
+    assert "Legal Advisers" in section_one
+    assert "Amendment" in section_one
+    assert "1975" in section_one
     assert "five lakh" in blob
     assert "House Building" not in blob
     assert "Airports" not in blob
@@ -491,6 +499,9 @@ def test_real_travel_agencies_file_is_not_tourist_guides():
     assert "Tourist Guides Act" not in blob
     assert "Seed Analyst" not in blob
     assert not (extracted["field_evidence"] or {}).get("bundled_gazette_marker_absent")
+    by_num = {str(section["section_number"]): section["section_text"] for section in extracted["sections"]}
+    assert "Federal Government" in by_num["14"]
+    assert not by_num["15"].lstrip().startswith("Federal Government")
 
 
 def test_real_lxvi_shard_is_present_and_not_selected():
@@ -520,6 +531,88 @@ def test_malaria_scan_with_only_an_unclean_lxiv_emits_nothing():
     assert extracted["sections"] == []
     assert "Cost of Living" not in _blob(extracted)
     assert not extracted["field_evidence"].get("bundled_gazette_marker_absent")
+
+
+PAT_FEEDER = "Land Reforms (Baluchistan Pat Feeder Canal) Regulation (Amendment) Act, 1976"
+PAT_FEEDER_URL = "https://senate.gov.pk/uploads/documents/1660623691_478.pdf|XXXIX of 1976"
+
+
+def test_real_pat_feeder_name_is_the_short_title_not_the_act_number_heading():
+    text = _fixture("s478.txt")
+    extracted = _extract(text, url=PAT_FEEDER_URL, title="XXXIX ol 1976 An Act")
+    blob = _blob(extracted)
+    assert extracted["statute_name"] == PAT_FEEDER
+    assert "1" in _numbers(extracted)
+    assert "2" in _numbers(extracted)
+    assert "Motor Vehicles" not in blob
+    assert "Pat Feeder" in blob
+
+
+def test_numeral_heading_name_is_held():
+    ok, reason = validate_statute_reconciled_json(
+        {
+            "statute_name": "XXXIX ol 1976 An Act",
+            "year_enacted": 1976,
+            "jurisdiction": "Federal",
+            "sections": [
+                {
+                    "section_number": "1",
+                    "section_text": "1. Short title. This Act may be called the Example Act, 1976.",
+                }
+            ],
+        },
+        raw_text="1. Short title.",
+        source_name="Senate",
+        source_url=PAT_FEEDER_URL,
+    )
+    assert not ok
+    assert reason == "numeral_heading_name"
+
+
+def test_unique_xxvll_above_act_no_is_kept_and_paren_form_is_not():
+    shared = """
+ACT No. I of 1973
+An Act to provide for an example neighbour.
+1. Short title.—This Act may be called the Example Act, 1973.
+2. Extent.—This Act extends to the example district.
+"""
+    above = shared + """
+xxvll
+ACT No. oF
+1973
+An Act to extend the jurisdiction of the courts.
+1. Short title.—This Act may be called the Tribal Areas Act, 1973.
+2. Extent.—This Act extends to the named tribal areas.
+"""
+    extracted = _extract(above, url=TRIBAL_URL, title="XXVII ol 1973 An Act")
+    blob = _blob(extracted)
+    assert [section["section_number"] for section in extracted["sections"]] == ["1", "2"]
+    assert "named tribal areas" in blob
+    assert "example district" not in blob
+    paren = shared + """
+ACT No. )O(Vlt oF
+1973
+An Act to reconstitute and reorganize the University of Islamabad.
+1. Short title.—This Act may be called the University of Islamabad Act, 1973.
+2. Definitions.—Academic Council means the Academic Council of the University.
+"""
+    rejected = _extract(paren, url=TRIBAL_URL, title="XXVII ol 1973 An Act")
+    assert rejected["sections"] == []
+    assert "University of Islamabad" not in _blob(rejected)
+    assert "Academic Council" not in _blob(rejected)
+
+
+def test_acr_no_xxii_dotted_year_keeps_the_constitution_act():
+    text = _fixture("s605.txt")
+    url = "https://senate.gov.pk/uploads/documents/1661400088_605.pdf|XXII of 1975"
+    extracted = _extract(text, url=url, title="XXII ol 1975 An Act")
+    blob = _blob(extracted)
+    assert extracted["sections"]
+    assert "197" not in _numbers(extracted)
+    assert "Political Parties" not in blob
+    assert "Constitution" in blob
+    assert not (extracted["field_evidence"] or {}).get("bundled_gazette_marker_absent")
+    assert not (extracted["field_evidence"] or {}).get("bundled_gazette_unresolved")
 
 
 def test_schedule_items_after_the_last_section_are_kept():

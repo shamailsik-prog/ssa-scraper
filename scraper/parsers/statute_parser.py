@@ -645,8 +645,10 @@ def year_section_is_bogus_heading(
     return reject_year_section_heading(token, _sibling_number_pairs(sibling_tokens), citation=citation)
 
 
+# The closing period is what makes this a marginal note (``Definitions.``).
+# A bare tail such as ``Federal Government`` stays on the previous section.
 _WRAPPED_MARGINAL_NOTE_RE = re.compile(
-    r"^[A-Z][A-Za-z]+(?:[ \t]+[A-Za-z][A-Za-z]*){0,5}\.?$"
+    r"^[A-Z][A-Za-z]+(?:[ \t]+[A-Za-z][A-Za-z]*){0,5}\.$"
 )
 _FOLLOWING_SECTION_HEAD_RE = re.compile(
     r"^\d{1,3}[A-Z]?\.\s+(?:\(\d+\)|[A-Z])"
@@ -661,9 +663,11 @@ def _join_wrapped_marginal_notes(text: str) -> str:
         Definitions.
         2. In this Act, unless the context otherwise requires
 
-    That label belongs to section 2. A line with a comma, a digit, or no
-    following ``N.`` heading is left where it is (footer continuations such as
-    ``Department, Quetta.`` and the wrapped year ``2025.``).
+    That label belongs to section 2. The note has to end with a period. A
+    line with no period (``Federal Government`` at the end of a subsection),
+    a comma, a digit, or no following ``N.`` heading stays where it is
+    (footer continuations such as ``Department, Quetta.`` and the wrapped
+    year ``2025.``).
     """
     lines = text.splitlines()
     joined: List[str] = []
@@ -883,6 +887,14 @@ def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> Li
     kept: List[Match[str]] = []
     for match in matches:
         if _year_citation_context(text, match):
+            continue
+        # ``197.5`` is a year the scan split with a dot, not section 197.
+        number_at = match.start(1) if match.groups() else match.start()
+        line_end = text.find("\n", number_at)
+        if line_end < 0:
+            line_end = len(text)
+        line_start = text.rfind("\n", 0, number_at) + 1
+        if re.fullmatch(r"\d{3}\.\d", text[line_start:line_end].strip()):
             continue
         kept.append(match)
     return kept
@@ -1480,6 +1492,29 @@ _OCR_COMMA_HEADING_RE = re.compile(
 )
 _STRUCTURAL_COMMA_TITLE_RE = re.compile(r"(?i)^(?:amendment|short\s+title|repeal)\b")
 _ENACTED_AS_FOLLOWS_RE = re.compile(r"(?i)\benacted\s+as\s+follows\b[ \t:.\-—–]*")
+# ``1.`` read as ``L`` or ``l`` on the short-title line. ``Short tide`` is
+# ``Short title``. The line has no comma and no dash, so the comma repair
+# does not see it. ``Amcndment`` on that same line is ``Amendment``.
+_OCR_L_SHORT_TITLE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)[Ll](?P<gap>[ \t]+)"
+    r"(?P<rest>Short[ \t]+t[itl1d][A-Za-z]{1,8}\b.*)$"
+)
+
+
+def _repair_ocr_l_short_title(text: str) -> str:
+    """Turn ``L Short tide …`` into section 1. ``l.`` already has its period.
+
+    ``Amcndment`` on the following short-title line is ``Amendment``. The
+    rewrite runs only when this ``L`` / ``l`` heading is present.
+    """
+    if not _OCR_L_SHORT_TITLE_RE.search(text or ""):
+        return text
+    text = text.replace("Amcndment", "Amendment")
+
+    def _repl(match: re.Match) -> str:
+        return f"{match.group('indent')}1.{match.group('gap')}{match.group('rest')}"
+
+    return _OCR_L_SHORT_TITLE_RE.sub(_repl, text)
 
 
 # ``2, In the said Ordinance`` / ``3, In the principal Act``. The comma is the
@@ -1910,7 +1945,7 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     """
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
-        plain = _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        plain = _repair_ocr_l_short_title(_join_wrapped_marginal_notes(_normalize_whitespace(plain)))
         if _is_amendment_statute(statute_name, plain):
             plain = _repair_amendment_ocr_clause_heads(plain)
         plain = _repair_ocr_swallowed_section_headings(
