@@ -37,6 +37,8 @@ envVarGroups:
         value: cloud
       - key: ALLOW_LOGIN_SCRAPING
         value: "false"
+      - key: SSA_PROMOTE_DEDICATED_QUEUE_ENABLED
+        value: "true"
       - key: LOG_LEVEL
         value: INFO
       - key: TIMEZONE
@@ -82,8 +84,8 @@ services:
           name: sikander-kv
           property: connectionString
 
-  # ------------------------------------------------------------------ Celery worker
-  # Public sources, maintenance (promotion, treatment, archive, dispatch) and embeddings.
+  # ------------------------------------------------------------------ Celery worker (no promote queue — see sikander-worker-promote)
+  # Public sources, maintenance (treatment, archive, dispatch) and embeddings.
   - type: worker
     name: sikander-worker
     runtime: docker
@@ -94,6 +96,29 @@ services:
     autoDeployTrigger: commit
     dockerCommand: |-
       sh -lc 'case "$DATABASE_URL" in postgresql+asyncpg://*) ;; postgresql://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgresql://}";; postgres://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgres://}";; esac; exec celery -A scraper.tasks.celery_app worker -Q scraper,maintenance,embeddings --concurrency=2 -n worker@%h --loglevel=INFO'
+    envVars:
+      - fromGroup: sikander-config
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sikander-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sikander-kv
+          property: connectionString
+
+  # ------------------------------------------------------------------ Celery promote worker (isolated from maintenance/embeddings backlog)
+  - type: worker
+    name: sikander-worker-promote
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    dockerCommand: |-
+      sh -lc 'case "$DATABASE_URL" in postgresql+asyncpg://*) ;; postgresql://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgresql://}";; postgres://*) export DATABASE_URL="postgresql+asyncpg://${DATABASE_URL#postgres://}";; esac; exec celery -A scraper.tasks.celery_app worker -Q promote --concurrency=1 -n promote@%h --loglevel=INFO'
     envVars:
       - fromGroup: sikander-config
       - key: DATABASE_URL

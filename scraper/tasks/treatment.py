@@ -323,7 +323,13 @@ async def refresh_citation_counts(db: AsyncSession) -> int:
 
 
 async def classify_treatment(limit: int = 200) -> Dict[str, int]:
+    import os
+    import time
+
     totals = {"judgments": 0, "rows": 0, "quarantined": 0, "skipped": 0}
+    test_sleep = float(os.environ.get("CLASSIFY_TREATMENT_TEST_SLEEP_SECONDS") or 0)
+    if test_sleep > 0:
+        time.sleep(test_sleep)
     async with SessionLocal() as db:
         done_ids = select(Treatment.citing_judgment_id).distinct()
         q = select(Judgment).where(Judgment.id.not_in(done_ids), Judgment.full_text.is_not(None)).order_by(Judgment.promoted_at.desc()).limit(limit)
@@ -448,9 +454,24 @@ async def reconcile_judgment_citation_relations(*, lookback_hours: Optional[int]
     return totals
 
 
-@shared_task(name="scraper.tasks.treatment.classify_treatment")
-def classify_treatment_task(limit: int = 200):
-    return run_async(classify_treatment(limit))
+@shared_task(
+    name="scraper.tasks.treatment.classify_treatment",
+    soft_time_limit=settings.CLASSIFY_TREATMENT_SOFT_TIME_LIMIT,
+    time_limit=settings.CLASSIFY_TREATMENT_SOFT_TIME_LIMIT + 60,
+)
+def classify_treatment_task(limit: int | None = None):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    batch = int(limit if limit is not None else settings.CLASSIFY_TREATMENT_BATCH)
+    try:
+        return run_async(classify_treatment(batch))
+    except SoftTimeLimitExceeded:
+        logger.warning("classify_treatment stopped at soft time limit (%ss); partial rows were committed", settings.CLASSIFY_TREATMENT_SOFT_TIME_LIMIT)
+        return {
+            "soft_time_limit": True,
+            "limit": batch,
+            "soft_time_limit_seconds": settings.CLASSIFY_TREATMENT_SOFT_TIME_LIMIT,
+        }
 
 
 @shared_task(name="scraper.tasks.treatment.reconcile_treatment_citation_links")
