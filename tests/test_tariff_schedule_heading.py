@@ -91,6 +91,23 @@ def test_ocr_chapter_tokens_with_tariff_text_are_schedule_content():
     assert "Income tax" in bodies["3"]
 
 
+def test_ocr_chapter_boundary_keeps_a_later_real_section():
+    """``0E`` has to be a split so ``4. Rolled`` folds and a later section 4 survives."""
+    text = """
+1. Short title.— This Act may be called the Finance Act, 1974 and it extends to the whole of Pakistan.
+2. Amendment of customs duties.— The First Schedule to the Customs Act, 1969 shall be amended as set out below.
+0E.05 Nuts, fresh or dried, whether or not shelled or peeled.
+4. Rolled but not further worked of a thickness exceeding 3 millimetres under this schedule.
+4. Penalty.— A person who contravenes this section shall be liable to a fine of one million rupees.
+"""
+    bodies = _by_number(text, "Finance Act, 1974")
+    assert "0E" not in bodies
+    assert "Nuts, fresh or dried" in bodies["2"]
+    assert "Rolled but not further worked" in bodies["2"]
+    assert "fine of one million rupees" in bodies["4"]
+    assert "Rolled but not further worked" not in bodies["4"]
+
+
 def test_real_integer_headings_are_not_tariff_rows():
     text = """
 1. Short title.— This Act may be called the Example Act, 2021 and it extends to the whole of the Province.

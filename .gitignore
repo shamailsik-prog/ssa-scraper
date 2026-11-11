@@ -14,6 +14,9 @@ venv/
 # re-extract backups written by bundled_gazette_acts --apply-reextract
 var/
 
+# section-zero dry-run backup JSONL and rollback SQL (statute text)
+section_zero_reports/
+
 # droplet-local clutter: never commit hand-made backups or hot patches (deploy from git only)
 *.bak
 *.bak.*
