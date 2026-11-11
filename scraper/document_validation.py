@@ -76,11 +76,22 @@ def validate_statute_reconciled_json(
         return False, "empty_statute_sections"
     if dict_sections and len(parseable) < len(dict_sections):
         return False, "empty_statute_sections"
+    from scraper.statute_quality.bundled_gazette import gazette_bundle_hold_reason
     from scraper.statute_quality.distribution_list import is_distribution_addressee_section
     from scraper.statute_quality.senate_integrity import name_s1_mismatch, section_embeds_next_act
 
     if any(is_distribution_addressee_section(str(s.get("section_text") or "")) for s in parseable):
         return False, "distribution_list_footer_as_sections"
+    hold = gazette_bundle_hold_reason(
+        statute_name=str(payload.get("statute_name") or ""),
+        year_enacted=payload.get("year_enacted"),
+        jurisdiction=payload.get("jurisdiction"),
+        source_url=source_url or str(payload.get("source_url") or ""),
+        source_name=source_name or str(payload.get("source_name") or ""),
+        sections=parseable,
+    )
+    if hold:
+        return False, hold
     if name_s1_mismatch(str(payload.get("statute_name") or ""), parseable):
         return False, "name_s1_mismatch"
     if any(section_embeds_next_act(str(s.get("section_text") or "")) for s in parseable):

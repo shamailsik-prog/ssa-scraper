@@ -645,8 +645,10 @@ def year_section_is_bogus_heading(
     return reject_year_section_heading(token, _sibling_number_pairs(sibling_tokens), citation=citation)
 
 
+# The closing period is what makes this a marginal note (``Definitions.``).
+# A bare tail such as ``Federal Government`` stays on the previous section.
 _WRAPPED_MARGINAL_NOTE_RE = re.compile(
-    r"^[A-Z][A-Za-z]+(?:[ \t]+[A-Za-z][A-Za-z]*){0,5}\.?$"
+    r"^[A-Z][A-Za-z]+(?:[ \t]+[A-Za-z][A-Za-z]*){0,5}\.$"
 )
 _FOLLOWING_SECTION_HEAD_RE = re.compile(
     r"^\d{1,3}[A-Z]?\.\s+(?:\(\d+\)|[A-Z])"
@@ -661,9 +663,11 @@ def _join_wrapped_marginal_notes(text: str) -> str:
         Definitions.
         2. In this Act, unless the context otherwise requires
 
-    That label belongs to section 2. A line with a comma, a digit, or no
-    following ``N.`` heading is left where it is (footer continuations such as
-    ``Department, Quetta.`` and the wrapped year ``2025.``).
+    That label belongs to section 2. The note has to end with a period. A
+    line with no period (``Federal Government`` at the end of a subsection),
+    a comma, a digit, or no following ``N.`` heading stays where it is
+    (footer continuations such as ``Department, Quetta.`` and the wrapped
+    year ``2025.``).
     """
     lines = text.splitlines()
     joined: List[str] = []
@@ -884,6 +888,14 @@ def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> Li
     for match in matches:
         if _year_citation_context(text, match):
             continue
+        # ``197.5`` is a year the scan split with a dot, not section 197.
+        number_at = match.start(1) if match.groups() else match.start()
+        line_end = text.find("\n", number_at)
+        if line_end < 0:
+            line_end = len(text)
+        line_start = text.rfind("\n", 0, number_at) + 1
+        if re.fullmatch(r"\d{3}\.\d", text[line_start:line_end].strip()):
+            continue
         kept.append(match)
     return kept
 
@@ -1079,6 +1091,10 @@ def _is_plausible_act_title(name: str) -> bool:
         return False
     if LISTING_CHROME_TITLE_RE.search(candidate):
         return False
+    from scraper.statute_quality.senate_integrity import is_gazette_non_act_title
+
+    if is_gazette_non_act_title(candidate):
+        return False
     if looks_like_fragment_name(candidate):
         return False
     if not (6 <= len(candidate) <= 180):
@@ -1131,6 +1147,15 @@ def prefer_official_statute_title(detected_name: Optional[str], official_title: 
         return official
     return detected
 
+_SCHEDULE_TAIL_RE = re.compile(r"(?im)^[ \t]*schedules?\b[^\n]*$")
+
+
+def _schedule_tail_is_open(text: str) -> bool:
+    """True when a Schedule heading is still the tail of this section."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return any(_SCHEDULE_TAIL_RE.match(line) for line in lines[-4:])
+
+
 def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional[str] = None) -> List[Dict[str, str]]:
     sanity_cap = _section_cap_for_statute(statute_name or "")
     siblings = _sibling_number_pairs([s.get("section_number", "") for s in sections])
@@ -1175,6 +1200,13 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
                 pending_schedule_text = (pending_schedule_text + "\n" + text).strip()
             continue
         previous_raw_was_tariff = False
+        # A Schedule after the last section is not a fresh set of section
+        # numbers. ``1. The first item…`` used to be dropped as a duplicate
+        # section 1, which deleted the schedule body.
+        if out and _schedule_tail_is_open(out[-1].get("section_text") or ""):
+            if text.strip():
+                _append_section_text(out[-1], text)
+            continue
         # allow duplicate numbers if text differs substantially (>50 chars diff) - keep first only for safety
         if key in seen:
             continue
@@ -1460,6 +1492,29 @@ _OCR_COMMA_HEADING_RE = re.compile(
 )
 _STRUCTURAL_COMMA_TITLE_RE = re.compile(r"(?i)^(?:amendment|short\s+title|repeal)\b")
 _ENACTED_AS_FOLLOWS_RE = re.compile(r"(?i)\benacted\s+as\s+follows\b[ \t:.\-—–]*")
+# ``1.`` read as ``L`` or ``l`` on the short-title line. ``Short tide`` is
+# ``Short title``. The line has no comma and no dash, so the comma repair
+# does not see it. ``Amcndment`` on that same line is ``Amendment``.
+_OCR_L_SHORT_TITLE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)[Ll](?P<gap>[ \t]+)"
+    r"(?P<rest>Short[ \t]+t[itl1d][A-Za-z]{1,8}\b.*)$"
+)
+
+
+def _repair_ocr_l_short_title(text: str) -> str:
+    """Turn ``L Short tide …`` into section 1. ``l.`` already has its period.
+
+    ``Amcndment`` on the following short-title line is ``Amendment``. The
+    rewrite runs only when this ``L`` / ``l`` heading is present.
+    """
+    if not _OCR_L_SHORT_TITLE_RE.search(text or ""):
+        return text
+    text = text.replace("Amcndment", "Amendment")
+
+    def _repl(match: re.Match) -> str:
+        return f"{match.group('indent')}1.{match.group('gap')}{match.group('rest')}"
+
+    return _OCR_L_SHORT_TITLE_RE.sub(_repl, text)
 
 
 # ``2, In the said Ordinance`` / ``3, In the principal Act``. The comma is the
@@ -1890,7 +1945,7 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
     """
     try:
         plain = BeautifulSoup(text, "html.parser").get_text(separator="\n") if _is_html(text) else text
-        plain = _join_wrapped_marginal_notes(_normalize_whitespace(plain))
+        plain = _repair_ocr_l_short_title(_join_wrapped_marginal_notes(_normalize_whitespace(plain)))
         if _is_amendment_statute(statute_name, plain):
             plain = _repair_amendment_ocr_clause_heads(plain)
         plain = _repair_ocr_swallowed_section_headings(

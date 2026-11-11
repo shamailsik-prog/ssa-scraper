@@ -18,6 +18,7 @@ Conciliation Courts ``86215821``, stays on ``python -m scraper.tasks.gok_multi_a
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -28,13 +29,14 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import pdf_text_layer
 from scraper.models import CorpusMetadata, DocumentQuarantine, Statute, StatuteSection, StatuteSectionVersion
+from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.statute_quality.bundled_gazette import (
     ACTION_QUARANTINE,
     VERDICT_FETCH_FAIL,
@@ -44,6 +46,7 @@ from scraper.statute_quality.bundled_gazette import (
     VERDICT_SKIPPED_EMPTY,
     BundledGazetteVerdict,
     classify_bundled_gazette,
+    gazette_bundle_hold_reason,
 )
 from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source
 from scraper.statute_quality.senate_integrity import is_pdf_document_url, is_senate_sourced, split_statute_source_url
@@ -52,6 +55,80 @@ from scraper.tasks.senate_statute_integrity import recorded_pdf_bytes
 logger = logging.getLogger(__name__)
 
 LATEST_RUN_KEY = "bundled_gazette_act_latest_run_id"
+
+# Source-verified rows. ``--preview-reextract`` reads these and writes nothing.
+CONFIRMED_BLEED_STATUTE_IDS = (
+    UUID("df10d129-fd7b-4c25-9a38-828878466e6a"),
+    UUID("b535370b-a524-4d2b-8e72-562984904397"),
+    UUID("92aeaf99-7603-41d6-a541-f2c38fe27d04"),
+    UUID("5636b724-6a47-42a7-93f5-4d78e07ddea8"),
+    UUID("12cf06c5-d90a-4ccb-92e6-30c8c0d7f7c3"),
+    UUID("925a267d-a608-419e-9a02-6efba375a7bc"),
+    UUID("21f60373-b62a-4df8-9f0f-947dcf8a352e"),
+    UUID("06a5058e-511e-4039-befa-947f1fcdfd68"),
+    UUID("a6583612-bc3a-4aaf-8584-bbb65b884596"),
+    UUID("a8803342-bb11-45d2-8651-bc2efd158476"),
+    UUID("018fa065-d60f-4332-bbe0-d731fc560961"),
+    UUID("e81dbcfa-910c-4065-8f3c-4d28b1c36c9f"),
+    UUID("6c73a686-c038-4611-8f05-8a429168c8a7"),
+    UUID("10cc6efa-f845-42e5-83ee-11eeabd0bc63"),
+    UUID("0181ad58-1a79-479c-bdd8-dad584cfd683"),
+    UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"),
+    UUID("bbc0bfca-6a0e-4eef-b771-532f4f3a4041"),
+    UUID("337584d6-c37a-4cfb-99bd-6e933f5b195b"),
+    UUID("eef57038-13dc-4b4d-b050-14cb7d490e44"),
+    UUID("eb8f8ae0-727a-464b-9786-db0247eca896"),
+    UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96"),
+    UUID("f700f160-4bf3-41df-9ec5-b052b5627f77"),
+    UUID("17f283f3-b875-4c5d-b3ed-6a235d9ebd21"),
+    UUID("df206e70-1114-4676-8eec-c77fa051f268"),
+    UUID("65c5b7b3-674c-4726-8372-b068527cea90"),
+    UUID("768e086d-329e-42d9-ade3-01900badfb8e"),
+)
+
+# Empty string: the URL no longer serves the harvested file, and no authentic
+# sha is on record. Any bytes are a mismatch.
+PIN_UNTRUSTED = ""
+_S217 = "d669e63a3a69670fa808c620672861ff3f616ca7986c217c0bb0b27415e5b114"
+_S710 = "02380046aded041db4be54b644b96afbc14e921f8f978756eb56d88f966b1ede"
+_S476 = "a169a902a17a3c38916c8bab05f27859d38989ba5ee63b02afde02b6262fdd01"
+_S441 = "320370bfdbe1631332ab60457c17ab1f79fed7e57102269413fe27e5963b51a7"
+_S605 = "5bc250481cb702b5565b7091e1b5720d4b657567bfcb60af1aec9a076d0afd34"
+_S478 = "d90008a3b35e0ad5b9d2056f0b69462e5fc55d6fb3428049e348fc06754e90a4"
+_S171 = "6e9dbba7f60a4265543521a4084565d150c9c29747cb6d860a993d6a1bc37636"
+_S685 = "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22"
+_S133 = "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616"
+_S678 = "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d"
+_S402 = "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe"
+CONFIRMED_PDF_SHA256 = {
+    UUID("df10d129-fd7b-4c25-9a38-828878466e6a"): _S217,
+    UUID("b535370b-a524-4d2b-8e72-562984904397"): _S217,
+    UUID("92aeaf99-7603-41d6-a541-f2c38fe27d04"): _S710,
+    UUID("5636b724-6a47-42a7-93f5-4d78e07ddea8"): _S710,
+    UUID("12cf06c5-d90a-4ccb-92e6-30c8c0d7f7c3"): _S476,
+    UUID("925a267d-a608-419e-9a02-6efba375a7bc"): _S476,
+    UUID("21f60373-b62a-4df8-9f0f-947dcf8a352e"): _S441,
+    UUID("06a5058e-511e-4039-befa-947f1fcdfd68"): _S441,
+    UUID("a6583612-bc3a-4aaf-8584-bbb65b884596"): PIN_UNTRUSTED,
+    UUID("a8803342-bb11-45d2-8651-bc2efd158476"): PIN_UNTRUSTED,
+    UUID("018fa065-d60f-4332-bbe0-d731fc560961"): _S605,
+    UUID("e81dbcfa-910c-4065-8f3c-4d28b1c36c9f"): _S605,
+    UUID("6c73a686-c038-4611-8f05-8a429168c8a7"): _S478,
+    UUID("10cc6efa-f845-42e5-83ee-11eeabd0bc63"): _S478,
+    UUID("0181ad58-1a79-479c-bdd8-dad584cfd683"): _S171,
+    UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"): _S171,
+    UUID("bbc0bfca-6a0e-4eef-b771-532f4f3a4041"): PIN_UNTRUSTED,
+    UUID("337584d6-c37a-4cfb-99bd-6e933f5b195b"): PIN_UNTRUSTED,
+    UUID("eef57038-13dc-4b4d-b050-14cb7d490e44"): _S685,
+    UUID("eb8f8ae0-727a-464b-9786-db0247eca896"): _S685,
+    UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96"): _S133,
+    UUID("f700f160-4bf3-41df-9ec5-b052b5627f77"): _S133,
+    UUID("17f283f3-b875-4c5d-b3ed-6a235d9ebd21"): _S678,
+    UUID("df206e70-1114-4676-8eec-c77fa051f268"): _S678,
+    UUID("65c5b7b3-674c-4726-8372-b068527cea90"): _S402,
+    UUID("768e086d-329e-42d9-ade3-01900badfb8e"): _S402,
+}
+LIVE_NA_320_SHA = "83236f6eeedc4bcfd96d3beea0402e3a147ca56393c053fda9fa3a34c238b19d"
 _FETCH_HOSTS = frozenset(
     {
         "senate.gov.pk",
@@ -211,6 +288,40 @@ def _row_payload(
     }
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(bytes(data)).hexdigest()
+
+
+def accept_pinned_pdf(
+    candidates: Sequence[tuple[str, Optional[bytes]]],
+    *,
+    pinned_sha: Optional[str] = None,
+    recorded_sha: Optional[str] = None,
+) -> tuple[Optional[bytes], str]:
+    """Keep bytes only when every supplied sha matches. A missing pin fails closed.
+
+    ``pinned_sha=""`` means this row has no authentic file. The live PDF is
+    not adopted, even when a stored hash was overwritten to that live file.
+    When no sha was supplied and the fetched bytes differ from the recorded
+    bytes, that is also a mismatch.
+    """
+    if pinned_sha == PIN_UNTRUSTED:
+        return None, "sha_mismatch"
+    pdfs = [(origin, bytes(blob)) for origin, blob in candidates if blob and bytes(blob).startswith(b"%PDF")]
+    pins = [item.lower() for item in (pinned_sha, recorded_sha) if item]
+    if not pins:
+        if len(pdfs) >= 2 and _sha256_hex(pdfs[0][1]) != _sha256_hex(pdfs[1][1]):
+            return None, "sha_mismatch"
+        if pdfs:
+            return pdfs[0]
+        return None, "unavailable"
+    for origin, blob in pdfs:
+        digest = _sha256_hex(blob)
+        if all(digest == pin for pin in pins):
+            return blob, origin
+    return None, "sha_mismatch"
+
+
 async def _resolve_pdf_text(
     fetch_url: str,
     *,
@@ -219,30 +330,30 @@ async def _resolve_pdf_text(
     recorded_loader: Optional[RecordedLoader],
     extract_text: ExtractText,
     skip_fetch: bool,
+    pinned_sha: Optional[str] = None,
+    recorded_sha: Optional[str] = None,
 ) -> tuple[Optional[str], str, bool]:
-    data: Optional[bytes] = None
-    origin = "unavailable"
+    fetched: Optional[bytes] = None
     if not skip_fetch and fetch_pdf is not None:
         try:
-            data = await _maybe_await(fetch_pdf(fetch_url))
+            fetched = await _maybe_await(fetch_pdf(fetch_url))
         except Exception as exc:
             logger.warning("bundled gazette fetch callback failed for %s: %s", fetch_url, exc)
-            data = None
-    if data and bytes(data).startswith(b"%PDF"):
-        origin = "fetched"
-    else:
-        recorded = None
-        if recorded_loader is not None:
-            recorded = await _maybe_await(recorded_loader(fetch_url))
-        else:
-            recorded = await recorded_pdf_bytes(db, fetch_url)
-        if recorded and bytes(recorded).startswith(b"%PDF"):
-            data = bytes(recorded)
-            origin = "recorded"
-        else:
-            data = None
-    if not data:
-        return None, "unavailable", False
+            fetched = None
+    recorded = None
+    if recorded_loader is not None:
+        recorded = await _maybe_await(recorded_loader(fetch_url))
+    elif pinned_sha is not None or recorded_sha is not None:
+        recorded = await recorded_pdf_bytes(db, fetch_url)
+    elif fetched is None or not bytes(fetched or b"").startswith(b"%PDF"):
+        recorded = await recorded_pdf_bytes(db, fetch_url)
+    data, origin = accept_pinned_pdf(
+        (("fetched", fetched), ("recorded", recorded)),
+        pinned_sha=pinned_sha,
+        recorded_sha=recorded_sha,
+    )
+    if origin == "sha_mismatch" or not data:
+        return None, origin, False
     try:
         text = extract_text(data) or ""
     except Exception as exc:
@@ -415,6 +526,103 @@ async def run_bundled_gazette_acts(
         }
 
 
+async def preview_confirmed_reextract(
+    *,
+    statute_id: Optional[UUID] = None,
+    skip_fetch: bool = False,
+    fetch_pdf: Optional[FetchPdf] = None,
+    extract_text: Optional[ExtractText] = None,
+    recorded_loader: Optional[RecordedLoader] = None,
+) -> Dict[str, Any]:
+    """Re-extract confirmed bundled-gazette rows in memory. Writes nothing.
+
+    A marker whose Act is not in the current PDF yields no sections. This does
+    not insert, update, or delete statute, section, or quarantine rows.
+    """
+    ids = [statute_id] if statute_id is not None else list(CONFIRMED_BLEED_STATUTE_IDS)
+    text_fn = extract_text or pdf_text_layer
+    fetcher = fetch_pdf if fetch_pdf is not None else fetch_gazette_pdf
+    rows: List[Dict[str, Any]] = []
+    async with SessionLocal() as db:
+        await db.execute(text("SET TRANSACTION READ ONLY"))
+        for sid in ids:
+            statute = (await db.execute(select(Statute).where(Statute.id == sid))).scalars().first()
+            if statute is None:
+                rows.append({"statute_id": str(sid), "found": False, "section_count": 0, "writes": 0})
+                continue
+            fetch_url, _label = split_statute_source_url(statute.source_url)
+            pinned = CONFIRMED_PDF_SHA256.get(statute.id) if statute.id in CONFIRMED_PDF_SHA256 else None
+            pdf_text, origin, available = await _resolve_pdf_text(
+                fetch_url,
+                db=db,
+                fetch_pdf=None if skip_fetch else fetcher,
+                recorded_loader=recorded_loader,
+                extract_text=text_fn,
+                skip_fetch=skip_fetch,
+                pinned_sha=pinned,
+            )
+            if not available:
+                rows.append(
+                    {
+                        "statute_id": str(sid),
+                        "found": True,
+                        "stored_name": statute.name,
+                        "source_url": statute.source_url,
+                        "pdf_origin": origin,
+                        "section_count": 0,
+                        "section_numbers": [],
+                        "hold_reason": "recorded_sha_mismatch" if origin == "sha_mismatch" else "pdf_unavailable",
+                        "writes": 0,
+                    }
+                )
+                continue
+            extracted = extract_statute_deterministic(
+                html=None,
+                text=pdf_text,
+                source_meta={
+                    "source_name": statute.source_name,
+                    "url": statute.source_url,
+                    "act_title": statute.name,
+                    "jurisdiction": statute.jurisdiction,
+                },
+            )
+            extracted_sections = list(extracted.get("sections") or [])
+            evidence = extracted.get("field_evidence") or {}
+            hold = gazette_bundle_hold_reason(
+                statute_name=str(extracted.get("statute_name") or ""),
+                year_enacted=extracted.get("year_enacted"),
+                jurisdiction=extracted.get("jurisdiction") or statute.jurisdiction,
+                source_url=statute.source_url,
+                source_name=statute.source_name,
+                sections=extracted_sections,
+            )
+            if not hold and evidence.get("bundled_gazette_marker_absent"):
+                hold = "bundled_gazette_marker_absent"
+            elif not hold and evidence.get("bundled_gazette_unresolved"):
+                hold = "bundled_gazette_unresolved"
+            published_name = extracted.get("statute_name")
+            if hold:
+                extracted_sections = []
+                published_name = statute.name
+            rows.append(
+                {
+                    "statute_id": str(sid),
+                    "found": True,
+                    "stored_name": statute.name,
+                    "source_url": statute.source_url,
+                    "pdf_origin": origin,
+                    "statute_name": published_name,
+                    "year_enacted": extracted.get("year_enacted"),
+                    "section_count": len(extracted_sections),
+                    "section_numbers": [section.get("section_number") for section in extracted_sections],
+                    "hold_reason": hold,
+                    "marker_absent": bool((extracted.get("field_evidence") or {}).get("bundled_gazette_marker_absent")),
+                    "writes": 0,
+                }
+            )
+    return {"dry_run": True, "writes": 0, "preview_reextract": True, "rows": rows}
+
+
 def build_parser():
     import argparse
 
@@ -426,6 +634,14 @@ def build_parser():
         )
     )
     parser.add_argument("--apply", action="store_true", help="Insert document_quarantine rows for visible mismatches")
+    parser.add_argument(
+        "--preview-reextract",
+        action="store_true",
+        help=(
+            "Re-extract the confirmed bundled-gazette rows, or one --statute-id, and print the result. "
+            "Writes nothing. A marker whose Act is not in the PDF produces no sections."
+        ),
+    )
     parser.add_argument("--undo", metavar="RUN_ID", help="Remove quarantine rows inserted by one --apply run")
     parser.add_argument("--limit", type=int, default=None, help="Classify at most this many in-scope rows")
     parser.add_argument("--statute-id", default=None, help="Classify one statute UUID")
@@ -446,6 +662,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     statute_id = UUID(args.statute_id) if args.statute_id else None
+    if args.preview_reextract:
+        if args.apply or args.undo:
+            raise SystemExit("preview-reextract writes nothing and cannot be combined with --apply or --undo")
+        out = run_async(
+            preview_confirmed_reextract(
+                statute_id=statute_id,
+                skip_fetch=args.skip_fetch,
+            )
+        )
+        print(json.dumps(out, indent=2, default=str))
+        return 0
     out = run_async(
         run_bundled_gazette_acts(
             apply=args.apply,

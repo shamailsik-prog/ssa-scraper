@@ -122,6 +122,10 @@ async def test_env_false_name_quality_allows_missing_year(db, monkeypatch):
             ],
         },
     )
+    # A Federal gazette payload that omits the year is held. This gate is the
+    # non-gazette case: the flag still promotes a missing year there.
+    st.source_name = "Sindh"
+    st.source_url = "https://example.test/legacy-missing-year"
     assert await promote_statute_staging(db, st) == "promoted"
 
 
