@@ -473,10 +473,10 @@ async def test_live_catalog_fixture_discovers_acts_and_records_rejected_urls(db,
     assert stats["rejected_urls"] >= 3
     assert len(sample) == stats["rejected_urls"]
     assert len(sample) <= REJECTED_URL_SAMPLE_LIMIT
-    hosts = {urlsplit(item["url"]).hostname for item in sample}
-    assert "drs.molaw.gov.pk" in hosts
-    assert "play.google.com" in hosts
-    assert "apps.apple.com" in hosts
+    found_hosts = [urlsplit(item["url"]).hostname for item in sample]
+    assert any(host == "drs.molaw.gov.pk" for host in found_hosts)
+    assert any(host == "play.google.com" for host in found_hosts)
+    assert any(host == "apps.apple.com" for host in found_hosts)
     assert all(item["reason"] for item in sample)
 
 

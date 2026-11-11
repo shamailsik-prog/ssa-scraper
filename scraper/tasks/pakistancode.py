@@ -177,14 +177,6 @@ def _url_for_reject_sample(url: str) -> str:
     return scrub_secrets(cleaned)[:500]
 
 
-def _host_for_reject_log(url: str) -> str:
-    """Hostname only. The full URL stays in job stats and is not written to the log."""
-    try:
-        return urlsplit(url or "").hostname or "unknown-host"
-    except ValueError:
-        return "unknown-host"
-
-
 def document_identity_suffix(meta: Optional[Dict[str, Any]] = None) -> str:
     """Detail page / act number / listing title that distinguishes shared PDF bytes."""
     meta = meta or {}
@@ -680,7 +672,13 @@ class PakistanCodePipeline(PublicPipeline):
         except ValueError:
             return
         sample.append({"url": recorded, "reason": reason})
-        logger.info("%s: rejected URL host %s", self.source.source_name, _host_for_reject_log(recorded))
+        # The scrubbed URL stays in job stats. The log records only the count so a
+        # credential-shaped link cannot be written to the log stream.
+        logger.info(
+            "%s: rejected URL recorded in job stats (%s)",
+            self.source.source_name,
+            int(self.stats["rejected_urls"]),
+        )
 
     @staticmethod
     def _retryable_retired(row: CrawlFrontier) -> bool:
