@@ -212,8 +212,22 @@ _ROBOTS_TTL = 6 * 3600
 _ROBOTS_UNAVAILABLE_TTL = 300
 _ROBOTS_UNAVAILABLE = object()
 # Long enough to tell a TLS failure from a timeout, short enough for a job error.
+# Userinfo, query strings, and Bearer/Basic tokens are removed before this cap.
 ROBOTS_TRANSPORT_REASON_LIMIT = 400
 _URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#\s@]+)@")
+# From '?' through the query. Stops at whitespace or a fragment so the path stays.
+_URL_QUERY_RE = re.compile(r"\?[^\s#]*")
+# Authorization-style Bearer and Basic values. "Basic Constraints" in a TLS
+# error is eleven letters and is not a token. An Authorization header value is
+# removed even when it is shorter than that. A bare scheme needs twelve
+# characters, or credential punctuation, before it is treated as a token.
+_AUTH_PREFIXED_RE = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)([A-Za-z0-9\-._~+/=]+)"
+)
+_AUTH_BARE_RE = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)"
+    r"([A-Za-z0-9\-._~+/=]{12,}|[A-Za-z0-9\-._~+/]*[=+./_~-][A-Za-z0-9\-._~+/=]*)"
+)
 
 
 def _redact_url_userinfo(text: str) -> str:
@@ -221,9 +235,26 @@ def _redact_url_userinfo(text: str) -> str:
     return _URL_USERINFO_RE.sub(r"\1***@", text or "")
 
 
+def _redact_robots_secrets(text: str) -> str:
+    """Userinfo, then query strings, then Bearer and Basic tokens.
+
+    Applying this twice leaves the same text: ``***``, ``?***`` and the scheme
+    words are not themselves tokens.
+    """
+    redacted = _redact_url_userinfo(text)
+    redacted = _URL_QUERY_RE.sub("?***", redacted)
+    redacted = _AUTH_PREFIXED_RE.sub(r"\1***", redacted)
+    return _AUTH_BARE_RE.sub(r"\1***", redacted)
+
+
 def _robots_transport_reason(text: str) -> str:
-    """Exception class and message, with URL userinfo removed and the length capped."""
-    reason = _redact_url_userinfo(text).replace("\n", " ").strip()
+    """Exception class and message, with secrets removed and the length capped.
+
+    URL userinfo, URL query strings, and Authorization-style Bearer and Basic
+    tokens are redacted before the 400-code-point cap.
+    """
+    folded = (text or "").replace("\n", " ").strip()
+    reason = _redact_robots_secrets(folded)
     limit = ROBOTS_TRANSPORT_REASON_LIMIT
     if len(reason) <= limit:
         return reason

@@ -131,6 +131,95 @@ def test_fetcher_supplied_reason_is_redacted_before_it_is_cached():
     reset_robots_cache()
 
 
+def _with_uncapped_tail(detail: str) -> tuple[str, str]:
+    tail = "TAILMARKER" + ("Z" * 40)
+    return f"{detail} " + ("A" * 800) + f" {tail}", tail
+
+
+def _transport_failure(monkeypatch, caplog, detail: str):
+    monkeypatch.setattr(httpx, "get", _boom(httpx.ConnectError(detail)))
+    reset_robots_cache()
+    with caplog.at_level(logging.WARNING, logger="scraper.security"):
+        with pytest.raises(RobotsUnavailable) as first:
+            robots_allows("https://na.gov.pk/en/acts-tenure.php")
+        with pytest.raises(RobotsUnavailable) as replayed:
+            robots_allows("https://na.gov.pk/en/bills.php")
+    message = str(first.value)
+    assert str(replayed.value) == message
+    stats: dict = {}
+    note_public_fetch_problem(stats, first.value, deferred=True)
+    reason = message.split("HTTP 599: ", 1)[1].split("); deferred", 1)[0]
+    logged = caplog.text
+    reset_robots_cache()
+    return message, reason, stats["last_fetch_error"], logged
+
+
+def _assert_reason_capped(reason: str, tail: str, *surfaces: str) -> None:
+    assert len(reason) <= ROBOTS_TRANSPORT_REASON_LIMIT
+    assert 300 <= ROBOTS_TRANSPORT_REASON_LIMIT <= 500
+    assert reason.endswith("...")
+    assert tail not in reason
+    for surface in surfaces:
+        assert tail not in surface
+
+
+def test_transport_reason_redacts_url_query_strings(monkeypatch, caplog):
+    user = "audit-user"
+    secret = "s3cret-token"
+    query = "?token=abc123&access_token=xyz789"
+    detail, tail = _with_uncapped_tail(
+        f"https://{user}:{secret}@na.gov.pk/robots.txt{query} and again {query}"
+    )
+    message, reason, stored, logged = _transport_failure(monkeypatch, caplog, detail)
+    assert "ConnectError:" in message
+    assert "https://***@" in message
+    assert "?***" in message
+    assert "na.gov.pk/robots.txt?***" in message
+    for leaked in (user, secret, "token=abc123", "access_token=xyz789", "abc123", "xyz789"):
+        assert leaked not in message
+        assert leaked not in stored
+        assert leaked not in logged
+    _assert_reason_capped(reason, tail, message, stored, logged)
+
+
+def test_transport_reason_redacts_bearer_tokens(monkeypatch, caplog):
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    )
+    detail, tail = _with_uncapped_tail(f"authorization: Bearer {jwt}")
+    message, reason, stored, logged = _transport_failure(monkeypatch, caplog, detail)
+    assert "ConnectError:" in message
+    assert "Bearer ***" in message
+    assert jwt not in message and jwt[:24] not in message
+    assert jwt not in stored and jwt not in logged
+    _assert_reason_capped(reason, tail, message, stored, logged)
+
+
+def test_transport_reason_redacts_basic_tokens(monkeypatch, caplog):
+    short_blob = "YQ=="
+    # Twelve alphanumeric characters, no padding: bare "Basic <word>" must not need
+    # punctuation, and a shorter Authorization value must not survive either.
+    alphanumeric = "dXNlcjpwYXNz"
+    short_alphanumeric = "YTpi"
+    blob = "dXNlcjpzM2NyZXQtdG9rZW4="
+    detail, tail = _with_uncapped_tail(
+        "certificate verify failed: Basic Constraints of CA cert not marked critical; "
+        f"Authorization: Basic {short_blob}; Authorization: Basic {short_alphanumeric}; "
+        f"Basic {alphanumeric}; Authorization: Basic {blob}"
+    )
+    message, reason, stored, logged = _transport_failure(monkeypatch, caplog, detail)
+    assert "ConnectError:" in message
+    assert "Basic Constraints of CA cert not marked critical" in message
+    assert "Basic ***" in message
+    for leaked in (short_blob, alphanumeric, short_alphanumeric, blob):
+        assert leaked not in message
+        assert leaked not in stored
+        assert leaked not in logged
+    _assert_reason_capped(reason, tail, message, stored, logged)
+
+
 def test_http_5xx_from_a_fetcher_stays_a_status_without_a_transport_reason():
     reset_robots_cache()
 
