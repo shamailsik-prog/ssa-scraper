@@ -46,7 +46,7 @@ def test_tls_failure_records_exception_class_and_message(monkeypatch, caplog):
     assert str(replayed.value) == message
     assert any(
         record.levelno == logging.WARNING
-        and "robots.txt fetch failed for https://na.gov.pk/robots.txt" in record.getMessage()
+        and "robots.txt fetch failed:" in record.getMessage()
         and "ConnectError:" in record.getMessage()
         and "unable to get local issuer certificate" in record.getMessage()
         for record in caplog.records

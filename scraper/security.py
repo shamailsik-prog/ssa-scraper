@@ -312,9 +312,9 @@ def _fetch_robots_sync(robots_url: str):
         return r.text, r.status_code
     except Exception as exc:
         reason = _robots_transport_reason(f"{type(exc).__name__}: {exc}")
-        # robots_url is the origin plus /robots.txt, with userinfo already removed.
-        # reason is the capped exception text after the same userinfo redaction.
-        logger.warning("robots.txt fetch failed for %s: %s", robots_url, reason)
+        # The request URL is not logged here. The redacted, length-capped exception
+        # text is what distinguishes a TLS failure from a timeout.
+        logger.warning("robots.txt fetch failed: %s", reason)
         return "", 599, reason
 
 
