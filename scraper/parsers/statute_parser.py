@@ -80,6 +80,13 @@ ACT_WITH_YEAR_PATTERN = re.compile(
 )
 SECTION_DIGIT_START_RE = re.compile(r'^\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)', re.DOTALL)
 SECTION_KEYWORD_RE = re.compile(r'^\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*(.*)', re.IGNORECASE | re.DOTALL)
+# A section number is at least 1. A lone 0 is not a heading: OCR reads clause
+# '(o)' as '0)', 'o)', 'O)' or '(0)'. '0A' is not a heading either. '1', '10',
+# '20', '08', '10A' and a hyphen closer stay. '0' followed by a digit ('03')
+# stays so a zero-padded tariff row still reaches the schedule fold.
+# The two alternatives diverge on the first character, so the match is linear.
+_SECTION_NUMBER_TOKEN = r"(?:[1-9]\d*|0\d+)[A-Z]?"
+_MARGINAL_SECTION_NUMBER_TOKEN = r"(?:[1-9]\d{0,2}|0\d{1,2})[A-Z]?"
 # Balochistan gazette PDFs put the marginal note in the left column and the
 # section number in the right. pdfplumber joins them onto one line
 # ("Short title, 1. (1) This Act may be called…"). A line-start split then
@@ -90,7 +97,7 @@ _MARGINAL_SECTION_HEAD_RE = re.compile(
     r"[A-Z][A-Za-z][A-Za-z,'’\-]{0,40}"
     r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,6}"
     r"\.?[ \t]+"
-    r"(\d{1,3}[A-Z]?)"
+    rf"({_MARGINAL_SECTION_NUMBER_TOKEN})"
     # "1. (1)" / "7. The" on a text layer. OCR also drops the period ("2 (1)")
     # or reads the subsection mark as "@)".
     r"(?:"
@@ -128,12 +135,14 @@ _PRINCIPAL_MARGIN_NOTE_INSTRUMENT_RE = re.compile(
     r"(?:act|ordinance|order|code|rules|regulations)\b"
 )
 _LINE_START_SECTION_RE = re.compile(
-    r"(?:^|\n)\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]\s*",
+    rf"(?:^|\n)\s*({_SECTION_NUMBER_TOKEN})\s*[\.\-\)\:\]]\s*",
     re.MULTILINE,
 )
 # Used only when line-start and marginal headings together find fewer than two
 # sections. Same cross-reference and sequence rules as a marginal heading.
-_LOOSE_SECTION_RE = re.compile(r"(\d+[A-Z]?)\s*[\.\-\)]\s+(?=[A-Z][a-z])")
+_LOOSE_SECTION_RE = re.compile(
+    rf"({_SECTION_NUMBER_TOKEN})\s*[\.\-\)]\s+(?=[A-Z][a-z])"
+)
 SHORT_TITLE_CLAUSE_RE = re.compile(
     r'^\s*(?:section\s+\d+[A-Z]?\s*[\.\-\)\:]\s*)?(?:short\s+title[^.:\n]*[:\-\.\)]\s*)?(?:this|the)\s+'
     r'(?:act|ordinance|order|code|rules?|regulations?)\s+(?:may|shall)\s+be\s+called\b',
@@ -352,6 +361,20 @@ def _parse_numeric_section_number(raw_section_number: str) -> Optional[int]:
 def is_exact_year_section_number(raw_section_number: str) -> bool:
     """True for a 4-digit token 1800–2099 (``^(1[89]|20)\\d{2}$``)."""
     return bool(EXACT_YEAR_SECTION_RE.fullmatch((raw_section_number or "").strip()))
+
+
+# ``0`` and ``0A``. ``10``, ``20`` and ``08`` are real numbers. ``0E`` / ``0I``
+# are tariff chapter tokens and stay on the schedule path.
+_ZERO_SECTION_NUMBER_RE = re.compile(r"(?i)^0[A-Z]?$")
+_TARIFF_OCR_CHAPTER_RE = re.compile(r"(?i)^0[EI]$")
+
+
+def is_zero_section_number(raw_section_number: str) -> bool:
+    """True when a heading token is section 0 (or ``0A``), which is never a section."""
+    raw = (raw_section_number or "").strip()
+    if _TARIFF_OCR_CHAPTER_RE.fullmatch(raw):
+        return False
+    return bool(_ZERO_SECTION_NUMBER_RE.fullmatch(raw))
 
 
 def section_text_starts_with_amendment_date(text: str) -> bool:
@@ -876,6 +899,52 @@ def _drop_ocr_definition_clause_headings(text: str, matches: Sequence[Match[str]
     return kept
 
 
+# '(o)' read as '0)', 'o)', 'O)' or '(0)'. The lookbehind keeps '10)' and '20)'
+# from matching the '0)' inside them. Fixed-width, linear.
+_OCR_O_CLAUSE_MARKER_RE = re.compile(r"(?<![0-9A-Za-z])(?:0\)|[oO]\)|\(0\))")
+_LETTER_CLAUSE_RE = re.compile(r"\(([A-Za-z])\)")
+
+
+def _running_letter_clauses_end_at_n(text: str, pos: int) -> bool:
+    """True when a letter-clause run such as ``(m)`` ``(n)`` ends at this point."""
+    window_start = max(0, pos - 4000)
+    letters = [item.group(1).lower() for item in _LETTER_CLAUSE_RE.finditer(text, window_start, pos)]
+    if len(letters) < 2 or letters[-1] != "n":
+        return False
+    run = 1
+    index = len(letters) - 1
+    while index > 0 and ord(letters[index]) == ord(letters[index - 1]) + 1:
+        run += 1
+        index -= 1
+    return run >= 2
+
+
+def _is_ocr_o_clause_in_running_list(text: str, match: Match[str]) -> bool:
+    """True when this heading is ``0)`` / ``o)`` / ``O)`` / ``(0)`` inside ``(m)`` ``(n)`` …"""
+    number_at = match.start(1) if match.groups() else match.start()
+    origin = number_at - 1 if number_at > 0 and text[number_at - 1] == "(" else number_at
+    if _OCR_O_CLAUSE_MARKER_RE.match(text, origin) is None:
+        return False
+    return _running_letter_clauses_end_at_n(text, origin)
+
+
+def _drop_zero_section_and_ocr_o_clauses(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
+    """Never start a section at 0. An OCR ``(o)`` inside ``(m)`` ``(n)`` stays in that section.
+
+    ``1.``, ``10.``, ``20.``, ``10A`` and a hyphen closer are real headings.
+    ``0E`` / ``0I`` are tariff chapter tokens and are not this class.
+    """
+    kept: List[Match[str]] = []
+    for match in matches:
+        token = (match.group(1) or "").strip() if match.groups() else ""
+        if is_zero_section_number(token):
+            continue
+        if _is_ocr_o_clause_in_running_list(text, match):
+            continue
+        kept.append(match)
+    return kept
+
+
 def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
     """Drop split points that are year citations ('of 1860)', '2001) dt.').
 
@@ -1243,6 +1312,12 @@ def _deduplicate_sections(sections: List[Dict[str, str]], statute_name: Optional
                     _append_section_text(out[-1], text)
                 else:
                     pending_year_text = (pending_year_text + "\n" + text).strip()
+            continue
+        # Section 0 is the OCR of clause (o). Keep the words on the previous
+        # section. A leading 0 with nothing before it is not stored as a section.
+        if is_zero_section_number(token):
+            if text.strip() and out:
+                _append_section_text(out[-1], text)
             continue
         # filter tiny sections that are likely not real
         if len(text) < 20:
@@ -1990,6 +2065,8 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         matches = _filter_year_heading_matches(plain, matches)
         matches = _drop_ocr_definition_clause_headings(plain, matches)
         matches = _drop_shadowed_paren_ocr_subsections(plain, matches)
+        # '0)' / 'o)' / 'O)' / '(0)' inside (m), (n), ... is clause (o), not a section.
+        matches = _drop_zero_section_and_ocr_o_clauses(plain, matches)
         sections = []
         if len(matches) >= 2:
             first_end = matches[1].start() if len(matches) > 1 else len(plain)
