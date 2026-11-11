@@ -211,6 +211,36 @@ _ROBOTS_CACHE: Dict[str, tuple] = {}
 _ROBOTS_TTL = 6 * 3600
 _ROBOTS_UNAVAILABLE_TTL = 300
 _ROBOTS_UNAVAILABLE = object()
+# Long enough to tell a TLS failure from a timeout, short enough for a job error.
+ROBOTS_TRANSPORT_REASON_LIMIT = 400
+_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#\s@]+)@")
+
+
+def _redact_url_userinfo(text: str) -> str:
+    """Replace ``scheme://user:password@host`` with ``scheme://***@host``."""
+    return _URL_USERINFO_RE.sub(r"\1***@", text or "")
+
+
+def _robots_transport_reason(text: str) -> str:
+    """Exception class and message, with URL userinfo removed and the length capped."""
+    reason = _redact_url_userinfo(text).replace("\n", " ").strip()
+    limit = ROBOTS_TRANSPORT_REASON_LIMIT
+    if len(reason) <= limit:
+        return reason
+    return reason[: limit - 3].rstrip() + "..."
+
+
+def _robots_base(url: str) -> str:
+    """Origin used for the robots cache and error text. Userinfo is not part of it."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host:
+        return _redact_url_userinfo(f"{parts.scheme}://{parts.netloc}")
+    if ":" in host:
+        host = f"[{host}]"
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return f"{parts.scheme}://{host}"
 
 
 def _robots_unavailable_message(base: str, status: int, reason: str = "") -> str:
@@ -223,8 +253,7 @@ def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> b
     if not settings.SCRAPER_RESPECT_ROBOTS:
         return True
     ua = user_agent or settings.SCRAPER_USER_AGENT
-    parts = urlsplit(url)
-    base = f"{parts.scheme}://{parts.netloc}"
+    base = _robots_base(url)
     now = time.time()
     cached = _ROBOTS_CACHE.get(base)
     if cached and cached[0] is _ROBOTS_UNAVAILABLE and now - cached[1] < _ROBOTS_UNAVAILABLE_TTL:
@@ -237,7 +266,7 @@ def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> b
         robots_url = base + "/robots.txt"
         fetched = (fetcher or _fetch_robots_sync)(robots_url)
         text_body, status = fetched[0], fetched[1]
-        reason = fetched[2] if len(fetched) > 2 and fetched[2] else ""
+        reason = _robots_transport_reason(fetched[2]) if len(fetched) > 2 and fetched[2] else ""
         if status >= 500:
             _ROBOTS_CACHE[base] = (_ROBOTS_UNAVAILABLE, now, status, reason)
             raise RobotsUnavailable(_robots_unavailable_message(base, status, reason))
@@ -278,8 +307,8 @@ def _fetch_robots_sync(robots_url: str):
         )
         return r.text, r.status_code
     except Exception as exc:
-        reason = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
-        logger.warning("robots.txt fetch failed for %s: %s", robots_url, reason)
+        reason = _robots_transport_reason(f"{type(exc).__name__}: {exc}")
+        logger.warning("robots.txt fetch failed for %s: %s", _redact_url_userinfo(robots_url), reason)
         return "", 599, reason
 
 
