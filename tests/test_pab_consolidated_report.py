@@ -1,8 +1,9 @@
 """Read-only pabalochistan consolidated-reprint report.
 
-The report proposes the base-Act name and year from promoted section text
-and flags a same-year stub whose name differs. It does not select
-statutes_staging.raw_text or raw_html, and the CLI transaction is read-only.
+The report proposes the base-Act name and year from the candidate row's
+statutes_staging.raw_text and flags a same-year stub whose name differs.
+Metadata queries stay column-scoped. raw_text is a separate select of that
+one column for the candidate ids. The CLI transaction is read-only.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from scraper.tasks.pab_consolidated_report import (
     build_parser,
     consolidated_reprint_report,
     same_year_statutes_select,
-    section_text_select,
+    staging_raw_text_select,
     staging_rows_select,
     statute_rows_select,
 )
@@ -49,13 +50,12 @@ def test_report_cli_has_no_apply_switch():
 
 
 def test_report_queries_are_column_scoped():
-    statements = (
+    metadata = (
         staging_rows_select(),
         statute_rows_select([uuid4()]),
         same_year_statutes_select([1975]),
-        section_text_select([uuid4()]),
     )
-    for stmt in statements:
+    for stmt in metadata:
         sql = str(stmt.compile(compile_kwargs={"literal_binds": True})).lower()
         names = {column.key.lower() for column in stmt.selected_columns}
         for blocked in _BLOCKED:
@@ -63,8 +63,14 @@ def test_report_queries_are_column_scoped():
             assert blocked not in sql
     staging_names = {column.key for column in staging_rows_select().selected_columns}
     assert staging_names == {"id", "source_url", "promoted_to_id", "created_at"}
-    section_names = {column.key for column in section_text_select([uuid4()]).selected_columns}
-    assert section_names == {"statute_id", "sort_key", "section_number", "section_text"}
+    candidate_id = uuid4()
+    raw_stmt = staging_raw_text_select([candidate_id])
+    raw_names = {column.key for column in raw_stmt.selected_columns}
+    raw_sql = str(raw_stmt.compile(compile_kwargs={"literal_binds": True})).lower()
+    assert raw_names == {"id", "raw_text"}
+    assert "raw_html" not in raw_sql
+    assert "reconciled_json" not in raw_sql
+    assert candidate_id.hex in raw_sql
 
 
 @pytest.mark.asyncio
@@ -94,9 +100,17 @@ async def _add_section(db, statute_id, body: str) -> None:
     await db.flush()
 
 
+SHORT_TITLE = (
+    "1. Short title. This Act may be called the Balochistan Chief Minister "
+    "and Provincial Ministers (Salaries, Allowances and Privileges) Act, 1975.\n"
+)
+
+
 @pytest.mark.asyncio
 async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
     page = CM_PAGE.read_text(encoding="utf-8")
+    assert "amended upto" not in SHORT_TITLE.lower()
+    assert "amended upto" in page.lower()
     consolidated = Statute(
         name=CM_LISTING,
         jurisdiction="Balochistan",
@@ -104,8 +118,8 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
         source_name="BalochistanAssembly",
         source_url=CM_URL,
     )
-    decoy = Statute(
-        name="Unrelated Balochistan Reprint Placeholder Act, 1999",
+    missing_text = Statute(
+        name="Balochistan Staging Text Missing Act, 1999",
         jurisdiction="Balochistan",
         year_enacted=1999,
         source_name="BalochistanAssembly",
@@ -132,9 +146,11 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
         source_name="BalochistanAssembly",
         source_url=AMENDMENT_URL,
     )
-    db.add_all([consolidated, decoy, stub, wildlife, amendment_statute])
+    db.add_all([consolidated, missing_text, stub, wildlife, amendment_statute])
     await db.flush()
-    await _add_section(db, consolidated.id, page)
+    # Live rows keep the cutoff in staging raw_text. Section 1 is only the short title.
+    await _add_section(db, consolidated.id, SHORT_TITLE)
+    await _add_section(db, missing_text.id, page)
     await _add_section(db, amendment_statute.id, AMENDMENT_PAGE.read_text(encoding="utf-8"))
 
     provenance = SourceProvenance(
@@ -148,7 +164,7 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
     decoy_provenance = SourceProvenance(
         source_name="BalochistanAssembly",
         access_method="public",
-        source_url=decoy.source_url,
+        source_url=missing_text.source_url,
         content_hash="b" * 64,
         content_kind="text",
         byte_size=len(page),
@@ -170,19 +186,19 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
         source_url=CM_URL,
         provenance_id=provenance.id,
         content_hash="d" * 64,
-        raw_text=None,
+        raw_text=page,
         promoted_to_id=consolidated.id,
         status="promoted",
     )
-    # The marker lives only on this row's raw_text. The report must not read it.
-    body_only = StatutesStaging(
+    # The first page is in section text only. Missing staging text must not use it.
+    no_text = StatutesStaging(
         source_name="BalochistanAssembly",
         access_method="public",
         source_url="https://pabalochistan.gov.pk/storage/9/placeholder.pdf",
         provenance_id=decoy_provenance.id,
         content_hash="e" * 64,
-        raw_text=page,
-        promoted_to_id=decoy.id,
+        raw_text=None,
+        promoted_to_id=missing_text.id,
         status="promoted",
     )
     amendment = StatutesStaging(
@@ -191,11 +207,11 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
         source_url=AMENDMENT_URL,
         provenance_id=amendment_provenance.id,
         content_hash="f" * 64,
-        raw_text=None,
+        raw_text=AMENDMENT_PAGE.read_text(encoding="utf-8"),
         promoted_to_id=amendment_statute.id,
         status="promoted",
     )
-    db.add_all([staging, body_only, amendment])
+    db.add_all([staging, no_text, amendment])
     await db.flush()
 
     before = {
@@ -207,15 +223,22 @@ async def test_report_lists_proposed_base_act_and_flags_a_differing_stub(db):
 
     assert report["dry_run"] is True
     assert report["writes"] == 0
-    assert report["consolidated_count"] == 1
-    row = report["consolidated"][0]
-    assert row["staging_id"] == str(staging.id)
+    assert report["consolidated_count"] == 2
+    by_id = {item["staging_id"]: item for item in report["consolidated"]}
+    row = by_id[str(staging.id)]
     assert row["statute_id"] == str(consolidated.id)
     assert row["stored_name"] == CM_LISTING
     assert row["stored_year"] == 2014
     assert row["proposed_name"] == CM_HEADING
     assert row["proposed_year"] == 1975
     assert row["pab_amended_upto"] == "Amended upto 9th October, 2014"
+    assert row["reason"] is None
+    missing = by_id[str(no_text.id)]
+    assert missing["proposed_name"] is None
+    assert missing["proposed_year"] is None
+    assert missing["pab_amended_upto"] is None
+    assert missing["reason"] == "no_staging_text"
+    assert str(amendment.id) not in by_id
     assert report["conflict_count"] == 1
     conflict = report["same_year_name_conflicts"][0]
     assert conflict["stub_id"] == str(stub.id)

@@ -1,16 +1,18 @@
 """Read-only inventory of pabalochistan consolidated reprints.
 
-Lists each promoted staging row whose section text carries an ``Amended
-upto`` or ``(as amended)`` marker, with the base-Act name and year that
-heading proposes. Also flags any other statute of that same year whose
-name differs (for example a ``Chief Minister and Ministers … Act No. III
-of 1975`` stub beside the consolidated Chief Minister reprint), so the
-canonical name can be chosen before any retitle.
+Lists each promoted staging row and the base-Act name and year parsed
+from that row's ``statutes_staging.raw_text``. Also flags any other
+statute of that same year whose name differs (for example a ``Chief
+Minister and Ministers … Act No. III of 1975`` stub beside the
+consolidated Chief Minister reprint), so the canonical name can be
+chosen before any retitle.
 
-The queries list columns. ``statutes_staging.raw_text`` and ``raw_html``
-are not selected: the reader role has no grant on those columns. The
-heading is parsed from ``statute_section_version.section_text`` of the
-promoted statute. ``run_report`` opens a read-only transaction
+Promoted section text does not carry the ``Amended upto`` line, so it is
+not the heading source. Metadata queries stay column-scoped.
+``raw_text`` is selected by itself, and only for the candidate staging
+ids. ``raw_html`` is not selected. A candidate with no staging text is
+reported with reason ``no_staging_text`` instead of being dropped.
+``run_report`` opens a read-only transaction
 (``default_transaction_read_only`` and ``SET TRANSACTION READ ONLY``).
 There is no ``--apply`` path.
 
@@ -31,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
 from scraper.database import SessionLocal, run_async
-from scraper.models import Statute, StatuteSection, StatuteSectionVersion, StatutesStaging
+from scraper.models import Statute, StatutesStaging
 from scraper.statute_quality.pab_consolidated import consolidated_base_heading, is_pabalochistan_source
 from scraper.statute_quality.senate_integrity import title_relation
 
@@ -57,6 +59,11 @@ def staging_rows_select() -> Select:
     )
 
 
+def staging_raw_text_select(staging_ids: Sequence[UUID]) -> Select:
+    """``raw_text`` only, and only for these candidate staging ids."""
+    return select(StatutesStaging.id, StatutesStaging.raw_text).where(StatutesStaging.id.in_(list(staging_ids)))
+
+
 def statute_rows_select(statute_ids: Sequence[UUID]) -> Select:
     return select(Statute.id, Statute.name, Statute.year_enacted, Statute.source_url).where(Statute.id.in_(list(statute_ids)))
 
@@ -69,25 +76,6 @@ def same_year_statutes_select(years: Sequence[int]) -> Select:
     )
 
 
-def section_text_select(statute_ids: Sequence[UUID]) -> Select:
-    """Current section text for the promoted statutes. Not staging raw_text."""
-    return (
-        select(
-            StatuteSection.statute_id,
-            StatuteSection.sort_key,
-            StatuteSection.section_number,
-            StatuteSectionVersion.section_text,
-        )
-        .join(StatuteSectionVersion, StatuteSectionVersion.id == StatuteSection.current_version_id)
-        .where(StatuteSection.statute_id.in_(list(statute_ids)))
-        .order_by(
-            StatuteSection.statute_id.asc(),
-            StatuteSection.sort_key.asc(),
-            StatuteSection.section_number.asc(),
-        )
-    )
-
-
 def _same_year_conflicts(proposals: List[Dict[str, Any]], statutes: Sequence[Any]) -> List[Dict[str, Any]]:
     by_year: Dict[int, List[Any]] = defaultdict(list)
     for statute in statutes:
@@ -95,6 +83,8 @@ def _same_year_conflicts(proposals: List[Dict[str, Any]], statutes: Sequence[Any
             by_year[statute.year_enacted].append(statute)
     conflicts: List[Dict[str, Any]] = []
     for proposal in proposals:
+        if proposal.get("proposed_year") is None:
+            continue
         for statute in by_year.get(proposal["proposed_year"], []):
             statute_id = str(statute.id)
             if proposal["statute_id"] and statute_id == proposal["statute_id"]:
@@ -119,13 +109,8 @@ def _same_year_conflicts(proposals: List[Dict[str, Any]], statutes: Sequence[Any
     return conflicts
 
 
-def _section_bodies(rows: Sequence[Any]) -> Dict[UUID, str]:
-    grouped: Dict[UUID, List[str]] = defaultdict(list)
-    for row in rows:
-        text_value = row.section_text or ""
-        if text_value.strip():
-            grouped[row.statute_id].append(text_value)
-    return {statute_id: "\n".join(parts) for statute_id, parts in grouped.items()}
+def _staging_text_missing(value: object) -> bool:
+    return not isinstance(value, str) or not value.strip()
 
 
 async def consolidated_reprint_report(db: AsyncSession) -> Dict[str, Any]:
@@ -134,31 +119,49 @@ async def consolidated_reprint_report(db: AsyncSession) -> Dict[str, Any]:
     candidates = [row for row in staging_rows if is_pabalochistan_source(row.source_url or "") and row.promoted_to_id is not None]
     promoted_ids = list({row.promoted_to_id for row in candidates})
     statutes_by_id: Dict[UUID, Any] = {}
-    bodies: Dict[UUID, str] = {}
     if promoted_ids:
         for statute in (await db.execute(statute_rows_select(promoted_ids))).all():
             statutes_by_id[statute.id] = statute
-        bodies = _section_bodies((await db.execute(section_text_select(promoted_ids))).all())
+    raw_by_id: Dict[UUID, object] = {}
+    if candidates:
+        text_rows = (await db.execute(staging_raw_text_select([row.id for row in candidates]))).all()
+        raw_by_id = {row.id: row.raw_text for row in text_rows}
 
     proposals: List[Dict[str, Any]] = []
     for row in candidates:
-        heading = consolidated_base_heading(bodies.get(row.promoted_to_id, ""))
+        stored = statutes_by_id.get(row.promoted_to_id)
+        base = {
+            "staging_id": str(row.id),
+            "source_url": row.source_url,
+            "statute_id": str(row.promoted_to_id),
+            "stored_name": stored.name if stored is not None else None,
+            "stored_year": stored.year_enacted if stored is not None else None,
+        }
+        raw_text = raw_by_id.get(row.id)
+        if _staging_text_missing(raw_text):
+            proposals.append(
+                {
+                    **base,
+                    "proposed_name": None,
+                    "proposed_year": None,
+                    "pab_amended_upto": None,
+                    "reason": "no_staging_text",
+                }
+            )
+            continue
+        heading = consolidated_base_heading(raw_text if isinstance(raw_text, str) else "")
         if heading is None:
             continue
-        stored = statutes_by_id.get(row.promoted_to_id)
         proposals.append(
             {
-                "staging_id": str(row.id),
-                "source_url": row.source_url,
+                **base,
                 "proposed_name": heading.title,
                 "proposed_year": heading.year,
                 "pab_amended_upto": heading.marker,
-                "statute_id": str(row.promoted_to_id),
-                "stored_name": stored.name if stored is not None else None,
-                "stored_year": stored.year_enacted if stored is not None else None,
+                "reason": None,
             }
         )
-    years = sorted({item["proposed_year"] for item in proposals})
+    years = sorted({item["proposed_year"] for item in proposals if item["proposed_year"] is not None})
     same_year: List[Any] = []
     if years:
         same_year = list((await db.execute(same_year_statutes_select(years))).all())
@@ -172,8 +175,9 @@ async def consolidated_reprint_report(db: AsyncSession) -> Dict[str, Any]:
         "same_year_name_conflicts": conflicts,
         "note": (
             "Read-only. Does not retitle or merge rows. "
-            "Heading text is the promoted statute's section text; "
-            "statutes_staging.raw_text and raw_html are not selected. "
+            "The heading is parsed from statutes_staging.raw_text for the "
+            "candidate ids only. raw_html is not selected. A candidate with "
+            "no staging text has proposed_name None and reason no_staging_text. "
             "A same-year stub with a different name, such as "
             "'Chief Minister and Ministers … Act No. III of 1975' beside the "
             "consolidated Chief Minister reprint, is listed so the canonical "
@@ -203,7 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(
         description=(
             "List pabalochistan consolidated reprints and the base-Act name and year "
-            "their section text proposes. Flags other statutes of that year whose name "
+            "their staging text proposes. Flags other statutes of that year whose name "
             "differs. Read-only: there is no --apply path and this command writes nothing."
         )
     )
