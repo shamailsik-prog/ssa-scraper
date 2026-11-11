@@ -297,12 +297,15 @@ class HybridExtractor:
         target_name = str(
             source_meta.get("act_title") or source_meta.get("detail_title") or source_meta.get("statute_name") or ""
         )
+        source_body = html or text or ""
         isolation = isolate_bundled_act(
-            html or text or "",
+            source_body,
             target_name=target_name,
             source_url=str(source_meta.get("url") or ""),
         )
-        if isolation.status == "isolated":
+        if isolation.status == "isolated" or (
+            isolation.status == "single" and isolation.text != source_body
+        ):
             raw_text = isolation.text
         elif isolation.status == "unresolved":
             raw_text = ""

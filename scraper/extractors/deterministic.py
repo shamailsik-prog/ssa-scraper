@@ -362,7 +362,8 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     from scraper.statute_quality.bundled_gazette import isolate_bundled_act
 
     isolation = isolate_bundled_act(body, target_name=target_name, source_url=source_url)
-    if isolation.status == "isolated":
+    # ``single`` still drops a later Act or Ordinance. The opening heading stays.
+    if isolation.status == "isolated" or (isolation.status == "single" and isolation.text != body):
         body = isolation.text
         raw_text = isolation.text
     detected_name = source_meta.get("statute_name") or detect_statute_name(body, source_meta.get("url"))
