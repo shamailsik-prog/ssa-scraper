@@ -213,6 +213,12 @@ _ROBOTS_UNAVAILABLE_TTL = 300
 _ROBOTS_UNAVAILABLE = object()
 
 
+def _robots_unavailable_message(base: str, status: int, reason: str = "") -> str:
+    """Status text for a robots.txt miss. A transport failure appends its exception class and message."""
+    detail = f"HTTP {status}: {reason}" if reason else f"HTTP {status}"
+    return f"robots.txt unavailable for {base} ({detail}); deferred, retry later"
+
+
 def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> bool:
     if not settings.SCRAPER_RESPECT_ROBOTS:
         return True
@@ -222,16 +228,19 @@ def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> b
     now = time.time()
     cached = _ROBOTS_CACHE.get(base)
     if cached and cached[0] is _ROBOTS_UNAVAILABLE and now - cached[1] < _ROBOTS_UNAVAILABLE_TTL:
-        raise RobotsUnavailable(f"robots.txt unavailable for {base} (HTTP {cached[2]}); deferred, retry later")
+        cached_reason = cached[3] if len(cached) > 3 else ""
+        raise RobotsUnavailable(_robots_unavailable_message(base, cached[2], cached_reason))
     if cached and cached[0] is not _ROBOTS_UNAVAILABLE and now - cached[1] < _ROBOTS_TTL:
         rp = cached[0]
     else:
         rp = urllib.robotparser.RobotFileParser()
         robots_url = base + "/robots.txt"
-        text_body, status = (fetcher or _fetch_robots_sync)(robots_url)
+        fetched = (fetcher or _fetch_robots_sync)(robots_url)
+        text_body, status = fetched[0], fetched[1]
+        reason = fetched[2] if len(fetched) > 2 and fetched[2] else ""
         if status >= 500:
-            _ROBOTS_CACHE[base] = (_ROBOTS_UNAVAILABLE, now, status)
-            raise RobotsUnavailable(f"robots.txt unavailable for {base} (HTTP {status}); deferred, retry later")
+            _ROBOTS_CACHE[base] = (_ROBOTS_UNAVAILABLE, now, status, reason)
+            raise RobotsUnavailable(_robots_unavailable_message(base, status, reason))
         if status == 404 or (status == 200 and not text_body.strip()):
             rp.parse([])
         elif status == 200:
@@ -249,6 +258,7 @@ def robots_allows(url: str, user_agent: Optional[str] = None, fetcher=None) -> b
 
 
 def _fetch_robots_sync(robots_url: str):
+    """Fetch robots.txt. Transport failures return ``("", 599, "ExceptionClass: message")``."""
     import httpx
 
     try:
@@ -268,8 +278,9 @@ def _fetch_robots_sync(robots_url: str):
         )
         return r.text, r.status_code
     except Exception as exc:
-        logger.warning("robots.txt fetch failed for %s: %s", robots_url, exc)
-        return "", 599
+        reason = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+        logger.warning("robots.txt fetch failed for %s: %s", robots_url, reason)
+        return "", 599, reason
 
 
 def reset_robots_cache() -> None:

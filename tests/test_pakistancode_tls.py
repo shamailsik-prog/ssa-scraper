@@ -117,7 +117,8 @@ def test_ssl_context_keeps_verification_and_trusts_the_root_and_intermediate():
 def test_extra_intermediate_is_only_used_for_pakistancode_hosts():
     pak = verify_for_url("https://pakistancode.gov.pk/english/index.php")
     www = verify_for_url("https://www.pakistancode.gov.pk/robots.txt")
-    other = verify_for_url("https://na.gov.pk/robots.txt")
+    # na.gov.pk has its own pinned intermediate. This bundle stays on PakistanCode hosts.
+    other = verify_for_url("https://example.com/robots.txt")
     assert pak is www
     assert isinstance(pak, ssl.SSLContext)
     assert other is True
