@@ -79,8 +79,9 @@ def verify_for_url(url: str) -> Union[ssl.SSLContext, bool]:
 
     Membership is exact, including a trailing DNS root dot. Do not reuse
     ``host_in_allow_list``: that helper strips the dot and accepts subdomains,
-    and a prefix or suffix check would also select ``evil-na.gov.pk`` and
-    ``na.gov.pk.evil.com``.
+    and a prefix or suffix check would also select ``evil-na.gov.pk``,
+    ``xna.gov.pk`` and ``na.gov.pk.evil.com``. ``urlsplit().hostname`` drops
+    userinfo and port before that exact check.
     """
     host = (urlsplit(url).hostname or "").lower()
     if host in PAKISTANCODE_HOSTS:
