@@ -5,9 +5,27 @@ Dry-run is the default. It writes a backup JSONL and a rollback SQL file and
 does not change the database. ``--apply`` merges one section into the
 preceding section only after an id and md5 precheck against that backup.
 
+``--csv`` classifies an evidence export and does not open a database and does
+not write a file. Each stored section 0 is one of:
+
+- A: a ``0)`` list clause. The missing letter is not assumed. The next clause
+  may be ``(k)``, ``(m)`` or anything else. The line continues the preceding
+  section.
+- B: a decimal that was split on the point, such as ``0.2 per cent``,
+  ``0.5%`` or ``0.1%``.
+- C: ``0.`` citation or OCR junk that is not a decimal, such as ``0. No.``
+  or ``0. [)isputc``.
+- unknown: a section 0 whose text matches none of those prefixes.
+
+A merge proposal names the preceding section. ``before_md5`` is the MD5 of
+that section's stored text. ``after_md5`` is the MD5 of the text after the
+section 0 body is appended. The CSV has only the section 0 row, so those two
+digests stay empty until a database dry-run can see the preceding section.
+
 Do not point this at a database until a person has read the dry-run. This
 script does not unquarantine, does not deploy, and does not fetch source PDFs.
 
+    python scripts/report_section_zero.py --csv tests/fixtures/statute_quality/section_zero_fs.csv --csv tests/fixtures/statute_quality/section_zero_main.csv
     python scripts/report_section_zero.py --out section_zero_reports
     python scripts/report_section_zero.py --apply --id <section-uuid> --md5 <md5> --out section_zero_reports
 
@@ -19,6 +37,7 @@ the write.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
@@ -79,12 +98,126 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Backup JSONL to precheck on --apply. Default: <out>/section_zero_backup.jsonl.",
     )
+    parser.add_argument(
+        "--csv",
+        action="append",
+        default=[],
+        help=(
+            "Classify section 0 rows in this evidence CSV. Repeat for each file. "
+            "Does not open a database and does not write a file."
+        ),
+    )
     return parser
 
 
 def section_text_md5(text: str) -> str:
     """MD5 of the section text as stored, UTF-8, with no whitespace rewrite."""
     return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+
+
+# Prefixes of the three stored shapes. Each is linear and anchored at the start.
+_CLASS_A_RE = re.compile(r"0\)")
+_CLASS_B_RE = re.compile(r"0\.\d")
+_CLASS_C_RE = re.compile(r"0\s*\.(?!\d)")
+SECTION_ZERO_CLASSES = ("A", "B", "C", "unknown")
+
+
+def classify_section_zero_text(text: str) -> str:
+    """Sort a section 0 body into A, B, C, or unknown.
+
+    A is a ``0)`` list clause, whatever letter it stood for. B is a decimal
+    (``0.2 per cent``, ``0.5%``, ``0.1%``, ``0.1 million``, ``0.09``). C is
+    ``0.`` junk that is not a decimal (``0. No.``, ``0. [)isputc``, ``0. 1993``,
+    ``0 . iby``, ``0..1033``).
+    """
+    raw = (text or "").lstrip()
+    if _CLASS_A_RE.match(raw):
+        return "A"
+    if _CLASS_B_RE.match(raw):
+        return "B"
+    if _CLASS_C_RE.match(raw):
+        return "C"
+    return "unknown"
+
+
+def propose_section_zero_merge(
+    zero_text: str,
+    preceding: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Name the preceding section and the before/after MD5s of a merge.
+
+    ``before_md5`` is the preceding section as stored. ``after_md5`` is that
+    text with the section 0 body appended. Both stay empty when there is no
+    preceding section. This function does not write.
+    """
+    text = zero_text or ""
+    proposal: Dict[str, Any] = {
+        "section_zero_class": classify_section_zero_text(text),
+        "zero_md5": section_text_md5(text) if text else None,
+        "into_section_id": None,
+        "into_section_number": None,
+        "before_md5": None,
+        "after_md5": None,
+        "merged_text": "",
+        "proposal": "skip",
+        "skip_reason": "empty" if not text.strip() else "no_preceding_section",
+    }
+    if not text.strip() or preceding is None:
+        return proposal
+    base = str(preceding.get("text") or "")
+    merged = base.rstrip() + "\n" + text.lstrip()
+    proposal.update(
+        {
+            "into_section_id": str(preceding.get("id")) if preceding.get("id") is not None else None,
+            "into_section_number": str(preceding.get("section_number") or "").strip() or None,
+            "before_md5": section_text_md5(base),
+            "after_md5": section_text_md5(merged),
+            "merged_text": merged,
+            "proposal": "merge",
+            "skip_reason": None,
+        }
+    )
+    return proposal
+
+
+def classify_section_zero_csv(path: Path) -> List[Dict[str, Any]]:
+    """Classify every section 0 row in an evidence CSV. No database and no writes.
+
+    The CSV carries the section 0 text only, so the merge target is the
+    preceding section when ``sort_key`` is after the first row, and the
+    before/after MD5s stay empty.
+    """
+    rows: List[Dict[str, Any]] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        for record in csv.DictReader(handle):
+            text = record.get("first80") or ""
+            sort_raw = (record.get("sort_key") or "").strip()
+            try:
+                sort_key = int(sort_raw)
+            except ValueError:
+                sort_key = None
+            has_previous = sort_key is not None and sort_key > 1
+            kind = classify_section_zero_text(text)
+            rows.append(
+                {
+                    "source_csv": path.name,
+                    "statute_id": record.get("statute_id") or "",
+                    "statute_name": record.get("name") or "",
+                    "section_number": (record.get("section_number") or "").strip(),
+                    "sort_key": sort_key,
+                    "section_zero_class": kind,
+                    "zero_md5": (record.get("md5") or "").strip().lower(),
+                    "snippet_md5": section_text_md5(text),
+                    "proposed_merge_target": "preceding section" if has_previous else None,
+                    "into_section_id": None,
+                    "into_section_number": None,
+                    "before_md5": None,
+                    "after_md5": None,
+                    "proposal": "merge" if has_previous else "skip",
+                    "skip_reason": None if has_previous else "no_preceding_section",
+                }
+            )
+    return rows
 
 
 def _order_key(section: Mapping[str, Any]) -> tuple:
@@ -110,8 +243,8 @@ def plan_section_zero_merges(sections: Sequence[Mapping[str, Any]]) -> Dict[str,
     """
     ordered = sorted(sections, key=_order_key)
     merged: List[Dict[str, Any]] = []
-    skipped_no_previous: List[Dict[str, str]] = []
-    skipped_empty: List[Dict[str, str]] = []
+    skipped_no_previous: List[Dict[str, Any]] = []
+    skipped_empty: List[Dict[str, Any]] = []
     merged_text_by_target: Dict[str, str] = {}
     last_real: Optional[Mapping[str, Any]] = None
 
@@ -126,23 +259,20 @@ def plan_section_zero_merges(sections: Sequence[Mapping[str, Any]]) -> Dict[str,
         }
         text = str(section.get("text") or "")
         if not text.strip():
+            entry.update(propose_section_zero_merge(text, None))
             skipped_empty.append(entry)
             continue
         if last_real is None:
+            entry.update(propose_section_zero_merge(text, None))
             skipped_no_previous.append(entry)
             continue
         target_id = str(last_real.get("id"))
         base = merged_text_by_target.get(target_id, str(last_real.get("text") or ""))
-        merged_text = base.rstrip() + "\n" + text.lstrip()
+        preceding = {"id": target_id, "section_number": last_real.get("section_number"), "text": base}
+        proposed = propose_section_zero_merge(text, preceding)
+        merged_text = proposed["merged_text"]
         merged_text_by_target[target_id] = merged_text
-        merged.append(
-            {
-                **entry,
-                "into_section_id": target_id,
-                "into_section_number": str(last_real.get("section_number") or "").strip(),
-                "merged_text": merged_text,
-            }
-        )
+        merged.append({**entry, **proposed})
     return {
         "merged": merged,
         "skipped_no_previous": skipped_no_previous,
@@ -350,6 +480,7 @@ def _backup_row(
     skip_reason = None
     into_id = None
     merged_text = ""
+    item: Mapping[str, Any] = {}
     if plan["merged"]:
         item = plan["merged"][0]
         zero_id = item["zero_section_id"]
@@ -357,10 +488,12 @@ def _backup_row(
         merged_text = item["merged_text"]
         proposal = "merge"
     elif plan["skipped_no_previous"]:
-        zero_id = plan["skipped_no_previous"][0]["zero_section_id"]
+        item = plan["skipped_no_previous"][0]
+        zero_id = item["zero_section_id"]
         skip_reason = "no_preceding_section"
     elif plan["skipped_empty"]:
-        zero_id = plan["skipped_empty"][0]["zero_section_id"]
+        item = plan["skipped_empty"][0]
+        zero_id = item["zero_section_id"]
         skip_reason = "empty"
     zero = by_id.get(str(zero_id)) or {}
     into = by_id.get(str(into_id)) if into_id else None
@@ -371,11 +504,15 @@ def _backup_row(
         "host": source_host(statute.get("source_url")),
         "proposal": proposal,
         "skip_reason": skip_reason,
+        "section_zero_class": item.get("section_zero_class")
+        or classify_section_zero_text(str(zero.get("text") or "")),
+        "before_md5": item.get("before_md5"),
+        "after_md5": item.get("after_md5"),
         "zero_section": _section_payload(zero),
         "preceding_section": _section_payload(into) if into else None,
         "merged_text": merged_text,
         "merged_text_hash": merged_text_hash(merged_text) if merged_text else None,
-        "relation_ids": [str(item) for item in relation_ids],
+        "relation_ids": [str(rel_id) for rel_id in relation_ids],
     }
 
 
@@ -587,8 +724,11 @@ async def run_section_zero_report(
                     "skip_reason": row["skip_reason"],
                     "zero_section_id": row["zero_section"]["id"],
                     "zero_md5": row["zero_section"]["md5"],
+                    "section_zero_class": row["section_zero_class"],
                     "into_section_id": (row["preceding_section"] or {}).get("id"),
                     "into_section_number": (row["preceding_section"] or {}).get("section_number"),
+                    "before_md5": row["before_md5"],
+                    "after_md5": row["after_md5"],
                 }
                 for row in rows
             ],
@@ -641,6 +781,37 @@ async def run_section_zero_report(
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.csv:
+        if args.apply:
+            print(
+                json.dumps({"apply": False, "error": "--csv does not write and cannot be combined with --apply"}),
+                file=sys.stderr,
+            )
+            return 2
+        rows: List[Dict[str, Any]] = []
+        for raw in args.csv:
+            rows.extend(classify_section_zero_csv(Path(raw)))
+        counts = {kind: 0 for kind in SECTION_ZERO_CLASSES}
+        for row in rows:
+            counts[row["section_zero_class"]] = counts.get(row["section_zero_class"], 0) + 1
+        print(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "writes": False,
+                    "counts": counts,
+                    "note": (
+                        "Each row is class A, B, C, or unknown. "
+                        "proposed_merge_target is the preceding section when sort_key is after 1. "
+                        "before_md5 and after_md5 need that section's stored text, which this CSV does not carry. "
+                        "A database dry-run fills them. This command writes nothing."
+                    ),
+                    "rows": rows,
+                },
+                indent=2,
+            )
+        )
+        return 0
     out_dir = Path(args.out)
     backup = Path(args.backup) if args.backup else None
     if args.apply and (not args.id or not args.md5):

@@ -899,47 +899,37 @@ def _drop_ocr_definition_clause_headings(text: str, matches: Sequence[Match[str]
     return kept
 
 
-# '(o)' read as '0)', 'o)', 'O)' or '(0)'. The lookbehind keeps '10)' and '20)'
-# from matching the '0)' inside them. Fixed-width, linear.
-_OCR_O_CLAUSE_MARKER_RE = re.compile(r"(?<![0-9A-Za-z])(?:0\)|[oO]\)|\(0\))")
-_LETTER_CLAUSE_RE = re.compile(r"\(([A-Za-z])\)")
+# A list clause read as '0)', 'o)', 'O)' or '(0)'. The lookbehind keeps
+# '10)' and '20)' from matching the '0)' inside them. The missing letter is
+# not fixed: the next clause may be (k), (m) or (p). Fixed-width, linear.
+_OCR_ZERO_CLAUSE_MARKER_RE = re.compile(r"(?<![0-9A-Za-z])(?:0\)|[oO]\)|\(0\))")
 
 
-def _running_letter_clauses_end_at_n(text: str, pos: int) -> bool:
-    """True when a letter-clause run such as ``(m)`` ``(n)`` ends at this point."""
-    window_start = max(0, pos - 4000)
-    letters = [item.group(1).lower() for item in _LETTER_CLAUSE_RE.finditer(text, window_start, pos)]
-    if len(letters) < 2 or letters[-1] != "n":
-        return False
-    run = 1
-    index = len(letters) - 1
-    while index > 0 and ord(letters[index]) == ord(letters[index - 1]) + 1:
-        run += 1
-        index -= 1
-    return run >= 2
+def _is_ocr_zero_clause_marker(text: str, match: Match[str]) -> bool:
+    """True when this heading is a ``0)`` / ``o)`` / ``O)`` / ``(0)`` list clause.
 
-
-def _is_ocr_o_clause_in_running_list(text: str, match: Match[str]) -> bool:
-    """True when this heading is ``0)`` / ``o)`` / ``O)`` / ``(0)`` inside ``(m)`` ``(n)`` …"""
+    The neighbouring letters are not consulted. A ``0)`` line continues the
+    preceding section whether the next clause is ``(k)``, ``(m)`` or ``(p)``.
+    """
     number_at = match.start(1) if match.groups() else match.start()
     origin = number_at - 1 if number_at > 0 and text[number_at - 1] == "(" else number_at
-    if _OCR_O_CLAUSE_MARKER_RE.match(text, origin) is None:
-        return False
-    return _running_letter_clauses_end_at_n(text, origin)
+    return _OCR_ZERO_CLAUSE_MARKER_RE.match(text, origin) is not None
 
 
 def _drop_zero_section_and_ocr_o_clauses(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
-    """Never start a section at 0. An OCR ``(o)`` inside ``(m)`` ``(n)`` stays in that section.
+    """Never start a section at 0. A ``0)`` line stays in the preceding section.
 
     ``1.``, ``10.``, ``20.``, ``10A`` and a hyphen closer are real headings.
-    ``0E`` / ``0I`` are tariff chapter tokens and are not this class.
+    ``0E`` / ``0I`` are tariff chapter tokens and are not this class. A decimal
+    such as ``0.2`` or ``0.5%``, and citation junk such as ``0. No.``, never
+    match the section-number token.
     """
     kept: List[Match[str]] = []
     for match in matches:
         token = (match.group(1) or "").strip() if match.groups() else ""
         if is_zero_section_number(token):
             continue
-        if _is_ocr_o_clause_in_running_list(text, match):
+        if _is_ocr_zero_clause_marker(text, match):
             continue
         kept.append(match)
     return kept
@@ -1470,8 +1460,12 @@ def _strategy_3_p_filtered_digit_start(soup: BeautifulSoup, statute_name: str) -
         return []
 
 # A period heading the line-start splitter already accepts. The lookahead
-# keeps a gazette date ``12.1975`` from being read as section 12.
-_PERIOD_LINE_HEADING_RE = re.compile(r"(?m)^[ \t]*(\d{1,3})[ \t]*\.(?!\d)")
+# keeps a gazette date ``12.1975`` and a decimal rate ``0.2`` from being
+# read as a section. A lone ``0.`` is citation or OCR junk, not a heading.
+# ``08.`` stays a heading.
+_PERIOD_LINE_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*((?:[1-9]\d{0,2}|0\d{1,2}))[ \t]*\.(?!\d)"
+)
 _MARGINAL_DASH_RE = re.compile(r"(?:\.-|--|—|–)")
 # ``Committees.--The Board`` and ``Finality of determination.-The``.
 _MARGINAL_NOTE_LINE_RE = re.compile(

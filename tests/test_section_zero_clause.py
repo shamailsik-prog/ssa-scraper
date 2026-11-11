@@ -1,9 +1,9 @@
-"""OCR clause '(o)' must not become statute section 0.
+"""A stored section number 0 is never a real heading.
 
-senate.gov.pk/uploads/documents/1528868742_798.pdf prints clause (o) as '0)'.
-The line-start splitter stored that as section 0. A lone 0 never starts a
-section. '0)' / 'o)' / 'O)' / '(0)' inside a running letter-clause list stays
-in the preceding section. '1.', '10.', '20.', a letter suffix, a hyphen
+Class A is a list clause printed as '0)'. The missing letter is not assumed:
+the next clause may be (k) or (m). Class B is a decimal rate ('0.2 per cent',
+'0.5%', '0.1%'). Class C is citation or OCR junk ('0. [)isputc', '0. No.').
+None of them starts a section. '1.', '10.', '20.', a letter suffix, a hyphen
 closer and a gazette marginal heading stay headings.
 """
 
@@ -15,7 +15,8 @@ import pytest
 
 from scraper.parsers.statute_parser import _LINE_START_SECTION_RE, split_into_sections
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "statute_quality" / "ocr_clause_o_as_section_zero.txt"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "statute_quality"
+FIXTURE = FIXTURES / "ocr_clause_o_as_section_zero.txt"
 ACT = "The Islamabad Healthcare Regulation Act, 2018"
 CLAUSE = (
     "provide guidelines to the Registration Board for grant, renewal, "
@@ -39,6 +40,11 @@ def test_line_start_regex_keeps_numbering_hyphen_suffix_and_rejects_zero():
             "08. Weekly rest stays a zero-padded heading in this Act.",
             "03) Cuprammonium hydroxide stays a tariff row marker in this Act.",
             "0) provide guidelines must not be a heading in this Act.",
+            "0.2 per cent of morphine must not be a heading in this Act.",
+            "0.5% of the value must not be a heading in this Act.",
+            "0.1% of the gross amount must not be a heading in this Act.",
+            "0. [)isputc must not be a heading in this Act.",
+            "0. No. 3 of 1977 must not be a heading in this Act.",
             "0. Zero period must not be a heading in this Act.",
             "0A. Zero letter must not be a heading in this Act.",
             "o) letter o must not be a heading in this Act.",
@@ -90,3 +96,48 @@ def test_lone_zero_outside_a_clause_list_does_not_start_a_section():
     assert "0" not in bodies
     assert CLAUSE in bodies["2"]
     assert "establish the Authority" in bodies["3"]
+
+
+def test_class_a_zero_paren_stays_with_the_preceding_section_whatever_the_next_letter():
+    bodies = _bodies((FIXTURES / "section_zero_class_a_clause.txt").read_text(encoding="utf-8"))
+    assert "0" not in bodies
+    assert "provide guidelines to the Registration Board" in bodies["4"]
+    assert "(i) monitor healthcare services" in bodies["4"]
+    assert "(k) advise the Government" in bodies["4"]
+    assert "meet at least once in every quarter" in bodies["5"]
+    assert "the Treasurer of the University" in bodies["6"]
+    assert "(l) the Director General" in bodies["6"]
+    assert "(m) such other persons" in bodies["6"]
+    assert "register of healthcare professionals" in bodies["10"]
+    assert "one million rupees" in bodies["20"]
+
+
+def test_class_b_decimal_rates_stay_in_the_preceding_section():
+    bodies = _bodies((FIXTURES / "section_zero_class_b_rates.txt").read_text(encoding="utf-8"))
+    assert "0" not in bodies
+    assert "0.2 per cent of morphine" in bodies["2"]
+    assert "0.5% of the value of the property" in bodies["2"]
+    assert "0.1% of the gross amount of sales" in bodies["2"]
+    assert "collected in the manner prescribed" in bodies["3"]
+
+
+def test_leading_decimal_rate_does_not_become_section_zero():
+    text = """
+0.2 per cent of morphine stands before any heading in this schedule.
+1. Short title.— This Act may be called the Leading Rate Act, 2026.
+2. Rates.— The duty under this Act is collected as prescribed.
+"""
+    bodies = _bodies(text)
+    assert "0" not in bodies
+    assert "called the Leading Rate Act" in bodies["1"]
+    assert "collected as prescribed" in bodies["2"]
+
+
+def test_class_c_citation_junk_stays_in_the_preceding_section():
+    bodies = _bodies((FIXTURES / "section_zero_class_c_junk.txt").read_text(encoding="utf-8"))
+    assert "0" not in bodies
+    assert "0. [)isputc" in bodies["2"]
+    assert "0. No. 3 of 1977" in bodies["2"]
+    assert "0 . iby the power" in bodies["2"]
+    assert "0..1033 REGISTERED" in bodies["2"]
+    assert "ceases to have effect from the appointed day" in bodies["3"]

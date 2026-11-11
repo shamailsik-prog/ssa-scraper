@@ -22,6 +22,8 @@ from scraper.models import (
 from scripts.report_section_zero import (
     SectionZeroPrecheckError,
     build_parser,
+    classify_section_zero_csv,
+    classify_section_zero_text,
     main,
     plan_section_zero_merges,
     precheck_section_zero,
@@ -30,6 +32,8 @@ from scripts.report_section_zero import (
     section_text_md5,
     write_report_files,
 )
+
+EVIDENCE = Path(__file__).resolve().parent / "fixtures" / "statute_quality"
 from sqlalchemy import select
 
 CLAUSE = "0) provide guidelines to the Registration Board for grant, renewal, suspension or cancellation of registrations."
@@ -41,6 +45,7 @@ def test_cli_defaults_to_dry_run_and_apply_requires_id_and_md5():
     assert args.out == "section_zero_reports"
     assert build_parser().parse_args(["--apply", "--id", "x", "--md5", "ab"]).apply is True
     assert main(["--apply"]) == 2
+    assert main(["--csv", str(EVIDENCE / "section_zero_fs.csv"), "--apply"]) == 2
 
 
 def test_plan_merges_section_zero_into_the_preceding_section():
@@ -51,17 +56,37 @@ def test_plan_merges_section_zero_into_the_preceding_section():
         {"id": "d", "section_number": "0", "text": "0) leading clause with no previous section.", "sort_key": 0},
     ]
     plan = plan_section_zero_merges(sections)
+    merged_text = "4. Powers and functions of the Authority.\n" + CLAUSE
+    leading = "0) leading clause with no previous section."
     assert plan["merged"] == [
         {
             "zero_section_id": "b",
             "zero_section_number": "0",
+            "section_zero_class": "A",
+            "zero_md5": section_text_md5(CLAUSE),
             "into_section_id": "a",
             "into_section_number": "4",
-            "merged_text": "4. Powers and functions of the Authority.\n" + CLAUSE,
+            "before_md5": section_text_md5("4. Powers and functions of the Authority."),
+            "after_md5": section_text_md5(merged_text),
+            "merged_text": merged_text,
+            "proposal": "merge",
+            "skip_reason": None,
         }
     ]
     assert plan["skipped_no_previous"] == [
-        {"zero_section_id": "d", "zero_section_number": "0"}
+        {
+            "zero_section_id": "d",
+            "zero_section_number": "0",
+            "section_zero_class": "A",
+            "zero_md5": section_text_md5(leading),
+            "into_section_id": None,
+            "into_section_number": None,
+            "before_md5": None,
+            "after_md5": None,
+            "merged_text": "",
+            "proposal": "skip",
+            "skip_reason": "no_preceding_section",
+        }
     ]
     assert "provide guidelines" in plan["merged_text_by_target"]["a"]
 
@@ -214,6 +239,18 @@ async def test_dry_run_lists_visible_section_zero_and_writes_files_without_delet
     assert report["apply"] is False
     assert report["merged"] == 1
     assert report["skipped_no_previous"] == 1
+    visible_row = next(row for row in report["rows"] if row["zero_section_id"] == str(seeded["zero"].id))
+    previous_text = "4. Powers and functions of the Authority shall be as follows."
+    merged_text = previous_text + "\n" + CLAUSE
+    assert visible_row["section_zero_class"] == "A"
+    assert visible_row["into_section_number"] == "4"
+    assert visible_row["before_md5"] == section_text_md5(previous_text)
+    assert visible_row["after_md5"] == section_text_md5(merged_text)
+    assert visible_row["before_md5"] != visible_row["after_md5"]
+    leading_row = next(row for row in report["rows"] if row["skip_reason"] == "no_preceding_section")
+    assert leading_row["section_zero_class"] == "A"
+    assert leading_row["before_md5"] is None
+    assert leading_row["after_md5"] is None
     ids = {row["zero_section_id"] for row in report["rows"]}
     assert str(seeded["zero"].id) in ids
     assert str(seeded["hidden_zero"].id) not in ids
@@ -311,3 +348,69 @@ async def test_apply_refuses_a_bad_md5_and_merges_when_the_precheck_matches(db, 
         await db.execute(select(StatuteSection.section_number).where(StatuteSection.statute_id == leading_id))
     ).scalars().all()
     assert leading_numbers.count("0") == 1
+
+
+def test_classifier_sorts_the_three_shapes_and_leaves_anything_else_unknown():
+    assert classify_section_zero_text(
+        "0) provide guidelines to the Registration Board for grant, renewal, suspension or cancellation"
+    ) == "A"
+    assert classify_section_zero_text('0) " prescribed " means prcscribed by regulations; (k) "prjncipal "') == "A"
+    assert classify_section_zero_text("0) the Treasurer; (m) such other persons") == "A"
+    assert classify_section_zero_text('0)) "member" means a member of the Policy Board') == "A"
+    assert classify_section_zero_text("0.2 per cent of morphine") == "B"
+    assert classify_section_zero_text("0.5% of the value of the property") == "B"
+    assert classify_section_zero_text("0.1% of the gross amount of sales") == "B"
+    assert classify_section_zero_text("0.50%will be deducted from the basic pay") == "B"
+    assert classify_section_zero_text("0.1 million fioe") == "B"
+    assert classify_section_zero_text("0.09, 90. l0") == "B"
+    assert classify_section_zero_text("0. [)isputc [orscparate possession") == "C"
+    assert classify_section_zero_text("0. No. 7 of 1972)") == "C"
+    assert classify_section_zero_text("0. 1993 (Act XIV of 1993)") == "C"
+    assert classify_section_zero_text("0 . iby the power to issue a search Warrant") == "C"
+    assert classify_section_zero_text("0..1033 REGISTERED No.") == "C"
+    assert classify_section_zero_text("section 4 continues without a zero marker") == "unknown"
+
+
+def test_evidence_csvs_sort_every_section_zero_row(capsys):
+    fs = EVIDENCE / "section_zero_fs.csv"
+    main_csv = EVIDENCE / "section_zero_main.csv"
+    assert main(["--csv", str(fs), "--csv", str(main_csv)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["writes"] is False
+    rows = payload["rows"]
+    assert [row["source_csv"] for row in rows].count("section_zero_fs.csv") == 90
+    assert [row["source_csv"] for row in rows].count("section_zero_main.csv") == 41
+    assert payload["counts"]["unknown"] == 0
+    assert payload["counts"]["A"] > 0
+    assert payload["counts"]["B"] > 0
+    assert payload["counts"]["C"] > 0
+    by_id = {row["statute_id"]: row for row in rows}
+    assert len(by_id) == 131
+    for statute_id in (
+        "aa8a983e-379d-4772-b1e5-83ffcc7edc0a",
+        "97b7dbea-1931-4c8e-a617-3a0c40726ac2",
+        "a1dd5b62-ab68-480a-b71e-841a2e05a668",
+        "4363583c-061d-4854-86d6-9ea4acec1459",
+    ):
+        assert by_id[statute_id]["section_zero_class"] == "A"
+        assert by_id[statute_id]["proposed_merge_target"] == "preceding section"
+        assert by_id[statute_id]["before_md5"] is None
+        assert by_id[statute_id]["after_md5"] is None
+    assert by_id["aa8a983e-379d-4772-b1e5-83ffcc7edc0a"]["zero_md5"] == "fe7e4a585fff84d477b95a42fab2b6fd"
+    for statute_id in (
+        "cedfb485-5e3b-47aa-abd4-41c6dd3a3616",
+        "8d11f55d-3168-4e94-be2b-b5c62b9be8de",
+        "a2f068d4-6dc8-4683-bc6e-761ef9311ebf",
+        "06ea4193-99e3-463b-9175-8704fe42fb04",
+        "4e73e42b-8728-48de-8d4c-01161cbbb6b3",
+        "fa78deb6-9ea2-49dd-bbc7-6a63ad7dc186",
+    ):
+        assert by_id[statute_id]["section_zero_class"] == "B"
+    assert by_id["cedfb485-5e3b-47aa-abd4-41c6dd3a3616"]["proposal"] == "skip"
+    assert by_id["cedfb485-5e3b-47aa-abd4-41c6dd3a3616"]["skip_reason"] == "no_preceding_section"
+    assert by_id["a2f068d4-6dc8-4683-bc6e-761ef9311ebf"]["proposed_merge_target"] == "preceding section"
+    assert by_id["ad06f94d-2b63-48f2-ab33-3afe06de41f3"]["section_zero_class"] == "C"
+    assert by_id["ad06f94d-2b63-48f2-ab33-3afe06de41f3"]["zero_md5"] == "94a8654928de4d67e767b13cc5411960"
+    direct = classify_section_zero_csv(fs) + classify_section_zero_csv(main_csv)
+    assert [row["section_zero_class"] for row in direct] == [row["section_zero_class"] for row in rows]
