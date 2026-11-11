@@ -62,6 +62,9 @@ _PERMANENT_RETIRE_MARKERS = (
     "image statute source rejected",
     "credentials embedded",
     "robots.txt disallows",
+    # PublicPipeline._claim retires a row after repeated worker deaths. Reopening it
+    # would reset that circuit breaker and send the same page back to the worker.
+    "the worker died",
 )
 
 
@@ -153,15 +156,33 @@ def _classify_discovered_url(url: str) -> Optional[str]:
 
 
 def _url_for_reject_sample(url: str) -> str:
-    """Drop userinfo, then scrub credential-shaped query values, before a URL is logged."""
+    """Drop userinfo, then scrub credential-shaped query values, before a URL is stored.
+
+    ``urlsplit().port`` raises ``ValueError`` for a non-numeric port. That must not
+    escape discovery: an off-site link with a bad port is still only a rejection.
+    """
     raw = url or ""
-    parts = urlsplit(raw)
-    if parts.username or parts.password or (parts.scheme and parts.hostname):
-        host = parts.hostname or ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "[unparseable URL]"
+    host = parts.hostname or ""
+    port_suffix = ""
+    try:
         if parts.port:
-            host = f"{host}:{parts.port}"
-        raw = urlunsplit((parts.scheme, host, parts.path or "", parts.query, ""))
-    return scrub_secrets(raw)[:500]
+            port_suffix = f":{parts.port}"
+    except ValueError:
+        port_suffix = ""
+    cleaned = urlunsplit((parts.scheme, f"{host}{port_suffix}", parts.path or "", parts.query, ""))
+    return scrub_secrets(cleaned)[:500]
+
+
+def _host_for_reject_log(url: str) -> str:
+    """Hostname only. The full URL stays in job stats and is not written to the log."""
+    try:
+        return urlsplit(url or "").hostname or "unknown-host"
+    except ValueError:
+        return "unknown-host"
 
 
 def document_identity_suffix(meta: Optional[Dict[str, Any]] = None) -> str:
@@ -653,10 +674,13 @@ class PakistanCodePipeline(PublicPipeline):
         sample = self.stats.setdefault("rejected_url_sample", [])
         if not isinstance(sample, list) or len(sample) >= REJECTED_URL_SAMPLE_LIMIT:
             return
-        recorded = _url_for_reject_sample(url)
-        reason = scrub_secrets(" ".join(str(exc).split()))[:240]
+        try:
+            recorded = _url_for_reject_sample(url)
+            reason = scrub_secrets(" ".join(str(exc).split()))[:240]
+        except ValueError:
+            return
         sample.append({"url": recorded, "reason": reason})
-        logger.info("%s: rejected URL %s (%s)", self.source.source_name, recorded, reason)
+        logger.info("%s: rejected URL host %s", self.source.source_name, _host_for_reject_log(recorded))
 
     @staticmethod
     def _retryable_retired(row: CrawlFrontier) -> bool:

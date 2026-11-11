@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
 
@@ -472,10 +473,10 @@ async def test_live_catalog_fixture_discovers_acts_and_records_rejected_urls(db,
     assert stats["rejected_urls"] >= 3
     assert len(sample) == stats["rejected_urls"]
     assert len(sample) <= REJECTED_URL_SAMPLE_LIMIT
-    joined = " ".join(item["url"] for item in sample)
-    assert "drs.molaw.gov.pk" in joined
-    assert "play.google.com" in joined
-    assert "apps.apple.com" in joined
+    hosts = {urlsplit(item["url"]).hostname for item in sample}
+    assert "drs.molaw.gov.pk" in hosts
+    assert "play.google.com" in hosts
+    assert "apps.apple.com" in hosts
     assert all(item["reason"] for item in sample)
 
 
@@ -525,3 +526,22 @@ async def test_rejected_url_sample_keeps_the_first_twenty(db, fixture_server):
     hostless = secret_pipeline.stats["rejected_url_sample"][-1]["url"]
     assert "hunter2" not in hostless
     assert "alice" not in hostless
+
+    secret_pipeline._capture_candidate(
+        raw="https://off.example:bad/chrome",
+        hint="",
+        base_url=base,
+        docs={},
+        listings={},
+        route_meta={},
+    )
+    bad_port = secret_pipeline.stats["rejected_url_sample"][-1]["url"]
+    assert urlsplit(bad_port).hostname == "off.example"
+    assert "bad" not in bad_port
+
+
+def test_worker_death_retirement_is_not_reopened():
+    row = type("Row", (), {})()
+    row.status = "retired"
+    row.last_error = "retired: the worker died 3 times while processing this item (out of memory, killed or timed out)"
+    assert PakistanCodePipeline._retryable_retired(row) is False
