@@ -55,7 +55,12 @@ def test_auto_deploy_merges_before_pls_idle_wait():
 
 
 def test_pls_host_release_search_harvest_locks_deletes_all_scanned_keys(tmp_path):
-    """Regression: docker compose exec must not consume the scan loop stdin (only first key deleted)."""
+    """Regression: docker compose exec must not consume the scan loop stdin (only first key deleted).
+
+    Source the library first, then stub only docker and pls_host_env_flag_enabled.
+    A grep() stub that ignores stdin races `set -o pipefail`: grep exits, `echo redis`
+    takes SIGPIPE (141), and the release returns before any DEL.
+    """
     del_log = tmp_path / "del.log"
     repo = Path(__file__).resolve().parents[1]
     script = tmp_path / "run_release.sh"
@@ -70,6 +75,9 @@ SCANNED=(
   "corpus:login_session_lock:PakistanLawSite:search_harvest:k3"
   "corpus:login_session_lock:PakistanLawSite:search_harvest:k4"
 )
+cd "{repo}"
+# shellcheck source=scripts/pls_host_lib.sh
+source scripts/pls_host_lib.sh
 docker() {{
   if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
     echo redis
@@ -92,20 +100,37 @@ docker() {{
   return 1
 }}
 pls_host_env_flag_enabled() {{ return 0; }}
-grep() {{ echo "PLS_DEPLOY_RELEASE_SEARCH_HARVEST_LOCKS=true"; }}
-cd "{repo}"
-# shellcheck source=scripts/pls_host_lib.sh
-source scripts/pls_host_lib.sh
 pls_host_release_search_harvest_locks
 test "$(wc -l < "$DEL_LOG" | tr -d ' ')" = "4"
 """,
         encoding="utf-8",
     )
     script.chmod(0o755)
-    subprocess.run(["bash", str(script)], check=True, cwd=repo)
-    lines = del_log.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 4
-    assert lines[0].endswith(":k1")
+    text = script.read_text(encoding="utf-8")
+    source_at = text.index("source scripts/pls_host_lib.sh")
+    assert source_at < text.index("docker() {")
+    assert source_at < text.index("pls_host_env_flag_enabled() {")
+    assert "grep()" not in text
+    expected = [
+        "corpus:login_session_lock:PakistanLawSite:search_harvest:k1",
+        "corpus:login_session_lock:PakistanLawSite:search_harvest:k2",
+        "corpus:login_session_lock:PakistanLawSite:search_harvest:k3",
+        "corpus:login_session_lock:PakistanLawSite:search_harvest:k4",
+    ]
+    # The old stub failed about 15% of runs. Repeat so a returned race fails here.
+    for _ in range(25):
+        completed = subprocess.run(
+            ["bash", str(script)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        detail = f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        assert completed.returncode == 0, detail
+        assert "released 4 search-harvest Redis lock(s)" in completed.stdout, detail
+        assert completed.stderr == "", detail
+        lines = del_log.read_text(encoding="utf-8").strip().splitlines()
+        assert lines == expected, detail
 
 
 def test_pls_host_release_search_harvest_locks_uses_mapfile_and_dev_null():
