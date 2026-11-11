@@ -2,7 +2,7 @@
 
 The pinned public intermediate (AIA http://crt.sectigo.com/GoGetSSLRSADVSSLCA2.crt) is appended
 to the system and certifi roots for na.gov.pk and its www alias only. Verification stays on.
-Other hosts, including ones that fail for a different reason, keep the default verifier.
+Other hosts keep the default verifier.
 """
 
 from __future__ import annotations
