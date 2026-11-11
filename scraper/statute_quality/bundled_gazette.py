@@ -350,7 +350,9 @@ def clip_section_text(text: str) -> str:
         if _GAZETTE_IMPRINT_RE.search(line) and len(_PDF_WORD_RE.findall(line)) < 14:
             continue
         kept.append(line)
-    return "\n".join(kept).strip()
+    from scraper.parsers.assembly_pdf_sections import strip_gazette_page_break_lines
+
+    return strip_gazette_page_break_lines("\n".join(kept))
 
 
 def strip_gazette_imprint_lines(text: str) -> str:

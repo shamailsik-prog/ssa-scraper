@@ -487,6 +487,11 @@ def test_real_s710_text_keeps_legal_advisers_and_not_the_neighbours():
     assert "five lakh" in blob
     assert "House Building" not in blob
     assert "Airports" not in blob
+    section_three = extracted["sections"][2]["section_text"]
+    assert "repealed" in section_three.lower() or "repcaled" in section_three.lower()
+    assert "M. A. HAQ" in section_three
+    assert "PRINTING CORPORATION" not in section_three.upper()
+    assert "PUBLICATIONS" not in section_three.upper()
 
 
 def test_real_travel_agencies_file_is_not_tourist_guides():
@@ -502,6 +507,11 @@ def test_real_travel_agencies_file_is_not_tourist_guides():
     by_num = {str(section["section_number"]): section["section_text"] for section in extracted["sections"]}
     assert "Federal Government" in by_num["14"]
     assert not by_num["15"].lstrip().startswith("Federal Government")
+    assert "official Gazette" in by_num["15"]
+    assert "oftcial Gaz" in by_num["16"]
+    assert "dispose" in by_num["12"]
+    assert "GAZET" not in by_num["12"].upper()
+    assert "manager or any partner" in by_num["4"]
 
 
 def test_real_lxvi_shard_is_present_and_not_selected():
@@ -546,6 +556,20 @@ def test_real_pat_feeder_name_is_the_short_title_not_the_act_number_heading():
     assert "2" in _numbers(extracted)
     assert "Motor Vehicles" not in blob
     assert "Pat Feeder" in blob
+    section_two = next(section["section_text"] for section in extracted["sections"] if section["section_number"] == "2")
+    assert section_two.rstrip().endswith("1976.")
+    foreign = text + """
+ACT No. XL of 1976
+An Act to amend the Motor Vehicles Act for a foreign instrument.
+1. Short title.—This Act may be called the Foreign Instrument Act, 1976.
+2. Extent.—This Act extends only to the foreign instrument and to no other.
+"""
+    kept = _extract(foreign, url=PAT_FEEDER_URL, title="XXXIX ol 1976 An Act")
+    kept_blob = _blob(kept)
+    assert "Foreign Instrument" not in kept_blob
+    assert "Motor Vehicles" not in kept_blob
+    kept_two = next(section["section_text"] for section in kept["sections"] if section["section_number"] == "2")
+    assert kept_two.rstrip().endswith("1976.")
 
 
 def test_numeral_heading_name_is_held():

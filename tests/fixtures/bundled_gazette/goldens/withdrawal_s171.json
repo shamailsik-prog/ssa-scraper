@@ -1,0 +1,17 @@
+{
+  "fixture": null,
+  "source_url": null,
+  "act_title": "Withdrawal of Remission of Sentences Act, 1976",
+  "statute_ids": [
+    "0181ad58-1a79-479c-bdd8-dad584cfd683",
+    "7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"
+  ],
+  "pinned_sha256": "6e9dbba7f60a4265543521a4084565d150c9c29747cb6d860a993d6a1bc37636",
+  "body_locked": false,
+  "section_numbers": [
+    "1",
+    "2",
+    "3"
+  ],
+  "limitation": "The pinned PDF text layer is not in this repo. Section numbers are the preview record. Body text is not locked and must not be invented from a different file."
+}

@@ -144,6 +144,30 @@ def test_strip_gazette_page_break_removes_extra_part_header_without_oct():
     assert "Continued" in cleaned
 
 
+def test_strip_keeps_a_year_that_ends_a_sentence_and_drops_printer_and_header_furniture():
+    body = (
+        "2. Amendment.—substituted on the 6rst day of April,\n"
+        "1976.\n"
+        "a'e,\n"
+        "1976\n"
+        "298 1976\n"
+        "(estr\n"
+        "TFIE GAZET^|E oF PAKISTAN, EXTRA..\n"
+        "PRINTED BY THE MANAQER, PRINTING CORPORATION OF PAKISTAN PRESS\n"
+        "PTIBT,TSHED RY TI{E MANAGER OF PUBLICATIONS, KARACHI\n"
+        "3. A manager or any partner of the applicant firm shall sign.\n"
+        "4. Published in the official Gazette, the notice takes effect."
+    )
+    cleaned = strip_gazette_page_break_lines(body)
+    assert "1976." in cleaned
+    assert "PRINTING CORPORATION" not in cleaned.upper()
+    assert "PUBLICATIONS" not in cleaned.upper()
+    assert "TFIE GAZET" not in cleaned
+    assert "(estr" not in cleaned
+    assert "manager or any partner" in cleaned
+    assert "official Gazette" in cleaned
+
+
 def test_strip_gazette_page_break_removes_header_shaped_lines():
     body = (
         "18. Cognizance.- No court shall take cognizance.\n"

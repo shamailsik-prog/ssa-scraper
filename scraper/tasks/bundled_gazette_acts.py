@@ -14,6 +14,9 @@ Conciliation Courts ``86215821``, stays on ``python -m scraper.tasks.gok_multi_a
     python -m scraper.tasks.bundled_gazette_acts --statute-id <uuid>
     python -m scraper.tasks.bundled_gazette_acts --apply
     python -m scraper.tasks.bundled_gazette_acts --undo RUN_ID
+    python -m scraper.tasks.bundled_gazette_acts --apply-reextract --statute-id <uuid>
+    python -m scraper.tasks.bundled_gazette_acts --lift-quarantine --statute-id <uuid>
+    python -m scraper.tasks.bundled_gazette_acts --rollback RUN_ID
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ from scraper.config import settings
 from scraper.database import SessionLocal, run_async
 from scraper.fetchers import pdf_text_layer
 from scraper.models import CorpusMetadata, DocumentQuarantine, Statute, StatuteSection, StatuteSectionVersion
-from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.statute_quality.bundled_gazette import (
     ACTION_QUARANTINE,
     VERDICT_FETCH_FAIL,
@@ -46,7 +48,6 @@ from scraper.statute_quality.bundled_gazette import (
     VERDICT_SKIPPED_EMPTY,
     BundledGazetteVerdict,
     classify_bundled_gazette,
-    gazette_bundle_hold_reason,
 )
 from scraper.statute_quality.gok_multi_act_bleed import is_law_gok_source
 from scraper.statute_quality.senate_integrity import is_pdf_document_url, is_senate_sourced, split_statute_source_url
@@ -561,64 +562,12 @@ async def preview_confirmed_reextract(
                 skip_fetch=skip_fetch,
                 pinned_sha=pinned,
             )
-            if not available:
-                rows.append(
-                    {
-                        "statute_id": str(sid),
-                        "found": True,
-                        "stored_name": statute.name,
-                        "source_url": statute.source_url,
-                        "pdf_origin": origin,
-                        "section_count": 0,
-                        "section_numbers": [],
-                        "hold_reason": "recorded_sha_mismatch" if origin == "sha_mismatch" else "pdf_unavailable",
-                        "writes": 0,
-                    }
-                )
-                continue
-            extracted = extract_statute_deterministic(
-                html=None,
-                text=pdf_text,
-                source_meta={
-                    "source_name": statute.source_name,
-                    "url": statute.source_url,
-                    "act_title": statute.name,
-                    "jurisdiction": statute.jurisdiction,
-                },
-            )
-            extracted_sections = list(extracted.get("sections") or [])
-            evidence = extracted.get("field_evidence") or {}
-            hold = gazette_bundle_hold_reason(
-                statute_name=str(extracted.get("statute_name") or ""),
-                year_enacted=extracted.get("year_enacted"),
-                jurisdiction=extracted.get("jurisdiction") or statute.jurisdiction,
-                source_url=statute.source_url,
-                source_name=statute.source_name,
-                sections=extracted_sections,
-            )
-            if not hold and evidence.get("bundled_gazette_marker_absent"):
-                hold = "bundled_gazette_marker_absent"
-            elif not hold and evidence.get("bundled_gazette_unresolved"):
-                hold = "bundled_gazette_unresolved"
-            published_name = extracted.get("statute_name")
-            if hold:
-                extracted_sections = []
-                published_name = statute.name
+            from scraper.tasks.bundled_gazette_reextract import marked_act_preview, public_preview_row
+
             rows.append(
-                {
-                    "statute_id": str(sid),
-                    "found": True,
-                    "stored_name": statute.name,
-                    "source_url": statute.source_url,
-                    "pdf_origin": origin,
-                    "statute_name": published_name,
-                    "year_enacted": extracted.get("year_enacted"),
-                    "section_count": len(extracted_sections),
-                    "section_numbers": [section.get("section_number") for section in extracted_sections],
-                    "hold_reason": hold,
-                    "marker_absent": bool((extracted.get("field_evidence") or {}).get("bundled_gazette_marker_absent")),
-                    "writes": 0,
-                }
+                public_preview_row(
+                    marked_act_preview(statute, pdf_text, origin=origin, available=available)
+                )
             )
     return {"dry_run": True, "writes": 0, "preview_reextract": True, "rows": rows}
 
@@ -642,9 +591,46 @@ def build_parser():
             "Writes nothing. A marker whose Act is not in the PDF produces no sections."
         ),
     )
+    parser.add_argument(
+        "--apply-reextract",
+        action="store_true",
+        help=(
+            "Replace sections for explicit allowlisted statute UUIDs from the pinned local PDF. "
+            "Does not fetch, does not delete the statute, and does not lift quarantine."
+        ),
+    )
+    parser.add_argument(
+        "--lift-quarantine",
+        action="store_true",
+        help=(
+            "Delete quarantine rows for explicit allowlisted statute UUIDs, whatever run inserted them. "
+            "Does not rewrite sections."
+        ),
+    )
     parser.add_argument("--undo", metavar="RUN_ID", help="Remove quarantine rows inserted by one --apply run")
+    parser.add_argument(
+        "--rollback",
+        metavar="RUN_ID",
+        help="Restore the statute, sections, and quarantine rows backed up by one --apply-reextract or --lift-quarantine run",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Classify at most this many in-scope rows")
-    parser.add_argument("--statute-id", default=None, help="Classify one statute UUID")
+    parser.add_argument(
+        "--statute-id",
+        action="append",
+        default=None,
+        help="Full statute UUID. Repeat for --apply-reextract and --lift-quarantine. Prefixes are refused.",
+    )
+    parser.add_argument(
+        "--expected-sections",
+        action="append",
+        default=None,
+        help="Optional per-id assertion UUID=1,2,3. Apply skips that id when the previewed numbers differ.",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="Directory for the JSONL backup written before an apply or lift. Default: var/bundled_gazette_reextract",
+    )
     parser.add_argument(
         "--skip-fetch",
         action="store_true",
@@ -658,13 +644,85 @@ def build_parser():
     return parser
 
 
+def _exclusive_mode(args) -> str:
+    selected = [
+        name
+        for name, enabled in (
+            ("apply", args.apply),
+            ("preview-reextract", args.preview_reextract),
+            ("apply-reextract", args.apply_reextract),
+            ("lift-quarantine", args.lift_quarantine),
+            ("undo", bool(args.undo)),
+            ("rollback", bool(args.rollback)),
+        )
+        if enabled
+    ]
+    if len(selected) > 1:
+        raise SystemExit("pass only one of --apply, --preview-reextract, --apply-reextract, --lift-quarantine, --undo, --rollback")
+    return selected[0] if selected else ""
+
+
+def _explicit_ids(raw_ids: Optional[List[str]]) -> list:
+    from scraper.tasks.bundled_gazette_reextract import parse_explicit_statute_id
+
+    try:
+        return [parse_explicit_statute_id(value) for value in (raw_ids or [])]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    from pathlib import Path
+
+    from scraper.tasks.bundled_gazette_reextract import (
+        apply_confirmed_reextract,
+        lift_confirmed_quarantine,
+        parse_expected_sections,
+        rollback_reextract,
+    )
+
     parser = build_parser()
     args = parser.parse_args(argv)
-    statute_id = UUID(args.statute_id) if args.statute_id else None
-    if args.preview_reextract:
-        if args.apply or args.undo:
-            raise SystemExit("preview-reextract writes nothing and cannot be combined with --apply or --undo")
+    mode = _exclusive_mode(args)
+    raw_ids = args.statute_id or []
+    if mode in {"apply-reextract", "lift-quarantine"}:
+        statute_ids = _explicit_ids(raw_ids)
+        if not statute_ids:
+            raise SystemExit(f"{mode} requires at least one full --statute-id")
+        backup_dir = Path(args.backup_dir) if args.backup_dir else None
+        try:
+            if mode == "apply-reextract":
+                expected = parse_expected_sections(args.expected_sections)
+                out = run_async(
+                    apply_confirmed_reextract(
+                        statute_ids=statute_ids,
+                        expected_sections=expected,
+                        backup_dir=backup_dir,
+                    )
+                )
+            else:
+                if args.expected_sections:
+                    raise SystemExit("expected-sections is only valid with --apply-reextract")
+                out = run_async(lift_confirmed_quarantine(statute_ids=statute_ids, backup_dir=backup_dir))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(out, indent=2, default=str))
+        return 2 if out.get("refused") else 0
+    if mode == "rollback":
+        if raw_ids or args.expected_sections:
+            raise SystemExit("rollback restores the backup for the run and does not take statute ids")
+        try:
+            out = run_async(rollback_reextract(args.rollback))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    if len(raw_ids) > 1:
+        raise SystemExit("pass one --statute-id unless using --apply-reextract or --lift-quarantine")
+    statute_id = _explicit_ids(raw_ids)[0] if raw_ids else None
+    if args.expected_sections:
+        raise SystemExit("expected-sections is only valid with --apply-reextract")
+    if mode == "preview-reextract":
         out = run_async(
             preview_confirmed_reextract(
                 statute_id=statute_id,
