@@ -1397,6 +1397,18 @@ def _strategy_3_p_filtered_digit_start(soup: BeautifulSoup, statute_name: str) -
 # A period heading the line-start splitter already accepts. The lookahead
 # keeps a gazette date ``12.1975`` from being read as section 12.
 _PERIOD_LINE_HEADING_RE = re.compile(r"(?m)^[ \t]*(\d{1,3})[ \t]*\.(?!\d)")
+# ``1.,.;:..`` and a page-break ``1.,`` are not headings. A bare ``1.`` and a
+# marginal ``1.—`` stay, because the title may be the next line.
+_PUNCT_SOUP_HEADING_LINE_RE = re.compile(
+    r"^[ \t]*\d{1,3}[ \t]*[\.\)\]][ \t]*[,.;:]+[ \t]*$"
+)
+_COLON_LINE_HEADING_RE = re.compile(r"(?m)^[ \t]*(\d{1,3})[ \t]*:(?!\d)")
+_BARE_L_HEADING_LINE_RE = re.compile(r"(?m)^[ \t]*[Ll][ \t]*$")
+_L_AMENDMENT_SAME_LINE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)[Ll](?P<gap>[ \t]+)"
+    r"(?P<title>(?:Amendment|Short[ \t]+title|Repeal)\b[^\n]*)"
+)
+_STRUCTURAL_NOTE_START_RE = re.compile(r"(?i)^(?:amendment|short[ \t]+title|repeal)\b")
 _MARGINAL_DASH_RE = re.compile(r"(?:\.-|--|—|–)")
 # ``Committees.--The Board`` and ``Finality of determination.-The``.
 _MARGINAL_NOTE_LINE_RE = re.compile(
@@ -1442,6 +1454,72 @@ def _next_content_line(text: str, after: int) -> str:
         if line.strip():
             return line
     return ""
+
+
+def _heading_line(text: str, start: int) -> str:
+    """The line a heading match sits on. A match may begin on the preceding newline."""
+    if 0 <= start < len(text) and text[start] == "\n":
+        start += 1
+    line_end = text.find("\n", start)
+    return text[start : line_end if line_end != -1 else None]
+
+
+def _line_is_punctuation_soup_heading(line: str) -> bool:
+    return _PUNCT_SOUP_HEADING_LINE_RE.match(line or "") is not None
+
+
+def _drop_punctuation_soup_headings(text: str, matches: Sequence[Match[str]]) -> List[Match[str]]:
+    """Drop ``1.,.;:..`` so it cannot take section 1 away from the short title."""
+    return [
+        match
+        for match in matches
+        if not _line_is_punctuation_soup_heading(_heading_line(text, match.start()))
+    ]
+
+
+def _period_heading_matches(text: str) -> List[Match[str]]:
+    return [
+        match
+        for match in _PERIOD_LINE_HEADING_RE.finditer(text or "")
+        if not _line_is_punctuation_soup_heading(_heading_line(text, match.start()))
+    ]
+
+
+def _lone_l_heading_replacement(slice_text: str, missing: int) -> Optional[Tuple[int, int, str]]:
+    """One ``L`` read as the missing section number. The note after it stays.
+
+    ``L`` on its own line, or ``L Amendment of …``, becomes ``3.`` only when
+    that note starts with Amendment, Short title, or Repeal. ``s€clion`` and
+    the rest of the note are not rewritten.
+    """
+    candidates: List[Tuple[int, int, str]] = []
+    for match in _BARE_L_HEADING_LINE_RE.finditer(slice_text):
+        if not _STRUCTURAL_NOTE_START_RE.match(_next_content_line(slice_text, match.end())):
+            continue
+        candidates.append((match.start(), match.end(), f"{missing}."))
+    for match in _L_AMENDMENT_SAME_LINE_RE.finditer(slice_text):
+        candidates.append(
+            (
+                match.start(),
+                match.end(),
+                f"{match.group('indent')}{missing}.{match.group('gap')}{match.group('title')}",
+            )
+        )
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _repair_l_after_colon_heading(slice_text: str, current: int) -> Optional[str]:
+    """``2:`` then a lone ``L`` before section 4 is section 3. ``2:`` stays."""
+    colons = [int(match.group(1)) for match in _COLON_LINE_HEADING_RE.finditer(slice_text)]
+    if colons != [current + 1]:
+        return None
+    span = _lone_l_heading_replacement(slice_text, current + 2)
+    if span is None:
+        return None
+    start, end, replacement = span
+    return slice_text[:start] + replacement + slice_text[end:]
 
 
 def _repair_one_heading_gap(slice_text: str, missing: int) -> str:
@@ -1496,6 +1574,10 @@ def _repair_one_heading_gap(slice_text: str, missing: int) -> str:
     if len(inlines) == 1:
         match = inlines[0]
         return slice_text[: match.start()] + f"{missing}." + slice_text[match.end("prefix") + 1 :]
+    lone = _lone_l_heading_replacement(slice_text, missing)
+    if lone is not None:
+        start, end, replacement = lone
+        return slice_text[:start] + replacement + slice_text[end:]
     return slice_text
 
 
@@ -1875,8 +1957,9 @@ def _repair_ocr_comma_section_headings(text: str) -> str:
     spans: List[Tuple[int, int, str]] = []
     for kind, _start, match in events:
         if kind == "period":
-            line_end = text.find("\n", match.start())
-            line = text[match.start() : line_end if line_end != -1 else None]
+            line = _heading_line(text, match.start())
+            if _line_is_punctuation_soup_heading(line):
+                continue
             stripped = line.strip()
             if (
                 _line_is_tariff_schedule_heading(stripped)
@@ -1938,15 +2021,22 @@ def _repair_ocr_swallowed_section_headings(text: str) -> str:
     ``51. Repeal``.
     """
     text = _renumber_duplicate_ocr_heading(text)
-    matches = list(_PERIOD_LINE_HEADING_RE.finditer(text))
+    matches = _period_heading_matches(text)
     spans: List[Tuple[int, int, str]] = []
     for index in range(len(matches) - 1):
         current = int(matches[index].group(1))
         following = int(matches[index + 1].group(1))
-        if following != current + 2 or current >= 400:
+        if current >= 400:
             continue
         start = matches[index].end()
         end = matches[index + 1].start()
+        if following == current + 3:
+            repaired = _repair_l_after_colon_heading(text[start:end], current)
+            if repaired is not None:
+                spans.append((start, end, repaired))
+            continue
+        if following != current + 2:
+            continue
         repaired = _repair_one_heading_gap(text[start:end], current + 1)
         if repaired != text[start:end]:
             spans.append((start, end, repaired))
@@ -1977,10 +2067,14 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         # Marginal headings are not a Baloch-only path: the same matcher used to
         # turn "Section 5. The" into a section in any plain-text act. Cross-reference
         # words and the previous+1 rule apply here and to the loose fallback.
-        matches = _select_heading_matches(plain, line_start, marginal)
+        matches = _drop_punctuation_soup_headings(
+            plain, _select_heading_matches(plain, line_start, marginal)
+        )
         if len(matches) < 2:
             loose = list(_LOOSE_SECTION_RE.finditer(plain))
-            matches = _select_heading_matches(plain, line_start, [*marginal, *loose])
+            matches = _drop_punctuation_soup_headings(
+                plain, _select_heading_matches(plain, line_start, [*marginal, *loose])
+            )
         # A line opening ``11.10.2018`` matches the day as a heading. Leave the
         # match in place so the note stays its own chunk. ``_deduplicate_sections``
         # refuses that chunk as a heading and parks the text on the neighbouring

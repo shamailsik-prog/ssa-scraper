@@ -13,8 +13,9 @@ Unresolved text is not split: storing a mixture is worse than storing nothing.
 An ``ACT No.`` glued into the middle of a section is a boundary when ``An Act``
 follows it, including when that next act's section 1 was not read. A citation
 tail (``Act No. ….- In the``) stays with the amending act. A later
-``ORDINANCE No.`` line, a later ``ACT No. … of …`` line, or a later
-``THE … ORDINANCE, 1976`` title line ends the segment. An in-body repeal such
+``ORDINANCE No.`` line, a later ``REGULATION No.`` line, a later
+``ACT No. … of …`` line, or a later ``THE … ORDINANCE, YEAR`` or
+``THE … REGULATION, YEAR`` title line ends the segment. An in-body repeal such
 as ``the Emigration Act, 1922 … is hereby repealed`` does not.
 
 A scanned heading still counts when ``ACT`` is ``AC_l`` or ``{-CT``, ``of`` is
@@ -165,46 +166,53 @@ def _unique_above_line_segment(segments: Sequence, pipe_act: Optional[tuple[int,
 
 
 # Line-start instrument headings. Quantifiers are bounded and not nested.
-# ``of`` may be the scan slips ``or``, ``on``, or ``ol``. The year may be the
-# next line (``ACT No. VII OF`` then ``1976``).
+# ``of`` may be the scan slips ``or``, ``on``, ``ol``, or ``op``. The year may
+# be the next line (``ACT No. VII OF`` then ``1976``). ``RBGUL^rloN`` is the
+# text-layer reading of ``REGULATION`` on senate.gov.pk 1660540218_920.pdf.
 _INSTRUMENT_NO_LINE_RE = re.compile(
-    r"(?im)^[ \t]*(?:act|ordinance)[ \t]+no\.?[ \t]+"
+    r"(?im)^[ \t]*(?:act|ordinance|regulation|rbgul\^rlon)[ \t]+no\.?[ \t]+"
     r"(?:"
-    r"[0-9ivxlcdm]{1,16}[ \t]+(?:of|or|on|ol)[ \t]*"
-    r"|(?:of|or|on|ol)[ \t]*"
+    r"[0-9ivxlcdm]{1,16}[ \t]+(?:of|or|on|ol|op)[ \t]*"
+    r"|(?:of|or|on|ol|op)[ \t]*"
     r")"
     r"(?:(?:18|19|20)[0-9]{2}|(?:\r?\n)[ \t]*(?:18|19|20)[0-9]{2})"
     r"[ \t]*$"
 )
 _FIRST_SECTION_LINE_RE = re.compile(r"(?im)^[ \t]*(?:\d{1,3}|[lL])[\.\)][ \t]+\S")
-# Title lines are ordinances only. A ``THE … ACT, YEAR`` line is the existing
-# law.gok.pk title cut, which runs after this segment is chosen.
-_TITLE_KIND_RE = re.compile(r"(?i) (ordinance), ((?:18|19|20)[0-9]{2})$")
+# Title lines are ordinances and regulations. A ``THE … ACT, YEAR`` line is
+# the existing law.gok.pk title cut, which runs after this segment is chosen.
+_TITLE_KIND_RE = re.compile(
+    r"(?i) (?:ordinance|regulation), ((?:18|19|20)[0-9]{2})$"
+)
 _TITLE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’\-]{0,40}")
 _OPENING_LINE_RE = re.compile(
-    r"(?i)^(?:an[ \t]+(?:act|ordinance)\b|whereas\b|"
-    r"(?:act|ordinance)[ \t]+no\.?\b|"
+    r"(?i)^(?:an[ \t]+(?:act|ordinance|regulation)\b|whereas\b|"
+    r"(?:act|ordinance|regulation)[ \t]+no\.?\b|"
     r"[1l][\.\)][ \t]*short[ \t]+title\b|"
-    r"it[ \t]+is[ \t]+hereby[ \t]+enacted\b|ordinance\b)"
+    r"it[ \t]+is[ \t]+hereby[ \t]+enacted\b|(?:ordinance|regulation)\b)"
 )
 _REPEAL_CONTINUATION_RE = re.compile(
     r"(?i)^(?:(?:is|are)[ \t]+hereby\b|hereby[ \t]+repealed\b|shall[ \t]+(?:be[ \t]+)?repealed\b)"
 )
 # The gazette line that publishes the next instrument, including a notification
-# number glued in front of ``The following Ordinance``.
+# number glued in front of ``The following Ordinance``. ``iollowing`` is the
+# scan of ``following`` on the Copyright Amendment bundle.
 _NEXT_PUBLICATION_RE = re.compile(
-    r"(?im)^[^\n]{0,80}\bthe[ \t]+following[ \t]+(?:acts?|ordinances?)\b"
+    r"(?im)^[^\n]{0,80}\bthe[ \t]+[fi]ollowing[ \t]+(?:acts?|ordinances?|regulations?)\b"
 )
 
 
 def _is_title_heading_line(line: str) -> bool:
-    """A whole line ``THE … ORDINANCE, 1976``.
+    """A whole line ``THE … ORDINANCE, 1976`` or ``THE … REGULATION, 1973``.
 
     Prose stays out: the line is only ``the`` plus title words, then
-    ``Ordinance`` and the year. ``the Emigration Act, 1922 is hereby repealed``
+    ``Ordinance`` or ``Regulation`` and the year. A parenthetical such as
+    ``(REPEAL)`` is not a word. ``the Emigration Act, 1922 is hereby repealed``
     does not fit, and a ``THE … ACT, YEAR`` line is not this cut.
     """
     stripped = re.sub(r"[ \t]+", " ", (line or "").strip())
+    stripped = re.sub(r"\([^)]{0,40}\)", " ", stripped)
+    stripped = re.sub(r"[ \t]+", " ", stripped).strip()
     if len(stripped) < 16 or len(stripped) > 180:
         return False
     if not stripped.lower().startswith("the "):
@@ -239,7 +247,7 @@ def _title_opens_new_instrument(following: Sequence[str]) -> bool:
     for line in following:
         if _REPEAL_CONTINUATION_RE.match(line):
             return False
-        if re.fullmatch(r"(?i)an", line):
+        if re.fullmatch(r"(?i)an?", line):
             continue
         if _OPENING_LINE_RE.match(line):
             return True
@@ -275,12 +283,13 @@ def _window_has_instrument_heading(window: str) -> bool:
 def _instrument_boundary_offset(text: str, *, skip_opening_number: bool) -> Optional[int]:
     """Offset of the next instrument, or None when this text is one instrument.
 
-    ``skip_opening_number`` keeps the first ``ACT No.`` / ``ORDINANCE No.``
-    line, which is the instrument being read. A section clip does not skip:
-    the heading inside the section is the neighbour, once eight words precede
-    it. Title lines and ``The following Ordinance`` lines count only after
-    this instrument's first section, and a title line counts only when the
-    next lines open an instrument.
+    ``skip_opening_number`` keeps the first ``ACT No.`` / ``ORDINANCE No.`` /
+    ``REGULATION No.`` line, which is the instrument being read. A section
+    clip does not skip: the heading inside the section is the neighbour, once
+    eight words precede it. Title lines and ``The following Ordinance`` /
+    ``The following Regulation`` lines count only after this instrument's
+    first section, and a title line counts only when the next lines open an
+    instrument.
     """
     raw = text or ""
     if not raw.strip():
@@ -318,13 +327,14 @@ def _instrument_boundary_offset(text: str, *, skip_opening_number: bool) -> Opti
 
 
 def truncate_at_next_instrument(text: str) -> str:
-    """Drop the next Act or Ordinance from a gazette segment.
+    """Drop the next Act, Ordinance, or Regulation from a gazette segment.
 
-    The first ``ACT No.`` or ``ORDINANCE No.`` line stays. A later number
-    heading, a ``THE … ORDINANCE, YEAR`` line that opens another instrument,
-    or the ``The following Ordinance`` publication line in front of that
-    heading is the cut. ``the Emigration Act, 1922`` followed by
-    ``is hereby repealed`` stays inside the section that cites it.
+    The first ``ACT No.``, ``ORDINANCE No.``, or ``REGULATION No.`` line
+    stays. A later number heading, a ``THE … ORDINANCE, YEAR`` or
+    ``THE … REGULATION, YEAR`` line that opens another instrument, or the
+    ``The following Ordinance`` / ``The following Regulation`` publication
+    line in front of that heading is the cut. ``the Emigration Act, 1922``
+    followed by ``is hereby repealed`` stays inside the section that cites it.
     """
     cut = _instrument_boundary_offset(text, skip_opening_number=True)
     if cut is None:

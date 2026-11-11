@@ -175,6 +175,76 @@ def test_later_act_number_without_an_immediate_preamble_does_not_splice_section_
     assert "Pakistan Engineering Council" not in "\n".join(bodies.values())
 
 
+def test_copyright_amendment_stops_before_the_frontier_crimes_regulation():
+    """Act II of 1973 keeps sections 1–6 and drops the next Regulation.
+
+    ``L`` before ``Amendment of s€clion 30`` is section 3. The note, including
+    that OCR spelling, is not rewritten. ``1.,.;:..`` is not section 1.
+    """
+    text = "\n".join(
+        [
+            "REGISTERED No. L.-756",
+            "1.,.;:..",
+            "NATIONAL ASSEMBLY OF PAKISTAN",
+            "The following Act of the National Assembly received the assent of the President.",
+            "Acr No. II oF",
+            "1973",
+            "An Act to amend the Copyright Ordinance, 1962.",
+            "WHEREAS it is expedient to amend the Copyright Ordinance, 1962;",
+            "It is hereby enacted as follows:-",
+            "1, Short title and commencement.—(1) This Act may be called the Copyright (Amendment) Act, 1973.",
+            "(2) It shall come into force at once.",
+            "2: Amendment of section 10, Ordinance XXXIV of 1962.—In the Copyright Ordinance, 1962, in section 10, a new subsection shall be inserted.",
+            "1.,",
+            "L",
+            "Amendment of s€clion 30, Ordinance XXXIV of 1962.—In the said Ordinance, in section 30, the words shall be inserted.",
+            "4. Amendment of section 53, Ordinance XXXIV of 1962.—In the said Ordinance, in section 53, the following shall be added.",
+            "5. General amendment, Ordinance XXXIV of 1962.—In the said Ordinance, for the words Central Government the words Federal Government shall be substituted.",
+            "6. Repeal.—The Copyright (Amendment) Ordinance, 1972, is hereby repealed.",
+            "ASLAM ABDULLAH KHAN,",
+            "Secretary.",
+            "No. F. 6 (35)-Fl (SOI)172.-The iollowing Regulation made by the President is hereby published for general information:-",
+            "THE FRONTIER CRIMES REGULATION (REPEAL) REGULATION, 1973",
+            "RBGUL^rloN No. I oP 1973",
+            "A",
+            "REGULATION",
+            "to repeal the Frontier Crimes Regulation, 1901 in its application to certain areas.",
+            "WHEREAS it is expedient to repeal the Frontier Crimes Regulation, 1901;",
+            "1. Short title and commencement.—(1) This Regulation may be called the Frontier Crimes Regulation (Repeal) Regulation, 1973.",
+            "2. Repeal.—The Frontier Crimes Regulation, 1901 (Regulation III of 1901), is hereby repealed.",
+            "3. Transfer of pending cases.—All criminal cases pending under the Frontier Crimes Regulation, 1901, stand transferred.",
+        ]
+    )
+    extracted = _extract(
+        text,
+        url="https://senate.gov.pk/uploads/documents/1660540218_920.pdf|II of 1973",
+        title="The Copyright (Amendment) Act, 1973",
+    )
+    bodies = _by_number(extracted)
+    blob = "\n".join(bodies.values())
+    assert _numbers(extracted) == ["1", "2", "3", "4", "5", "6"]
+    assert "Copyright (Amendment) Act, 1973" in bodies["1"]
+    assert "NATIONAL ASSEMBLY" not in bodies["1"]
+    assert "section 10" in bodies["2"]
+    assert "Amendment of s€clion 30" in bodies["3"]
+    assert "s€clion 30" in bodies["3"]
+    assert "Transfer of pending cases" not in bodies["3"]
+    assert "is hereby repealed" in bodies["6"]
+    assert "Secretary" in bodies["6"]
+    for banned in (
+        "following Regulation",
+        "iollowing Regulation",
+        "REGULATION No",
+        "RBGUL",
+        "FRONTIER",
+        "1901",
+        "Transfer of pending cases",
+        "This Regulation may be called",
+    ):
+        assert banned not in bodies["6"]
+        assert banned not in blob
+
+
 def test_emigration_repeal_inside_a_section_is_not_an_instrument_boundary():
     text = "\n".join(
         [
