@@ -52,6 +52,22 @@ jobs:
             getent hosts "$1" >/dev/null 2>&1
           }
 
+          # Fatal even when rewrite_sources is called from a conditional: a bad
+          # mirror must not fall through into apt. DNS misses use return 2 instead.
+          require_https_mirror() {
+            case "$1" in
+              https://azure.archive.ubuntu.com*)
+                echo "refusing Azure apt mirror: $1" >&2
+                exit 1
+                ;;
+              https://*) ;;
+              *)
+                echo "refusing non-HTTPS apt mirror: $1" >&2
+                exit 1
+                ;;
+            esac
+          }
+
           # Runner images point Ubuntu suites at mirror+file:/etc/apt/apt-mirrors.txt
           # with azure.archive.ubuntu.com first. A DNS miss there aborts this step
           # (apt exit 100) before pytest. Rewrite to official HTTPS mirrors and keep
@@ -68,7 +84,7 @@ jobs:
               echo "archive.ubuntu.com does not resolve; using mirrors.kernel.org"
             else
               echo "no official Ubuntu archive mirror resolved" >&2
-              return 1
+              return 2
             fi
             if resolves security.ubuntu.com; then
               security="https://security.ubuntu.com/ubuntu/"
@@ -76,15 +92,10 @@ jobs:
               security="$archive"
               echo "security.ubuntu.com does not resolve; security suites use ${archive}"
             fi
-            case "${archive}${security}" in
-              https://*) ;;
-              *)
-                echo "refusing non-HTTPS apt mirror" >&2
-                return 1
-                ;;
-            esac
+            require_https_mirror "$archive"
+            require_https_mirror "$security"
             echo "rewriting apt sources: archive=${archive} security=${security}"
-            sudo ARCHIVE_URI="$archive" SECURITY_URI="$security" /usr/bin/python3 - <<'PY'
+            if ! sudo ARCHIVE_URI="$archive" SECURITY_URI="$security" /usr/bin/python3 - <<'PY'
           import os
           import re
           from pathlib import Path
@@ -108,7 +119,12 @@ jobs:
               return "azure.archive.ubuntu.com" in uri or uri.startswith("mirror+file:")
 
           def assert_trust(text):
-              if re.search(r"(?i)trusted\s*=\s*yes|Trusted:\s*yes|AllowUnauthenticated|Verify-Peer", text):
+              # Verify-Peer: yes is the secure setting. Refuse only an explicit disable.
+              weakened = re.search(
+                  r"(?i)(?:trusted\s*=\s*yes|trusted\s*:\s*yes|allowunauthenticated|verify-peer\s*[:=]\s*\W*(?:false|no|0)\b)",
+                  text,
+              )
+              if weakened:
                   raise SystemExit("refusing apt source that weakens signature or TLS checks")
 
           def replace_field(stanza, name, value):
@@ -228,6 +244,10 @@ jobs:
               if updated != original:
                   path.write_text(updated)
           PY
+            then
+              echo "apt source rewrite rejected the sources" >&2
+              exit 1
+            fi
             echo "--- apt-mirrors.txt ---"
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               cat /etc/apt/apt-mirrors.txt
@@ -240,25 +260,60 @@ jobs:
             fi
           }
 
+          # status 0: sources rewritten. status 2: DNS miss, caller may retry.
+          # Signature, TLS, and parse failures call exit and do not return.
+          try_rewrite() {
+            local status=0
+            rewrite_sources || status=$?
+            if [ "$status" -eq 0 ]; then
+              rewritten=1
+              return 0
+            fi
+            if [ "$status" -eq 2 ]; then
+              echo "official Ubuntu mirrors did not resolve; retrying DNS inside the install loop" >&2
+              return 0
+            fi
+            exit "$status"
+          }
+
           rewritten=0
-          if ! resolves azure.archive.ubuntu.com; then
-            echo "azure.archive.ubuntu.com does not resolve; rewriting apt sources before install"
-            rewrite_sources
-            rewritten=1
-          else
+          attempts=3
+          attempt=1
+          if resolves azure.archive.ubuntu.com; then
             echo "azure.archive.ubuntu.com resolves; trying the runner mirror list first"
+          else
+            echo "azure.archive.ubuntu.com does not resolve; rewriting apt sources inside the install loop"
           fi
 
-          for attempt in 1 2 3; do
+          while [ "$attempt" -le "$attempts" ]; do
             if [ "$attempt" -eq 2 ]; then
               sleep 15
-            elif [ "$attempt" -eq 3 ]; then
+            elif [ "$attempt" -ge 3 ]; then
               sleep 30
             fi
-            echo "apt attempt ${attempt}/3 (Acquire::Retries=5)"
+            if [ "$rewritten" -eq 0 ] && ! resolves azure.archive.ubuntu.com; then
+              echo "azure.archive.ubuntu.com does not resolve; retrying official mirror DNS"
+              try_rewrite
+              if [ "$rewritten" -eq 0 ]; then
+                echo "apt attempt ${attempt}/${attempts} skipped; no official Ubuntu mirror resolved yet"
+                attempt=$((attempt + 1))
+                continue
+              fi
+            fi
+            echo "apt attempt ${attempt}/${attempts} (Acquire::Retries=5 Acquire::http::Timeout=120 Acquire::https::Timeout=120 Acquire::https::Verify-Peer=true)"
             : >"$log"
-            if sudo apt-get -o Acquire::Retries=5 update >>"$log" 2>&1 \
-              && sudo apt-get -o Acquire::Retries=5 install -y tesseract-ocr fonts-dejavu-core >>"$log" 2>&1; then
+            if sudo apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::http::Timeout=120 \
+                -o Acquire::https::Timeout=120 \
+                -o Acquire::https::Verify-Peer=true \
+                update >>"$log" 2>&1 \
+              && sudo apt-get \
+                -o Acquire::Retries=5 \
+                -o Acquire::http::Timeout=120 \
+                -o Acquire::https::Timeout=120 \
+                -o Acquire::https::Verify-Peer=true \
+                install -y tesseract-ocr fonts-dejavu-core >>"$log" 2>&1; then
               cat "$log"
               echo "installed tesseract-ocr and fonts-dejavu-core"
               exit 0
@@ -270,11 +325,15 @@ jobs:
                 || grep -qF "Temporary failure resolving 'azure.archive.ubuntu.com'" "$log"
             }; then
               echo "azure.archive.ubuntu.com still fails to resolve; rewriting apt sources"
-              rewrite_sources
-              rewritten=1
+              try_rewrite
+              if [ "$rewritten" -eq 1 ] && [ "$attempt" -eq "$attempts" ]; then
+                attempts=$((attempts + 1))
+                echo "rewrote apt sources on the final attempt; reserving one install against the new mirrors"
+              fi
             fi
+            attempt=$((attempt + 1))
           done
-          echo "failed to install tesseract-ocr and fonts-dejavu-core after 3 attempts" >&2
+          echo "failed to install tesseract-ocr and fonts-dejavu-core after ${attempts} attempts" >&2
           exit 1
       - name: Install dependencies
         run: |
