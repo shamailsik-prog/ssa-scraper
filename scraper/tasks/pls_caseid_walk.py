@@ -29,7 +29,21 @@ from scraper.harvest_mode import get_harvest_mode, login_pacing_profile
 from scraper.models import Judgment, ScraperSource, ScraperStaging
 from scraper.pls_grid_health import dispatch_saturated
 from scraper.parsers.text_cleaner import clean_html
-from scraper.pls_caseid import case_name, case_page_diagnostics, case_url, ceiling, group_order, known_by_group, looks_like_case_page, new_state, next_serial, record, same_judgment, split_group_key
+from scraper.pls_caseid import (
+    case_name,
+    case_page_diagnostics,
+    case_url,
+    ceiling,
+    group_eligible_for_walk,
+    group_order,
+    known_by_group,
+    looks_like_case_page,
+    new_state,
+    next_serial,
+    record,
+    same_judgment,
+    split_group_key,
+)
 from scraper.tasks.pakistanlawsite import PacingBudgetExceeded, PakistanLawSitePipeline, SOURCE_NAME, claim_free_slot, release_claimed_slot
 
 logger = logging.getLogger(__name__)
@@ -161,9 +175,10 @@ class CaseIdWalker:
         elif not state.get("calibrated_at"):
             return {"skipped": "calibration failed recently; waiting for the recheck", "calibration": state.get("calibration")}
 
-        years = [split_group_key(k)[0] for k in known]
+        walk_known = {k: v for k, v in known.items() if group_eligible_for_walk(k)}
+        years = [split_group_key(k)[0] for k in walk_known] or [split_group_key(k)[0] for k in known]
         first_year = int(settings.PLS_EARLIEST_YEAR or 0) or min(years)
-        order = group_order(known, first_year=min(first_year, min(years)), last_year=now.year)
+        order = group_order(walk_known, first_year=min(first_year, min(years)), last_year=now.year)
         if self.partition is not None:
             order = [k for k in order if partition_of(k) == self.partition]
         floor, pad, streak = int(settings.PLS_CASEID_WALK_CEILING), int(settings.PLS_CASEID_WALK_CEILING_PAD), int(settings.PLS_CASEID_WALK_MISS_STREAK)

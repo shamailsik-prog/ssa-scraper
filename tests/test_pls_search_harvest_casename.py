@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 import pytest
 
 from scraper.models import Judgment, ScraperStaging, SourceProvenance
 from scraper.pls_search_harvest_core import CASE_KEY_PREFIX, case_name_from_url, citation_keys_for_row
 from scraper.tasks import pls_search_harvest as harvest
+
+_PRE_HYPHEN_CASE_NAME_RE = re.compile(r"CaseName=(\d{4}[A-Za-z]{1,8}\d{1,6})(?![0-9A-Za-z])")
+_CASE_NAME_FIXTURE_URLS = (
+    "https://x/Login/ReferenceCaseLawSearch?CaseName=2022S472&Row=0",
+    "https://x/?CaseName=2025L8&bookName=undefined",
+    "https://x/?CaseName=2023HCAJK1&Row=3",
+    "https://x/?CaseName=2023SCAJK1&Row=0",
+    "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=2026S701&court=&Row=0",
+    "https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=1980L238&&court= &&Row=0",
+)
 
 
 def test_case_name_from_url_legacy_short_codes():
@@ -19,6 +30,23 @@ def test_case_name_from_url_legacy_short_codes():
 def test_case_name_from_url_ajk_high_and_supreme_court_codes():
     assert case_name_from_url("https://x/?CaseName=2023HCAJK1&Row=3") == "2023HCAJK1"
     assert case_name_from_url("https://x/?CaseName=2023SCAJK1&Row=0") == "2023SCAJK1"
+
+
+def test_case_name_from_url_hyphenated_court_codes():
+    assert case_name_from_url("https://x/?CaseName=2024LAT-SINDH12&Row=0") == "2024LAT-SINDH12"
+    assert case_name_from_url("https://x/?CaseName=2025HC-A3&court=") == "2025HC-A3"
+    assert case_name_from_url("https://x/?CaseName=2026SC-A701&Row=0") == "2026SC-A701"
+
+
+def test_hyphen_pattern_does_not_change_keys_on_existing_fixtures():
+    changed = []
+    for url in _CASE_NAME_FIXTURE_URLS:
+        old = _PRE_HYPHEN_CASE_NAME_RE.search(url)
+        new = case_name_from_url(url)
+        assert old is not None and new is not None
+        if new != old.group(1).upper():
+            changed.append((url, old.group(1).upper(), new))
+    assert changed == []
 
 
 @pytest.mark.asyncio
