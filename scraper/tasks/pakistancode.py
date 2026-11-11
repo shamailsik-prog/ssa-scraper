@@ -2,8 +2,9 @@
 PakistanCode (Ministry of Law and Justice) — PUBLIC statute/instrument source.
 
 Live PakistanCode pages expose law discovery through alphabetical / chronological / category
-indexes that link to encoded detail pages, with the official document served as downloadable PDF
-(`pdffiles/...pdf`) and via ViewerJS embeds.
+indexes and the full federal catalog (``/english/sHyuRiF.php``, latest ordinances at
+``/english/KmTY5e.php``). Those pages link to encoded detail pages, with the official
+document served as downloadable PDF (`pdffiles/...pdf`) and via ViewerJS embeds.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.fetchers import has_pdf_signature
 from scraper.models import CrawlFrontier, ScraperSource
-from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
+from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy, scrub_secrets
 from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, note_public_fetch_problem, run_public_source
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,8 @@ ACT_NO_RE = re.compile(r"\b([IVXLCDM]{1,15}\s+of\s+\d{4})\b", re.IGNORECASE)
 PROMULGATION_RE = re.compile(r"Promulgation\s+Date:\s*([A-Za-z]+\s+\d{1,2}\s+\d{4})", re.IGNORECASE)
 DETAIL_PATH_RE = re.compile(r"(?i)^/english/uy2fqajw1-[^/?#]+$")
 LISTING_PATH_RE = re.compile(
-    r"(?i)^/english/(?:index\.php|lgu0xad(?:\.php)?|lgu0xbd(?:\.php)?|lgu0xvd(?:\.php)?|lgu0xvd-[^/?#]+|ldj0xvd(?:\.php)?)$"
+    r"(?i)^/english/(?:index\.php|lgu0xad(?:\.php)?|lgu0xbd(?:\.php)?|lgu0xvd(?:\.php)?|"
+    r"lgu0xvd-[^/?#]+|ldj0xvd(?:\.php)?|shyurif\.php|kmty5e\.php)$"
 )
 PDF_PATH_RE = re.compile(r"(?i)^/pdffiles/.+\.pdf$")
 VIEWER_PATH_RE = re.compile(r"(?i)^/viewerjs/?$")
@@ -43,10 +45,27 @@ DEFAULT_LISTINGS: List[Dict[str, str]] = [
     {"url": "https://pakistancode.gov.pk/english/LGu0xAD.php", "target_kind": "statute"},
     {"url": "https://pakistancode.gov.pk/english/LGu0xBD.php", "target_kind": "statute"},
     {"url": "https://pakistancode.gov.pk/english/LGu0xVD.php", "target_kind": "statute"},
+    # Full federal catalog (about a thousand Act rows). The four indexes above only
+    # show a slice; this page is the one the homepage card links as "List of Federal Laws".
+    {"url": "https://pakistancode.gov.pk/english/sHyuRiF.php", "target_kind": "statute"},
 ]
 PAKISTANCODE_DOCUMENT_PRIORITY = 10
 PAKISTANCODE_LISTING_PRIORITY = 80
 PAKISTANCODE_MIN_CRAWL_MAX_PAGES = 200
+REJECTED_URL_SAMPLE_LIMIT = 20
+_PERMANENT_RETIRE_MARKERS = (
+    "missing %pdf",
+    "http 404",
+    "http 410",
+    "outside the source allow-list",
+    "scheme not permitted",
+    "image statute source rejected",
+    "credentials embedded",
+    "robots.txt disallows",
+    # PublicPipeline._claim retires a row after repeated worker deaths. Reopening it
+    # would reset that circuit breaker and send the same page back to the worker.
+    "the worker died",
+)
 
 
 def listings_for(source: ScraperSource) -> List[Dict[str, Any]]:
@@ -136,6 +155,24 @@ def _classify_discovered_url(url: str) -> Optional[str]:
     return None
 
 
+def _url_for_reject_sample(url: str) -> str:
+    """Drop userinfo, then scrub credential-shaped query values, before a URL is stored.
+
+    The port stays as text on the netloc. ``urlsplit().port`` raises ``ValueError``
+    for a non-numeric port, and that must not escape discovery.
+    """
+    raw = url or ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "[unparseable URL]"
+    netloc = parts.netloc or ""
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    cleaned = urlunsplit((parts.scheme, netloc, parts.path or "", parts.query, ""))
+    return scrub_secrets(cleaned)[:500]
+
+
 def document_identity_suffix(meta: Optional[Dict[str, Any]] = None) -> str:
     """Detail page / act number / listing title that distinguishes shared PDF bytes."""
     meta = meta or {}
@@ -165,6 +202,10 @@ def _infer_target_kind(*, title: str, source_section: str) -> str:
 
 class PakistanCodePipeline(PublicPipeline):
     """Source-specific extraction for PakistanCode listings/detail pages and pdffiles routing."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stats["rejected_url_sample"] = []
 
     async def handle_listing(self, res, fr: CrawlFrontier) -> None:  # type: ignore[override]
         depth = int(fr.query_json.get("depth", 0))
@@ -215,44 +256,49 @@ class PakistanCodePipeline(PublicPipeline):
                     )
                 )
             ).scalars().first()
-            if exists is None:
-                route = {"listing": res.final_url}
-                for key_name in (
-                    "listing_fetch",
-                    "detail_fetch",
-                    "discovery_channel",
-                    "result_index",
-                    "source_section",
-                    "category_title",
-                    "act_year",
-                    "act_no",
-                    "act_title",
-                    "act_type",
-                    "act_promulgation_date",
-                    "detail_url",
-                ):
-                    if key_name in nmeta:
-                        route[key_name] = nmeta[key_name]
-                self.db.add(
-                    CrawlFrontier(
-                        source_name=self.source.source_name,
-                        tier=0,
-                        query_key=key,
-                        query_json={
-                            "kind": "listing",
-                            "url": nurl,
-                            "target_kind": nmeta.get("target_kind", default_target_kind),
-                            "depth": depth + 1,
-                            "route": route,
-                            "meta": nmeta,
-                        },
-                        cursor_json={},
-                        # public_pipeline.pending() drains lower priorities first (ASC),
-                        # so listing rows must stay behind document/PDF rows.
-                        priority=PAKISTANCODE_LISTING_PRIORITY,
-                    )
+            if exists is not None:
+                # Act detail pages only. Reopening retired alphabetical/year indexes
+                # would fill the drain batch ahead of Act rows discovered later.
+                if self._is_detail_listing(nurl) and self._retryable_retired(exists):
+                    self._reopen_retired(exists, priority=PAKISTANCODE_LISTING_PRIORITY, meta=nmeta)
+                continue
+            route = {"listing": res.final_url}
+            for key_name in (
+                "listing_fetch",
+                "detail_fetch",
+                "discovery_channel",
+                "result_index",
+                "source_section",
+                "category_title",
+                "act_year",
+                "act_no",
+                "act_title",
+                "act_type",
+                "act_promulgation_date",
+                "detail_url",
+            ):
+                if key_name in nmeta:
+                    route[key_name] = nmeta[key_name]
+            self.db.add(
+                CrawlFrontier(
+                    source_name=self.source.source_name,
+                    tier=0,
+                    query_key=key,
+                    query_json={
+                        "kind": "listing",
+                        "url": nurl,
+                        "target_kind": nmeta.get("target_kind", default_target_kind),
+                        "depth": depth + 1,
+                        "route": route,
+                        "meta": nmeta,
+                    },
+                    cursor_json={},
+                    # public_pipeline.pending() drains lower priorities first (ASC),
+                    # so listing rows must stay behind document/PDF rows.
+                    priority=PAKISTANCODE_LISTING_PRIORITY,
                 )
-                self.stats["discovered"] += 1
+            )
+            self.stats["discovered"] += 1
         await self.db.flush()
 
     @staticmethod
@@ -501,8 +547,8 @@ class PakistanCodePipeline(PublicPipeline):
                 document_cdn_hosts=self.source.document_cdn_hosts or [],
                 allow_private_for_tests=_tests_allow_private(),
             )
-        except URLPolicyError:
-            self.stats["rejected_urls"] += 1
+        except URLPolicyError as exc:
+            self._note_rejected_url(normalized, exc)
             return
 
         kind = _classify_discovered_url(safe)
@@ -566,6 +612,8 @@ class PakistanCodePipeline(PublicPipeline):
                 )
             ).scalars().first()
             if exists is not None:
+                if self._retryable_retired(exists):
+                    self._reopen_retired(exists, priority=PAKISTANCODE_DOCUMENT_PRIORITY, meta=meta)
                 continue
 
             route: Dict[str, Any] = {"listing": listing_url}
@@ -607,6 +655,51 @@ class PakistanCodePipeline(PublicPipeline):
             added += 1
         await self.db.flush()
         return added
+
+    def _note_rejected_url(self, url: str, exc: BaseException) -> None:
+        """Count a policy rejection and keep a bounded sample on the job stats and log."""
+        self.stats["rejected_urls"] = int(self.stats.get("rejected_urls") or 0) + 1
+        sample = self.stats.setdefault("rejected_url_sample", [])
+        if not isinstance(sample, list) or len(sample) >= REJECTED_URL_SAMPLE_LIMIT:
+            return
+        try:
+            recorded = _url_for_reject_sample(url)
+            reason = scrub_secrets(" ".join(str(exc).split()))[:240]
+        except ValueError:
+            return
+        sample.append({"url": recorded, "reason": reason})
+        # The scrubbed URL stays in job stats. The log records only the count so a
+        # credential-shaped link cannot be written to the log stream.
+        logger.info(
+            "%s: rejected URL recorded in job stats (%s)",
+            self.source.source_name,
+            int(self.stats["rejected_urls"]),
+        )
+
+    @staticmethod
+    def _retryable_retired(row: CrawlFrontier) -> bool:
+        """True when a retired row failed for a transient reason and should be tried again."""
+        if row.status != "retired":
+            return False
+        err = (row.last_error or "").lower()
+        return not any(marker in err for marker in _PERMANENT_RETIRE_MARKERS)
+
+    def _reopen_retired(self, row: CrawlFrontier, *, priority: int, meta: Optional[Dict[str, Any]] = None) -> None:
+        row.status = "pending"
+        row.attempts = 0
+        row.last_error = None
+        row.next_run_at = None
+        row.priority = priority
+        if meta:
+            query = dict(row.query_json or {})
+            merged = dict(query.get("meta") or {})
+            for key, value in meta.items():
+                if key not in merged and value not in ("", None):
+                    merged[key] = value
+            query["meta"] = merged
+            row.query_json = query
+        self.stats["discovered"] += 1
+        self.stats["reopened_retired"] = int(self.stats.get("reopened_retired") or 0) + 1
 
     async def _drain_one(self, fr: CrawlFrontier) -> str:
         """Process one frontier row with fail-closed `%PDF` checks on PDF document candidates."""
