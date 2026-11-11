@@ -231,11 +231,15 @@ def _robots_transport_reason(text: str) -> str:
 
 
 def _robots_base(url: str) -> str:
-    """Origin used for the robots cache and error text. Userinfo is not part of it."""
+    """Origin used for the robots cache and error text.
+
+    Built from the hostname only. ``urlsplit().hostname`` never includes userinfo,
+    so this string does not need to pass through the userinfo redactor.
+    """
     parts = urlsplit(url)
     host = parts.hostname or ""
     if not host:
-        return _redact_url_userinfo(f"{parts.scheme}://{parts.netloc}")
+        return f"{parts.scheme}://"
     if ":" in host:
         host = f"[{host}]"
     if parts.port:
