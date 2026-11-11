@@ -478,8 +478,9 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     from scraper.statute_quality_jurisdiction import resolve_statute_jurisdiction
 
     # A missing or Federal label is the statute column default. Provincial
-    # sources, pas.gov.pk, and an act's own "Sindh Act No." marker keep the
-    # province. See resolve_statute_jurisdiction.
+    # assembly sources and pas.gov.pk keep the province. An act's own
+    # "Sindh Act No." marker does too, but a federal source that only quotes
+    # a provincial Act No. stays Federal. See resolve_statute_jurisdiction.
     act_no = source_meta.get("act_no")
     jurisdiction = resolve_statute_jurisdiction(
         source_name=source_meta.get("source_name"),

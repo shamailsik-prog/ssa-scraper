@@ -12,7 +12,9 @@ landed as Federal while older rows stayed Sindh.
 promotion. A missing or Federal label on a provincial source is the column
 default, not the province. A pas.gov.pk host is Sindh. A provincial
 ``Act No.`` marker in the act's own heading or act-number field is not replaced
-with Federal.
+with Federal, except on a federal source: National Assembly, Senate, the
+Gazette of Pakistan, and Pakistan Code stay Federal when they only quote a
+provincial Act No.
 """
 
 from __future__ import annotations
@@ -49,6 +51,11 @@ _PROVINCIAL_ACT_NO_MARKERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\bPunjab\s+Act\s+No\."), "Punjab"),
     (re.compile(r"(?i)\bKhyber\s+Pakhtunkhwa\s+Act\s+No\."), "Khyber Pakhtunkhwa"),
     (re.compile(r"(?i)\bBalochistan\s+Act\s+No\."), "Balochistan"),
+)
+
+# A citation of another legislature's act is not this act's own number.
+_CITATION_LEAD = re.compile(
+    r"(?i)(?:\bamendment\s+of|\brepeal\s+of|\badapted\s+the|\bsee\s+also)\s*$"
 )
 
 _FEDERAL_SOURCE_NAMES = frozenset(
@@ -95,28 +102,41 @@ def _is_federal_default(value: Optional[str]) -> bool:
     return (value or "").strip().lower() == FEDERAL_JURISDICTION.lower()
 
 
+def _own_act_marker(window: str) -> Optional[tuple[int, str]]:
+    """Earliest provincial Act No. in ``window`` that is this act's own number."""
+    found: Optional[str] = None
+    found_at: Optional[int] = None
+    for pattern, label in _PROVINCIAL_ACT_NO_MARKERS:
+        start = 0
+        while start < len(window):
+            match = pattern.search(window, start)
+            if match is None:
+                break
+            if _CITATION_LEAD.search(window[: match.start()]) is None:
+                if found_at is None or match.start() < found_at:
+                    found = label
+                    found_at = match.start()
+                break
+            start = match.end()
+    if found is None or found_at is None:
+        return None
+    return found_at, found
+
+
 def jurisdiction_from_act_marker(*texts: Optional[str]) -> Optional[str]:
     """Province named by the act's own ``Act No.`` marker, if one is present.
 
     ``act_no`` should be passed first: it is the listing's act number, not a
-    citation. Body text is read only at the heading. The earliest marker in a
-    single text wins when a heading names one province.
+    citation. Body text is read only at the heading. The earliest own marker
+    in a single text wins. A marker led by ``amendment of``, ``repeal of``,
+    ``adapted the``, or ``see also`` is a citation of another act.
     """
     for text in texts:
         if not text:
             continue
-        window = text[:ACT_NO_MARKER_HEAD_CHARS]
-        found: Optional[str] = None
-        found_at: Optional[int] = None
-        for pattern, label in _PROVINCIAL_ACT_NO_MARKERS:
-            match = pattern.search(window)
-            if match is None:
-                continue
-            if found_at is None or match.start() < found_at:
-                found = label
-                found_at = match.start()
+        found = _own_act_marker(text[:ACT_NO_MARKER_HEAD_CHARS])
         if found:
-            return found
+            return found[1]
     return None
 
 
@@ -134,16 +154,19 @@ def resolve_statute_jurisdiction(
     pas.gov.pk and www.pas.gov.pk are Sindh. A missing or Federal label on a
     provincial assembly source uses the source map (the KPAssembly rule, for
     every province in ``SOURCE_JURISDICTION``). An explicit provincial act-number
-    marker is kept when the alternative would be Federal.
+    marker is kept when the alternative would be Federal, unless the source
+    itself is federal. A National Assembly, Senate, Gazette of Pakistan, or
+    Pakistan Code act that quotes a provincial Act No. stays Federal.
     """
     if is_pas_source_url(source_url) or is_pas_source_url(detail_url):
         return "Sindh"
     explicit_clean = (str(explicit).strip() if explicit is not None else "")
     mapped = jurisdiction_for_source(source_name)
+    federal_source = mapped == FEDERAL_JURISDICTION or (source_name or "") in _FEDERAL_SOURCE_NAMES
     federal_label = explicit_clean == "" or _is_federal_default(explicit_clean)
     if mapped and mapped != FEDERAL_JURISDICTION and federal_label:
         return mapped
-    if federal_label:
+    if federal_label and not federal_source:
         marker = jurisdiction_from_act_marker(
             act_no if isinstance(act_no, str) else None,
             text if isinstance(text, str) else None,

@@ -3,7 +3,8 @@
 The source map already said SindhAssembly → Sindh. Promotion applied that map
 only for KPAssembly, then stored an empty jurisdiction as Federal. A confident
 extract skips AI, so nothing else filled the province. These tests keep that
-path on Sindh, including the two 2026 pas.gov.pk acts.
+path on Sindh, including the two 2026 pas.gov.pk acts. A federal source that
+only quotes a provincial Act No. stays Federal.
 """
 
 from __future__ import annotations
@@ -82,43 +83,62 @@ def test_pas_host_and_sindh_assembly_map_beat_the_federal_default():
 
 
 def test_provincial_act_no_marker_is_not_stored_as_federal():
+    """An unmapped source keeps its own provincial Act No. A citation does not count."""
     assert resolve_statute_jurisdiction(
-        source_name="NationalAssembly",
-        source_url="https://na.gov.pk/uploads/documents/example.pdf",
+        source_name=None,
+        source_url="https://example.test/act",
         explicit="Federal",
-        text=_act_body("Punjab Act No. IV of 2024"),
-    ) == "Punjab"
+        text=_act_body("Sindh Act No. XXXVI of 2026"),
+    ) == "Sindh"
     assert resolve_statute_jurisdiction(
-        source_name="Senate",
-        source_url="https://senate.gov.pk/uploads/documents/example.pdf",
+        source_name="UnknownAssembly",
+        source_url="https://example.test/act",
         explicit="",
         act_no="Khyber Pakhtunkhwa Act No. XIII of 2026",
         text="1. Short title.- This Act may be called the Example Act, 2026.",
     ) == "Khyber Pakhtunkhwa"
     assert resolve_statute_jurisdiction(
-        source_name="GazetteOfPakistan",
-        source_url="http://pcp.gov.pk/siteimage/downloads/example.pdf",
+        source_name=None,
+        source_url="https://example.test/act",
         explicit="Federal",
         text=_act_body("Balochistan Act No. II of 2019"),
     ) == "Balochistan"
     assert resolve_statute_jurisdiction(
-        source_name="PakistanCode",
-        source_url="https://pakistancode.gov.pk/english/example",
+        source_name=None,
+        source_url="https://example.test/act",
         explicit="Federal",
         text=_act_body("sindh   act   no. XXXVI of 2026"),
     ) == "Sindh"
+    assert resolve_statute_jurisdiction(
+        source_name=None,
+        source_url="https://example.test/act",
+        explicit="Federal",
+        text=_act_body("See also Sindh Act No. I of 1950.", "Punjab Act No. IV of 2024"),
+    ) == "Punjab"
+    for cited in (
+        "Amendment of Sindh Act No. V of 1975.",
+        "Repeal of Sindh Act No. X of 1976.",
+        "adapted the Sindh Act No. V of 1975.",
+        "See also Sindh Act No. V of 1975.",
+    ):
+        assert resolve_statute_jurisdiction(
+            source_name=None,
+            source_url="https://example.test/act",
+            explicit="Federal",
+            text=_act_body(cited),
+        ) == "Federal"
     buried = ("word " * 40) * ((ACT_NO_MARKER_HEAD_CHARS // 200) + 2)
     buried += "\nSindh Act No. I of 2020\n"
     assert len(buried) > ACT_NO_MARKER_HEAD_CHARS
     assert resolve_statute_jurisdiction(
-        source_name="NationalAssembly",
-        source_url="https://na.gov.pk/uploads/documents/example.pdf",
+        source_name=None,
+        source_url="https://example.test/act",
         explicit="Federal",
         text=buried,
     ) == "Federal"
     assert resolve_statute_jurisdiction(
-        source_name="PakistanCode",
-        source_url="https://pakistancode.gov.pk/english/example",
+        source_name=None,
+        source_url="https://example.test/act",
         explicit="Federal",
         text=_act_body("Act No. V of 1908"),
     ) == "Federal"
@@ -130,9 +150,77 @@ def test_provincial_act_no_marker_is_not_stored_as_federal():
     ) is None
 
 
+def test_federal_source_quoting_a_provincial_act_no_stays_federal():
+    """Rule 3 does not relabel NA, Senate, Gazette, or Pakistan Code."""
+    quotes = (
+        {
+            "source_name": "NationalAssembly",
+            "source_url": "https://na.gov.pk/uploads/documents/adapt-sindh.pdf",
+            "explicit": "Federal",
+            "text": _act_body(
+                "WHEREAS it is expedient to adapt the Sindh Act No. V of 1975 to the Federation."
+            ),
+        },
+        {
+            "source_name": "Senate",
+            "source_url": "https://senate.gov.pk/uploads/documents/repeal-sindh.pdf",
+            "explicit": "Federal",
+            "text": _act_body(
+                "1. Short title.- This Act may be called the Example Repeal Act, 1976.",
+                "2. Repeal of Sindh Act No. X of 1976.- The said Act is hereby repealed.",
+            ),
+        },
+        {
+            "source_name": "GazetteOfPakistan",
+            "source_url": "http://pcp.gov.pk/siteimage/downloads/punjab-citation.pdf",
+            "explicit": "Federal",
+            "text": _act_body(
+                "WHEREAS this Act cites the Punjab Act No. IV of 1958 in its preamble."
+            ),
+        },
+        {
+            "source_name": "PakistanCode",
+            "source_url": "https://pakistancode.gov.pk/english/example",
+            "explicit": "Federal",
+            "act_no": "See also Sindh Act No. V of 1975",
+            "text": _act_body("1. Short title.- This Act may be called the Example Federal Act, 1975."),
+        },
+        {
+            "source_name": "NationalAssembly",
+            "source_url": "https://na.gov.pk/uploads/documents/repeal-empty.pdf",
+            "explicit": "",
+            "text": _act_body(
+                "2. Repeal of Sindh Act No. X of 1976.- The said Act is hereby repealed."
+            ),
+        },
+        {
+            "source_name": "NationalAssembly",
+            "source_url": "https://na.gov.pk/uploads/documents/amend-balochistan.pdf",
+            "explicit": None,
+            "text": _act_body("AN ACT to amend the Balochistan Act No. II of 2019."),
+        },
+        {
+            "source_name": "Senate",
+            "source_url": "https://senate.gov.pk/uploads/documents/own-number.pdf",
+            "explicit": "",
+            "act_no": "Khyber Pakhtunkhwa Act No. XIII of 2026",
+            "text": "1. Short title.- This Act may be called the Example Act, 2026.",
+        },
+        {
+            "source_name": "PakistanCode",
+            "source_url": "https://pakistancode.gov.pk/english/example",
+            "explicit": "Federal",
+            "text": _act_body("sindh   act   no. XXXVI of 2026"),
+        },
+    )
+    for quote in quotes:
+        assert resolve_statute_jurisdiction(**quote) == "Federal"
+
+
 def test_lookalike_hosts_are_not_pas():
     for url in (
         "https://notpas.gov.pk/index.php/acts/details/33/664",
+        "https://xpas.gov.pk/index.php/acts/details/33/664",
         "https://pas.gov.pk.example.com/index.php/acts/details/33/664",
         "https://example.com/?next=https://pas.gov.pk/index.php/acts/details/33/664",
         "https://sindhlaws.gov.pk/Gazette.aspx?pg=ACT",
@@ -175,33 +263,49 @@ def test_extract_fiu_fixture_from_pas_is_sindh_even_when_labeled_federal():
     assert unlabeled["jurisdiction"] == "Sindh"
 
 
-def test_extract_punjab_marker_on_a_federal_source_is_not_federal():
+def test_extract_federal_source_quoting_a_provincial_act_no_stays_federal():
     extracted = extract_statute_deterministic(
         html=None,
-        text=_act_body("Punjab Act No. IV of 2024"),
+        text=_act_body(
+            "WHEREAS it is expedient to adapt the Sindh Act No. V of 1975 to the Federation.",
+            "2. Repeal of Sindh Act No. X of 1976.- The said Act is hereby repealed.",
+        ),
         source_meta={
             "source_name": "NationalAssembly",
-            "url": "https://na.gov.pk/uploads/documents/punjab-act.pdf",
+            "url": "https://na.gov.pk/uploads/documents/adapt-sindh.pdf",
             "jurisdiction": "Federal",
-            "act_title": "Example Provincial Act, 2020",
+            "act_title": "The Example Federal Adaptation Act, 1976",
         },
     )
-    assert extracted["jurisdiction"] == "Punjab"
-    assert all(section["jurisdiction"] == "Punjab" for section in extracted["sections"])
+    assert extracted["jurisdiction"] == "Federal"
+    assert extracted["sections"]
+    assert all(section["jurisdiction"] == "Federal" for section in extracted["sections"])
+
+    empty_label = extract_statute_deterministic(
+        html=None,
+        text=_act_body("AN ACT to amend the Balochistan Act No. II of 2019."),
+        source_meta={
+            "source_name": "NationalAssembly",
+            "url": "https://na.gov.pk/uploads/documents/amend-balochistan.pdf",
+            "act_title": "The Example Federal Amendment Act, 2019",
+        },
+    )
+    assert empty_label["jurisdiction"] == "Federal"
 
 
-def test_pakistan_code_contents_path_keeps_a_sindh_act_number():
+def test_pakistan_code_contents_path_stays_federal_when_text_quotes_a_sindh_act_no():
     text = FIXTURE.read_text(encoding="utf-8")
-    sindh = _extract_statute_by_contents(
+    quoted = _extract_statute_by_contents(
         text,
         FIU_NAME,
         {
             "source_name": "PakistanCode",
             "url": "https://pakistancode.gov.pk/english/example",
             "jurisdiction": "Federal",
+            "act_no": "See also Sindh Act No. XXXVI of 2026",
         },
     )
-    assert sindh["jurisdiction"] == "Sindh"
+    assert quoted["jurisdiction"] == "Federal"
     federal = _extract_statute_by_contents(
         "Act No. V of 1908\n1. Short title.- This Act may be called the Code of Civil Procedure, 1908.",
         "Code of Civil Procedure, 1908",
@@ -340,6 +444,48 @@ async def test_promotion_keeps_kp_and_federal_sources(db):
         await db.execute(select(Statute).where(Statute.id == federal.promoted_to_id))
     ).scalars().one()
     assert federal_statute.jurisdiction == "Federal"
+
+    repeal_text = (
+        "AN ACT to amend the Balochistan Act No. II of 2019.\n"
+        "1. Short title.- This Act may be called the Example Repeal Act, 1976 "
+        "and it extends to the whole of Pakistan.\n"
+        "2. Repeal of Sindh Act No. X of 1976.- The said Act is hereby repealed "
+        "and the repeal extends to the whole of Pakistan.\n"
+        "3. Extent.- This Act extends to the whole of Pakistan and comes into force at once.\n"
+    )
+    repeal = await _stage(
+        db,
+        "NationalAssembly",
+        "https://na.gov.pk/uploads/documents/repeal-sindh.pdf",
+        repeal_text,
+        {
+            "statute_name": "The Example Repeal Act, 1976",
+            "year_enacted": 1976,
+            "statute_type": "act",
+            "sections": [_section(repeal_text)],
+        },
+    )
+    assert await promote_statute_staging(db, repeal) == "promoted"
+    repeal_statute = (
+        await db.execute(select(Statute).where(Statute.id == repeal.promoted_to_id))
+    ).scalars().one()
+    assert repeal_statute.jurisdiction == "Federal"
+
+
+def test_backup_write_fsyncs_before_replace(tmp_path, monkeypatch):
+    synced: list[int] = []
+    real_fsync = backfill.os.fsync
+
+    def _track(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(backfill.os, "fsync", _track)
+    path = tmp_path / "pas_jurisdiction_backup.jsonl"
+    backfill._write(path, "{\"id\": \"1\"}\n")
+    assert path.read_text(encoding="utf-8") == "{\"id\": \"1\"}\n"
+    assert synced
+    assert not path.with_name(path.name + ".tmp").exists()
 
 
 def test_backfill_precheck_matches_fs_two_rows_and_main_zero():
