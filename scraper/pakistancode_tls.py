@@ -75,7 +75,13 @@ def na_ssl_context() -> ssl.SSLContext:
 
 
 def verify_for_url(url: str) -> Union[ssl.SSLContext, bool]:
-    """SSL material for one URL. Each pinned intermediate is only for its own hosts."""
+    """SSL material for one URL. Each pinned intermediate is only for its own hosts.
+
+    Membership is exact, including a trailing DNS root dot. Do not reuse
+    ``host_in_allow_list``: that helper strips the dot and accepts subdomains,
+    and a prefix or suffix check would also select ``evil-na.gov.pk`` and
+    ``na.gov.pk.evil.com``.
+    """
     host = (urlsplit(url).hostname or "").lower()
     if host in PAKISTANCODE_HOSTS:
         return pakistancode_ssl_context()
