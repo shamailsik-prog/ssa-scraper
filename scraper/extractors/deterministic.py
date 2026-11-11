@@ -428,6 +428,22 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     if gazette_source and not unresolved:
         body = strip_gazette_imprint_lines(body or "")
         raw_text = strip_gazette_imprint_lines(raw_text or "")
+    pab_amendment_label = ""
+    if not unresolved:
+        from scraper.statute_quality.pab_consolidated import (
+            amendment_label_from_source,
+            consolidated_base_heading,
+            is_pabalochistan_source,
+        )
+
+        if is_pabalochistan_source(source_url):
+            # A consolidated reprint's first page names the base Act. The
+            # listing row and the filename name the amending instrument.
+            heading = consolidated_base_heading(raw_text or "")
+            if heading is not None:
+                name = heading.title
+                gazette_year = heading.year
+                pab_amendment_label = amendment_label_from_source(source_meta)
     sections = [] if unresolved else split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -464,6 +480,8 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
     name_norm = re.sub(r"\s+", " ", name or "").strip()
     if official and name_norm == official and not listed_title_supported_by_text(official, raw_text):
         evidence["listed_title_absent"] = official[:160]
+    if pab_amendment_label:
+        evidence["pab_amendment_label"] = pab_amendment_label
     year: Optional[int] = gazette_year
     if year is None:
         m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", name or "")
