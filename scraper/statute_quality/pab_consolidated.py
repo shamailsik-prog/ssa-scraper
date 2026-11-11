@@ -3,9 +3,10 @@
 A listing row, or a filename such as ``act282014``, can name the amending
 instrument. When the PDF's first page carries an ``Amended upto`` or
 ``(as amended)`` marker, the statute title and year come from the base
-Act's own heading. The listing or filename label is returned separately
-so the caller can keep it as metadata. The cutoff stays on the heading,
-so this edition does not share the bare Act's name.
+Act's own heading. The listing or filename label, and the cutoff phrase,
+are returned separately so the caller can keep them as metadata. The
+cutoff is not part of the title: promotion matches ``Statute.name``
+exactly, and a suffix would insert a second statute.
 """
 
 from __future__ import annotations
@@ -51,6 +52,12 @@ _MARKER_PAREN_RE = re.compile(
     r"(?i)\s*\(\s*(?:amended\s+up\s*to|as\s+amended)\b[^)]*\)"
 )
 _CUTOFF_YEAR_RE = re.compile(r"\b(?:1[89]|20)\d{2}\b")
+# Between the base heading and the cutoff, reprints print the original
+# act number on its own line: "(BALOCHISTAN ACT NO.V OF 1975)."
+_ACT_NO_LINE_RE = re.compile(
+    r"(?i)^\(?\s*balochistan\s+act\s+no\.?\s*[0-9ivxlcdm]+\s+of\s+"
+    r"(?:1[89]|20)\d{2}\s*\)?\.?\s*$"
+)
 _AMENDMENT_LABEL_RE = re.compile(r"(?i)\bamendment\b|\bact\s+no\b")
 _FILENAME_ACT_RE = re.compile(r"(?i)act(\d{1,3})((?:19|20)\d{2})(?!\d)")
 _HAS_ORDINAL_RE = re.compile(r"(?i)\d(?:st|nd|rd|th)\b")
@@ -85,8 +92,8 @@ def consolidated_base_heading(text: str) -> Optional[ConsolidatedHeading]:
     The marker has to be a finished parenthetical in the title block, before
     ``An Act`` / ``further to amend`` / ``may be called``. An ``Amended upto``
     cutoff wrapped onto the next line is joined first. An open cutoff that
-    never reaches its year is not a heading, so two reprints cannot share a
-    title that dropped the year.
+    never reaches its year is not a heading. The title is the base Act
+    without the cutoff; ``marker`` is that cutoff.
     """
     lines = (text or "").splitlines()[:_FIRST_PAGE_LINES]
     limit = _title_block_end(lines)
@@ -201,18 +208,25 @@ def _act_on_marker_line(line: str) -> Optional[tuple[str, int]]:
     return head, year
 
 
+def _punctuation_only(line: str) -> bool:
+    return not any(char.isalnum() for char in line)
+
+
 def _act_line_above(lines: list[str], marker_index: int):
     ordinal = None
     skipped_ordinal = False
     index = marker_index - 1
     while index >= 0:
         stripped = lines[index].strip()
-        if not stripped or _PAGE_NO_RE.match(stripped):
+        if not stripped or _PAGE_NO_RE.match(stripped) or _punctuation_only(stripped):
             index -= 1
             continue
         if _ORDINAL_ONLY_RE.match(stripped) and not skipped_ordinal:
             ordinal = stripped.strip(".")
             skipped_ordinal = True
+            index -= 1
+            continue
+        if _ACT_NO_LINE_RE.match(stripped):
             index -= 1
             continue
         if _is_preamble_or_clause(stripped):
@@ -268,5 +282,5 @@ def _build(lines: list[str], act_index: int, head: str, year: int, marker: str) 
     parts.append(re.sub(r"\s+", " ", head).strip(" .,"))
     heading = re.sub(r"\s+", " ", " ".join(parts)).strip()
     marker = re.sub(r"\s+", " ", marker).strip()
-    title = f"{heading}, {year} ({marker})"
+    title = f"{heading}, {year}"
     return ConsolidatedHeading(title=title, year=year, marker=marker)

@@ -429,6 +429,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         body = strip_gazette_imprint_lines(body or "")
         raw_text = strip_gazette_imprint_lines(raw_text or "")
     pab_amendment_label = ""
+    pab_amended_upto = ""
     if not unresolved:
         from scraper.statute_quality.pab_consolidated import (
             amendment_label_from_source,
@@ -444,6 +445,7 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
                 name = heading.title
                 gazette_year = heading.year
                 pab_amendment_label = amendment_label_from_source(source_meta)
+                pab_amended_upto = heading.marker
     sections = [] if unresolved else split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -482,6 +484,8 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         evidence["listed_title_absent"] = official[:160]
     if pab_amendment_label:
         evidence["pab_amendment_label"] = pab_amendment_label
+    if pab_amended_upto:
+        evidence["pab_amended_upto"] = pab_amended_upto
     year: Optional[int] = gazette_year
     if year is None:
         m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", name or "")
