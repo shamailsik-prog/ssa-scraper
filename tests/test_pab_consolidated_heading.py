@@ -140,6 +140,106 @@ def test_sentence_as_amended_does_not_replace_an_amendment_title():
     assert extracted["year_enacted"] == 2025
 
 
+def test_wrapped_cutoff_keeps_its_year_and_distinguishes_editions():
+    listing = "The Balochistan Local Government (Amendment) Act No. VI of 2023"
+
+    def wrapped(year: str) -> str:
+        return (
+            "THE BALOCHISTAN LOCAL GOVERNMENT ACT, 2010.\n"
+            "(Amended upto 9th October,\n"
+            f"{year}).\n"
+            "An Act to consolidate the law relating to local government.\n"
+        )
+
+    earlier = _extract(
+        wrapped("2014"),
+        url="https://pabalochistan.gov.pk/storage/5001/local-government-upto-2014.pdf",
+        act_title=listing,
+        act_year="2023",
+        act_no="VI of 2023",
+    )
+    later = _extract(
+        wrapped("2015"),
+        url="https://pabalochistan.gov.pk/storage/5002/local-government-upto-2015.pdf",
+        act_title=listing,
+        act_year="2023",
+        act_no="VI of 2023",
+    )
+
+    assert earlier["statute_name"] == (
+        "THE BALOCHISTAN LOCAL GOVERNMENT ACT, 2010 (Amended upto 9th October, 2014)"
+    )
+    assert later["statute_name"] == (
+        "THE BALOCHISTAN LOCAL GOVERNMENT ACT, 2010 (Amended upto 9th October, 2015)"
+    )
+    assert earlier["statute_name"] != later["statute_name"]
+    assert earlier["year_enacted"] == 2010
+    assert later["year_enacted"] == 2010
+    assert "VI of 2023" not in earlier["statute_name"]
+    assert "VI of 2023" not in later["statute_name"]
+
+
+def test_unclosed_cutoff_does_not_drop_the_year_into_the_title():
+    text = (
+        "THE BALOCHISTAN LOCAL GOVERNMENT ACT, 2010.\n"
+        "(Amended upto 9th October,\n"
+        "An Act to consolidate the law relating to local government.\n"
+    )
+    listing = "The Balochistan Local Government (Amendment) Act No. VI of 2023"
+    extracted = _extract(
+        text,
+        url="https://pabalochistan.gov.pk/storage/5003/local-government-open-cutoff.pdf",
+        act_title=listing,
+        act_year="2023",
+        act_no="VI of 2023",
+    )
+
+    assert extracted["statute_name"] == listing
+    assert extracted["year_enacted"] == 2023
+    assert "pab_amendment_label" not in (extracted.get("field_evidence") or {})
+
+
+def test_preamble_parenthetical_as_amended_keeps_the_amendment_title():
+    text = (
+        "THE BALOCHISTAN JUDICIAL ACADEMY (AMENDMENT) ACT, 2025.\n"
+        "An Act further to amend the Balochistan Judicial Academy Act, 2010 (as amended).\n"
+        "1. Short title. This Act may be called the Balochistan Judicial Academy (Amendment) Act, 2025.\n"
+    )
+    extracted = _extract(
+        text,
+        url=AMENDMENT_URL,
+        act_title=AMENDMENT_LISTING,
+        act_year="2026",
+        act_no="VII of 2026",
+    )
+
+    assert extracted["statute_name"] == AMENDMENT_LISTING
+    assert extracted["year_enacted"] == 2025
+    assert "2010" not in extracted["statute_name"]
+    assert "pab_amendment_label" not in (extracted.get("field_evidence") or {})
+
+
+def test_wrapped_as_amended_under_a_preamble_keeps_the_amendment_title():
+    text = (
+        "THE BALOCHISTAN JUDICIAL ACADEMY (AMENDMENT) ACT, 2025.\n"
+        "An Act further to amend the Balochistan Judicial Academy Act, 2010\n"
+        "(as amended).\n"
+        "1. Short title. This Act may be called the Balochistan Judicial Academy (Amendment) Act, 2025.\n"
+    )
+    extracted = _extract(
+        text,
+        url=AMENDMENT_URL,
+        act_title=AMENDMENT_LISTING,
+        act_year="2026",
+        act_no="VII of 2026",
+    )
+
+    assert extracted["statute_name"] == AMENDMENT_LISTING
+    assert extracted["year_enacted"] == 2025
+    assert "2010" not in extracted["statute_name"]
+    assert "pab_amendment_label" not in (extracted.get("field_evidence") or {})
+
+
 def test_balochistan_code_host_keeps_the_listing_title():
     text = CM_PAGE.read_text(encoding="utf-8")
     extracted = _extract(
