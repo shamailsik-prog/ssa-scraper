@@ -94,11 +94,21 @@ async def test_the_api_needs_its_own_key(db, client, monkeypatch):
     assert off.status_code == 503 and "not configured" in off.json()["detail"]
 
 
-async def test_wrong_corpus_keys_lock_out_only_the_corpus_api(db, client, admin_headers):
+async def test_wrong_corpus_keys_lock_out_only_the_corpus_api(db, client, admin_headers, monkeypatch):
     """A misconfigured agent hammering the corpus API must not lock the operator out of /admin."""
+    import time
+
     from scraper.routers import auth
 
+    # Stamps left by earlier tests sit in a 300s window. _auth_failures drops any stamp
+    # that ages out, so the count can fall during this loop even though corpus keys never
+    # touch the admin counter. Freeze that clock and seed a live in-window count: the
+    # equality below still fails if a wrong corpus key increments it.
+    frozen = time.time()
+    monkeypatch.setattr(auth.time, "time", lambda: frozen)
+    monkeypatch.setitem(auth._AUTH_FAILS, "testclient", [frozen - 5.0, frozen - 4.0, frozen - 3.0])
     before = auth._auth_failures("testclient")
+    assert before == 3
     for _ in range(20):
         assert client.get("/corpus/v1/judgments/search", params={"q": "bail"}, headers={"X-Corpus-Key": "wrong"}).status_code == 401
     assert client.get("/corpus/v1/judgments/search", params={"q": "bail"}, headers=H).status_code == 429
