@@ -50,12 +50,31 @@ def login_pacing_profile(mode: HarvestMode) -> Dict[str, Any]:
     }
 
 
+def update_interval_hours(source: ScraperSource) -> int:
+    """Hours between updates-mode runs for one source.
+
+    ``config_json.update_frequency_hours`` is an explicit operator override.
+    Otherwise the source row's ``scrape_frequency_hours`` is the configured
+    interval (PakistanCode is seeded at 48). ``UPDATE_CADENCE_HOURS`` (6) applies
+    only when neither is set. The scheduler used to ignore the column, so a
+    source whose record said 48 hours was dispatched every 6.
+    """
+    cfg = source.config_json or {}
+    explicit = cfg.get("update_frequency_hours")
+    if explicit is not None and str(explicit).strip() != "":
+        return max(1, int(explicit))
+    column = getattr(source, "scrape_frequency_hours", None)
+    if column:
+        return max(1, int(column))
+    return max(1, int(settings.UPDATE_CADENCE_HOURS))
+
+
 def cadence_for_source(source: ScraperSource, mode: HarvestMode) -> int:
     """Return scheduling cadence in minutes for one source in the selected mode."""
     cfg = source.config_json or {}
     if mode == "backfill":
         return max(1, int(cfg.get("backfill_frequency_minutes") or settings.BACKFILL_SOURCE_FREQUENCY_MINUTES))
-    return max(1, int(cfg.get("update_frequency_hours") or settings.UPDATE_CADENCE_HOURS) * 60)
+    return update_interval_hours(source) * 60
 
 
 def source_selected_for_mode(source: ScraperSource, mode: HarvestMode) -> bool:

@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scraper.fetchers import has_pdf_signature
 from scraper.models import CrawlFrontier, ScraperSource
 from scraper.security import ExplicitBlock, RobotsUnavailable, URLPolicyError, check_url_policy
-from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, run_public_source
+from scraper.tasks.public_pipeline import PublicPipeline, _tests_allow_private, note_public_fetch_problem, run_public_source
 
 logger = logging.getLogger(__name__)
 
@@ -530,13 +530,13 @@ class NasirLawSitePipeline(PublicPipeline):
             fr.status = "pending"
             fr.attempts -= 1
             fr.last_error = str(exc)[:1000]
-            self.stats["deferred"] += 1
+            note_public_fetch_problem(self.stats, exc, deferred=True)
         except ExplicitBlock:
             fr.status = "pending"
             await self.db.flush()
             return "halted"
         except Exception as exc:
-            self.stats["errors"] += 1
+            note_public_fetch_problem(self.stats, exc)
             fr.last_error = str(exc)[:1000]
             fr.status = "pending" if fr.attempts < 3 else "retired"
             logger.exception("%s: frontier item failed %s", self.source.source_name, url)

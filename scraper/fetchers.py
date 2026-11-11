@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
 from scraper.models import ScraperSource, ScraperStaging, SourceProvenance, StatutesStaging
+from scraper.pakistancode_tls import verify_for_source
 from scraper.security import ExplicitBlock, PageVerdict, check_url_policy, classify_response, robots_allows
 
 logger = logging.getLogger(__name__)
@@ -107,12 +108,14 @@ class HttpFetcher:
         self._own_client = client is None
         self._resolver = resolver
         self._allow_private = allow_private_for_tests
+        self._verify = verify_for_source(source)
 
     async def __aenter__(self) -> "HttpFetcher":
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=settings.SCRAPER_TIMEOUT_SECONDS,
                 follow_redirects=True,
+                verify=self._verify,
                 headers={
                     "User-Agent": settings.SCRAPER_USER_AGENT,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

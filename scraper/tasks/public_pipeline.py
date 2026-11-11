@@ -685,13 +685,13 @@ class PublicPipeline:
             fr.status = "pending"
             fr.attempts -= 1
             fr.last_error = str(exc)[:1000]
-            self.stats["deferred"] += 1
+            note_public_fetch_problem(self.stats, exc, deferred=True)
         except ExplicitBlock:
             fr.status = "pending"
             await self.db.flush()
             return "halted"
         except Exception as exc:
-            self.stats["errors"] += 1
+            note_public_fetch_problem(self.stats, exc)
             fr.last_error = str(exc)[:1000]
             fr.status = "pending" if fr.attempts < 3 else "retired"
             logger.exception("%s: frontier item failed %s", self.source.source_name, url)
@@ -808,6 +808,50 @@ def _tests_allow_private() -> bool:
     return bool(settings.APP_ENV == "development" and settings.DEBUG)
 
 
+def note_public_fetch_problem(stats: Dict[str, Any], exc: BaseException, *, deferred: bool = False) -> None:
+    """Count a transport or robots failure and keep the first message for the job."""
+    key = "deferred" if deferred else "errors"
+    stats[key] = int(stats.get(key) or 0) + 1
+    message = str(exc).strip()
+    if message and not stats.get("last_fetch_error"):
+        stats["last_fetch_error"] = message[:1000]
+
+
+def describe_public_fetch_failure(stats: Dict[str, Any]) -> Optional[str]:
+    """Why a public run must not be recorded as a clean success, or None.
+
+    A TLS/transport error is swallowed per frontier row so the crawl can continue.
+    That used to finish the job as ``done`` with ``last_error`` cleared and
+    ``last_success_at`` moved, including a PakistanCode run that fetched 0 pages
+    because every robots.txt request failed certificate verification. Zero pages
+    after listings were armed, or after every item was deferred, is the same miss.
+    """
+    if stats.get("halted") or stats.get("blocked_cooldown") or stats.get("skipped") or stats.get("paused"):
+        return None
+    fetched = int(stats.get("fetched") or 0)
+    errors = int(stats.get("errors") or 0)
+    deferred = int(stats.get("deferred") or 0)
+    if errors and fetched == 0:
+        reason = f"fetch failed: {errors} error(s), 0 pages"
+    elif errors:
+        reason = f"fetch degraded: {errors} error(s) after {fetched} page(s)"
+    elif fetched == 0 and deferred:
+        reason = f"fetch yielded 0 pages; {deferred} item(s) deferred"
+    elif (
+        fetched == 0
+        and int(stats.get("listings_armed") or 0) > 0
+        and int(stats.get("completed") or 0) == 0
+        and int(stats.get("rejected_urls") or 0) == 0
+    ):
+        reason = "fetch yielded 0 pages from listings that were queued"
+    else:
+        return None
+    detail = str(stats.get("last_fetch_error") or "").strip()
+    if detail:
+        reason = f"{reason}: {detail}"
+    return reason[:2000]
+
+
 async def _continue_while_backlog(db: AsyncSession, source: ScraperSource, stats: Dict[str, Any]) -> None:
     """Run again soon, not after the full cadence, while this source's frontier still holds work.
 
@@ -851,6 +895,7 @@ async def run_public_source(
     if source.state in ("HALTED", "DISABLED", "PAUSED"):
         return {"skipped": source.state, "reason": source.state_reason}
     pipeline = pipeline_cls(db, source, fetcher=fetcher, managed=managed, local=local, job_id=job_id)
+    listings_armed = 0
     for item in seed_listings:
         url = item["url"]
         try:
@@ -862,6 +907,7 @@ async def run_public_source(
         exists = (await db.execute(select(CrawlFrontier).where(CrawlFrontier.source_name == source.source_name, CrawlFrontier.tier == 0, CrawlFrontier.query_key == key))).scalars().first()
         if exists is None:
             db.add(CrawlFrontier(source_name=source.source_name, tier=0, query_key=key, query_json={"kind": "listing", "url": url, "target_kind": item.get("target_kind", "judgment"), "depth": 0}, cursor_json={}, priority=30))
+            listings_armed += 1
         elif exists.status in ("done", "retired") and item.get("refresh", True):
             from scraper.judgment_document_body import EMPTY_BODY_FIRST_SEEN_AT_KEY
 
@@ -873,6 +919,8 @@ async def run_public_source(
             cursor = dict(exists.cursor_json or {})
             cursor.pop(EMPTY_BODY_FIRST_SEEN_AT_KEY, None)
             exists.cursor_json = cursor
+            listings_armed += 1
+    pipeline.stats["listings_armed"] = listings_armed
     await db.flush()
     own_fetcher = fetcher is None
     if own_fetcher:
@@ -885,7 +933,14 @@ async def run_public_source(
         if own_fetcher:
             await fetcher.__aexit__(None, None, None)
     source.last_scraped_at = datetime.now(timezone.utc)
-    if not pipeline.stats["halted"] and not pipeline.stats.get("blocked_cooldown"):
+    fetch_failure = describe_public_fetch_failure(pipeline.stats)
+    if pipeline.stats["halted"] or pipeline.stats.get("blocked_cooldown"):
+        pass
+    elif fetch_failure:
+        pipeline.stats["fetch_failure"] = True
+        pipeline.stats["stop_reason"] = fetch_failure
+        source.last_error = fetch_failure[:2000]
+    else:
         source.last_success_at = source.last_scraped_at
         cfg = dict(source.config_json or {})
         if cfg.pop("block_retry", None) is not None:

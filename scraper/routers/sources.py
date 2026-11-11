@@ -24,6 +24,7 @@ from scraper.harvest_mode import (
     set_harvest_mode,
     source_backfill_priority,
     source_selected_for_mode,
+    update_interval_hours,
 )
 from scraper.extractors.scrapegraph_local import LocalScrapeGraphEngine
 from scraper.models import BrowserSessionSlot, CorpusMetadata, ExtractionAudit, Judgment, ScraperSource, SgaiUsageDaily
@@ -165,7 +166,7 @@ async def source_view(
         "scheduler": {
             "selected_for_mode": source_selected_for_mode(s, mode),
             "update_enabled": bool(cfg.get("update_enabled", True)),
-            "update_frequency_hours": int(cfg.get("update_frequency_hours") or settings.UPDATE_CADENCE_HOURS),
+            "update_frequency_hours": update_interval_hours(s),
             "backfill_enabled": bool(cfg.get("backfill_enabled", True)),
             "backfill_priority": int(cfg.get("backfill_priority", 100)),
             "backfill_frequency_minutes": int(cfg.get("backfill_frequency_minutes") or settings.BACKFILL_SOURCE_FREQUENCY_MINUTES),

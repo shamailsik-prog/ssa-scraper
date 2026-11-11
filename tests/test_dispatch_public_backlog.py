@@ -86,7 +86,9 @@ async def test_updates_mode_queues_public_source_with_pending_frontier_even_when
 async def test_lost_task_after_recreate_queues_when_last_job_older_than_cadence(db, monkeypatch):
     await set_harvest_mode(db, "updates", changed_by="qa", reason="lost task")
     shc = await _only_shc_due(db)
-    cadence_hours = int((shc.config_json or {}).get("update_frequency_hours") or settings.UPDATE_CADENCE_HOURS)
+    from scraper.harvest_mode import cadence_for_source
+
+    cadence_hours = cadence_for_source(shc, "updates") / 60
     old = datetime.now(timezone.utc) - timedelta(hours=cadence_hours + 1)
     await _seed_finished_job(db, shc, completed=0, backlog_remaining=False, finished_at=old)
     await _pending_tier0(db, "SindhHighCourt", "judgment:test-lost-task")
