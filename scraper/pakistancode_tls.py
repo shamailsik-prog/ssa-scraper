@@ -1,14 +1,18 @@
-"""TLS trust for pakistancode.gov.pk.
+"""TLS trust for origins that omit the intermediate which signed their leaf.
 
-The origin certificate (CN=pakistancode.gov.pk) is signed by GoGetSSL RSA DV CA,
-but the handshake does not send that intermediate. It sends a different GoGetSSL
-certificate that does not sign the leaf, so a normal certifi/system verify fails
-with "unable to get local issuer certificate".
+pakistancode.gov.pk is signed by GoGetSSL RSA DV CA. The handshake does not send
+that intermediate, so a normal certifi/system verify fails with "unable to get
+local issuer certificate".
 
-This module appends the pinned public intermediate, fetched from the leaf's AIA
-issuer URL, to the system and certifi roots. Verification stays on: hostname
-checks and CERT_REQUIRED are unchanged, and the bundle is used only for
-pakistancode.gov.pk / www.pakistancode.gov.pk.
+na.gov.pk is the same class of failure with a different issuer. The leaf
+(CN=na.gov.pk, also www.na.gov.pk) is signed by GoGetSSL RSA DV SSL CA 2. The
+handshake sends other GoGetSSL and USERTrust certificates that do not sign the
+leaf. The missing intermediate is the one named by the leaf AIA CA Issuers URL.
+
+Each host gets its own bundle: system roots, plus certifi, plus that host's
+pinned public intermediate. Verification stays on (hostname checks and
+CERT_REQUIRED). A client whose allow-list is not entirely inside one of these
+host sets keeps the default verifier.
 """
 
 from __future__ import annotations
@@ -28,33 +32,55 @@ INTERMEDIATE_SHA256 = "43cac31ef8e8ba1b4b16b8206e4c0a26c5badb2fc3aa09e90170e41b6
 INTERMEDIATE_NOT_AFTER = datetime(2028, 9, 5, 23, 59, 59, tzinfo=timezone.utc)
 INTERMEDIATE_SUBJECT_CN = "GoGetSSL RSA DV CA"
 
+NA_HOSTS = frozenset({"na.gov.pk", "www.na.gov.pk"})
+NA_ISSUER_URL = "http://crt.sectigo.com/GoGetSSLRSADVSSLCA2.crt"
+NA_INTERMEDIATE_SHA256 = "b5286796dadf16521de41772ab2fdb5818729971b5274721146c6e8172befe07"
+NA_INTERMEDIATE_NOT_AFTER = datetime(2035, 8, 19, 23, 59, 59, tzinfo=timezone.utc)
+NA_INTERMEDIATE_SUBJECT_CN = "GoGetSSL RSA DV SSL CA 2"
+
 _CERT_PATH = Path(__file__).resolve().parents[1] / "certs" / "GoGetSSL_RSA_DV_CA.pem"
+_NA_CERT_PATH = Path(__file__).resolve().parents[1] / "certs" / "GoGetSSL_RSA_DV_SSL_CA_2.pem"
 
 
 def intermediate_path() -> Path:
     return _CERT_PATH
 
 
-@lru_cache(maxsize=1)
-def pakistancode_ssl_context() -> ssl.SSLContext:
-    """System roots, plus certifi, plus the pinned GoGetSSL intermediate.
+def na_intermediate_path() -> Path:
+    return _NA_CERT_PATH
+
+
+def _ssl_context(cafile: Path, label: str) -> ssl.SSLContext:
+    """System roots, plus certifi, plus one pinned intermediate.
 
     ``load_verify_locations`` adds to the store created by ``create_default_context``.
     The context keeps certificate and hostname verification enabled.
     """
     ctx = ssl.create_default_context()
     ctx.load_verify_locations(cafile=certifi.where())
-    ctx.load_verify_locations(cafile=str(intermediate_path()))
+    ctx.load_verify_locations(cafile=str(cafile))
     if ctx.verify_mode != ssl.CERT_REQUIRED or not ctx.check_hostname:
-        raise RuntimeError("PakistanCode TLS context must verify certificates and hostnames")
+        raise RuntimeError(f"{label} TLS context must verify certificates and hostnames")
     return ctx
 
 
+@lru_cache(maxsize=1)
+def pakistancode_ssl_context() -> ssl.SSLContext:
+    return _ssl_context(intermediate_path(), "PakistanCode")
+
+
+@lru_cache(maxsize=1)
+def na_ssl_context() -> ssl.SSLContext:
+    return _ssl_context(na_intermediate_path(), "NationalAssembly")
+
+
 def verify_for_url(url: str) -> Union[ssl.SSLContext, bool]:
-    """SSL material for one URL. The extra intermediate is only for PakistanCode hosts."""
+    """SSL material for one URL. Each pinned intermediate is only for its own hosts."""
     host = (urlsplit(url).hostname or "").lower()
     if host in PAKISTANCODE_HOSTS:
         return pakistancode_ssl_context()
+    if host in NA_HOSTS:
+        return na_ssl_context()
     return True
 
 
@@ -68,12 +94,15 @@ def _host_labels(values) -> set[str]:
 
 
 def verify_for_source(source) -> Union[ssl.SSLContext, bool]:
-    """Client verify value when every host the source may contact is PakistanCode.
+    """Client verify value when every host the source may contact shares one pinned bundle.
 
-    A source pointed at a fixture host keeps the default verifier. The augmented
-    bundle is not installed on a client that also talks to other sites.
+    A source pointed at a fixture host, or at hosts from more than one pinned set,
+    keeps the default verifier. The augmented bundle is not installed on a client
+    that also talks to other sites.
     """
     hosts = _host_labels(getattr(source, "allow_list", None)) | _host_labels(getattr(source, "document_cdn_hosts", None))
     if hosts and hosts <= PAKISTANCODE_HOSTS:
         return pakistancode_ssl_context()
+    if hosts and hosts <= NA_HOSTS:
+        return na_ssl_context()
     return True
