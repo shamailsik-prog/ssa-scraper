@@ -25,6 +25,7 @@ import hashlib
 import inspect
 import json
 import logging
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
@@ -85,6 +86,22 @@ CONFIRMED_BLEED_STATUTE_IDS = (
     UUID("df206e70-1114-4676-8eec-c77fa051f268"),
     UUID("65c5b7b3-674c-4726-8372-b068527cea90"),
     UUID("768e086d-329e-42d9-ade3-01900badfb8e"),
+)
+
+# Apply and lift. Preview still reads the full CONFIRMED_BLEED_STATUTE_IDS table.
+# These eight are the Auditor-approved pairs (MAIN and FREE-SITES): Legal Advisers,
+# Travel Agencies, Pat Feeder, and Withdrawal of Remission.
+APPROVED_REEXTRACT_IDS = frozenset(
+    {
+        UUID("5636b724-6a47-42a7-93f5-4d78e07ddea8"),
+        UUID("92aeaf99-7603-41d6-a541-f2c38fe27d04"),
+        UUID("21f60373-b62a-4df8-9f0f-947dcf8a352e"),
+        UUID("06a5058e-511e-4039-befa-947f1fcdfd68"),
+        UUID("6c73a686-c038-4611-8f05-8a429168c8a7"),
+        UUID("10cc6efa-f845-42e5-83ee-11eeabd0bc63"),
+        UUID("0181ad58-1a79-479c-bdd8-dad584cfd683"),
+        UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"),
+    }
 )
 
 # Empty string: the URL no longer serves the harvested file, and no authentic
@@ -644,6 +661,12 @@ def build_parser():
     return parser
 
 
+def _preflight(message: str) -> None:
+    """A refusal before any backup or write. Exit 2, with the reason on stderr."""
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
 def _exclusive_mode(args) -> str:
     selected = [
         name
@@ -658,7 +681,7 @@ def _exclusive_mode(args) -> str:
         if enabled
     ]
     if len(selected) > 1:
-        raise SystemExit("pass only one of --apply, --preview-reextract, --apply-reextract, --lift-quarantine, --undo, --rollback")
+        _preflight("pass only one of --apply, --preview-reextract, --apply-reextract, --lift-quarantine, --undo, --rollback")
     return selected[0] if selected else ""
 
 
@@ -668,7 +691,7 @@ def _explicit_ids(raw_ids: Optional[List[str]]) -> list:
     try:
         return [parse_explicit_statute_id(value) for value in (raw_ids or [])]
     except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+        _preflight(str(exc))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -688,7 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if mode in {"apply-reextract", "lift-quarantine"}:
         statute_ids = _explicit_ids(raw_ids)
         if not statute_ids:
-            raise SystemExit(f"{mode} requires at least one full --statute-id")
+            _preflight(f"{mode} requires at least one full --statute-id")
         backup_dir = Path(args.backup_dir) if args.backup_dir else None
         try:
             if mode == "apply-reextract":
@@ -702,26 +725,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             else:
                 if args.expected_sections:
-                    raise SystemExit("expected-sections is only valid with --apply-reextract")
+                    _preflight("expected-sections is only valid with --apply-reextract")
                 out = run_async(lift_confirmed_quarantine(statute_ids=statute_ids, backup_dir=backup_dir))
         except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
+            _preflight(str(exc))
         print(json.dumps(out, indent=2, default=str))
         return 2 if out.get("refused") else 0
     if mode == "rollback":
         if raw_ids or args.expected_sections:
-            raise SystemExit("rollback restores the backup for the run and does not take statute ids")
+            _preflight("rollback restores the backup for the run and does not take statute ids")
         try:
             out = run_async(rollback_reextract(args.rollback))
         except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
+            _preflight(str(exc))
         print(json.dumps(out, indent=2, default=str))
         return 0
     if len(raw_ids) > 1:
-        raise SystemExit("pass one --statute-id unless using --apply-reextract or --lift-quarantine")
+        _preflight("pass one --statute-id unless using --apply-reextract or --lift-quarantine")
     statute_id = _explicit_ids(raw_ids)[0] if raw_ids else None
     if args.expected_sections:
-        raise SystemExit("expected-sections is only valid with --apply-reextract")
+        _preflight("expected-sections is only valid with --apply-reextract")
     if mode == "preview-reextract":
         out = run_async(
             preview_confirmed_reextract(

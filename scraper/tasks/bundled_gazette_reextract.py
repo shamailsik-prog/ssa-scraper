@@ -21,6 +21,7 @@ from typing import Any, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import delete, select
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.database import SessionLocal
@@ -96,18 +97,53 @@ def confirmed_pin(statute_id: UUID) -> Optional[str]:
     return pin
 
 
-def require_confirmed_ids(statute_ids: Sequence[UUID]) -> dict[UUID, str]:
-    """Refuse the whole call when any id is missing from the allowlist or has no pin."""
+def _approval(statute_id: UUID) -> tuple[Optional[str], str]:
+    """Pin for an id in ``APPROVED_REEXTRACT_IDS``, or a refusal reason.
+
+    Membership in ``CONFIRMED_BLEED_STATUTE_IDS`` is not enough. Preview still
+    reads that wider table. Apply and lift do not.
+    """
+    from scraper.tasks.bundled_gazette_acts import APPROVED_REEXTRACT_IDS
+
+    if statute_id not in APPROVED_REEXTRACT_IDS:
+        return None, "not_approved"
+    pin = confirmed_pin(statute_id)
+    if pin is None:
+        return None, "unpinned"
+    return pin, ""
+
+
+def _refused_row(statute_id: UUID, reason: str) -> dict:
+    return {"statute_id": str(statute_id), "status": "refused", "reason": reason, "writes": 0}
+
+
+def _split_approved(statute_ids: Sequence[UUID]) -> tuple[list[dict], dict[UUID, str]]:
+    """Split a batch before any backup or write.
+
+    An id outside ``APPROVED_REEXTRACT_IDS`` is a refused row. The other ids in
+    the same invocation still proceed. An empty list is a pre-flight error.
+    """
     if not statute_ids:
         raise ValueError("pass at least one full statute UUID")
+    refused: list[dict] = []
     pins: dict[UUID, str] = {}
     for statute_id in statute_ids:
-        pin = confirmed_pin(statute_id)
+        pin, reason = _approval(statute_id)
         if pin is None:
-            raise ValueError(
-                f"statute id is not an allowlisted pinned bundled-gazette row: {statute_id}"
-            )
+            refused.append(_refused_row(statute_id, reason))
+            continue
         pins[statute_id] = pin
+    return refused, pins
+
+
+def require_confirmed_ids(statute_ids: Sequence[UUID]) -> dict[UUID, str]:
+    """Refuse the whole call when any id is outside the apply allowlist or has no pin."""
+    refused, pins = _split_approved(statute_ids)
+    if refused:
+        raise ValueError(
+            "statute id is not an allowlisted pinned bundled-gazette row: "
+            + ", ".join(row["statute_id"] for row in refused)
+        )
     return pins
 
 
@@ -299,6 +335,7 @@ async def _snapshot_statute(db: AsyncSession, statute: Statute) -> dict:
                     "amending_instrument_text": version.amending_instrument_text,
                     "version_confidence": version.version_confidence,
                     "source_provenance_id": str(version.source_provenance_id) if version.source_provenance_id else None,
+                    "created_at": _iso(version.created_at),
                 }
             )
             if current_id and str(version.id) == current_id:
@@ -314,6 +351,8 @@ async def _snapshot_statute(db: AsyncSession, statute: Statute) -> dict:
                 "embedding": _embedding(section.embedding),
                 "current_version_id": current_id,
                 "section_text": current_text,
+                "created_at": _iso(section.created_at),
+                "updated_at": _iso(section.updated_at),
                 "versions": version_payload,
             }
         )
@@ -454,6 +493,8 @@ async def _restore_snapshot(db: AsyncSession, snapshot: dict) -> None:
     )
     await db.flush()
     for section in snapshot.get("sections") or []:
+        created_at = _parse_dt(section.get("created_at"))
+        updated_at = _parse_dt(section.get("updated_at"))
         row = StatuteSection(
             id=UUID(section["id"]),
             statute_id=statute_id,
@@ -464,27 +505,36 @@ async def _restore_snapshot(db: AsyncSession, snapshot: dict) -> None:
             sort_key=section.get("sort_key"),
             embedding=section.get("embedding"),
         )
+        if created_at is not None:
+            row.created_at = created_at
+        if updated_at is not None:
+            row.updated_at = updated_at
         db.add(row)
         await db.flush()
         current_id = UUID(section["current_version_id"]) if section.get("current_version_id") else None
         for version in section.get("versions") or []:
-            db.add(
-                StatuteSectionVersion(
-                    id=UUID(version["id"]),
-                    section_id=row.id,
-                    version_no=int(version["version_no"]),
-                    section_text=version.get("section_text") or "",
-                    text_hash=version["text_hash"],
-                    effective_from=_parse_date(version.get("effective_from")),
-                    effective_to=_parse_date(version.get("effective_to")),
-                    amending_instrument_id=UUID(version["amending_instrument_id"]) if version.get("amending_instrument_id") else None,
-                    amending_instrument_text=version.get("amending_instrument_text"),
-                    version_confidence=float(version.get("version_confidence") if version.get("version_confidence") is not None else 0.5),
-                    source_provenance_id=UUID(version["source_provenance_id"]) if version.get("source_provenance_id") else None,
-                )
+            version_row = StatuteSectionVersion(
+                id=UUID(version["id"]),
+                section_id=row.id,
+                version_no=int(version["version_no"]),
+                section_text=version.get("section_text") or "",
+                text_hash=version["text_hash"],
+                effective_from=_parse_date(version.get("effective_from")),
+                effective_to=_parse_date(version.get("effective_to")),
+                amending_instrument_id=UUID(version["amending_instrument_id"]) if version.get("amending_instrument_id") else None,
+                amending_instrument_text=version.get("amending_instrument_text"),
+                version_confidence=float(version.get("version_confidence") if version.get("version_confidence") is not None else 0.5),
+                source_provenance_id=UUID(version["source_provenance_id"]) if version.get("source_provenance_id") else None,
             )
+            version_created = _parse_dt(version.get("created_at"))
+            if version_created is not None:
+                version_row.created_at = version_created
+            db.add(version_row)
         await db.flush()
         row.current_version_id = current_id
+        if updated_at is not None:
+            row.updated_at = updated_at
+            flag_modified(row, "updated_at")
     for prior in snapshot.get("priors") or []:
         db.add(
             StatuteSectionReextractPrior(
@@ -592,17 +642,29 @@ async def apply_confirmed_reextract(
     from scraper.fetchers import pdf_text_layer
     from scraper.statute_quality.senate_integrity import split_statute_source_url
 
-    pins = require_confirmed_ids(statute_ids)
+    refused_rows, pins = _split_approved(statute_ids)
     expected_sections = expected_sections or {}
-    unknown = [str(statute_id) for statute_id in expected_sections if statute_id not in pins]
+    unknown = [str(statute_id) for statute_id in expected_sections if statute_id not in set(statute_ids)]
     if unknown:
         raise ValueError("expected-sections names an id that was not passed: " + ", ".join(unknown))
     text_fn = extract_text or pdf_text_layer
     directory = Path(backup_dir) if backup_dir is not None else Path("var/bundled_gazette_reextract")
-    rows: list[dict] = []
+    rows: list[dict] = list(refused_rows)
     ready: list[dict] = []
+    if not pins:
+        return {
+            "dry_run": False,
+            "apply_reextract": True,
+            "writes": 0,
+            "refused": True,
+            "run_id": None,
+            "backup_path": None,
+            "rows": rows,
+        }
     async with SessionLocal() as db:
         for statute_id in statute_ids:
+            if statute_id not in pins:
+                continue
             statute = (await db.execute(select(Statute).where(Statute.id == statute_id))).scalars().first()
             if statute is None:
                 rows.append(
@@ -740,12 +802,24 @@ async def lift_confirmed_quarantine(
     Sections are not rewritten. A second call, when the row is already gone,
     writes nothing.
     """
-    require_confirmed_ids(statute_ids)
+    refused_rows, pins = _split_approved(statute_ids)
     directory = Path(backup_dir) if backup_dir is not None else Path("var/bundled_gazette_reextract")
-    rows: list[dict] = []
+    rows: list[dict] = list(refused_rows)
     ready: list[dict] = []
+    if not pins:
+        return {
+            "dry_run": False,
+            "lift_quarantine": True,
+            "writes": 0,
+            "refused": True,
+            "run_id": None,
+            "backup_path": None,
+            "rows": rows,
+        }
     async with SessionLocal() as db:
         for statute_id in statute_ids:
+            if statute_id not in pins:
+                continue
             statute = (await db.execute(select(Statute).where(Statute.id == statute_id))).scalars().first()
             if statute is None:
                 rows.append({"statute_id": str(statute_id), "status": "refused", "reason": "not_found", "writes": 0})

@@ -29,9 +29,10 @@ def _pin_ids(monkeypatch, pins: dict[UUID, str]) -> None:
 
     monkeypatch.setattr(acts, "CONFIRMED_BLEED_STATUTE_IDS", tuple(pins))
     monkeypatch.setattr(acts, "CONFIRMED_PDF_SHA256", dict(pins))
+    monkeypatch.setattr(acts, "APPROVED_REEXTRACT_IDS", frozenset(pins))
 
 
-async def _add_statute(db, *, name: str, url: str, sections: list[dict]):
+async def _add_statute(db, *, name: str, url: str, sections: list[dict], statute_id: UUID | None = None):
     statute = Statute(
         name=name,
         jurisdiction="Federal",
@@ -39,6 +40,7 @@ async def _add_statute(db, *, name: str, url: str, sections: list[dict]):
         source_url=url,
         year_enacted=1976,
         needs_section_refetch=False,
+        **({"id": statute_id} if statute_id is not None else {}),
     )
     db.add(statute)
     await db.flush()
@@ -86,6 +88,27 @@ async def _bodies(db, statute_id: UUID) -> list[tuple]:
     return found
 
 
+async def _section_times(db, statute_id: UUID) -> list[tuple]:
+    db.expire_all()
+    rows = (
+        await db.execute(
+            select(StatuteSection)
+            .where(StatuteSection.statute_id == statute_id)
+            .order_by(StatuteSection.sort_key, StatuteSection.section_number)
+        )
+    ).scalars().all()
+    found = []
+    for row in rows:
+        version_created = None
+        if row.current_version_id is not None:
+            version = (
+                await db.execute(select(StatuteSectionVersion).where(StatuteSectionVersion.id == row.current_version_id))
+            ).scalars().first()
+            version_created = version.created_at if version is not None else None
+        found.append((row.id, row.created_at, row.updated_at, version_created))
+    return found
+
+
 async def _quarantine(db, statute_id: UUID):
     db.expire_all()
     return (
@@ -106,12 +129,15 @@ def test_prefix_and_unhyphenated_ids_are_refused_before_a_write():
         parse_explicit_statute_id("6c73a686")
     with pytest.raises(ValueError):
         parse_explicit_statute_id("6c73a686c03846118f058a429168c8a7")
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as prefix:
         main(["--apply-reextract", "--statute-id", "6c73a686"])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as bare:
         main(["--apply-reextract", "--statute-id", "6c73a686c03846118f058a429168c8a7"])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as combined:
         main(["--apply-reextract", "--apply", "--statute-id", "6c73a686-c038-4611-8f05-8a429168c8a7"])
+    assert prefix.value.code == 2
+    assert bare.value.code == 2
+    assert combined.value.code == 2
 
 
 def test_an_empty_pin_is_not_an_authentic_allowlist_entry(monkeypatch):
@@ -158,6 +184,7 @@ async def test_apply_backs_up_and_rolls_back_only_that_statute(db, tmp_path, mon
     await db.commit()
     _pin_ids(monkeypatch, {target_id: digest})
     before = await _bodies(db, target_id)
+    times_before = await _section_times(db, target_id)
     control_before = await _bodies(db, control_id)
     calls = {"fetch": 0}
 
@@ -239,6 +266,7 @@ async def test_apply_backs_up_and_rolls_back_only_that_statute(db, tmp_path, mon
     restored = await rollback_reextract(report["run_id"])
     assert restored["writes"] == 1
     assert await _bodies(db, target_id) == before
+    assert await _section_times(db, target_id) == times_before
     quarantine = await _quarantine(db, target_id)
     assert quarantine is not None
     assert quarantine.run_id == "older-run"
@@ -309,13 +337,17 @@ async def test_an_id_outside_the_allowlist_writes_nothing(db, tmp_path, monkeypa
     stranger = uuid4()
     _pin_ids(monkeypatch, {stranger: hashlib.sha256(_pdf(text)).hexdigest()})
     before = await _bodies(db, target_id)
-    with pytest.raises(ValueError, match="allowlisted"):
-        await apply_confirmed_reextract(
-            statute_ids=[target_id],
-            backup_dir=tmp_path,
-            recorded_loader=lambda _url: _pdf(text),
-            extract_text=lambda _data: text,
-        )
+    report = await apply_confirmed_reextract(
+        statute_ids=[target_id],
+        backup_dir=tmp_path,
+        recorded_loader=lambda _url: _pdf(text),
+        extract_text=lambda _data: text,
+    )
+    assert report["writes"] == 0
+    assert report["backup_path"] is None
+    assert report["refused"] is True
+    assert report["rows"][0]["status"] == "refused"
+    assert report["rows"][0]["reason"] == "not_approved"
     assert await _bodies(db, target_id) == before
     assert list(tmp_path.glob("*.jsonl")) == []
 
@@ -395,3 +427,151 @@ async def test_a_failed_replace_leaves_the_sections_and_rewinds_the_backup(db, t
     files = list(tmp_path.glob("*.jsonl"))
     assert len(files) == 1
     assert files[0].read_text(encoding="utf-8") == ""
+
+
+HIDDEN_BLEED_ID = UUID("d7d3187e-9ebd-4782-aa9a-228b40d2dd96")
+APPROVED_PAT_FEEDER_ID = UUID("6c73a686-c038-4611-8f05-8a429168c8a7")
+_APPROVED_EIGHT = frozenset(
+    {
+        UUID("5636b724-6a47-42a7-93f5-4d78e07ddea8"),
+        UUID("92aeaf99-7603-41d6-a541-f2c38fe27d04"),
+        UUID("21f60373-b62a-4df8-9f0f-947dcf8a352e"),
+        UUID("06a5058e-511e-4039-befa-947f1fcdfd68"),
+        UUID("6c73a686-c038-4611-8f05-8a429168c8a7"),
+        UUID("10cc6efa-f845-42e5-83ee-11eeabd0bc63"),
+        UUID("0181ad58-1a79-479c-bdd8-dad584cfd683"),
+        UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"),
+    }
+)
+
+
+def test_apply_allowlist_is_the_eight_approved_ids():
+    from scraper.tasks.bundled_gazette_acts import APPROVED_REEXTRACT_IDS, CONFIRMED_BLEED_STATUTE_IDS
+
+    assert APPROVED_REEXTRACT_IDS == _APPROVED_EIGHT
+    assert len(APPROVED_REEXTRACT_IDS) == 8
+    assert HIDDEN_BLEED_ID in CONFIRMED_BLEED_STATUTE_IDS
+    assert HIDDEN_BLEED_ID not in APPROVED_REEXTRACT_IDS
+
+
+def test_an_unapproved_id_exits_2_and_writes_no_backup(tmp_path):
+    from scraper.tasks.bundled_gazette_acts import main
+
+    apply_dir = tmp_path / "apply"
+    lift_dir = tmp_path / "lift"
+    apply_code = main(
+        ["--apply-reextract", "--statute-id", str(HIDDEN_BLEED_ID), "--backup-dir", str(apply_dir)]
+    )
+    lift_code = main(
+        ["--lift-quarantine", "--statute-id", str(HIDDEN_BLEED_ID), "--backup-dir", str(lift_dir)]
+    )
+    assert apply_code == 2
+    assert lift_code == 2
+    assert list(apply_dir.glob("*.jsonl")) == []
+    assert list(lift_dir.glob("*.jsonl")) == []
+
+
+@pytest.mark.asyncio
+async def test_keep_hidden_id_is_refused_before_backup_and_an_approved_id_still_applies(db, tmp_path, monkeypatch):
+    import scraper.tasks.bundled_gazette_acts as acts
+    from scraper.tasks.bundled_gazette_reextract import apply_confirmed_reextract
+
+    text = _FIXTURE.read_text(encoding="utf-8")
+    pdf = _pdf(text)
+    digest = hashlib.sha256(pdf).hexdigest()
+    hidden_before = await _bodies(
+        db,
+        await _add_statute(
+            db,
+            statute_id=HIDDEN_BLEED_ID,
+            name="Keep hidden lpbc2nd",
+            url="https://example.test/hidden-lpbc.pdf|LIV of 1976",
+            sections=[{"section_number": "1", "section_text": "HIDDEN SECTION must stay untouched."}],
+        ),
+    )
+    await _add_statute(
+        db,
+        statute_id=APPROVED_PAT_FEEDER_ID,
+        name="Approved Pat Feeder reextract",
+        url=PAT_FEEDER_URL,
+        sections=[{"section_number": "9", "section_text": "OLD APPROVED SECTION that the splitter replaces."}],
+    )
+    pins = dict(acts.CONFIRMED_PDF_SHA256)
+    pins[APPROVED_PAT_FEEDER_ID] = digest
+    monkeypatch.setattr(acts, "CONFIRMED_PDF_SHA256", pins)
+
+    async def recorded(url):
+        if "hidden-lpbc" in url:
+            raise AssertionError("a refused id was read before the refusal")
+        return pdf
+
+    async def fetch_pdf(_url):
+        raise AssertionError("apply-reextract must not fetch")
+
+    monkeypatch.setattr(acts, "fetch_gazette_pdf", fetch_pdf)
+
+    report = await apply_confirmed_reextract(
+        statute_ids=[HIDDEN_BLEED_ID, APPROVED_PAT_FEEDER_ID],
+        expected_sections={APPROVED_PAT_FEEDER_ID: ["1", "2"]},
+        backup_dir=tmp_path,
+        recorded_loader=recorded,
+        extract_text=lambda _data: text,
+    )
+    by_id = {row["statute_id"]: row for row in report["rows"]}
+    assert report["refused"] is True
+    assert report["writes"] == 1
+    assert by_id[str(HIDDEN_BLEED_ID)]["status"] == "refused"
+    assert by_id[str(HIDDEN_BLEED_ID)]["reason"] == "not_approved"
+    assert by_id[str(HIDDEN_BLEED_ID)]["writes"] == 0
+    assert by_id[str(APPROVED_PAT_FEEDER_ID)]["status"] == "applied"
+    assert await _bodies(db, HIDDEN_BLEED_ID) == hidden_before
+    backup = Path(report["backup_path"]).read_text(encoding="utf-8")
+    assert str(HIDDEN_BLEED_ID) not in backup
+    assert str(APPROVED_PAT_FEEDER_ID) in backup
+    assert [number for _id, number, _text in await _bodies(db, APPROVED_PAT_FEEDER_ID)] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_lift_refuses_keep_hidden_id_before_backup_and_lifts_an_approved_id(db, tmp_path):
+    from scraper.tasks.bundled_gazette_reextract import lift_confirmed_quarantine
+
+    hidden_id = await _add_statute(
+        db,
+        statute_id=HIDDEN_BLEED_ID,
+        name="Keep hidden lift",
+        url="https://example.test/hidden-lpbc.pdf|LIV of 1976",
+        sections=[{"section_number": "1", "section_text": "HIDDEN LIFT SECTION stays."}],
+    )
+    approved_id = await _add_statute(
+        db,
+        statute_id=APPROVED_PAT_FEEDER_ID,
+        name="Approved lift Pat Feeder",
+        url=PAT_FEEDER_URL,
+        sections=[{"section_number": "1", "section_text": "APPROVED LIFT SECTION stays."}],
+    )
+    db.add(DocumentQuarantine(doc_type="statute", doc_id=hidden_id, reason="bundled_gazette_act_bleed", run_id="hidden-run"))
+    db.add(DocumentQuarantine(doc_type="statute", doc_id=approved_id, reason="bundled_gazette_act_bleed", run_id="approved-run"))
+    await db.commit()
+    hidden_before = await _bodies(db, hidden_id)
+    approved_before = await _bodies(db, approved_id)
+
+    report = await lift_confirmed_quarantine(
+        statute_ids=[HIDDEN_BLEED_ID, APPROVED_PAT_FEEDER_ID],
+        backup_dir=tmp_path,
+    )
+    by_id = {row["statute_id"]: row for row in report["rows"]}
+    assert report["refused"] is True
+    assert report["writes"] == 1
+    assert by_id[str(HIDDEN_BLEED_ID)]["status"] == "refused"
+    assert by_id[str(HIDDEN_BLEED_ID)]["reason"] == "not_approved"
+    assert by_id[str(HIDDEN_BLEED_ID)]["writes"] == 0
+    assert by_id[str(APPROVED_PAT_FEEDER_ID)]["status"] == "lifted"
+    hidden_quarantine = await _quarantine(db, hidden_id)
+    assert hidden_quarantine is not None
+    assert hidden_quarantine.run_id == "hidden-run"
+    assert await _quarantine(db, approved_id) is None
+    assert await _bodies(db, hidden_id) == hidden_before
+    assert await _bodies(db, approved_id) == approved_before
+    backup = Path(report["backup_path"]).read_text(encoding="utf-8")
+    assert str(HIDDEN_BLEED_ID) not in backup
+    assert str(APPROVED_PAT_FEEDER_ID) in backup
