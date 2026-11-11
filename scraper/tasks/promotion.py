@@ -75,14 +75,14 @@ from scraper.parsers.citation_extractor import (
     extract_citations,
     normalise_citation,
 )
-from scraper.parsers.kpcode_sections import KP_JURISDICTION, kpcode_toc_stub_quarantine_reason
+from scraper.parsers.kpcode_sections import kpcode_toc_stub_quarantine_reason
 from scraper.parsers.statute_parser import (
     is_short_title_clause,
     looks_like_clause_fragment,
     looks_like_fragment_name,
     looks_like_garbage_name,
 )
-from scraper.statute_quality_jurisdiction import jurisdiction_for_source
+from scraper.statute_quality_jurisdiction import resolve_statute_jurisdiction
 from scraper.unreported import (
     SOURCE_COURT_CODE,
     find_case_number,
@@ -2410,9 +2410,16 @@ async def promote_statute_staging(
             )
             return "quarantined"
     if created_new_statute:
-        stored_jurisdiction = (data.get("jurisdiction") or "").strip()
-        if st.source_name == "KPAssembly" and stored_jurisdiction in ("", "Federal"):
-            stored_jurisdiction = jurisdiction_for_source("KPAssembly") or KP_JURISDICTION
+        act_no = data.get("act_no")
+        detail_url = data.get("detail_url")
+        stored_jurisdiction = resolve_statute_jurisdiction(
+            source_name=st.source_name,
+            source_url=st.source_url,
+            detail_url=detail_url if isinstance(detail_url, str) else None,
+            explicit=data.get("jurisdiction"),
+            text=st.raw_text,
+            act_no=act_no if isinstance(act_no, str) else None,
+        )
         statute = Statute(
             name=name,
             canonical_name_key=_statute_canonical_name_key_for_name(name),
