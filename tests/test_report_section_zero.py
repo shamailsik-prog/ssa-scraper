@@ -7,6 +7,8 @@ the id and the text md5 still match the dry-run backup.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -110,6 +112,32 @@ def test_rollback_sql_is_not_executed_and_quotes_section_text(tmp_path):
             "section_text": text,
             "text_hash": "def",
             "version_confidence": 0.5,
+            "versions": [
+                {
+                    "id": "66666666-6666-6666-6666-666666666666",
+                    "version_no": 0,
+                    "section_text": "older clause text",
+                    "text_hash": "olderhash",
+                    "effective_from": "2017-01-01",
+                    "effective_to": "2018-06-12",
+                    "amending_instrument_id": None,
+                    "amending_instrument_text": None,
+                    "version_confidence": 0.4,
+                    "source_provenance_id": None,
+                },
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "version_no": 1,
+                    "section_text": text,
+                    "text_hash": "def",
+                    "effective_from": "2018-06-13",
+                    "effective_to": None,
+                    "amending_instrument_id": "77777777-7777-7777-7777-777777777777",
+                    "amending_instrument_text": "Act XXIII of 2018",
+                    "version_confidence": 0.5,
+                    "source_provenance_id": None,
+                },
+            ],
         },
         "preceding_section": {
             "id": "44444444-4444-4444-4444-444444444444",
@@ -124,19 +152,60 @@ def test_rollback_sql_is_not_executed_and_quotes_section_text(tmp_path):
     assert "22222222-2222-2222-2222-222222222222" in sql
     assert "board's guidelines" in sql
     assert "$szx$" in sql
+    assert "DATE '2018-06-13'" in sql
+    assert "DATE '2017-01-01'" in sql
+    assert "older clause text" in sql
+    assert "Act XXIII of 2018" in sql
+    assert "77777777-7777-7777-7777-777777777777" in sql
+    assert "DELETE FROM statute_section_version" in sql
+    assert "embedding_queue" in sql
+    kept = dict(row)
+    kept["merged_version_id"] = "88888888-8888-8888-8888-888888888888"
+    kept_sql = render_rollback_sql([kept])
+    assert "DELETE FROM statute_section_version" not in kept_sql
+    assert "embedding_queue" in kept_sql
     paths = write_report_files(tmp_path, [row])
     backup = Path(paths["backup_jsonl"]).read_text(encoding="utf-8")
     assert json.loads(backup)["proposal"] == "merge"
     assert "DELETE FROM statute_section" not in Path(paths["rollback_sql"]).read_text(encoding="utf-8").split("BEGIN;", 1)[0]
 
 
-def test_precheck_refuses_a_changed_md5():
-    zero = {"id": "22222222-2222-2222-2222-222222222222", "section_number": "0", "text": CLAUSE}
-    into = {"id": "44444444-4444-4444-4444-444444444444", "text": "4. Powers."}
+def test_precheck_refuses_a_changed_md5_or_a_backup_without_version_history():
+    version_id = "33333333-3333-3333-3333-333333333333"
+    into_version = "55555555-5555-5555-5555-555555555555"
+    zero = {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "section_number": "0",
+        "text": CLAUSE,
+        "version_id": version_id,
+    }
+    into = {
+        "id": "44444444-4444-4444-4444-444444444444",
+        "text": "4. Powers.",
+        "version_id": into_version,
+    }
     backup = {
         "proposal": "merge",
-        "zero_section": {"id": zero["id"], "md5": section_text_md5(CLAUSE)},
-        "preceding_section": {"id": into["id"], "md5": section_text_md5(into["text"])},
+        "merged_version_id": None,
+        "zero_section": {
+            "id": zero["id"],
+            "md5": section_text_md5(CLAUSE),
+            "version_id": version_id,
+            "versions": [
+                {
+                    "id": version_id,
+                    "version_no": 1,
+                    "section_text": CLAUSE,
+                    "text_hash": "abc",
+                    "effective_from": "2018-06-13",
+                }
+            ],
+        },
+        "preceding_section": {
+            "id": into["id"],
+            "md5": section_text_md5(into["text"]),
+            "version_id": into_version,
+        },
         "relation_ids": [],
     }
     precheck_section_zero(
@@ -146,6 +215,7 @@ def test_precheck_refuses_a_changed_md5():
         live_zero=zero,
         live_into=into,
         live_relation_ids=[],
+        live_version_ids=[version_id],
     )
     with pytest.raises(SectionZeroPrecheckError, match="md5"):
         precheck_section_zero(
@@ -155,6 +225,21 @@ def test_precheck_refuses_a_changed_md5():
             live_zero=zero,
             live_into=into,
             live_relation_ids=[],
+            live_version_ids=[version_id],
+        )
+    thin = {
+        **backup,
+        "zero_section": {"id": zero["id"], "md5": section_text_md5(CLAUSE), "version_id": version_id},
+    }
+    with pytest.raises(SectionZeroPrecheckError, match="version history"):
+        precheck_section_zero(
+            claimed_id=zero["id"],
+            claimed_md5=section_text_md5(CLAUSE),
+            backup_row=thin,
+            live_zero=zero,
+            live_into=into,
+            live_relation_ids=[],
+            live_version_ids=[version_id],
         )
 
 
@@ -264,6 +349,10 @@ async def test_dry_run_lists_visible_section_zero_and_writes_files_without_delet
         await db.execute(select(StatuteSection).where(StatuteSection.id == seeded["zero"].id))
     ).scalars().one()
     assert still.section_number == "0"
+    sql = Path(report["rollback_sql"]).read_text(encoding="utf-8")
+    assert "embedding_queue" in sql
+    with pytest.raises(SectionZeroPrecheckError, match="recovery files"):
+        await run_section_zero_report(apply=False, out_dir=tmp_path)
     quarantine = (
         await db.execute(select(DocumentQuarantine).where(DocumentQuarantine.doc_id == seeded["hidden"].id))
     ).scalars().one()
@@ -348,6 +437,28 @@ async def test_apply_refuses_a_bad_md5_and_merges_when_the_precheck_matches(db, 
         await db.execute(select(StatuteSection.section_number).where(StatuteSection.statute_id == leading_id))
     ).scalars().all()
     assert leading_numbers.count("0") == 1
+
+
+def test_script_invocation_imports_scraper_from_the_repository_root():
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "scripts/report_section_zero.py",
+            "--csv",
+            str(EVIDENCE / "section_zero_fs.csv"),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "ModuleNotFoundError" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["writes"] is False
+    assert payload["counts"]["A"] == 77
+    assert payload["counts"]["unknown"] == 0
 
 
 def test_classifier_sorts_the_three_shapes_and_leaves_anything_else_unknown():

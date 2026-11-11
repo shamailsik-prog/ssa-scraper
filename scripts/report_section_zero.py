@@ -29,6 +29,13 @@ script does not unquarantine, does not deploy, and does not fetch source PDFs.
     python scripts/report_section_zero.py --out section_zero_reports
     python scripts/report_section_zero.py --apply --id <section-uuid> --md5 <md5> --out section_zero_reports
 
+A second dry-run refuses to replace recovery files that are already in
+``--out``. Pass a new directory. ``--apply`` locks the section 0 row and the
+preceding section, rereads them, and writes only when their version pointers
+still match the backup. The rollback restores every backed-up version and
+queues both sections for embedding. It deletes a merged version only when
+that version did not already exist.
+
 ``--md5`` is the MD5 (32 hex characters) of the section 0 text, UTF-8, as
 printed in the dry-run and stored in the backup JSONL. A mismatch refuses
 the write.
@@ -46,6 +53,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from uuid import UUID
+
+# `python scripts/report_section_zero.py` puts scripts/ on sys.path, not the
+# repository root, so `import scraper` fails in an image that does not install
+# the project. The root is this file's parent.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,6 +81,7 @@ from scraper.statute_quality.year_section_merge import source_host
 BACKUP_NAME = "section_zero_backup.jsonl"
 ROLLBACK_NAME = "section_zero_rollback.sql"
 _MD5_RE = re.compile(r"[0-9a-f]{32}")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class SectionZeroPrecheckError(RuntimeError):
@@ -297,13 +312,68 @@ def _sql_uuid(value: str) -> str:
     return "'" + str(UUID(str(value))) + "'"
 
 
+def _sql_date(value: Optional[str]) -> str:
+    if not value:
+        return "NULL"
+    raw = str(value)[:10]
+    if not _ISO_DATE_RE.fullmatch(raw):
+        raise SectionZeroPrecheckError("version date is not YYYY-MM-DD")
+    return f"DATE '{raw}'"
+
+
+def _sql_uuid_or_null(value: Optional[str]) -> str:
+    if not value:
+        return "NULL"
+    return _sql_uuid(value)
+
+
+def _version_rows(zero: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """Every version the backup can restore. A lone current version is the old shape."""
+    versions = zero.get("versions")
+    if isinstance(versions, list):
+        return list(versions)
+    if not zero.get("version_id"):
+        return []
+    return [
+        {
+            "id": zero.get("version_id"),
+            "version_no": zero.get("version_no") or 1,
+            "section_text": zero.get("section_text") or "",
+            "text_hash": zero.get("text_hash") or "",
+            "effective_from": None,
+            "effective_to": None,
+            "amending_instrument_id": None,
+            "amending_instrument_text": None,
+            "version_confidence": zero.get("version_confidence"),
+            "source_provenance_id": None,
+        }
+    ]
+
+
+def _embedding_requeue_sql(section_id_sql: str) -> str:
+    """Ask the worker to rebuild the vector. The script does not copy vectors."""
+    model = _dollar_quote(str(settings.EMBEDDING_MODEL or ""))
+    dimensions = int(settings.EMBEDDING_DIM or 0)
+    return (
+        "INSERT INTO embedding_queue "
+        "(id, record_id, table_name, access_method, status, attempts, max_attempts, "
+        "embedding_model, embedding_dimensions) "
+        f"VALUES (gen_random_uuid(), {section_id_sql}, 'statute_section', 'public', "
+        f"'pending', 0, 3, {model}, {dimensions}) "
+        "ON CONFLICT ON CONSTRAINT uq_embedding_record DO UPDATE "
+        "SET status = 'pending', attempts = 0, error_message = NULL, updated_at = now();"
+    )
+
+
 def render_rollback_sql(rows: Sequence[Mapping[str, Any]]) -> str:
     """SQL an operator can run to put merged rows back. This script never runs it."""
     lines = [
         "-- section-zero rollback. report_section_zero.py does not execute this file.",
         "-- Run one block only for a merge that --apply wrote, after reading it.",
-        "-- Each block restores the preceding section's version pointer, removes the",
-        "-- merged version, and inserts the section_number 0 row from the backup.",
+        "-- Each block restores the preceding section's version pointer, deletes the",
+        "-- merged version only when this repair created it, and inserts every",
+        "-- backed-up version of section 0, including dates and provenance.",
+        "-- Both sections are queued so their embeddings are rebuilt.",
         "",
     ]
     merges = [row for row in rows if row.get("proposal") == "merge"]
@@ -319,9 +389,8 @@ def render_rollback_sql(rows: Sequence[Mapping[str, Any]]) -> str:
         into_id = _sql_uuid(into["id"])
         statute_id = _sql_uuid(row["statute_id"])
         old_version = _sql_uuid(into["version_id"]) if into.get("version_id") else "NULL"
-        zero_version = _sql_uuid(zero["version_id"]) if zero.get("version_id") else None
         merged_hash = str(row.get("merged_text_hash") or "")
-        old_version_no = int(into.get("version_no") or 0)
+        merged_existed = bool(row.get("merged_version_id"))
         relation_ids = [str(UUID(item)) for item in row.get("relation_ids") or []]
         title_sql = "NULL" if zero.get("section_title") is None else _dollar_quote(str(zero.get("section_title")))
         chapter_sql = "NULL" if not zero.get("chapter") else _dollar_quote(str(zero.get("chapter")))
@@ -332,30 +401,37 @@ def render_rollback_sql(rows: Sequence[Mapping[str, Any]]) -> str:
             f"UPDATE statute_section SET current_version_id = {old_version} "
             f"WHERE id = {into_id};"
         )
-        if merged_hash and into.get("version_id"):
+        if merged_hash and into.get("version_id") and not merged_existed:
             lines.append(
                 "DELETE FROM statute_section_version "
                 f"WHERE section_id = {into_id} "
                 f"AND text_hash = {_dollar_quote(merged_hash)} "
-                f"AND id <> {old_version} "
-                f"AND version_no > {old_version_no};"
+                f"AND id <> {old_version};"
             )
         lines.append(
             "INSERT INTO statute_section "
             "(id, statute_id, section_number, section_title, chapter, part, sort_key, current_version_id) "
             f"VALUES ({zero_id}, {statute_id}, '0', {title_sql}, {chapter_sql}, {part_sql}, {sort_sql}, NULL);"
         )
-        if zero_version is not None:
+        for version in _version_rows(zero):
+            confidence = version.get("version_confidence")
+            confidence_sql = "0.5" if confidence is None else str(float(confidence))
             lines.append(
                 "INSERT INTO statute_section_version "
-                "(id, section_id, version_no, section_text, text_hash, version_confidence) "
-                f"VALUES ({zero_version}, {zero_id}, {int(zero.get('version_no') or 1)}, "
-                f"{_dollar_quote(str(zero.get('section_text') or ''))}, "
-                f"{_dollar_quote(str(zero.get('text_hash') or ''))}, "
-                f"{float(zero.get('version_confidence') if zero.get('version_confidence') is not None else 0.5)});"
+                "(id, section_id, version_no, section_text, text_hash, effective_from, effective_to, "
+                "amending_instrument_id, amending_instrument_text, version_confidence, source_provenance_id) "
+                f"VALUES ({_sql_uuid(version['id'])}, {zero_id}, {int(version.get('version_no') or 1)}, "
+                f"{_dollar_quote(str(version.get('section_text') or ''))}, "
+                f"{_dollar_quote(str(version.get('text_hash') or ''))}, "
+                f"{_sql_date(version.get('effective_from'))}, {_sql_date(version.get('effective_to'))}, "
+                f"{_sql_uuid_or_null(version.get('amending_instrument_id'))}, "
+                f"{_dollar_quote(str(version.get('amending_instrument_text') or '')) if version.get('amending_instrument_text') else 'NULL'}, "
+                f"{confidence_sql}, {_sql_uuid_or_null(version.get('source_provenance_id'))});"
             )
+        if zero.get("version_id"):
             lines.append(
-                f"UPDATE statute_section SET current_version_id = {zero_version} WHERE id = {zero_id};"
+                f"UPDATE statute_section SET current_version_id = {_sql_uuid(zero['version_id'])} "
+                f"WHERE id = {zero_id};"
             )
         if relation_ids:
             id_list = ", ".join(_sql_uuid(item) for item in relation_ids)
@@ -364,6 +440,8 @@ def render_rollback_sql(rows: Sequence[Mapping[str, Any]]) -> str:
                 f"SET target_statute_section_id = {zero_id} WHERE id IN ({id_list});"
             )
         lines.append(f"DELETE FROM statute_section_reextract_prior WHERE section_id = {zero_id};")
+        lines.append(_embedding_requeue_sql(zero_id))
+        lines.append(_embedding_requeue_sql(into_id))
         lines.append("COMMIT;")
         lines.append("")
     return "\n".join(lines)
@@ -373,6 +451,10 @@ def write_report_files(out_dir: Path, rows: Sequence[Mapping[str, Any]]) -> Dict
     out_dir.mkdir(parents=True, exist_ok=True)
     backup = out_dir / BACKUP_NAME
     rollback = out_dir / ROLLBACK_NAME
+    if backup.exists() or rollback.exists():
+        raise SectionZeroPrecheckError(
+            f"recovery files already exist in {out_dir}; pass a fresh --out directory"
+        )
     body = "".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n" for row in rows
     )
@@ -415,6 +497,8 @@ def precheck_section_zero(
     live_zero: Mapping[str, Any],
     live_into: Optional[Mapping[str, Any]],
     live_relation_ids: Sequence[str],
+    live_version_ids: Sequence[str] = (),
+    live_merged_version_id: Optional[str] = None,
 ) -> None:
     """Refuse the write unless the live rows still match the dry-run backup."""
     try:
@@ -448,6 +532,34 @@ def precheck_section_zero(
     backed_relations = sorted(str(item) for item in backup_row.get("relation_ids") or [])
     if sorted(str(item) for item in live_relation_ids) != backed_relations:
         raise SectionZeroPrecheckError("citation links changed since the backup")
+    if str(live_zero.get("version_id") or "") != str(backed_zero.get("version_id") or ""):
+        raise SectionZeroPrecheckError("section 0 version pointer changed since the backup")
+    if str(live_into.get("version_id") or "") != str(backed_into.get("version_id") or ""):
+        raise SectionZeroPrecheckError("preceding section version pointer changed since the backup")
+    backed_versions = backed_zero.get("versions")
+    if not isinstance(backed_versions, list):
+        raise SectionZeroPrecheckError("backup has no restorable version history")
+    backed_ids: List[str] = []
+    for version in backed_versions:
+        version_id = str(version.get("id") or "")
+        if not version_id or version.get("section_text") is None or not version.get("text_hash"):
+            raise SectionZeroPrecheckError("backup version is missing id, text, or hash")
+        if version.get("version_no") is None:
+            raise SectionZeroPrecheckError("backup version is missing a version number")
+        for field in ("effective_from", "effective_to"):
+            if version.get(field):
+                _sql_date(version.get(field))
+        backed_ids.append(version_id)
+    current = str(backed_zero.get("version_id") or "")
+    if current and current not in backed_ids:
+        raise SectionZeroPrecheckError("backup version history does not include the current version")
+    if not current and backed_ids:
+        raise SectionZeroPrecheckError("backup version history does not match the current pointer")
+    if sorted(str(item) for item in live_version_ids) != sorted(backed_ids):
+        raise SectionZeroPrecheckError("section 0 version history changed since the backup")
+    backed_merged = backup_row.get("merged_version_id") or None
+    if (live_merged_version_id or None) != backed_merged:
+        raise SectionZeroPrecheckError("merged version identity changed since the backup")
 
 
 def _section_payload(section: Mapping[str, Any]) -> Dict[str, Any]:
@@ -465,6 +577,7 @@ def _section_payload(section: Mapping[str, Any]) -> Dict[str, Any]:
         "text_hash": section.get("text_hash"),
         "version_confidence": section.get("version_confidence"),
         "md5": section_text_md5(text),
+        "versions": list(section.get("versions") or []),
     }
 
 
@@ -473,6 +586,7 @@ def _backup_row(
     sections: Sequence[Mapping[str, Any]],
     plan: Mapping[str, Any],
     relation_ids: Sequence[str],
+    merged_version_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     by_id = {str(section.get("id")): section for section in sections}
     zero_id = None
@@ -512,6 +626,7 @@ def _backup_row(
         "preceding_section": _section_payload(into) if into else None,
         "merged_text": merged_text,
         "merged_text_hash": merged_text_hash(merged_text) if merged_text else None,
+        "merged_version_id": merged_version_id,
         "relation_ids": [str(rel_id) for rel_id in relation_ids],
     }
 
@@ -611,41 +726,119 @@ async def _requeue_section_embedding(db: AsyncSession, section_id: UUID) -> None
     row.error_message = None
 
 
-async def _apply_merge(db: AsyncSession, item: Mapping[str, Any]) -> None:
+def _version_payload(row: StatuteSectionVersion) -> Dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "version_no": row.version_no,
+        "section_text": row.section_text,
+        "text_hash": row.text_hash,
+        "effective_from": row.effective_from.isoformat() if row.effective_from else None,
+        "effective_to": row.effective_to.isoformat() if row.effective_to else None,
+        "amending_instrument_id": str(row.amending_instrument_id) if row.amending_instrument_id else None,
+        "amending_instrument_text": row.amending_instrument_text,
+        "version_confidence": row.version_confidence,
+        "source_provenance_id": str(row.source_provenance_id) if row.source_provenance_id else None,
+    }
+
+
+async def _load_version_history(
+    db: AsyncSession, section_ids: Sequence[UUID]
+) -> Dict[UUID, List[Dict[str, Any]]]:
+    if not section_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(StatuteSectionVersion)
+            .where(StatuteSectionVersion.section_id.in_(list(section_ids)))
+            .order_by(StatuteSectionVersion.version_no, StatuteSectionVersion.id)
+        )
+    ).scalars().all()
+    grouped: Dict[UUID, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row.section_id, []).append(_version_payload(row))
+    return grouped
+
+
+async def _version_id_for_hash(db: AsyncSession, section_id: UUID, text_hash: str) -> Optional[str]:
+    found = (
+        await db.execute(
+            select(StatuteSectionVersion.id).where(
+                StatuteSectionVersion.section_id == section_id,
+                StatuteSectionVersion.text_hash == text_hash,
+            )
+        )
+    ).scalar_one_or_none()
+    return str(found) if found else None
+
+
+async def _lock_sections(db: AsyncSession, section_ids: Sequence[UUID]) -> None:
+    ids = sorted(set(section_ids), key=str)
+    if not ids:
+        return
+    await db.execute(
+        select(StatuteSection.id)
+        .where(StatuteSection.id.in_(ids))
+        .order_by(StatuteSection.id)
+        .with_for_update()
+    )
+
+
+async def _lock_relation_ids(db: AsyncSession, section_id: UUID) -> List[str]:
+    rows = (
+        await db.execute(
+            select(InstrumentSectionRelation.id)
+            .where(InstrumentSectionRelation.target_statute_section_id == section_id)
+            .order_by(InstrumentSectionRelation.id)
+            .with_for_update()
+        )
+    ).scalars().all()
+    return sorted(str(item) for item in rows)
+
+
+async def _apply_merge(
+    db: AsyncSession,
+    item: Mapping[str, Any],
+    *,
+    expected_into_version: Optional[UUID],
+    expected_zero_version: Optional[UUID],
+    reuse_version_id: Optional[UUID],
+) -> None:
     target_id = UUID(str(item["into_section_id"]))
     zero_id = UUID(str(item["zero_section_id"]))
     merged_text = str(item["merged_text"])
     text_hash = merged_text_hash(merged_text)
-    target = (
-        await db.execute(select(StatuteSection).where(StatuteSection.id == target_id))
-    ).scalars().one()
-    existing = (
-        await db.execute(
-            select(StatuteSectionVersion).where(
-                StatuteSectionVersion.section_id == target.id,
-                StatuteSectionVersion.text_hash == text_hash,
-            )
-        )
-    ).scalars().first()
-    if existing is None:
+    if reuse_version_id is None:
         current_no = (
             await db.execute(
                 select(func.max(StatuteSectionVersion.version_no)).where(
-                    StatuteSectionVersion.section_id == target.id
+                    StatuteSectionVersion.section_id == target_id
                 )
             )
         ).scalar() or 0
-        existing = StatuteSectionVersion(
-            section_id=target.id,
+        created = StatuteSectionVersion(
+            section_id=target_id,
             version_no=int(current_no) + 1,
             section_text=merged_text,
             text_hash=text_hash,
             version_confidence=0.5,
         )
-        db.add(existing)
+        db.add(created)
         await db.flush()
-    target.current_version_id = existing.id
-    await db.flush()
+        new_version_id = created.id
+    else:
+        new_version_id = reuse_version_id
+    into_clause = (
+        StatuteSection.current_version_id.is_(None)
+        if expected_into_version is None
+        else StatuteSection.current_version_id == expected_into_version
+    )
+    pointed = await db.execute(
+        update(StatuteSection)
+        .where(StatuteSection.id == target_id, into_clause)
+        .values(current_version_id=new_version_id)
+    )
+    if pointed.rowcount != 1:
+        raise SectionZeroPrecheckError("preceding section version pointer changed before the write")
     await db.execute(
         update(InstrumentSectionRelation)
         .where(InstrumentSectionRelation.target_statute_section_id == zero_id)
@@ -657,7 +850,16 @@ async def _apply_merge(db: AsyncSession, item: Mapping[str, Any]) -> None:
             EmbeddingQueue.record_id == zero_id,
         )
     )
-    await db.execute(delete(StatuteSection).where(StatuteSection.id == zero_id))
+    zero_clause = (
+        StatuteSection.current_version_id.is_(None)
+        if expected_zero_version is None
+        else StatuteSection.current_version_id == expected_zero_version
+    )
+    removed = await db.execute(
+        delete(StatuteSection).where(StatuteSection.id == zero_id, zero_clause)
+    )
+    if removed.rowcount != 1:
+        raise SectionZeroPrecheckError("section 0 version pointer changed before the delete")
     await db.execute(
         delete(StatuteSectionReextractPrior).where(StatuteSectionReextractPrior.section_id == zero_id)
     )
@@ -683,12 +885,21 @@ async def run_section_zero_report(
         statutes = await _load_visible_zero_statutes(db)
         statute_ids = [statute.id for statute in statutes]
         grouped = await _load_sections(db, statute_ids)
+        zero_section_ids = [
+            section["id"]
+            for sections in grouped.values()
+            for section in sections
+            if _is_section_zero(str(section.get("section_number") or ""))
+        ]
+        history = await _load_version_history(db, zero_section_ids)
+        for sections in grouped.values():
+            for section in sections:
+                if section["id"] in history:
+                    section["versions"] = history[section["id"]]
         rows: List[Dict[str, Any]] = []
-        plans: Dict[str, Dict[str, Any]] = {}
         for statute in sorted(statutes, key=lambda item: str(item.id)):
             sections = grouped.get(statute.id, [])
             plan = plan_section_zero_merges(sections)
-            plans[str(statute.id)] = plan
             zero_ids = [
                 item["zero_section_id"]
                 for item in plan["merged"] + plan["skipped_no_previous"] + plan["skipped_empty"]
@@ -696,6 +907,13 @@ async def run_section_zero_report(
             relation_ids: List[str] = []
             if zero_ids:
                 relation_ids = await _relation_ids(db, UUID(zero_ids[0]))
+            merged_version_id = None
+            if plan["merged"]:
+                merged_version_id = await _version_id_for_hash(
+                    db,
+                    UUID(plan["merged"][0]["into_section_id"]),
+                    merged_text_hash(plan["merged"][0]["merged_text"]),
+                )
             rows.append(
                 _backup_row(
                     {
@@ -706,6 +924,7 @@ async def run_section_zero_report(
                     sections,
                     plan,
                     relation_ids,
+                    merged_version_id,
                 )
             )
         summary = {
@@ -752,27 +971,53 @@ async def run_section_zero_report(
             await db.rollback()
             raise SectionZeroPrecheckError("id is not a visible section_number 0 row in the backup")
         statute_id = UUID(match["statute_id"])
-        sections = grouped.get(statute_id, [])
-        by_id = {str(section["id"]): section for section in sections}
-        live_zero = by_id.get(wanted)
         into_id = (match.get("preceding_section") or {}).get("id")
+        lock_ids = [UUID(wanted)]
+        if into_id:
+            lock_ids.append(UUID(str(into_id)))
+        await _lock_sections(db, lock_ids)
+        relation_ids = await _lock_relation_ids(db, UUID(wanted))
+        fresh = await _load_sections(db, [statute_id])
+        fresh_history = await _load_version_history(db, [UUID(wanted)])
+        by_id = {str(section["id"]): section for section in fresh.get(statute_id, [])}
+        live_zero = by_id.get(wanted) or {}
         live_into = by_id.get(str(into_id)) if into_id else None
-        relation_ids = await _relation_ids(db, UUID(wanted))
+        live_versions = fresh_history.get(UUID(wanted), [])
+        if live_zero:
+            live_zero["versions"] = live_versions
+        locked_merge = ""
+        if live_into is not None and str(live_zero.get("text") or "").strip():
+            locked_merge = str(live_into.get("text") or "").rstrip() + "\n" + str(live_zero.get("text") or "").lstrip()
+        reuse_id = None
+        if live_into is not None and locked_merge:
+            reuse_id = await _version_id_for_hash(
+                db, UUID(str(live_into["id"])), merged_text_hash(locked_merge)
+            )
         try:
             precheck_section_zero(
                 claimed_id=wanted,
                 claimed_md5=section_md5,
                 backup_row=backup[wanted],
-                live_zero=live_zero or {},
+                live_zero=live_zero,
                 live_into=live_into,
                 live_relation_ids=relation_ids,
+                live_version_ids=[str(version["id"]) for version in live_versions],
+                live_merged_version_id=reuse_id,
             )
         except SectionZeroPrecheckError:
             await db.rollback()
             raise
-        plan = plans[str(statute_id)]
-        item = next(entry for entry in plan["merged"] if entry["zero_section_id"] == wanted)
-        await _apply_merge(db, item)
+        await _apply_merge(
+            db,
+            {
+                "into_section_id": str(live_into["id"]),
+                "zero_section_id": wanted,
+                "merged_text": locked_merge,
+            },
+            expected_into_version=UUID(str(live_into["version_id"])) if live_into and live_into.get("version_id") else None,
+            expected_zero_version=UUID(str(live_zero["version_id"])) if live_zero.get("version_id") else None,
+            reuse_version_id=UUID(reuse_id) if reuse_id else None,
+        )
         await db.commit()
         summary["applied_section_id"] = wanted
         summary["dry_run"] = False

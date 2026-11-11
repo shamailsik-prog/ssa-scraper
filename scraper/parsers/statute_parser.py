@@ -80,13 +80,15 @@ ACT_WITH_YEAR_PATTERN = re.compile(
 )
 SECTION_DIGIT_START_RE = re.compile(r'^\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)', re.DOTALL)
 SECTION_KEYWORD_RE = re.compile(r'^\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*(.*)', re.IGNORECASE | re.DOTALL)
-# A section number is at least 1. A lone 0 is not a heading: OCR reads clause
-# '(o)' as '0)', 'o)', 'O)' or '(0)'. '0A' is not a heading either. '1', '10',
+# A section number is at least 1. A lone 0 is not a heading: OCR reads a list
+# clause as '0)', 'o)', 'O)' or '(0)'. '0A' is not a heading either. '1', '10',
 # '20', '08', '10A' and a hyphen closer stay. '0' followed by a digit ('03')
-# stays so a zero-padded tariff row still reaches the schedule fold.
-# The two alternatives diverge on the first character, so the match is linear.
-_SECTION_NUMBER_TOKEN = r"(?:[1-9]\d*|0\d+)[A-Z]?"
-_MARGINAL_SECTION_NUMBER_TOKEN = r"(?:[1-9]\d{0,2}|0\d{1,2})[A-Z]?"
+# stays so a zero-padded tariff row still reaches the schedule fold. '0E' and
+# '0I' stay too: they are the OCR forms of tariff chapters 08 and 01, and the
+# schedule fold needs them as split boundaries. The alternatives diverge on
+# the first character, so the match is linear.
+_SECTION_NUMBER_TOKEN = r"(?:(?:[1-9]\d*|0\d+)[A-Z]?|0[EI])"
+_MARGINAL_SECTION_NUMBER_TOKEN = r"(?:(?:[1-9]\d{0,2}|0\d{1,2})[A-Z]?|0[EI])"
 # Balochistan gazette PDFs put the marginal note in the left column and the
 # section number in the right. pdfplumber joins them onto one line
 # ("Short title, 1. (1) This Act may be called…"). A line-start split then
@@ -2059,7 +2061,8 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         matches = _filter_year_heading_matches(plain, matches)
         matches = _drop_ocr_definition_clause_headings(plain, matches)
         matches = _drop_shadowed_paren_ocr_subsections(plain, matches)
-        # '0)' / 'o)' / 'O)' / '(0)' inside (m), (n), ... is clause (o), not a section.
+        # A '0)' / 'o)' / 'O)' / '(0)' line is a list clause, not a section.
+        # '0E' / '0I' stay matches so the tariff fold can see them.
         matches = _drop_zero_section_and_ocr_o_clauses(plain, matches)
         sections = []
         if len(matches) >= 2:

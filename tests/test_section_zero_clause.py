@@ -39,6 +39,8 @@ def test_line_start_regex_keeps_numbering_hyphen_suffix_and_rejects_zero():
             "6- Inspection stays a hyphen-closer heading in this Act.",
             "08. Weekly rest stays a zero-padded heading in this Act.",
             "03) Cuprammonium hydroxide stays a tariff row marker in this Act.",
+            "0E.05 Nuts, fresh or dried, stay a tariff boundary in this Act.",
+            "0I.01 hotels stay a tariff boundary in this Act.",
             "0) provide guidelines must not be a heading in this Act.",
             "0.2 per cent of morphine must not be a heading in this Act.",
             "0.5% of the value must not be a heading in this Act.",
@@ -61,6 +63,8 @@ def test_line_start_regex_keeps_numbering_hyphen_suffix_and_rejects_zero():
         "6",
         "08",
         "03",
+        "0E",
+        "0I",
         "10",
     ]
 
