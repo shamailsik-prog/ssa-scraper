@@ -9,10 +9,12 @@ from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
 from scraper.tasks.pakistancode import (
     REJECTED_URL_SAMPLE_LIMIT,
+    TRANSIENT_REOPEN_LIMIT,
     PakistanCodePipeline,
     _classify_discovered_url,
     _effective_crawl_limit,
     document_query_key,
+    listings_for,
     normalize_pakistancode_public_url,
     scrape_pakistancode,
 )
@@ -466,6 +468,7 @@ async def test_live_catalog_fixture_discovers_acts_and_records_rejected_urls(db,
         )
     ).scalars().first()
     assert defense_row is not None and defense_row.status == "done"
+    assert "transient_reopen_count" not in (defense_row.cursor_json or {})
     assert ordinance_row is not None and ordinance_row.status == "retired"
     assert ordinance_row.last_error == "HTTP 404"
 
@@ -545,3 +548,53 @@ def test_worker_death_retirement_is_not_reopened():
     row.status = "retired"
     row.last_error = "retired: the worker died 3 times while processing this item (out of memory, killed or timed out)"
     assert PakistanCodePipeline._retryable_retired(row) is False
+
+
+def test_ordinance_catalog_is_seeded():
+    source = type("Source", (), {"config_json": None})()
+    seeded = listings_for(source)
+    match = next(item for item in seeded if item["url"].endswith("/KmTY5e.php"))
+    assert match["url"] == "https://pakistancode.gov.pk/english/KmTY5e.php"
+    assert match["target_kind"] == "instrument"
+    assert _classify_discovered_url(match["url"]) == "listing"
+
+
+def test_transient_reopen_is_capped_then_retired():
+    pipeline = PakistanCodePipeline(None, type("Source", (), {"source_name": "PakistanCode"})())
+    row = type("Row", (), {})()
+    row.status = "retired"
+    row.last_error = "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate"
+    row.attempts = 3
+    row.next_run_at = "set"
+    row.priority = 80
+    row.cursor_json = {"claimed_by": "worker-1"}
+    row.query_json = {"meta": {"act_title": "kept"}}
+
+    for cycle in range(1, TRANSIENT_REOPEN_LIMIT + 1):
+        pipeline._reopen_or_exhaust(row, priority=80, meta={"act_no": "I of 2026"})
+        assert row.status == "pending"
+        assert row.attempts == 0
+        assert row.last_error is None
+        assert row.cursor_json["transient_reopen_count"] == cycle
+        assert row.cursor_json["claimed_by"] == "worker-1"
+        assert row.query_json["meta"]["act_title"] == "kept"
+        assert row.query_json["meta"]["act_no"] == "I of 2026"
+        row.status = "retired"
+        row.last_error = "connection reset by peer"
+        row.attempts = 3
+
+    pipeline._reopen_or_exhaust(row, priority=80)
+    exhausted = f"transient reopen limit reached after {TRANSIENT_REOPEN_LIMIT} cycles"
+    assert row.status == "retired"
+    assert row.last_error == exhausted
+    assert row.cursor_json["transient_reopen_count"] == TRANSIENT_REOPEN_LIMIT
+    assert PakistanCodePipeline._retryable_retired(row) is False
+    assert pipeline.stats["reopened_retired"] == TRANSIENT_REOPEN_LIMIT
+
+    pipeline._reopen_or_exhaust(row, priority=80)
+    assert row.status == "retired"
+    assert row.last_error == exhausted
+
+    pipeline._reset_reopen_count(row)
+    assert "transient_reopen_count" not in row.cursor_json
+    assert row.cursor_json["claimed_by"] == "worker-1"

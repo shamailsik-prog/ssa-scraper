@@ -48,11 +48,16 @@ DEFAULT_LISTINGS: List[Dict[str, str]] = [
     # Full federal catalog (about a thousand Act rows). The four indexes above only
     # show a slice; this page is the one the homepage card links as "List of Federal Laws".
     {"url": "https://pakistancode.gov.pk/english/sHyuRiF.php", "target_kind": "statute"},
+    # Latest ordinances. Classified as a listing, and seeded so a run reaches it
+    # without first discovering the path from another page.
+    {"url": "https://pakistancode.gov.pk/english/KmTY5e.php", "target_kind": "instrument"},
 ]
 PAKISTANCODE_DOCUMENT_PRIORITY = 10
 PAKISTANCODE_LISTING_PRIORITY = 80
 PAKISTANCODE_MIN_CRAWL_MAX_PAGES = 200
 REJECTED_URL_SAMPLE_LIMIT = 20
+TRANSIENT_REOPEN_LIMIT = 3
+_REOPEN_COUNT_KEY = "transient_reopen_count"
 _PERMANENT_RETIRE_MARKERS = (
     "missing %pdf",
     "http 404",
@@ -65,6 +70,8 @@ _PERMANENT_RETIRE_MARKERS = (
     # PublicPipeline._claim retires a row after repeated worker deaths. Reopening it
     # would reset that circuit breaker and send the same page back to the worker.
     "the worker died",
+    # Written once transient_reopen_count reaches TRANSIENT_REOPEN_LIMIT.
+    "transient reopen limit",
 )
 
 
@@ -259,8 +266,8 @@ class PakistanCodePipeline(PublicPipeline):
             if exists is not None:
                 # Act detail pages only. Reopening retired alphabetical/year indexes
                 # would fill the drain batch ahead of Act rows discovered later.
-                if self._is_detail_listing(nurl) and self._retryable_retired(exists):
-                    self._reopen_retired(exists, priority=PAKISTANCODE_LISTING_PRIORITY, meta=nmeta)
+                if self._is_detail_listing(nurl):
+                    self._reopen_or_exhaust(exists, priority=PAKISTANCODE_LISTING_PRIORITY, meta=nmeta)
                 continue
             route = {"listing": res.final_url}
             for key_name in (
@@ -612,8 +619,7 @@ class PakistanCodePipeline(PublicPipeline):
                 )
             ).scalars().first()
             if exists is not None:
-                if self._retryable_retired(exists):
-                    self._reopen_retired(exists, priority=PAKISTANCODE_DOCUMENT_PRIORITY, meta=meta)
+                self._reopen_or_exhaust(exists, priority=PAKISTANCODE_DOCUMENT_PRIORITY, meta=meta)
                 continue
 
             route: Dict[str, Any] = {"listing": listing_url}
@@ -657,7 +663,10 @@ class PakistanCodePipeline(PublicPipeline):
         return added
 
     def _note_rejected_url(self, url: str, exc: BaseException) -> None:
-        """Count a policy rejection and keep a bounded sample on the job stats and log."""
+        """Count a policy rejection and keep a bounded sample on the job stats.
+
+        The log line records the rejection count only.
+        """
         self.stats["rejected_urls"] = int(self.stats.get("rejected_urls") or 0) + 1
         sample = self.stats.setdefault("rejected_url_sample", [])
         if not isinstance(sample, list) or len(sample) >= REJECTED_URL_SAMPLE_LIMIT:
@@ -677,6 +686,14 @@ class PakistanCodePipeline(PublicPipeline):
         )
 
     @staticmethod
+    def _reopen_count(row: CrawlFrontier) -> int:
+        cursor = row.cursor_json if isinstance(row.cursor_json, dict) else {}
+        try:
+            return max(0, int(cursor.get(_REOPEN_COUNT_KEY) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def _retryable_retired(row: CrawlFrontier) -> bool:
         """True when a retired row failed for a transient reason and should be tried again."""
         if row.status != "retired":
@@ -684,7 +701,27 @@ class PakistanCodePipeline(PublicPipeline):
         err = (row.last_error or "").lower()
         return not any(marker in err for marker in _PERMANENT_RETIRE_MARKERS)
 
+    def _reopen_or_exhaust(self, row: CrawlFrontier, *, priority: int, meta: Optional[Dict[str, Any]] = None) -> None:
+        """Reopen a transient retirement, or re-retire it once the reopen cap is spent."""
+        if not self._retryable_retired(row):
+            return
+        if self._reopen_count(row) >= TRANSIENT_REOPEN_LIMIT:
+            row.status = "retired"
+            row.last_error = f"transient reopen limit reached after {TRANSIENT_REOPEN_LIMIT} cycles"
+            return
+        self._reopen_retired(row, priority=priority, meta=meta)
+
+    def _reset_reopen_count(self, row: CrawlFrontier) -> None:
+        cursor = dict(row.cursor_json or {})
+        if _REOPEN_COUNT_KEY not in cursor:
+            return
+        cursor.pop(_REOPEN_COUNT_KEY, None)
+        row.cursor_json = cursor
+
     def _reopen_retired(self, row: CrawlFrontier, *, priority: int, meta: Optional[Dict[str, Any]] = None) -> None:
+        cursor = dict(row.cursor_json or {})
+        cursor[_REOPEN_COUNT_KEY] = self._reopen_count(row) + 1
+        row.cursor_json = cursor
         row.status = "pending"
         row.attempts = 0
         row.last_error = None
@@ -733,6 +770,7 @@ class PakistanCodePipeline(PublicPipeline):
                     fr.status = "done"
                     fr.last_error = None
                     fr.last_run_at = datetime.now(timezone.utc)
+                    self._reset_reopen_count(fr)
         except URLPolicyError as exc:
             fr.status = "retired"
             fr.last_error = str(exc)[:1000]
