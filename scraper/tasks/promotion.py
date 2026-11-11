@@ -82,6 +82,10 @@ from scraper.parsers.statute_parser import (
     looks_like_fragment_name,
     looks_like_garbage_name,
 )
+from scraper.statute_quality.assembly_statute_title import (
+    statute_name_unknown_reason,
+    strip_listing_chrome_source_url,
+)
 from scraper.statute_quality_jurisdiction import resolve_statute_jurisdiction
 from scraper.unreported import (
     SOURCE_COURT_CODE,
@@ -2264,6 +2268,16 @@ async def promote_statute_staging(
             {"reason_code": "listing_only_statute", "statute_name": name[:280]},
         )
         return "quarantined"
+    unknown_reason = statute_name_unknown_reason(name, evidence)
+    if unknown_reason:
+        await _quarantine(
+            db,
+            st,
+            unknown_reason,
+            "statute",
+            {"reason_code": "name_unknown", "statute_name": name[:280]},
+        )
+        return "quarantined"
     if not name or name == "Unknown Statute":
         await _quarantine(db, st, "statute name or sections missing", "statute")
         return "quarantined"
@@ -2428,7 +2442,7 @@ async def promote_statute_staging(
             statute_type=data.get("statute_type"),
             year_enacted=incoming_year,
             source_name=st.source_name,
-            source_url=st.source_url,
+            source_url=strip_listing_chrome_source_url(st.source_url) or None,
         )
         db.add(statute)
         await db.flush()
