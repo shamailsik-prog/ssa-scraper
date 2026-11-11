@@ -11,6 +11,9 @@ blackletter_state/
 .venv/
 venv/
 
+# re-extract backups written by bundled_gazette_acts --apply-reextract
+var/
+
 # droplet-local clutter: never commit hand-made backups or hot patches (deploy from git only)
 *.bak
 *.bak.*

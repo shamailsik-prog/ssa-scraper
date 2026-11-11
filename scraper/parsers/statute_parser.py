@@ -900,6 +900,22 @@ def _filter_year_heading_matches(text: str, matches: Sequence[Match[str]]) -> Li
     return kept
 
 
+def _chunk_is_lone_year_continuation(chunk: str) -> bool:
+    """True when the chunk is only a year and an optional period, such as ``1976.``."""
+    return bool(re.fullmatch(r"(?:18|19|20)\d{2}\.?", (chunk or "").strip()))
+
+
+def _append_lone_year_continuation(target: Dict[str, str], chunk: str) -> None:
+    """Append ``1976.`` even when that year already appears earlier in the section."""
+    addition = (chunk or "").strip()
+    if not addition:
+        return
+    current = target.get("section_text") or ""
+    if current.rstrip().endswith(addition):
+        return
+    target["section_text"] = current.rstrip() + "\n" + addition
+
+
 def _append_section_text(target: Dict[str, str], extra: str) -> None:
     addition = (extra or "").strip()
     if not addition:
@@ -1999,6 +2015,12 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
                 # A short HS row (``98.01 hotels``) is still schedule text. The
                 # 15-character floor would drop it between two longer headings.
                 if len(chunk) < 15 and not section_text_starts_with_tariff_schedule_row(chunk):
+                    # A wrapped year on its own line (``1976.``) is the end of the
+                    # previous sentence. The 15-character floor used to drop that
+                    # line. Keep the line only when the chunk is the year itself,
+                    # so a following Act cannot ride along inside this short chunk.
+                    if sections and _chunk_is_lone_year_continuation(chunk):
+                        _append_lone_year_continuation(sections[-1], chunk)
                     continue
                 num, title, body = _extract_number_title_from_chunk(chunk)
                 if num:

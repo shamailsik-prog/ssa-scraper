@@ -91,7 +91,45 @@ python -m scraper.tasks.bundled_gazette_acts --apply
 
 Only a visible `MISMATCH` gets a new `document_quarantine` row. Section text stays as evidence. `needs_section_refetch` stays false, because a later promote onto the same row would replace numbers that appear again and would leave numbers that exist only because of the other act (section 59 on `f200fa53`). Running `--apply` twice does not insert a second row.
 
-Quarantine hides the statute from search and corpus reads.
+Quarantine hides the statute from search and corpus reads. `--apply` does not rewrite sections. Rebuilding a row is the separate command below.
+
+## Apply a previewed re-extract
+
+`--apply-reextract` replaces sections for statute UUIDs named on that command. Each id must be the full hyphenated UUID and must be in `APPROVED_REEXTRACT_IDS` (the eight Auditor-approved MAIN and FREE-SITES ids for Legal Advisers, Travel Agencies, Pat Feeder, and Withdrawal of Remission). It must also have a 64-hex pin in `CONFIRMED_PDF_SHA256`. `CONFIRMED_BLEED_STATUTE_IDS` stays the preview table. An id in that wider table, including `d7d3187e-9ebd-4782-aa9a-228b40d2dd96`, is refused for apply and for lift before any backup or write. An 8-hex prefix, a 32-hex string with no hyphens, or an empty pin is the same kind of refusal. Those pre-flight refusals exit 2. The command reads the recorded local PDF and checks its sha256 against the pin. A mismatch refuses that id. It does not fetch, with or without `--skip-fetch`. A refused id does not stop an approved id named in the same command.
+
+The splitter is the one `--preview-reextract` uses. A row is written only when that preview has sections, has no hold, and matches `--expected-sections UUID=1,2` when that assertion is present. A hold, an empty section list, or a different number list skips that id and the JSON says why. One statute is one transaction. Other statutes are not updated. The statute row is not deleted. `statute.name` is not changed. Quarantine is not removed.
+
+Before the write, the command appends a JSONL line with the statute, its sections (including versions), and its quarantine rows. The same snapshot is stored on `corpus_metadata` under `bundled_reextract_bak:<run_id>` in that transaction. A second run whose sections already match the preview writes nothing: no new `run_id`, no new backup.
+
+```bash
+python -m scraper.tasks.bundled_gazette_acts --apply-reextract \
+  --statute-id 6c73a686-c038-4611-8f05-8a429168c8a7 \
+  --statute-id 10cc6efa-f845-42e5-83ee-11eeabd0bc63 \
+  --expected-sections 6c73a686-c038-4611-8f05-8a429168c8a7=1,2 \
+  --expected-sections 10cc6efa-f845-42e5-83ee-11eeabd0bc63=1,2
+```
+
+Exit code 2 means at least one id was refused. Skipped ids still exit 0. `run_id` and `rollback_command` are in the JSON.
+
+## Lift quarantine
+
+Lifting quarantine is a separate command. It does not rewrite sections. The ids are the same `APPROVED_REEXTRACT_IDS` UUIDs. An id outside that set is refused before any backup or write, and the process exits 2. It deletes the `document_quarantine` row for the approved ids whatever `run_id` inserted it, after the same style of backup.
+
+```bash
+python -m scraper.tasks.bundled_gazette_acts --lift-quarantine \
+  --statute-id 6c73a686-c038-4611-8f05-8a429168c8a7 \
+  --statute-id 10cc6efa-f845-42e5-83ee-11eeabd0bc63
+```
+
+## Roll back one re-extract run
+
+```bash
+python -m scraper.tasks.bundled_gazette_acts --rollback <run_id>
+```
+
+`<run_id>` is the 32-hex id from `--apply-reextract` or `--lift-quarantine`. Rollback reads `bundled_reextract_bak:<run_id>` and puts back that statute's scalar fields, section rows and versions (same UUIDs), prior-capture rows, and quarantine rows. Restored sections keep the backed-up `created_at` and `updated_at`. Restored versions keep the backed-up `created_at` (a version row has no `updated_at`). It does not recreate a statute that has been deleted. A second rollback of the same run writes nothing once the live rows match the backup. `--undo` remains the quarantine-only undo for `--apply` and does not restore sections.
+
+A lone year that ends a sentence, such as `1976.` on Pat Feeder section 2, stays with that section. A following Act does not. Printer imprint lines and OCR running headers are dropped. `M. A. HAQ,` / `Scctetuy.` on Legal Advisers section 3 stays, because that is the authentication signature. The Withdrawal of Remission pair (`0181ad58-1a79-479c-bdd8-dad584cfd683`, `7f0a008c-6775-4a44-87b0-4e0e5c1b5b02`) is pinned, and the preview record is sections 1–3. Its PDF text layer is not in this repo, so the body is not golden-locked and must not be taken from a different file.
 
 ## What not to do with f200fa53
 

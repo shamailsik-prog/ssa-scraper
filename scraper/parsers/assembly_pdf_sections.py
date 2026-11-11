@@ -143,6 +143,94 @@ def _has_gazette_extra_part_header(stripped: str) -> bool:
     return bool(_GAZETTE_EXTRA_PART_HEADER_RE.search(stripped))
 
 
+# A running header the scan damaged (``TFIE GAZET^|E``, ``GAZBTTE OF PAXIS'IAN``).
+# A real citation has several lowercase words or an operative verb, and is kept.
+_OCR_RUNNING_HEADER_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_OCR_RUNNING_HEADER_PROSE_RE = re.compile(
+    r"(?i)\b(?:shall|means|hereby|provided|notification|official|offtcial)\b"
+)
+_PRINTER_IMPRINT_PROSE_RE = re.compile(
+    r"(?i)\b(?:shall|means|hereby|provided|applicant|partner|director)\b"
+)
+# Page number plus year (``298 1976``, ``296 1976 l-'``), not a sentence ending ``1976.``.
+_PAGE_AND_YEAR_RE = re.compile(r"^\d{1,4}\s+(?:19|20)\d{2}\b")
+_HEADER_STUB_RE = re.compile(
+    r"^(?:[A-Z]{2,4}|\([A-Za-z]{3,8}|[A-Za-z]{1,6}['’\-][A-Za-z0-9]{1,4},?)$"
+)
+_HEADER_STUB_WORDS = frozenset({"AND", "THE", "FOR", "NOT", "ANY", "ACT", "BUT", "NOR", "OR"})
+
+
+def _is_ocr_gazette_running_header(stripped: str) -> bool:
+    """True for a gazette running header whose letters the scan broke.
+
+    ``THE GAZETTE OF PAKISTAN, EXTRA.`` is already a header. This also matches
+    ``TFIE GAZET^|E oF PAKISTAN, EXTRA..`` and ``GAZBTTE OF PAXIS'IAN``.
+    A line with three lowercase words, or with ``shall`` / ``official Gazette``,
+    stays. That is a citation, not furniture.
+    """
+    if not stripped or len(stripped) > 180:
+        return False
+    if _OCR_RUNNING_HEADER_PROSE_RE.search(stripped):
+        return False
+    words = _OCR_RUNNING_HEADER_WORD_RE.findall(stripped)
+    lower = [word for word in words if any(char.islower() for char in word)]
+    if len(lower) >= 3:
+        return False
+    folded = re.sub(r"[^A-Za-z]", "", stripped).upper()
+    if not re.search(r"GAZ[A-Z]{0,6}T", folded):
+        return False
+    if not re.search(r"PAK|PAX", folded):
+        return False
+    if not re.search(
+        r"EXTRA|XTRA|PART|PANR|HTRA|MAY|JUNE|JULY|JAN|FEB|MAR|APR|AUG|SEP|OCT|NOV|DEC",
+        folded,
+    ):
+        return False
+    return True
+
+
+def _is_printer_imprint_line(stripped: str) -> bool:
+    """True for the printer's closing line, not a sentence that mentions a manager."""
+    if not stripped or len(stripped) > 220:
+        return False
+    if _PRINTER_IMPRINT_PROSE_RE.search(stripped):
+        return False
+    if re.search(r"(?i)\bprinting\s+corporation\b", stripped):
+        return True
+    if re.search(r"(?i)\bmanager\s+of\s+publications\b", stripped):
+        return True
+    if re.search(r"(?i)\bmanaqer\b", stripped) and re.search(r"(?i)\b(?:press|print|corporation)\b", stripped):
+        return True
+    if re.search(r"(?i)\bprinted\s+by\b", stripped) and re.search(
+        r"(?i)\b(?:manager|press|corporation)\b", stripped
+    ):
+        return True
+    if re.search(r"(?i)\bpublished\s+by\b", stripped) and re.search(
+        r"(?i)\b(?:manager|publications|press)\b", stripped
+    ):
+        return True
+    return False
+
+
+def _is_page_furniture_stub(stripped: str) -> bool:
+    """A slug or page-and-year line that sits directly above a running header.
+
+    ``1976.`` is the end of a sentence and is not furniture. ``1976`` with no
+    period, directly above the header, is the page's year.
+    """
+    if not stripped or len(stripped) > 24:
+        return False
+    if stripped in _HEADER_STUB_WORDS:
+        return False
+    if re.fullmatch(r"(?:18|19|20)\d{2}\.", stripped):
+        return False
+    if re.fullmatch(r"(?:19|20)\d{2}", stripped):
+        return True
+    if _PAGE_AND_YEAR_RE.match(stripped):
+        return True
+    return bool(_HEADER_STUB_RE.match(stripped))
+
+
 def _is_gazette_page_header_line(stripped: str) -> bool:
     if not stripped:
         return False
@@ -177,16 +265,37 @@ def normalize_assembly_gazette_pdf_text(text: str) -> str:
 
 
 def strip_gazette_page_break_lines(body: str) -> str:
-    """Remove gazette page chrome lines that pdfplumber leaves inside a section body."""
-    kept: List[str] = []
-    for line in (body or "").splitlines():
+    """Remove gazette page chrome lines that pdfplumber leaves inside a section body.
+
+    A running header also drops the page-number line and the short scan slug
+    directly above it (``(estr`` / ``298 1976`` / the header). A year that ends
+    with a period stays, because that is the previous sentence. Printer imprint
+    lines are dropped on their own.
+    """
+    lines = (body or "").splitlines()
+    drop = [False] * len(lines)
+    header_at: List[int] = []
+    for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
-            kept.append(line)
             continue
-        if _is_gazette_page_header_line(stripped):
-            continue
-        kept.append(line)
+        header = _is_gazette_page_header_line(stripped) or _is_ocr_gazette_running_header(stripped)
+        if header or _is_printer_imprint_line(stripped):
+            drop[index] = True
+            if header:
+                header_at.append(index)
+    for index in header_at:
+        cursor = index - 1
+        while cursor >= 0:
+            stripped = lines[cursor].strip()
+            if not stripped or drop[cursor]:
+                cursor -= 1
+                continue
+            if not _is_page_furniture_stub(stripped):
+                break
+            drop[cursor] = True
+            cursor -= 1
+    kept = [line for index, line in enumerate(lines) if not drop[index]]
     return _collapse_section_body_whitespace("\n".join(kept).strip())
 
 
