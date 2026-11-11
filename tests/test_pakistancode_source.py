@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import func, select
 
 from scraper.fetchers import HttpFetcher
 from scraper.models import CrawlFrontier, ScraperSource, SourceProvenance, StatutesStaging
 from scraper.tasks.pakistancode import (
+    REJECTED_URL_SAMPLE_LIMIT,
+    PakistanCodePipeline,
+    _classify_discovered_url,
     _effective_crawl_limit,
     document_query_key,
     normalize_pakistancode_public_url,
     scrape_pakistancode,
 )
 from tests.fixtures import text_pdf_bytes
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pakistancode"
+DEFENSE_ACT_PATH = "/english/UY2FqaJw1-apaUY2Fqa-apaUY2Npa5tqaw%3D%3D-sg-jjjjjjjjjjjjj"
+ORDINANCE_PATH = "/english/UY2FqaJw1-apaUY2Fqa-apaUY2Npa5tqaQ%3D%3D-sg-jjjjjjjjjjjjj"
 
 
 async def _pakistancode_source(db, fixture_server, listings):
@@ -370,3 +379,149 @@ async def test_pakistancode_shared_pdf_keeps_distinct_act_frontier_and_staging(d
     assert len(staged) == 2
     assert "Alpha Fisheries Act, 2026" in names
     assert "Beta Forestry Act, 2026" in names
+
+
+def test_federal_catalog_paths_are_listings():
+    assert _classify_discovered_url("https://pakistancode.gov.pk/english/sHyuRiF.php") == "listing"
+    assert _classify_discovered_url("https://pakistancode.gov.pk/english/KmTY5e.php") == "listing"
+
+
+async def test_live_catalog_fixture_discovers_acts_and_records_rejected_urls(db, fixture_server):
+    """Homepage chrome is off-allow-list; Act rows live on sHyuRiF.php.
+
+    A retired Act detail is retried. A detail retired for HTTP 404 stays retired.
+    """
+    fixture_server.add("/robots.txt", "", status=404, content_type="text/plain")
+    fixture_server.add("/english/index.php", (FIXTURE_DIR / "listing_index_excerpt.html").read_text(encoding="utf-8"))
+    fixture_server.add("/english/sHyuRiF.php", (FIXTURE_DIR / "federal_laws_excerpt.html").read_text(encoding="utf-8"))
+    fixture_server.add("/english/UY2FqaJw1-apaUY2Fqa-apaUY2Npa5tqaw%3D%3D-sg-jjjjjjjjjjjjj", (FIXTURE_DIR / "act_detail_excerpt.html").read_text(encoding="utf-8"))
+    fixture_server.add(
+        "/pdffiles/defense-forces-act-2026.pdf",
+        text_pdf_bytes(
+            "Defense Forces of Pakistan Act, 2026\n"
+            "1. Short title.- This Act may be called the Defense Forces of Pakistan Act, 2026.\n"
+            "2. Definitions.- In this Act, unless the context otherwise requires, terms have assigned meanings.\n"
+        ),
+        content_type="application/pdf",
+    )
+
+    index_url = fixture_server.url("/english/index.php")
+    defense_url = normalize_pakistancode_public_url(DEFENSE_ACT_PATH, base_url=index_url)
+    ordinance_url = normalize_pakistancode_public_url(ORDINANCE_PATH, base_url=index_url)
+    source = await _pakistancode_source(db, fixture_server, ["/english/index.php"])
+    db.add(
+        CrawlFrontier(
+            source_name="PakistanCode",
+            tier=0,
+            query_key=f"listing:{defense_url}",
+            query_json={"kind": "listing", "url": defense_url, "target_kind": "statute", "depth": 2},
+            cursor_json={},
+            status="retired",
+            priority=80,
+            attempts=3,
+            last_error="[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate",
+        )
+    )
+    db.add(
+        CrawlFrontier(
+            source_name="PakistanCode",
+            tier=0,
+            query_key=f"listing:{ordinance_url}",
+            query_json={"kind": "listing", "url": ordinance_url, "target_kind": "instrument", "depth": 2},
+            cursor_json={},
+            status="retired",
+            priority=80,
+            attempts=1,
+            last_error="HTTP 404",
+        )
+    )
+    await db.commit()
+
+    async with HttpFetcher(source, allow_private_for_tests=True) as fetcher:
+        stats = await scrape_pakistancode(source, db, fetcher=fetcher, limit=4)
+    await db.commit()
+
+    assert stats["discovered"] > 0
+    assert stats["halted"] is False
+    assert "/english/sHyuRiF.php" in fixture_server.hits
+    assert DEFENSE_ACT_PATH in fixture_server.hits
+    assert "/pdffiles/defense-forces-act-2026.pdf" in fixture_server.hits
+    assert ORDINANCE_PATH not in fixture_server.hits
+
+    defense_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PakistanCode",
+                CrawlFrontier.query_key == f"listing:{defense_url}",
+            )
+        )
+    ).scalars().first()
+    ordinance_row = (
+        await db.execute(
+            select(CrawlFrontier).where(
+                CrawlFrontier.source_name == "PakistanCode",
+                CrawlFrontier.query_key == f"listing:{ordinance_url}",
+            )
+        )
+    ).scalars().first()
+    assert defense_row is not None and defense_row.status == "done"
+    assert ordinance_row is not None and ordinance_row.status == "retired"
+    assert ordinance_row.last_error == "HTTP 404"
+
+    sample = stats["rejected_url_sample"]
+    assert stats["rejected_urls"] >= 3
+    assert len(sample) == stats["rejected_urls"]
+    assert len(sample) <= REJECTED_URL_SAMPLE_LIMIT
+    joined = " ".join(item["url"] for item in sample)
+    assert "drs.molaw.gov.pk" in joined
+    assert "play.google.com" in joined
+    assert "apps.apple.com" in joined
+    assert all(item["reason"] for item in sample)
+
+
+async def test_rejected_url_sample_keeps_the_first_twenty(db, fixture_server):
+    source = await _pakistancode_source(db, fixture_server, ["/english/index.php"])
+    pipeline = PakistanCodePipeline(db, source)
+    base = fixture_server.url("/english/index.php")
+    for i in range(REJECTED_URL_SAMPLE_LIMIT + 5):
+        pipeline._capture_candidate(
+            raw=f"https://off.example/chrome/{i}",
+            hint="store",
+            base_url=base,
+            docs={},
+            listings={},
+            route_meta={},
+        )
+    sample = pipeline.stats["rejected_url_sample"]
+    assert pipeline.stats["rejected_urls"] == REJECTED_URL_SAMPLE_LIMIT + 5
+    assert len(sample) == REJECTED_URL_SAMPLE_LIMIT
+    assert sample[0]["url"] == "https://off.example/chrome/0"
+    assert sample[-1]["url"] == f"https://off.example/chrome/{REJECTED_URL_SAMPLE_LIMIT - 1}"
+    assert "allow-list" in sample[0]["reason"]
+
+    secret_pipeline = PakistanCodePipeline(db, source)
+    secret_pipeline._capture_candidate(
+        raw="https://user:secret-token@off.example/hidden?token=abcdef",
+        hint="",
+        base_url=base,
+        docs={},
+        listings={},
+        route_meta={},
+    )
+    hidden = secret_pipeline.stats["rejected_url_sample"][0]["url"]
+    assert hidden.startswith("https://off.example/hidden")
+    assert "secret-token" not in hidden
+    assert "abcdef" not in hidden
+    assert "@" not in hidden
+
+    secret_pipeline._capture_candidate(
+        raw="http://alice:hunter2@/hidden",
+        hint="",
+        base_url=base,
+        docs={},
+        listings={},
+        route_meta={},
+    )
+    hostless = secret_pipeline.stats["rejected_url_sample"][-1]["url"]
+    assert "hunter2" not in hostless
+    assert "alice" not in hostless
