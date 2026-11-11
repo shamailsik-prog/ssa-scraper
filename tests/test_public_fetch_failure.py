@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from scraper.fetchers import HttpFetcher
+from scraper.fetchers import FetchResult, HttpFetcher
 from scraper.models import ScraperJob, ScraperSource
 from scraper.security import RobotsUnavailable
 from scraper.tasks.dispatcher import run_source
@@ -47,6 +47,16 @@ def test_describe_public_fetch_failure_names_tls_and_zero_page_runs():
     assert deferred is not None and "0 pages" in deferred
     partial = describe_public_fetch_failure({"fetched": 2, "errors": 1, "halted": False})
     assert partial is not None and partial.startswith("fetch degraded:")
+    partial_robots = describe_public_fetch_failure(
+        {
+            "fetched": 3,
+            "errors": 0,
+            "deferred": 1,
+            "halted": False,
+            "last_fetch_error": "robots.txt unavailable for https://pakistancode.gov.pk (HTTP 599)",
+        }
+    )
+    assert partial_robots is not None and partial_robots.startswith("fetch degraded:") and "deferred fetch error" in partial_robots
     assert describe_public_fetch_failure({"fetched": 0, "errors": 3, "halted": True}) is None
 
 
@@ -67,6 +77,48 @@ async def test_tls_error_does_not_move_last_success(db, source, fixture_server):
     assert source.last_success_at == PREVIOUS_SUCCESS
     assert "issuer" in (source.last_error or "")
     assert "0 pages" in source.last_error
+
+
+class _PageThenRobots:
+    """First GET returns a page. Later GETs are the robots/TLS deferral."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def get(self, url, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status_code=200,
+                content=b"<html><body>no links</body></html>",
+                content_type="text/html",
+            )
+        raise RobotsUnavailable("robots.txt unavailable for https://pakistancode.gov.pk (HTTP 599)")
+
+
+async def test_robots_unavailable_after_a_page_is_degraded(db, source, fixture_server):
+    source.last_success_at = PREVIOUS_SUCCESS
+    source.last_error = None
+    await db.commit()
+    stats = await run_public_source(
+        db,
+        source,
+        seed_listings=[
+            {"url": fixture_server.url("/ok-then-robots"), "target_kind": "judgment"},
+            {"url": fixture_server.url("/robots-after"), "target_kind": "judgment"},
+        ],
+        fetcher=_PageThenRobots(),
+        limit=5,
+    )
+    assert stats["fetched"] == 1
+    assert stats["deferred"] == 1
+    assert stats["errors"] == 0
+    assert stats["fetch_failure"] is True
+    assert str(stats.get("stop_reason") or "").startswith("fetch degraded:")
+    assert source.last_success_at == PREVIOUS_SUCCESS
+    assert "robots.txt unavailable" in (source.last_error or "")
 
 
 async def test_robots_transport_failure_with_zero_pages_is_a_failure(db, source, fixture_server):

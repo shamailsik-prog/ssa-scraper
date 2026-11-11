@@ -825,16 +825,22 @@ def describe_public_fetch_failure(stats: Dict[str, Any]) -> Optional[str]:
     ``last_success_at`` moved, including a PakistanCode run that fetched 0 pages
     because every robots.txt request failed certificate verification. Zero pages
     after listings were armed, or after every item was deferred, is the same miss.
+    A ``RobotsUnavailable`` after some pages only increments ``deferred`` and records
+    ``last_fetch_error``; that partial run is degraded. An ordinary HTTP or PDF-miss
+    deferral does not set ``last_fetch_error`` and still counts as success.
     """
     if stats.get("halted") or stats.get("blocked_cooldown") or stats.get("skipped") or stats.get("paused"):
         return None
     fetched = int(stats.get("fetched") or 0)
     errors = int(stats.get("errors") or 0)
     deferred = int(stats.get("deferred") or 0)
+    fetch_error = str(stats.get("last_fetch_error") or "").strip()
     if errors and fetched == 0:
         reason = f"fetch failed: {errors} error(s), 0 pages"
     elif errors:
         reason = f"fetch degraded: {errors} error(s) after {fetched} page(s)"
+    elif fetched and deferred and fetch_error:
+        reason = f"fetch degraded: {deferred} deferred fetch error(s) after {fetched} page(s)"
     elif fetched == 0 and deferred:
         reason = f"fetch yielded 0 pages; {deferred} item(s) deferred"
     elif (
