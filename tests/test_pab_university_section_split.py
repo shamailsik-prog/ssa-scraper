@@ -38,7 +38,7 @@ def test_uob_quorum_subclause_does_not_swallow_the_next_marginal_heading():
     bodies = _bodies(UOB, "pab_uob_act_1996_pattern.txt")
     numbers = list(bodies)
 
-    assert numbers == [str(number) for number in range(1, 24)]
+    assert numbers == [str(number) for number in range(1, 24)] + ["Schedule"]
     assert "quorum for a meeting of the Syndicate" in bodies["21"]
     assert "executive body" not in bodies["21"]
     assert "reconstituted" in bodies["3"]
@@ -64,16 +64,19 @@ def test_uob_citation_years_stay_inside_the_section_that_quotes_them():
 def test_uob_first_schedule_faculties_are_not_main_act_sections():
     sections = _sections(UOB, "pab_uob_act_1996_pattern.txt")
     bodies = {section["section_number"]: section["section_text"] for section in sections}
-    joined = "\n".join(section["section_text"] for section in sections)
 
     assert bodies["4"].startswith("Powers of the University")
     assert "Boards of Studies" not in bodies["4"]
-    assert "Faculties" not in joined
-    assert "Board of each Faculty" not in joined
-    assert "Boards of Studies" not in joined
-    assert "THE FIRST SCHEDULE" not in joined
-    assert "See section" not in joined
-    assert "Dean of each Faculty" not in joined
+    operative = "\n".join(section["section_text"] for section in sections if section["section_number"] != "Schedule")
+    assert "Faculties" not in operative
+    assert "Board of each Faculty" not in operative
+    assert "Boards of Studies" not in operative
+    assert "THE FIRST SCHEDULE" not in operative
+    assert "See section" not in operative
+    assert "Dean of each Faculty" not in operative
+    assert bodies["Schedule"].lstrip().startswith("THE FIRST SCHEDULE")
+    assert "1. Faculties" in bodies["Schedule"]
+    assert "Dean of each Faculty" in bodies["Schedule"]
 
 
 def test_lasbela_quorum_subclause_and_citation_years_are_not_sections():
@@ -95,12 +98,14 @@ def test_lasbela_quorum_subclause_and_citation_years_are_not_sections():
 def test_turbat_first_statute_tail_is_not_stored_on_section_58():
     bodies = _bodies(TURBAT, "pab_turbat_act_2012_pattern.txt")
 
-    assert list(bodies) == ["57", "58"]
+    assert list(bodies) == ["57", "58", "Schedule"]
     assert "difficulty arises" in bodies["58"]
     assert "Faculties" not in bodies["58"]
     assert "FIRST STATUE" not in bodies["58"]
     assert "Board of each Faculty" not in bodies["58"]
-    assert "1" not in bodies
+    assert "1" not in {key for key in bodies if key != "Schedule"}
+    assert "FIRST STATUE" in bodies["Schedule"]
+    assert "Faculties" in bodies["Schedule"]
 
 
 def test_buitems_senate_quorum_does_not_swallow_section_18b():
@@ -169,15 +174,16 @@ def test_offline_dry_run_prints_section_counts_without_a_database():
     turbat, buitems = rest.split("BUITEMS Amendment Act XII/2015", 1)
 
     assert "no database writes" in text
-    assert "section_count: 23" in uob
+    assert "section_count: 24" in uob
+    assert "Schedule" in uob
     assert "1882" not in uob
     assert "1925" not in uob
     assert "1970" not in uob
     assert "not in repo fixtures" in uob
     assert "398d88c1a9a251e7d08a50dbf3bcd46088afa95ff7a04afef24c3d5dba58e67f" in uob
     assert "section_count: 20" in lasbela
-    assert "section_count: 2\n" in turbat
-    assert "section_numbers: 57, 58" in turbat
+    assert "section_count: 3\n" in turbat
+    assert "section_numbers: 57, 58, Schedule" in turbat
     assert "18-B" in buitems
     assert "10" not in buitems.split("section_numbers: ", 1)[1]
 

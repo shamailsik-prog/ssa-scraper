@@ -80,7 +80,7 @@ ACT_WITH_YEAR_PATTERN = re.compile(
 )
 # ``18-B.`` is one section number. ``6- Inspection`` keeps the hyphen as the closer.
 SECTION_DIGIT_START_RE = re.compile(
-    r'^\s*(\d+-[A-Z]|\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)',
+    r'^\s*(\d+[A-Z]?)\s*[\.\-\)\:\]]+\s*(.*)',
     re.DOTALL,
 )
 SECTION_KEYWORD_RE = re.compile(r'^\s*(?:Section|Sec\.|S\.)\s+(\d+[A-Z]?)\s*[:\.\-\)]*\s*(.*)', re.IGNORECASE | re.DOTALL)
@@ -102,7 +102,9 @@ _MARGINAL_SECTION_HEAD_RE = re.compile(
     r"(?m)^[ \t]*"
     r"[A-Z][A-Za-z][A-Za-z,'’\-]{0,40}"
     r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,6}"
-    r"\.?[ \t]+"
+    # ``Senate:- 17.`` and ``Syndicate :- 19`` keep the colon-hyphen
+    # the text layer prints between the marginal note and the number.
+    r"(?:[ \t]*[:\-–—]+\.?|\.)?[ \t]+"
     rf"({_MARGINAL_SECTION_NUMBER_TOKEN})"
     # "1. (1)" / "7. The" on a text layer. OCR also drops the period ("2 (1)")
     # or reads the subsection mark as "@)".
@@ -113,6 +115,16 @@ _MARGINAL_SECTION_HEAD_RE = re.compile(
     r")"
     # ``(1)`` or a roman subsection ``(i)`` as printed in the Lasbela Syndicate clause.
     r"(?=(?:[\(\[\{]\s*(?:\d|[ivxlcdmIVXLCDM]{1,6}\b)|@\)|[A-Z]))"
+)
+# OCR sometimes parenthesises the section number itself: ``Powers and (18).``.
+# A subsection ``(2).`` does not continue the previous section, so the
+# sequence rule below keeps it inside the open section.
+_MARGINAL_PAREN_SECTION_RE = re.compile(
+    r"(?m)^[ \t]*"
+    r"[A-Z][A-Za-z][A-Za-z,'’\-]{0,40}"
+    r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,6}"
+    r"\.?[ \t]+"
+    r"\((\d{1,3})\)\s*\."
 )
 # The word immediately before a marginal number. "Section 5. The" and
 # "under section 12. (1)" are cross-references, not headings.
@@ -308,7 +320,10 @@ def _extract_number_title_from_chunk(chunk: str) -> Tuple[Optional[str], str, st
         return num, title, chunk_clean
 
     # Marginal note, then the number: "Short title, 1. (1) This Act…"
-    marginal = _MARGINAL_SECTION_HEAD_RE.match(chunk_clean)
+    # or the OCR form "Powers and (18).".
+    marginal = _MARGINAL_SECTION_HEAD_RE.match(chunk_clean) or _MARGINAL_PAREN_SECTION_RE.match(
+        chunk_clean
+    )
     if marginal:
         num = marginal.group(1).strip()
         note = _usable_marginal_title(chunk_clean[: marginal.start(1)])
@@ -776,7 +791,7 @@ def _cross_ref_prior(text: str, match: Match[str]) -> bool:
     return bool(_CROSS_REF_PRIOR_RE.search(text[: match.start(1)]))
 
 
-_HYPHEN_LETTER_SECTION_RE = re.compile(r"^([A-Za-z])\.")
+_HYPHEN_LETTER_SECTION_RE = re.compile(r"^([A-Za-z]+)\.")
 
 
 def _effective_heading_token(text: str, match: Match[str]) -> str:
@@ -796,15 +811,63 @@ _TITLED_HEADING_RE = re.compile(
     r"^[A-Z][A-Za-z0-9,'’\-]*(?:[ \t]+[A-Za-z][A-Za-z0-9,'’\-]*){0,8}[ \t]*[.\-–—](?:[.\-–—]|[ \t])"
 )
 _RUNNING_CLAUSE_RE = re.compile(
-    r"(?is)^(?:the|a|an|where|if|provided|notwithstanding)\b.{0,300}?\bshall\b"
+    r"(?is)^(?:the|a|an|where|if|provided|notwithstanding|members)\b.{0,300}?\bshall\b"
 )
 
 
-def _rest_is_running_clause(rest: str) -> bool:
-    head = (rest or "").lstrip()
+def _rest_is_running_clause(rest: str, *, any_shall: bool = False) -> bool:
+    # OCR quotes the clause: ``3. 'The quorum … shall``. A wrapped list
+    # item puts ``shall`` on the next line. ``4. Hot work … Act.— The
+    # occupier shall`` is a heading: the title dash comes before the verb.
+    # Stop before the next numbered line so that verb is not borrowed.
+    head = re.sub(r"""^[\s\"'`“”‘’]+""", "", (rest or "").lstrip())
     if not head or _TITLED_HEADING_RE.match(head):
         return False
-    return bool(_RUNNING_CLAUSE_RE.match(head))
+    window = head[:300]
+    next_heading = re.search(r"\n\s*\d", window)
+    if next_heading:
+        window = window[: next_heading.start()]
+    if _RUNNING_CLAUSE_RE.match(window):
+        return True
+    if not any_shall:
+        return False
+    # ``2. All regular employees … shall`` is a clause. ``3. Director-General``
+    # and ``4. in item 129 … shall`` are sections.
+    if not re.match(r"(?i)(?:all|every|no|each|such|whoever|nothing|anything)\b", window):
+        return False
+    shall = re.search(r"(?i)\bshall\b", window)
+    if not shall:
+        return False
+    title_dash = re.search(r"[.\-–—](?:[.\-–—]|[ \t])", window)
+    return not (title_dash and title_dash.start() < shall.start())
+
+
+def _hyphen_closer_is_not_a_heading(text: str, match: Match[str]) -> bool:
+    """``12-13 Ordinance`` and ``18-B, Ordinance`` are wrapped margin notes.
+
+    ``10-A.`` and ``6- Inspection`` still use the hyphen as a section closer.
+    """
+    if _heading_closer(text, match) != "-":
+        return False
+    rest_line = text[match.end() :].split("\n", 1)[0].strip()
+    # ``12-13 Ordinance`` and ``18-B, Ordinance`` are wrapped margin scraps.
+    # ``16-30 tola gold`` and ``19-B, Act, IV of`` stay headings.
+    return bool(re.fullmatch(r"(?:\d+|[A-Za-z]),?\s+[A-Z][a-z]+", rest_line))
+
+
+def _amendment_marginal_one_gap(text: str, match: Match[str], token: str, previous: Optional[str]) -> bool:
+    """``Amendment of 17.`` still opens a section when 16 is missing from the text."""
+    if previous is None:
+        return False
+    number, letter = _heading_parts(token)
+    prev_number, prev_letter = _heading_parts(previous)
+    if letter or prev_letter or number is None or prev_number is None:
+        return False
+    if number != prev_number + 2:
+        return False
+    line_start = text.rfind("\n", 0, match.start(1)) + 1
+    title = text[line_start : match.start(1)]
+    return bool(re.match(r"(?i)[ \t]*(?:amendment|insertion|substitution|repeal|saving)\b", title))
 
 
 def _line_start_is_inner_subclause(
@@ -828,52 +891,105 @@ def _line_start_is_inner_subclause(
     prev_number, _prev_letter = _heading_parts(previous)
     if number is None or prev_number is None or number >= prev_number:
         return False
-    return _rest_is_running_clause(text[match.end() :])
+    # ``17. (2)`` is a subsection the text layer numbered, not a new
+    # section. ``5A`` after section 6 stays a heading. A quorum ``3``
+    # after section 21, or ``2. Members … shall``, is a clause. A
+    # two-digit backwards heading stays a section. ``03)`` is an OCR
+    # section number, not clause (3).
+    raw = match.group(1) or ""
+    if raw.startswith("0") and len(raw) > 1:
+        return False
+    rest = text[match.end() :]
+    # ``17. (2)`` continues an earlier section. ``95. (1)`` opens a
+    # section. ``1) (2) (3)`` is a table header, not a subsection.
+    if _heading_closer(text, match) == "." and re.match(r"\(\s*[2-9]", rest.lstrip()):
+        return True
+    if prev_number - number < 2:
+        return False
+    # ``14)`` and ``23 :`` stay sections. ``10. The quorum … shall`` does
+    # not. A year is outside this band, so the year guard above is what
+    # keeps ``1882`` from becoming a clause of a later year. A one-digit
+    # backwards line may be a clause even when it does not open with The.
+    if 10 <= number < 1800 and _heading_closer(text, match) != ".":
+        return False
+    return _rest_is_running_clause(rest, any_shall=number < 10)
 
 
 def _select_heading_matches(
     text: str,
     line_start: Sequence[Match[str]],
     extras: Sequence[Match[str]],
-) -> List[Match[str]]:
+) -> Tuple[List[Match[str]], Dict[int, str]]:
     """Keep a line-start heading unless it is an inner numbered clause.
 
     A marginal heading is kept only when it is not a cross-reference and it
     continues the last real section. The quorum line does not reset that
     sequence, so the next marginal heading still opens the next section.
     ``5-A.`` directly under section 5 stays in section 5. ``18-B.`` after a
-    rejected quorum clause is the next section.
+    rejected quorum clause is the next section. ``70-E.`` stays section 70
+    unless that hyphen form itself continues the open section.
     """
     line_pos = {match.start(1) for match in line_start}
     previous: Optional[str] = None
     saw_inner_clause = False
     kept: List[Match[str]] = []
+    tokens: Dict[int, str] = {}
     for match in _merge_heading_matches(line_start, extras):
         raw = (match.group(1) or "").strip()
+        if match.start(1) in line_pos and _hyphen_closer_is_not_a_heading(text, match):
+            continue
         hyphen = _effective_heading_token(text, match)
         if match.start(1) in line_pos:
+            _prev_number, prev_letter = _heading_parts(previous or "")
+            promoted = (
+                hyphen != raw
+                and previous is not None
+                and _heading_continues(hyphen, previous)
+                and (saw_inner_clause or bool(prev_letter))
+            )
+            # ``5-A`` directly under section 5 is a clause of 5.
+            # ``12-B`` quoted inside an amending section is not the later
+            # ``Substitution of 12``. ``70-E`` has no later amending heading,
+            # so it stays section 70.
+            later_amending = False
+            if hyphen != raw and not promoted and _prev_number is not None:
+                later_amending = bool(
+                    re.search(
+                        rf"(?i)\b(?:amendment|insertion|substitution|repeal|saving)\s+of\s+{_heading_parts(hyphen)[0]}\b",
+                        text[match.end() :],
+                    )
+                )
             if (
                 hyphen != raw
-                and not saw_inner_clause
+                and not promoted
                 and previous is not None
-                and _heading_parts(hyphen)[0] == _heading_parts(previous)[0]
+                and (
+                    _heading_parts(hyphen)[0] == _prev_number
+                    or later_amending
+                )
             ):
                 continue
-            token = hyphen if saw_inner_clause and hyphen != raw else raw
+            token = hyphen if promoted else raw
             if _line_start_is_inner_subclause(text, match, token, previous):
                 saw_inner_clause = True
                 continue
             kept.append(match)
+            tokens[match.start()] = token
             if not is_exact_year_section_number(token):
                 previous = token
             saw_inner_clause = False
             continue
-        if _cross_ref_prior(text, match) or not _heading_continues(hyphen, previous):
+        if _cross_ref_prior(text, match):
+            continue
+        if not _heading_continues(hyphen, previous) and not _amendment_marginal_one_gap(
+            text, match, hyphen, previous
+        ):
             continue
         kept.append(match)
+        tokens[match.start()] = hyphen
         previous = hyphen
         saw_inner_clause = False
-    return kept
+    return kept, tokens
 
 
 # ``(2)`` read with the opening parenthesis as a digit: ``12) "Board" means``.
@@ -1102,7 +1218,9 @@ def _is_false_section_candidate(section_text: str) -> bool:
         return True
     if GAZETTE_FOOTNOTE_RE.search(body) and len(body) < 400:
         return True
-    if FOOTNOTE_ANNOTATION_RE.search(body):
+    # A long section may quote ``amended by`` inside an inserted provision.
+    # A footnote chunk is short.
+    if FOOTNOTE_ANNOTATION_RE.search(body) and len(body) < 400:
         return True
     if SECTION_RANGE_FOOTNOTE_RE.search(body) and len(body) < 260:
         return True
@@ -1314,71 +1432,110 @@ _SCHEDULE_TAIL_RE = re.compile(r"(?im)^[ \t]*schedules?\b[^\n]*$")
 # the Customs Act`` and ``The First Schedule specifies the faculties.`` are
 # sentences. A customs ``THE FIRST SCHEDULE`` with no university statutes
 # after it stays in the Act.
+# ``THE FIRST STATUTES`` and ``FIRST STATUTE`` (OCR ``STATUE`` included).
+# ``First Statutes 49.`` is a marginal note, not this heading: the section
+# mark on the same line rejects it. ``The First Schedule to the Customs Act``
+# is a citation.
 _PAB_STATUTES_HEADING_RE = re.compile(
-    r"(?i)^(?:SCHEDULE\b[ \t]*)?FIRST[ \t]+STATU(?:TES?|E)\b"
+    r"(?i)^(?:the[ \t]+)?first[ \t]+statu(?:tes?|e)\b"
 )
 _PAB_FIRST_SCHEDULE_LINE_RE = re.compile(
-    r"(?i)^(?:SCHEDULE\b[ \t]*)?"
-    r"THE[ \t]+FIRST[ \t]+SCHEDULE\b(?![ \t]+(?:of|to)\b)"
+    r"(?i)^the[ \t]+first[ \t]+schedule\b(?![ \t]+(?:of|to)\b)"
 )
+_PAB_BARE_SCHEDULE_LINE_RE = re.compile(r"(?i)^schedule\b\.?$")
 _PAB_INLINE_STATUTES_RE = re.compile(
     r"(?i)(?<=[.!?;:])[ \t]+SCHEDULE[ \t]+THE[ \t]+FIRST[ \t]+STATU(?:TES?|E)\b"
 )
-_PAB_SEE_SECTION_LINE_RE = re.compile(
-    r"(?im)^[ \t]*\(?[ \t]*see[ \t]+section\b[^\n]*$"
-)
-_PAB_FACULTIES_ITEM_RE = re.compile(
-    r"(?im)^[ \t]*1[ \t]*[.,][ \t]*Faculties\b"
-)
-_PAB_FACULTIES_FOLLOW_RE = re.compile(
-    r"(?i)\bfaculties\b|\bboard of faculty\b|\bboards of studies\b"
-)
-_PAB_UNIVERSITY_STATUTES_RE = re.compile(
-    r"(?i)\bfaculties\b|\bboard of faculty\b|\bboards of studies\b|"
-    r"\bfirst[ \t]+statu(?:tes?|e)\b"
-)
+_PAB_SECTION_MARK_RE = re.compile(r"\b\d{1,3}[A-Za-z]{0,2}\s*\.|\.-")
 
 
-def _drop_pab_university_statutes_tail(text: str) -> str:
-    """Cut the First Schedule and the First Statutes out of the operative Act.
+def _operative_section_positions(text: str) -> List[Tuple[int, int]]:
+    """Start offset and integer of each section-number token, years excluded."""
+    found: Dict[int, int] = {}
+    for pattern in (
+        _LINE_START_SECTION_RE,
+        _MARGINAL_SECTION_HEAD_RE,
+        _MARGINAL_PAREN_SECTION_RE,
+    ):
+        for match in pattern.finditer(text):
+            number, _letter = _heading_parts(match.group(1) or "")
+            if number is None or number == 0 or number >= 1800:
+                continue
+            found.setdefault(match.start(1), number)
+    return sorted(found.items())
 
-    ``1. Faculties`` and ``1, Faculties`` are statute clauses. They are not
-    section 1, and they are not stored on the last Act section. A bare
-    ``SCHEDULE`` plus ``(See section 2)`` and ordinary items stays in the
-    text so it can remain with the last section. A sentence that mentions
-    the First Schedule is not this boundary, and a customs schedule heading
-    is not cut unless university statutes follow it.
+
+def _schedule_cut_follows_last_section(text: str, pos: int) -> bool:
+    """True when every section number after ``pos`` is a schedule restart.
+
+    A contents line before section 1 has no earlier section. A marginal note
+    ``First Statutes and`` in the middle of the Act is followed by a higher
+    section number, so it is not the tail.
+    """
+    positions = _operative_section_positions(text)
+    earlier = [number for start, number in positions if start < pos]
+    if not earlier:
+        return False
+    highest = max(earlier)
+    later = [number for start, number in positions if start > pos]
+    return not any(number > highest for number in later)
+
+
+def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
+    """Separate a trailing First Statutes / First Schedule heading.
+
+    The cut is a heading line after the last operative section. The line and
+    the next line must not carry a section number or ``.-``. The tail is
+    returned for storage as section ``Schedule``. A bare ``SCHEDULE`` of
+    ordinary items stays in the Act. A marginal ``First Statutes 49.`` stays
+    a section.
     """
     if not text:
-        return text
+        return text, ""
     cuts: List[int] = []
-    cuts.extend(match.start() for match in _PAB_INLINE_STATUTES_RE.finditer(text))
-    for line_match in re.finditer(r"(?m)^[^\n]*", text):
-        line = line_match.group(0)
-        stripped = line.strip()
-        if not stripped or len(stripped) > 180 or re.search(r"(?i)\bshall\b", line):
+    for match in _PAB_INLINE_STATUTES_RE.finditer(text):
+        if _schedule_cut_follows_last_section(text, match.start()):
+            cuts.append(match.start())
+    lines = list(re.finditer(r"(?m)^[^\n]*", text))
+    for index, line_match in enumerate(lines):
+        stripped = line_match.group(0).strip()
+        if not stripped or len(stripped) > 180 or re.search(r"(?i)\bshall\b", stripped):
             continue
-        if _PAB_STATUTES_HEADING_RE.match(stripped):
+        next_line = ""
+        for later in lines[index + 1 :]:
+            if later.group(0).strip():
+                next_line = later.group(0).strip()
+                break
+        if _PAB_SECTION_MARK_RE.search(stripped) or _PAB_SECTION_MARK_RE.search(next_line):
+            continue
+        schedule_line = bool(_PAB_FIRST_SCHEDULE_LINE_RE.match(stripped))
+        if schedule_line:
+            # A customs or finance ``THE FIRST SCHEDULE`` is not the
+            # university boundary unless Faculties or the First Statutes follow.
+            window = text[line_match.end() : line_match.end() + 1200]
+            schedule_line = bool(
+                re.search(r"(?i)\b(?:faculties|first\s+statut|board\s+of\s+(?:each\s+)?faculty)\b", window)
+            )
+        is_heading = bool(
+            _PAB_STATUTES_HEADING_RE.match(stripped)
+            or schedule_line
+            or (
+                _PAB_BARE_SCHEDULE_LINE_RE.match(stripped)
+                and _PAB_STATUTES_HEADING_RE.match(next_line)
+            )
+        )
+        if not is_heading:
+            continue
+        if _schedule_cut_follows_last_section(text, line_match.start()):
             cuts.append(line_match.start())
-            continue
-        if not _PAB_FIRST_SCHEDULE_LINE_RE.match(stripped):
-            continue
-        window = text[line_match.end() : line_match.end() + 1200]
-        if _PAB_UNIVERSITY_STATUTES_RE.search(window):
-            cuts.append(line_match.start())
-    for see in _PAB_SEE_SECTION_LINE_RE.finditer(text):
-        window = text[see.end() : see.end() + 800]
-        if _PAB_FACULTIES_FOLLOW_RE.search(window):
-            cuts.append(see.start())
-    for faculties in _PAB_FACULTIES_ITEM_RE.finditer(text):
-        rest = text[faculties.end() :]
-        if _LINE_START_SECTION_RE.search(rest) or _MARGINAL_SECTION_HEAD_RE.search(rest):
-            continue
-        cuts.append(faculties.start())
     positive = [item for item in cuts if item > 0]
     if not positive:
-        return text
-    return text[: min(positive)].rstrip()
+        return text, ""
+    cut = min(positive)
+    tail = text[cut:].strip()
+    if len(tail) < 40:
+        return text, ""
+    return text[:cut].rstrip(), tail
 
 
 def _schedule_tail_is_open(text: str) -> bool:
@@ -2198,14 +2355,16 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
         # ("Short title, 1. (1) This Act"). The second form is how a two-column
         # gazette extract places every section except the one whose note wrapped.
         line_start = list(_LINE_START_SECTION_RE.finditer(plain))
-        marginal = list(_MARGINAL_SECTION_HEAD_RE.finditer(plain))
+        marginal = list(_MARGINAL_SECTION_HEAD_RE.finditer(plain)) + list(
+            _MARGINAL_PAREN_SECTION_RE.finditer(plain)
+        )
         # Marginal headings are not a Baloch-only path: the same matcher used to
         # turn "Section 5. The" into a section in any plain-text act. Cross-reference
         # words and the previous+1 rule apply here and to the loose fallback.
-        matches = _select_heading_matches(plain, line_start, marginal)
+        matches, heading_tokens = _select_heading_matches(plain, line_start, marginal)
         if len(matches) < 2:
             loose = list(_LOOSE_SECTION_RE.finditer(plain))
-            matches = _select_heading_matches(plain, line_start, [*marginal, *loose])
+            matches, heading_tokens = _select_heading_matches(plain, line_start, [*marginal, *loose])
         # A line opening ``11.10.2018`` matches the day as a heading. Leave the
         # match in place so the note stays its own chunk. ``_deduplicate_sections``
         # refuses that chunk as a heading and parks the text on the neighbouring
@@ -2251,6 +2410,9 @@ def _strategy_4_resplit_digit(text: str, statute_name: str) -> List[Dict[str, st
                         _append_lone_year_continuation(sections[-1], chunk)
                     continue
                 num, title, body = _extract_number_title_from_chunk(chunk)
+                promoted = heading_tokens.get(m.start())
+                if num and promoted and promoted != (m.group(1) or "").strip():
+                    num = promoted
                 if num:
                     sections.append(_make_section_dict(num, title, chunk, statute_name))
             logger.debug(f"Strategy4 re.split digit found {len(sections)}")
@@ -2373,9 +2535,6 @@ def _split_into_sections_strategies(text: str, statute_name: Optional[str] = Non
     # byte, including a real ``sub-`` line break and a ``Sch`` stub.
     if _ocr_column_cleanup_applies(text, statute_name):
         text = _strip_ocr_column_pipes(text)
-    # First Schedule / First Statutes are not a second run of section numbers.
-    if not _is_html(text):
-        text = _drop_pab_university_statutes_tail(text)
     if len(text.strip()) < 10:
         return []
 
@@ -2469,22 +2628,41 @@ def _split_into_sections_strategies(text: str, statute_name: Optional[str] = Non
     return []
 
 
+def _with_schedule_section(
+    sections: List[Dict[str, str]],
+    schedule: str,
+    statute_name: str,
+) -> List[Dict[str, str]]:
+    """Keep a peeled First Statutes / First Schedule tail searchable."""
+    body = (schedule or "").strip()
+    if not body:
+        return sections
+    stored = list(sections or [])
+    stored.append(_make_section_dict("Schedule", "", body, statute_name))
+    return stored
+
+
 def split_into_sections(text: str, statute_name: Optional[str] = None) -> List[Dict[str, str]]:
     """Split a statute, preferring an amendment Act's own clauses when the
     ordinary heading scan collapsed or numbered the principal's sections.
-    """
-    sections = _split_into_sections_strategies(text, statute_name)
-    if not isinstance(text, str) or not text or _is_html(text):
-        return sections
-    name = (statute_name or "Unidentified Statute").strip()
-    if not _is_amendment_statute(name, text):
-        return sections
-    from scraper.statute_quality.distribution_list import strip_distribution_list_footer
 
-    prepared = _drop_pab_university_statutes_tail(
-        _strip_ocr_column_pipes(strip_distribution_list_footer(text))
-    )
-    return _prefer_amendment_split(sections, _split_amendment_clauses(prepared, name))
+    A trailing First Statutes or First Schedule heading is not a second run
+    of section numbers. It is returned as a final ``Schedule`` section.
+    """
+    body = text
+    schedule = ""
+    if isinstance(text, str) and text and not _is_html(text):
+        from scraper.statute_quality.distribution_list import strip_distribution_list_footer
+
+        cleaned = strip_distribution_list_footer(text)
+        if _ocr_column_cleanup_applies(cleaned, statute_name):
+            cleaned = _strip_ocr_column_pipes(cleaned)
+        body, schedule = _peel_trailing_schedule(cleaned)
+    sections = _split_into_sections_strategies(body, statute_name)
+    name = (statute_name or "Unidentified Statute").strip()
+    if isinstance(body, str) and body and not _is_html(body) and _is_amendment_statute(name, body):
+        sections = _prefer_amendment_split(sections, _split_amendment_clauses(body, name))
+    return _with_schedule_section(sections, schedule, name)
 
 
 def _detect_statute_name_from_text_or_url(text: str, url: Optional[str] = None) -> str:
