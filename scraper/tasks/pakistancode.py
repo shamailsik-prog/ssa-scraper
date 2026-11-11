@@ -158,22 +158,18 @@ def _classify_discovered_url(url: str) -> Optional[str]:
 def _url_for_reject_sample(url: str) -> str:
     """Drop userinfo, then scrub credential-shaped query values, before a URL is stored.
 
-    ``urlsplit().port`` raises ``ValueError`` for a non-numeric port. That must not
-    escape discovery: an off-site link with a bad port is still only a rejection.
+    The port stays as text on the netloc. ``urlsplit().port`` raises ``ValueError``
+    for a non-numeric port, and that must not escape discovery.
     """
     raw = url or ""
     try:
         parts = urlsplit(raw)
     except ValueError:
         return "[unparseable URL]"
-    host = parts.hostname or ""
-    port_suffix = ""
-    try:
-        if parts.port:
-            port_suffix = f":{parts.port}"
-    except ValueError:
-        port_suffix = ""
-    cleaned = urlunsplit((parts.scheme, f"{host}{port_suffix}", parts.path or "", parts.query, ""))
+    netloc = parts.netloc or ""
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    cleaned = urlunsplit((parts.scheme, netloc, parts.path or "", parts.query, ""))
     return scrub_secrets(cleaned)[:500]
 
 

@@ -537,7 +537,7 @@ async def test_rejected_url_sample_keeps_the_first_twenty(db, fixture_server):
     )
     bad_port = secret_pipeline.stats["rejected_url_sample"][-1]["url"]
     assert urlsplit(bad_port).hostname == "off.example"
-    assert "bad" not in bad_port
+    assert bad_port.startswith("https://off.example:bad/")
 
 
 def test_worker_death_retirement_is_not_reopened():
