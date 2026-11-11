@@ -384,6 +384,14 @@ async def run_source(
                 stats = {**(stats if isinstance(stats, dict) else {}), "stop_reason": zero_fail, "zero_query_failure": True}
                 job.result_summary = stats
                 logger.warning("%s job failed: %s", source_name, zero_fail)
+            elif isinstance(stats, dict) and stats.get("fetch_failure"):
+                reason = str(stats.get("stop_reason") or "fetch failed")[:4000]
+                fetched_pages = int(stats.get("pages_charged") or stats.get("pages") or stats.get("fetched") or 0)
+                job.status = "failed" if fetched_pages == 0 else "degraded"
+                job.error_message = reason
+                source.last_error = reason[:2000]
+                job.result_summary = stats
+                logger.warning("%s job %s: %s", source_name, job.status, reason)
             else:
                 job.status = "done"
                 if not (isinstance(stats, dict) and (stats.get("skipped") or stats.get("paused") or stats.get("halted") or stats.get("stop_reason"))):
@@ -496,7 +504,7 @@ async def _last_finished_public_job(db, source_name: str) -> Optional[ScraperJob
             select(ScraperJob)
             .where(
                 ScraperJob.source_name == source_name,
-                ScraperJob.status.in_(("done", "failed", "interrupted")),
+                ScraperJob.status.in_(("done", "failed", "degraded", "interrupted")),
                 ScraperJob.finished_at.is_not(None),
             )
             .order_by(ScraperJob.finished_at.desc())

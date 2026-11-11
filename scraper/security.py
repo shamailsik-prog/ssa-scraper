@@ -253,6 +253,8 @@ def _fetch_robots_sync(robots_url: str):
 
     try:
         # Some gov WordPress/WAF stacks return 403 unless Accept is present (law.gok.pk).
+        from scraper.pakistancode_tls import verify_for_url
+
         r = httpx.get(
             robots_url,
             timeout=15,
@@ -262,6 +264,7 @@ def _fetch_robots_sync(robots_url: str):
                 "Accept-Language": "en-US,en;q=0.9",
             },
             follow_redirects=True,
+            verify=verify_for_url(robots_url),
         )
         return r.text, r.status_code
     except Exception as exc:
