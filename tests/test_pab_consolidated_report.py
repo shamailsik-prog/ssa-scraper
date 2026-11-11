@@ -60,6 +60,17 @@ MEMBERS_ACT_VIII = (
     "(Amendment) Act No. VIII of 1975"
 )
 TRUNCATED_TITLE = "Privileges), Act, 1975"
+# Live stored names. MAIN and FS use the same wording.
+LIVE_CM_STUB = (
+    "The Balochistan Chief Minister and Ministers "
+    "(Salaries, Allowances and Privileges) Act No. III of 1975"
+)
+LIVE_SPEAKER_STUB = (
+    "The Balochistan Speaker's and Deputy Speaker's "
+    "(Salary, Allowances and Privileges) Act No. V of 1975"
+)
+AJK_FRAGMENT = "s (Salaries, Allowances and Privileges) Act, 1975"
+PUNJAB_MINISTERS = "Ministers (Salaries, Allowances and Privileges) Act, 1975"
 
 STUB_NAME = (
     "Chief Minister and Ministers (Salaries, Allowances and Privileges) Act No. III of 1975"
@@ -568,13 +579,25 @@ async def _pool_default_read_only(factory) -> str:
 
 
 @pytest.mark.asyncio
-async def test_run_report_does_not_return_read_only_state_to_the_pool(monkeypatch):
-    pooled = create_async_engine(settings.DATABASE_URL, pool_size=1, max_overflow=0)
-    factory = async_sessionmaker(pooled, expire_on_commit=False, class_=AsyncSession)
-    monkeypatch.setattr(report_mod, "SessionLocal", factory, raising=False)
+async def test_run_report_clears_read_only_on_the_engine_it_uses(monkeypatch):
+    """The flag is cleared on the dedicated engine, not on an unused SessionLocal."""
+    pooled = create_async_engine(
+        settings.DATABASE_URL,
+        pool_size=1,
+        max_overflow=0,
+        connect_args=report_mod._report_connect_args(),
+    )
+    opened: list = []
+
+    def _use_pooled():
+        opened.append(pooled)
+        return pooled
+
+    monkeypatch.setattr(report_mod, "open_report_engine", _use_pooled)
     seen: dict[str, str] = {}
 
     async def _capture(db):
+        assert db.bind is pooled
         seen["default"] = (await db.execute(text("SHOW default_transaction_read_only"))).scalar()
         seen["transaction"] = (await db.execute(text("SHOW transaction_read_only"))).scalar()
         # Commit so a session-level SET survives. Rollback would hide the leak.
@@ -583,21 +606,26 @@ async def test_run_report_does_not_return_read_only_state_to_the_pool(monkeypatc
             await db.execute(text("CREATE TEMP TABLE pab_pool_probe (id int)"))
         raise RuntimeError("stop-after-read-only")
 
+    real_release = report_mod._release_report_connection
+
+    async def _release_and_record(db):
+        await real_release(db)
+        seen["after_release"] = (await db.execute(text("SHOW default_transaction_read_only"))).scalar()
+
     monkeypatch.setattr(report_mod, "consolidated_reprint_report", _capture)
+    monkeypatch.setattr(report_mod, "_release_report_connection", _release_and_record)
     try:
         with pytest.raises(RuntimeError, match="stop-after-read-only"):
             await run_report()
+        assert opened == [pooled]
         assert seen["transaction"] == "on"
         assert seen["default"] == "on"
-        assert await _pool_default_read_only(factory) == "off"
-        async with factory() as db:
-            await db.execute(text("CREATE TEMP TABLE pab_pool_probe_ok (id int)"))
-            await db.rollback()
-        monkeypatch.setattr(report_mod, "consolidated_reprint_report", consolidated_reprint_report)
-        finished = await run_report()
-        assert finished["dry_run"] is True
-        assert finished["writes"] == 0
-        assert await _pool_default_read_only(factory) == "off"
+        assert seen["after_release"] == "off"
+        async with SessionLocal() as app_db:
+            app_mode = (await app_db.execute(text("SHOW default_transaction_read_only"))).scalar()
+            assert app_mode == "off"
+            await app_db.execute(text("CREATE TEMP TABLE pab_app_pool_ok (id int)"))
+            await app_db.rollback()
     finally:
         await pooled.dispose()
 
@@ -620,6 +648,158 @@ def test_conflict_rejects_federal_speaker_amendments_and_a_one_token_title():
         "Widgets Act No. II of 1975",
         "balochistan",
     )
+    assert reprint_names_conflict(
+        "The Balochistan Widgets (Amendment) Act No.V of 1975",
+        "Balochistan",
+        "Widgets (Amendment) Act No. 5 of 1975",
+        "Balochistan",
+        proposed_year=1975,
+        other_year=1975,
+    )
+
+
+def test_live_cm_and_speaker_stubs_are_kept_and_the_negatives_stay_out():
+    """Exact live wording. MAIN and FS store the same two stub titles."""
+    assert reprint_names_conflict(
+        CM_HEADING, "Balochistan", LIVE_CM_STUB, "Balochistan", proposed_year=1975, other_year=1975
+    )
+    curly_heading = SPEAKER_HEADING
+    assert "\u2019" in curly_heading
+    straight_heading = curly_heading.replace("\u2019", "'")
+    for heading in (curly_heading, straight_heading):
+        assert reprint_names_conflict(
+            heading,
+            "Balochistan",
+            LIVE_SPEAKER_STUB,
+            "Balochistan",
+            proposed_year=1975,
+            other_year=1975,
+        )
+        assert reprint_names_conflict(
+            heading.lower(),
+            "balochistan",
+            LIVE_SPEAKER_STUB,
+            "Balochistan",
+            proposed_year=1975,
+            other_year=1975,
+        )
+    assert not reprint_names_conflict(
+        SPEAKER_HEADING, "Balochistan", FEDERAL_SPEAKER, "Federal", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        SPEAKER_HEADING, "Balochistan", FEDERAL_CHAIRMAN, "Federal", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        MEMBERS_BASE, "Balochistan", MEMBERS_ACT_II, "Balochistan", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        MEMBERS_BASE, "Balochistan", MEMBERS_ACT_VIII, "Balochistan", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        CM_HEADING, "Balochistan", TRUNCATED_TITLE, "Balochistan", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        CM_HEADING, "Balochistan", AJK_FRAGMENT, "Azad Kashmir", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        CM_HEADING, "Balochistan", PUNJAB_MINISTERS, "Punjab", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        CM_HEADING, "Balochistan", LIVE_CM_STUB, "Balochistan", proposed_year=1975, other_year=2014
+    )
+    deputy = "The Deputy Chairman and the Deputy Speaker (Salaries, Allowances and Privileges) Act, 1975"
+    assert reprint_names_conflict(
+        SPEAKER_HEADING, "Balochistan", deputy, "Balochistan", proposed_year=1975, other_year=1975
+    )
+    assert not reprint_names_conflict(
+        SPEAKER_HEADING, "Balochistan", deputy, "Federal", proposed_year=1975, other_year=1975
+    )
+
+
+def test_captured_report_replay_keeps_two_stubs_on_each_host():
+    """Pairs named in the round-5 audit of the captured MAIN and FS reports.
+
+    The captured JSON is not in this checkout. These are the conflict rows
+    that audit listed, with the live stub sentences and the fragment titles.
+    """
+    cm = CM_HEADING
+    speaker = SPEAKER_HEADING
+    members = MEMBERS_BASE
+    fragments = (
+        ("ordinance", "Allowances and Privileges Ordinance, 1975", "Azad Kashmir"),
+        ("privileges-paren", "Allowances and Privileges) Act, 1975", "Federal"),
+        ("one-token", TRUNCATED_TITLE, "Azad Kashmir"),
+        ("ssc", "SSC and Privileges) Act, 1975", "Punjab"),
+        ("order", "Salaries Allowances and Privileges Order, 1975", "Federal"),
+        ("salaries-paren", "Salaries, Allowances and Privileges) Act, 1975", "Federal"),
+        ("and-privileges", "and Privileges) Act, 1975", "Federal"),
+        ("ajk-fragment", AJK_FRAGMENT, "Azad Kashmir"),
+    )
+    federal_speaker_titles = (
+        ("chairman", "The Chairman and the Speaker (Salaries, Allowances and Privileges) Act, 1975"),
+        (
+            "deputy",
+            "The Deputy Chairman and the Deputy Speaker (Salaries, Allowances and Privileges) Act, 1975",
+        ),
+    )
+    rows = {
+        "MAIN": [],
+        "FS": [],
+    }
+    # MAIN CM reprint 9b9b4ca4, Speaker reprint 1fbb393b, Members reprint f2851840.
+    rows["MAIN"].append(("9b9b4ca4", cm, "2bb4def0", LIVE_CM_STUB, "Balochistan"))
+    rows["FS"].append(("5b5a4adb", cm, "d373d91d", LIVE_CM_STUB, "Balochistan"))
+    rows["MAIN"].append(("1fbb393b", speaker, "5df0b1e6", LIVE_SPEAKER_STUB, "Balochistan"))
+    rows["FS"].append(("dad32f32", speaker, "f1c74e1c", LIVE_SPEAKER_STUB, "Balochistan"))
+    for _key, title, jurisdiction in fragments:
+        rows["MAIN"].append(("9b9b4ca4", cm, _key, title, jurisdiction))
+        rows["MAIN"].append(("1fbb393b", speaker, _key + "-spk", title, jurisdiction))
+        rows["FS"].append(("5b5a4adb", cm, _key, title, jurisdiction))
+        rows["FS"].append(("dad32f32", speaker, _key + "-spk", title, jurisdiction))
+    rows["FS"].append(("5b5a4adb", cm, "6a3534cd", PUNJAB_MINISTERS, "Punjab"))
+    rows["FS"].append(("dad32f32", speaker, "6a3534cd-spk", PUNJAB_MINISTERS, "Punjab"))
+    for key, title in federal_speaker_titles:
+        rows["MAIN"].append(("1fbb393b", speaker, key, title, "Federal"))
+        rows["FS"].append(("dad32f32", speaker, key, title, "Federal"))
+    rows["MAIN"].append(
+        (
+            "1fbb393b",
+            speaker,
+            "6080987e",
+            "The Azad Jammu and Kashmir Speaker (Salaries, Allowances and Privileges) Act, 1975",
+            "Azad Kashmir",
+        )
+    )
+    rows["FS"].append(
+        (
+            "dad32f32",
+            speaker,
+            "398de738",
+            "The Azad Jammu and Kashmir Speaker (Salaries, Allowances and Privileges) Act, 1975",
+            "Azad Kashmir",
+        )
+    )
+    rows["MAIN"].append(("f2851840", members, "2bbd4062", MEMBERS_ACT_II, "Balochistan"))
+    rows["MAIN"].append(("f2851840", members, "f3d2c0f8", MEMBERS_ACT_VIII, "Balochistan"))
+    rows["FS"].append(("be6a400c", members, "895821fe", MEMBERS_ACT_II, "Balochistan"))
+    rows["FS"].append(("be6a400c", members, "c6850391", MEMBERS_ACT_VIII, "Balochistan"))
+
+    kept = {}
+    for host, pairs in rows.items():
+        kept[host] = {
+            stub_id
+            for _reprint, proposed, stub_id, stub_name, jurisdiction in pairs
+            if reprint_names_conflict(
+                proposed,
+                "Balochistan",
+                stub_name,
+                jurisdiction,
+                proposed_year=1975,
+                other_year=1975,
+            )
+        }
+    assert kept["MAIN"] == {"2bb4def0", "5df0b1e6"}
+    assert kept["FS"] == {"d373d91d", "f1c74e1c"}
 
 
 @pytest.mark.asyncio
@@ -678,7 +858,16 @@ async def test_report_conflict_list_drops_the_auditor_false_positives(db):
         content_hash="cd" * 32,
     )
     staging.promoted_to_id = consolidated.id
-    db.add(staging)
+    unpromoted_prov = await _provenance(db, url=CM_URL + "?draft=1", content_hash="ef" * 32)
+    unpromoted = _staging(
+        UUID("00000000-0000-4000-8000-0000000000c2"),
+        url=CM_URL + "?draft=1",
+        provenance_id=unpromoted_prov.id,
+        raw_text=CM_PAGE.read_text(encoding="utf-8"),
+        created_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        content_hash="11" * 32,
+    )
+    db.add_all([staging, unpromoted])
     await db.flush()
 
     report = await consolidated_reprint_report(db)
@@ -687,3 +876,7 @@ async def test_report_conflict_list_drops_the_auditor_false_positives(db):
     names = {item["stub_name"] for item in report["same_year_name_conflicts"]}
     assert names == {STUB_NAME}
     assert report["consolidated"][0]["stored_jurisdiction"] == "Balochistan"
+    assert report["consolidated"][0]["proposed_name"] == CM_HEADING
+    assert CM_HEADING.isupper()
+    promoted = {item["statute_id"] for item in report["consolidated"]}
+    assert str(unpromoted.id) not in promoted

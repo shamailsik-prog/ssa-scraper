@@ -9,10 +9,14 @@ listed under ``duplicate_staging`` and is not a second proposal or a
 second conflict. The report also flags any other statute of that same
 year whose name differs (for example a ``Chief Minister and Ministers …
 Act No. III of 1975`` stub beside the consolidated Chief Minister reprint).
-The pair must share a jurisdiction. A token subset counts only at five or
-more content tokens. Otherwise the Jaccard overlap must be at least 0.75,
-or both titles must carry the same Act No. A title that says Amendment is
-not a conflict unless the reprint heading is itself an amendment.
+The pair must share a jurisdiction. Plurals are folded before the
+comparison (``salaries`` / ``salary``). A token subset counts only at five
+or more content tokens. Otherwise the Jaccard overlap must be at least
+0.75, or both titles must carry the same Act No. When the years agree, a
+Jaccard overlap of at least 0.70 also counts if both titles share an
+anchor token (speaker, deputy, chief, minister). A title that says
+Amendment is not a conflict unless the reprint heading is itself an
+amendment.
 
 Promoted section text does not carry the ``Amended upto`` line, so it is
 not the heading source. Metadata queries stay column-scoped.
@@ -59,7 +63,9 @@ from scraper.statute_quality.senate_integrity import _matched_token_count, _toke
 
 # Conflict overlap is tighter than title_relation (subset, or Jaccard >= 0.55).
 _JACCARD_MIN = 0.75
+_ANCHOR_JACCARD_MIN = 0.70
 _SUBSET_MIN_TOKENS = 5
+_ANCHOR_TOKENS = frozenset({"speaker", "deputy", "chief", "minister"})
 
 # Newest parsed heading wins. Missing text is chosen only when nothing parsed.
 # Not-a-reprint rows are listed as duplicates and are never the choice.
@@ -127,25 +133,56 @@ def _amendment_title(name: str) -> bool:
     return re.search(r"(?i)\bamendment\b", name or "") is not None
 
 
+def _fold_plural(token: str) -> str:
+    """Light singular fold so ``salaries`` and ``salary`` are one token.
+
+    ``ies`` becomes ``y``. A trailing ``s`` on a longer word is dropped.
+    ``ss`` is left alone. This is only for the conflict comparison.
+    """
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 5 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _conflict_tokens(name: str) -> set[str]:
+    return {_fold_plural(token) for token in _tokens(name)}
+
+
+def _years_agree(proposed_year: object, other_year: object) -> bool:
+    if proposed_year is None or other_year is None:
+        return False
+    return int(proposed_year) == int(other_year)
+
+
 def reprint_names_conflict(
     proposed_name: str,
     proposed_jurisdiction: object,
     other_name: str,
     other_jurisdiction: object,
+    *,
+    proposed_year: object = None,
+    other_year: object = None,
 ) -> bool:
     """True when the other statute is the same Act as this consolidated reprint.
 
     ``title_relation`` treats a token subset, or a Jaccard overlap of 0.55, as
     ``same`` and ignores province. That flags federal Speaker acts and
-    one-token fragments. A conflict here needs the same jurisdiction, and
-    then one of: a subset of at least five content tokens, a Jaccard overlap
-    of at least 0.75, or the same Act No. when both titles carry one.
-    A title that says Amendment is not the base Act, unless the reprint
-    heading is itself an amendment. Differing Act numbers do not match.
+    one-token fragments. A conflict here needs the same jurisdiction.
+    Plurals are folded first (``salaries`` / ``salary``). Then one of: a
+    subset of at least five content tokens, a Jaccard overlap of at least
+    0.75, the same Act No. when both titles carry one, or, when the years
+    agree, a Jaccard overlap of at least 0.70 if both titles share an
+    anchor token (speaker, deputy, chief, minister). A title that says
+    Amendment is not the base Act, unless the reprint heading is itself an
+    amendment. Differing Act numbers do not match.
     """
     proposed_province = _province(proposed_jurisdiction)
     other_province = _province(other_jurisdiction)
     if not proposed_province or proposed_province != other_province:
+        return False
+    if proposed_year is not None and other_year is not None and not _years_agree(proposed_year, other_year):
         return False
     if _amendment_title(other_name) and not _amendment_title(proposed_name):
         return False
@@ -155,8 +192,8 @@ def reprint_names_conflict(
         return False
     if proposed_act and other_act and proposed_act == other_act:
         return True
-    left = _tokens(proposed_name or "")
-    right = _tokens(other_name or "")
+    left = _conflict_tokens(proposed_name or "")
+    right = _conflict_tokens(other_name or "")
     if not left or not right:
         return False
     matched = _matched_token_count(left, right)
@@ -164,8 +201,11 @@ def reprint_names_conflict(
     union = len(left) + len(right) - matched
     if union <= 0:
         return False
+    jaccard = matched / union
     subset = matched == smaller and smaller >= _SUBSET_MIN_TOKENS
-    return subset or (matched / union) >= _JACCARD_MIN
+    shared_anchor = bool(left & right & _ANCHOR_TOKENS)
+    anchor = shared_anchor and jaccard >= _ANCHOR_JACCARD_MIN and _years_agree(proposed_year, other_year)
+    return subset or jaccard >= _JACCARD_MIN or anchor
 
 
 def _same_year_conflicts(proposals: List[Dict[str, Any]], statutes: Sequence[Any]) -> List[Dict[str, Any]]:
@@ -188,6 +228,8 @@ def _same_year_conflicts(proposals: List[Dict[str, Any]], statutes: Sequence[Any
                 proposal.get("stored_jurisdiction"),
                 statute.name or "",
                 statute.jurisdiction,
+                proposed_year=proposal.get("proposed_year"),
+                other_year=statute.year_enacted,
             ):
                 continue
             conflicts.append(
@@ -396,6 +438,9 @@ async def consolidated_reprint_report(db: AsyncSession) -> Dict[str, Any]:
             "A same-year conflict needs the same jurisdiction. A token subset "
             "must have at least five content tokens, or the Jaccard overlap "
             "must be at least 0.75, or both titles must carry the same Act No. "
+            "salaries and salary are the same token. When the years agree, "
+            "Jaccard of at least 0.70 also counts if both titles share "
+            "speaker, deputy, chief, or minister. "
             "Titles that say Amendment are excluded unless the reprint heading "
             "is itself an amendment. Differing Act numbers are not conflicts. "
             "A same-year stub with a different name, such as "
@@ -448,13 +493,18 @@ async def _release_report_connection(db: AsyncSession) -> None:
         await db.invalidate()
 
 
-async def run_report() -> Dict[str, Any]:
-    """Read the inventory on a connection that is not the application pool."""
-    report_engine = create_async_engine(
+def open_report_engine():
+    """Dedicated engine. The application ``SessionLocal`` pool is not used."""
+    return create_async_engine(
         settings.DATABASE_URL,
         poolclass=NullPool,
         connect_args=_report_connect_args(),
     )
+
+
+async def run_report() -> Dict[str, Any]:
+    """Read the inventory on a connection that is not the application pool."""
+    report_engine = open_report_engine()
     factory = async_sessionmaker(report_engine, expire_on_commit=False, class_=AsyncSession)
     try:
         async with factory() as db:
