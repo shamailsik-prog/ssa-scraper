@@ -86,11 +86,16 @@ CONFIRMED_BLEED_STATUTE_IDS = (
     UUID("df206e70-1114-4676-8eec-c77fa051f268"),
     UUID("65c5b7b3-674c-4726-8372-b068527cea90"),
     UUID("768e086d-329e-42d9-ade3-01900badfb8e"),
+    # The Antiquities Act, 1976 (Act VII of 1976), MAIN and FREE-SITES.
+    UUID("a125355e-f78f-4421-81ef-b79fc16a4eb5"),
+    UUID("2ceea487-53ab-46a6-b8b2-406cf1146a11"),
 )
 
 # Apply and lift. Preview still reads the full CONFIRMED_BLEED_STATUTE_IDS table.
-# These eight are the Auditor-approved pairs (MAIN and FREE-SITES): Legal Advisers,
-# Travel Agencies, Pat Feeder, and Withdrawal of Remission.
+# The first eight are the Auditor-approved pairs (MAIN and FREE-SITES): Legal
+# Advisers, Travel Agencies, Pat Feeder, and Withdrawal of Remission. The last
+# pair is The Antiquities Act, 1976. Apply still refuses every other id, and
+# still refuses an id whose pin is missing or not 64 hex characters.
 APPROVED_REEXTRACT_IDS = frozenset(
     {
         UUID("5636b724-6a47-42a7-93f5-4d78e07ddea8"),
@@ -101,6 +106,8 @@ APPROVED_REEXTRACT_IDS = frozenset(
         UUID("10cc6efa-f845-42e5-83ee-11eeabd0bc63"),
         UUID("0181ad58-1a79-479c-bdd8-dad584cfd683"),
         UUID("7f0a008c-6775-4a44-87b0-4e0e5c1b5b02"),
+        UUID("a125355e-f78f-4421-81ef-b79fc16a4eb5"),
+        UUID("2ceea487-53ab-46a6-b8b2-406cf1146a11"),
     }
 )
 
@@ -118,6 +125,8 @@ _S685 = "dbdcb76b792e4a127987d275347cf989ed37bb158438455a6ea6c0971dfa3e22"
 _S133 = "03cee95b52dbd3ae1f96058937f90c945e7c48634f120da64222f4e4a1c8c616"
 _S678 = "f9df01dc3d558ac22b082e634a1e36973d1a7e84e59ac8735e109c9ab94d8c4d"
 _S402 = "478655ccc6f6fd1eee8f911ed1d4bedd00950b3855ba6f17ee094a7c818d2bfe"
+# senate.gov.pk/uploads/documents/1660631634_471.pdf. Operator-confirmed on both hosts.
+_S471 = "b6eee4aa83fcb53b7b7e07a33e25131f7c4e4cf98e1037b753e4ae71a915151c"
 CONFIRMED_PDF_SHA256 = {
     UUID("df10d129-fd7b-4c25-9a38-828878466e6a"): _S217,
     UUID("b535370b-a524-4d2b-8e72-562984904397"): _S217,
@@ -145,6 +154,8 @@ CONFIRMED_PDF_SHA256 = {
     UUID("df206e70-1114-4676-8eec-c77fa051f268"): _S678,
     UUID("65c5b7b3-674c-4726-8372-b068527cea90"): _S402,
     UUID("768e086d-329e-42d9-ade3-01900badfb8e"): _S402,
+    UUID("a125355e-f78f-4421-81ef-b79fc16a4eb5"): _S471,
+    UUID("2ceea487-53ab-46a6-b8b2-406cf1146a11"): _S471,
 }
 LIVE_NA_320_SHA = "83236f6eeedc4bcfd96d3beea0402e3a147ca56393c053fda9fa3a34c238b19d"
 _FETCH_HOSTS = frozenset(
@@ -331,7 +342,10 @@ def accept_pinned_pdf(
         if len(pdfs) >= 2 and _sha256_hex(pdfs[0][1]) != _sha256_hex(pdfs[1][1]):
             return None, "sha_mismatch"
         if pdfs:
-            return pdfs[0]
+            # (origin, blob) in, (blob, origin) out. Swapping these makes
+            # extract_text see a str and the preview reports pdf_unavailable.
+            origin, blob = pdfs[0]
+            return blob, origin
         return None, "unavailable"
     for origin, blob in pdfs:
         digest = _sha256_hex(blob)

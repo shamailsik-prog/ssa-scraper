@@ -445,13 +445,27 @@ _APPROVED_EIGHT = frozenset(
 )
 
 
-def test_apply_allowlist_is_the_eight_approved_ids():
-    from scraper.tasks.bundled_gazette_acts import APPROVED_REEXTRACT_IDS, CONFIRMED_BLEED_STATUTE_IDS
+ANTIQUITIES_MAIN_ID = UUID("a125355e-f78f-4421-81ef-b79fc16a4eb5")
+ANTIQUITIES_FS_ID = UUID("2ceea487-53ab-46a6-b8b2-406cf1146a11")
+ANTIQUITIES_SHA = "b6eee4aa83fcb53b7b7e07a33e25131f7c4e4cf98e1037b753e4ae71a915151c"
 
-    assert APPROVED_REEXTRACT_IDS == _APPROVED_EIGHT
-    assert len(APPROVED_REEXTRACT_IDS) == 8
+
+def test_apply_allowlist_keeps_the_eight_and_adds_the_antiquities_pair():
+    from scraper.tasks.bundled_gazette_acts import (
+        APPROVED_REEXTRACT_IDS,
+        CONFIRMED_BLEED_STATUTE_IDS,
+        CONFIRMED_PDF_SHA256,
+    )
+
+    assert _APPROVED_EIGHT <= APPROVED_REEXTRACT_IDS
+    assert APPROVED_REEXTRACT_IDS - _APPROVED_EIGHT == {ANTIQUITIES_MAIN_ID, ANTIQUITIES_FS_ID}
+    assert len(APPROVED_REEXTRACT_IDS) == 10
     assert HIDDEN_BLEED_ID in CONFIRMED_BLEED_STATUTE_IDS
     assert HIDDEN_BLEED_ID not in APPROVED_REEXTRACT_IDS
+    for statute_id in (ANTIQUITIES_MAIN_ID, ANTIQUITIES_FS_ID):
+        assert statute_id in CONFIRMED_BLEED_STATUTE_IDS
+        assert statute_id in APPROVED_REEXTRACT_IDS
+        assert CONFIRMED_PDF_SHA256[statute_id] == ANTIQUITIES_SHA
 
 
 def test_an_unapproved_id_exits_2_and_writes_no_backup(tmp_path):
