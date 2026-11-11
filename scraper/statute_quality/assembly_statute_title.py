@@ -2,10 +2,11 @@
 
 The ingest used to keep an OCR fragment of the body (``Itr this Act``,
 ``The follorving Act``, ``REGTSTTRED No.``) or the listing chrome that was
-glued on after the PDF path. The title now comes from the short-title
-clause, then from an ``AN ACT to …`` heading read with the ``Act No. … of
-YYYY`` line, then from a real listing title. A candidate that is still
-chrome, a body clause, or too thin to be a name is ``name_unknown``.
+glued on after the PDF path. A name that is already a real instrument title
+stays. Otherwise the title comes from the short-title clause, then from an
+``AN ACT to establish …`` heading read with the ``Act No. … of YYYY`` line,
+then from a listing title the text supports. OCR repair is a fixed map.
+A candidate that is still chrome, a body clause, or too thin is ``name_unknown``.
 """
 
 from __future__ import annotations
@@ -16,20 +17,23 @@ from typing import Optional
 
 from scraper.parsers.statute_parser import (
     _is_plausible_act_title,
+    listed_title_supported_by_text,
     looks_like_clause_fragment,
     looks_like_garbage_name,
 )
 from scraper.statute_quality.senate_integrity import is_gazette_non_act_title
 
+# 2099 is not a statute year. 1800-2030 keeps the historical acts and the
+# current gazette years, and drops 1066, 2602 and 2099.
+_YEAR_MIN = 1800
+_YEAR_MAX = 2030
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+_YEARISH_RE = re.compile(r"\b\d{4}\b")
 _INSTRUMENT_RE = re.compile(
     r"(?i)\b(acts?|ordinances?|orders?|codes?|rules|regulations|constitution)\b"
 )
-_CALLED_RE = re.compile(
-    r"(?is)\b(?:this|the)\s+act\s+(?:shall|may)\s+be\b"
-    r".{0,180}?\bcalled\s+(?:the\s+)?"
-    r"(?P<title>.{4,240}?)"
-    r"(?=\s*(?:\(\s*[0-9]+\s*\)|\bit\s+(?:extends|shall|ex)\b|\n\s*\n|\Z))"
+_CALLED_START_RE = re.compile(
+    r"(?is)\b(?:this|the)\s+act\s+(?:shall|may)\s+be\b.{0,180}?\bcalled\b"
 )
 _AN_ACT_RE = re.compile(
     r"(?is)\ban\s+act\b.{0,80}?\bto\s+(?P<purpose>[^\n]{8,240})"
@@ -48,6 +52,7 @@ _GAZETTE_DATE_RE = re.compile(
     r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b"
     r"[^\n]{0,30}\b((?:1[89]|20)\d{2})\b"
 )
+_FILE_NUMBER_RE = re.compile(r"(?i)\bno\.\s*f\.\s*\d[\w()/.\-]{0,40}")
 _LISTING_CHROME_RE = re.compile(
     r"(?i)(?:"
     r"\bshare\s+print\b"
@@ -61,13 +66,14 @@ _WELL_FORMED_TITLE_RE = re.compile(
     r"(?i)\b(?:act|ordinance|order|code|rules|regulations|constitution)\b"
     r",?\s+(?:1[89]\d{2}|20\d{2})\b"
 )
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]*")
 _STOP = frozenset({"the", "and", "of", "for", "a", "an", "to", "or", "by"})
 _INSTRUMENT_WORDS = frozenset(
     {
         "act",
         "acts",
+        "acr",
+        "acf",
         "ordinance",
         "ordinances",
         "order",
@@ -79,60 +85,47 @@ _INSTRUMENT_WORDS = frozenset(
         "constitution",
     }
 )
-_FUNCTION_WORDS = frozenset({"the", "and", "of", "to", "for", "an", "a", "or"})
-_SHORT_OCR = {
-    "rhe": "the",
-    "teh": "the",
-    "tne": "the",
+_INSTRUMENT_KEYS = {
+    "act": "Act",
+    "acr": "Act",
+    "acf": "Act",
+    "ordinance": "Ordinance",
+    "order": "Order",
+    "code": "Code",
+}
+# OCR tokens only. A word that is already spelled correctly is not in this map,
+# so Armed Forces, Services, Institutes and the other clean titles stay as printed.
+_OCR_MAP = {
+    "notionul": "National",
+    "agri-trddc": "Agri-trade",
     "ad": "and",
     "nd": "and",
     "ot": "of",
+    "rhe": "the",
+    "teh": "the",
+    "tne": "the",
+    "aut[ority": "Authority",
+    "4uthoriq": "Authority",
+    "esltblish": "establish",
+    "f-orce": "Force",
+    "acr": "Act",
+    "acf": "Act",
 }
-# Words a gazette title is allowed to snap to. Proper names that are not here
-# stay as printed, so a two-edit slip cannot rename an instrument.
-_TITLE_WORDS = frozenset(
-    {
-        "national",
-        "pakistan",
-        "authority",
-        "food",
-        "safety",
-        "trade",
-        "infrastructure",
-        "development",
-        "assets",
-        "management",
-        "library",
-        "federal",
-        "islamic",
-        "republic",
-        "amendment",
-        "establishment",
-        "establish",
-        "provide",
-        "further",
-        "amend",
-        "commission",
-        "corporation",
-        "university",
-        "institute",
-        "finance",
-        "force",
-        "shipping",
-        "service",
-        "tribunal",
-        "tribunals",
-    }
-)
 _PHRASES = (
-    ("this act", (1, 0)),
-    ("following act", (2, 0)),
+    ("this act", (1, 1)),
+    ("following act", (2, 1)),
     ("registered no", (2, 1)),
-    ("further to amend", (2, 0, 1)),
-    ("an act to", (1, 0, 0)),
-    ("whereas it", (2, 0)),
+    ("further to amend", (2, 1, 1)),
+    ("an act to", (1, 1, 1)),
+    ("whereas it", (2, 1)),
 )
-_LEADING_DIGIT = {"4": "a", "8": "b", "0": "o", "1": "i", "5": "s"}
+_CLAUSE_PREFIX_RE = re.compile(
+    r"(?i)^(?:"
+    r"amendment\s+of|insertion|substitution|repeal|notwithstanding|"
+    r"sections?\b|no\.|an\s+act\b|whereas\b|called\b"
+    r")"
+)
+_ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
 @dataclass(frozen=True)
@@ -171,10 +164,6 @@ def _within(left: str, right: str, budget: int) -> bool:
     if abs(len(left) - len(right)) > budget:
         return False
     return _edit_distance(left, right) <= budget
-
-
-def _letters(token: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", token or "")
 
 
 def _phrase_words(name: str) -> list[str]:
@@ -217,7 +206,7 @@ def _real_words(name: str) -> list[str]:
 
 
 def _valid_year(year: int) -> bool:
-    return 1800 <= year <= 2099
+    return _YEAR_MIN <= year <= _YEAR_MAX
 
 
 def _year_in(text: str) -> Optional[int]:
@@ -228,14 +217,109 @@ def _year_in(text: str) -> Optional[int]:
     return year if _valid_year(year) else None
 
 
+def _impossible_year(name: str) -> bool:
+    return any(not _valid_year(int(token)) for token in _YEARISH_RE.findall(name or ""))
+
+
 def _substantive_words(name: str) -> list[str]:
     return [word for word in _real_words(name) if word.lower() not in _INSTRUMENT_WORDS]
+
+
+def _mentions_legis(name: str) -> bool:
+    for word in re.findall(r"[a-z]+", (name or "").lower()):
+        if _within(word, "legis", 1):
+            return True
+    return False
+
+
+def _has_following_or_further(name: str) -> bool:
+    """OCR of following/further, including a split ``lb!lowing`` and glued ``Actfurther``."""
+    low = (name or "").lower()
+    compact = re.sub(r"[^a-z]", "", low)
+    if re.search(r"lb\W*lowing", low) or "lblowing" in compact:
+        return True
+    if "actfurther" in compact or "actfurlher" in compact:
+        return True
+    if re.search(r"(?i)\bto\s+amend\b", low) or "toamend" in compact:
+        return True
+    if re.search(r"foll\w{0,3}w\w{0,3}n\w{0,3}g|follorv|followiag|furlh", low):
+        return True
+    return False
+
+
+def _starts_with_amendment_of(name: str) -> bool:
+    match = re.match(r"(?i)^([a-z]+)\s+of\b", name)
+    if not match:
+        return False
+    word = match.group(1).lower()
+    return _within(word, "amendment", 1) or _within(word, "amendments", 1)
+
+
+def _has_called_word(name: str) -> bool:
+    for word in re.findall(r"[a-z]+", name.lower()):
+        if _within(word, "called", 1):
+            return True
+    return False
+
+
+def _has_section_number(name: str) -> bool:
+    for match in re.finditer(r"(?i)\b([a-z]{5,10})\s*(\d+)", name):
+        word = match.group(1).lower()
+        if _within(word, "section", 1) or _within(word, "sections", 1):
+            return True
+    return False
+
+
+def _is_clause_like_name(name: str) -> bool:
+    """Body clauses, amending long titles, and gazette notices are not instrument names."""
+    flat = _collapse(name)
+    if not flat:
+        return True
+    for char in flat:
+        if char.isalpha():
+            if char.islower():
+                return True
+            break
+    if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
+        return True
+    if re.match(r"(?i)^short\s+title\b", flat):
+        return True
+    if _has_section_number(flat):
+        return True
+    if ")-" in flat or ").-" in flat or ")," in flat:
+        return True
+    if " / " in flat:
+        return True
+    if re.search(r"(?i)\bin\s+the\b.{0,80}\b(?:act|ordinance|code)\b", flat):
+        return True
+    if re.search(r"(?i)\bofthe\b", flat):
+        return True
+    words = re.findall(r"[a-z]+", flat.lower())
+    if any(_within(word, "mentioned", 1) or _within(word, "ofthe", 1) for word in words):
+        return True
+    low = flat.lower()
+    if "the meaning of" in low or "provisions of" in low:
+        return True
+    if re.search(
+        r"(?i)\b(?:shall\s+be|have\s+been|mentioned\s+in|may\s+constitute|under\s+the|or\s+the|and\s+the)\b",
+        flat,
+    ):
+        return True
+    if re.search(r"(?i)no\.\s*f\.", flat) or _mentions_legis(flat):
+        return True
+    if re.search(r"(?i)\bassent\b", flat) or re.search(r"(?i)majlis(?:\s*-?\s*e\s*-?\s*shoor)", flat):
+        return True
+    if _has_called_word(flat) or _has_following_or_further(flat):
+        return True
+    return False
 
 
 def is_well_formed_instrument_title(name: str) -> bool:
     """A short title such as ``Finance Act, 2026`` stays even with two words."""
     flat = _collapse(name)
     if not flat or not _INSTRUMENT_RE.search(flat):
+        return False
+    if _impossible_year(flat) or _is_clause_like_name(flat):
         return False
     if not _substantive_words(flat):
         return False
@@ -259,13 +343,15 @@ def is_rejected_assembly_statute_name(name: str) -> bool:
     lowered = flat.lower()
     if lowered in {"unknown statute", "name_unknown"}:
         return True
-    if looks_like_garbage_name(flat) and not _substantive_words(flat):
+    if looks_like_garbage_name(flat):
         return True
     if is_gazette_non_act_title(flat) or is_listing_chrome_text(flat):
         return True
-    if looks_like_clause_fragment(flat):
+    if looks_like_clause_fragment(flat) or _is_clause_like_name(flat):
         return True
     if any(_matches_phrase(flat, phrase, budgets) for phrase, budgets in _PHRASES):
+        return True
+    if _impossible_year(flat):
         return True
     if is_well_formed_instrument_title(flat):
         return False
@@ -277,118 +363,95 @@ def is_rejected_assembly_statute_name(name: str) -> bool:
 
 
 def strip_listing_chrome_source_url(url: Optional[str]) -> str:
-    """Drop listing chrome glued after a PDF path. A real ``|IV of 2026`` label stays."""
-    raw = (url or "").strip().replace("%7C", "|").replace("%7c", "|")
-    if not raw or "|" not in raw:
+    """Drop listing chrome glued after a PDF path. A real ``|IV of 2026`` label stays.
+
+    ``%7C`` is decoded only in the path. A query string is left as written, so
+    ``?a=1%7cb`` is not turned into a pipe.
+    """
+    raw = (url or "").strip()
+    if not raw:
         return raw
-    fetch, label = raw.split("|", 1)
-    if is_listing_chrome_text(label):
-        return fetch.strip()
-    return raw
+    query = ""
+    path = raw
+    split_at = raw.find("?")
+    if split_at != -1:
+        path, query = raw[:split_at], raw[split_at:]
+    path = path.replace("%7C", "|").replace("%7c", "|")
+    if "|" not in path:
+        return path + query
+    fetch, label = path.split("|", 1)
+    label_text = re.sub(r"(?i)%20", " ", label)
+    if is_listing_chrome_text(label) or is_listing_chrome_text(label_text):
+        return fetch.strip() + query
+    return path + query
 
 
-def _fold_piece(piece: str) -> str:
-    chars = []
-    for index, char in enumerate(piece):
-        if index == 0 and char in _LEADING_DIGIT and len(piece) > 1:
-            chars.append(_LEADING_DIGIT[char])
-        else:
-            chars.append(char)
-    return "".join(chars)
+def _lookup_key(token: str) -> str:
+    text = token.strip().strip(".,;:")
+    text = text.strip("'\"`*")
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1]
+    text = re.sub(r"[)'\"]+$", "", text)
+    return text.lower()
 
 
-def _closest_title_word(token: str) -> Optional[str]:
-    if len(token) < 4:
-        return None
-    budget = 1 if len(token) <= 4 else 2
-    best: list[tuple[int, str]] = []
-    for word in _TITLE_WORDS:
-        if token[0] != word[0]:
-            continue
-        if abs(len(token) - len(word)) > budget:
-            continue
-        distance = _edit_distance(token, word)
-        if distance == 0:
-            return word
-        if distance <= budget:
-            best.append((distance, word))
-    if not best:
-        return None
-    best.sort()
-    if len(best) > 1 and best[0][0] == best[1][0]:
-        return None
-    return best[0][1]
+def _apply_ocr_token(token: str) -> str:
+    """Apply the fixed OCR map. A token that is not in the map is returned as printed."""
+    key = _lookup_key(token)
+    if key in _OCR_MAP:
+        return _OCR_MAP[key]
+    if key in _INSTRUMENT_KEYS:
+        return _INSTRUMENT_KEYS[key]
+    return token.strip().strip(",")
 
 
-def _repair_piece(piece: str) -> str:
-    cleaned = piece.strip(".,;:*'\"()[]{}")
-    cleaned = cleaned.replace(",", "").replace("[", "").replace("]", "").replace("*", "")
-    cleaned = _fold_piece(cleaned)
-    if not cleaned:
-        return piece
-    low = cleaned.lower()
-    if low in _SHORT_OCR:
-        return _SHORT_OCR[low]
-    if low in _FUNCTION_WORDS:
-        return low
-    if low in _TITLE_WORDS or low in _INSTRUMENT_WORDS:
-        return cleaned
-    snapped = _closest_title_word(low)
-    if not snapped:
-        return cleaned
-    if cleaned[:1].isupper() or piece[:1] in _LEADING_DIGIT:
-        return snapped[:1].upper() + snapped[1:]
-    return snapped
+def _symbol_mixed(token: str) -> bool:
+    """True for ``'*qZOZA`` and other tokens that are not a word."""
+    if _lookup_key(token) in _OCR_MAP:
+        return False
+    if re.search(r"[^A-Za-z0-9'’\-(),.\s]", token):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", token)
+    if len(letters) >= 4 and not re.search(r"[AEIOUYaeiouy]", letters):
+        return True
+    return False
 
 
-def _repair_token(token: str) -> str:
-    if "-" in token:
-        return "-".join(_repair_piece(part) for part in token.split("-"))
-    return _repair_piece(token)
+def _is_chrome_token(token: str) -> bool:
+    bare = token.strip(".,;:()[]").lower()
+    if bare in {"price", "rs", "gaz", "gazette", "ex"}:
+        return True
+    if re.search(r"(?i)/ex\b|\bgaz\b", token):
+        return True
+    if (
+        re.search(r"\d", token)
+        and re.search(r"[A-Za-z]", token)
+        and len(re.sub(r"[^A-Za-z0-9]", "", token)) <= 4
+    ):
+        return True
+    return False
 
 
-def _prepare_span(span: str) -> str:
-    """Join OCR splits that landed inside a word, and leave real punctuation alone."""
-    span = re.sub(r"(?<=[A-Za-z]),(?=[A-Za-z])", "", span or "")
-    span = re.sub(r"(?<=[A-Za-z])[\[\]](?=[A-Za-z])", "", span)
-    return span
+def _join_inside_words(text: str) -> str:
+    return re.sub(r"(?<=[A-Za-z]),(?=[A-Za-z])", "", text or "")
 
 
 def _repair_span(span: str) -> str:
-    span = _prepare_span(span)
-    parts = []
+    span = _join_inside_words(span)
+    parts: list[str] = []
     last = 0
-    for match in _TOKEN_RE.finditer(span or ""):
+    for match in re.finditer(r"\S+", span or ""):
         parts.append(span[last : match.start()])
-        parts.append(_repair_token(match.group(0)))
+        token = match.group(0)
+        if _symbol_mixed(token):
+            last = match.end()
+            continue
+        parts.append(_apply_ocr_token(token))
         last = match.end()
     parts.append((span or "")[last:])
     repaired = _collapse("".join(parts))
     repaired = re.sub(r"(?<![A-Za-z])['’\"]+(?=[A-Za-z])", "", repaired)
     return _strip_ocr_closers(repaired)
-
-
-def _instrument_word(text: str) -> str:
-    head = (text or "")[:5000]
-    if re.search(r"(?i)\ban\s+ordinance\b|\bordinance\s+no\b", head):
-        return "Ordinance"
-    return "Act"
-
-
-def _act_number_year(text: str) -> Optional[int]:
-    match = _ACT_NO_YEAR_RE.search((text or "")[:8000])
-    if not match:
-        return None
-    year = int(match.group(1))
-    return year if _valid_year(year) else None
-
-
-def _gazette_year(text: str) -> Optional[int]:
-    match = _GAZETTE_DATE_RE.search((text or "")[:2500])
-    if not match:
-        return None
-    year = int(match.group(1))
-    return year if _valid_year(year) else None
 
 
 def _strip_ocr_closers(title: str) -> str:
@@ -401,11 +464,45 @@ def _strip_ocr_closers(title: str) -> str:
     return cleaned.strip(" .,:;")
 
 
+def _without_file_numbers(text: str) -> str:
+    return _FILE_NUMBER_RE.sub(" ", text or "")
+
+
+def _instrument_word(text: str) -> str:
+    head = (text or "")[:5000]
+    if re.search(r"(?i)\ban\s+ordinance\b|\bordinance\s+no\b", head):
+        return "Ordinance"
+    return "Act"
+
+
+def _act_number_year(text: str) -> Optional[int]:
+    match = _ACT_NO_YEAR_RE.search(_without_file_numbers(text)[:8000])
+    if not match:
+        return None
+    year = int(match.group(1))
+    return year if _valid_year(year) else None
+
+
+def _gazette_year(text: str) -> Optional[int]:
+    match = _GAZETTE_DATE_RE.search(_without_file_numbers(text)[:2500])
+    if not match:
+        return None
+    year = int(match.group(1))
+    return year if _valid_year(year) else None
+
+
 def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tuple[str, Optional[int]]:
     cleaned = _strip_ocr_closers(title)
     cleaned = re.sub(r"(?i)^the\s+", "", cleaned).strip()
+    already_dated = _YEARISH_RE.search(cleaned) is not None
     title_year = _year_in(cleaned)
-    chosen = title_year or year or _act_number_year(text) or _gazette_year(text)
+    act_year = _act_number_year(text)
+    if title_year is not None and act_year is not None and title_year != act_year:
+        return "", None
+    if already_dated:
+        chosen = title_year
+    else:
+        chosen = title_year or year or act_year or _gazette_year(text)
     has_instrument = _INSTRUMENT_RE.search(cleaned) is not None
     if not has_instrument and _substantive_words(cleaned):
         word = _instrument_word(text)
@@ -413,12 +510,20 @@ def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tup
             cleaned = f"{cleaned} {word}, {chosen}"
         else:
             cleaned = f"{cleaned} {word}"
-    elif chosen is not None and title_year is None and _INSTRUMENT_RE.search(cleaned):
+    elif chosen is not None and title_year is None and not already_dated and _INSTRUMENT_RE.search(cleaned):
         cleaned = f"{cleaned.rstrip(' .,:;')}, {chosen}"
     return cleaned, chosen if chosen is not None else title_year
 
 
+def _years_disagree(title: str, text: str) -> bool:
+    printed = _year_in(title or "")
+    act_year = _act_number_year(text)
+    return bool(printed and act_year and printed != act_year)
+
+
 def _accept(title: str, text: str, year: Optional[int]) -> Optional[tuple[str, Optional[int]]]:
+    if _years_disagree(title, text):
+        return None
     cleaned, chosen = _with_instrument_and_year(title, text, year)
     if not cleaned or is_rejected_assembly_statute_name(cleaned):
         return None
@@ -428,10 +533,64 @@ def _accept(title: str, text: str, year: Optional[int]) -> Optional[tuple[str, O
 
 
 def _short_title(text: str) -> Optional[str]:
-    match = _CALLED_RE.search(text or "")
+    """Read the called-clause up to Act/Ordinance/Order/Code and an optional year."""
+    match = _CALLED_START_RE.search(text or "")
     if not match:
         return None
-    return _repair_span(match.group("title"))
+    rest = (text or "")[match.end() :]
+    rest = re.sub(
+        r"(?is)^\s*(?:the\s+)?(?:[-–]?\s*[\(\{]\s*[0-9lI]+\s*[\)\}]\s*)?",
+        "",
+        rest,
+        count=1,
+    )
+    rest = _join_inside_words(rest[:700])
+    tokens = [(gap, token) for gap, token in _token_gaps(rest)]
+    parts: list[str] = []
+    year: Optional[str] = None
+    index = 0
+    while index < len(tokens):
+        gap, token = tokens[index]
+        if parts and re.search(r"\n\s*\n", gap):
+            break
+        if re.fullmatch(r"[\(\[]?\d{1,3}[\)\]]?", token):
+            if parts:
+                break
+            index += 1
+            continue
+        if _is_chrome_token(token) or _symbol_mixed(token):
+            break
+        instrument = _INSTRUMENT_KEYS.get(_lookup_key(token))
+        if instrument:
+            parts.append(instrument)
+            year = _year_after(tokens, index + 1)
+            break
+        parts.append(_apply_ocr_token(token))
+        index += 1
+    if not parts:
+        return None
+    title = _collapse(" ".join(parts))
+    if year and not title.endswith(year):
+        title = f"{title}, {year}"
+    return title.strip(" .")
+
+
+def _token_gaps(text: str):
+    last = 0
+    for match in re.finditer(r"\S+", text or ""):
+        yield text[last : match.start()], match.group(0)
+        last = match.end()
+
+
+def _year_after(tokens: list[tuple[str, str]], index: int) -> Optional[str]:
+    if index < len(tokens) and tokens[index][1] == ",":
+        index += 1
+    if index >= len(tokens):
+        return None
+    match = re.fullmatch(r"(\d{4})\.?", tokens[index][1].strip(","))
+    if not match:
+        return None
+    return match.group(1)
 
 
 def _established_name(text: str) -> Optional[str]:
@@ -443,6 +602,15 @@ def _established_name(text: str) -> Optional[str]:
     if not established:
         return None
     return _collapse(established.group("name")).strip(" .,:;")
+
+
+def _listing_supported(listing_title: Optional[str], text: str) -> bool:
+    flat = _collapse(listing_title or "")
+    if not flat or is_rejected_assembly_statute_name(flat):
+        return False
+    if not _is_plausible_act_title(flat):
+        return False
+    return listed_title_supported_by_text(flat, text or "")
 
 
 def _listing_title(listing_title: Optional[str], text: str) -> Optional[tuple[str, Optional[int]]]:
@@ -469,11 +637,18 @@ def resolve_assembly_statute_title(
     fallback_year = act_year or gazette_year
 
     short = _short_title(body)
-    if short:
-        accepted = _accept(short, body, fallback_year)
-        if accepted:
-            name, year = accepted
-            return AssemblyTitleDecision(name, year, "short_title")
+    accepted = _accept(short, body, fallback_year) if short else None
+    if accepted:
+        name, year = accepted
+        return AssemblyTitleDecision(name, year, "short_title")
+
+    # A garbage or year-disagreeing short title must not beat a listing title
+    # that the text actually contains.
+    if short and _listing_supported(listing_title, body):
+        listed = _listing_title(listing_title, body)
+        if listed:
+            name, year = listed
+            return AssemblyTitleDecision(name, year, "listing")
 
     established = _established_name(body)
     if established:
@@ -539,6 +714,8 @@ def apply_rejected_assembly_title(
         listing_title=listing_title,
         source_url=source_url,
     )
+    # The short-title or Act-number year wins over a year carried in from an
+    # earlier bad name. An incoming year is only a fallback.
     chosen_year = decision.year if decision.year is not None else year
     detail = decision.detail if decision.source == "name_unknown" else ""
     return decision.name, chosen_year, detail

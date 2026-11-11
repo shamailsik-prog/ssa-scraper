@@ -14,6 +14,7 @@ from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute, statute_staging_identity_url
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
+    apply_rejected_assembly_title,
     is_rejected_assembly_statute_name,
     resolve_assembly_statute_title,
     strip_listing_chrome_source_url,
@@ -21,6 +22,7 @@ from scraper.statute_quality.assembly_statute_title import (
 from scraper.tasks.promotion import promote_statute_staging
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "na_agri_trade_food_safety_authority_act_2026_p1_p2.txt"
+RECORDED = Path(__file__).resolve().parent / "fixtures" / "na_agri_trade_food_safety_authority_act_2026_pdftotext.txt"
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "na_statute_title_dry_run.py"
 TITLE = "National Agri-trade and Food Safety Authority Act, 2026"
@@ -297,6 +299,228 @@ def test_dry_run_prints_the_title_and_skips_rows_without_local_text(tmp_path):
     assert rows[1]["source"] == "no_local_text"
     assert rows[1]["proposed_name"] == ""
     assert "Finance Act" not in rows[1]["proposed_name"]
+
+
+H2_TITLES = (
+    "Armed Forces Act, 2026",
+    "Employees Provident Fund Act, 2026",
+    "Federally Administered Tribal Areas Act, 2026",
+    "Civil Services Act, 2026",
+    "Election Commissioner Act, 2026",
+    "Pakistani Citizenship Act, 2026",
+    "Food Trades Act, 2026",
+    "Pakistan Institutes Act, 2026",
+    "Corporations Act, 2026",
+)
+
+H4_CLAUSES = (
+    "Amendment of section 2, Act XXIX of 1976.- In the Seed Act",
+    "XXI oF 2025 An Actfurther to amend the Extradition Act, 1972",
+    "called the Anti-Dumping Duties (Amendment) Act, 2025",
+    "No. F. 22(68)/2025-Lcgis.-Thc lb!lowing Act of llallis-e'Shoora",
+    "therefore, the existing provisions in the Pakistan Penal Code, 1860",
+    "IV of 1969).- In the Customs Act",
+    "AN ACT furlher lo amend rhe lzgal Practitioners and Bar Councils Act, 1973",
+)
+
+AIR_FORCE_OCR = """1. Short title and commencement. This Act shall be called the
+-(1)
+Pakistan Air F-orce (Amendment) Act, 2025.
+(80s)
+Price. Rs.5.00
+0(2025)/Ex. Gaz.l
+"""
+
+SHIPPING_OCR = """1. Short title and commercement.{l) This Act shall be called the
+Pakistan National Shipping Corporation (Amendment) Acr, 2024.
+( 1e5)
+Price: Rs 10.00
+caz.l
+t800(202a)/Ex.
+THE GAZE'I'l']] OI' PAKIS i A\\ EXI-RA. JU\\E 12.1024
+(2)
+ll comc rnlo force al onc(.
+"""
+
+
+def _called(title: str) -> str:
+    return (
+        f"1. Short title. This Act shall be called the {title}.\n"
+        "(2) It extends to the whole of Pakistan.\n"
+    )
+
+
+def test_recorded_pdftotext_fixture_is_the_audit_file():
+    digest = __import__("hashlib").sha256(RECORDED.read_bytes()).hexdigest()
+    assert digest == "7d2e77aaafaf1f27f3dffeb22e78ebbcbd42357bfdca17fa065c35d402537b21"
+    text = RECORDED.read_text(encoding="utf-8")
+    assert "'*qZOZA" in text
+    assert "No. F. 22(68)/2025" in text
+    assert text.index("No. F. 22(68)/2025") < text.index("'*qZOZA")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_recorded_layout_full_extractor_recovers_agri_title(source_name):
+    out = _extract(RECORDED.read_text(encoding="utf-8"), source_name=source_name, act_title=CHROME, url=DIRTY_URL)
+    assert out["statute_name"] == TITLE
+    assert out["year_enacted"] == 2026
+
+
+@pytest.mark.parametrize("title", H2_TITLES)
+def test_clean_short_titles_are_not_rewritten(title):
+    decision = resolve_assembly_statute_title(_called(title))
+    assert decision.name == title
+
+
+def test_air_force_stored_ocr_drops_the_price_line():
+    decision = resolve_assembly_statute_title(AIR_FORCE_OCR)
+    assert decision.name == "Pakistan Air Force (Amendment) Act, 2025"
+    assert decision.year == 2025
+    assert "Price" not in decision.name
+    assert "Gaz" not in decision.name
+
+
+def test_shipping_stored_ocr_drops_the_price_line():
+    decision = resolve_assembly_statute_title(SHIPPING_OCR)
+    assert decision.name == "Pakistan National Shipping Corporation (Amendment) Act, 2024"
+    assert decision.year == 2024
+    assert "Price" not in decision.name
+    assert "GAZE" not in decision.name
+
+
+@pytest.mark.parametrize("clause", H4_CLAUSES)
+def test_clause_like_names_are_rejected(clause):
+    assert is_rejected_assembly_statute_name(clause)
+
+
+def test_registered_no_inside_a_dated_act_is_rejected():
+    assert is_rejected_assembly_statute_name("REGISTERED No. Finance Act, 2026")
+
+
+def test_may_be_called_is_a_short_title():
+    decision = resolve_assembly_statute_title(
+        "1. Short title. This Act may be called the Explosives Act, 1884.\n"
+    )
+    assert decision.name == "Explosives Act, 1884"
+    assert decision.year == 1884
+    assert decision.source == "short_title"
+
+
+def test_gazette_date_supplies_the_year_when_the_short_title_has_none():
+    text = (
+        "Islamabad, the 3rd March, 2024\n"
+        "1. Short title. This Act shall be called the Sample Library Act.\n"
+        "(2) It extends to the whole of Pakistan.\n"
+    )
+    decision = resolve_assembly_statute_title(text)
+    assert decision.name == "Sample Library Act, 2024"
+    assert decision.year == 2024
+
+
+def test_file_number_year_is_not_the_act_year():
+    text = (
+        "No. F. 22(68)/2019-Legis.\n"
+        "Islamabad, the 3rd March, 2024\n"
+        "1. Short title. This Act shall be called the Sample Library Act.\n"
+    )
+    decision = resolve_assembly_statute_title(text)
+    assert decision.year == 2024
+    assert decision.year != 2019
+
+
+def test_short_title_year_wins_over_an_incoming_year():
+    text = (
+        "ACT NO. XII OF 2025\n"
+        "1. This Act shall be called the Pakistan Air Force (Amendment) Act, 2025.\n"
+    )
+    name, year, _detail = apply_rejected_assembly_title(
+        name="Itr this Act",
+        year=1999,
+        text=text,
+    )
+    assert name == "Pakistan Air Force (Amendment) Act, 2025"
+    assert year == 2025
+
+
+def test_short_title_year_must_agree_with_the_act_number():
+    text = (
+        "ACT NO. IV OF 2026\n"
+        "1. This Act shall be called the Wrong Year Act, 2024.\n"
+        "The National Agri-trade and Food Safety Authority Act, 2026 is cited in the schedule.\n"
+    )
+    decision = resolve_assembly_statute_title(
+        text,
+        listing_title="National Agri-trade and Food Safety Authority Act, 2026",
+    )
+    assert decision.name == "National Agri-trade and Food Safety Authority Act, 2026"
+    assert decision.year == 2026
+    assert decision.source == "listing"
+
+
+def test_impossible_year_is_not_kept_or_doubled():
+    text = (
+        "Acr No. IV OF 2026\n"
+        "1. This Act shall be called the E Dilsiotr Act, 2602.\n"
+    )
+    decision = resolve_assembly_statute_title(text)
+    assert decision.name == "name_unknown"
+    assert "2602, 2026" not in decision.name
+    assert not is_rejected_assembly_statute_name("Finance Act, 2026")
+    assert is_rejected_assembly_statute_name("Something Act, 2099")
+    assert is_rejected_assembly_statute_name("%PDF Finance Act, 2026")
+
+
+def test_percent_encoded_chrome_is_stripped_and_query_pipes_stay():
+    encoded = "https://na.gov.pk/uploads/documents/a.pdf%7CShare%20Print"
+    assert strip_listing_chrome_source_url(encoded) == "https://na.gov.pk/uploads/documents/a.pdf"
+    query = "https://na.gov.pk/x.pdf?a=1%7cb"
+    assert strip_listing_chrome_source_url(query) == query
+
+
+async def test_promoted_statute_source_url_drops_listing_chrome(db):
+    source = (
+        await db.execute(select(ScraperSource).where(ScraperSource.source_name == "NationalAssembly"))
+    ).scalars().first()
+    assert source is not None
+    section = (
+        "1. Short title. This Act may be called the Chrome Strip Act, 2026 "
+        "and it extends to the whole of Pakistan. It shall come into force at once."
+    )
+    prov = await record_provenance(
+        db,
+        source=source,
+        url=PDF,
+        content=section.encode("utf-8"),
+        content_kind="text",
+    )
+    staged = await stage_statute(
+        db,
+        source=source,
+        prov=prov,
+        raw_html=None,
+        raw_text=section,
+        url=DIRTY_URL,
+        identity_key=DIRTY_URL,
+        kind="statute",
+    )
+    staged.status = "extracted"
+    staged.reconciled_json = {
+        "statute_name": "Chrome Strip Act, 2026",
+        "jurisdiction": "Federal",
+        "year_enacted": 2026,
+        "statute_type": "act",
+        "sections": [
+            {
+                "section_number": "1",
+                "section_title": "Short title",
+                "section_text": section,
+            }
+        ],
+    }
+    assert await promote_statute_staging(db, staged) == "promoted"
+    stored = (await db.execute(select(Statute).where(Statute.name == "Chrome Strip Act, 2026"))).scalars().first()
+    assert stored is not None
+    assert stored.source_url == PDF
 
 
 def test_title_repair_does_not_disable_tls():
