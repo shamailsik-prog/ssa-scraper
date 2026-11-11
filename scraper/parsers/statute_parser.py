@@ -1308,19 +1308,21 @@ def prefer_official_statute_title(detected_name: Optional[str], official_title: 
     return detected
 
 _SCHEDULE_TAIL_RE = re.compile(r"(?im)^[ \t]*schedules?\b[^\n]*$")
-# A heading, not "the first schedule of rates" and not a bare "SCHEDULE".
-# ``The First Schedule to the Customs Act`` cites a schedule. It is not the
-# boundary. ``THE FIRST SCHEDULE`` on its own line, and ``SCHEDULE THE FIRST
-# STATUTE``, are the university-statutes boundary.
-_PAB_STATUTES_LINE_RE = re.compile(
+# ``FIRST STATUTES`` (and the OCR form ``FIRST STATUE``) is the university
+# boundary. ``THE FIRST SCHEDULE`` is that boundary only when Faculties, a
+# Board of Faculty, or the First Statutes follow it. ``The First Schedule to
+# the Customs Act`` and ``The First Schedule specifies the faculties.`` are
+# sentences. A customs ``THE FIRST SCHEDULE`` with no university statutes
+# after it stays in the Act.
+_PAB_STATUTES_HEADING_RE = re.compile(
+    r"(?i)^(?:SCHEDULE\b[ \t]*)?FIRST[ \t]+STATU(?:TES?|E)\b"
+)
+_PAB_FIRST_SCHEDULE_LINE_RE = re.compile(
     r"(?i)^(?:SCHEDULE\b[ \t]*)?"
-    r"(?:THE[ \t]+FIRST[ \t]+SCHEDULE\b(?![ \t]+(?:of|to)\b)"
-    r"|FIRST[ \t]+STATU(?:TES?|E)\b)"
+    r"THE[ \t]+FIRST[ \t]+SCHEDULE\b(?![ \t]+(?:of|to)\b)"
 )
 _PAB_INLINE_STATUTES_RE = re.compile(
-    r"(?i)(?<=[.!?;:])[ \t]+"
-    r"(?:SCHEDULE[ \t]+THE[ \t]+FIRST[ \t]+STATU(?:TES?|E)\b"
-    r"|THE[ \t]+FIRST[ \t]+SCHEDULE\b(?![ \t]+(?:of|to)\b))"
+    r"(?i)(?<=[.!?;:])[ \t]+SCHEDULE[ \t]+THE[ \t]+FIRST[ \t]+STATU(?:TES?|E)\b"
 )
 _PAB_SEE_SECTION_LINE_RE = re.compile(
     r"(?im)^[ \t]*\(?[ \t]*see[ \t]+section\b[^\n]*$"
@@ -1331,6 +1333,10 @@ _PAB_FACULTIES_ITEM_RE = re.compile(
 _PAB_FACULTIES_FOLLOW_RE = re.compile(
     r"(?i)\bfaculties\b|\bboard of faculty\b|\bboards of studies\b"
 )
+_PAB_UNIVERSITY_STATUTES_RE = re.compile(
+    r"(?i)\bfaculties\b|\bboard of faculty\b|\bboards of studies\b|"
+    r"\bfirst[ \t]+statu(?:tes?|e)\b"
+)
 
 
 def _drop_pab_university_statutes_tail(text: str) -> str:
@@ -1339,8 +1345,9 @@ def _drop_pab_university_statutes_tail(text: str) -> str:
     ``1. Faculties`` and ``1, Faculties`` are statute clauses. They are not
     section 1, and they are not stored on the last Act section. A bare
     ``SCHEDULE`` plus ``(See section 2)`` and ordinary items stays in the
-    text so it can remain with the last section. A mid-sentence "in the
-    First Schedule" is not this boundary.
+    text so it can remain with the last section. A sentence that mentions
+    the First Schedule is not this boundary, and a customs schedule heading
+    is not cut unless university statutes follow it.
     """
     if not text:
         return text
@@ -1351,7 +1358,13 @@ def _drop_pab_university_statutes_tail(text: str) -> str:
         stripped = line.strip()
         if not stripped or len(stripped) > 180 or re.search(r"(?i)\bshall\b", line):
             continue
-        if _PAB_STATUTES_LINE_RE.match(stripped):
+        if _PAB_STATUTES_HEADING_RE.match(stripped):
+            cuts.append(line_match.start())
+            continue
+        if not _PAB_FIRST_SCHEDULE_LINE_RE.match(stripped):
+            continue
+        window = text[line_match.end() : line_match.end() + 1200]
+        if _PAB_UNIVERSITY_STATUTES_RE.search(window):
             cuts.append(line_match.start())
     for see in _PAB_SEE_SECTION_LINE_RE.finditer(text):
         window = text[see.end() : see.end() + 800]

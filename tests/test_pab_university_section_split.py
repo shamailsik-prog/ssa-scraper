@@ -180,3 +180,34 @@ def test_offline_dry_run_prints_section_counts_without_a_database():
     assert "section_numbers: 57, 58" in turbat
     assert "18-B" in buitems
     assert "10" not in buitems.split("section_numbers: ", 1)[1]
+
+
+def test_a_sentence_about_the_first_schedule_does_not_drop_later_sections():
+    text = """
+1. Short title. This Act may be called the Example Rates Act, 2024.
+2. Rates. The University may set rates. The First Schedule specifies the faculties.
+3. Appeal. An appeal shall lie to the Board within thirty days of the order.
+"""
+    sections = split_into_sections(text, "The Example Rates Act, 2024")
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+
+    assert list(bodies) == ["1", "2", "3"]
+    assert "specifies the faculties" in bodies["2"]
+    assert "within thirty days" in bodies["3"]
+
+
+def test_a_customs_first_schedule_heading_stays_with_the_act():
+    text = """
+1. Short title. This Act may be called the Example Finance Act, 2024.
+2. Customs. In the Customs Act, 1969, the following amendments shall be made.
+THE FIRST SCHEDULE
+Heading 0101. Live horses, asses and mules, at the rate of twenty percent.
+3. Income tax. The rate of tax shall be the rate set out in this section.
+"""
+    sections = split_into_sections(text, "The Example Finance Act, 2024")
+    bodies = {section["section_number"]: section["section_text"] for section in sections}
+
+    assert list(bodies) == ["1", "2", "3"]
+    assert "THE FIRST SCHEDULE" in bodies["2"]
+    assert "Live horses" in bodies["2"]
+    assert "rate of tax" in bodies["3"]
