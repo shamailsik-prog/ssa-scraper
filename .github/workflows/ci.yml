@@ -42,7 +42,240 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: System packages (Tesseract for OCR tests)
-        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr fonts-dejavu-core
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+
+          resolves() {
+            getent hosts "$1" >/dev/null 2>&1
+          }
+
+          # Runner images point Ubuntu suites at mirror+file:/etc/apt/apt-mirrors.txt
+          # with azure.archive.ubuntu.com first. A DNS miss there aborts this step
+          # (apt exit 100) before pytest. Rewrite to official HTTPS mirrors and keep
+          # Signed-By so apt still verifies Release signatures.
+          rewrite_sources() {
+            local archive security
+            if resolves archive.ubuntu.com; then
+              archive="https://archive.ubuntu.com/ubuntu/"
+            elif resolves mirrors.edge.kernel.org; then
+              archive="https://mirrors.edge.kernel.org/ubuntu/"
+              echo "archive.ubuntu.com does not resolve; using the kernel.org Ubuntu archive mirror"
+            elif resolves mirrors.kernel.org; then
+              archive="https://mirrors.kernel.org/ubuntu/"
+              echo "archive.ubuntu.com does not resolve; using mirrors.kernel.org"
+            else
+              echo "no official Ubuntu archive mirror resolved" >&2
+              return 1
+            fi
+            if resolves security.ubuntu.com; then
+              security="https://security.ubuntu.com/ubuntu/"
+            else
+              security="$archive"
+              echo "security.ubuntu.com does not resolve; security suites use ${archive}"
+            fi
+            case "${archive}${security}" in
+              https://*) ;;
+              *)
+                echo "refusing non-HTTPS apt mirror" >&2
+                return 1
+                ;;
+            esac
+            echo "rewriting apt sources: archive=${archive} security=${security}"
+            sudo ARCHIVE_URI="$archive" SECURITY_URI="$security" /usr/bin/python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          archive = os.environ["ARCHIVE_URI"]
+          security = os.environ["SECURITY_URI"]
+          root = Path(os.environ.get("APT_ROOT", "/etc/apt"))
+
+          def https_uri(uri):
+              if not uri.startswith("https://") or uri.startswith("https://azure.archive.ubuntu.com"):
+                  raise SystemExit("refusing apt URI {}".format(uri))
+              return uri
+
+          archive = https_uri(archive)
+          security = https_uri(security)
+
+          def security_suite(suite):
+              return suite == "security" or suite.endswith("-security")
+
+          def needs_rewrite(uri):
+              return "azure.archive.ubuntu.com" in uri or uri.startswith("mirror+file:")
+
+          def assert_trust(text):
+              if re.search(r"(?i)trusted\s*=\s*yes|Trusted:\s*yes|AllowUnauthenticated|Verify-Peer", text):
+                  raise SystemExit("refusing apt source that weakens signature or TLS checks")
+
+          def replace_field(stanza, name, value):
+              pattern = r"^{}:[ \t]*.+$".format(re.escape(name))
+              updated, count = re.subn(pattern, "{}: {}".format(name, value), stanza, count=1, flags=re.M)
+              if count != 1:
+                  raise SystemExit("could not replace {} in apt source".format(name))
+              return updated
+
+          def rewrite_deb822_stanza(stanza):
+              if any(line[:1] in " \t" for line in stanza.splitlines()):
+                  uri_match = re.search(r"^URIs:[ \t]*(\S+)", stanza, re.M)
+                  if not uri_match or not needs_rewrite(uri_match.group(1)):
+                      return [stanza]
+                  stanza = replace_field(stanza, "URIs", archive)
+                  assert_trust(stanza)
+                  return [stanza]
+              uri_match = re.search(r"^URIs:[ \t]*(.+)$", stanza, re.M)
+              suites_match = re.search(r"^Suites:[ \t]*(.+)$", stanza, re.M)
+              if not uri_match or not needs_rewrite(uri_match.group(1).strip()):
+                  return [stanza]
+              if not suites_match:
+                  stanza = replace_field(stanza, "URIs", archive)
+                  assert_trust(stanza)
+                  return [stanza]
+              suites = suites_match.group(1).split()
+              secure = [suite for suite in suites if security_suite(suite)]
+              rest = [suite for suite in suites if suite not in secure]
+              blocks = []
+              if rest:
+                  block = replace_field(stanza, "URIs", archive)
+                  block = replace_field(block, "Suites", " ".join(rest))
+                  assert_trust(block)
+                  blocks.append(block)
+              if secure:
+                  block = replace_field(stanza, "URIs", security)
+                  block = replace_field(block, "Suites", " ".join(secure))
+                  assert_trust(block)
+                  blocks.append(block)
+              if not blocks:
+                  raise SystemExit("apt stanza has no suites")
+              return blocks
+
+          def rewrite_deb822(text):
+              if not text.strip():
+                  return text
+              stanzas = re.split(r"\n[ \t]*\n", text.strip())
+              pieces = []
+              changed = False
+              for stanza in stanzas:
+                  blocks = rewrite_deb822_stanza(stanza)
+                  if blocks != [stanza]:
+                      changed = True
+                  pieces.extend(blocks)
+              if not changed:
+                  return text
+              return "\n\n".join(pieces) + "\n"
+
+          def rewrite_list(text):
+              line_re = re.compile(
+                  r"^(deb(?:-src)?)((?:\s+\[[^\]]*\])?)\s+(\S+)\s+(\S+)\s+(.+)$"
+              )
+              out = []
+              changed = False
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      out.append(line)
+                      continue
+                  match = line_re.match(stripped)
+                  if match is None and (
+                      "azure.archive.ubuntu.com" in stripped or "mirror+file:" in stripped
+                  ):
+                      raise SystemExit("unparsed apt source line: {}".format(stripped))
+                  if not match or not needs_rewrite(match.group(3)):
+                      out.append(line)
+                      continue
+                  options = match.group(2) or ""
+                  assert_trust(options)
+                  suite = match.group(4)
+                  uri = security if security_suite(suite) else archive
+                  rewritten = "{}{} {} {} {}".format(
+                      match.group(1), options, uri, suite, match.group(5)
+                  )
+                  assert_trust(rewritten)
+                  out.append(rewritten)
+                  changed = True
+              if not changed:
+                  return text
+              body = "\n".join(out)
+              if text.endswith("\n"):
+                  body += "\n"
+              return body
+
+          mirror_list = root / "apt-mirrors.txt"
+          if mirror_list.is_file():
+              lines = ["{}\tpriority:1\n".format(archive)]
+              if security.rstrip("/") != archive.rstrip("/"):
+                  lines.append("{}\tpriority:2\n".format(security))
+              mirror_list.write_text("".join(lines))
+
+          paths = []
+          sources_list = root / "sources.list"
+          if sources_list.is_file():
+              paths.append(sources_list)
+          sources_dir = root / "sources.list.d"
+          if sources_dir.is_dir():
+              paths.extend(sorted(p for p in sources_dir.iterdir() if p.is_file()))
+          for path in paths:
+              original = path.read_text()
+              if path.name.endswith(".sources"):
+                  updated = rewrite_deb822(original)
+              elif path.name == "sources.list" or path.name.endswith(".list"):
+                  updated = rewrite_list(original)
+              else:
+                  continue
+              if updated != original:
+                  path.write_text(updated)
+          PY
+            echo "--- apt-mirrors.txt ---"
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              cat /etc/apt/apt-mirrors.txt
+            fi
+            echo "--- ubuntu apt sources ---"
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              cat /etc/apt/sources.list.d/ubuntu.sources
+            elif [ -f /etc/apt/sources.list ]; then
+              cat /etc/apt/sources.list
+            fi
+          }
+
+          rewritten=0
+          if ! resolves azure.archive.ubuntu.com; then
+            echo "azure.archive.ubuntu.com does not resolve; rewriting apt sources before install"
+            rewrite_sources
+            rewritten=1
+          else
+            echo "azure.archive.ubuntu.com resolves; trying the runner mirror list first"
+          fi
+
+          for attempt in 1 2 3; do
+            if [ "$attempt" -eq 2 ]; then
+              sleep 15
+            elif [ "$attempt" -eq 3 ]; then
+              sleep 30
+            fi
+            echo "apt attempt ${attempt}/3 (Acquire::Retries=5)"
+            : >"$log"
+            if sudo apt-get -o Acquire::Retries=5 update >>"$log" 2>&1 \
+              && sudo apt-get -o Acquire::Retries=5 install -y tesseract-ocr fonts-dejavu-core >>"$log" 2>&1; then
+              cat "$log"
+              echo "installed tesseract-ocr and fonts-dejavu-core"
+              exit 0
+            fi
+            cat "$log"
+            echo "apt attempt ${attempt} failed"
+            if [ "$rewritten" -eq 0 ] && {
+              ! resolves azure.archive.ubuntu.com \
+                || grep -qF "Temporary failure resolving 'azure.archive.ubuntu.com'" "$log"
+            }; then
+              echo "azure.archive.ubuntu.com still fails to resolve; rewriting apt sources"
+              rewrite_sources
+              rewritten=1
+            fi
+          done
+          echo "failed to install tesseract-ocr and fonts-dejavu-core after 3 attempts" >&2
+          exit 1
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
