@@ -270,16 +270,39 @@ def _has_section_number(name: str) -> bool:
     return False
 
 
+def _leading_word_is_lower(name: str) -> bool:
+    """A lowercase clause start. A leading ``e-`` or a digit (``5G``) is a title."""
+    text = name.lstrip()
+    if re.match(r"^e-", text, re.IGNORECASE):
+        text = text[2:].lstrip()
+    for char in text:
+        if char.isalpha():
+            return char.islower()
+        if char.isdigit():
+            return False
+    return False
+
+
+def _connector_has_clause_marker(name: str) -> bool:
+    """``and the`` / ``or the`` / ``under the`` reject a name only beside a real clause."""
+    if re.search(r"(?i)\bshall\b", name):
+        return True
+    if _has_section_number(name):
+        return True
+    if re.search(r"(?i)\bin\s+the\b.{0,80}\b(?:act|ordinance|code)\b", name):
+        return True
+    if ").-" in name or ")-" in name:
+        return True
+    return False
+
+
 def _is_clause_like_name(name: str) -> bool:
     """Body clauses, amending long titles, and gazette notices are not instrument names."""
     flat = _collapse(name)
     if not flat:
         return True
-    for char in flat:
-        if char.isalpha():
-            if char.islower():
-                return True
-            break
+    if _leading_word_is_lower(flat):
+        return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
     if re.match(r"(?i)^short\s+title\b", flat):
@@ -300,10 +323,9 @@ def _is_clause_like_name(name: str) -> bool:
     low = flat.lower()
     if "the meaning of" in low or "provisions of" in low:
         return True
-    if re.search(
-        r"(?i)\b(?:shall\s+be|have\s+been|mentioned\s+in|may\s+constitute|under\s+the|or\s+the|and\s+the)\b",
-        flat,
-    ):
+    if re.search(r"(?i)\b(?:shall\s+be|have\s+been|mentioned\s+in|may\s+constitute)\b", flat):
+        return True
+    if re.search(r"(?i)\b(?:and|or|under)\s+the\b", flat) and _connector_has_clause_marker(flat):
         return True
     if re.search(r"(?i)no\.\s*f\.", flat) or _mentions_legis(flat):
         return True
@@ -402,12 +424,19 @@ def _apply_ocr_token(token: str) -> str:
         return _OCR_MAP[key]
     if key in _INSTRUMENT_KEYS:
         return _INSTRUMENT_KEYS[key]
-    return token.strip().strip(",")
+    # Keep a printed comma ("Salary,"). An OCR comma inside a word is removed earlier.
+    return token
+
+
+def _is_caps_acronym(token: str) -> bool:
+    """``PTCL`` and ``NTDC`` have no vowels. Mixed-case OCR junk does not."""
+    letters = re.sub(r"[^A-Za-z]", "", token or "")
+    return bool(letters) and letters.isupper() and not re.search(r"[AEIOUY]", letters)
 
 
 def _symbol_mixed(token: str) -> bool:
     """True for ``'*qZOZA`` and other tokens that are not a word."""
-    if _lookup_key(token) in _OCR_MAP:
+    if _lookup_key(token) in _OCR_MAP or _is_caps_acronym(token):
         return False
     if re.search(r"[^A-Za-z0-9'’\-(),.\s]", token):
         return True
@@ -417,19 +446,12 @@ def _symbol_mixed(token: str) -> bool:
     return False
 
 
-def _is_chrome_token(token: str) -> bool:
+def _is_price_chrome(token: str) -> bool:
+    """Price and gazette running heads. A digit-led word such as ``5G`` is not one."""
     bare = token.strip(".,;:()[]").lower()
     if bare in {"price", "rs", "gaz", "gazette", "ex"}:
         return True
-    if re.search(r"(?i)/ex\b|\bgaz\b", token):
-        return True
-    if (
-        re.search(r"\d", token)
-        and re.search(r"[A-Za-z]", token)
-        and len(re.sub(r"[^A-Za-z0-9]", "", token)) <= 4
-    ):
-        return True
-    return False
+    return re.search(r"(?i)/ex\b|\bgaz\b", token) is not None
 
 
 def _join_inside_words(text: str) -> str:
@@ -493,7 +515,8 @@ def _gazette_year(text: str) -> Optional[int]:
 
 def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tuple[str, Optional[int]]:
     cleaned = _strip_ocr_closers(title)
-    cleaned = re.sub(r"(?i)^the\s+", "", cleaned).strip()
+    # Drop the gazette formula "the", and keep a capitalised "The" that is part of the name.
+    cleaned = re.sub(r"^the\s+", "", cleaned).strip()
     already_dated = _YEARISH_RE.search(cleaned) is not None
     title_year = _year_in(cleaned)
     act_year = _act_number_year(text)
@@ -532,47 +555,80 @@ def _accept(title: str, text: str, year: Optional[int]) -> Optional[tuple[str, O
     return cleaned, chosen or _year_in(cleaned)
 
 
+def _subsection_end(token: str) -> bool:
+    return re.fullmatch(r"[\(\[]?\d{1,3}[\)\]]?", token or "") is not None
+
+
+def _instrument_ends_title(tokens: list[tuple[str, str]], index: int) -> bool:
+    """An instrument word ends the title only when the clause ends after it.
+
+    ``Code of Ethics Act, 2024`` keeps reading past Code. ``(Amendment) Act``
+    is not cut off. A following year, period, ``(2)``, newline, price line, or
+    the end of the text does end it.
+    """
+    nxt = index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        nxt += 1
+    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
+        if tokens[nxt][1].strip(",").endswith("."):
+            return True
+        nxt += 1
+    if nxt >= len(tokens):
+        return True
+    gap, token = tokens[nxt]
+    if "\n" in gap or _subsection_end(token) or _is_price_chrome(token):
+        return True
+    return token[:1] == "."
+
+
+def _render_short_title(tokens: list[tuple[str, str]], end: int) -> str:
+    parts: list[str] = []
+    for _gap, token in tokens[: end + 1]:
+        instrument = _INSTRUMENT_KEYS.get(_lookup_key(token))
+        parts.append(instrument if instrument else _apply_ocr_token(token))
+    title = _collapse(" ".join(parts))
+    year = _year_after(tokens, end + 1)
+    if year and not re.search(rf"\b{year}\b", title):
+        title = f"{title}, {year}"
+    return title.strip(" .")
+
+
 def _short_title(text: str) -> Optional[str]:
-    """Read the called-clause up to Act/Ordinance/Order/Code and an optional year."""
+    """Read the called-clause through the last instrument word that ends it."""
     match = _CALLED_START_RE.search(text or "")
     if not match:
         return None
     rest = (text or "")[match.end() :]
     rest = re.sub(
-        r"(?is)^\s*(?:the\s+)?(?:[-–]?\s*[\(\{]\s*[0-9lI]+\s*[\)\}]\s*)?",
+        r"^\s*(?:the\s+)?(?:[-–]?\s*[\(\{]\s*[0-9lI]+\s*[\)\}]\s*)?",
         "",
         rest,
         count=1,
     )
     rest = _join_inside_words(rest[:700])
     tokens = [(gap, token) for gap, token in _token_gaps(rest)]
-    parts: list[str] = []
-    year: Optional[str] = None
-    index = 0
-    while index < len(tokens):
-        gap, token = tokens[index]
-        if parts and re.search(r"\n\s*\n", gap):
+    kept: list[tuple[str, str]] = []
+    ends: list[int] = []
+    seen_instrument = False
+    for index, (gap, token) in enumerate(tokens):
+        if kept and re.search(r"\n\s*\n", gap):
             break
-        if re.fullmatch(r"[\(\[]?\d{1,3}[\)\]]?", token):
-            if parts:
-                break
-            index += 1
-            continue
-        if _is_chrome_token(token) or _symbol_mixed(token):
+        if kept and _subsection_end(token):
             break
-        instrument = _INSTRUMENT_KEYS.get(_lookup_key(token))
-        if instrument:
-            parts.append(instrument)
-            year = _year_after(tokens, index + 1)
+        if _symbol_mixed(token):
             break
-        parts.append(_apply_ocr_token(token))
-        index += 1
-    if not parts:
+        if _is_price_chrome(token) and seen_instrument:
+            break
+        kept.append((gap, token))
+        if _INSTRUMENT_KEYS.get(_lookup_key(token)):
+            seen_instrument = True
+            if _instrument_ends_title(tokens, index):
+                ends.append(len(kept) - 1)
+    if ends:
+        return _render_short_title(kept, ends[-1])
+    if not kept:
         return None
-    title = _collapse(" ".join(parts))
-    if year and not title.endswith(year):
-        title = f"{title}, {year}"
-    return title.strip(" .")
+    return _render_short_title(kept, len(kept) - 1)
 
 
 def _token_gaps(text: str):
@@ -696,6 +752,21 @@ def _is_object_of_amendment_heading(name: str, text: str) -> bool:
     return False
 
 
+def _title_core(name: str) -> str:
+    core = re.sub(r"(?i)^the\s+", "", _collapse(name))
+    core = re.sub(r",?\s*(?:1[89]\d{2}|20\d{2})\s*$", "", core)
+    return core.strip(" .,;").lower()
+
+
+def _short_title_supersedes(current: str, short_name: str) -> bool:
+    """A truncated instrument (``Pakistan Code, 2024``) loses to the full short title."""
+    current_core = _title_core(current)
+    short_core = _title_core(short_name)
+    if not current_core or not short_core or current_core == short_core:
+        return False
+    return short_core.startswith(current_core + " ") or short_core.startswith(current_core + "(")
+
+
 def apply_rejected_assembly_title(
     *,
     name: Optional[str],
@@ -707,7 +778,13 @@ def apply_rejected_assembly_title(
     """Replace a junk name. A title that is already a real instrument name stays."""
     current = _collapse(name or "")
     amended_principal = _is_object_of_amendment_heading(current, text)
-    if not name_needs_assembly_title(current) and not amended_principal:
+    needs = name_needs_assembly_title(current)
+    if not needs and not amended_principal:
+        short = _short_title(text or "")
+        accepted = _accept(short, text or "", year) if short else None
+        if accepted and _short_title_supersedes(current, accepted[0]):
+            chosen = accepted[1] if accepted[1] is not None else year
+            return accepted[0], chosen, ""
         return current, year, ""
     decision = resolve_assembly_statute_title(
         text,

@@ -503,6 +503,10 @@ async def test_promoted_statute_source_url_drops_listing_chrome(db):
         identity_key=DIRTY_URL,
         kind="statute",
     )
+    # Staging already stores a stripped URL. Put a chrome label back so this
+    # asserts the promotion write. ``Filter by`` is listing chrome, and it is
+    # not the ``Share Print … Filter by`` pair that validation quarantines first.
+    staged.source_url = PDF + "|Filter by"
     staged.status = "extracted"
     staged.reconciled_json = {
         "statute_name": "Chrome Strip Act, 2026",
@@ -521,6 +525,144 @@ async def test_promoted_statute_source_url_drops_listing_chrome(db):
     stored = (await db.execute(select(Statute).where(Statute.name == "Chrome Strip Act, 2026"))).scalars().first()
     assert stored is not None
     assert stored.source_url == PDF
+
+
+N1_TITLES = (
+    "The Chairman and the Speaker (Salaries, Allowances and Privileges) Act, 1975",
+    "The Deputy Chairman and the Deputy Speaker (Salaries, Allowances and Privileges) Act, 1975",
+    "Members of Senate and the National Assembly (Salaries) Act, 2024",
+)
+
+N2_TITLES = (
+    "Pakistan Penal Code (Amendment) Act, 2024",
+    "Code of Criminal Procedure (Amendment) Act, 2024",
+    "Code of Civil Procedure (Amendment) Act, 2024",
+    "Cantonments Order (Amendment) Act, 2024",
+    "Qanun-e-Shahadat Order (Amendment) Act, 2024",
+    "Income Tax Ordinance (Amendment) Act, 2024",
+    "Pakistan Code of Ethics Act, 2024",
+    "Order of Precedence Act, 2024",
+    "Code of Conduct for Legislators Act, 2024",
+    "Criminal Laws (Amendment) Act, 2024",
+)
+
+N2_PRINCIPAL = {
+    "Pakistan Penal Code (Amendment) Act, 2024": "further to amend the Pakistan Penal Code, 1860",
+    "Code of Criminal Procedure (Amendment) Act, 2024": "further to amend the Code of Criminal Procedure, 1898",
+    "Code of Civil Procedure (Amendment) Act, 2024": "further to amend the Code of Civil Procedure, 1908",
+    "Cantonments Order (Amendment) Act, 2024": "further to amend the Cantonments Order, 2002",
+    "Qanun-e-Shahadat Order (Amendment) Act, 2024": "further to amend the Qanun-e-Shahadat Order, 1984",
+    "Income Tax Ordinance (Amendment) Act, 2024": "further to amend the Income Tax Ordinance, 2001",
+}
+
+N3_TITLES = (
+    "e-Commerce Act, 2024",
+    "PTCL (Re-organization) Act, 2024",
+    "5G Spectrum Act, 2024",
+)
+
+N4_TITLE = "Prime Minister (Salary, Allowances and Privileges) (Amendment) Act, 2024"
+
+
+def _called_act(title: str) -> str:
+    year = int(title[-4:])
+    principal = N2_PRINCIPAL.get(title, "")
+    heading = f"AN ACT\n{principal}\n" if principal else ""
+    return (
+        f"ACT NO. I OF {year}\n"
+        f"{heading}"
+        f"1. Short title.—(1) This Act shall be called the {title}.\n"
+        "(2) It shall come into force at once.\n"
+        "2. Definitions. In this Act a word has its ordinary meaning.\n"
+    )
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome"])
+@pytest.mark.parametrize("title", N1_TITLES)
+def test_and_the_federal_acts_are_kept(source_name, listing, title):
+    out = _extract(
+        _called_act(title),
+        source_name=source_name,
+        act_title=title if listing == "good" else CHROME,
+        url=DIRTY_URL,
+    )
+    assert out["statute_name"] == title
+    assert "and the" in out["statute_name"]
+    assert out["year_enacted"] == int(title[-4:])
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+def test_and_the_is_rejected_only_with_a_clause_marker():
+    assert is_rejected_assembly_statute_name(
+        "shall be called the Chairman and the Speaker Act, 1975"
+    )
+    assert is_rejected_assembly_statute_name(
+        "Amendment of section 2, Act XXIX of 1976.- In the Seed Act"
+    )
+    for title in N1_TITLES:
+        assert not is_rejected_assembly_statute_name(title)
+
+
+@pytest.mark.parametrize("title", N2_TITLES)
+def test_short_title_keeps_the_last_instrument_word(title):
+    decision = resolve_assembly_statute_title(_called_act(title), listing_title=CHROME)
+    assert decision.name == title
+    assert decision.year == 2024
+    assert decision.name != "name_unknown"
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome"])
+@pytest.mark.parametrize("title", N2_TITLES)
+def test_instrument_word_titles_round_trip(source_name, listing, title):
+    out = _extract(
+        _called_act(title),
+        source_name=source_name,
+        act_title=title if listing == "good" else CHROME,
+        url=DIRTY_URL,
+    )
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert out["statute_name"] != "Pakistan Penal Code, 1860"
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("title", N3_TITLES)
+def test_acronym_and_digit_titles_are_accepted(source_name, title):
+    out = _extract(
+        _called_act(title),
+        source_name=source_name,
+        act_title=CHROME,
+        url=DIRTY_URL,
+    )
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert not is_rejected_assembly_statute_name(title)
+    kept = _extract(
+        _called_act(title),
+        source_name=source_name,
+        act_title=title,
+        url=DIRTY_URL,
+    )
+    assert kept["statute_name"] == title
+    assert not (kept.get("field_evidence") or {}).get("name_unknown")
+    decision = resolve_assembly_statute_title(_called_act(title), listing_title=title)
+    assert decision.name == title
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_printed_commas_inside_a_title_stay(source_name):
+    out = _extract(
+        _called_act(N4_TITLE),
+        source_name=source_name,
+        act_title=CHROME,
+        url=DIRTY_URL,
+    )
+    assert out["statute_name"] == N4_TITLE
+    assert "(Salary, Allowances and Privileges)" in out["statute_name"]
 
 
 def test_title_repair_does_not_disable_tls():
