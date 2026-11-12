@@ -5,10 +5,10 @@ The corpus rows were produced by ``split_into_sections`` on PAB OCR text.
 This command prints the section count that splitter now returns. It does not
 connect to a database, does not fetch, and does not deploy.
 
-A sha-pinned PDF or OCR text file under the repo fixtures is preferred when
-one is present. The University of Balochistan scan is image-only, so an empty
-text layer is not used. The regression fixtures stand in when the pinned file
-is absent.
+A sha-pinned PDF under the repo fixtures is preferred when one is present.
+The University of Balochistan report uses the real OCR text in the fixtures.
+The other three acts still use their pattern fixtures when no pinned file
+is present.
 
     python scripts/report_pab_university_sections.py
 """
@@ -40,7 +40,7 @@ ACTS: Sequence[dict] = (
     {
         "label": "University of Balochistan Act III/1996",
         "statute_name": "The University of Balochistan Act No. III of 1996",
-        "fixture": "statute_quality/pab_uob_act_1996_pattern.txt",
+        "fixture": "statute_quality/pab_uob_1996_ocr.txt",
         "sha256": _UOB_SHA256,
     },
     {

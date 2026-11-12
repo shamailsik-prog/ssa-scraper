@@ -158,7 +158,7 @@ Penalty 3. Whoever contravenes this Act shall be punished with fine which may ex
 
 
 def test_offline_dry_run_prints_section_counts_without_a_database():
-    """The report reads fixtures only. The pinned UoB PDF is not in the repo."""
+    """The report reads fixtures only. UoB uses the real OCR, not the pattern."""
     repo = Path(__file__).resolve().parents[1]
     completed = subprocess.run(
         [sys.executable, str(repo / "scripts" / "report_pab_university_sections.py")],
@@ -174,8 +174,11 @@ def test_offline_dry_run_prints_section_counts_without_a_database():
     turbat, buitems = rest.split("BUITEMS Amendment Act XII/2015", 1)
 
     assert "no database writes" in text
-    assert "section_count: 24" in uob
-    assert "Schedule" in uob
+    assert "pab_uob_1996_ocr.txt" in uob
+    assert "section_count: 40" in uob
+    assert "section_numbers: 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 14," in uob
+    assert "52, Schedule" in uob
+    assert "03" not in uob.split("section_numbers:", 1)[-1].split("Lasbela", 1)[0]
     assert "1882" not in uob
     assert "1925" not in uob
     assert "1970" not in uob

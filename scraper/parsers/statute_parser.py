@@ -99,22 +99,34 @@ _MARGINAL_SECTION_NUMBER_TOKEN = r"(?:(?:[1-9]\d{0,2}|0\d{1,2})[A-Z]?|0[EI])"
 # sees only the heading whose note wrapped onto the previous line, and the
 # rest of the act is glued into that one row.
 _MARGINAL_SECTION_HEAD_RE = re.compile(
-    r"(?m)^[ \t]*"
+    r"(?m)^[ \t]*[-–—]?[ \t]*"
     r"[A-Z][A-Za-z][A-Za-z,'’\-]{0,40}"
     r"(?:[ \t]+[A-Za-z][A-Za-z,'’\-]{0,40}){0,6}"
     # ``Senate:- 17.`` and ``Syndicate :- 19`` keep the colon-hyphen
     # the text layer prints between the marginal note and the number.
-    r"(?:[ \t]*[:\-–—]+\.?|\.)?[ \t]+"
-    rf"({_MARGINAL_SECTION_NUMBER_TOKEN})"
-    # "1. (1)" / "7. The" on a text layer. OCR also drops the period ("2 (1)")
-    # or reads the subsection mark as "@)".
+    # A guillemet or curly quote is the OCR of the space before the number
+    # (``Officers of the «9.``, ``Affiliations. “31.``).
     r"(?:"
-    r"\s*\.(?:\s*[-–—]\s*|\s+)"
+    r"(?:[ \t]*[:\-–—]+\.?|\.)?[ \t]+"
+    r"|"
+    r"(?:[ \t]*[:\-–—]+\.?|\.)?[ \t]*[«»“”\"'][ \t]*"
+    r")"
+    rf"({_MARGINAL_SECTION_NUMBER_TOKEN})"
+    # "1. (1)" / "7. The" on a text layer. OCR also drops the period ("2 (1)"),
+    # reads the closer as a comma (``Teaching in the 7, (1)``), or reads the
+    # subsection mark as "@)", "()", "(ly" or "(pb".
+    r"(?:"
+    r"\s*[\.,](?:\s*[-–—]\s*|\s+)"
     r"|"
     r"\s+(?=\()"
     r")"
-    # ``(1)`` or a roman subsection ``(i)`` as printed in the Lasbela Syndicate clause.
-    r"(?=(?:[\(\[\{]\s*(?:\d|[ivxlcdmIVXLCDM]{1,6}\b)|@\)|[A-Z]))"
+    r"(?=(?:"
+    r"[\(\[\{]\s*(?:\d|[ivxlcdmIVXLCDM]{1,6}\b)"
+    r"|@\)"
+    r"|[A-Z]"
+    r"|\(\s*\)"
+    r"|\(\s*(?:ly|pb)\b"
+    r"))"
 )
 # OCR sometimes parenthesises the section number itself: ``Powers and (18).``.
 # A subsection ``(2).`` does not continue the previous section, so the
@@ -915,6 +927,101 @@ def _line_start_is_inner_subclause(
     return _rest_is_running_clause(rest, any_shall=number < 10)
 
 
+def _dense_marginal_run(text: str, extras: Sequence[Match[str]]) -> Dict[int, int]:
+    """Start offset of each heading in the longest dense rising marginal run.
+
+    A run is strictly ascending and dense when it holds at least twelve
+    headings and the numeric span is at most three times that count. The
+    University of Balochistan scan is one such run (1 through 52). A short
+    or sparse series of notes is not, so an ordinary Act is unchanged.
+    """
+    points: List[Tuple[int, int]] = []
+    seen: set[int] = set()
+    for match in sorted(extras, key=lambda item: item.start(1)):
+        if _cross_ref_prior(text, match):
+            continue
+        number, letter = _heading_parts((match.group(1) or "").strip())
+        if letter or number is None or number <= 0 or number >= 1800:
+            continue
+        if match.start(1) in seen:
+            continue
+        seen.add(match.start(1))
+        points.append((match.start(1), number))
+    best: List[Tuple[int, int]] = []
+    current: List[Tuple[int, int]] = []
+
+    def consider(run: List[Tuple[int, int]]) -> None:
+        nonlocal best
+        if len(run) < 12:
+            return
+        span = run[-1][1] - run[0][1] + 1
+        if span > len(run) * 3:
+            return
+        if len(run) > len(best):
+            best = list(run)
+
+    for pos, number in points:
+        if not current or number > current[-1][1]:
+            current.append((pos, number))
+        else:
+            consider(current)
+            current = [(pos, number)]
+    consider(current)
+    return {pos: number for pos, number in best}
+
+
+def _marginal_needs_ocr_tolerance(text: str, match: Match[str]) -> bool:
+    """A closer the ordinary gazette rule does not treat as a heading.
+
+    ``N,``, ``N. ()``, ``N. (ly``, ``N. (pb``, a quote before the number, and
+    a leading hyphen are how the Balochistan scan prints real notes. Outside
+    a dense rising run they are citations and list scraps, not sections.
+    """
+    number_at = match.start(1)
+    before = text[max(0, number_at - 4) : number_at]
+    after = text[match.end(1) : match.end(1) + 12]
+    if re.search(r"[«»“”\"']\s*$", before):
+        return True
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    lead = text[line_start : match.start()].lstrip()[:1]
+    if lead and lead in "-–—":
+        return True
+    if re.match(r"\s*,", after):
+        return True
+    if re.match(r"\s*\.\s*\(\s*(?:\)|ly\b|pb\b)", after):
+        return True
+    return False
+
+
+def _line_start_breaks_marginal_run(
+    text: str,
+    match: Match[str],
+    run: Dict[int, int],
+) -> bool:
+    """A line-start scrap inside a dense marginal run is not the next section.
+
+    ``7 :``, ``23 :``, ``30. 0))``, ``03)``, ``34 -`` and a bare ``37 .``
+    reset the sequence when they are stored as headings. A real ``26. (3)``
+    or ``31. Where…`` on the same line stays a heading. ``18-B.`` stays too.
+    """
+    if len(run) < 12:
+        return False
+    start = min(run)
+    end = max(run)
+    if not (start < match.start(1) < end):
+        return False
+    closer = _heading_closer(text, match)
+    if closer != ".":
+        if closer == "-" and _HYPHEN_LETTER_SECTION_RE.match(text[match.end() :]):
+            return False
+        return True
+    rest = text[match.end() :].split("\n", 1)[0]
+    rest = re.sub(r"""^[\s\"'`“”‘’]+""", "", rest)
+    if not rest or rest[0].isdigit():
+        return True
+    return False
+
+
 def _select_heading_matches(
     text: str,
     line_start: Sequence[Match[str]],
@@ -930,6 +1037,7 @@ def _select_heading_matches(
     unless that hyphen form itself continues the open section.
     """
     line_pos = {match.start(1) for match in line_start}
+    marginal_run = _dense_marginal_run(text, extras)
     previous: Optional[str] = None
     saw_inner_clause = False
     kept: List[Match[str]] = []
@@ -970,6 +1078,8 @@ def _select_heading_matches(
             ):
                 continue
             token = hyphen if promoted else raw
+            if _line_start_breaks_marginal_run(text, match, marginal_run):
+                continue
             if _line_start_is_inner_subclause(text, match, token, previous):
                 saw_inner_clause = True
                 continue
@@ -981,7 +1091,25 @@ def _select_heading_matches(
             continue
         if _cross_ref_prior(text, match):
             continue
-        if not _heading_continues(hyphen, previous) and not _amendment_marginal_one_gap(
+        if _marginal_needs_ocr_tolerance(text, match) and match.start(1) not in marginal_run:
+            continue
+        # A dense rising marginal run survives a gap of a few unprinted
+        # numbers. A wider gap stays on the strict next-integer rule, so a
+        # later line-start section is not pulled in early.
+        number, _letter = _heading_parts(hyphen)
+        prev_number, _prev_letter = _heading_parts(previous or "")
+        within_run = (
+            match.start(1) in marginal_run
+            and number is not None
+            and (
+                previous is None
+                or (
+                    prev_number is not None
+                    and prev_number < number <= prev_number + 4
+                )
+            )
+        )
+        if not within_run and not _heading_continues(hyphen, previous) and not _amendment_marginal_one_gap(
             text, match, hyphen, previous
         ):
             continue
@@ -1443,6 +1571,11 @@ _PAB_FIRST_SCHEDULE_LINE_RE = re.compile(
     r"(?i)^the[ \t]+first[ \t]+schedule\b(?![ \t]+(?:of|to)\b)"
 )
 _PAB_BARE_SCHEDULE_LINE_RE = re.compile(r"(?i)^schedule\b\.?$")
+# ``SCHEDULE,`` / ``i. Faculties`` is the University of Balochistan statutes tail.
+_PAB_OCR_SCHEDULE_COMMA_RE = re.compile(r"(?i)^schedule\s*,$")
+_REAL_SHORT_TITLE_BODY_RE = re.compile(
+    r"(?i)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+called\b"
+)
 _PAB_INLINE_STATUTES_RE = re.compile(
     r"(?i)(?<=[.!?;:])[ \t]+SCHEDULE[ \t]+THE[ \t]+FIRST[ \t]+STATU(?:TES?|E)\b"
 )
@@ -1465,20 +1598,55 @@ def _operative_section_positions(text: str) -> List[Tuple[int, int]]:
     return sorted(found.items())
 
 
+def _longest_increasing_end(numbers: Sequence[int]) -> Optional[int]:
+    """Smallest end value among the longest strictly increasing subsequences.
+
+    A stray OCR ``74`` is skipped when a longer subsequence continues past
+    it. ``max()`` of every earlier token would treat that 74 as the last
+    section and approve a cut in the middle of the Act.
+    """
+    if not numbers:
+        return None
+    best = [1] * len(numbers)
+    for index, number in enumerate(numbers):
+        for earlier in range(index):
+            if numbers[earlier] < number and best[earlier] + 1 > best[index]:
+                best[index] = best[earlier] + 1
+    longest = max(best)
+    return min(numbers[index] for index, length in enumerate(best) if length == longest)
+
+
 def _schedule_cut_follows_last_section(text: str, pos: int) -> bool:
-    """True when every section number after ``pos`` is a schedule restart.
+    """True when no later section number passes the longest rising run.
 
     A contents line before section 1 has no earlier section. A marginal note
     ``First Statutes and`` in the middle of the Act is followed by a higher
-    section number, so it is not the tail.
+    section number, so it is not the tail. The last section is the end of
+    that rising run, not the highest stray token before the note.
     """
     positions = _operative_section_positions(text)
     earlier = [number for start, number in positions if start < pos]
     if not earlier:
         return False
-    highest = max(earlier)
+    last = _longest_increasing_end(earlier)
+    if last is None:
+        return False
     later = [number for start, number in positions if start > pos]
-    return not any(number > highest for number in later)
+    return not any(number > last for number in later)
+
+
+def _real_short_title_body_precedes(text: str, pos: int) -> bool:
+    """The operative short-title sentence is before this cut.
+
+    A contents stub (``Short title and commencement.``) is not that sentence.
+    An excerpt that never prints ``may be called`` can still end in a
+    statutes tail. When the sentence exists, a cut in front of it is the
+    contents list, not the tail.
+    """
+    found = _REAL_SHORT_TITLE_BODY_RE.search(text or "")
+    if found is None:
+        return True
+    return found.start() < pos
 
 
 def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
@@ -1494,7 +1662,9 @@ def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
         return text, ""
     cuts: List[int] = []
     for match in _PAB_INLINE_STATUTES_RE.finditer(text):
-        if _schedule_cut_follows_last_section(text, match.start()):
+        if _schedule_cut_follows_last_section(text, match.start()) and _real_short_title_body_precedes(
+            text, match.start()
+        ):
             cuts.append(match.start())
     lines = list(re.finditer(r"(?m)^[^\n]*", text))
     for index, line_match in enumerate(lines):
@@ -1516,9 +1686,14 @@ def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
             schedule_line = bool(
                 re.search(r"(?i)\b(?:faculties|first\s+statut|board\s+of\s+(?:each\s+)?faculty)\b", window)
             )
+        ocr_schedule = bool(_PAB_OCR_SCHEDULE_COMMA_RE.match(stripped))
+        if ocr_schedule:
+            window = text[line_match.end() : line_match.end() + 1200]
+            ocr_schedule = bool(re.search(r"(?i)\bfacult", window))
         is_heading = bool(
             _PAB_STATUTES_HEADING_RE.match(stripped)
             or schedule_line
+            or ocr_schedule
             or (
                 _PAB_BARE_SCHEDULE_LINE_RE.match(stripped)
                 and _PAB_STATUTES_HEADING_RE.match(next_line)
@@ -1526,7 +1701,9 @@ def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
         )
         if not is_heading:
             continue
-        if _schedule_cut_follows_last_section(text, line_match.start()):
+        if _schedule_cut_follows_last_section(text, line_match.start()) and _real_short_title_body_precedes(
+            text, line_match.start()
+        ):
             cuts.append(line_match.start())
     positive = [item for item in cuts if item > 0]
     if not positive:
