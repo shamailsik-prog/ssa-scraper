@@ -125,6 +125,15 @@ _CLAUSE_PREFIX_RE = re.compile(
     r"sections?\b|no\.|an\s+act\b|whereas\b|called\b"
     r")"
 )
+# ``Code, 1860, and the …`` is a cross-reference, not an instrument name.
+# ``Pakistan Penal Code, 1860`` and ``Code of Criminal Procedure, 1898`` do not match.
+_LEADING_INSTRUMENT_YEAR_RE = re.compile(
+    r"(?i)^(?:act|ordinance|order|code|rules|regulations|constitution)\s*,\s*"
+    r"(?:1[89]\d{2}|20\d{2})\b"
+)
+_RUN_ON_SHORT_TITLE_RE = re.compile(
+    r"(?i)(?:(?:^|\s)\d{1,3}\.|\bamendment\s+of\b|\bin\s+the\b|\bshall\b)"
+)
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -302,6 +311,8 @@ def _is_clause_like_name(name: str) -> bool:
     if not flat:
         return True
     if _leading_word_is_lower(flat):
+        return True
+    if _LEADING_INSTRUMENT_YEAR_RE.match(flat):
         return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
@@ -581,6 +592,55 @@ def _instrument_ends_title(tokens: list[tuple[str, str]], index: int) -> bool:
     return token[:1] == "."
 
 
+def _year_token_index(tokens: list[tuple[str, str]], index: int) -> Optional[int]:
+    """The year token sitting immediately after an instrument word, if there is one."""
+    nxt = index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        nxt += 1
+    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
+        return nxt
+    return None
+
+
+def _commencement_end(tokens: list[tuple[str, str]], index: int) -> bool:
+    """``, and shall`` / ``and it shall`` / ``and shall …`` after the year ends the clause."""
+    nxt = index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip(".,") == "":
+        nxt += 1
+    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",.")):
+        nxt += 1
+    if nxt < len(tokens) and tokens[nxt][1].strip(".,") == "":
+        nxt += 1
+    words = [re.sub(r"[^A-Za-z]", "", token).lower() for _gap, token in tokens[nxt : nxt + 3]]
+    if words[:2] == ["and", "shall"]:
+        return True
+    return words[:3] == ["and", "it", "shall"]
+
+
+def _sentence_closed(tokens: list[tuple[str, str]], index: int) -> bool:
+    """The clause has ended: ``Act.``, ``Act, 2024.``, ``2024.``, or a commencement tail.
+
+    A newline after ``Code`` in ``Pakistan Penal Code`` / ``(Amendment) Act`` is not
+    a sentence end, so the read continues to the later instrument word.
+    """
+    if _commencement_end(tokens, index):
+        return True
+    if tokens[index][1].rstrip().endswith("."):
+        return True
+    year_at = _year_token_index(tokens, index)
+    return year_at is not None and tokens[year_at][1].strip(",").endswith(".")
+
+
+def _keep_following_year(kept: list[tuple[str, str]], tokens: list[tuple[str, str]], index: int) -> None:
+    """Leave the year in the token list so rendering can append it."""
+    nxt = index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        kept.append(tokens[nxt])
+        nxt += 1
+    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
+        kept.append(tokens[nxt])
+
+
 def _render_short_title(tokens: list[tuple[str, str]], end: int) -> str:
     parts: list[str] = []
     for _gap, token in tokens[: end + 1]:
@@ -594,7 +654,7 @@ def _render_short_title(tokens: list[tuple[str, str]], end: int) -> str:
 
 
 def _short_title(text: str) -> Optional[str]:
-    """Read the called-clause through the last instrument word that ends it."""
+    """Read the called-clause through the first instrument word that ends the sentence."""
     match = _CALLED_START_RE.search(text or "")
     if not match:
         return None
@@ -622,8 +682,11 @@ def _short_title(text: str) -> Optional[str]:
         kept.append((gap, token))
         if _INSTRUMENT_KEYS.get(_lookup_key(token)):
             seen_instrument = True
-            if _instrument_ends_title(tokens, index):
+            if _instrument_ends_title(tokens, index) or _commencement_end(tokens, index):
                 ends.append(len(kept) - 1)
+                if _sentence_closed(tokens, index):
+                    _keep_following_year(kept, tokens, index)
+                    break
     if ends:
         return _render_short_title(kept, ends[-1])
     if not kept:
@@ -759,7 +822,15 @@ def _title_core(name: str) -> str:
 
 
 def _short_title_supersedes(current: str, short_name: str) -> bool:
-    """A truncated instrument (``Pakistan Code, 2024``) loses to the full short title."""
+    """A truncated instrument (``Pakistan Code, 2024``) loses to the full short title.
+
+    A short title that has already run into the next section (``2.``, ``Amendment of``,
+    ``In the``, ``shall``, or a second year) must not replace a stored name.
+    """
+    if _RUN_ON_SHORT_TITLE_RE.search(short_name or ""):
+        return False
+    if len(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", short_name or "")) >= 2:
+        return False
     current_core = _title_core(current)
     short_core = _title_core(short_name)
     if not current_core or not short_core or current_core == short_core:

@@ -14,6 +14,7 @@ from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute, statute_staging_identity_url
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
+    _short_title_supersedes,
     apply_rejected_assembly_title,
     is_rejected_assembly_statute_name,
     resolve_assembly_statute_title,
@@ -651,6 +652,180 @@ def test_acronym_and_digit_titles_are_accepted(source_name, title):
     assert not (kept.get("field_evidence") or {}).get("name_unknown")
     decision = resolve_assembly_statute_title(_called_act(title), listing_title=title)
     assert decision.name == title
+
+
+N6_FINANCE = "Finance Act, 2024"
+N6_ELECTIONS = "Elections (Amendment) Act, 2024"
+N6_PPC = "Pakistan Penal Code (Amendment) Act, 2024"
+
+# Single-sentence section 1. A bare ``2.`` is not ``(2)``, so the reader must
+# stop at the sentence instead of rendering through section 2.
+N6_BODIES = (
+    (
+        "finance-section-2",
+        N6_FINANCE,
+        "1. Short title.- This Act may be called the Finance Act, 2024.\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+    (
+        "finance-subsection-control",
+        N6_FINANCE,
+        "1. Short title.- This Act may be called the Finance Act, 2024.\n"
+        "(2) It shall come into force at once.\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+    (
+        "elections-act",
+        N6_ELECTIONS,
+        "1. Short title.- This Act may be called the Elections (Amendment) Act, 2024.\n"
+        "2. Amendment of the Elections Act, 2017.\n",
+    ),
+    (
+        "elections-section",
+        N6_ELECTIONS,
+        "1. Short title.- This Act may be called the Elections (Amendment) Act, 2024.\n"
+        "2. Amendment of section 2, Act XXXIII of 2017.- In the Elections Act, 2017,\n"
+        "for the words, the following shall be substituted.\n",
+    ),
+    (
+        "ppc-and-shall",
+        N6_PPC,
+        "1. Short title.- This Act may be called the Pakistan Penal Code (Amendment) Act, 2024, "
+        "and shall come into force at once.\n"
+        "2. Amendment of the Pakistan Penal Code, 1860.- In the said Code, after section 1.\n",
+    ),
+    (
+        "finance-and-it-shall",
+        N6_FINANCE,
+        "1. Short title.- This Act may be called the Finance Act 2024 and it shall come into force at once.\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+)
+
+
+def _with_listing(text: str, *, source_name: str, listing: str, title: str):
+    meta = {"source_name": source_name, "url": DIRTY_URL}
+    if listing == "good":
+        meta["act_title"] = title
+    elif listing == "chrome":
+        meta["act_title"] = CHROME
+    return _extract(text, **meta)
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("_case,title,body", N6_BODIES, ids=[item[0] for item in N6_BODIES])
+def test_single_sentence_section_stops_before_section_two(source_name, listing, _case, title, body):
+    out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert "2." not in out["statute_name"]
+    assert "shall" not in out["statute_name"].lower()
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_wrapped_penal_code_title_keeps_the_later_act(source_name):
+    text = (
+        "1. Short title.—(1) This Act may be called the Pakistan Penal Code\n"
+        "(Amendment) Act, 2024.\n"
+        "(2) It shall come into force at once.\n"
+    )
+    out = _extract(text, source_name=source_name, act_title=CHROME, url=DIRTY_URL)
+    assert out["statute_name"] == N6_PPC
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+def test_supersede_refuses_a_section_run_on():
+    junk = "Finance Act 2024. 2. Amendment of the Income Tax Ordinance, 2001"
+    assert _short_title_supersedes("Pakistan Penal Code, 1860", "Pakistan Penal Code (Amendment) Act, 2024")
+    assert not _short_title_supersedes(N6_FINANCE, junk)
+    assert not _short_title_supersedes(N6_FINANCE, "Finance Act, 2024 and it shall come into force at once")
+    assert not _short_title_supersedes(
+        N6_ELECTIONS,
+        "Elections (Amendment) Act, 2024. 2. Amendment of section 2.- In the Elections Act, 2017",
+    )
+    assert not _short_title_supersedes(N6_PPC, "Pakistan Penal Code (Amendment) Act, 2024 and 1860")
+
+
+def test_lowercase_sweep_fragment_is_not_a_title():
+    fragment = "c Karachi Port TnEr Act, 1886"
+    assert is_rejected_assembly_statute_name(fragment)
+    decision = resolve_assembly_statute_title(
+        "1. Short title.- This Act may be called the c Karachi Port TnEr Act, 1886.\n"
+        "(2) It extends to the Port.\n",
+        listing_title=fragment,
+    )
+    assert decision.name == "name_unknown"
+    assert decision.name != fragment
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["chrome", "none"])
+@pytest.mark.parametrize(
+    "title,principal",
+    [
+        ("Pakistan Penal Code (Amendment) Act, 2024", "Pakistan Penal Code, 1860"),
+        ("Code of Criminal Procedure (Amendment) Act, 2024", "Code of Criminal Procedure, 1898"),
+    ],
+)
+def test_short_title_supersedes_an_upstream_principal(source_name, listing, title, principal):
+    text = (
+        f"1. Short title.—(1) This Act may be called the {title}.\n"
+        "(2) It shall come into force at once.\n"
+    )
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["statute_name"] != principal
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_may_be_called_keeps_a_printed_comma(source_name):
+    text = (
+        "ACT NO. IV OF 2024\n"
+        "1. Short title.- This Act may be called the "
+        "Prime Minister (Salary, Allowances and Privileges) (Amendment) Act, 2024.\n"
+        "(2) It shall come into force at once.\n"
+    )
+    decision = resolve_assembly_statute_title(text, listing_title=CHROME)
+    assert decision.name == N4_TITLE
+    assert "(Salary, Allowances and Privileges)" in decision.name
+    out = _extract(text, source_name=source_name, act_title=CHROME, url=DIRTY_URL)
+    assert out["statute_name"] == N4_TITLE
+    assert "(Salary, Allowances and Privileges)" in out["statute_name"]
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_caps_acronym_reaches_the_title_finder(source_name):
+    text = (
+        "ACT NO. IV OF 2024\n"
+        "1. Short title.- This Act may be called the PTCL (Re-organization) Act, 2024.\n"
+        "(2) It shall come into force at once.\n"
+    )
+    decision = resolve_assembly_statute_title(text, listing_title=CHROME)
+    assert decision.name == "PTCL (Re-organization) Act, 2024"
+    assert decision.source == "short_title"
+    out = _extract(text, source_name=source_name, act_title=CHROME, url=DIRTY_URL)
+    assert out["statute_name"] == "PTCL (Re-organization) Act, 2024"
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+def test_leading_instrument_and_year_is_not_a_title():
+    fragment = "Code, 1860, and the Qanun-e-Shahadat Order"
+    assert is_rejected_assembly_statute_name(fragment)
+    for name in (
+        "Pakistan Penal Code, 1860",
+        "Code of Criminal Procedure, 1898",
+        "Finance Act, 2024",
+        "Qanun-e-Shahadat Order, 1984",
+        "Trust Act, 1882",
+    ):
+        assert not is_rejected_assembly_statute_name(name)
 
 
 @pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
