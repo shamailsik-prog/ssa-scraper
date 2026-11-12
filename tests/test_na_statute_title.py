@@ -747,6 +747,91 @@ def test_supersede_refuses_a_section_run_on():
         "Elections (Amendment) Act, 2024. 2. Amendment of section 2.- In the Elections Act, 2017",
     )
     assert not _short_title_supersedes(N6_PPC, "Pakistan Penal Code (Amendment) Act, 2024 and 1860")
+    # Two printed years, and the second is not the title year. Dropping the
+    # second-year guard lets this replace the 1952 Act.
+    assert not _short_title_supersedes(
+        "Pakistan Army Act, 1952",
+        "Pakistan Army Act 1952 (XXXIX of 1952) as amended",
+    )
+
+
+ACT_NO_HEADER = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n"
+R4_BODIES = (
+    (
+        "shall-finance",
+        N6_FINANCE,
+        "1. Short title.- This Act shall be called the Finance Act, 2024.\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+    (
+        "shall-elections",
+        N6_ELECTIONS,
+        "1. Short title.- This Act shall be called the Elections (Amendment) Act, 2024.\n"
+        "2. Amendment of the Elections Act, 2017.\n",
+    ),
+    (
+        "shall-ppc",
+        N6_PPC,
+        "1. Short title.- This Act shall be called the Pakistan Penal Code (Amendment) Act, 2024, "
+        "and shall come into force at once.\n"
+        "2. Amendment of the Pakistan Penal Code, 1860.\n",
+    ),
+    (
+        "no-period",
+        N6_FINANCE,
+        "1. Short title.- This Act may be called the Finance Act, 2024\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+    (
+        "glued-subsection",
+        N6_ELECTIONS,
+        "1. Short title.- This Act may be called the Elections (Amendment) Act, 2024.(2) "
+        "It shall come into force at once.\n"
+        "2. Amendment of the Elections Act, 2017.\n",
+    ),
+    (
+        "which-shall",
+        N6_FINANCE,
+        "1. Short title.- This Act may be called the Finance Act, 2024, which shall come into force at once.\n"
+        "2. Amendment of the Income Tax Ordinance, 2001.\n",
+    ),
+    (
+        "ocr-penal-period",
+        N6_PPC,
+        "1. Short title.—(1) This Act may be called the Pakistan Penal Code.\n"
+        "(Amendment) Act, 2024.\n"
+        "(2) It shall come into force at once.\n",
+    ),
+    (
+        "ocr-order-period",
+        "Cantonments Order (Amendment) Act, 2024",
+        "1. Short title.—(1) This Act may be called the Cantonments Order.\n"
+        "(Amendment) Act, 2024.\n"
+        "(2) It shall come into force at once.\n",
+    ),
+)
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("_case,title,body", R4_BODIES, ids=[item[0] for item in R4_BODIES])
+def test_remaining_run_ons_store_the_exact_title(source_name, listing, layout, _case, title, body):
+    text = body if layout == "bare" else ACT_NO_HEADER + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert "2." not in out["statute_name"]
+    assert "shall" not in out["statute_name"].lower()
+    assert "(2)" not in out["statute_name"]
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    if _case == "glued-subsection" and listing == "good":
+        # The glued run-on still must not replace the listing if the reader regresses.
+        # Dropping ``shall`` from the run-on guard makes this True.
+        assert not _short_title_supersedes(
+            title,
+            "Elections (Amendment) Act 2024.(2) It shall come into force at once",
+        )
 
 
 def test_lowercase_sweep_fragment_is_not_a_title():
@@ -813,6 +898,10 @@ def test_caps_acronym_reaches_the_title_finder(source_name):
     assert out["statute_name"] == "PTCL (Re-organization) Act, 2024"
     assert out["year_enacted"] == 2024
     assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+def test_numbered_act_is_not_a_section_run_on():
+    assert not is_rejected_assembly_statute_name("Finance (No. 2) Act, 2024")
 
 
 def test_leading_instrument_and_year_is_not_a_title():

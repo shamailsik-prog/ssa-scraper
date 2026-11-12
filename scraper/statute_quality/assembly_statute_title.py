@@ -134,6 +134,12 @@ _LEADING_INSTRUMENT_YEAR_RE = re.compile(
 _RUN_ON_SHORT_TITLE_RE = re.compile(
     r"(?i)(?:(?:^|\s)\d{1,3}\.|\bamendment\s+of\b|\bin\s+the\b|\bshall\b)"
 )
+# A stored name that already ran past the short title. ``(No. 2)`` does not match:
+# the digit is not followed by ``. Capital``.
+_CLAUSE_RUN_ON_RE = re.compile(
+    r"(?i)(?:\bshall\b|(?<![\w(])\d{1,3}\.\s+[A-Z]|\.\s*\(\d{1,2}\))"
+)
+_YEAR_TOKEN_RE = re.compile(r"(\d{4})(\.?)(?:\((\d{1,2})\))?$")
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -313,6 +319,8 @@ def _is_clause_like_name(name: str) -> bool:
     if _leading_word_is_lower(flat):
         return True
     if _LEADING_INSTRUMENT_YEAR_RE.match(flat):
+        return True
+    if _CLAUSE_RUN_ON_RE.search(flat):
         return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
@@ -570,6 +578,22 @@ def _subsection_end(token: str) -> bool:
     return re.fullmatch(r"[\(\[]?\d{1,3}[\)\]]?", token or "") is not None
 
 
+def _year_token(token: str) -> Optional[re.Match]:
+    """A year, optionally ``2024.`` or glued ``2024.(2)``."""
+    return _YEAR_TOKEN_RE.fullmatch((token or "").strip(","))
+
+
+def _year_token_closes(token: str) -> bool:
+    match = _year_token(token)
+    return bool(match and (match.group(2) or match.group(3)))
+
+
+def _paren_continues_title(token: str) -> bool:
+    """``(Amendment)`` continues a wrapped title. ``(2)`` does not."""
+    text = token or ""
+    return text.startswith("(") and not _subsection_end(text)
+
+
 def _instrument_ends_title(tokens: list[tuple[str, str]], index: int) -> bool:
     """An instrument word ends the title only when the clause ends after it.
 
@@ -580,14 +604,16 @@ def _instrument_ends_title(tokens: list[tuple[str, str]], index: int) -> bool:
     nxt = index + 1
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
         nxt += 1
-    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
-        if tokens[nxt][1].strip(",").endswith("."):
+    if nxt < len(tokens) and _year_token(tokens[nxt][1]):
+        if _year_token_closes(tokens[nxt][1]):
             return True
         nxt += 1
     if nxt >= len(tokens):
         return True
     gap, token = tokens[nxt]
     if "\n" in gap or _subsection_end(token) or _is_price_chrome(token):
+        return True
+    if re.fullmatch(r"\d{1,3}\.", token):
         return True
     return token[:1] == "."
 
@@ -597,22 +623,22 @@ def _year_token_index(tokens: list[tuple[str, str]], index: int) -> Optional[int
     nxt = index + 1
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
         nxt += 1
-    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
+    if nxt < len(tokens) and _year_token(tokens[nxt][1]):
         return nxt
     return None
 
 
 def _commencement_end(tokens: list[tuple[str, str]], index: int) -> bool:
-    """``, and shall`` / ``and it shall`` / ``and shall …`` after the year ends the clause."""
+    """``, and shall`` / ``and it shall`` / ``which shall`` after the year ends the clause."""
     nxt = index + 1
     if nxt < len(tokens) and tokens[nxt][1].strip(".,") == "":
         nxt += 1
-    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",.")):
+    if nxt < len(tokens) and _year_token(tokens[nxt][1]):
         nxt += 1
     if nxt < len(tokens) and tokens[nxt][1].strip(".,") == "":
         nxt += 1
     words = [re.sub(r"[^A-Za-z]", "", token).lower() for _gap, token in tokens[nxt : nxt + 3]]
-    if words[:2] == ["and", "shall"]:
+    if words[:2] in (["and", "shall"], ["which", "shall"]):
         return True
     return words[:3] == ["and", "it", "shall"]
 
@@ -625,10 +651,14 @@ def _sentence_closed(tokens: list[tuple[str, str]], index: int) -> bool:
     """
     if _commencement_end(tokens, index):
         return True
+    # ``Code.\n(Amendment) Act`` is one title. ``Act.\n(2)`` is the end of it.
     if tokens[index][1].rstrip().endswith("."):
+        nxt = index + 1
+        if nxt < len(tokens) and _paren_continues_title(tokens[nxt][1]):
+            return False
         return True
     year_at = _year_token_index(tokens, index)
-    return year_at is not None and tokens[year_at][1].strip(",").endswith(".")
+    return year_at is not None and _year_token_closes(tokens[year_at][1])
 
 
 def _keep_following_year(kept: list[tuple[str, str]], tokens: list[tuple[str, str]], index: int) -> None:
@@ -637,7 +667,7 @@ def _keep_following_year(kept: list[tuple[str, str]], tokens: list[tuple[str, st
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
         kept.append(tokens[nxt])
         nxt += 1
-    if nxt < len(tokens) and re.fullmatch(r"\d{4}\.?", tokens[nxt][1].strip(",")):
+    if nxt < len(tokens) and _year_token(tokens[nxt][1]):
         kept.append(tokens[nxt])
 
 
@@ -675,6 +705,9 @@ def _short_title(text: str) -> Optional[str]:
             break
         if kept and _subsection_end(token):
             break
+        # A bare ``2.`` after the title has already ended is the next section.
+        if ends and re.fullmatch(r"\d{1,3}\.", token or ""):
+            break
         if _symbol_mixed(token):
             break
         if _is_price_chrome(token) and seen_instrument:
@@ -706,7 +739,7 @@ def _year_after(tokens: list[tuple[str, str]], index: int) -> Optional[str]:
         index += 1
     if index >= len(tokens):
         return None
-    match = re.fullmatch(r"(\d{4})\.?", tokens[index][1].strip(","))
+    match = _year_token(tokens[index][1])
     if not match:
         return None
     return match.group(1)
