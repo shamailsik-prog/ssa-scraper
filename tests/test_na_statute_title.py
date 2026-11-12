@@ -14,6 +14,7 @@ from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute, statute_staging_identity_url
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
+    _short_title,
     _short_title_supersedes,
     apply_rejected_assembly_title,
     is_rejected_assembly_statute_name,
@@ -1053,6 +1054,131 @@ def test_words_after_the_year_stop_at_the_year(
         # Dropping the words-after-year guard makes this True and the listing
         # would be replaced by the run-on.
         assert not _short_title_supersedes(title, run_on)
+
+
+# A year, a space, then a bracket that is not part of the title, and no full stop.
+PAREN_AFTER_YEAR_TITLES = YEAR_THEN_WORDS_TITLES
+PAREN_AFTER_YEAR_TAILS = (
+    " (Z) It extends to the whole of Pakistan.",
+    " (z) It extends to the whole of Pakistan.",
+    " (ii) It extends to the whole of Pakistan.",
+    " (I) It extends to the whole of Pakistan.",
+    " (l) It extends to the whole of Pakistan.",
+    " (a) It extends to the whole of Pakistan.",
+    " (b) It extends to the whole of Pakistan.",
+    " (2A) It extends to the whole of Pakistan.",
+    " ( 2) It extends to the whole of Pakistan.",
+    " (It extends to the whole of Pakistan.)",
+    " (hereinafter referred to as the said Act) It extends to the whole of Pakistan.",
+    " (the Act) It extends to the whole of Pakistan.",
+    " (Z)\nIt extends to the whole of Pakistan.",
+)
+
+
+def _paren_after_year_run_on(title: str, year: int, tail: str) -> str:
+    core = title[: -len(str(year))].rstrip(" ,")
+    return f"{core} {year}{tail}".replace("\n", " ")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("tail", PAREN_AFTER_YEAR_TAILS)
+@pytest.mark.parametrize("title,year", PAREN_AFTER_YEAR_TITLES)
+def test_bracket_after_the_year_stops_at_the_year(
+    source_name, listing, layout, verb, section, tail, title, year
+):
+    body = _year_then_words_body(title, verb, tail, section)
+    header = f"ACT NO. I OF {year}\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == year
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    run_on = _paren_after_year_run_on(title, year, tail)
+    assert is_rejected_assembly_statute_name(run_on)
+    if listing == "good":
+        # A blanket bracket exemption, or dropping the bracket guard, replaces
+        # this listing with the run-on.
+        assert not _short_title_supersedes(title, run_on)
+
+
+INNER_YEAR_TITLES = (
+    ("Pakistan Penal Code, 1860 and Code of Criminal Procedure, 1898 (Amendment) Act, 2024", 2024),
+    ("Representation of the People Act, 1976 and Senate (Election) Act, 1975 (Amendment) Act, 1985", 1985),
+    ("Federal Public Service Commission Ordinance, 1977 Validation Act, 1980", 1980),
+    ("Income Tax Ordinance, 2001 Amendment Act, 2024", 2024),
+    ("The Code of Criminal Procedure, 1898 Balochistan (Amendment) Act, 2024", 2024),
+)
+INNER_YEAR_TAILS = (
+    ".",
+    ". It extends to the whole of Pakistan.",
+    ". It shall come into force at once.",
+)
+COMPANIES_AMENDMENT = "Companies Act, 2017 (Amendment) Act, 2024"
+
+
+def _years_printed(title: str) -> set[int]:
+    found = set()
+    for piece in title.replace(",", " ").split():
+        if piece.isdigit() and len(piece) == 4:
+            found.add(int(piece))
+    return found
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("tail", INNER_YEAR_TAILS)
+@pytest.mark.parametrize("title,later", INNER_YEAR_TITLES)
+def test_inner_year_title_is_kept(
+    source_name, listing, layout, verb, section, tail, title, later
+):
+    body = _year_then_words_body(title, verb, tail, section)
+    header = f"ACT NO. I OF {later}\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] in _years_printed(title)
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert not is_rejected_assembly_statute_name(title)
+    if listing == "good":
+        assert _short_title(body) == title
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+def test_companies_amendment_title_keeps_the_continuation(source_name, listing, layout):
+    body = (
+        "1. Short title and commencement.— This Act may be called the "
+        f"{COMPANIES_AMENDMENT}.\n"
+    )
+    header = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=COMPANIES_AMENDMENT)
+    assert out["statute_name"] == COMPANIES_AMENDMENT
+    assert "(Amendment)" in out["statute_name"]
+    assert not is_rejected_assembly_statute_name(COMPANIES_AMENDMENT)
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    # Dropping the bracket continuation stores only the 2017 Act.
+    assert _short_title(body) == COMPANIES_AMENDMENT
+    assert "(Amendment)" in (_short_title(body) or "")
+
+
+def test_citation_and_numbered_act_stay_titles_and_act_no_run_on_does_not():
+    assert not is_rejected_assembly_statute_name("Finance Act, 2024 (XVII of 2024)")
+    assert not is_rejected_assembly_statute_name("Pakistan Army Act, 1952 (XXXIX of 1952)")
+    assert not is_rejected_assembly_statute_name("Finance (No. 2) Act, 2024")
+    assert is_rejected_assembly_statute_name("Finance Act, 2024, Act No. V of, 2024")
+    assert not _short_title_supersedes(
+        "Pakistan Army Act, 1952",
+        "Pakistan Army Act 1952 (XXXIX of 1952) as amended",
+    )
 
 
 def test_title_repair_does_not_disable_tls():

@@ -150,6 +150,22 @@ _YEAR_GLUED_TAIL_RE = re.compile(
 _YEAR_THEN_WORDS_RE = re.compile(
     r"\b(?:1[89]\d{2}|20\d{2})(?:\s*,\s*\S|\s+-\s*\S|\s+[A-Za-z])"
 )
+# ``Finance Act, 2024, Act No. V of, 2024`` is a called-line run-on.
+# A citation ``(Act No. V of 2024)`` has no comma before Act and does not match.
+_ACT_NO_RUN_ON_RE = re.compile(r"(?i),\s*act\s+no\b")
+# One trailing citation, so the title year is what remains.
+_TRAILING_CITATION_RE = re.compile(
+    r"(?i)\s*\((?:act\s+no\.\s*)?(?:[ivxlcdm]+|\d+)\s+of\s+(?:1[89]\d{2}|20\d{2})\)\s*$"
+)
+_PAREN_CONTINUES_RE = re.compile(
+    r"(?i)^\((?:"
+    r"amendment\)|second\s+amendment\)|no\.\s*\d|"
+    r"(?:act\s+no\.\s*)?(?:[ivxlcdm]+|\d+)\s+of\s+(?:1[89]\d{2}|20\d{2})"
+    r")"
+)
+_INNER_YEAR_STOP_WORDS = frozenset(
+    {"it", "lt", "shall", "extends", "comes", "this", "whereas"}
+)
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -334,7 +350,9 @@ def _is_clause_like_name(name: str) -> bool:
         return True
     if _YEAR_GLUED_TAIL_RE.search(flat):
         return True
-    if _YEAR_THEN_WORDS_RE.search(flat):
+    if _ACT_NO_RUN_ON_RE.search(flat):
+        return True
+    if _text_after_last_year(flat):
         return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
@@ -554,7 +572,9 @@ def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tup
     title_year = _year_in(cleaned)
     act_year = _act_number_year(text)
     if title_year is not None and act_year is not None and title_year != act_year:
-        return "", None
+        if _last_year_in(cleaned) != act_year:
+            return "", None
+        title_year = act_year
     if already_dated:
         chosen = title_year
     else:
@@ -571,10 +591,21 @@ def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tup
     return cleaned, chosen if chosen is not None else title_year
 
 
+def _last_year_in(text: str) -> Optional[int]:
+    years = re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", text or "")
+    if not years:
+        return None
+    year = int(years[-1])
+    return year if _valid_year(year) else None
+
+
 def _years_disagree(title: str, text: str) -> bool:
     printed = _year_in(title or "")
     act_year = _act_number_year(text)
-    return bool(printed and act_year and printed != act_year)
+    if not printed or not act_year or printed == act_year:
+        return False
+    # An amending title may name an older Act and still close on the Act-number year.
+    return _last_year_in(title or "") != act_year
 
 
 def _accept(title: str, text: str, year: Optional[int]) -> Optional[tuple[str, Optional[int]]]:
@@ -607,11 +638,78 @@ def _year_token_closes(token: str) -> bool:
     return bool(match and match.group(2))
 
 
-def _same_line_words_after_year(tokens: list[tuple[str, str]], index: int) -> bool:
-    """``2024, It``, ``2024 It``, or ``2024 - It`` on the called line.
+def _last_year_match(name: str) -> tuple[str, Optional[re.Match]]:
+    """The last year, after peeling one trailing citation bracket."""
+    peeled = _TRAILING_CITATION_RE.sub("", _collapse(name))
+    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", peeled))
+    if not years:
+        return peeled, None
+    return peeled, years[-1]
 
-    A glued year, a clean ``.(N)``, a subsection, and ``(Amendment)`` do not.
-    A year with nothing after it, or only a following line, stays a whole title.
+
+def _text_after_last_year(name: str) -> bool:
+    """True when more than punctuation follows the final year.
+
+    An earlier year inside a real title does not count. ``1860 and Code … Act,
+    2024`` ends at 2024. ``2024 (Z) It`` and ``2024, It`` do not.
+    """
+    peeled, year = _last_year_match(name)
+    if year is None:
+        return False
+    return re.search(r"[^.,\s]", peeled[year.end() :]) is not None
+
+
+def _bad_bracket_after_last_year(name: str) -> bool:
+    """A space and a bracket after the final year that is not part of the title."""
+    peeled, year = _last_year_match(name)
+    if year is None:
+        return False
+    tail = peeled[year.end() :]
+    if not re.match(r"\s+\(", tail):
+        return False
+    return _PAREN_CONTINUES_RE.match(tail.lstrip()) is None
+
+
+def _paren_after_year_continues(tokens: list[tuple[str, str]], start: int) -> bool:
+    """``(Amendment)``, ``(No. 2)``, and a citation continue. ``(Z)`` does not."""
+    window = " ".join(token for _gap, token in tokens[start : start + 6])
+    return _PAREN_CONTINUES_RE.match(window) is not None
+
+
+def _later_instrument_year(tokens: list[tuple[str, str]], start: int) -> bool:
+    """A later instrument and its year on this line means the year already seen is inner."""
+    for index in range(start, len(tokens)):
+        gap, token = tokens[index]
+        if index > start and "\n" in gap:
+            return False
+        word = re.sub(r"[^A-Za-z]", "", token).lower()
+        if word in _INNER_YEAR_STOP_WORDS:
+            return False
+        if token.endswith(".") and not _year_token(token) and word != "no":
+            return False
+        if not _INSTRUMENT_KEYS.get(_lookup_key(token)):
+            continue
+        nxt = index + 1
+        if nxt < len(tokens) and re.match(r"(?i)no\.?$", tokens[nxt][1].strip(".,")):
+            continue
+        if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+            nxt += 1
+        if (
+            nxt < len(tokens)
+            and "\n" not in tokens[nxt][0]
+            and _year_token(tokens[nxt][1])
+        ):
+            return True
+    return False
+
+
+def _same_line_words_after_year(tokens: list[tuple[str, str]], index: int) -> bool:
+    """``2024, It``, ``2024 It``, ``2024 - It``, or ``2024 (Z)`` on the called line.
+
+    A glued year, a clean subsection, ``(Amendment)``, ``(No. 2)``, and a
+    citation stay with the title. An earlier year does too when a later
+    instrument year is still on the line. A year with nothing after it, or
+    only a following line, stays a whole title.
     """
     nxt = index + 1
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
@@ -628,9 +726,15 @@ def _same_line_words_after_year(tokens: list[tuple[str, str]], index: int) -> bo
     if nxt >= len(tokens):
         return False
     gap, token = tokens[nxt]
-    if "\n" in gap or _paren_continues_title(token) or _subsection_end(token):
+    if "\n" in gap or _subsection_end(token):
         return False
-    return re.search(r"[A-Za-z]", token) is not None
+    if token.startswith("("):
+        return not _paren_after_year_continues(tokens, nxt)
+    if not re.search(r"[A-Za-z]", token):
+        return False
+    if _later_instrument_year(tokens, nxt):
+        return False
+    return True
 
 
 def _paren_continues_title(token: str) -> bool:
@@ -722,9 +826,17 @@ def _keep_following_year(kept: list[tuple[str, str]], tokens: list[tuple[str, st
 
 def _render_short_title(tokens: list[tuple[str, str]], end: int) -> str:
     parts: list[str] = []
-    for _gap, token in tokens[: end + 1]:
+    kept = tokens[: end + 1]
+    for index, (_gap, token) in enumerate(kept):
         instrument = _INSTRUMENT_KEYS.get(_lookup_key(token))
-        parts.append(instrument if instrument else _apply_ocr_token(token))
+        if instrument:
+            piece = instrument
+            nxt = kept[index + 1][1] if index + 1 < len(kept) else ""
+            if "," in token and nxt and (_year_token(nxt) or nxt[:1].isdigit()):
+                piece = f"{instrument},"
+            parts.append(piece)
+        else:
+            parts.append(_apply_ocr_token(token))
     title = _collapse(" ".join(parts))
     year = _year_after(tokens, end + 1)
     if year and not re.search(rf"\b{year}\b", title):
@@ -903,27 +1015,49 @@ def _title_core(name: str) -> str:
     return core.strip(" .,;").lower()
 
 
+def _closes_on_instrument_year(name: str) -> bool:
+    """True when the last year is the year of a closing Act, Ordinance, Order, or Code."""
+    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", name or ""))
+    if not years:
+        return False
+    last = years[-1]
+    if re.search(r"[A-Za-z]", (name or "")[last.end() :]):
+        return False
+    before = (name or "")[: last.start()]
+    return re.search(r"(?i)(?:act|ordinance|order|code)\s*,?\s*$", before) is not None
+
+
 def _short_title_supersedes(current: str, short_name: str) -> bool:
     """A truncated instrument (``Pakistan Code, 2024``) loses to the full short title.
 
     A short title that has already run into the next section (``2.``, ``Amendment of``,
     ``In the``, ``shall``, or a second year) must not replace a stored name.
     A year glued to the next words (``2024.It``, ``2024.(Z)``) must not either.
-    Nor a year followed by a comma, space, or dash and more words.
+    Nor words or a non-title bracket after the final year.
     """
     if _RUN_ON_SHORT_TITLE_RE.search(short_name or ""):
         return False
     if _YEAR_GLUED_TAIL_RE.search(short_name or ""):
         return False
-    if _YEAR_THEN_WORDS_RE.search(short_name or ""):
+    _peeled, _last_year = _last_year_match(short_name or "")
+    if _last_year is not None and _YEAR_THEN_WORDS_RE.match(_peeled, _last_year.start()):
+        return False
+    if _bad_bracket_after_last_year(short_name or ""):
         return False
     if len(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", short_name or "")) >= 2:
-        return False
+        # A title that closes on its own instrument year may name an older Act.
+        # ``and 1860`` and a citation year with more words after it still block.
+        if not _closes_on_instrument_year(short_name or ""):
+            return False
     current_core = _title_core(current)
     short_core = _title_core(short_name)
     if not current_core or not short_core or current_core == short_core:
         return False
-    return short_core.startswith(current_core + " ") or short_core.startswith(current_core + "(")
+    return (
+        short_core.startswith(current_core + " ")
+        or short_core.startswith(current_core + "(")
+        or short_core.startswith(current_core + ",")
+    )
 
 
 def apply_rejected_assembly_title(
