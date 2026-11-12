@@ -929,6 +929,72 @@ def test_printed_commas_inside_a_title_stay(source_name):
     assert "(Salary, Allowances and Privileges)" in out["statute_name"]
 
 
+# A year glued to the next words, when that glue is not a 1–2 digit ``(N)``.
+# The body ends at the commencement sentence, or a blank line then section 2.
+YEAR_GLUED_TAILS = (
+    ".It extends to the whole of Pakistan.",
+    ".(Z) It extends to the whole of Pakistan.",
+    ".(l) It extends to the whole of Pakistan.",
+    ".(2 ) It extends to the whole of Pakistan.",
+    ".(ii) It extends to the whole of Pakistan.",
+    ".(a) It extends to the whole of Pakistan.",
+    ".(2a) It extends to the whole of Pakistan.",
+    ".(1A) It extends to the whole of Pakistan.",
+)
+
+
+def _finance_glued(verb: str, tail: str, section: str) -> str:
+    sentence = (
+        f"1. Short title and commencement.— This Act {verb} be called the Finance Act, 2024{tail}"
+    )
+    if section == "blank":
+        return sentence + "\n\n2. Amendment of the Income Tax Ordinance, 2001.\n"
+    return sentence + "\n"
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("tail", YEAR_GLUED_TAILS)
+def test_year_glued_tail_stops_at_the_year(source_name, listing, layout, verb, section, tail):
+    body = _finance_glued(verb, tail, section)
+    text = body if layout == "bare" else ACT_NO_HEADER + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=N6_FINANCE)
+    assert out["statute_name"] == N6_FINANCE
+    assert out["year_enacted"] == 2024
+    assert "extends" not in out["statute_name"].lower()
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    if listing == "good":
+        # The run-on must not replace the listing. Dropping the glued-tail
+        # guard makes this True even when the reader still stops at the year.
+        assert not _short_title_supersedes(N6_FINANCE, f"Finance Act 2024{tail}")
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ".(2) It extends to the whole of Pakistan.",
+        ".(3) It extends to the whole of Pakistan.",
+        ".(2) It shall come into force at once.",
+    ],
+)
+def test_clean_subsection_after_the_year_stays_exact(source_name, listing, layout, verb, tail):
+    body = _finance_glued(verb, tail, "end")
+    text = body if layout == "bare" else ACT_NO_HEADER + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=N6_FINANCE)
+    assert out["statute_name"] == N6_FINANCE
+    assert out["year_enacted"] == 2024
+    assert "extends" not in out["statute_name"].lower()
+    assert "shall" not in out["statute_name"].lower()
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
 def test_title_repair_does_not_disable_tls():
     blobs = [
         (REPO / "scraper" / "statute_quality" / "assembly_statute_title.py").read_text(encoding="utf-8"),

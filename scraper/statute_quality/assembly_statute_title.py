@@ -139,7 +139,12 @@ _RUN_ON_SHORT_TITLE_RE = re.compile(
 _CLAUSE_RUN_ON_RE = re.compile(
     r"(?i)(?:\bshall\b|(?<![\w(])\d{1,3}\.\s+[A-Z]|\.\s*\(\d{1,2}\))"
 )
-_YEAR_TOKEN_RE = re.compile(r"(\d{4})(\.?)(?:\((\d{1,2})\))?$")
+_YEAR_TOKEN_RE = re.compile(r"(\d{4})(.*)")
+# ``2024.It`` and ``2024.(Z)`` glue the next words onto the year.
+# ``2024.(2)`` and ``2024.(12)`` are a sub-clause, not this tail.
+_YEAR_GLUED_TAIL_RE = re.compile(
+    r"\b(?:1[89]\d{2}|20\d{2})(?:\.(?!\(\d{1,2}\))(?=\S)|(?=[A-Za-z]))"
+)
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -321,6 +326,8 @@ def _is_clause_like_name(name: str) -> bool:
     if _LEADING_INSTRUMENT_YEAR_RE.match(flat):
         return True
     if _CLAUSE_RUN_ON_RE.search(flat):
+        return True
+    if _YEAR_GLUED_TAIL_RE.search(flat):
         return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
@@ -579,13 +586,18 @@ def _subsection_end(token: str) -> bool:
 
 
 def _year_token(token: str) -> Optional[re.Match]:
-    """A year, optionally ``2024.`` or glued ``2024.(2)``."""
-    return _YEAR_TOKEN_RE.fullmatch((token or "").strip(","))
+    """A year token, including ``2024.``, ``2024.(2)``, and ``2024.It`` / ``2024.(Z)``."""
+    text = (token or "").strip().strip(",")
+    match = _YEAR_TOKEN_RE.fullmatch(text)
+    if not match or not _valid_year(int(match.group(1))):
+        return None
+    return match
 
 
 def _year_token_closes(token: str) -> bool:
+    """Anything glued after the year ends the title. A bare ``2024`` does not."""
     match = _year_token(token)
-    return bool(match and (match.group(2) or match.group(3)))
+    return bool(match and match.group(2))
 
 
 def _paren_continues_title(token: str) -> bool:
@@ -859,8 +871,11 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
 
     A short title that has already run into the next section (``2.``, ``Amendment of``,
     ``In the``, ``shall``, or a second year) must not replace a stored name.
+    A year glued to the next words (``2024.It``, ``2024.(Z)``) must not either.
     """
     if _RUN_ON_SHORT_TITLE_RE.search(short_name or ""):
+        return False
+    if _YEAR_GLUED_TAIL_RE.search(short_name or ""):
         return False
     if len(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", short_name or "")) >= 2:
         return False
