@@ -995,6 +995,66 @@ def test_clean_subsection_after_the_year_stays_exact(source_name, listing, layou
     assert not (out.get("field_evidence") or {}).get("name_unknown")
 
 
+# A year, then a comma, space, or dash, then more words, with no full stop.
+YEAR_THEN_WORDS_TITLES = (
+    ("Finance Act, 2024", 2024),
+    ("Pakistan Penal Code (Amendment) Act, 2024", 2024),
+    ("Elections (Amendment) Act, 2025", 2025),
+    ("Societies Registration Act, 1860", 1860),
+    ("National Agri-trade and Food Safety Authority Act, 2026", 2026),
+)
+YEAR_THEN_WORDS_TAILS = (
+    ", It extends to the whole of Pakistan.",
+    " , It extends to the whole of Pakistan.",
+    ", and it extends to the whole of Pakistan.",
+    ", and comes into force at once.",
+    ", lt extends to the whole of Pakistan.",
+    " It extends to the whole of Pakistan.",
+    "  It extends to the whole of Pakistan.",
+    " - It extends to the whole of Pakistan.",
+    " and extends to the whole of Pakistan.",
+)
+
+
+def _year_then_words_body(title: str, verb: str, tail: str, section: str) -> str:
+    sentence = (
+        f"1. Short title and commencement.— This Act {verb} be called the {title}{tail}"
+    )
+    if section == "blank":
+        return sentence + "\n\n2. Amendment of the Income Tax Ordinance, 2001.\n"
+    return sentence + "\n"
+
+
+def _year_then_words_run_on(title: str, year: int, tail: str) -> str:
+    core = title[: -len(str(year))].rstrip(" ,")
+    return f"{core} {year}{tail}"
+
+
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("tail", YEAR_THEN_WORDS_TAILS)
+@pytest.mark.parametrize("title,year", YEAR_THEN_WORDS_TITLES)
+def test_words_after_the_year_stop_at_the_year(
+    source_name, listing, layout, verb, section, tail, title, year
+):
+    body = _year_then_words_body(title, verb, tail, section)
+    header = f"ACT NO. I OF {year}\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == year
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    run_on = _year_then_words_run_on(title, year, tail)
+    assert is_rejected_assembly_statute_name(run_on)
+    if listing == "good":
+        # Dropping the words-after-year guard makes this True and the listing
+        # would be replaced by the run-on.
+        assert not _short_title_supersedes(title, run_on)
+
+
 def test_title_repair_does_not_disable_tls():
     blobs = [
         (REPO / "scraper" / "statute_quality" / "assembly_statute_title.py").read_text(encoding="utf-8"),

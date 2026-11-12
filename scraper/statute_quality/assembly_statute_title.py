@@ -145,6 +145,11 @@ _YEAR_TOKEN_RE = re.compile(r"(\d{4})(.*)")
 _YEAR_GLUED_TAIL_RE = re.compile(
     r"\b(?:1[89]\d{2}|20\d{2})(?:\.(?!\(\d{1,2}\))(?=\S)|(?=[A-Za-z]))"
 )
+# ``2024, It`` / ``2024 It`` / ``2024 - It``. A glued ``2024.It``, a clean
+# ``2024.(2)``, and a citation bracket ``1952 (XXXIX`` do not match.
+_YEAR_THEN_WORDS_RE = re.compile(
+    r"\b(?:1[89]\d{2}|20\d{2})(?:\s*,\s*\S|\s+-\s*\S|\s+[A-Za-z])"
+)
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -328,6 +333,8 @@ def _is_clause_like_name(name: str) -> bool:
     if _CLAUSE_RUN_ON_RE.search(flat):
         return True
     if _YEAR_GLUED_TAIL_RE.search(flat):
+        return True
+    if _YEAR_THEN_WORDS_RE.search(flat):
         return True
     if _CLAUSE_PREFIX_RE.match(flat) or _ROMAN_OF_RE.match(flat) or _starts_with_amendment_of(flat):
         return True
@@ -600,6 +607,32 @@ def _year_token_closes(token: str) -> bool:
     return bool(match and match.group(2))
 
 
+def _same_line_words_after_year(tokens: list[tuple[str, str]], index: int) -> bool:
+    """``2024, It``, ``2024 It``, or ``2024 - It`` on the called line.
+
+    A glued year, a clean ``.(N)``, a subsection, and ``(Amendment)`` do not.
+    A year with nothing after it, or only a following line, stays a whole title.
+    """
+    nxt = index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        nxt += 1
+    if nxt >= len(tokens) or not _year_token(tokens[nxt][1]):
+        return False
+    if _year_token_closes(tokens[nxt][1]):
+        return False
+    nxt += 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        nxt += 1
+    if nxt < len(tokens) and tokens[nxt][1] in {"-", "–", "—"}:
+        nxt += 1
+    if nxt >= len(tokens):
+        return False
+    gap, token = tokens[nxt]
+    if "\n" in gap or _paren_continues_title(token) or _subsection_end(token):
+        return False
+    return re.search(r"[A-Za-z]", token) is not None
+
+
 def _paren_continues_title(token: str) -> bool:
     """``(Amendment)`` continues a wrapped title. ``(2)`` does not."""
     text = token or ""
@@ -613,6 +646,8 @@ def _instrument_ends_title(tokens: list[tuple[str, str]], index: int) -> bool:
     is not cut off. A following year, period, ``(2)``, newline, price line, or
     the end of the text does end it.
     """
+    if _same_line_words_after_year(tokens, index):
+        return True
     nxt = index + 1
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
         nxt += 1
@@ -668,6 +703,8 @@ def _sentence_closed(tokens: list[tuple[str, str]], index: int) -> bool:
         nxt = index + 1
         if nxt < len(tokens) and _paren_continues_title(tokens[nxt][1]):
             return False
+        return True
+    if _same_line_words_after_year(tokens, index):
         return True
     year_at = _year_token_index(tokens, index)
     return year_at is not None and _year_token_closes(tokens[year_at][1])
@@ -872,10 +909,13 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
     A short title that has already run into the next section (``2.``, ``Amendment of``,
     ``In the``, ``shall``, or a second year) must not replace a stored name.
     A year glued to the next words (``2024.It``, ``2024.(Z)``) must not either.
+    Nor a year followed by a comma, space, or dash and more words.
     """
     if _RUN_ON_SHORT_TITLE_RE.search(short_name or ""):
         return False
     if _YEAR_GLUED_TAIL_RE.search(short_name or ""):
+        return False
+    if _YEAR_THEN_WORDS_RE.search(short_name or ""):
         return False
     if len(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", short_name or "")) >= 2:
         return False
