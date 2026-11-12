@@ -308,6 +308,9 @@ def test_agriculture_quetta_keeps_sections_1_through_58_and_the_schedule():
     assert list(bodies) == [str(number) for number in range(1, 59)] + ["Schedule"]
     assert len(bodies["Schedule"]) > 10000
     assert "FIRST STATUTES" in bodies["Schedule"] or "First Statutes" in bodies["Schedule"]
+    # Subsection (2) is a numbered clause. Dropping the any_shall check deletes it.
+    assert "All regular employees of Balochistan Agriculture College" in bodies["4"]
+    assert len(bodies["4"]) > 1500
 
 
 def test_na_societies_text_stays_at_52_without_the_section_mark_guard():
@@ -355,3 +358,173 @@ def test_finance_act_2020_keeps_94_sections_past_the_first_schedule():
     assert numbers == _FINANCE_2020_NUMBERS
     assert len(numbers) == 94
     assert "Schedule" not in numbers
+
+
+_IST_BODY_LENGTHS = {
+    "3": 1461,
+    "10": 264,
+    "12": 2971,
+    "18": 733,
+    "24": 1887,
+    "25": 1423,
+    "40": 255,
+}
+_NEWSPAPER_NUMBERS = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16", "17", "19",
+    "20", "21", "22", "23",
+]
+_FSF_NUMBERS = [
+    "1", "2", "3", "5", "6", "7", "9", "10", "12", "13", "14", "15", "16", "17",
+    "18", "19", "2O", "21", "22",
+]
+
+
+def _ist_with_short_title(sentence: str) -> dict[str, str]:
+    text = (FIXTURES / "pab_ist_bahawalpur_2018.txt").read_text(encoding="utf-8")
+    original = "This Act may be called"
+    assert text.count(original) == 1
+    text = text.replace(original, sentence, 1)
+    return {
+        section["section_number"]: section["section_text"]
+        for section in split_into_sections(text, IST)
+    }
+
+
+def _assert_ist_bodies_survive(bodies: dict[str, str]) -> None:
+    for number, length in _IST_BODY_LENGTHS.items():
+        assert number in bodies
+        assert len(bodies[number]) == length
+    assert len(bodies["Schedule"]) <= 12000
+    assert "Incorporation" not in bodies["Schedule"]
+    assert "Faculties" in bodies["Schedule"]
+    assert bodies["Schedule"].lstrip().startswith("The First Statutes of the")
+
+
+def test_ist_may_he_called_does_not_restore_the_contents_wipe():
+    bodies = _ist_with_short_title("This Act may he called")
+
+    _assert_ist_bodies_survive(bodies)
+
+
+def test_ist_may_be_cited_as_keeps_the_operative_sections():
+    bodies = _ist_with_short_title("This Act may be cited as")
+
+    _assert_ist_bodies_survive(bodies)
+
+
+def test_ist_shall_be_known_as_keeps_the_operative_sections():
+    bodies = _ist_with_short_title("This Act shall be known as")
+
+    _assert_ist_bodies_survive(bodies)
+
+
+def _contents_then_body(short_title_sentence: str) -> dict[str, str]:
+    text = f"""
+CONTENTS
+1.
+
+Short title.
+
+2.
+
+Definitions.
+
+3.
+
+Repeal.
+SCHEDULE
+FIRST STATUTES
+1. Faculties. There shall be a Faculty of Arts and a Dean of that Faculty.
+1. Short title. {short_title_sentence} and it shall come into force at once.
+2. Definitions. In this Act, Board means the Board of the College established under this Act for the province.
+3. Repeal. The Ordinance of 2010 is hereby repealed and this Act shall prevail over that Ordinance.
+"""
+    return {
+        section["section_number"]: section["section_text"]
+        for section in split_into_sections(text, "The Example College Act, 2018")
+    }
+
+
+def test_cited_as_after_a_contents_list_is_not_one_schedule():
+    bodies = _contents_then_body("This Act may be cited as the Example College Act, 2018")
+    operative = "\n".join(text for number, text in bodies.items() if number != "Schedule")
+
+    assert "may be cited as the Example College Act" in operative
+    assert "may be cited as the Example College Act" not in bodies.get("Schedule", "")
+    assert len(bodies.get("Schedule", "")) < 500
+
+
+def test_known_as_after_a_contents_list_is_not_one_schedule():
+    bodies = _contents_then_body("This Act shall be known as the Example College Act, 2018")
+    operative = "\n".join(text for number, text in bodies.items() if number != "Schedule")
+
+    assert "shall be known as the Example College Act" in operative
+    assert "shall be known as the Example College Act" not in bodies.get("Schedule", "")
+    assert len(bodies.get("Schedule", "")) < 500
+
+
+def test_preamble_may_be_called_does_not_approve_a_contents_cut():
+    text = """
+Preamble. For the reasons in this Act may be called a scheme of the Institute, the following is enacted.
+CONTENTS
+1.
+
+Short title.
+
+2.
+
+Definitions.
+
+3.
+
+Incorporation.
+
+4.
+
+Powers.
+
+5.
+
+Repeal.
+SCHEDULE
+FIRST STATUTES
+1. Faculties. There shall be a Faculty of Arts and a Board of each Faculty of the Institute.
+1. Short title. The Institute is established under this instrument and it shall come into force at once across the province.
+2. Definitions. In this instrument, Board means the Board of the Institute established for the province and its campuses.
+3. Incorporation. The Institute shall be a body corporate with perpetual succession and a common seal and may sue in its own name.
+4. Powers. The Institute shall have the power to provide teaching and research and to award degrees of the Institute to its students.
+5. Repeal. The Ordinance of 2010 is hereby repealed and this instrument shall prevail over that Ordinance from the commencement date.
+"""
+    bodies = {
+        section["section_number"]: section["section_text"]
+        for section in split_into_sections(text, "The Example Institute Act, 2018")
+    }
+
+    assert "body corporate" in bodies["3"]
+    assert "award degrees" in bodies["4"]
+    assert "body corporate" not in bodies.get("Schedule", "")
+    assert len(bodies.get("Schedule", "")) < 500
+
+
+def test_newspaper_employees_1973_keeps_mains_section_list_including_s1():
+    """OCR closers outside a dense marginal run are not sections.
+
+    Accepting them everywhere drops section 1 and the list opens at 13.
+    """
+    text = (FIXTURES / "newspaper_employees_1973.txt").read_text(encoding="utf-8")
+    sections = split_into_sections(text, "Newspaper Employees (Conditions of Service) Act, 1973")
+    numbers = [section["section_number"] for section in sections]
+
+    assert numbers == _NEWSPAPER_NUMBERS
+    assert numbers[0] == "1"
+    assert sections[0]["section_text"].lstrip().startswith("l. Sbort title")
+
+
+def test_federal_security_force_1973_keeps_mains_section_list_including_s1():
+    text = (FIXTURES / "federal_security_force_1973.txt").read_text(encoding="utf-8")
+    sections = split_into_sections(text, "Federal Security Force Act, 1973")
+    numbers = [section["section_number"] for section in sections]
+
+    assert numbers == _FSF_NUMBERS
+    assert numbers[0] == "1"
+    assert "Security Force Act" in sections[0]["section_text"]

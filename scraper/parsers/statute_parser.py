@@ -1573,9 +1573,20 @@ _PAB_FIRST_SCHEDULE_LINE_RE = re.compile(
 _PAB_BARE_SCHEDULE_LINE_RE = re.compile(r"(?i)^schedule\b\.?$")
 # ``SCHEDULE,`` / ``i. Faculties`` is the University of Balochistan statutes tail.
 _PAB_OCR_SCHEDULE_COMMA_RE = re.compile(r"(?i)^schedule\s*,$")
+# ``may he called`` is one-letter OCR of ``may be called``. ``cited as`` and
+# ``known as`` are the other short-title wordings. A contents stub that only
+# says ``Short title`` does not match.
 _REAL_SHORT_TITLE_BODY_RE = re.compile(
-    r"(?i)\b(?:this|the)\s+(?:act|ordinance|order)\s+(?:may|shall)\s+be\s+called\b"
+    r"(?i)\b(?:this|the)\s+(?:act|ordinance|order)\s+"
+    r"(?:"
+    r"(?:may|shall)\s+be\s+called\b"
+    r"|may\s+he\s+called\b"
+    r"|may\s+b[ec]\s+cal\w*"
+    r"|may\s+be\s+cited\s+as\b"
+    r"|shall\s+be\s+known\s+as\b"
+    r")"
 )
+_OCR_SECTION_ONE_LINE_RE = re.compile(r"(?m)^[ \t]*[lL]\s*\.\s+\S")
 _PAB_INLINE_STATUTES_RE = re.compile(
     r"(?i)(?<=[.!?;:])[ \t]+SCHEDULE[ \t]+THE[ \t]+FIRST[ \t]+STATU(?:TES?|E)\b"
 )
@@ -1635,18 +1646,101 @@ def _schedule_cut_follows_last_section(text: str, pos: int) -> bool:
     return not any(number > last for number in later)
 
 
-def _real_short_title_body_precedes(text: str, pos: int) -> bool:
-    """The operative short-title sentence is before this cut.
+def _contiguous_rising_runs(text: str) -> List[List[Tuple[int, int]]]:
+    """Strictly rising section-number runs, in document order."""
+    positions = _operative_section_positions(text)
+    if not positions:
+        return []
+    runs: List[List[Tuple[int, int]]] = []
+    current = [positions[0]]
+    for start, number in positions[1:]:
+        if number > current[-1][1]:
+            current.append((start, number))
+            continue
+        runs.append(current)
+        current = [(start, number)]
+    runs.append(current)
+    return runs
 
-    A contents stub (``Short title and commencement.``) is not that sentence.
-    An excerpt that never prints ``may be called`` can still end in a
-    statutes tail. When the sentence exists, a cut in front of it is the
-    contents list, not the tail.
+
+def _body_run_start(text: str) -> Optional[int]:
+    """Start of the rising run that holds the operative text.
+
+    The contents list and the Act can both count 1..N. The Act's run covers
+    the body; the contents run is a short span of stubs. A cut in front of
+    that body run is the contents list.
     """
-    found = _REAL_SHORT_TITLE_BODY_RE.search(text or "")
-    if found is None:
-        return True
-    return found.start() < pos
+    runs = _contiguous_rising_runs(text)
+    if not runs:
+        return None
+    body = max(runs, key=lambda run: (run[-1][0] - run[0][0], len(run)))
+    return body[0][0]
+
+
+def _later_section_positions(text: str, pos: int) -> List[Tuple[int, int]]:
+    """Section numbers after ``pos``, with an ``l.`` line read as section 1."""
+    found: Dict[int, int] = {
+        start: number
+        for start, number in _operative_section_positions(text)
+        if start > pos
+    }
+    for match in _OCR_SECTION_ONE_LINE_RE.finditer(text or "", pos):
+        found.setdefault(match.start(), 1)
+    return sorted(found.items())
+
+
+def _restarting_body_follows(text: str, pos: int) -> bool:
+    """A second 1..N run, with real sentences, follows this cut.
+
+    The contents schedule is that shape: stubs, then the Act starts again at
+    ``1`` or ``l.`` and climbs back to the contents high. Schedule items that
+    stay below the last section are not this run.
+    """
+    earlier = [number for start, number in _operative_section_positions(text) if start < pos]
+    high = _longest_increasing_end(earlier)
+    if high is None:
+        return False
+    later = _later_section_positions(text, pos)
+    for index, (start, number) in enumerate(later):
+        if number != 1:
+            continue
+        end = 1
+        previous = start
+        has_body = False
+        for start2, number2 in later[index + 1 :]:
+            if number2 <= end:
+                continue
+            if start2 - previous >= 80:
+                has_body = True
+            end = number2
+            previous = start2
+            if end >= high and has_body:
+                return True
+    return False
+
+
+def _real_short_title_body_precedes(text: str, pos: int) -> bool:
+    """The operative Act is already under way before this cut.
+
+    Missing the exact words ``may be called`` does not allow the cut. OCR
+    ``may he called`` and the wordings ``cited as`` / ``known as`` are the
+    same sentence. A preamble sentence before the contents list is not
+    enough: the cut still has to sit after the Act's own rising run, and a
+    second 1..N run after the cut is the Act, not the tail. An excerpt that
+    never prints a short-title sentence can still end in a tail that follows
+    its only rising run.
+    """
+    if _restarting_body_follows(text, pos):
+        return False
+    run_start = _body_run_start(text)
+    if run_start is not None and pos < run_start:
+        return False
+    matches = list(_REAL_SHORT_TITLE_BODY_RE.finditer(text or ""))
+    if any(match.start() > pos for match in matches):
+        return False
+    if matches:
+        return any(match.start() < pos for match in matches)
+    return True
 
 
 def _peel_trailing_schedule(text: str) -> Tuple[str, str]:
