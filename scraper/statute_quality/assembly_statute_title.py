@@ -146,7 +146,7 @@ _YEAR_GLUED_TAIL_RE = re.compile(
     r"\b(?:1[89]\d{2}|20\d{2})(?:\.(?!\(\d{1,2}\))(?=\S)|(?=[A-Za-z]))"
 )
 # ``2024, It`` / ``2024 It`` / ``2024 - It``. A glued ``2024.It``, a clean
-# ``2024.(2)``, and a citation bracket ``1952 (XXXIX`` do not match.
+# ``2024.(2)``, and a parenthetical citation after the year do not match.
 _YEAR_THEN_WORDS_RE = re.compile(
     r"\b(?:1[89]\d{2}|20\d{2})(?:\s*,\s*\S|\s+-\s*\S|\s+[A-Za-z])"
 )
