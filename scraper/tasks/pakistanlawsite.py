@@ -65,6 +65,7 @@ from scraper.extractors.judgment_guards import (
 from scraper.extractors.pls_failure_page import detect_pls_case_detail_failure
 from scraper.pls_search_harvest_core import (
     annexure_short_text_reason,
+    citation_lookup_keys,
     is_annexure_stub_row,
     search_gap_detail_result,
 )
@@ -103,7 +104,12 @@ DEFAULT_REPORTER_SHARD_TITLES = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "C
 CONFIRMED_CITATION_GRID_SEEK_MODES = frozenset({"datatable", "dom_absolute"})
 
 
+_PCRLJN_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\.?N\b", re.IGNORECASE)
 _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
+# N glued to the closing parenthesis. "PLC (CS) N" (a separated N) is the note word, not this code.
+_PLC_CS_NOTES_RE = re.compile(r"PLC\s*\(\s*C\.?\s*S\.?\s*\)N\b", re.IGNORECASE)
+# Routes that open a case page go through the same empty-body and non-judgment checks.
+CASE_DETAIL_HARVESTS = frozenset({"search_gap", "index_search"})
 _REPORTER_BY_UPPER: Dict[str, str] = {}
 for _reporter in KNOWN_REPORTERS:
     _REPORTER_BY_UPPER.setdefault(_reporter.upper(), _reporter)
@@ -170,6 +176,10 @@ def reporter_from_citation(citation: str) -> str:
     if normalized and normalized != raw:
         candidates.insert(0, normalized)
     for text in candidates:
+        if _PLC_CS_NOTES_RE.search(text):
+            return "PLC(CS)N"
+        if _PCRLJN_RE.search(text):
+            return "PCrLJN"
         if _PCRLJ_RE.search(text):
             return "PCrLJ"
         for token in re.findall(r"[A-Za-z][A-Za-z.]*", text):
@@ -1260,7 +1270,6 @@ class PakistanLawSitePipeline:
             row = rows[row_idx]
             processed_rows_total = idx + 1
             citation_key = (row.get("citation") or "").strip()
-            citation_norm = normalise_citation(citation_key) if citation_key else ""
             if self.reporter_shard is not None:
                 row_reporter = reporter_from_citation(citation_key)
                 if not self._row_in_shard(row_reporter):
@@ -1277,15 +1286,10 @@ class PakistanLawSitePipeline:
                         details_since_flush = 0
                         staged_since_flush = 0
                     continue
-            is_full_ready = (citation_norm and citation_norm in full_ready_citations) or (
-                citation_key and citation_key in full_ready_citations
-            )
-            is_known = (citation_norm and citation_norm in known_citations) or (
-                citation_key and citation_key in known_citations
-            )
-            is_staged = (citation_norm and citation_norm in staged_citations) or (
-                citation_key and citation_key in staged_citations
-            )
+            lookup = citation_lookup_keys(citation_key)
+            is_full_ready = bool(lookup & full_ready_citations)
+            is_known = bool(lookup & known_citations)
+            is_staged = bool(lookup & staged_citations)
             if is_full_ready or is_staged:
                 if is_full_ready:
                     known_citation_skips += 1
@@ -1366,7 +1370,14 @@ class PakistanLawSitePipeline:
                 "absolute_row_index": snapshot_start_row + row_idx,
                 "slot": self.runner.browser.slot_number if self.runner.browser else None,
             }
-            refetch_ids = list({*refetch_staging_ids.get(citation_norm, []), *refetch_staging_ids.get(citation_key, [])})
+            refetch_ids = []
+            seen_refetch = set()
+            for key in lookup:
+                for item in refetch_staging_ids.get(key, []):
+                    if item in seen_refetch:
+                        continue
+                    seen_refetch.add(item)
+                    refetch_ids.append(item)
             if refetch_ids:
                 # Count the attempt before fetching, whatever comes back: a page whose bytes change on every
                 # fetch creates a new staging row each time and would otherwise be refetched on every lap.
@@ -1514,6 +1525,28 @@ class PakistanLawSitePipeline:
         await self._charge_page()
         return await self.runner.run(op)
 
+    async def fetch_index_surface(self, request: Dict[str, Any]) -> PageResult:
+        """Open one IndexSearch page. Selectors and the path live in scraper/pls_index_search.py.
+
+        A Load More URL is fetched directly. The first page of a volume is the form named there.
+        """
+        from scraper.pls_index_search import absolute_index_url, index_search_form_map
+
+        async def op(browser: Browser) -> PageResult:
+            target = request.get("url")
+            if target:
+                page = await browser.goto(absolute_index_url(str(target)))
+                raise_for_verdict(page)
+                return page
+            page = await browser.goto(absolute_index_url(""))
+            raise_for_verdict(page)
+            page = await browser.submit_search(index_search_form_map(), dict(request.get("form") or {}))
+            raise_for_verdict(page)
+            return page
+
+        await self._charge_page()
+        return await self.runner.run(op)
+
     async def download(self, url: str) -> bytes:
         async def op(browser: Browser) -> bytes:
             return await browser.download(url)
@@ -1649,7 +1682,7 @@ class PakistanLawSitePipeline:
         failure = detect_pls_case_detail_failure(text)
         if failure:
             return await self._mark_case_detail_fetch_error(page, route, row, failure, html_prov)
-        if str((route or {}).get("harvest") or "") == "search_gap":
+        if str((route or {}).get("harvest") or "") in CASE_DETAIL_HARVESTS:
             # A 1-2 digit annexure whose body is only a short "Versus" stub is not
             # staged. The harvester counts it known only after a second miss.
             if is_annexure_stub_row(row):
