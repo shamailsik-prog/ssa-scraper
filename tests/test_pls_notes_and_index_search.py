@@ -806,6 +806,12 @@ async def _promote_incomplete(db, login_source, held: str, incoming: str, report
     [
         ("2017 YLR Note 99", "2017 YLRN 99", "YLR"),
         ("2017 YLRN 99", "2017 YLR Note 99", "YLRN"),
+        ("2017 CLC Note 99", "2017 CLCN 99", "CLC"),
+        ("2017 CLCN 99", "2017 CLC Note 99", "CLCN"),
+        ("2017 PCrLJ Note 99", "2017 PCrLJN 99", "PCrLJ"),
+        ("2017 PCrLJN 99", "2017 PCrLJ Note 99", "PCrLJN"),
+        ("2017 PLC Note 99", "2017 PLCN 99", "PLC"),
+        ("2017 PLCN 99", "2017 PLC Note 99", "PLCN"),
         ("2019 PLC (CS) Note 49", "2019 PLC(CS)N 49", "PLC (CS)"),
         ("2019 PLC(CS)N 49", "2019 PLC (CS) Note 49", "PLC(CS)N"),
     ],
@@ -1047,3 +1053,136 @@ async def test_the_tick_commits_the_count_after_the_first_request(db, login_sour
     first = merges[0][INDEX_SEARCH_STATE_KEY]
     assert int(first.get("day_requests") or 0) >= 1
     assert result["state"]["day_requests"] == 1
+
+
+# A complete held row is at least the promotion full-ready length and has judges.
+# A longer incoming capture must not replace it, under either Notes spelling.
+_NOTES_FAMILIES = (
+    ("YLR", "YLRN", "YLR"),
+    ("CLC", "CLCN", "CLC"),
+    ("PCrLJ", "PCrLJN", "PCrLJ"),
+    ("PLC", "PLCN", "PLC"),
+    ("PLC (CS)", "PLC(CS)N", "PLC (CS)"),
+)
+_FULLER_PAD = "<p>" + ("Further reasons are recorded in this paragraph. " * 300) + "</p></body>"
+
+
+def _notes_forms(family):
+    parent, code, word = family
+    return f"2017 {parent} 99", f"2017 {code} 99", f"2017 {word} Note 99"
+
+
+_NOTES_ALIAS_PAIRS = []
+for _family in _NOTES_FAMILIES:
+    _parent, _glued, _word = _notes_forms(_family)
+    _NOTES_ALIAS_PAIRS.append((_glued, _word))
+    _NOTES_ALIAS_PAIRS.append((_word, _glued))
+
+_NOTES_SAME_SPELLINGS = []
+for _family in _NOTES_FAMILIES:
+    _parent, _glued, _word = _notes_forms(_family)
+    _NOTES_SAME_SPELLINGS.append(_glued)
+    _NOTES_SAME_SPELLINGS.append(_word)
+
+
+async def _held_complete(db, login_source, canonical):
+    from scraper.fetchers import canonical_text_hash
+    from scraper.models import Citation, Judgment
+
+    text = "Held complete body. " + ("The court dismissed the appeal on merits. " * 140)
+    row = Judgment(
+        canonical_citation=canonical,
+        case_title="Held",
+        court_name="Lahore High Court",
+        reporter="HELDREP",
+        full_text=text,
+        full_text_hash=canonical_text_hash(text),
+        judge_names=["Held Judge"],
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url=f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=held-{canonical.replace(' ', '')}",
+        confidence_score=0.9,
+    )
+    db.add(row)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=row.id,
+            citation_string=canonical,
+            raw_string=canonical,
+            reporter="HELDREP",
+            year=2017,
+            page=99,
+            is_primary=True,
+        )
+    )
+    await db.flush()
+    return text
+
+
+async def _promote_fuller(db, login_source, incoming):
+    from scraper.fetchers import record_provenance, stage_judgment
+    from scraper.parsers.text_cleaner import clean_html
+    from scraper.tasks.promotion import promote_judgment_staging
+    from tests.fixtures import judgment_html
+
+    detail_url = f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=in-{incoming.replace(' ', '')}"
+    full_html = judgment_html(incoming, title="Incoming Copy").replace("</body>", _FULLER_PAD)
+    full_text = clean_html(full_html)
+    prov = await record_provenance(
+        db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html"
+    )
+    staging = await stage_judgment(
+        db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url
+    )
+    staging.extracted_citation = incoming
+    staging.reconciled_json = {
+        "citations": [incoming],
+        "court": "Lahore High Court",
+        "year": 2017,
+        "case_title": "Incoming Copy",
+        "judge_names": ["A Judge"],
+        "document_type": "full_judgment",
+    }
+    staging.status = "extracted"
+    staging.confidence_score = 0.99
+    result = await promote_judgment_staging(db, staging)
+    return result, full_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held,incoming", _NOTES_ALIAS_PAIRS)
+async def test_r3_complete_alias_never_overwritten(db, login_source, held, incoming):
+    from sqlalchemy import select
+
+    from scraper.models import Judgment
+
+    held_text = await _held_complete(db, login_source, held)
+    result, incoming_text = await _promote_fuller(db, login_source, incoming)
+    rows = (await db.execute(select(Judgment))).scalars().all()
+    assert len(incoming_text) > len(held_text)
+    assert result == "duplicate"
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.full_text == held_text
+    assert row.canonical_citation == held
+    assert row.reporter == "HELDREP"
+    assert row.judge_names == ["Held Judge"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", _NOTES_SAME_SPELLINGS)
+async def test_r3_complete_same_spelling_baseline(db, login_source, held):
+    from sqlalchemy import select
+
+    from scraper.models import Judgment
+
+    held_text = await _held_complete(db, login_source, held)
+    result, _incoming_text = await _promote_fuller(db, login_source, held)
+    rows = (await db.execute(select(Judgment))).scalars().all()
+    assert result == "duplicate"
+    assert len(rows) == 1
+    assert rows[0].full_text == held_text
+    assert rows[0].judge_names == ["Held Judge"]
+    assert rows[0].canonical_citation == held
+    assert rows[0].reporter == "HELDREP"
