@@ -13,7 +13,7 @@ from scraper.parsers.pls_text_encoding import classify_mojibake, strip_mojibake_
 
 SHORT_TEXT_MIN_CHARS = 500
 _REPORTED_CITATION = re.compile(
-    r"\b(PLD|SCMR|CLC|YLR|CLD|PLC|MLD|PCrLJ|PTD|GBLR)\b",
+    r"\b(PLC\(CS\)N|PCrLJN|CLCN|YLRN|PLCN|PLD|SCMR|CLC|YLR|CLD|PLC|MLD|PCrLJ|PTD|GBLR)\b",
     re.I,
 )
 

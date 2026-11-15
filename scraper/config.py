@@ -29,7 +29,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
-KNOWN_REPORTERS = ("PLD", "SCMR", "CLC", "PCrLJ", "PTD", "PLC", "CLD", "YLR", "MLD", "GBLR", "PLJ", "NLR", "KLR", "PCRLJ")
+# Notes editions (field list V5, 2026-11-15) are their own journals. A glued N is not
+# the parent title: CLCN is not CLC, YLRN is not YLR, and PLC(CS)N is not PLC(CS).
+NOTES_EDITION_REPORTERS = ("CLCN", "YLRN", "PCrLJN", "PLCN", "PLC(CS)N")
+KNOWN_REPORTERS = (
+    "PLD",
+    "SCMR",
+    "CLC",
+    "CLCN",
+    "PCrLJ",
+    "PCrLJN",
+    "PTD",
+    "PLC",
+    "PLCN",
+    "PLC(CS)N",
+    "CLD",
+    "YLR",
+    "YLRN",
+    "MLD",
+    "GBLR",
+    "PLJ",
+    "NLR",
+    "KLR",
+    "PCRLJ",
+)
 # Site journal codes: 2–8 letters, or that stem plus one parenthetical series and an
 # optional trailing letter. PLC(CS), PLC(CS)N and the printed PLC (C.S.) are real
 # dropdown codes; digits and other punctuation are not.
@@ -490,6 +513,70 @@ class Settings(BaseSettings):
         default=0,
         description="Optional per-query page ceiling for one runner invocation (0 = enumerate all pages).",
     )
+    # IndexSearch (plan V8). Off by default: a live page has not confirmed the selectors.
+    PLS_INDEX_SEARCH_ENABLED: bool = Field(
+        default=False,
+        description="When true, Celery Beat may schedule pls_index_search_tick. Off leaves the live harvest unchanged.",
+    )
+    PLS_INDEX_SEARCH_SCHEDULE_SECONDS: int = Field(
+        default=3600,
+        description="Beat interval for pls_index_search_tick when PLS_INDEX_SEARCH_ENABLED is true.",
+    )
+    PLS_INDEX_SEARCH_JOURNALS: str = Field(
+        default="",
+        description="Comma list of IndexSearch journals. Blank = subscribed reporters plus the Notes edition of each subscribed parent. Blank subscribed list = the source idles.",
+    )
+    PLS_INDEX_SEARCH_COURT_JOURNALS: str = Field(
+        default="PLD",
+        description="Comma list of journals whose index is walked per court. Other journals are journal x year only.",
+    )
+    PLS_INDEX_SEARCH_COURTS: str = Field(
+        default=(
+            "SUPREME-COURT,LAHORE-HIGH-COURT-LAHORE,KARACHI-HIGH-COURT-SINDH,PESHAWAR-HIGH-COURT,"
+            "ISLAMABAD,FEDERAL-SERVICE-TRIBUNAL,SUPREME-COURT-AZAD-KASHMIR,FEDERAL-SHARIAT-COURT"
+        ),
+        description="Court slugs for journals in PLS_INDEX_SEARCH_COURT_JOURNALS. Field list V4.",
+    )
+    PLS_INDEX_SEARCH_PAGE_SIZE: int = Field(
+        default=50,
+        description="Documented IndexSearch page size (Load More). The parser reads every row on the page.",
+    )
+    PLS_INDEX_SEARCH_MAX_PAGES_PER_TICK: int = Field(
+        default=1,
+        description="Index pages opened in one tick. One page, then the tick stops so search harvest can take the login.",
+    )
+    PLS_INDEX_SEARCH_DELAY_MIN: float = Field(
+        default=15.0,
+        description="Minimum seconds before each IndexSearch request, before the login-session delay.",
+    )
+    PLS_INDEX_SEARCH_DELAY_MAX: float = Field(
+        default=35.0,
+        description="Maximum seconds before each IndexSearch request. The wait is chosen uniformly in the min/max range.",
+    )
+    PLS_INDEX_SEARCH_REQUESTS_PER_DAY: int = Field(
+        default=30,
+        description="IndexSearch requests (index pages and judgment pages) allowed per calendar day. The tick stops before the next request when this is spent.",
+    )
+    PLS_INDEX_SEARCH_REQUESTS_PER_MONTH: int = Field(
+        default=400,
+        description="IndexSearch requests allowed per calendar month.",
+    )
+    PLS_INDEX_SEARCH_SECONDS_PER_DAY: float = Field(
+        default=1200.0,
+        description="Seconds of IndexSearch delay plus request time allowed per calendar day.",
+    )
+    PLS_INDEX_SEARCH_SECONDS_PER_MONTH: float = Field(
+        default=7200.0,
+        description="Seconds of IndexSearch delay plus request time allowed per calendar month.",
+    )
+    PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS: float = Field(
+        default=300.0,
+        description="First wait after an IndexSearch error or login challenge. Each further failure doubles it.",
+    )
+    PLS_INDEX_SEARCH_BACKOFF_CAP_SECONDS: float = Field(
+        default=7200.0,
+        description="Ceiling on the IndexSearch error backoff.",
+    )
     PLS_BROWSER_RECYCLE_WINDOWS: int = Field(
         default=12,
         description="Recycle the Playwright browser after this many search-harvest windows/pages.",
@@ -799,6 +886,16 @@ class Settings(BaseSettings):
             raise ValueError("SPOT_CHECK_SCHEDULE_SECONDS must be positive and SPOT_CHECK_JUDGMENTS/STATUTES >= 0")
         if self.PLS_SEARCH_HARVEST_TAKEOVER_MINUTES < 0:
             raise ValueError("PLS_SEARCH_HARVEST_TAKEOVER_MINUTES must be >= 0")
+        if self.PLS_INDEX_SEARCH_DELAY_MIN < 0 or self.PLS_INDEX_SEARCH_DELAY_MAX < self.PLS_INDEX_SEARCH_DELAY_MIN:
+            raise ValueError("PLS_INDEX_SEARCH_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
+        if self.PLS_INDEX_SEARCH_REQUESTS_PER_DAY <= 0 or self.PLS_INDEX_SEARCH_REQUESTS_PER_MONTH < self.PLS_INDEX_SEARCH_REQUESTS_PER_DAY:
+            raise ValueError("PLS_INDEX_SEARCH_REQUESTS_PER_MONTH must be >= PLS_INDEX_SEARCH_REQUESTS_PER_DAY, both positive")
+        if self.PLS_INDEX_SEARCH_SECONDS_PER_DAY <= 0 or self.PLS_INDEX_SEARCH_SECONDS_PER_MONTH < self.PLS_INDEX_SEARCH_SECONDS_PER_DAY:
+            raise ValueError("PLS_INDEX_SEARCH_SECONDS_PER_MONTH must be >= PLS_INDEX_SEARCH_SECONDS_PER_DAY, both positive")
+        if self.PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS <= 0 or self.PLS_INDEX_SEARCH_BACKOFF_CAP_SECONDS < self.PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS:
+            raise ValueError("PLS_INDEX_SEARCH_BACKOFF_CAP_SECONDS must be >= PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS, both positive")
+        if self.PLS_INDEX_SEARCH_PAGE_SIZE <= 0 or self.PLS_INDEX_SEARCH_MAX_PAGES_PER_TICK <= 0 or self.PLS_INDEX_SEARCH_SCHEDULE_SECONDS <= 0:
+            raise ValueError("PLS_INDEX_SEARCH page size, pages per tick, and schedule must be positive")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:

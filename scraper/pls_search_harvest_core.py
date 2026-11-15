@@ -244,18 +244,64 @@ def unmapped_harvest_reason(search_map: Dict[str, Any], query_json: Dict[str, An
 
 CASE_KEY_PREFIX = "case:"
 
+# A glued notes-edition code and the older "Note" word are one citation for lookup.
+# The stored string of the word form is left as it was; both keys count as held.
+_NOTES_CODE_OF_WORD = {
+    "CLC": "CLCN",
+    "YLR": "YLRN",
+    "PCrLJ": "PCrLJN",
+    "PLC": "PLCN",
+    "PLC (CS)": "PLC(CS)N",
+}
+_NOTES_WORD_OF_CODE = {code: word for word, code in _NOTES_CODE_OF_WORD.items()}
+_GLUED_NOTES_KEY = re.compile(
+    r"^(?P<year>(?:19|20)\d{2}) (?P<code>PLC\(CS\)N|PCrLJN|CLCN|YLRN|PLCN) (?P<page>\d+[A-Z]?)$"
+)
+_NOTE_WORD_KEY = re.compile(
+    r"^(?P<year>(?:19|20)\d{2}) (?P<parent>PLC \(CS\)|PCrLJ|CLC|YLR|PLC) Note (?P<page>\d+[A-Z]?)$"
+)
+
+
+def notes_edition_alias_keys(citation: str) -> Set[str]:
+    """The other stored spelling of a notes-edition citation, if this is one."""
+    text = re.sub(r"\s+", " ", (citation or "").strip())
+    glued = _GLUED_NOTES_KEY.match(text)
+    if glued:
+        word = _NOTES_WORD_OF_CODE[glued.group("code")]
+        return {f"{glued.group('year')} {word} Note {glued.group('page')}"}
+    word = _NOTE_WORD_KEY.match(text)
+    if word:
+        code = _NOTES_CODE_OF_WORD[word.group("parent")]
+        return {f"{word.group('year')} {code} {word.group('page')}"}
+    return set()
+
+
+def citation_lookup_keys(citation: str) -> Set[str]:
+    """Raw citation, its normalised form, and the notes-edition spelling alias."""
+    keys: Set[str] = set()
+    raw = str(citation or "").strip()
+    if not raw:
+        return keys
+    keys.add(raw)
+    normalized = normalise_citation(raw)
+    if normalized:
+        keys.add(normalized)
+        keys |= notes_edition_alias_keys(normalized)
+    keys |= notes_edition_alias_keys(raw)
+    return {key for key in keys if key}
+
 
 def citation_keys_for_row(row: Dict[str, Any]) -> Set[str]:
     """Keys that identify a result row's judgment: its citation (raw and normalised) and, from its detail link, its
     CaseName ("case:2025L8"). Search-harvest rows carry no citation column, so without the CaseName every row
-    already held looked new and was fetched again."""
+    already held looked new and was fetched again. A notes-edition alias is included so YLRN and "YLR Note"
+    are one held judgment. Parallel citations passed on the row are included the same way."""
     keys: Set[str] = set()
     raw = str(row.get("citation") or "").strip()
     if raw:
-        keys.add(raw)
-        normalized = normalise_citation(raw)
-        if normalized:
-            keys.add(normalized)
+        keys |= citation_lookup_keys(raw)
+    for extra in row.get("parallel_citations") or []:
+        keys |= citation_lookup_keys(str(extra))
     name = case_name_from_url(row.get("detail_url") or row.get("pdf_url"))
     if name:
         keys.add(CASE_KEY_PREFIX + name)

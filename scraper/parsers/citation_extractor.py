@@ -20,7 +20,8 @@ Reporters Covered:
   GBLR - Gilgit-Baltistan Law Reports
 
 Reporters are matched run together ("PLD") or spaced/dotted as PakistanLawSite prints them ("P L D",
-"P.L.D."); a "Note"/"N" series ("2019 YLR Note 120") is kept apart from the main page run.
+"P.L.D."). A separated "Note" or "N" word ("2019 YLR Note 120") keeps that stored string. A glued
+notes-edition code (CLCN, YLRN, PCrLJN, PLCN, PLC(CS)N) is its own journal, not the parent title.
 
 Statutes Covered:
   SECTION, ARTICLE, ORDER_RULE, ACT_YEAR
@@ -99,7 +100,8 @@ def _letters(abbr: str) -> str:
 
 # Year-first reporters: "2025 SCMR 1967", "2025 S C M R 1967", "2023 CLC (Lahore) 789", "2019 YLR Note 120"
 _COURT_PAREN = r"(?:\(\s*(?P<court>[A-Za-z\s\.\-&]+?)\s*\))?"
-_NOTE = r"(?:\s*(?P<note>N(?:ote)?\b\.?))?"
+# The N must be its own word. A glued N is a notes-edition code (YLRN), not this note word.
+_NOTE = r"(?:\s+(?P<note>N(?:ote)?\b\.?))?"
 
 
 def _year_first(token: str, *, court: bool = True, note: bool = True) -> re.Pattern:
@@ -151,6 +153,19 @@ CITATION_PATTERNS: Dict[str, re.Pattern] = {
     ),
     "CLD": _year_first(_letters("CLD")),
     "GBLR": _year_first(_letters("GBLR"), court=False),
+    # Notes editions. The N is glued to the abbreviation (or to the closing series
+    # parenthesis). A separated "N" / "Note" stays on the parent pattern above.
+    "CLCN": _year_first(_letters("CLC") + r"N\.?", note=False),
+    "YLRN": _year_first(_letters("YLR") + r"N\.?", note=False),
+    "PLCN": _year_first(_letters("PLC") + r"N\.?", note=False),
+    "PCrLJN": _year_first(r"P\.?\s*Cr\.?\s*L\.?\s*J\.?N\.?", note=False),
+    "PLC(CS)N": re.compile(
+        r"\b(?P<year>19\d{2}|20\d{2})\s+"
+        + _letters("PLC")
+        + r"\s*\(\s*C\.?\s*S\.?\s*\)N\.?"
+        + r"\s+(?P<page>\d+[A-Z]?)\b",
+        re.IGNORECASE,
+    ),
     # A court's own neutral citation: "2025 SHC KHI 608" (Sindh High Court, with its bench seat),
     # "2025 PHC 1", "2012 LHC 869", "2024 IHC 123", "2023 SCP 245". The court issues it, so the
     # citation names the court and no law report is involved.
@@ -457,8 +472,11 @@ def normalise_instrument_mention(raw: str, mention_type: str) -> str:
 # Core Functions
 # ============================================================================
 
+# Glued notes codes before the parent titles, so YLRN is not read as YLR.
+_NOTES_EDITION_ORDER = ("PLC(CS)N", "PCrLJN", "CLCN", "YLRN", "PLCN")
 # normalise_citation tries the year-first reporters in this order (PCrLJ first: its dotted forms are the loosest)
 _YEAR_FIRST_ORDER = ("PCrLJ", "SCMR", "CLC", "YLR", "MLD", "PTD", "PTCL", "PLC", "CLD", "GBLR")
+_NOTES_EDITION_REPORTERS = frozenset(_NOTES_EDITION_ORDER)
 
 
 def _year_first_normalised(reporter_key: str, m: re.Match) -> str:
@@ -545,7 +563,7 @@ def normalise_citation(raw: str) -> str:
             court_out = court_canonical
         return f"PLD {year} {court_out} {page}"
 
-    for reporter_key in _YEAR_FIRST_ORDER:
+    for reporter_key in (*_NOTES_EDITION_ORDER, *_YEAR_FIRST_ORDER):
         m = CITATION_PATTERNS[reporter_key].search(s)
         if m:
             return _year_first_normalised(reporter_key, m)
@@ -562,6 +580,26 @@ def normalise_citation(raw: str) -> str:
     s = re.sub(r"\bpcrlj\b", "PCrLJ", s, flags=re.IGNORECASE)
     s = re.sub(r"\bpcr\.lj\b", "PCrLJ", s, flags=re.IGNORECASE)
     return s
+
+
+def _spans_overlap(left: Tuple[int, int], right: Tuple[int, int]) -> bool:
+    return not (left[1] <= right[0] or left[0] >= right[1])
+
+
+def _prefer_citation_span(results: List[Dict[str, Any]], entry: Dict[str, Any]) -> None:
+    """Keep one citation per overlapping span. A notes-edition code wins over its parent."""
+    span = entry["span"]
+    for index, old in enumerate(results):
+        if not _spans_overlap(span, old["span"]):
+            continue
+        new_notes = entry.get("reporter") in _NOTES_EDITION_REPORTERS
+        old_notes = old.get("reporter") in _NOTES_EDITION_REPORTERS
+        new_len = span[1] - span[0]
+        old_len = old["span"][1] - old["span"][0]
+        if (new_notes and not old_notes) or new_len > old_len:
+            results[index] = entry
+        return
+    results.append(entry)
 
 
 def extract_citations(text: str) -> List[Dict[str, Any]]:
@@ -642,7 +680,7 @@ def extract_citations(text: str) -> List[Dict[str, Any]]:
                 "normalized": normalized,
                 "span": (match.start(), match.end()),
             }
-            results.append(entry)
+            _prefer_citation_span(results, entry)
 
     results.sort(key=lambda x: x["span"][0])
     results = _dedupe_citations(results)
