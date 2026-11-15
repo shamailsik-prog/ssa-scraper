@@ -17,13 +17,17 @@ from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute, statute_staging_identity_url
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
+    _amending_spans,
+    _citation_prefix,
     _cited_upstream_name,
     _combining_suffix_at_end,
+    _connector_between_years,
     _enacted_year,
     _listing_is_another_principal,
     _short_title,
     _short_title_supersedes,
     _title_core,
+    _verbatim_good_listing,
     apply_rejected_assembly_title,
     is_rejected_assembly_statute_name,
     resolve_assembly_statute_title,
@@ -2020,8 +2024,8 @@ def test_wide_amending_close_keeps_the_single_act_title(source_name, listing, su
 @pytest.mark.parametrize("close", _UNLISTED_WELL_FORMED_CLOSES)
 def test_unlisted_well_formed_close_keeps_a_good_listing(close):
     title = f"Companies Act, 2017 {close} Act, 2024"
-    assert not is_rejected_assembly_statute_name(title)
     assert not _combining_suffix_at_end(title)
+    assert _verbatim_good_listing(title, _year_then_words_body(title, "may", ".", "end"))
     body = _year_then_words_body(title, "may", ".", "end")
     out = _with_listing(body, source_name="NationalAssembly", listing="good", title=title)
     assert out["statute_name"] == title
@@ -2143,7 +2147,8 @@ _SPOT14_TITLES = (
 @pytest.mark.no_db
 @pytest.mark.parametrize("title", _SPOT14_TITLES)
 def test_spot14_amending_listing_is_kept(title):
-    assert not is_rejected_assembly_statute_name(title)
+    stripped = re.sub(r"(?i)^the\s+", "", title)
+    assert not is_rejected_assembly_statute_name(stripped)
     single = _side_by_side_body(f"{title}.")
     two = _side_by_side_body(f"the Finance Act, 2024, {title[4:]}.")
     for body in (single, two):
@@ -2152,6 +2157,222 @@ def test_spot14_amending_listing_is_kept(title):
         assert out["year_enacted"] == int(title[-4:])
         assert not (out.get("field_evidence") or {}).get("name_unknown")
     assert is_rejected_assembly_statute_name("the following Act")
+    assert is_rejected_assembly_statute_name("the Federal Government may by notification Act, 2024")
+    assert is_rejected_assembly_statute_name(
+        "the Federal Government or the Provincial Government Act, 2024"
+    )
+    assert is_rejected_assembly_statute_name("the Prime Minister may Act, 2024")
+    assert is_rejected_assembly_statute_name("the Government Act, 2024")
+    assert is_rejected_assembly_statute_name("the Trusts Act, 1882")
+
+
+# A well-formed close on a good listing is the called title. The amending
+# whitelist does not have to name it. Chrome and a missing listing still repair.
+_VERBATIM_CLOSES = (
+    "(Special Provisions)",
+    "(Continuance)",
+    "(Revival)",
+    "(Abolition)",
+)
+_VERBATIM_JOINS = (" and ", " and the ", ", and ", ", and the ", " and\n", " & ")
+_SHAPE_JUNK_TAILS = (
+    " (Punjab) Act, 2025",
+    " (Sindh) Act, 2025",
+    " (Customs) Act, 2025",
+    " (Sales Tax) Act, 2025",
+    " (Third Schedule) Act, 2025",
+    " (1st Schedule) Act, 2025",
+    " (Deleted) Act, 2025",
+    " (Inserted) Act, 2025",
+    " (Lapsed) Act, 2025",
+    " (Draft) Act, 2025",
+    " (Bill) Act, 2025",
+    " (Urdu) Act, 2025",
+    " (Notification) Act, 2025",
+    " (Explanation) Act, 2025",
+    " (Proviso) Act, 2025",
+    " (Corrigendum) Act, 2025",
+    " (2nd) Act, 2025",
+    " (4th) Act, 2025",
+    " (3rd Proviso) Act, 2025",
+    " (21st Century) Act, 2025",
+    " (Gazette of Pakistan) Act, 2025",
+    " Customs Act, 2025",
+    " Punjab Act, 2025",
+    " Bill Act, 2025",
+)
+_LEADING_THE_CLAUSES = (
+    "the Federal Government may by notification Act, 2024",
+    "the Federal Government or the Provincial Government Act, 2024",
+    "the Prime Minister may Act, 2024",
+    "the Government Act, 2024",
+    "the Trusts Act, 1882",
+    "the Land ln provement, Loans Act, 1883",
+    "the Sind lrrigetion Act, 1879",
+)
+
+
+def _with_act_number(body: str, layout: str) -> str:
+    if layout == "bare":
+        return body
+    return "ACT NO. I OF 2024\nAN ACT\nto amend the law\n" + body
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("join", _VERBATIM_JOINS)
+@pytest.mark.parametrize("close", _VERBATIM_CLOSES)
+def test_verbatim_listing_keeps_a_well_formed_close_on_every_join(
+    source_name, verb, layout, join, close
+):
+    rendered = f"{_CLOSING_LEFT}{join}{_CLOSING_RIGHT} {close} Act, 2024"
+    title = _collapsed_called(rendered)
+    body = _with_act_number(_year_then_words_body(rendered, verb, ".", "end"), layout)
+    assert _verbatim_good_listing(title, body)
+    assert not _combining_suffix_at_end(title)
+    out = _with_listing(body, source_name=source_name, listing="good", title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("close", _VERBATIM_CLOSES)
+def test_verbatim_listing_keeps_a_well_formed_principal_close(source_name, verb, layout, close):
+    title = f"Companies Act, 2017 {close} Act, 2024"
+    body = _with_act_number(_year_then_words_body(title, verb, ".", "end"), layout)
+    assert _verbatim_good_listing(title, body)
+    out = _with_listing(body, source_name=source_name, listing="good", title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+def test_repeal_and_saving_stays_a_title(source_name, listing):
+    single = "Companies Act, 2017 (Repeal and Saving) Act, 2024"
+    joined = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} (Repeal and Saving) Act, 2024"
+    for title in (single, joined):
+        assert not is_rejected_assembly_statute_name(title)
+        assert _combining_suffix_at_end(title)
+        body = _year_then_words_body(title, "may", ".", "end")
+        out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+        assert out["statute_name"] == title
+        assert out["year_enacted"] == 2024
+        assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("name", _LEADING_THE_CLAUSES)
+def test_leading_the_does_not_make_a_clause_a_title(name):
+    assert is_rejected_assembly_statute_name(name)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("tail", _SHAPE_JUNK_TAILS)
+def test_non_amending_close_is_junk_by_shape(tail):
+    assert is_rejected_assembly_statute_name(f"Finance Act, 2024{tail}")
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["chrome", "none"])
+def test_numbered_act_after_a_closed_title_does_not_join(source_name, listing):
+    title = "Finance Act, 2024 (No. 2) Act, 2025"
+    assert is_rejected_assembly_statute_name(title)
+    body = (
+        "ACT NO. I OF 2024\n"
+        "1. Short title.- This Act may be called the Finance Act, 2024 (No. 2) Act, 2025.\n"
+    )
+    out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+    stored = out["statute_name"] or ""
+    assert stored != title
+    assert "(No. 2) Act, 2025" not in stored
+    assert not is_rejected_assembly_statute_name("Finance (No. 2) Act, 2024")
+    assert not is_rejected_assembly_statute_name("Companies Act, 2017 (Amendment) (No. 2) Act, 2024")
+
+
+@pytest.mark.no_db
+def test_citation_year_then_section_dash_stops():
+    body = (
+        "1. Short title.- This Act may be called the Finance (No. 2) Act, 2024 "
+        "(V of 2024). 2.- Amendment of the Income Tax Ordinance, 2001.\n"
+    )
+    short = _short_title(body) or ""
+    assert "Amendment of" not in short
+    assert "Ordinance" not in short
+    out = _with_listing(body, source_name="NationalAssembly", listing="chrome", title="Finance (No. 2) Act, 2024")
+    stored = out["statute_name"] or ""
+    assert "Amendment of" not in stored
+    assert "2001" not in stored
+
+
+@pytest.mark.no_db
+def test_stacked_parentheses_are_junk():
+    assert is_rejected_assembly_statute_name("Finance Act, 2024 (No. 2) (Z) Act, 2025")
+    assert is_rejected_assembly_statute_name("Finance Act, 2024 (Amendment) (Amendment) Act, 2025")
+    assert is_rejected_assembly_statute_name("Finance Act, 2024 (Amendment) (No. 2) (No. 3) Act, 2025")
+    assert not is_rejected_assembly_statute_name("Finance Act, 2024 (Amendment) (No. 2) Act, 2025")
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["chrome", "none"])
+def test_act_number_year_does_not_keep_the_penal_code(source_name, listing):
+    body = (
+        "ACT NO. V OF 2024\n"
+        "AN ACT\n"
+        "further to amend the Pakistan Penal Code\n"
+        "1. Short title.- This Act may be called the Code.\n"
+        "(Amendment) Act, 2024.\n"
+    )
+    out = _with_listing(body, source_name=source_name, listing=listing, title="Pakistan Penal Code, 1860")
+    assert out["statute_name"] != "Pakistan Penal Code, 1860"
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("listing", ["Sales Tax Act, 1990", "Tax Act, 1990"])
+def test_principal_listing_on_an_amending_body_is_corrected(listing):
+    title = "Sales Tax Act, 1990 (Amendment) Act, 2024"
+    body = _year_then_words_body(title, "may", ".", "end")
+    out = _with_listing(body, source_name="NationalAssembly", listing="good", title=listing)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.no_db
+def test_citation_prefix_is_required_to_reject_a_wrapper():
+    assert _citation_prefix("2 Amendment")
+    assert _citation_prefix("No. 2 Amendment")
+    assert _citation_prefix("Act Amendment")
+    assert _citation_prefix("V of Amendment")
+    wrapped = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} (2 Amendment) Act, 2025"
+    assert is_rejected_assembly_statute_name(wrapped)
+    assert not _combining_suffix_at_end(wrapped)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+def test_second_amending_instrument_is_not_stored(source_name):
+    # No list joiner, so a connector check cannot reject this. Two amending
+    # spans are the only reason it is not a title.
+    title = "Sales Tax Act, 1990 (Amendment) Act, 2024 (Repeal) Act, 2025"
+    assert len(_amending_spans(title)) >= 2
+    assert not _connector_between_years(title)
+    assert is_rejected_assembly_statute_name(title)
+    body = _year_then_words_body(title, "may", ".", "end")
+    out = _with_listing(body, source_name=source_name, listing="chrome", title="Finance Act, 2024")
+    stored = out["statute_name"] or ""
+    assert stored != title
+    assert "Repeal Act, 2025" not in stored
 
 
 @pytest.mark.no_db

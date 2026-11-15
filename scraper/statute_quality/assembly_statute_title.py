@@ -213,6 +213,7 @@ _AMENDING_ATOM_RE = re.compile(
     r"amendments?|amending"
     r"|validat\w*(?:\s+of\s+laws)?"
     r"|repeal"
+    r"|savings?"
     r"|extensions?(?:\s+of\s+validity)?"
     r"|removal\s+of\s+difficult(?:y|ies)"
     r")$"
@@ -240,20 +241,6 @@ _CITATION_PAREN_RE = re.compile(
     r"|(?:[ivxlcdm]+|\d+)\s+of\b"
     r"|\d{1,3}(?!(?:st|nd|rd|th)\b)[a-z]?"
     r")[^)]*\)$"
-)
-# A junk close is one of these classes. Anything else after a year, including
-# ``(Special Provisions)``, is a well-formed listing and is not quarantined.
-_JUNK_CLOSE_RE = re.compile(
-    r"(?i)^(?:"
-    r"[a-z]"
-    r"|[ivxlcdm]+"
-    r"|\d+"
-    r"|omitted|repealed|substituted|schedule"
-    r"|(?:first|second)\s+schedule"
-    r"|islamabad|finance"
-    r"|federal\s+excise"
-    r"|it\b.*|hereinafter\b.*|see\b.*|amended\s+by\b.*|as\s+amended\b.*"
-    r")$"
 )
 _YEAR_BEFORE_SUFFIX_RE = re.compile(
     r"(?i)(?:1[89]\d{2}|20\d{2})(?:\s*\(\s*no\.?\s*\d+[a-z]?\s*\))?\s*$"
@@ -416,15 +403,13 @@ def _has_section_number(name: str) -> bool:
 def _leading_word_is_lower(name: str) -> bool:
     """A lowercase clause start. A leading ``e-`` or a digit (``5G``) is a title.
 
-    ``the Constitution (Twenty-sixth Amendment) Act, 2024`` is the instrument.
-    ``the following Act`` stays a clause.
+    ``the following Act`` and ``the Federal Government may … Act`` both start
+    with a lowercase word. A listing strips that ``the`` before this check,
+    so ``the Constitution (Twenty-sixth Amendment) Act`` can still be kept.
     """
     text = name.lstrip()
     if re.match(r"^e-", text, re.IGNORECASE):
         text = text[2:].lstrip()
-    leading_the = re.match(r"(?i)^the\s+(\S)", text)
-    if leading_the and leading_the.group(1)[:1].isupper():
-        return False
     for char in text:
         if char.isalpha():
             return char.islower()
@@ -825,15 +810,19 @@ def _close_phrase_is_amending(phrase: str) -> bool:
     """
     raw = _collapse(phrase).strip()
     if re.fullmatch(r"(?:\([^()]{1,80}\)\s*)+", raw):
-        saw = False
+        # ``(Amendment) (No. 2)`` is one close. A second amending parenthesis
+        # or a second number is stacked junk.
+        amending = 0
+        numbers = 0
         for inner in re.findall(r"\(([^()]*)\)", raw):
             text = _collapse(inner)
             if re.fullmatch(r"(?i)no\.?\s*\d+[a-z]?", text):
+                numbers += 1
                 continue
             if not _parts_are_amending(text):
                 return False
-            saw = True
-        return saw
+            amending += 1
+        return amending == 1 and numbers <= 1
     if _parts_are_amending(raw):
         return True
     return _CITATION_SHAPED_AMENDMENT_RE.match(raw) is not None
@@ -884,27 +873,22 @@ def _amending_spans(flat: str) -> list[re.Match]:
 
 
 def _phrase_is_junk_close(phrase: str) -> bool:
-    """True for a letter, roman, digit, status word, place, or a mixed and-pair.
+    """A close after an earlier year is junk unless every word of it amends.
 
-    ``(Amendment and Z)`` is junk. ``(Special Provisions)`` is not: a good
-    listing that uses it stays a listing.
+    Shape, not a word list: ``(Punjab)``, ``(2nd)``, ``(Third Schedule)``,
+    ``(Draft)`` and ``(Amendment and Z)`` are junk. ``(Repeal and Saving)``
+    is not. A citation prefix (``No. 2 Amendment``, ``2 Amendment``) is junk
+    even when the words look like a close. A good listing that is the called
+    title is kept before this check runs.
     """
     raw = _collapse(phrase)
-    inners = re.findall(r"\(([^()]*)\)", raw) or [raw]
-    for inner in inners:
-        flat = _collapse(inner).lower().strip(" .")
-        if not flat:
-            continue
-        if _JUNK_CLOSE_RE.match(flat) or _citation_prefix(flat):
-            return True
-        parts = _split_close_parts(flat)
-        if (
-            len(parts) >= 2
-            and any(_part_is_amending(part) for part in parts)
-            and not all(_part_is_amending(part) for part in parts)
-        ):
-            return True
-    return False
+    if not raw:
+        return False
+    if _citation_prefix(raw):
+        return True
+    if _close_phrase_is_amending(raw):
+        return False
+    return True
 
 
 def _numbered_act_paren(match: re.Match) -> bool:
@@ -916,11 +900,12 @@ def _numbered_act_paren(match: re.Match) -> bool:
 
 
 def _junk_close_at_end(name: str) -> bool:
-    """A letter, status word, place, or other Act's name glued on after a year.
+    """A non-amending tail after an earlier year, or two amending instruments.
 
-    ``Finance Act, 2024`` is a principal. ``2005 (Z) Act, 2025`` is not.
-    A well-formed close that is not on the amending list is not junk.
-    Two amending instruments (``(Amendment) Act, 2024 Repeal Act, 2025``) are.
+    ``Finance Act, 2024`` is a principal. ``2005 (Z) Act, 2025``,
+    ``(Punjab) Act, 2025`` and ``(No. 2) Act, 2025`` are not.
+    ``(Amendment) Act, 2024 Repeal Act, 2025`` is two instruments.
+    A good listing that is the called title is kept before this runs.
     """
     flat = _collapse(name or "").strip()
     if len(_amending_spans(flat)) >= 2:
@@ -933,8 +918,13 @@ def _junk_close_at_end(name: str) -> bool:
         return False
     if _YEAR_BEFORE_SUFFIX_RE.search(flat[: end.start()]) is None:
         return False
-    if _combining_match_counts(end) or _numbered_act_paren(end):
+    if _combining_match_counts(end):
         return False
+    # ``(No. N) Act, YYYY`` after a title that already closed is a second
+    # instrument. ``Finance (No. 2) Act`` has no year before the parenthesis,
+    # so it never reaches this line.
+    if _numbered_act_paren(end):
+        return True
     return _phrase_is_junk_close(_close_phrase(end))
 
 
@@ -982,7 +972,11 @@ def _called_clause(text: str) -> str:
 def _listing_is_another_principal(listing: str, resolved: str, text: str) -> bool:
     """The listing names a principal in the called line that this resolution does not replace."""
     listed = _collapse(listing)
-    if not listed or is_rejected_assembly_statute_name(listed):
+    if not listed:
+        return False
+    # A leading ``the`` is clause-like on its own. The listing is still a
+    # principal when the words after ``the`` are a full title.
+    if is_rejected_assembly_statute_name(listed) and not _listing_body_is_well_formed(listing):
         return False
     if not resolved or resolved == "name_unknown" or is_rejected_assembly_statute_name(resolved):
         return False
@@ -1377,8 +1371,9 @@ def _short_title(text: str) -> Optional[str]:
             break
         if kept and _subsection_end(token) and not _continues_numbered_act(kept, token):
             break
-        # A bare ``2.`` after the title has already ended is the next section.
-        if ends and re.fullmatch(r"\d{1,3}\.", token or ""):
+        # A bare ``2.`` or ``2.-`` after the title has already ended is the
+        # next section, including ``(V of 2024). 2.-``.
+        if seen_instrument and re.fullmatch(r"\d{1,3}\.-?", token or ""):
             break
         # ``&`` joins two principals inside one amending title. Other symbols still stop.
         if _symbol_mixed(token) and not (
@@ -1562,6 +1557,139 @@ def _closes_on_instrument_year(name: str) -> bool:
     ) is not None
 
 
+def _truncated_principal(current: str, short_name: str) -> bool:
+    """``Tax Act, 1990`` is the unfinished tail of ``Sales Tax Act, 1990 (Amendment) Act``.
+
+    The words in front must be more of the same name. A different Act joined
+    with ``and`` still has its own instrument word in that prefix.
+    """
+    if not _combining_suffix_at_end(short_name):
+        return False
+    current_flat = _collapse(current).lower()
+    short_flat = _collapse(short_name).lower()
+    if len(current_flat) < 8 or current_flat not in short_flat:
+        return False
+    at = short_flat.find(current_flat)
+    if at <= 0:
+        return False
+    before = short_flat[at - 1]
+    after = short_flat[at + len(current_flat) : at + len(current_flat) + 1]
+    if before.isalnum() or (after and after.isalnum()):
+        return False
+    prefix = short_flat[:at]
+    if re.search(r"\d|\(", prefix):
+        return False
+    if re.search(r"\b(?:act|ordinance|order|code|rules|regulations)\b", prefix):
+        return False
+    return bool(prefix.strip())
+
+
+def _strip_leading_the(name: str) -> str:
+    return re.sub(r"(?i)^the\s+", "", _collapse(name))
+
+
+def _listing_body_is_well_formed(listing: str) -> bool:
+    """A full instrument title. Clause junk stays out. The close is not re-listed here."""
+    flat = _strip_leading_the(listing)
+    if not flat or is_listing_chrome_text(flat) or is_gazette_non_act_title(flat):
+        return False
+    if looks_like_garbage_name(flat) or looks_like_clause_fragment(flat):
+        return False
+    if _leading_word_is_lower(flat):
+        return False
+    if re.search(r"(?i)\b(?:shall|may)\b", flat):
+        return False
+    if re.search(r"(?i)\b(?:or|under)\s+the\b", flat):
+        return False
+    if _starts_with_amendment_of(flat) or _has_section_number(flat) or _has_called_word(flat):
+        return False
+    # ``as amended by`` between years is a clause. ``and the Y (Special
+    # Provisions) Act`` is one title, so a parenthetical close keeps it.
+    if _connector_between_years(flat) and not re.search(
+        r"(?i)\([^)]{1,80}\)\s*(?:act|ordinance|order|code|regulation)\b",
+        flat,
+    ):
+        return False
+    if _CLAUSE_RUN_ON_RE.search(flat) or _YEAR_GLUED_TAIL_RE.search(flat):
+        return False
+    if _ACT_NO_RUN_ON_RE.search(flat) or _has_ocr_year(flat):
+        return False
+    if not _INSTRUMENT_RE.search(flat):
+        return False
+    return _closes_on_instrument_year(flat)
+
+
+def _called_listing_matches(listing: str, text: str) -> bool:
+    """The called clause is ``may/shall be called the <listing>``, and nothing further."""
+    listed = _collapse(listing)
+    clause = _called_clause(text)
+    if not listed or not clause:
+        return False
+    low_clause = clause.lower()
+    low_listed = listed.lower()
+    if low_clause.startswith(low_listed):
+        rest = clause[len(listed) :]
+    elif low_clause.startswith("the " + low_listed):
+        rest = clause[len("the ") + len(listed) :]
+    else:
+        return False
+    # The called title may be followed by ``(2)`` or ``2.`` The next instrument
+    # (`` (Amendment) Act``) is a different name.
+    return re.match(r"(?i)^(?:\s*[.)\]])+(?:\s*(?:\(\s*\d|\d{1,3}\.).*)?$", rest) is not None or rest.strip() == ""
+
+
+def _verbatim_good_listing(listing: Optional[str], text: str) -> bool:
+    """A well-formed listing that is the called title, whatever its close or join.
+
+    Repair runs only for chrome, a missing listing, or a listing that is not
+    this called title.
+    """
+    if not listing or is_listing_chrome_text(listing):
+        return False
+    if not _listing_body_is_well_formed(listing):
+        return False
+    return _called_listing_matches(listing, text)
+
+
+def _own_instrument_listing(listing: Optional[str], text: str) -> bool:
+    """The listing is a full title inside the called clause, not a prefix of a longer one.
+
+    ``the Constitution (Twenty-sixth Amendment) Act, 2024`` beside the Finance
+    Act stays. ``Sales Tax Act, 1990`` in front of ``(Amendment) Act, 2024``
+    does not: that called line is the amending instrument.
+    """
+    if not listing or not _listing_body_is_well_formed(listing):
+        return False
+    clause = _strip_leading_the(_called_clause(text))
+    listed = _strip_leading_the(listing)
+    if not clause or not listed:
+        return False
+    low_clause = clause.lower()
+    low_listed = listed.lower()
+    at = low_clause.find(low_listed)
+    if at < 0:
+        return False
+    before = low_clause[at - 1] if at else " "
+    after = low_clause[at + len(low_listed) : at + len(low_listed) + 1]
+    if (at and before.isalnum()) or (after and after.isalnum()):
+        return False
+    rest = clause[at + len(listed) :].lstrip()
+    continues = rest[:1].isalpha() or (rest.startswith("(") and not re.match(r"^\(\s*\d", rest))
+    if not continues:
+        return True
+    # The called line keeps going, so this listing is a prefix or a truncated tail
+    # of one amending instrument, not a side-by-side Act.
+    if at == 0 or low_clause[:at].rstrip().lower().endswith("the"):
+        return False
+    prefix = clause[:at]
+    if not re.search(r"(?i)\b(?:act|ordinance|order|code|rules|regulations)\b", prefix):
+        return False
+    head = re.split(r"[.]", clause, maxsplit=1)[0]
+    if _combining_suffix_at_end(head) and (_second_principal_joined(head) or at > 0):
+        return False
+    return True
+
+
 def _short_title_supersedes(current: str, short_name: str) -> bool:
     """A truncated instrument (``Pakistan Code, 2024``) loses to the full short title.
 
@@ -1595,6 +1723,8 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
         or short_core.startswith(current_core + "(")
         or short_core.startswith(current_core + ",")
     ):
+        return True
+    if _truncated_principal(current, short_name or ""):
         return True
     # The known principal can be the second Act only when the list is joined by
     # and / & / and the / , and the and the close is an amending phrase.
@@ -1660,12 +1790,21 @@ def _cited_upstream_name(current: str, short: str, listing: Optional[str]) -> bo
 
 
 def _dated_listing_is_complete(current: str, short: str, listing: Optional[str]) -> bool:
-    """True when the stored name is already the dated listing and the called line only runs on."""
+    """True when the stored name is already the dated listing and the called line only runs on.
+
+    ``Sales Tax Act, 1990 (Amendment) Act, 2024`` is a longer instrument, not a
+    run-on. ``Finance Act, 2024 and Code (Amendment) Act, 2025`` still is.
+    """
     listed = _collapse(listing or "")
     if not listed or listed != _collapse(current) or _year_in(listed) is None:
         return False
     longer = _collapse(short or "")
-    return longer.lower().startswith(listed.lower()) and len(longer) > len(listed)
+    if not (longer.lower().startswith(listed.lower()) and len(longer) > len(listed)):
+        return False
+    rest = longer[len(listed) :].lstrip()
+    if rest.startswith("(") and _combining_suffix_at_end(longer):
+        return False
+    return True
 
 
 def apply_rejected_assembly_title(
@@ -1678,6 +1817,21 @@ def apply_rejected_assembly_title(
 ) -> tuple[str, Optional[int], str]:
     """Replace a junk name. A title that is already a real instrument name stays."""
     current = _collapse(name or "")
+    # One guard. A well-formed listing that the short-title clause names
+    # verbatim stays, close and join included. Chrome, no listing, and junk
+    # listings are the only names repair is allowed to change.
+    listed_flat = _collapse(listing_title or "")
+    keep_listing = _verbatim_good_listing(listing_title, text or "") or (
+        listed_flat
+        and _own_instrument_listing(listing_title, text or "")
+        and (
+            current == listed_flat
+            or name_needs_assembly_title(current)
+        )
+    )
+    if keep_listing:
+        listed_year = _last_year_in(listed_flat) if _closes_on_instrument_year(listed_flat) else _year_in(listed_flat)
+        return listed_flat, listed_year if listed_year is not None else year, ""
 
     def finish(stored: str, stored_year: Optional[int], detail: str = "") -> tuple[str, Optional[int], str]:
         if stored and stored != "name_unknown":
@@ -1687,6 +1841,10 @@ def apply_rejected_assembly_title(
 
     amended_principal = _is_object_of_amendment_heading(current, text)
     needs = name_needs_assembly_title(current)
+    # ``Pakistan Penal Code, 1860`` detected under ``ACT NO. … OF 2024`` is not
+    # the instrument. A called title whose own last year is 2024 is.
+    if not needs and not amended_principal and _years_disagree(current, text or ""):
+        needs = True
     if not needs and not amended_principal:
         short = _short_title(text or "")
         accepted = _accept(short, text or "", year) if short else None
