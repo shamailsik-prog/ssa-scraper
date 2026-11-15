@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote, urlparse, urlunparse
 
 import pytest
 from sqlalchemy import func, select
@@ -1560,6 +1562,16 @@ def test_no_db_with_a_database_fixture_is_a_collection_error(tmp_path):
         "import pytest\n\n@pytest.mark.no_db\ndef test_bad(db):\n    pass\n",
         encoding="utf-8",
     )
+    # An xdist worker has already rewritten DATABASE_URL to ``…_gwN``. A nested
+    # pytest that still looks like that worker refuses the name before collection.
+    env = os.environ.copy()
+    for key in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID"):
+        env.pop(key, None)
+    base = env.get("_CORPUS_TEST_DATABASE_BASE")
+    current = env.get("DATABASE_URL")
+    if base and current:
+        parsed = urlparse(current)
+        env["DATABASE_URL"] = urlunparse(parsed._replace(path="/" + quote(base, safe="")))
     try:
         completed = subprocess.run(
             [
@@ -1571,17 +1583,21 @@ def test_no_db_with_a_database_fixture_is_a_collection_error(tmp_path):
                 "-q",
                 "-p",
                 "no:cacheprovider",
+                "-p",
+                "no:xdist",
             ],
             cwd=REPO,
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
     finally:
         probe.unlink(missing_ok=True)
     blob = completed.stdout + completed.stderr
     assert completed.returncode != 0
     assert "no_db" in blob
+    assert "database fixture" in blob
 
 
 @pytest.mark.no_db
