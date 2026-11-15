@@ -179,6 +179,63 @@ def _current_query(queries: Sequence[Any], state: Dict[str, Any]):
     return queries[idx], idx
 
 
+_LISTING_KEYS = ("listing_held", "listing_query_index", "listing_next_url", "listing_rows")
+
+
+def _store_listing(state: Dict[str, Any], page: ListingPage, query_index: int) -> None:
+    """Keep the parsed listing on the cursor. The page HTML is not stored."""
+    state["listing_held"] = True
+    state["listing_query_index"] = query_index
+    state["listing_next_url"] = page.next_url
+    state["listing_rows"] = [
+        {
+            "citation": row.citation,
+            "title": row.title,
+            "court": row.court,
+            "detail_url": row.detail_url,
+            "reporter": row.reporter,
+            "parallel_citations": list(row.parallel_citations),
+        }
+        for row in page.rows
+    ]
+
+
+def _clear_listing(state: Dict[str, Any]) -> None:
+    for key in _LISTING_KEYS:
+        state.pop(key, None)
+
+
+def _cached_listing(state: Dict[str, Any], query_index: int) -> Optional[ListingPage]:
+    if state.get("listing_held") is not True:
+        return None
+    if state.get("listing_query_index") != query_index:
+        return None
+    raw_rows = state.get("listing_rows")
+    if not isinstance(raw_rows, list):
+        return None
+    rows: List[EnumeratedCase] = []
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        parallel = item.get("parallel_citations")
+        if not isinstance(parallel, list):
+            parallel = []
+        court = item.get("court")
+        detail = item.get("detail_url")
+        rows.append(
+            EnumeratedCase(
+                citation=str(item.get("citation") or ""),
+                title=str(item.get("title") or ""),
+                court=str(court) if court else None,
+                detail_url=str(detail) if detail else None,
+                reporter=str(item.get("reporter") or ""),
+                parallel_citations=[str(value) for value in parallel],
+            )
+        )
+    next_url = state.get("listing_next_url")
+    return ListingPage(rows=rows, next_url=str(next_url) if next_url else None, recognized=True)
+
+
 async def run_case_enumeration(
     *,
     harvest: str,
@@ -202,6 +259,8 @@ async def run_case_enumeration(
 
     The hard per-run cap counts listing pages and case pages in this call. It stops
     before the request that would pass it, and the cursor stays on the unfetched row.
+    The listing rows stay on the cursor too, so the next tick continues with case
+    pages and does not spend another day or month request repeating the listing.
     """
     state = dict(state or {})
     roll_periods(state, now)
@@ -257,29 +316,35 @@ async def run_case_enumeration(
         query, idx = _current_query(queries, state)
         if query is None:
             return stop("no_queries", staged=staged, known=known)
-        request = build_request(query, state)
-        if request is None:
-            skipped_queries += 1
-            state["query_index"] = (idx + 1) % len(queries)
-            state["page"] = 1
-            state["row_index"] = 0
-            state["next_url"] = None
-            if skipped_queries >= len(queries):
+        page = _cached_listing(state, idx)
+        if page is None:
+            request = build_request(query, state)
+            if request is None:
+                _clear_listing(state)
+                skipped_queries += 1
+                state["query_index"] = (idx + 1) % len(queries)
+                state["page"] = 1
+                state["row_index"] = 0
+                state["next_url"] = None
+                if skipped_queries >= len(queries):
+                    await save()
+                    return stop("no_sendable_query", staged=staged, known=known)
+                continue
+            html, failure = await paced(lambda req=request: fetch_listing(req))
+            if failure:
+                return stop(failure, staged=staged, known=known)
+            page = parse_listing(html or "")
+            if not page.recognized:
+                _clear_listing(state)
+                note_failure(state, now, limits)
                 await save()
-                return stop("no_sendable_query", staged=staged, known=known)
-            continue
-        html, failure = await paced(lambda req=request: fetch_listing(req))
-        if failure:
-            return stop(failure, staged=staged, known=known)
-        pages_opened += 1
-        page = parse_listing(html or "")
-        if not page.recognized:
-            note_failure(state, now, limits)
+                return stop("unrecognized_page", staged=staged, known=known)
+            if page.interpretation:
+                state["last_interpretation"] = dict(page.interpretation)
+            _store_listing(state, page, idx)
             await save()
-            return stop("unrecognized_page", staged=staged, known=known)
+        pages_opened += 1
         clear_backoff(state)
-        if page.interpretation:
-            state["last_interpretation"] = dict(page.interpretation)
         start_row = int(state.get("row_index") or 0)
         for index, row in enumerate(page.rows):
             if index < start_row:
@@ -334,6 +399,7 @@ async def run_case_enumeration(
             state["row_index"] = index + 1
             clear_backoff(state)
             await save()
+        _clear_listing(state)
         page_no = int(state.get("page") or 1)
         state["query_index"] = idx
         state["row_index"] = 0

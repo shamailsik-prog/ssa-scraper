@@ -2,8 +2,9 @@
 
 A natural-language query comes back as structured JSON. Two shapes are read:
 the V6 envelope (`results` plus the interpretation flags) and an Elasticsearch
-`hits.hits[]._source` envelope. Either may be the raw body or a
-script#smartSearchPayload element. The headnote on a hit is not kept.
+`hits.hits[]._source` envelope. The body may be the raw JSON, a
+script#smartSearchPayload element, or the browser document Chromium returns
+for a JSON navigation (the JSON text inside <pre>). The headnote on a hit is not kept.
 
 UNVERIFIED against a live response. The path and the query field below must be
 confirmed before PLS_SMART_SEARCH_ENABLED is turned on. The query cap is 500
@@ -131,26 +132,34 @@ def _compact_interpretation(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _json_object(text: str) -> Optional[Dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw or raw[0] not in "{[":
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _load_payload(payload: str) -> Optional[Dict[str, Any]]:
+    """Accept raw JSON, the embedded script, or a browser-rendered JSON document."""
     text = (payload or "").strip()
     if not text:
         return None
     if text[0] in "{[":
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        return data if isinstance(data, dict) else None
+        return _json_object(text)
     soup = BeautifulSoup(text, "html.parser")
     node = soup.select_one(SMART_JSON_SCRIPT)
-    if node is None:
-        return None
-    raw = node.string if node.string is not None else node.get_text()
-    try:
-        data = json.loads(raw or "")
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    if node is not None:
+        raw = node.string if node.string is not None else node.get_text()
+        return _json_object(raw or "")
+    for pre in soup.find_all("pre"):
+        data = _json_object(pre.get_text())
+        if data is not None and _hit_list(data) is not None:
+            return data
+    return None
 
 
 def _hit_list(data: Dict[str, Any]) -> Optional[List[Any]]:
@@ -213,7 +222,11 @@ def _case_from_hit(hit: Any) -> Optional[EnumeratedCase]:
 
 
 def parse_smart_search(payload: str) -> ListingPage:
-    """Read one Smart Search body. A page that is neither JSON shape is not an empty result."""
+    """Read one Smart Search body. A page that is neither JSON shape is not an empty result.
+
+    A browser-rendered JSON document is unwrapped first: the raw response body,
+    or the text inside the <pre> Chromium uses when it navigates to JSON.
+    """
     data = _load_payload(payload)
     if data is None:
         return ListingPage(rows=[], next_url=None, recognized=False)

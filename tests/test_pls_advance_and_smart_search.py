@@ -6,6 +6,7 @@ recorded tr.caseType / casetypeid shape. Smart payloads are synthetic JSON.
 
 from __future__ import annotations
 
+import html
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -302,6 +303,50 @@ def test_smart_parser_reads_the_envelope_and_the_elasticsearch_shape():
     assert HEADNOTE not in json.dumps(other.interpretation)
 
 
+def _browser_json_document(payload: str) -> str:
+    """Chromium page.content() for a navigated JSON response: the body is a <pre>."""
+    return (
+        '<html><head><meta name="color-scheme" content="light dark"></head>'
+        '<body><pre style="word-wrap: break-word; white-space: pre-wrap;">'
+        + html.escape(payload, quote=True)
+        + "</pre></body></html>"
+    )
+
+
+def test_smart_browser_document_unwraps_json_before_parsing():
+    from scraper.pls_smart_search import parse_smart_search
+
+    payload = json.dumps(
+        {
+            "results": [_smart_hit(headnote=HEADNOTE + " <bail>")],
+            **_flags(),
+            "next_url": "/Login/SmartSearch?page=2",
+        }
+    )
+    assert "&quot;" in _browser_json_document(payload)
+    page = parse_smart_search(_browser_json_document(payload))
+    assert page.recognized is True
+    assert len(page.rows) == 1
+    assert page.rows[0].citation == "2005 YLR 1362"
+    assert page.rows[0].reporter == "YLR"
+    assert "CaseName=2005L4281" in (page.rows[0].detail_url or "")
+    assert page.next_url == "/Login/SmartSearch?page=2"
+    assert HEADNOTE not in json.dumps(page.interpretation)
+    raw = parse_smart_search(payload)
+    assert raw.recognized is True and raw.rows[0].citation == page.rows[0].citation
+
+
+def test_smart_html_that_is_not_a_json_document_stays_unrecognized():
+    from scraper.pls_smart_search import parse_smart_search
+
+    page = parse_smart_search(
+        "<html><body><h1>Welcome back</h1><pre>Sign in to continue</pre></body></html>"
+    )
+    assert page.recognized is False
+    assert page.rows == []
+    assert page.next_url is None
+
+
 def test_smart_stranger_payload_is_not_an_empty_result():
     from scraper.pls_smart_search import parse_smart_search
 
@@ -480,6 +525,115 @@ async def test_run_cap_stops_before_the_next_request_and_resumes_on_that_row():
     assert result["staged"] == 1
     assert result["state"]["row_index"] == 1
     assert result["state"]["query_index"] == 0
+
+
+async def _capped_listing_ticks(html: str, *, cap: int, ticks: int):
+    from scraper.pls_advance_search import parse_advance_page
+    from scraper.pls_case_enumeration import HARVEST_ADVANCE, run_case_enumeration
+
+    calls = {"listing": 0, "detail": 0, "parse": 0}
+
+    async def fetch_listing(_request):
+        calls["listing"] += 1
+        return html
+
+    async def fetch_detail(_url):
+        calls["detail"] += 1
+        return {"url": _url}
+
+    async def preserve(_detail, route, row):
+        assert route["harvest"] == HARVEST_ADVANCE
+        assert "<" not in json.dumps(row)
+        return "staged"
+
+    def parse_listing(body):
+        calls["parse"] += 1
+        return parse_advance_page(body)
+
+    state: dict = {}
+    history = []
+    for _tick in range(ticks):
+        result = await run_case_enumeration(
+            harvest=HARVEST_ADVANCE,
+            state=state,
+            now=NOW,
+            limits=_limits(
+                max_requests_per_run=cap,
+                requests_per_day=50,
+                requests_per_month=50,
+                seconds_per_day=100000,
+                seconds_per_month=100000,
+            ),
+            queries=[{"keyword": "bail"}],
+            build_request=lambda query, cursor: {"form": {"keyword": query["keyword"], "page": cursor.get("page")}},
+            parse_listing=parse_listing,
+            fetch_listing=fetch_listing,
+            fetch_detail=fetch_detail,
+            preserve=preserve,
+            known_keys=lambda _keys: _empty_known(),
+            sleep=_asleep,
+            monotonic=_clock(),
+            rng=_Zero(),
+            harvest_claimable=False,
+        )
+        state = result["state"]
+        history.append(result)
+    return history, calls
+
+
+async def _empty_known():
+    return set()
+
+
+async def test_cap_of_one_stages_cases_across_ticks_without_refetching_the_listing():
+    html = _advance_html(
+        _advance_row(1, "2024 SCMR 1", "ONE", "SUPREME-COURT", "2024S1"),
+        _advance_row(2, "2024 SCMR 2", "TWO", "SUPREME-COURT", "2024S2"),
+    )
+    history, calls = await _capped_listing_ticks(html, cap=1, ticks=3)
+    assert [item["stopped"] for item in history] == ["run_cap", "run_cap", None]
+    assert [item["staged"] for item in history] == [0, 1, 1]
+    assert calls["listing"] == 1
+    assert calls["parse"] == 1
+    assert calls["detail"] == 2
+    assert sum(item["staged"] for item in history) == 2
+    held = history[0]["state"]
+    assert held["listing_held"] is True
+    assert held["row_index"] == 0
+    assert len(held["listing_rows"]) == 2
+    assert set(held["listing_rows"][0]) == {
+        "citation",
+        "title",
+        "court",
+        "detail_url",
+        "reporter",
+        "parallel_citations",
+    }
+    assert "<" not in json.dumps(held["listing_rows"])
+    assert "listing_html" not in held
+    assert history[0]["state"]["day_requests"] == 1
+    assert history[-1]["state"]["day_requests"] == 3
+    assert history[-1]["state"].get("listing_held") is not True
+
+
+async def test_cap_of_two_finishes_the_saved_listing_on_the_next_tick():
+    html = _advance_html(
+        _advance_row(1, "2024 SCMR 1", "ONE", "SUPREME-COURT", "2024S1"),
+        _advance_row(2, "2024 SCMR 2", "TWO", "SUPREME-COURT", "2024S2"),
+        _advance_row(3, "2024 SCMR 3", "THREE", "SUPREME-COURT", "2024S3"),
+    )
+    history, calls = await _capped_listing_ticks(html, cap=2, ticks=2)
+    assert history[0]["stopped"] == "run_cap"
+    assert history[0]["staged"] == 1
+    assert history[0]["state"]["row_index"] == 1
+    assert history[0]["state"]["listing_held"] is True
+    assert history[1]["stopped"] is None
+    assert history[1]["staged"] == 2
+    assert calls["listing"] == 1
+    assert calls["parse"] == 1
+    assert calls["detail"] == 3
+    assert history[1]["state"]["day_requests"] == 4
+    assert history[1]["state"].get("listing_held") is not True
 
 
 async def test_known_alias_parallel_and_case_name_are_not_fetched_again():

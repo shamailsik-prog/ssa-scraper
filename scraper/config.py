@@ -633,7 +633,7 @@ class Settings(BaseSettings):
     )
     PLS_ADVANCE_SEARCH_MAX_REQUESTS_PER_RUN: int = Field(
         default=8,
-        description="Hard cap on Advance Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it.",
+        description="Hard cap on Advance Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it. The listing stays on the cursor, so a cap of 1 fetches the listing on one tick and a case on the next.",
     )
     # Smart Search (plan V6). Off by default. Queries longer than 500 characters are not sent.
     PLS_SMART_SEARCH_ENABLED: bool = Field(
@@ -690,7 +690,7 @@ class Settings(BaseSettings):
     )
     PLS_SMART_SEARCH_MAX_REQUESTS_PER_RUN: int = Field(
         default=8,
-        description="Hard cap on Smart Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it.",
+        description="Hard cap on Smart Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it. The listing stays on the cursor, so a cap of 1 fetches the listing on one tick and a case on the next.",
     )
     PLS_BROWSER_RECYCLE_WINDOWS: int = Field(
         default=12,
