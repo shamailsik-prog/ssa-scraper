@@ -25,6 +25,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.config import settings
+from scraper.pls_search_harvest_core import citation_lookup_keys
 from scraper.database import SessionLocal, engine, run_async
 from scraper.document_validation import (
     record_validation_reject,
@@ -307,6 +308,35 @@ def _apply_pls_full_text_replacement(judgment: Judgment, new_full_text: str, dat
         )
 
 
+def _citation_identity_keys(canonical: str) -> List[str]:
+    """Spellings that name one reported judgment, exact form first.
+
+    A notes-edition alias is the same judgment: "2017 YLR Note 99" and
+    "2017 YLRN 99" share keys. The parent page "2017 YLR 99" does not.
+    """
+    keys = [key for key in citation_lookup_keys(canonical) if key]
+    if canonical and canonical not in keys:
+        keys.insert(0, canonical)
+    elif canonical and canonical in keys:
+        keys = [canonical] + [key for key in keys if key != canonical]
+    return keys
+
+
+async def _judgment_by_identity_keys(db: AsyncSession, canonical: str, keys: Sequence[str]):
+    if not keys:
+        return None
+    rows = (await db.execute(select(Judgment).where(Judgment.canonical_citation.in_(list(keys))))).scalars().all()
+    by_canon = {}
+    for row in rows:
+        by_canon.setdefault(row.canonical_citation, row)
+    if canonical in by_canon:
+        return by_canon[canonical]
+    for key in keys:
+        if key in by_canon:
+            return by_canon[key]
+    return None
+
+
 async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, force: bool = False) -> str:
     """Returns promoted|duplicate|quarantined."""
     data = st.reconciled_json or {}
@@ -514,7 +544,12 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
     if st.source_name in SOURCE_COURT_CODE:
         identity_court = await _court_by_name(db, SOURCE_COURT_CODE[st.source_name]) or court
     incoming_court_id = identity_court.id if identity_court else None
-    by_citation = (await db.execute(select(Judgment).where(Judgment.canonical_citation == canonical))).scalars().first()
+    if unreported:
+        identity_keys = [canonical] if canonical else []
+        by_citation = (await db.execute(select(Judgment).where(Judgment.canonical_citation == canonical))).scalars().first()
+    else:
+        identity_keys = _citation_identity_keys(canonical)
+        by_citation = await _judgment_by_identity_keys(db, canonical, identity_keys)
     hash_rows = (await db.execute(select(Judgment).where(Judgment.full_text_hash == text_hash))).scalars().all()
     matching_hash = [
         row
@@ -573,13 +608,21 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             link_unreported_id = sole.id
         else:
             existing = sole
-    if existing is None:
-        # Only a clash on the CANONICAL citation is a real conflict. A clash on an alternate citation
-        # just means that string is not ours to attach: drop it and promote under the canonical one.
-        alt = (await db.execute(select(Citation).where(Citation.citation_string == canonical))).scalars().first()
+    if existing is None and identity_keys:
+        # A notes-edition alias is the same judgment, not a second citation that "already belongs"
+        # somewhere else. A string whose judgment is outside these keys is still a real clash.
+        alt_rows = (await db.execute(select(Citation).where(Citation.citation_string.in_(list(identity_keys))))).scalars().all()
+        by_string = {}
+        for row in alt_rows:
+            by_string.setdefault(row.citation_string, row)
+        alt = by_string.get(canonical) or next((by_string[key] for key in identity_keys if key in by_string), None)
         if alt is not None:
             existing = (await db.execute(select(Judgment).where(Judgment.id == alt.judgment_id))).scalars().first()
-            if existing is not None and existing.full_text_hash != text_hash and existing.canonical_citation != canonical:
+            if (
+                existing is not None
+                and existing.full_text_hash != text_hash
+                and existing.canonical_citation not in set(identity_keys)
+            ):
                 await _quarantine(db, st, f"citation {alt.citation_string} already belongs to judgment {existing.canonical_citation}", "judgment", {"conflict_with": str(existing.id)})
                 return "quarantined"
     if existing is not None:

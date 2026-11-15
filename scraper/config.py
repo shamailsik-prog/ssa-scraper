@@ -42,6 +42,7 @@ KNOWN_REPORTERS = (
     "PTD",
     "PLC",
     "PLCN",
+    "PLC(CS)",
     "PLC(CS)N",
     "CLD",
     "YLR",
@@ -516,7 +517,7 @@ class Settings(BaseSettings):
     # IndexSearch (plan V8). Off by default: a live page has not confirmed the selectors.
     PLS_INDEX_SEARCH_ENABLED: bool = Field(
         default=False,
-        description="When true, Celery Beat may schedule pls_index_search_tick. Off leaves the live harvest unchanged.",
+        description="When true, Celery Beat may schedule pls_index_search_tick. Off leaves the live harvest unchanged. A blank value is off.",
     )
     PLS_INDEX_SEARCH_SCHEDULE_SECONDS: int = Field(
         default=3600,
@@ -553,21 +554,24 @@ class Settings(BaseSettings):
         default=35.0,
         description="Maximum seconds before each IndexSearch request. The wait is chosen uniformly in the min/max range.",
     )
+    # V9 names a monthly fair-usage limit and no timezone. The worker clock and the
+    # stored day/month keys are UTC, so the budget window stays put across a restart.
+    # These are UTC calendar periods, not Asia/Karachi.
     PLS_INDEX_SEARCH_REQUESTS_PER_DAY: int = Field(
         default=30,
-        description="IndexSearch requests (index pages and judgment pages) allowed per calendar day. The tick stops before the next request when this is spent.",
+        description="IndexSearch requests (index pages and judgment pages) allowed per UTC calendar day. The tick stops before the next request when this is spent.",
     )
     PLS_INDEX_SEARCH_REQUESTS_PER_MONTH: int = Field(
         default=400,
-        description="IndexSearch requests allowed per calendar month.",
+        description="IndexSearch requests allowed per UTC calendar month.",
     )
     PLS_INDEX_SEARCH_SECONDS_PER_DAY: float = Field(
         default=1200.0,
-        description="Seconds of IndexSearch delay plus request time allowed per calendar day.",
+        description="Seconds of IndexSearch delay plus request time allowed per UTC calendar day.",
     )
     PLS_INDEX_SEARCH_SECONDS_PER_MONTH: float = Field(
         default=7200.0,
-        description="Seconds of IndexSearch delay plus request time allowed per calendar month.",
+        description="Seconds of IndexSearch delay plus request time allowed per UTC calendar month.",
     )
     PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS: float = Field(
         default=300.0,
@@ -759,6 +763,13 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_is_none(cls, v: Any) -> Any:
         return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("PLS_INDEX_SEARCH_ENABLED", mode="before")
+    @classmethod
+    def _blank_index_search_flag_is_off(cls, v: Any) -> Any:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return False
+        return v
 
     @field_validator(
         "PLS_EARLIEST_YEAR",

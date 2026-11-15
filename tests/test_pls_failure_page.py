@@ -199,7 +199,8 @@ async def test_search_gap_empty_modal_is_empty_not_staged(db, login_source, harv
     assert (await db.execute(select(ScraperStaging))).scalars().all() == []
 
 
-async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source):
+@pytest.mark.parametrize("harvest", ["search_gap", "index_search"])
+async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source, harvest):
     from sqlalchemy import select
 
     from scraper.auth.session_manager import PageResult
@@ -223,7 +224,7 @@ async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source):
         },
     )
     row = {"citation": citation, "title": "Notes Only", "detail_url": detail_url}
-    assert await pipeline.preserve_and_extract(page, {"harvest": "search_gap"}, row) == "non_judgment"
+    assert await pipeline.preserve_and_extract(page, {"harvest": harvest}, row) == "non_judgment"
     assert (await db.execute(select(ScraperStaging))).scalars().all() == []
 
 

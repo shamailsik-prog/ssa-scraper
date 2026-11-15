@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 from urllib.parse import urljoin
 
@@ -42,6 +42,11 @@ LOAD_MORE_LABEL = "load more"
 LOAD_MORE_URL_ATTRS = ("href", "data-href", "data-url", "formaction")
 DETAIL_HREF_NEEDLES = ("ReferenceCaseLawSearch", "GetCaseFile")
 INDEX_SEARCH_STATE_KEY = "pls_index_search"
+# Blank option of select[name=court] ("All courts"). A journal that is not
+# court-split always submits this value so a court left selected for PLD cannot
+# stay selected. Confirm on a live page that value="" is that option before the
+# flag is turned on. If the live option is a different value, change this constant.
+INDEX_COURT_ALL_VALUE = ""
 
 # A parent journal's index is not the notes edition. Subscribing to the parent
 # adds the notes edition (and PLC's civil-service series) to the walk.
@@ -56,7 +61,9 @@ _NOTES_OF_PARENT = {
 
 _INDEX_CITE = re.compile(
     r"(?P<year>19\d{2}|20\d{2})\s+"
-    r"(?P<reporter>PLC\(CS\)N|PCrLJN|CLCN|YLRN|PLCN|PLC\(CS\)|PCrLJ|SCMR|CLC|YLR|MLD|CLD|PTD|GBLR|PLD|PLC)"
+    r"(?P<reporter>PLC\s*\(\s*C\.?\s*S\.?\s*\)N|PLC\s*\(\s*C\.?\s*S\.?\s*\)|"
+    r"PCrLJN|CLCN|YLRN|PLCN|PCrLJ|SCMR|CLC|YLR|MLD|CLD|PTD|GBLR|PLD|PLC)"
+    r"(?:\s+(?P<note>Note))?"
     r"\s+(?P<page>\d+[A-Z]?)\b",
     re.IGNORECASE,
 )
@@ -202,6 +209,17 @@ def index_search_should_yield(*, harvest_claimable: bool, session_lock_held: boo
 
 
 def roll_periods(state: Dict[str, Any], now: datetime) -> None:
+    """Reset day and month counters on the UTC calendar date.
+
+    The tick passes datetime.now(timezone.utc). V9 names a monthly fair-usage
+    limit and no timezone, so the stored keys stay on that UTC clock: day is
+    YYYY-MM-DD and month is YYYY-MM. A restart does not move the window. This
+    is not Asia/Karachi local time.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     day = now.strftime("%Y-%m-%d")
     month = now.strftime("%Y-%m")
     if state.get("day") != day:
@@ -301,6 +319,32 @@ def _load_more_url(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
+def _forms_from_hit(hit, court: Optional[str]) -> tuple[str, str, List[str]]:
+    """Citation string, reporter code, and every lookup form of one index hit.
+
+    A word-form Note stays that spelling ("2017 YLR Note 99"). A glued or spaced
+    PLC(CS) citation keeps the stored spaced string, and the reporter code is
+    PLC(CS) or PLC(CS)N, never the letters-only fold PLCCS.
+    """
+    token = canonical_reporter(hit.group("reporter")) or hit.group("reporter")
+    year = hit.group("year")
+    page = hit.group("page")
+    note = hit.group("note")
+    raw = f"{year} {token} Note {page}" if note else f"{year} {token} {page}"
+    printed = normalise_citation(raw) or raw
+    forms = [printed]
+    citation = printed
+    if token == "PLD" and not note:
+        mapped = _citation_court(court)
+        if mapped:
+            completed = normalise_citation(f"PLD {year} {mapped} {page}")
+            if completed and completed not in forms:
+                forms.append(completed)
+            if completed:
+                citation = completed
+    return citation, token, forms
+
+
 def _row_from_entry(entry) -> Optional[IndexRow]:
     detail_url = None
     for anchor in entry.find_all("a", href=True):
@@ -320,29 +364,13 @@ def _row_from_entry(entry) -> Optional[IndexRow]:
     if not hits:
         return IndexRow(citation="", title=text, court=court, detail_url=detail_url, reporter="")
     primary = hits[0]
-    reporter = primary.group("reporter")
-    year = primary.group("year")
-    page = primary.group("page")
-    printed = normalise_citation(f"{year} {reporter} {page}") or f"{year} {reporter} {page}"
-    citation = printed
-    if reporter.upper() == "PLD":
-        token = _citation_court(court)
-        if token:
-            completed = normalise_citation(f"PLD {year} {token} {page}")
-            if completed:
-                citation = completed
+    citation, reporter, _primary_forms = _forms_from_hit(primary, court)
     parallel: List[str] = []
     for hit in hits[1:]:
-        other = normalise_citation(f"{hit.group('year')} {hit.group('reporter')} {hit.group('page')}")
-        other = other or f"{hit.group('year')} {hit.group('reporter')} {hit.group('page')}"
-        if other not in parallel:
-            parallel.append(other)
-        if hit.group("reporter").upper() == "PLD":
-            token = _citation_court(court)
-            if token:
-                completed = normalise_citation(f"PLD {hit.group('year')} {token} {hit.group('page')}")
-                if completed and completed not in parallel:
-                    parallel.append(completed)
+        _other_citation, _other_reporter, forms = _forms_from_hit(hit, court)
+        for form in forms:
+            if form not in parallel:
+                parallel.append(form)
     title = text[primary.end():].strip(" -")
     title = _TRAILING_COURT.sub("", title).strip(" -")
     title = _INDEX_CITE.sub("", title).strip(" -")
@@ -352,7 +380,7 @@ def _row_from_entry(entry) -> Optional[IndexRow]:
         title=re.sub(r"\s+", " ", title).strip(),
         court=court,
         detail_url=detail_url,
-        reporter=canonical_reporter(reporter) or reporter,
+        reporter=reporter,
         parallel_citations=parallel,
     )
 
@@ -393,9 +421,13 @@ def _index_request(query: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, An
     next_url = state.get("next_url")
     if next_url and page_no > 1:
         return {"url": str(next_url), "form": None}
-    form = {"reporter": str(query["reporter"]), "year": str(query["year"])}
-    if query.get("court"):
-        form["court"] = str(query["court"])
+    # Always send the court control. Omitting it leaves the previous PLD court
+    # selected, and a journal that is not court-split would be searched as that court.
+    form = {
+        "reporter": str(query["reporter"]),
+        "year": str(query["year"]),
+        "court": str(query["court"]) if query.get("court") else INDEX_COURT_ALL_VALUE,
+    }
     if page_no > 1:
         form["page"] = str(page_no)
     return {"url": None, "form": form, "path": INDEX_SEARCH_PATH}
@@ -473,6 +505,7 @@ async def run_index_search(
             await save()
             return None, "backoff"
         record_request(state, max(0.0, monotonic() - started))
+        await save()
         return value, None
 
     def stop(reason: str, *, staged: int, known: int) -> Dict[str, Any]:

@@ -75,18 +75,106 @@ def test_existing_citation_strings_keep_their_canonical_form(raw, expected):
 
 
 def test_notes_code_and_note_word_are_one_lookup_key_and_not_the_parent_page():
-    glued = citation_lookup_keys("2024 YLRN 120")
-    word = citation_lookup_keys("2019 YLR Note 120")
-    assert "2024 YLRN 120" in glued
-    assert "2024 YLR Note 120" in glued
-    assert "2019 YLR Note 120" in word
-    assert "2019 YLRN 120" in word
-    parent = citation_lookup_keys("2024 YLR 120")
-    assert "2024 YLRN 120" not in parent
-    assert "2024 YLR Note 120" not in parent
-    plc = citation_lookup_keys("2025 PLC(CS)N 45")
-    assert "2025 PLC(CS)N 45" in plc
-    assert "2025 PLC (CS) Note 45" in plc
+    """Both directions. A notes lookup must not contain the parent page, and the parent lookup must not contain the notes spellings."""
+    pairs = (
+        ("2024 YLRN 120", "2024 YLR Note 120", "2024 YLR 120"),
+        ("2024 CLCN 15", "2024 CLC Note 15", "2024 CLC 15"),
+        ("2018 PCrLJN 41", "2018 PCrLJ Note 41", "2018 PCrLJ 41"),
+        ("2020 PLCN 5", "2020 PLC Note 5", "2020 PLC 5"),
+        ("2025 PLC(CS)N 45", "2025 PLC (CS) Note 45", "2025 PLC (CS) 45"),
+    )
+    for glued, word, parent in pairs:
+        held_glued = citation_lookup_keys(glued)
+        held_word = citation_lookup_keys(word)
+        assert glued in held_glued and word in held_glued
+        assert word in held_word and glued in held_word
+        assert parent not in held_glued
+        assert parent not in held_word
+        parent_keys = citation_lookup_keys(parent)
+        assert glued not in parent_keys
+        assert word not in parent_keys
+
+
+def test_blank_index_search_flag_does_not_crash_settings(monkeypatch):
+    monkeypatch.setenv("PLS_INDEX_SEARCH_ENABLED", "")
+    fresh = Settings(DATABASE_URL="postgresql+asyncpg://x:y@localhost/db", REDIS_URL="redis://localhost/0")
+    assert fresh.PLS_INDEX_SEARCH_ENABLED is False
+    monkeypatch.setenv("PLS_INDEX_SEARCH_ENABLED", "   ")
+    fresh = Settings(DATABASE_URL="postgresql+asyncpg://x:y@localhost/db", REDIS_URL="redis://localhost/0")
+    assert fresh.PLS_INDEX_SEARCH_ENABLED is False
+
+
+def test_budget_periods_follow_the_utc_calendar_date():
+    from scraper.pls_index_search import roll_periods
+
+    # 01:30 in Pakistan on 16 Nov is still 15 Nov in UTC. The stored day is the UTC date.
+    state = {}
+    roll_periods(state, datetime(2026, 11, 16, 1, 30, tzinfo=timezone(timedelta(hours=5))))
+    assert state["day"] == "2026-11-15"
+    assert state["month"] == "2026-11"
+
+
+def test_non_court_journal_clears_a_leftover_court():
+    from scraper.pls_index_search import INDEX_COURT_ALL_VALUE, _index_request
+
+    pld = _index_request({"reporter": "PLD", "year": 2024, "court": "SUPREME-COURT"}, {})
+    ylrn = _index_request({"reporter": "YLRN", "year": 2024}, {})
+    assert pld["form"]["court"] == "SUPREME-COURT"
+    assert ylrn["form"]["court"] == INDEX_COURT_ALL_VALUE == ""
+    assert ylrn["form"]["court"] != pld["form"]["court"]
+
+
+def _index_entry(line: str, href: str) -> str:
+    return (
+        '<html><body><div id="indexSearchResults"><div class="index-entry">'
+        f"<span>{line}</span>"
+        f'<a href="{href}">Read</a>'
+        "</div></div></body></html>"
+    )
+
+
+def test_index_parser_accepts_word_form_notes_and_spaced_or_glued_plc_cs():
+    from scraper.pls_index_search import parse_index_page
+
+    word = parse_index_page(
+        _index_entry(
+            "2017 YLR Note 99 ALI VS THE STATE (LAHORE-HIGH-COURT-LAHORE)",
+            "/Login/ReferenceCaseLawSearch?CaseName=2017Y99",
+        )
+    ).rows[0]
+    assert word.citation == "2017 YLR Note 99"
+    assert word.reporter == "YLR"
+
+    spaced = parse_index_page(
+        _index_entry(
+            "2025 PLC (CS) 45 KHAN VS FEDERATION (SUPREME-COURT)",
+            "/Login/ReferenceCaseLawSearch?CaseName=2025C45",
+        )
+    ).rows[0]
+    assert spaced.citation == "2025 PLC (CS) 45"
+    assert spaced.reporter == "PLC(CS)"
+
+    glued = parse_index_page(
+        _index_entry(
+            "2025 PLC(CS) 45 KHAN VS FEDERATION (SUPREME-COURT)",
+            "/Login/ReferenceCaseLawSearch?CaseName=2025C45",
+        )
+    ).rows[0]
+    assert glued.citation == "2025 PLC (CS) 45"
+    assert glued.reporter == "PLC(CS)"
+    assert glued.reporter != "PLCCS"
+
+    notes = parse_index_page(
+        _index_entry(
+            "2025 PLC(CS)N 45 KHAN VS FEDERATION (SUPREME-COURT)",
+            "/Login/ReferenceCaseLawSearch?CaseName=2025N45",
+        )
+    ).rows[0]
+    assert notes.citation == "2025 PLC(CS)N 45"
+    assert notes.reporter == "PLC(CS)N"
+    assert canonical_reporter("PLC(CS)") == "PLC(CS)"
+    assert canonical_reporter("PLCCS") == "PLC(CS)"
+    assert canonical_reporter("PLC(CS)N") == "PLC(CS)N"
 
 
 def test_case_name_keys_are_unchanged_when_the_row_has_no_citation():
@@ -513,3 +601,141 @@ async def test_yield_helper_uses_gap_focus_claimability(db, monkeypatch):
     monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_GAP_FOCUS", True)
     assert await index_search_yield_reason(db, session_lock_held=False) == "search_harvest"
     await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_the_request_count_before_the_page_cursor_advances():
+    from scraper.pls_index_search import run_index_search
+
+    saved = []
+
+    async def fetch_index(_request):
+        return INDEX_FIXTURE
+
+    async def fetch_detail(url):
+        return {"url": url, "html": "<html>body</html>"}
+
+    async def preserve(_detail, _route, _row):
+        return "staged"
+
+    async def known(_keys):
+        return set()
+
+    async def sleep(_seconds):
+        return None
+
+    async def persist(state):
+        saved.append({"requests": int(state.get("day_requests") or 0), "page": state.get("page")})
+
+    clock = {"t": 0.0}
+
+    def monotonic():
+        clock["t"] += 1.0
+        return clock["t"]
+
+    class Seq:
+        def uniform(self, _a, _b):
+            return 0.0
+
+    result = await run_index_search(
+        state={},
+        now=datetime(2026, 11, 15, tzinfo=timezone.utc),
+        limits=_limits(requests_per_day=10, requests_per_month=10, seconds_per_day=100, seconds_per_month=100),
+        queries=[{"reporter": "PLD", "year": 2024, "court": "SUPREME-COURT"}],
+        fetch_index=fetch_index,
+        fetch_detail=fetch_detail,
+        preserve=preserve,
+        known_keys=known,
+        sleep=sleep,
+        monotonic=monotonic,
+        rng=Seq(),
+        harvest_claimable=False,
+        persist=persist,
+    )
+    assert result["stopped"] is None
+    assert saved
+    assert saved[0]["requests"] >= 1
+    assert saved[0]["page"] in (None, 1)
+    assert saved[-1]["page"] == 2
+    assert any(item["requests"] >= 1 and item["page"] in (None, 1) for item in saved)
+
+
+async def _promote_notes(db, login_source, held: str, incoming: str) -> str:
+    from sqlalchemy import func, select
+
+    from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment
+    from scraper.models import Citation, Judgment
+    from scraper.parsers.text_cleaner import clean_html
+    from scraper.tasks.promotion import promote_judgment_staging
+    from tests.fixtures import judgment_html
+
+    held_text = f"Held judgment body for {held}. " + ("The court dismissed the appeal. " * 40)
+    existing = Judgment(
+        canonical_citation=held,
+        case_title="Held row",
+        court_name="Lahore High Court",
+        full_text=held_text,
+        full_text_hash=canonical_text_hash(held_text),
+        judge_names=["A Judge"],
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url=f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=held-{held.replace(' ', '')}",
+        confidence_score=0.9,
+    )
+    db.add(existing)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=existing.id,
+            citation_string=held,
+            raw_string=held,
+            reporter="YLR",
+            year=2017,
+            page=99,
+            is_primary=True,
+        )
+    )
+    await db.flush()
+    detail_url = f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=in-{incoming.replace(' ', '')}"
+    full_html = judgment_html(incoming, title="Incoming Notes Case")
+    full_text = clean_html(full_html)
+    prov = await record_provenance(db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html")
+    st = await stage_judgment(db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url)
+    st.extracted_citation = incoming
+    st.reconciled_json = {
+        "citations": [incoming],
+        "court": "Lahore High Court",
+        "year": 2017,
+        "case_title": "Incoming Notes Case",
+        "judge_names": ["A Judge"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+    result = await promote_judgment_staging(db, st)
+    count = (await db.execute(select(func.count()).select_from(Judgment))).scalar()
+    canonicals = set((await db.execute(select(Judgment.canonical_citation))).scalars().all())
+    return result, count, canonicals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "held,incoming",
+    [
+        ("2017 YLR Note 99", "2017 YLRN 99"),
+        ("2017 YLRN 99", "2017 YLR Note 99"),
+    ],
+)
+async def test_notes_spellings_promote_as_the_same_judgment(db, login_source, held, incoming):
+    result, count, canonicals = await _promote_notes(db, login_source, held, incoming)
+    assert result == "duplicate"
+    assert count == 1
+    assert canonicals == {held}
+
+
+@pytest.mark.asyncio
+async def test_parent_page_stays_a_different_judgment_from_the_notes_edition(db, login_source):
+    result, count, canonicals = await _promote_notes(db, login_source, "2017 YLR 99", "2017 YLRN 99")
+    assert result == "promoted"
+    assert count == 2
+    assert canonicals == {"2017 YLR 99", "2017 YLRN 99"}

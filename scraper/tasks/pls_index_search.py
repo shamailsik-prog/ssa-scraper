@@ -138,6 +138,11 @@ async def run_index_search_tick(db, *, redis_client=None) -> Dict[str, Any]:
         async def known(keys):
             return await load_known_citation_keys(db, set(keys))
 
+        async def persist(snapshot):
+            # Cursor and counters commit with the page, not only when the tick returns.
+            await merge_source_config(db, source, {INDEX_SEARCH_STATE_KEY: snapshot})
+            await db.commit()
+
         result = await run_index_search(
             state=state,
             now=now,
@@ -151,6 +156,7 @@ async def run_index_search_tick(db, *, redis_client=None) -> Dict[str, Any]:
             monotonic=time.monotonic,
             rng=random.Random(),
             harvest_claimable=False,
+            persist=persist,
         )
         await merge_source_config(db, source, {INDEX_SEARCH_STATE_KEY: result["state"]})
         await db.commit()
