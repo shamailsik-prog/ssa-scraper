@@ -23,6 +23,7 @@ LOGIN_ONLY_BEAT_ENTRIES = frozenset(
         "recover-login-slots", "pls-keepalive", "pls-stall-watchdog", "spot-check-judgments",
         "pls-search-harvest", "pls-search-harvest-s2", "pls-seed-snowball",
         "pls-caseid-walk", "pls-caseid-walk-p1", "pls-index-search",
+        "pls-advance-search", "pls-smart-search",
     }
 )
 # Beat entries that only make sense where the free sites are harvested (statutes come from them).

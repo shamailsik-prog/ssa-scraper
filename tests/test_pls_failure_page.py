@@ -171,7 +171,7 @@ async def test_real_short_judgment_still_passes_the_harvest_path(db, login_sourc
     assert staged.status in ("extracted", "quarantined")
 
 
-@pytest.mark.parametrize("harvest", ["search_gap", "index_search"])
+@pytest.mark.parametrize("harvest", ["search_gap", "index_search", "advance_search", "smart_search"])
 async def test_search_gap_empty_modal_is_empty_not_staged(db, login_source, harvest):
     from sqlalchemy import select
 
@@ -199,7 +199,7 @@ async def test_search_gap_empty_modal_is_empty_not_staged(db, login_source, harv
     assert (await db.execute(select(ScraperStaging))).scalars().all() == []
 
 
-@pytest.mark.parametrize("harvest", ["search_gap", "index_search"])
+@pytest.mark.parametrize("harvest", ["search_gap", "index_search", "advance_search", "smart_search"])
 async def test_search_gap_headnote_is_non_judgment_not_staged(db, login_source, harvest):
     from sqlalchemy import select
 

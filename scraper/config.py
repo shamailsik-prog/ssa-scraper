@@ -581,6 +581,117 @@ class Settings(BaseSettings):
         default=7200.0,
         description="Ceiling on the IndexSearch error backoff.",
     )
+    # Advance Search (plan V1). Off by default. A blank query list idles even when the flag is on.
+    # No year field is submitted. Day and month budgets are UTC, the same clock as IndexSearch.
+    PLS_ADVANCE_SEARCH_ENABLED: bool = Field(
+        default=False,
+        description="When true, Celery Beat may schedule pls_advance_search_tick. Off leaves the live harvest unchanged. A blank value is off.",
+    )
+    PLS_ADVANCE_SEARCH_SCHEDULE_SECONDS: int = Field(
+        default=3600,
+        description="Beat interval for pls_advance_search_tick when PLS_ADVANCE_SEARCH_ENABLED is true.",
+    )
+    PLS_ADVANCE_SEARCH_QUERIES: str = Field(
+        default="",
+        description="JSON list of Advance Search queries (court, judge, lawyer, party, keyword, rule, act, section, act2, section2). Year is ignored. Blank idles.",
+    )
+    PLS_ADVANCE_SEARCH_DELAY_MIN: float = Field(
+        default=15.0,
+        description="Minimum seconds before each Advance Search request, before the login-session delay.",
+    )
+    PLS_ADVANCE_SEARCH_DELAY_MAX: float = Field(
+        default=35.0,
+        description="Maximum seconds before each Advance Search request.",
+    )
+    PLS_ADVANCE_SEARCH_REQUESTS_PER_DAY: int = Field(
+        default=20,
+        description="Advance Search requests (listing pages and judgment pages) allowed per UTC calendar day.",
+    )
+    PLS_ADVANCE_SEARCH_REQUESTS_PER_MONTH: int = Field(
+        default=200,
+        description="Advance Search requests allowed per UTC calendar month.",
+    )
+    PLS_ADVANCE_SEARCH_SECONDS_PER_DAY: float = Field(
+        default=900.0,
+        description="Seconds of Advance Search delay plus request time allowed per UTC calendar day.",
+    )
+    PLS_ADVANCE_SEARCH_SECONDS_PER_MONTH: float = Field(
+        default=5400.0,
+        description="Seconds of Advance Search delay plus request time allowed per UTC calendar month.",
+    )
+    PLS_ADVANCE_SEARCH_BACKOFF_BASE_SECONDS: float = Field(
+        default=300.0,
+        description="First wait after an Advance Search error or login challenge. Each further failure doubles it.",
+    )
+    PLS_ADVANCE_SEARCH_BACKOFF_CAP_SECONDS: float = Field(
+        default=7200.0,
+        description="Ceiling on the Advance Search error backoff.",
+    )
+    PLS_ADVANCE_SEARCH_MAX_LISTING_PAGES_PER_TICK: int = Field(
+        default=1,
+        description="Advance Search listing pages opened in one tick. One page, then the tick stops.",
+    )
+    PLS_ADVANCE_SEARCH_MAX_REQUESTS_PER_RUN: int = Field(
+        default=8,
+        description="Hard cap on Advance Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it.",
+    )
+    # Smart Search (plan V6). Off by default. Queries longer than 500 characters are not sent.
+    PLS_SMART_SEARCH_ENABLED: bool = Field(
+        default=False,
+        description="When true, Celery Beat may schedule pls_smart_search_tick. Off leaves the live harvest unchanged. A blank value is off.",
+    )
+    PLS_SMART_SEARCH_SCHEDULE_SECONDS: int = Field(
+        default=3600,
+        description="Beat interval for pls_smart_search_tick when PLS_SMART_SEARCH_ENABLED is true.",
+    )
+    PLS_SMART_SEARCH_QUERIES: str = Field(
+        default="",
+        description="Smart Search queries: a JSON list, or one natural-language query per line. Blank idles. Each query is capped at PLS_SMART_SEARCH_QUERY_MAX_CHARS.",
+    )
+    PLS_SMART_SEARCH_QUERY_MAX_CHARS: int = Field(
+        default=500,
+        description="Maximum Smart Search query length. A longer query is skipped, not truncated. 500 is the cap named in the field notes.",
+    )
+    PLS_SMART_SEARCH_DELAY_MIN: float = Field(
+        default=15.0,
+        description="Minimum seconds before each Smart Search request, before the login-session delay.",
+    )
+    PLS_SMART_SEARCH_DELAY_MAX: float = Field(
+        default=35.0,
+        description="Maximum seconds before each Smart Search request.",
+    )
+    PLS_SMART_SEARCH_REQUESTS_PER_DAY: int = Field(
+        default=20,
+        description="Smart Search requests (listing pages and judgment pages) allowed per UTC calendar day.",
+    )
+    PLS_SMART_SEARCH_REQUESTS_PER_MONTH: int = Field(
+        default=200,
+        description="Smart Search requests allowed per UTC calendar month.",
+    )
+    PLS_SMART_SEARCH_SECONDS_PER_DAY: float = Field(
+        default=900.0,
+        description="Seconds of Smart Search delay plus request time allowed per UTC calendar day.",
+    )
+    PLS_SMART_SEARCH_SECONDS_PER_MONTH: float = Field(
+        default=5400.0,
+        description="Seconds of Smart Search delay plus request time allowed per UTC calendar month.",
+    )
+    PLS_SMART_SEARCH_BACKOFF_BASE_SECONDS: float = Field(
+        default=300.0,
+        description="First wait after a Smart Search error or login challenge. Each further failure doubles it.",
+    )
+    PLS_SMART_SEARCH_BACKOFF_CAP_SECONDS: float = Field(
+        default=7200.0,
+        description="Ceiling on the Smart Search error backoff.",
+    )
+    PLS_SMART_SEARCH_MAX_LISTING_PAGES_PER_TICK: int = Field(
+        default=1,
+        description="Smart Search listing pages opened in one tick. One page, then the tick stops.",
+    )
+    PLS_SMART_SEARCH_MAX_REQUESTS_PER_RUN: int = Field(
+        default=8,
+        description="Hard cap on Smart Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it.",
+    )
     PLS_BROWSER_RECYCLE_WINDOWS: int = Field(
         default=12,
         description="Recycle the Playwright browser after this many search-harvest windows/pages.",
@@ -764,7 +875,7 @@ class Settings(BaseSettings):
     def _blank_is_none(cls, v: Any) -> Any:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("PLS_INDEX_SEARCH_ENABLED", mode="before")
+    @field_validator("PLS_INDEX_SEARCH_ENABLED", "PLS_ADVANCE_SEARCH_ENABLED", "PLS_SMART_SEARCH_ENABLED", mode="before")
     @classmethod
     def _blank_index_search_flag_is_off(cls, v: Any) -> Any:
         if v is None or (isinstance(v, str) and not v.strip()):
@@ -907,6 +1018,32 @@ class Settings(BaseSettings):
             raise ValueError("PLS_INDEX_SEARCH_BACKOFF_CAP_SECONDS must be >= PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS, both positive")
         if self.PLS_INDEX_SEARCH_PAGE_SIZE <= 0 or self.PLS_INDEX_SEARCH_MAX_PAGES_PER_TICK <= 0 or self.PLS_INDEX_SEARCH_SCHEDULE_SECONDS <= 0:
             raise ValueError("PLS_INDEX_SEARCH page size, pages per tick, and schedule must be positive")
+        for prefix in ("PLS_ADVANCE_SEARCH", "PLS_SMART_SEARCH"):
+            delay_min = getattr(self, f"{prefix}_DELAY_MIN")
+            delay_max = getattr(self, f"{prefix}_DELAY_MAX")
+            per_day = getattr(self, f"{prefix}_REQUESTS_PER_DAY")
+            per_month = getattr(self, f"{prefix}_REQUESTS_PER_MONTH")
+            seconds_day = getattr(self, f"{prefix}_SECONDS_PER_DAY")
+            seconds_month = getattr(self, f"{prefix}_SECONDS_PER_MONTH")
+            backoff_base = getattr(self, f"{prefix}_BACKOFF_BASE_SECONDS")
+            backoff_cap = getattr(self, f"{prefix}_BACKOFF_CAP_SECONDS")
+            pages = getattr(self, f"{prefix}_MAX_LISTING_PAGES_PER_TICK")
+            run_cap = getattr(self, f"{prefix}_MAX_REQUESTS_PER_RUN")
+            schedule = getattr(self, f"{prefix}_SCHEDULE_SECONDS")
+            if delay_min < 0 or delay_max < delay_min:
+                raise ValueError(f"{prefix}_DELAY_MIN/MAX must be non-negative with MAX >= MIN")
+            if per_day <= 0 or per_month < per_day:
+                raise ValueError(f"{prefix}_REQUESTS_PER_MONTH must be >= {prefix}_REQUESTS_PER_DAY, both positive")
+            if seconds_day <= 0 or seconds_month < seconds_day:
+                raise ValueError(f"{prefix}_SECONDS_PER_MONTH must be >= {prefix}_SECONDS_PER_DAY, both positive")
+            if backoff_base <= 0 or backoff_cap < backoff_base:
+                raise ValueError(f"{prefix}_BACKOFF_CAP_SECONDS must be >= {prefix}_BACKOFF_BASE_SECONDS, both positive")
+            if pages <= 0 or schedule <= 0:
+                raise ValueError(f"{prefix} listing pages per tick and schedule must be positive")
+            if run_cap <= 0 or run_cap > per_day:
+                raise ValueError(f"{prefix}_MAX_REQUESTS_PER_RUN must be positive and no higher than {prefix}_REQUESTS_PER_DAY")
+        if self.PLS_SMART_SEARCH_QUERY_MAX_CHARS <= 0 or self.PLS_SMART_SEARCH_QUERY_MAX_CHARS > 500:
+            raise ValueError("PLS_SMART_SEARCH_QUERY_MAX_CHARS must be from 1 to 500")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:
