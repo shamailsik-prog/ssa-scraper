@@ -143,7 +143,7 @@ def test_index_parser_accepts_word_form_notes_and_spaced_or_glued_plc_cs():
         )
     ).rows[0]
     assert word.citation == "2017 YLR Note 99"
-    assert word.reporter == "YLR"
+    assert word.reporter == "YLRN"
 
     spaced = parse_index_page(
         _index_entry(
@@ -739,3 +739,311 @@ async def test_parent_page_stays_a_different_judgment_from_the_notes_edition(db,
     assert result == "promoted"
     assert count == 2
     assert canonicals == {"2017 YLR 99", "2017 YLRN 99"}
+
+
+async def _promote_incomplete(db, login_source, held: str, incoming: str, reporter: str):
+    """A short Notes row with no judges, then a fuller capture under `incoming`."""
+    from sqlalchemy import func, select
+
+    from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment
+    from scraper.models import Citation, Judgment
+    from scraper.parsers.text_cleaner import clean_html
+    from scraper.tasks.promotion import promote_judgment_staging
+    from tests.fixtures import judgment_html
+
+    stub = "stubby"
+    existing = Judgment(
+        canonical_citation=held,
+        case_title="Thin notes row",
+        court_name="Lahore High Court",
+        reporter=reporter,
+        full_text=stub,
+        full_text_hash=canonical_text_hash(stub),
+        judge_names=None,
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url=f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=stub-{held.replace(' ', '')}",
+        confidence_score=0.4,
+    )
+    db.add(existing)
+    await db.flush()
+    db.add(
+        Citation(
+            judgment_id=existing.id,
+            citation_string=held,
+            raw_string=held,
+            reporter=reporter,
+            year=2017,
+            page=99,
+            is_primary=True,
+        )
+    )
+    await db.flush()
+    detail_url = f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=full-{incoming.replace(' ', '')}"
+    full_html = judgment_html(incoming, title="Fuller Notes Copy")
+    full_text = clean_html(full_html)
+    prov = await record_provenance(db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html")
+    st = await stage_judgment(db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url)
+    st.extracted_citation = incoming
+    st.reconciled_json = {
+        "citations": [incoming],
+        "court": "Lahore High Court",
+        "year": 2017,
+        "case_title": "Fuller Notes Copy",
+        "judge_names": ["A Judge"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+    result = await promote_judgment_staging(db, st)
+    rows = (await db.execute(select(Judgment))).scalars().all()
+    return result, rows, st
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "held,incoming,reporter",
+    [
+        ("2017 YLR Note 99", "2017 YLRN 99", "YLR"),
+        ("2017 YLRN 99", "2017 YLR Note 99", "YLRN"),
+        ("2019 PLC (CS) Note 49", "2019 PLC(CS)N 49", "PLC (CS)"),
+        ("2019 PLC(CS)N 49", "2019 PLC (CS) Note 49", "PLC(CS)N"),
+    ],
+)
+async def test_a_fuller_notes_spelling_upgrades_an_incomplete_row(db, login_source, held, incoming, reporter):
+    from sqlalchemy import select
+
+    from scraper.models import Citation
+
+    result, rows, _st = await _promote_incomplete(db, login_source, held, incoming, reporter)
+    assert result == "promoted"
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.canonical_citation == held
+    assert row.reporter == reporter
+    assert len(row.full_text or "") > len("stubby")
+    attached = (await db.execute(select(Citation).where(Citation.judgment_id == row.id))).scalars().all()
+    by_string = {item.citation_string: item for item in attached}
+    assert incoming in by_string
+    if incoming != held:
+        assert by_string[incoming].is_primary is False
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_parent_stays_separate_from_an_incoming_notes_copy(db, login_source):
+    result, rows, _st = await _promote_incomplete(db, login_source, "2017 YLR 99", "2017 YLRN 99", "YLR")
+    assert result == "promoted"
+    by_canon = {row.canonical_citation: row for row in rows}
+    assert set(by_canon) == {"2017 YLR 99", "2017 YLRN 99"}
+    assert by_canon["2017 YLR 99"].full_text == "stubby"
+    assert by_canon["2017 YLR 99"].reporter == "YLR"
+    assert len(by_canon["2017 YLRN 99"].full_text or "") > len("stubby")
+
+
+async def _promote_parallel(db, login_source, alt_string: str, incoming: str):
+    """`alt_string` is a non-primary citation on a different judgment (2017 SCMR 5)."""
+    from sqlalchemy import func, select
+
+    from scraper.fetchers import canonical_text_hash, record_provenance, stage_judgment
+    from scraper.models import Citation, Judgment
+    from scraper.parsers.text_cleaner import clean_html
+    from scraper.tasks.promotion import promote_judgment_staging
+    from tests.fixtures import judgment_html
+
+    body = "Held SCMR body. " + ("The court allowed the petition. " * 40)
+    held = Judgment(
+        canonical_citation="2017 SCMR 5",
+        case_title="Held",
+        court_name="Lahore High Court",
+        full_text=body,
+        full_text_hash=canonical_text_hash(body),
+        judge_names=["A Judge"],
+        access_method=login_source.access_method,
+        source_name="PakistanLawSite",
+        source_url="https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=held-scmr5",
+        confidence_score=0.9,
+    )
+    db.add(held)
+    await db.flush()
+    db.add(Citation(judgment_id=held.id, citation_string="2017 SCMR 5", raw_string="2017 SCMR 5", reporter="SCMR", year=2017, page=5, is_primary=True))
+    db.add(Citation(judgment_id=held.id, citation_string=alt_string, raw_string=alt_string, reporter="YLR", year=2017, page=99, is_primary=False))
+    await db.flush()
+    detail_url = f"https://www.pakistanlawsite.com/Login/ReferenceCaseLawSearch?CaseName=in-{incoming.replace(' ', '')}"
+    full_html = judgment_html(incoming, title="Incoming")
+    full_text = clean_html(full_html)
+    prov = await record_provenance(db, source=login_source, url=detail_url, content=full_html.encode("utf-8"), content_kind="html")
+    st = await stage_judgment(db, source=login_source, prov=prov, raw_html=full_html, raw_text=full_text, url=detail_url)
+    st.extracted_citation = incoming
+    st.reconciled_json = {
+        "citations": [incoming],
+        "court": "Lahore High Court",
+        "year": 2017,
+        "case_title": "Incoming",
+        "judge_names": ["A Judge"],
+        "document_type": "full_judgment",
+    }
+    st.status = "extracted"
+    st.confidence_score = 0.99
+    result = await promote_judgment_staging(db, st)
+    count = (await db.execute(select(func.count()).select_from(Judgment))).scalar()
+    return result, count, st
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alt,incoming",
+    [
+        ("2017 YLR Note 99", "2017 YLRN 99"),
+        ("2017 YLRN 99", "2017 YLR Note 99"),
+    ],
+)
+async def test_a_notes_alias_held_as_a_parallel_citation_is_a_clash(db, login_source, alt, incoming):
+    result, count, staging = await _promote_parallel(db, login_source, alt, incoming)
+    assert result == "quarantined"
+    assert count == 1
+    assert "already belongs" in (staging.quarantine_reason or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alt,incoming",
+    [
+        ("2017 YLR 99", "2017 YLRN 99"),
+        ("2017 YLR 99", "2017 YLR Note 99"),
+        ("2017 YLRN 99", "2017 YLR 99"),
+        ("2017 YLR Note 99", "2017 YLR 99"),
+    ],
+)
+async def test_a_parent_held_as_a_parallel_citation_does_not_match_notes(db, login_source, alt, incoming):
+    result, count, _staging = await _promote_parallel(db, login_source, alt, incoming)
+    assert result == "promoted"
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_index_request_keeps_the_counted_request(monkeypatch):
+    from scraper.pls_index_search import run_index_search
+
+    saved = []
+
+    async def fetch_index(_request):
+        return "<html></html>"
+
+    async def fetch_detail(_url):
+        raise AssertionError("detail fetched")
+
+    async def preserve(*_args):
+        raise AssertionError("preserved")
+
+    async def known(_keys):
+        return set()
+
+    async def sleep(_seconds):
+        return None
+
+    async def persist(state):
+        saved.append(int(state.get("day_requests") or 0))
+
+    def crash(_html):
+        raise RuntimeError("crash after the index request")
+
+    monkeypatch.setattr("scraper.pls_index_search.parse_index_page", crash)
+    clock = {"t": 0.0}
+
+    def monotonic():
+        clock["t"] += 1.0
+        return clock["t"]
+
+    class Seq:
+        def uniform(self, _a, _b):
+            return 0.0
+
+    with pytest.raises(RuntimeError, match="crash after the index request"):
+        await run_index_search(
+            state={},
+            now=datetime(2026, 11, 15, tzinfo=timezone.utc),
+            limits=_limits(requests_per_day=10, requests_per_month=10, seconds_per_day=100, seconds_per_month=100),
+            queries=[{"reporter": "YLRN", "year": 2017}],
+            fetch_index=fetch_index,
+            fetch_detail=fetch_detail,
+            preserve=preserve,
+            known_keys=known,
+            sleep=sleep,
+            monotonic=monotonic,
+            rng=Seq(),
+            harvest_claimable=False,
+            persist=persist,
+        )
+    assert saved and saved[0] >= 1
+
+
+@pytest.mark.asyncio
+async def test_the_tick_commits_the_count_after_the_first_request(db, login_source, monkeypatch):
+    from scraper.auth.session_manager import merge_source_config
+    from scraper.config import settings
+    from scraper.pls_index_search import INDEX_SEARCH_STATE_KEY
+    from scraper.tasks import pls_index_search as tick_mod
+
+    login_source.state = "ACTIVE"
+    login_source.is_active = True
+    await db.flush()
+    monkeypatch.setattr(settings, "PLS_INDEX_SEARCH_ENABLED", True)
+    monkeypatch.setattr(type(settings), "login_scraping_effective", property(lambda self: True))
+
+    class _Lock:
+        async def acquire(self):
+            return None
+
+        async def release(self):
+            return None
+
+    monkeypatch.setattr(tick_mod, "SessionLock", lambda *_args, **_kwargs: _Lock())
+
+    async def claim(_pipeline):
+        return object()
+
+    async def release(_pipeline):
+        return None
+
+    async def mode(_db):
+        return "updates"
+
+    async def no_yield(_db, *, session_lock_held):
+        return None
+
+    merges = []
+    commits = []
+    during = {}
+    real_merge = merge_source_config
+    real_commit = db.commit
+
+    async def spy_merge(session, source, patch):
+        merges.append(dict(patch))
+        return await real_merge(session, source, patch)
+
+    async def spy_commit():
+        commits.append(len(merges))
+        return await real_commit()
+
+    async def fake_run(**kwargs):
+        persist = kwargs.get("persist")
+        assert callable(persist)
+        await persist({"day_requests": 1, "day": "2026-11-15", "month": "2026-11", "page": 1})
+        during["merges"] = len(merges)
+        during["commits"] = len(commits)
+        return {"stopped": None, "state": {"day_requests": 1, "page": 1}, "staged": 0, "known": 0}
+
+    monkeypatch.setattr(tick_mod, "claim_free_slot", claim)
+    monkeypatch.setattr(tick_mod, "release_claimed_slot", release)
+    monkeypatch.setattr(tick_mod, "get_harvest_mode", mode)
+    monkeypatch.setattr(tick_mod, "index_search_yield_reason", no_yield)
+    monkeypatch.setattr(tick_mod, "merge_source_config", spy_merge)
+    monkeypatch.setattr(tick_mod, "run_index_search", fake_run)
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    result = await tick_mod.run_index_search_tick(db)
+    assert during["merges"] >= 1
+    assert during["commits"] >= 1
+    first = merges[0][INDEX_SEARCH_STATE_KEY]
+    assert int(first.get("day_requests") or 0) >= 1
+    assert result["state"]["day_requests"] == 1

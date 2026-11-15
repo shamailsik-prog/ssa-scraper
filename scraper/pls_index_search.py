@@ -48,6 +48,18 @@ INDEX_SEARCH_STATE_KEY = "pls_index_search"
 # flag is turned on. If the live option is a different value, change this constant.
 INDEX_COURT_ALL_VALUE = ""
 
+# Word-form Note lines use the notes code as the row reporter, matching the glued
+# line (YLR Note and YLRN are both YLRN). The citation string stays the word form,
+# and that string is the stored key. This map is not copied into the citation or
+# the preserve payload.
+_NOTE_ROW_REPORTER = {
+    "YLR": "YLRN",
+    "CLC": "CLCN",
+    "PCrLJ": "PCrLJN",
+    "PLC": "PLCN",
+    "PLC(CS)": "PLC(CS)N",
+}
+
 # A parent journal's index is not the notes edition. Subscribing to the parent
 # adds the notes edition (and PLC's civil-service series) to the walk.
 _NOTES_OF_PARENT = {
@@ -322,9 +334,11 @@ def _load_more_url(soup: BeautifulSoup) -> Optional[str]:
 def _forms_from_hit(hit, court: Optional[str]) -> tuple[str, str, List[str]]:
     """Citation string, reporter code, and every lookup form of one index hit.
 
-    A word-form Note stays that spelling ("2017 YLR Note 99"). A glued or spaced
-    PLC(CS) citation keeps the stored spaced string, and the reporter code is
-    PLC(CS) or PLC(CS)N, never the letters-only fold PLCCS.
+    A word-form Note stays that spelling ("2017 YLR Note 99"), which is the stored
+    key. The row reporter for that line is the notes code (YLRN), the same code a
+    glued line uses. A glued or spaced PLC(CS) citation keeps the stored spaced
+    string, and the reporter code is PLC(CS) or PLC(CS)N, never the letters-only
+    fold PLCCS.
     """
     token = canonical_reporter(hit.group("reporter")) or hit.group("reporter")
     year = hit.group("year")
@@ -334,6 +348,7 @@ def _forms_from_hit(hit, court: Optional[str]) -> tuple[str, str, List[str]]:
     printed = normalise_citation(raw) or raw
     forms = [printed]
     citation = printed
+    reporter = _NOTE_ROW_REPORTER.get(token, token) if note else token
     if token == "PLD" and not note:
         mapped = _citation_court(court)
         if mapped:
@@ -342,7 +357,7 @@ def _forms_from_hit(hit, court: Optional[str]) -> tuple[str, str, List[str]]:
                 forms.append(completed)
             if completed:
                 citation = completed
-    return citation, token, forms
+    return citation, reporter, forms
 
 
 def _row_from_entry(entry) -> Optional[IndexRow]:

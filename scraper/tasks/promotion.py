@@ -636,10 +636,15 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
         incoming_is_fuller = len(full_text or "") > len(existing.full_text or "") or (
             not existing.judge_names and bool(data.get("judge_names"))
         )
+        # A notes spelling of the same judgment ("2017 YLR Note 99" and "2017 YLRN 99")
+        # may upgrade an incomplete row. Unreported identity stays an exact match.
+        # The stored canonical is left as it is.
+        notes_spelling = (not unreported) and existing.canonical_citation in set(identity_keys)
+        same_citation = existing.canonical_citation == canonical
         should_upgrade_existing = (
             st.source_name == "PakistanLawSite"
             and (existing.source_name or "") == "PakistanLawSite"
-            and existing.canonical_citation == canonical
+            and (same_citation or notes_spelling)
             and existing.full_text_hash != text_hash
             and existing_is_incomplete
             and incoming_is_fuller
@@ -653,7 +658,11 @@ async def promote_judgment_staging(db: AsyncSession, st: ScraperStaging, *, forc
             existing.bench_type = data.get("bench_type")
             existing.decision_date = decision_date
             existing.year = data.get("year") or parts["year"] or existing.year
-            existing.reporter = parts["reporter"] or existing.reporter
+            # An alias upgrade keeps the held reporter (YLR stays YLR on a word-form
+            # row). An empty reporter can take the incoming one. The canonical above
+            # is not assigned.
+            if existing.canonical_citation == canonical or not existing.reporter:
+                existing.reporter = parts["reporter"] or existing.reporter
             existing.page_number = parts["page"] or existing.page_number
             existing.full_text = full_text
             existing.full_text_hash = text_hash
