@@ -38,6 +38,8 @@ def test_flags_default_off_and_budgets_are_conservative():
         assert 0 < getattr(fresh, f"{prefix}_SECONDS_PER_DAY") <= getattr(fresh, f"{prefix}_SECONDS_PER_MONTH")
         assert 0 < getattr(fresh, f"{prefix}_BACKOFF_BASE_SECONDS") <= getattr(fresh, f"{prefix}_BACKOFF_CAP_SECONDS")
         assert getattr(fresh, f"{prefix}_MAX_LISTING_PAGES_PER_TICK") == 1
+        assert fresh.PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH == 5400.0
+        assert fresh.PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH <= getattr(fresh, f"{prefix}_SECONDS_PER_MONTH")
         cap = getattr(fresh, f"{prefix}_MAX_REQUESTS_PER_RUN")
         assert 0 < cap <= getattr(fresh, f"{prefix}_REQUESTS_PER_DAY")
         assert getattr(fresh, f"{prefix}_SCHEDULE_SECONDS") > 0
@@ -54,7 +56,8 @@ def test_blank_flags_are_off(monkeypatch):
 
 def test_smart_query_cap_cannot_be_raised_past_500_characters():
     with pytest.raises(ValueError):
-        _fresh(PLS_SMART_SEARCH_QUERY_MAX_CHARS=501)
+        _fresh(PLS_SMART_SEARCH_ENABLED=True, PLS_SMART_SEARCH_QUERY_MAX_CHARS=501)
+    assert _fresh(PLS_SMART_SEARCH_QUERY_MAX_CHARS=501).PLS_SMART_SEARCH_ENABLED is False
 
 
 def test_case_detail_gate_includes_both_harvests_and_keeps_the_existing_ones():
@@ -581,8 +584,12 @@ async def _capped_listing_ticks(html: str, *, cap: int, ticks: int):
     return history, calls
 
 
-async def _empty_known():
+async def _empty_known(_keys=None):
     return set()
+
+
+async def _echo_detail(url):
+    return {"url": url}
 
 
 async def test_cap_of_one_stages_cases_across_ticks_without_refetching_the_listing():
@@ -1102,3 +1109,539 @@ async def test_tick_commits_the_cursor_under_its_own_state_key(db, login_source,
     assert int(saved.get("day_requests") or 0) == 1
     assert result["state"]["day_requests"] == 1
     assert HARVEST_ADVANCE == "advance_search"
+
+
+def _summary_with(marker: str) -> str:
+    return f"The judgment discusses {marker} in the facts of the case."
+
+
+def _smart_listing_html(marker: str) -> str:
+    """The body the live fetch classifies: a browser document, or the raw JSON when escaping would hide the marker."""
+    payload = json.dumps({"results": [_smart_hit(headnote=_summary_with(marker))], **_flags()})
+    wrapped = _browser_json_document(payload)
+    if marker.lower() in wrapped.lower():
+        return wrapped
+    return payload
+
+
+def _advance_listing_html(marker: str) -> str:
+    return _advance_html(
+        _advance_row(1, "2024 SCMR 1", _summary_with(marker), "SUPREME-COURT", "2024S1"),
+    )
+
+
+_FORM_HTML = "<html><body><form id='search'></form></body></html>"
+
+
+class _ListingBrowser:
+    def __init__(self, result_html: str, *, result_status: int = 200, result_url: str = "https://www.pakistanlawsite.com/Login/SmartSearch", landing_html: str = _FORM_HTML):
+        self.result_html = result_html
+        self.result_status = result_status
+        self.result_url = result_url
+        self.landing_html = landing_html
+        self.calls = []
+
+    async def goto(self, url: str, **_kwargs):
+        from scraper.auth.session_manager import PageResult
+
+        self.calls.append(("goto", url))
+        return PageResult(url=url, html=self.landing_html, status=200)
+
+    async def submit_search(self, _search_map, values, **_kwargs):
+        from scraper.auth.session_manager import PageResult
+
+        self.calls.append(("search", dict(values)))
+        return PageResult(url=self.result_url, html=self.result_html, status=self.result_status)
+
+
+class _ListingRunner:
+    def __init__(self, browser):
+        self.browser = browser
+        self.halted = False
+        self.needs_human = False
+
+    async def run(self, op):
+        from scraper.auth.session_manager import LoginRequired
+        from scraper.security import ExplicitBlock, VerificationRequired
+
+        try:
+            return await op(self.browser)
+        except ExplicitBlock:
+            self.halted = True
+            raise
+        except (LoginRequired, VerificationRequired):
+            self.needs_human = True
+            raise
+
+
+def _listing_pipeline(browser):
+    from scraper.tasks.pakistanlawsite import PakistanLawSitePipeline
+
+    source = type("Source", (), {"config_json": {}, "source_name": "PakistanLawSite", "id": 1, "state": "ACTIVE", "is_active": True})()
+    pipeline = PakistanLawSitePipeline(object(), source, sleep=_asleep)
+    pipeline.runner = _ListingRunner(browser)
+
+    async def _no_charge():
+        return None
+
+    pipeline._charge_page = _no_charge
+    return pipeline
+
+
+def _listing_markers():
+    from scraper.security import BLOCK_MARKERS, CAPTCHA_MARKERS, LOGIN_MARKERS, MULTILOGIN_MARKERS
+
+    return list(BLOCK_MARKERS + CAPTCHA_MARKERS + LOGIN_MARKERS + MULTILOGIN_MARKERS)
+
+
+@pytest.mark.parametrize("marker", _listing_markers())
+async def test_smart_summary_marker_does_not_halt_the_source(marker):
+    from scraper.pls_smart_search import SMART_SEARCH_PATH
+
+    browser = _ListingBrowser(_smart_listing_html(marker))
+    pipeline = _listing_pipeline(browser)
+    page = await pipeline.fetch_smart_surface({"form": {"q": "bail"}, "path": SMART_SEARCH_PATH})
+    assert pipeline.runner.halted is False
+    assert pipeline.runner.needs_human is False
+    assert marker.lower() in (page.html or "").lower() or marker.lower() in json.loads(page.html)["results"][0]["headnote"].lower()
+
+
+@pytest.mark.parametrize("marker", _listing_markers())
+async def test_advance_row_marker_does_not_halt_the_source(marker):
+    from scraper.pls_advance_search import ADVANCE_SEARCH_PATH
+
+    browser = _ListingBrowser(
+        _advance_listing_html(marker),
+        result_url="https://www.pakistanlawsite.com/Login/AdvanceSearch",
+    )
+    pipeline = _listing_pipeline(browser)
+    page = await pipeline.fetch_advance_surface({"form": {"keyword": "bail"}, "path": ADVANCE_SEARCH_PATH})
+    assert pipeline.runner.halted is False
+    assert pipeline.runner.needs_human is False
+    assert marker.lower() in (page.html or "").lower()
+
+
+@pytest.mark.parametrize(
+    "surface,html,status,url,kind",
+    [
+        ("smart", "<html><body><h1>Access denied</h1></body></html>", 200, "https://www.pakistanlawsite.com/Login/SmartSearch", "block"),
+        ("advance", "<html><body><h1>Access denied</h1></body></html>", 200, "https://www.pakistanlawsite.com/Login/AdvanceSearch", "block"),
+        ("smart", "<html><body><p>Please complete the captcha</p></body></html>", 200, "https://www.pakistanlawsite.com/Login/SmartSearch", "verification"),
+        ("advance", "<html><body><p>Please complete the captcha</p></body></html>", 200, "https://www.pakistanlawsite.com/Login/AdvanceSearch", "verification"),
+        ("smart", "<html><body><p>Your session expired. Please log in.</p></body></html>", 200, "https://www.pakistanlawsite.com/Login/SmartSearch", "login"),
+        ("advance", "<html><body><p>Your session expired. Please log in.</p></body></html>", 200, "https://www.pakistanlawsite.com/Login/AdvanceSearch", "login"),
+    ],
+)
+async def test_real_block_captcha_and_login_pages_still_raise(surface, html, status, url, kind):
+    from scraper.auth.session_manager import LoginRequired
+    from scraper.pls_advance_search import ADVANCE_SEARCH_PATH
+    from scraper.pls_smart_search import SMART_SEARCH_PATH
+    from scraper.security import ExplicitBlock, VerificationRequired
+
+    browser = _ListingBrowser(html, result_status=status, result_url=url)
+    pipeline = _listing_pipeline(browser)
+    path = SMART_SEARCH_PATH if surface == "smart" else ADVANCE_SEARCH_PATH
+    fetch = pipeline.fetch_smart_surface if surface == "smart" else pipeline.fetch_advance_surface
+    expected = {"block": ExplicitBlock, "verification": VerificationRequired, "login": LoginRequired}[kind]
+    with pytest.raises(expected):
+        await fetch({"form": {"q": "bail", "keyword": "bail"}, "path": path})
+    if kind == "block":
+        assert pipeline.runner.halted is True
+        assert pipeline.runner.needs_human is False
+    else:
+        assert pipeline.runner.needs_human is True
+        assert pipeline.runner.halted is False
+
+
+async def test_smart_json_keeps_status_and_login_url_checks_and_ignores_only_hit_text():
+    from scraper.auth.session_manager import LoginRequired
+    from scraper.pls_smart_search import SMART_SEARCH_PATH
+    from scraper.security import ExplicitBlock
+
+    stray = _ListingBrowser('{"message": "access denied"}')
+    pipeline = _listing_pipeline(stray)
+    with pytest.raises(ExplicitBlock):
+        await pipeline.fetch_smart_surface({"form": {"q": "bail"}, "path": SMART_SEARCH_PATH})
+    assert pipeline.runner.halted is True
+
+    blocked = _ListingBrowser(_smart_listing_html("ordinary headnote"), result_status=403)
+    pipeline = _listing_pipeline(blocked)
+    with pytest.raises(ExplicitBlock):
+        await pipeline.fetch_smart_surface({"form": {"q": "bail"}, "path": SMART_SEARCH_PATH})
+
+    login = _ListingBrowser(
+        _smart_listing_html("ordinary headnote"),
+        result_url="https://www.pakistanlawsite.com/Login/MainPage",
+    )
+    pipeline = _listing_pipeline(login)
+    with pytest.raises(LoginRequired):
+        await pipeline.fetch_smart_surface({"form": {"q": "bail"}, "path": SMART_SEARCH_PATH})
+    assert pipeline.runner.needs_human is True
+
+
+async def test_advance_marker_outside_the_results_table_still_halts():
+    from scraper.pls_advance_search import ADVANCE_SEARCH_PATH
+    from scraper.security import ExplicitBlock
+
+    html = "<html><body><p>Access denied</p>" + _advance_listing_html("ordinary party") + "</body></html>"
+    browser = _ListingBrowser(html, result_url="https://www.pakistanlawsite.com/Login/AdvanceSearch")
+    pipeline = _listing_pipeline(browser)
+    with pytest.raises(ExplicitBlock):
+        await pipeline.fetch_advance_surface({"form": {"keyword": "bail"}, "path": ADVANCE_SEARCH_PATH})
+    assert pipeline.runner.halted is True
+
+
+async def test_page_two_resubmits_the_query_and_stages_its_cases():
+    from scraper.pls_advance_search import advance_request, parse_advance_page
+    from scraper.pls_case_enumeration import HARVEST_ADVANCE, HARVEST_SMART, run_case_enumeration
+    from scraper.pls_smart_search import parse_smart_search, smart_request
+
+    advance_pages = [
+        _advance_html(
+            _advance_row(1, "2024 SCMR 1", "ONE", "SUPREME-COURT", "2024S1"),
+            more="<button id='readMoreAdvanceSearch' data-page='2'>Load More</button>",
+        ),
+        _advance_html(_advance_row(2, "2024 SCMR 2", "TWO", "SUPREME-COURT", "2024S2")),
+    ]
+    advance_requests = []
+
+    async def fetch_advance(request):
+        advance_requests.append(request)
+        return advance_pages[len(advance_requests) - 1]
+
+    async def preserve(_detail, route, row):
+        assert "<" not in json.dumps(row)
+        return "staged"
+
+    advance = await run_case_enumeration(
+        harvest=HARVEST_ADVANCE,
+        state={},
+        now=NOW,
+        limits=_limits(max_listing_pages_per_tick=2, max_requests_per_run=8, requests_per_day=20, requests_per_month=40),
+        queries=[{"keyword": "bail", "court": "SUPREME-COURT"}],
+        build_request=advance_request,
+        parse_listing=parse_advance_page,
+        fetch_listing=fetch_advance,
+        fetch_detail=_echo_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert advance["staged"] == 2
+    assert advance_requests[1]["form"]["keyword"] == "bail"
+    assert advance_requests[1]["form"]["court"] == "SUPREME-COURT"
+    assert advance_requests[1]["form"]["page"] == "2"
+    assert advance_requests[1]["url"] is None
+
+    smart_pages = [
+        json.dumps({"results": [_smart_hit(citation="2024 SCMR 1", case_name="2024S1")], **_flags(), "page": 1, "total_pages": 2}),
+        json.dumps({"results": [_smart_hit(citation="2024 SCMR 2", case_name="2024S2", case_title="SECOND")], **_flags(), "page": 2, "total_pages": 2}),
+    ]
+    smart_requests = []
+
+    async def fetch_smart(request):
+        smart_requests.append(request)
+        return smart_pages[len(smart_requests) - 1]
+
+    smart = await run_case_enumeration(
+        harvest=HARVEST_SMART,
+        state={},
+        now=NOW,
+        limits=_limits(max_listing_pages_per_tick=2, max_requests_per_run=8, requests_per_day=20, requests_per_month=40),
+        queries=["pre-arrest bail"],
+        build_request=lambda query, state: smart_request(query, state, max_chars=500),
+        parse_listing=parse_smart_search,
+        fetch_listing=fetch_smart,
+        fetch_detail=_echo_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert smart["staged"] == 2
+    assert smart_requests[1]["form"]["q"] == "pre-arrest bail"
+    assert smart_requests[1]["form"]["page"] == "2"
+    assert smart_requests[1]["url"] is None
+    carried = smart_request("pre-arrest bail", {"page": 2, "next_url": "/Login/SmartSearch?q=pre-arrest+bail&page=2"}, max_chars=500)
+    assert carried["form"] is None
+    assert "q=pre-arrest+bail" in carried["url"]
+    assert "page=2" in carried["url"]
+
+
+async def test_two_unrecognized_or_empty_pages_skip_to_the_next_query(caplog):
+    import logging
+
+    from scraper.pls_advance_search import advance_request, parse_advance_page
+    from scraper.pls_case_enumeration import run_case_enumeration
+
+    caplog.set_level(logging.WARNING)
+    bad = "<html><body><p>Welcome back</p></body></html>"
+    good = _advance_html(_advance_row(1, "2024 SCMR 9", "NINE", "SUPREME-COURT", "2024S9"))
+    seen = []
+
+    async def fetch(request):
+        seen.append(request["form"]["keyword"])
+        return bad if request["form"]["keyword"] == "bad" else good
+
+    async def preserve(*_a):
+        return "staged"
+
+    limits = _limits(backoff_base_seconds=1, backoff_cap_seconds=1, requests_per_day=20, requests_per_month=40)
+    queries = [{"keyword": "bad"}, {"keyword": "good"}]
+    state = {}
+    now = NOW
+    first = await run_case_enumeration(
+        harvest="advance_search",
+        state=state,
+        now=now,
+        limits=limits,
+        queries=queries,
+        build_request=advance_request,
+        parse_listing=parse_advance_page,
+        fetch_listing=fetch,
+        fetch_detail=_echo_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert first["stopped"] == "unrecognized_page"
+    assert first["state"]["query_index"] == 0
+    assert seen == ["bad"]
+    now = datetime.fromisoformat(first["state"]["backoff_until"]) + timedelta(seconds=1)
+    second = await run_case_enumeration(
+        harvest="advance_search",
+        state=first["state"],
+        now=now,
+        limits=limits,
+        queries=queries,
+        build_request=advance_request,
+        parse_listing=parse_advance_page,
+        fetch_listing=fetch,
+        fetch_detail=_echo_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert second["stopped"] == "empty_query"
+    assert second["state"]["query_index"] == 1
+    assert seen == ["bad", "bad"]
+    assert "skipped" in caplog.text.lower()
+    third = await run_case_enumeration(
+        harvest="advance_search",
+        state=second["state"],
+        now=now,
+        limits=limits,
+        queries=queries,
+        build_request=advance_request,
+        parse_listing=parse_advance_page,
+        fetch_listing=fetch,
+        fetch_detail=_echo_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert third["staged"] == 1
+    assert seen.count("bad") == 2
+    assert seen[-1] == "good"
+
+    empty_seen = []
+    empty_pages = [
+        _advance_html(more="<button id='readMoreAdvanceSearch' data-page='2'>Load More</button>"),
+        _advance_html(more="<button id='readMoreAdvanceSearch' data-page='3'>Load More</button>"),
+        _advance_html(_advance_row(1, "2024 SCMR 4", "FOUR", "SUPREME-COURT", "2024S4")),
+    ]
+
+    async def fetch_empty(request):
+        empty_seen.append(int(request["form"].get("page") or 1))
+        return empty_pages[len(empty_seen) - 1]
+
+    empty_state = {}
+    empty_now = NOW
+    for _tick in range(2):
+        empty = await run_case_enumeration(
+            harvest="advance_search",
+            state=empty_state,
+            now=empty_now,
+            limits=limits,
+            queries=[{"keyword": "none"}, {"keyword": "later"}],
+            build_request=advance_request,
+            parse_listing=parse_advance_page,
+            fetch_listing=fetch_empty,
+            fetch_detail=_echo_detail,
+            preserve=preserve,
+            known_keys=_empty_known,
+            sleep=_asleep,
+            monotonic=_clock(),
+            rng=_Zero(),
+            harvest_claimable=False,
+        )
+        empty_state = empty["state"]
+        if empty["state"].get("backoff_until"):
+            empty_now = datetime.fromisoformat(empty["state"]["backoff_until"]) + timedelta(seconds=1)
+    assert empty["stopped"] == "empty_query"
+    assert empty_state["query_index"] == 1
+    assert empty_seen == [1, 2]
+
+
+def test_run_cap_above_the_daily_cap_is_rejected():
+    with pytest.raises(ValueError):
+        _fresh(
+            PLS_ADVANCE_SEARCH_ENABLED=True,
+            PLS_ADVANCE_SEARCH_REQUESTS_PER_DAY=20,
+            PLS_ADVANCE_SEARCH_MAX_REQUESTS_PER_RUN=21,
+        )
+    with pytest.raises(ValueError):
+        _fresh(PLS_SMART_SEARCH_ENABLED=True, PLS_SMART_SEARCH_MAX_REQUESTS_PER_RUN=0)
+    booted = _fresh(PLS_ADVANCE_SEARCH_MAX_REQUESTS_PER_RUN=21, PLS_ADVANCE_SEARCH_REQUESTS_PER_DAY=20)
+    assert booted.PLS_ADVANCE_SEARCH_ENABLED is False
+
+
+async def test_a_form_listing_counts_each_page_load():
+    from scraper.pls_advance_search import advance_request, parse_advance_page
+    from scraper.pls_case_enumeration import run_case_enumeration
+
+    html = _advance_html(_advance_row(1, "2024 SCMR 1", "ONE", "SUPREME-COURT", "2024S1"))
+    calls = {"listing": 0, "detail": 0}
+
+    async def fetch_listing(request):
+        assert request["loads"] == 2
+        calls["listing"] += 1
+        return html
+
+    async def fetch_detail(_url):
+        calls["detail"] += 1
+        return {"url": _url}
+
+    async def preserve(*_a):
+        return "staged"
+
+    result = await run_case_enumeration(
+        harvest="advance_search",
+        state={},
+        now=NOW,
+        limits=_limits(max_requests_per_run=2, requests_per_day=20, requests_per_month=40),
+        queries=[{"keyword": "bail"}],
+        build_request=advance_request,
+        parse_listing=parse_advance_page,
+        fetch_listing=fetch_listing,
+        fetch_detail=fetch_detail,
+        preserve=preserve,
+        known_keys=_empty_known,
+        sleep=_asleep,
+        monotonic=_clock(),
+        rng=_Zero(),
+        harvest_claimable=False,
+    )
+    assert calls["listing"] == 1
+    assert calls["detail"] == 0
+    assert result["stopped"] == "run_cap"
+    assert result["state"]["day_requests"] == 2
+    assert result["state"]["month_requests"] == 2
+    direct = advance_request(
+        {"keyword": "bail"},
+        {"page": 2, "next_url": "/Login/AdvanceSearch?keyword=bail&page=2"},
+    )
+    assert direct["loads"] == 1
+    assert direct["form"] is None
+    assert "keyword=bail" in direct["url"]
+
+
+def test_configured_queries_reject_quotes_operators_and_a_bad_court_slug(monkeypatch, caplog):
+    import logging
+
+    from scraper.pls_advance_search import advance_queries_from_settings
+    from scraper.pls_smart_search import smart_queries_from_settings
+
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(
+        settings,
+        "PLS_ADVANCE_SEARCH_QUERIES",
+        json.dumps(
+            [
+                {"keyword": "bail", "court": "SUPREME-COURT", "rule": "Order XXXIX"},
+                {"keyword": 'bail "remand"'},
+                {"keyword": "bail OR remand"},
+                {"keyword": "bail (remand)"},
+                {"keyword": "NOT bail"},
+                {"court": "Supreme Court", "keyword": "bail"},
+            ]
+        ),
+    )
+    kept = advance_queries_from_settings()
+    assert kept == [{"keyword": "bail", "court": "SUPREME-COURT", "rule": "Order XXXIX"}]
+    monkeypatch.setattr(settings, "PLS_SMART_SEARCH_QUERIES", "pre-arrest bail\nbail OR remand\n\"quoted\"\nsection (497)\n")
+    assert smart_queries_from_settings() == ["pre-arrest bail"]
+    assert "quotes" in caplog.text
+    assert "boolean operator" in caplog.text
+    assert "parentheses" in caplog.text
+    assert "court slug" in caplog.text
+
+
+async def test_shared_account_month_stops_before_another_request():
+    from scraper.pls_case_enumeration import budget_block_reason, run_case_enumeration
+    from scraper.tasks.pls_case_enumeration import other_surface_month_seconds
+
+    limits = _limits(seconds_per_day=100000, seconds_per_month=100000, requests_per_day=50, requests_per_month=50)
+    state = {"day": "2026-11-15", "month": "2026-11", "month_seconds": 1000}
+    assert budget_block_reason(dict(state), NOW, limits, upcoming_seconds=12, account_month_seconds=4500, account_month_cap=5400) == "account_month_seconds"
+    assert budget_block_reason(dict(state), NOW, limits, upcoming_seconds=12, account_month_seconds=0, account_month_cap=5400) is None
+
+    async def boom(*_a, **_k):
+        raise AssertionError("request left")
+
+    blocked = await run_case_enumeration(
+        harvest="smart_search",
+        state=dict(state),
+        now=NOW,
+        limits=limits,
+        queries=["bail"],
+        build_request=lambda query, _state: {"form": {"q": query}, "loads": 2},
+        parse_listing=boom,
+        fetch_listing=boom,
+        fetch_detail=boom,
+        preserve=boom,
+        known_keys=boom,
+        sleep=boom,
+        monotonic=lambda: 0.0,
+        rng=None,
+        harvest_claimable=False,
+        account_month_seconds=4500,
+        account_month_cap=5400,
+    )
+    assert blocked["stopped"] == "account_month_seconds"
+    cfg = {"pls_advance_search": {"month": "2026-11", "month_seconds": 4000}, "pls_smart_search": {"month": "2026-10", "month_seconds": 9000}}
+    assert other_surface_month_seconds(cfg, own_key="pls_smart_search", month="2026-11") == 4000
+    assert other_surface_month_seconds(cfg, own_key="pls_advance_search", month="2026-11") == 0
+
+
+def test_bad_enumeration_env_does_not_break_boot_while_the_flags_are_off(monkeypatch):
+    monkeypatch.setenv("PLS_ADVANCE_SEARCH_ENABLED", "false")
+    monkeypatch.setenv("PLS_SMART_SEARCH_ENABLED", "0")
+    monkeypatch.setenv("PLS_ADVANCE_SEARCH_DELAY_MIN", "not-a-number")
+    monkeypatch.setenv("PLS_ADVANCE_SEARCH_MAX_REQUESTS_PER_RUN", "999")
+    monkeypatch.setenv("PLS_SMART_SEARCH_QUERY_MAX_CHARS", "nope")
+    monkeypatch.setenv("PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH", "nope")
+    fresh = _fresh()
+    assert fresh.PLS_ADVANCE_SEARCH_ENABLED is False
+    assert fresh.PLS_SMART_SEARCH_ENABLED is False
+    assert fresh.PLS_ADVANCE_SEARCH_DELAY_MIN == 15.0
+    assert fresh.PLS_SMART_SEARCH_QUERY_MAX_CHARS == 500
+    assert fresh.PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH == 5400.0
+    monkeypatch.setenv("PLS_ADVANCE_SEARCH_ENABLED", "true")
+    monkeypatch.setenv("PLS_ADVANCE_SEARCH_DELAY_MIN", "not-a-number")
+    with pytest.raises(ValueError):
+        _fresh()

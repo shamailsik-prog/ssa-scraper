@@ -116,6 +116,18 @@ def _smart_build_request(query, state):
     return smart_request(query, state, max_chars=int(settings.PLS_SMART_SEARCH_QUERY_MAX_CHARS))
 
 
+def other_surface_month_seconds(cfg: Dict[str, Any], *, own_key: str, month: str) -> float:
+    """Seconds the other enumeration surface has already spent in this UTC month."""
+    total = 0.0
+    for key in (ADVANCE_SEARCH_STATE_KEY, SMART_SEARCH_STATE_KEY):
+        if key == own_key:
+            continue
+        blob = (cfg or {}).get(key) or {}
+        if isinstance(blob, dict) and str(blob.get("month") or "") == month:
+            total += float(blob.get("month_seconds") or 0)
+    return total
+
+
 async def enumeration_yield_reason(db, *, session_lock_held: bool) -> Optional[str]:
     """search_harvest when either login's next ledger row is claimable, including GAP_FOCUS."""
     if session_lock_held:
@@ -237,6 +249,8 @@ async def _run_tick(db, kind: _Kind, *, redis_client=None) -> Dict[str, Any]:
             rng=random.Random(),
             harvest_claimable=False,
             persist=persist,
+            account_month_seconds=other_surface_month_seconds(cfg, own_key=kind.state_key, month=now.strftime("%Y-%m")),
+            account_month_cap=float(settings.PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH),
         )
         await merge_source_config(db, source, {kind.state_key: result["state"]})
         await db.commit()

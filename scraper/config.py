@@ -119,6 +119,44 @@ SECRET_FIELD_NAMES = (
 )
 
 
+_ENUM_NUMERIC_SUFFIXES = (
+    "DELAY_MIN",
+    "DELAY_MAX",
+    "REQUESTS_PER_DAY",
+    "REQUESTS_PER_MONTH",
+    "SECONDS_PER_DAY",
+    "SECONDS_PER_MONTH",
+    "BACKOFF_BASE_SECONDS",
+    "BACKOFF_CAP_SECONDS",
+    "MAX_LISTING_PAGES_PER_TICK",
+    "MAX_REQUESTS_PER_RUN",
+    "SCHEDULE_SECONDS",
+    "QUERY_MAX_CHARS",
+)
+
+
+def _enumeration_flag_on(value: Any) -> bool:
+    if value is None or (isinstance(value, str) and not str(value).strip()):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _coercible_number(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str) and value.strip():
+        try:
+            float(value.strip())
+        except ValueError:
+            return False
+        return True
+    return False
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -692,6 +730,10 @@ class Settings(BaseSettings):
         default=8,
         description="Hard cap on Smart Search requests in one tick, listing pages and case pages together. The tick stops before the request that would pass it. The listing stays on the cursor, so a cap of 1 fetches the listing on one tick and a case on the next.",
     )
+    PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH: float = Field(
+        default=5400.0,
+        description="Shared monthly ceiling, in seconds, for Advance Search and Smart Search together on one account. Each surface also keeps its own ceiling. The default is one surface's month, not the sum.",
+    )
     PLS_BROWSER_RECYCLE_WINDOWS: int = Field(
         default=12,
         description="Recycle the Playwright browser after this many search-harvest windows/pages.",
@@ -981,6 +1023,31 @@ class Settings(BaseSettings):
             raise ValueError(f"Reporter codes must be journal abbreviations (letters, or a parenthetical series such as PLC(CS)): {bad}")
         return ",".join(items)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _disabled_enumeration_ignores_bad_env(cls, data: Any) -> Any:
+        """A bad Advance or Smart value must not stop boot while that flag is off."""
+        if not isinstance(data, dict):
+            return data
+        cleaned = dict(data)
+        any_on = False
+        for prefix, flag in (
+            ("PLS_ADVANCE_SEARCH", "PLS_ADVANCE_SEARCH_ENABLED"),
+            ("PLS_SMART_SEARCH", "PLS_SMART_SEARCH_ENABLED"),
+        ):
+            if _enumeration_flag_on(cleaned.get(flag)):
+                any_on = True
+                continue
+            for suffix in _ENUM_NUMERIC_SUFFIXES:
+                key = f"{prefix}_{suffix}"
+                if key in cleaned and not _coercible_number(cleaned[key]):
+                    cleaned.pop(key)
+        if not any_on:
+            shared = cleaned.get("PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH")
+            if shared is not None and not _coercible_number(shared):
+                cleaned.pop("PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH", None)
+        return cleaned
+
     @model_validator(mode="after")
     def _cross_field_guards(self) -> "Settings":
         if self.SCRAPER_DELAY_MIN < 0 or self.SCRAPER_DELAY_MAX < self.SCRAPER_DELAY_MIN:
@@ -1018,7 +1085,12 @@ class Settings(BaseSettings):
             raise ValueError("PLS_INDEX_SEARCH_BACKOFF_CAP_SECONDS must be >= PLS_INDEX_SEARCH_BACKOFF_BASE_SECONDS, both positive")
         if self.PLS_INDEX_SEARCH_PAGE_SIZE <= 0 or self.PLS_INDEX_SEARCH_MAX_PAGES_PER_TICK <= 0 or self.PLS_INDEX_SEARCH_SCHEDULE_SECONDS <= 0:
             raise ValueError("PLS_INDEX_SEARCH page size, pages per tick, and schedule must be positive")
-        for prefix in ("PLS_ADVANCE_SEARCH", "PLS_SMART_SEARCH"):
+        for prefix, enabled in (
+            ("PLS_ADVANCE_SEARCH", self.PLS_ADVANCE_SEARCH_ENABLED),
+            ("PLS_SMART_SEARCH", self.PLS_SMART_SEARCH_ENABLED),
+        ):
+            if not enabled:
+                continue
             delay_min = getattr(self, f"{prefix}_DELAY_MIN")
             delay_max = getattr(self, f"{prefix}_DELAY_MAX")
             per_day = getattr(self, f"{prefix}_REQUESTS_PER_DAY")
@@ -1042,8 +1114,12 @@ class Settings(BaseSettings):
                 raise ValueError(f"{prefix} listing pages per tick and schedule must be positive")
             if run_cap <= 0 or run_cap > per_day:
                 raise ValueError(f"{prefix}_MAX_REQUESTS_PER_RUN must be positive and no higher than {prefix}_REQUESTS_PER_DAY")
-        if self.PLS_SMART_SEARCH_QUERY_MAX_CHARS <= 0 or self.PLS_SMART_SEARCH_QUERY_MAX_CHARS > 500:
+        if self.PLS_SMART_SEARCH_ENABLED and (
+            self.PLS_SMART_SEARCH_QUERY_MAX_CHARS <= 0 or self.PLS_SMART_SEARCH_QUERY_MAX_CHARS > 500
+        ):
             raise ValueError("PLS_SMART_SEARCH_QUERY_MAX_CHARS must be from 1 to 500")
+        if (self.PLS_ADVANCE_SEARCH_ENABLED or self.PLS_SMART_SEARCH_ENABLED) and self.PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH <= 0:
+            raise ValueError("PLS_ACCOUNT_SEARCH_SECONDS_PER_MONTH must be positive")
         if self.PLS_KEEPALIVE_SCHEDULE_SECONDS <= 0 or self.PLS_STALL_WATCHDOG_SECONDS <= 0:
             raise ValueError("PLS_KEEPALIVE_SCHEDULE_SECONDS and PLS_STALL_WATCHDOG_SECONDS must be positive")
         if self.PLS_ARCHIVED_GRID_MAX_ROWS <= 0:

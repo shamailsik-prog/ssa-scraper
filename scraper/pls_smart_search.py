@@ -75,26 +75,48 @@ def smart_queries_from_settings() -> List[str]:
             return []
         if not isinstance(data, list):
             return []
-        return [str(item).strip() for item in data if str(item).strip()]
-    return [line.strip() for line in raw.splitlines() if line.strip()]
+        texts = [str(item).strip() for item in data if str(item).strip()]
+    else:
+        texts = [line.strip() for line in raw.splitlines() if line.strip()]
+    from scraper.pls_case_enumeration import query_text_problem
+
+    kept: List[str] = []
+    for text in texts:
+        problem = query_text_problem(text)
+        if problem:
+            logger.warning("Smart Search query dropped: %s", problem)
+            continue
+        kept.append(text)
+    return kept
 
 
 def smart_request(query: str, state: Dict[str, Any], *, max_chars: int) -> Optional[Dict[str, Any]]:
-    """One listing request. A query longer than the cap is not sent and not truncated."""
+    """One listing request. A query longer than the cap is not sent and not truncated.
+
+    A next link that is only a page number is submitted again with the query. A link
+    that already carries the query string is opened as-is. A form submit is the
+    landing page plus the result, so it counts as two loads.
+    """
+    from scraper.pls_case_enumeration import page_only_number, query_text_problem
+
     text = str(query or "").strip()
-    if not text or len(text) > int(max_chars):
+    if not text or len(text) > int(max_chars) or query_text_problem(text):
         return None
     page_no = int(state.get("page") or 1)
     next_url = state.get("next_url")
     if next_url and page_no > 1:
-        target = str(next_url)
-        if target.startswith("?"):
-            target = SMART_SEARCH_PATH + target
-        return {"url": absolute_pls_url(target), "form": None}
+        bare = page_only_number(str(next_url), SMART_SEARCH_PATH)
+        if bare is None:
+            target = str(next_url)
+            if target.startswith("?"):
+                target = SMART_SEARCH_PATH + target
+            return {"url": absolute_pls_url(target), "form": None, "loads": 1}
+        if str(bare).isdigit():
+            page_no = int(bare)
     form = {SMART_QUERY_FIELD: text}
     if page_no > 1:
         form["page"] = str(page_no)
-    return {"url": None, "form": form, "path": SMART_SEARCH_PATH}
+    return {"url": None, "form": form, "path": SMART_SEARCH_PATH, "loads": 2}
 
 
 def _short_list(value: Any, limit: int = 12) -> List[str]:
@@ -219,6 +241,12 @@ def _case_from_hit(hit: Any) -> Optional[EnumeratedCase]:
         reporter=reporter,
         parallel_citations=parallel,
     )
+
+
+def smart_results_document(payload: str) -> bool:
+    """True when the body is a Smart Search hit list, including a browser-wrapped JSON document."""
+    data = _load_payload(payload)
+    return data is not None and _hit_list(data) is not None
 
 
 def parse_smart_search(payload: str) -> ListingPage:

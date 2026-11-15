@@ -9,10 +9,11 @@ Day and month budgets are UTC calendar periods, the same clock IndexSearch uses.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,8 @@ def budget_block_reason(
     limits: EnumerationLimits,
     *,
     upcoming_seconds: float = 0.0,
+    account_month_seconds: float = 0.0,
+    account_month_cap: Optional[float] = None,
 ) -> Optional[str]:
     roll_periods(state, now)
     if int(state.get("day_requests") or 0) >= limits.requests_per_day:
@@ -139,6 +142,10 @@ def budget_block_reason(
         return "day_seconds"
     if month_seconds >= limits.seconds_per_month or month_seconds + upcoming_seconds > limits.seconds_per_month:
         return "month_seconds"
+    if account_month_cap is not None and float(account_month_cap) > 0:
+        spent = month_seconds + float(account_month_seconds)
+        if spent >= float(account_month_cap) or spent + float(upcoming_seconds) > float(account_month_cap):
+            return "account_month_seconds"
     until = state.get("backoff_until")
     if until:
         try:
@@ -150,9 +157,11 @@ def budget_block_reason(
     return None
 
 
-def record_request(state: Dict[str, Any], seconds: float) -> None:
-    state["day_requests"] = int(state.get("day_requests") or 0) + 1
-    state["month_requests"] = int(state.get("month_requests") or 0) + 1
+def record_request(state: Dict[str, Any], seconds: float, *, loads: int = 1) -> None:
+    """Count page loads. A form listing that opens the landing page and the result counts as two."""
+    count = max(1, int(loads))
+    state["day_requests"] = int(state.get("day_requests") or 0) + count
+    state["month_requests"] = int(state.get("month_requests") or 0) + count
     state["day_seconds"] = float(state.get("day_seconds") or 0) + float(seconds)
     state["month_seconds"] = float(state.get("month_seconds") or 0) + float(seconds)
 
@@ -167,6 +176,67 @@ def note_failure(state: Dict[str, Any], now: datetime, limits: EnumerationLimits
 def clear_backoff(state: Dict[str, Any]) -> None:
     state["backoff_step"] = 0
     state["backoff_until"] = None
+
+
+def query_text_problem(value: str) -> Optional[str]:
+    """Plan rule for an operator query: no quotes, no boolean operators, no parentheses."""
+    text = str(value or "")
+    if '"' in text or "'" in text:
+        return "quotes"
+    if "(" in text or ")" in text:
+        return "parentheses"
+    if re.search(r"\b(?:OR|NOT)\b", text, re.IGNORECASE):
+        return "boolean operator"
+    return None
+
+
+def page_only_number(target: str, form_path: str) -> Optional[str]:
+    """The page number when a next link carries nothing else. None when the query string is real."""
+    raw = str(target or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        parsed = urlsplit(raw)
+    elif raw.startswith("?"):
+        parsed = urlsplit("http://pls-page.invalid/" + raw)
+    else:
+        path = raw if raw.startswith("/") else "/" + raw
+        parsed = urlsplit("http://pls-page.invalid" + path)
+    query = parse_qs(parsed.query)
+    if set(query) != {"page"}:
+        return None
+    number = str((query.get("page") or [""])[0]).strip()
+    if not number:
+        return None
+    got = parsed.path or ""
+    if got not in ("", "/", form_path):
+        return None
+    return number
+
+
+def _request_loads(request: Any) -> int:
+    if isinstance(request, dict):
+        try:
+            return max(1, int(request.get("loads") or 1))
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def _blank_streak(state: Dict[str, Any], query_index: int) -> int:
+    if state.get("blank_query") != query_index:
+        state["blank_query"] = query_index
+        state["blank_pages"] = 0
+    state["blank_pages"] = int(state.get("blank_pages") or 0) + 1
+    return int(state["blank_pages"])
+
+
+def _clear_blank(state: Dict[str, Any]) -> None:
+    state["blank_pages"] = 0
+    state.pop("blank_query", None)
+
+
+_BLANK_PAGE_LIMIT = 2
 
 
 def _current_query(queries: Sequence[Any], state: Dict[str, Any]):
@@ -254,6 +324,8 @@ async def run_case_enumeration(
     rng: Any,
     harvest_claimable: bool,
     persist: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    account_month_seconds: float = 0.0,
+    account_month_cap: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Open at most one listing page per tick unless the page cap says otherwise.
 
@@ -275,14 +347,22 @@ async def run_case_enumeration(
 
     run_requests = 0
 
-    async def paced(call):
+    async def paced(call, *, loads: int = 1):
         nonlocal run_requests
         from scraper.tasks.pakistanlawsite import PacingBudgetExceeded
 
-        if run_requests >= int(limits.max_requests_per_run):
+        count = max(1, int(loads))
+        if run_requests + count > int(limits.max_requests_per_run):
             return None, "run_cap"
         delay = float(limits.delay_min if rng is None else rng.uniform(limits.delay_min, limits.delay_max))
-        block = budget_block_reason(state, now, limits, upcoming_seconds=delay)
+        block = budget_block_reason(
+            state,
+            now,
+            limits,
+            upcoming_seconds=delay,
+            account_month_seconds=account_month_seconds,
+            account_month_cap=account_month_cap,
+        )
         if block:
             return None, block
         started = monotonic()
@@ -294,13 +374,13 @@ async def run_case_enumeration(
             return None, "login_pacing"
         except Exception as exc:
             logger.warning("%s request failed: %s", harvest, type(exc).__name__)
-            record_request(state, max(0.0, monotonic() - started))
-            run_requests += 1
+            record_request(state, max(0.0, monotonic() - started), loads=count)
+            run_requests += count
             note_failure(state, now, limits)
             await save()
             return None, "backoff"
-        record_request(state, max(0.0, monotonic() - started))
-        run_requests += 1
+        record_request(state, max(0.0, monotonic() - started), loads=count)
+        run_requests += count
         await save()
         return value, None
 
@@ -330,19 +410,32 @@ async def run_case_enumeration(
                     await save()
                     return stop("no_sendable_query", staged=staged, known=known)
                 continue
-            html, failure = await paced(lambda req=request: fetch_listing(req))
+            html, failure = await paced(lambda req=request: fetch_listing(req), loads=_request_loads(request))
             if failure:
                 return stop(failure, staged=staged, known=known)
             page = parse_listing(html or "")
-            if not page.recognized:
+            if not page.recognized or not page.rows:
                 _clear_listing(state)
-                note_failure(state, now, limits)
+                streak = _blank_streak(state, idx)
+                if streak >= _BLANK_PAGE_LIMIT:
+                    logger.warning("%s skipped query %s after %s unrecognized or empty pages", harvest, idx, streak)
+                    _clear_blank(state)
+                    state["query_index"] = (idx + 1) % len(queries)
+                    state["page"] = 1
+                    state["row_index"] = 0
+                    state["next_url"] = None
+                    await save()
+                    return stop("empty_query", staged=staged, known=known)
+                if not page.recognized:
+                    note_failure(state, now, limits)
+                    await save()
+                    return stop("unrecognized_page", staged=staged, known=known)
+            else:
+                _clear_blank(state)
+                if page.interpretation:
+                    state["last_interpretation"] = dict(page.interpretation)
+                _store_listing(state, page, idx)
                 await save()
-                return stop("unrecognized_page", staged=staged, known=known)
-            if page.interpretation:
-                state["last_interpretation"] = dict(page.interpretation)
-            _store_listing(state, page, idx)
-            await save()
         pages_opened += 1
         clear_backoff(state)
         start_row = int(state.get("row_index") or 0)
@@ -367,7 +460,7 @@ async def run_case_enumeration(
                 state["row_index"] = index + 1
                 state["unlinked"] = int(state.get("unlinked") or 0) + 1
                 continue
-            detail, failure = await paced(lambda url=row.detail_url: fetch_detail(url))
+            detail, failure = await paced(lambda url=row.detail_url: fetch_detail(url), loads=1)
             if failure:
                 state["row_index"] = index
                 state["query_index"] = idx

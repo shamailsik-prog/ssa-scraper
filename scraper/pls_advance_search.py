@@ -107,29 +107,73 @@ def advance_queries_from_settings() -> List[Dict[str, str]]:
             value = str(item.get(key) or "").strip()
             if value:
                 query[key] = value
-        if query:
-            queries.append(query)
+        if not query:
+            continue
+        problem = _advance_query_problem(query)
+        if problem:
+            logger.warning("Advance Search query dropped: %s", problem)
+            continue
+        queries.append(query)
     return queries
 
 
+def _advance_query_problem(query: Dict[str, str]) -> Optional[str]:
+    from scraper.pls_case_enumeration import query_text_problem
+
+    for value in query.values():
+        problem = query_text_problem(value)
+        if problem:
+            return problem
+    court = query.get("court") or ""
+    if not court:
+        return None
+    allowed = {part.strip() for part in str(settings.PLS_INDEX_SEARCH_COURTS or "").split(",") if part.strip()}
+    if court not in allowed:
+        return "court slug"
+    return None
+
+
+def advance_marker_html(html: str) -> str:
+    """HTML the word checks may see: everything outside the results table."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    for node in soup.select(ADVANCE_RESULTS_SELECTOR):
+        node.decompose()
+    for node in soup.select(ADVANCE_ENTRY_SELECTOR):
+        node.decompose()
+    return str(soup)
+
+
 def advance_request(query: Dict[str, Any], state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """One listing request. Year is never submitted, including when the query carries one."""
+    """One listing request. Year is never submitted, including when the query carries one.
+
+    A next link that is only a page number is submitted again with the same fields.
+    A link that already carries the query string is opened as-is. A form submit is
+    the landing page plus the result, so it counts as two loads.
+    """
+    from scraper.pls_case_enumeration import page_only_number
+
     if not isinstance(query, dict):
         return None
     filled = {key: str(query.get(key) or "").strip() for key in ADVANCE_QUERY_FIELDS}
     if not any(filled.values()):
         return None
+    if _advance_query_problem(filled):
+        return None
     page_no = int(state.get("page") or 1)
     next_url = state.get("next_url")
     if next_url and page_no > 1:
-        target = str(next_url)
-        if target.startswith("?"):
-            target = ADVANCE_SEARCH_PATH + target
-        return {"url": absolute_pls_url(target), "form": None}
+        bare = page_only_number(str(next_url), ADVANCE_SEARCH_PATH)
+        if bare is None:
+            target = str(next_url)
+            if target.startswith("?"):
+                target = ADVANCE_SEARCH_PATH + target
+            return {"url": absolute_pls_url(target), "form": None, "loads": 1}
+        if str(bare).isdigit():
+            page_no = int(bare)
     form = dict(filled)
     if page_no > 1:
         form["page"] = str(page_no)
-    return {"url": None, "form": form, "path": ADVANCE_SEARCH_PATH}
+    return {"url": None, "form": form, "path": ADVANCE_SEARCH_PATH, "loads": 2}
 
 
 def _load_more_url(soup: BeautifulSoup) -> Optional[str]:
