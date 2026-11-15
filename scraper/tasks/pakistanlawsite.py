@@ -109,7 +109,7 @@ _PCRLJ_RE = re.compile(r"\bP\s*CR\.?\s*L\.?\s*J\b", re.IGNORECASE)
 # N glued to the closing parenthesis. "PLC (CS) N" (a separated N) is the note word, not this code.
 _PLC_CS_NOTES_RE = re.compile(r"PLC\s*\(\s*C\.?\s*S\.?\s*\)N\b", re.IGNORECASE)
 # Routes that open a case page go through the same empty-body and non-judgment checks.
-CASE_DETAIL_HARVESTS = frozenset({"search_gap", "index_search"})
+CASE_DETAIL_HARVESTS = frozenset({"search_gap", "index_search", "advance_search", "smart_search"})
 _REPORTER_BY_UPPER: Dict[str, str] = {}
 for _reporter in KNOWN_REPORTERS:
     _REPORTER_BY_UPPER.setdefault(_reporter.upper(), _reporter)
@@ -1546,6 +1546,40 @@ class PakistanLawSitePipeline:
 
         await self._charge_page()
         return await self.runner.run(op)
+
+    async def _fetch_named_surface(self, request: Dict[str, Any], *, form_map, landing_path: str, surface: str) -> PageResult:
+        """Open one Advance Search or Smart Search listing. Selectors live in the feature module."""
+        from scraper.pls_case_enumeration import absolute_pls_url
+        from scraper.pls_listing_guard import raise_for_listing
+
+        async def op(browser: Browser) -> PageResult:
+            target = request.get("url")
+            if target:
+                page = await browser.goto(absolute_pls_url(str(target)))
+                raise_for_listing(page, surface=surface)
+                return page
+            page = await browser.goto(absolute_pls_url(landing_path))
+            raise_for_listing(page, surface=surface)
+            page = await browser.submit_search(form_map(), dict(request.get("form") or {}))
+            raise_for_listing(page, surface=surface)
+            return page
+
+        await self._charge_page()
+        return await self.runner.run(op)
+
+    async def fetch_advance_surface(self, request: Dict[str, Any]) -> PageResult:
+        from scraper.pls_advance_search import ADVANCE_SEARCH_PATH, advance_form_map
+
+        return await self._fetch_named_surface(
+            request, form_map=advance_form_map, landing_path=ADVANCE_SEARCH_PATH, surface="advance"
+        )
+
+    async def fetch_smart_surface(self, request: Dict[str, Any]) -> PageResult:
+        from scraper.pls_smart_search import SMART_SEARCH_PATH, smart_form_map
+
+        return await self._fetch_named_surface(
+            request, form_map=smart_form_map, landing_path=SMART_SEARCH_PATH, surface="smart"
+        )
 
     async def download(self, url: str) -> bytes:
         async def op(browser: Browser) -> bytes:

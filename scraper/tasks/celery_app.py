@@ -35,6 +35,7 @@ app = Celery(
         "scraper.tasks.pls_search_harvest",
         "scraper.tasks.pls_caseid_walk",
         "scraper.tasks.pls_index_search",
+        "scraper.tasks.pls_case_enumeration",
         "scraper.tasks.pls_backfill",
         "scraper.tasks.judgment_identity_reconcile",
     ],
@@ -69,6 +70,8 @@ app.conf.update(
         "scraper.tasks.pls_search_harvest.pls_seed_snowball_tick": {"queue": "maintenance"},
         "scraper.tasks.pls_caseid_walk.pls_caseid_walk_tick": {"queue": "login_session"},
         "scraper.tasks.pls_index_search.pls_index_search_tick": {"queue": "login_session"},
+        "scraper.tasks.pls_case_enumeration.pls_advance_search_tick": {"queue": "login_session"},
+        "scraper.tasks.pls_case_enumeration.pls_smart_search_tick": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_judgments": {"queue": "login_session"},
         "scraper.tasks.spot_check.spot_check_statutes": {"queue": "maintenance"},
     },
@@ -161,8 +164,10 @@ if settings.PLS_SEARCH_HARVEST_ENABLED:
     app.conf.beat_schedule.update(search_harvest_beat_entries())
     app.conf.beat_schedule.update(pls_seed_snowball_beat_entry())
 from scraper.tasks.pls_index_search import index_search_beat_entries
+from scraper.tasks.pls_case_enumeration import case_enumeration_beat_entries
 
 app.conf.beat_schedule.update(index_search_beat_entries())
+app.conf.beat_schedule.update(case_enumeration_beat_entries())
 if settings.PLS_CASEID_WALK_ENABLED:
     # two walks, one per login, each over its own half of the (year, court) groups (see pls_caseid_walk)
     for _name, _partition in (("pls-caseid-walk", 0), ("pls-caseid-walk-p1", 1)):
