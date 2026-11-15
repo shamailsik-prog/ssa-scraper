@@ -182,16 +182,40 @@ _CLAUSE_CONNECTOR_RE = re.compile(
 _OF_THE_AFTER_YEAR_RE = re.compile(
     r"(?i)\b(?:1[89]\d{2}|20\d{2})\b\s*[, \-–—]*\s*of\s+the\b"
 )
-# A combined title closes on a capitalised parenthesis, or on bare capitalised
-# words, immediately after an earlier instrument year and before the closing
-# instrument. ``(Third Amendment)``, ``(Removal of Difficulties)``, ``Repeal``
-# and ``Validation`` are the same shape. A citation bracket is not a close.
+# A combined title closes on an amending phrase immediately after an earlier
+# instrument year and before the closing instrument. ``(Third Amendment)``,
+# ``(Removal of Difficulties)``, ``Repeal`` and ``Validation`` are that phrase.
+# A letter, a roman numeral, a status word, a place, or another Act's name is not.
 _COMBINING_SUFFIX_RE = re.compile(
-    r"(?i)(?:"
+    r"(?i)(?P<phrase>"
     r"\([^()]{1,80}\)"
     r"|"
     r"[a-z]+(?:\s+and\s+[a-z]+)?"
     r")\s+(?:act|ordinance|order|code|regulation)\s*,?\s*(?:1[89]\d{2}|20\d{2})"
+)
+# The whole close, not a word inside a citation or a status note.
+_AMENDING_CLOSE_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
+    r"|\d+(?:st|nd|rd|th))\s+)?"
+    r"amendments?"
+    r"(?:\s+and\s+[a-z]+)?"
+    r"|validat\w*(?:\s+and\s+[a-z]+)?"
+    r"|repeal(?:\s+and\s+[a-z]+)?"
+    r"|extension"
+    r"|removal\s+of\s+difficulties"
+    r")$"
+)
+# Same four shapes as ``_CITATION_PAREN_RE``. A wrapper such as
+# ``(No. 2 Amendment)`` is not a close, and each shape has to stay here
+# or that wrapper becomes one.
+_CITATION_PREFIX_RES = (
+    re.compile(r"(?i)^no\.?\s*\d+[a-z]?\b"),
+    re.compile(
+        r"(?i)^(?:act|ordinance|ord\.?|p\.o\.?|president(?:'s)?(?:\s+order)?|regulation)\b"
+    ),
+    re.compile(r"(?i)^(?:[ivxlcdm]+|\d+)\s+of\b"),
+    re.compile(r"(?i)^\d{1,3}[a-z]?\b"),
 )
 _CITATION_PAREN_RE = re.compile(
     r"(?i)^\(\s*(?:"
@@ -401,6 +425,8 @@ def _is_clause_like_name(name: str) -> bool:
     if _has_ocr_year(flat):
         return True
     if _connector_between_years(flat):
+        return True
+    if _junk_close_at_end(flat):
         return True
     if _ACT_NO_RUN_ON_RE.search(flat):
         return True
@@ -696,22 +722,84 @@ def _combining_match_is_citation(match: re.Match) -> bool:
     return bool(paren and _CITATION_PAREN_RE.match(paren.group(0)))
 
 
+def _close_phrase(match: re.Match) -> str:
+    phrase = match.group("phrase")
+    if phrase.startswith("(") and phrase.endswith(")"):
+        phrase = phrase[1:-1]
+    return _collapse(phrase)
+
+
+def _close_phrase_is_amending(phrase: str) -> bool:
+    """``(Third Amendment)`` and ``Repeal`` close a combined title. ``(Z)`` does not."""
+    return _AMENDING_CLOSE_RE.match(_collapse(phrase).lower()) is not None
+
+
+def _phrase_contains_amending_word(phrase: str) -> bool:
+    return (
+        re.search(
+            r"\b(?:amend(?:ment|ments)?|validat\w*|repeal|extension|removal\s+of\s+difficulties)\b",
+            _collapse(phrase).lower(),
+        )
+        is not None
+    )
+
+
+def _citation_prefix(phrase: str) -> bool:
+    flat = _collapse(phrase)
+    return any(pattern.match(flat) for pattern in _CITATION_PREFIX_RES)
+
+
+def _combining_match_counts(match: re.Match) -> bool:
+    """An amending close counts. A citation wrapper around an amending word does not."""
+    phrase = _close_phrase(match)
+    if _close_phrase_is_amending(phrase):
+        return not _combining_match_is_citation(match)
+    if _phrase_contains_amending_word(phrase) and _citation_prefix(phrase):
+        return not _combining_match_is_citation(match)
+    return False
+
+
+def _numbered_act_paren(match: re.Match) -> bool:
+    """``(No. 2) Act, 2024`` is a numbered Act. ``(No. 2 Amendment)`` is not."""
+    paren = re.match(r"\([^()]*\)", match.group(0))
+    if not paren:
+        return False
+    return re.fullmatch(r"(?i)\(\s*no\.?\s*\d+[a-z]?\s*\)", paren.group(0)) is not None
+
+
+def _junk_close_at_end(name: str) -> bool:
+    """A letter, status word, place, or other Act's name glued on after a year.
+
+    ``Finance Act, 2024`` is a principal. ``2005 (Z) Act, 2025`` is not.
+    """
+    flat = _collapse(name or "").strip()
+    for match in _COMBINING_SUFFIX_RE.finditer(flat):
+        if flat[match.end() :].strip(" .") != "":
+            continue
+        if _YEAR_BEFORE_SUFFIX_RE.search(flat[: match.start()]) is None:
+            return False
+        if _combining_match_counts(match) or _numbered_act_paren(match):
+            return False
+        return True
+    return False
+
+
 def _combining_suffix_starts(text: str) -> bool:
     """True when this text, already past an instrument year, opens on the closing instrument."""
     match = _COMBINING_SUFFIX_RE.match(_collapse(text))
-    return match is not None and not _combining_match_is_citation(match)
+    return match is not None and _combining_match_counts(match)
 
 
 def _combining_suffix_at_end(name: str) -> bool:
-    """True when the name closes on words that follow an earlier instrument year.
+    """True when the name closes on an amending instrument after an earlier year.
 
     ``Sales Tax Act, 1990`` is a principal. ``1990 (Validation) Act, 2024`` and
-    ``2001 Repeal Act, 2024`` are one amending instrument.
+    ``2001 Repeal Act, 2024`` are one amending instrument. ``(Z) Act, 2025`` is not.
     """
     flat = _collapse(name or "").strip()
     found = None
     for match in _COMBINING_SUFFIX_RE.finditer(flat):
-        if _combining_match_is_citation(match):
+        if not _combining_match_counts(match):
             continue
         if _YEAR_BEFORE_SUFFIX_RE.search(flat[: match.start()]) is None:
             continue
@@ -722,15 +810,54 @@ def _combining_suffix_at_end(name: str) -> bool:
 
 
 def _text_has_combining_suffix(text: str) -> bool:
-    """True when a closing instrument sits in this remainder, on a year or at its start."""
+    """True when an amending close sits in this remainder, on a year or at its start."""
     flat = _collapse(text)
     for match in _COMBINING_SUFFIX_RE.finditer(flat):
-        if _combining_match_is_citation(match):
+        if not _combining_match_counts(match):
             continue
         before = flat[: match.start()]
         if before.strip() == "" or _YEAR_BEFORE_SUFFIX_RE.search(before):
             return True
     return False
+
+
+def _called_clause(text: str) -> str:
+    match = _CALLED_START_RE.search(text or "")
+    if not match:
+        return ""
+    return _collapse((text or "")[match.end() : match.end() + 700])
+
+
+def _listing_is_another_principal(listing: str, resolved: str, text: str) -> bool:
+    """The listing names a principal in the called line that this resolution does not replace."""
+    listed = _collapse(listing)
+    if not listed or is_rejected_assembly_statute_name(listed):
+        return False
+    if not resolved or resolved == "name_unknown" or is_rejected_assembly_statute_name(resolved):
+        return False
+    if _title_core(listed) == _title_core(resolved):
+        return False
+    if _short_title_supersedes(listed, resolved):
+        return False
+    core = _title_core(listed)
+    if len(core) < 8:
+        return False
+    return re.search(r"(?<![a-z])" + re.escape(core) + r"(?![a-z])", _called_clause(text).lower()) is not None
+
+
+def _second_principal_joined(name: str) -> bool:
+    """The first two instrument years are joined by and, &, and the, or , and the.
+
+    A comma, a space, or a newline between two Acts is not that list.
+    """
+    flat = _collapse(name or "")
+    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", flat))
+    if len(years) < 2:
+        return False
+    between = flat[years[0].end() : years[1].start()]
+    if "&" in between:
+        return True
+    return re.search(r"(?i)(?<![a-z])and(?![a-z])", between) is not None
 
 
 def _connector_between_years(name: str) -> bool:
@@ -1297,9 +1424,13 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
         or short_core.startswith(current_core + ",")
     ):
         return True
-    # The known principal can be the second Act in a combining amendment.
+    # The known principal can be the second Act only when the list is joined by
+    # and / & / and the / , and the and the close is an amending phrase.
+    # ``Finance Act, 2024, Federal Excise Act, 2005 (Z) Act, 2025`` stays the
+    # Excise Act. ``X and Y (Amendment) Act`` is still one title.
     return bool(
         _combining_suffix_at_end(short_name or "")
+        and _second_principal_joined(short_name or "")
         and len(current_core) >= 8
         and re.search(r"(?<![a-z])" + re.escape(current_core) + r"(?![a-z])", short_core)
     )
@@ -1406,6 +1537,13 @@ def apply_rejected_assembly_title(
     # The short-title or Act-number year wins over a year carried in from an
     # earlier bad name. An incoming year is only a fallback.
     chosen_year = decision.year if decision.year is not None else year
+    # A rejected gazette capture is not a reason to rename the other Act in
+    # the same called line. ``Federal Excise Act, 2005`` stays that Act when
+    # the line also names the Finance Act and then a junk close.
+    if _listing_is_another_principal(listing_title or "", decision.name, text or ""):
+        listed = _collapse(listing_title or "")
+        listed_year = _year_in(listed)
+        return finish(listed, listed_year if listed_year is not None else chosen_year)
     detail = decision.detail if decision.source == "name_unknown" else ""
     return finish(decision.name, chosen_year, detail)
 

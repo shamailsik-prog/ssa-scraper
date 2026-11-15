@@ -17,6 +17,8 @@ from scraper.extractors.deterministic import extract_statute_deterministic
 from scraper.fetchers import record_provenance, stage_statute, statute_staging_identity_url
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
+    _cited_upstream_name,
+    _enacted_year,
     _short_title,
     _short_title_supersedes,
     apply_rejected_assembly_title,
@@ -1749,6 +1751,189 @@ def test_citation_tail_on_chrome_stores_the_core(source_name, listing, called, c
         assert "(Act" not in out["statute_name"]
         assert "(XLV" not in out["statute_name"]
     assert not is_rejected_assembly_statute_name(called)
+
+
+# The good listing is the second Act. A junk close must not rename it.
+# and / & / and the / , and the still combine when the close amends.
+_SECOND_ACT = "Federal Excise Act, 2005"
+_FIRST_ACT = "Finance Act, 2024"
+_SIDE_BY_SIDE_JOINS = (", ", " ", "\n", " and ", " and the ", " & ")
+_LIST_JOINS = (" and ", " & ", " and the ", ", and the ")
+_GAP_JOINS = (", ", " ", "\n")
+_JUNK_CLOSES = (
+    " (Z) Act, 2025",
+    " (a) Act, 2025",
+    " (iv) Act, 2025",
+    " (2) Act, 2025",
+    " (Omitted) Act, 2025",
+    " (Repealed) Act, 2025",
+    " (Substituted) Act, 2025",
+    " (Schedule) Act, 2025",
+    " (First Schedule) Act, 2025",
+    " (Second Schedule) Act, 2025",
+    " (It extends to the whole of Pakistan) Act, 2025",
+    " (hereinafter referred to as the said Act) Act, 2025",
+    " (See section 2) Act, 2025",
+    " (Amended by the Finance Act, 2023) Act, 2025",
+    " (as amended) Act, 2025",
+    " (Islamabad) Act, 2025",
+    " (Federal Excise) Act, 2025",
+    " Finance Act, 2025",
+    " Repealed Act, 2025",
+)
+# These were accepted once a junk close sat on a real combined amendment.
+_REJECTED_ON_COMBINED_BASE = (
+    " (Omitted) Act, 2025",
+    " (Z) Act, 2025",
+    " (a) Act, 2025",
+    " (iv) Act, 2025",
+    " (2) Act, 2025",
+    " (Repealed) Act, 2025",
+    " (Substituted) Act, 2025",
+    " (Schedule) Act, 2025",
+    " (Second Schedule) Act, 2025",
+    " (First Schedule) Act, 2025",
+    " (Islamabad) Act, 2025",
+    " (Federal Excise) Act, 2025",
+    " (It extends to the whole of Pakistan) Act, 2025",
+    " Finance Act, 2025",
+    " Repealed Act, 2025",
+)
+_CITATION_WRAPPERS = (
+    " (No. 2 Amendment) Act, 2025",
+    " (Act Amendment) Act, 2025",
+    " (V of Amendment) Act, 2025",
+    " (2 Amendment) Act, 2025",
+)
+_COMBINED_BASE = "Income Tax Ordinance, 2001 and Sales Tax Act, 1990 (Amendment) Act, 2024"
+
+
+def _side_by_side_body(title_line: str) -> str:
+    return (
+        "ACT NO. V OF 2024\n"
+        "AN ACT\n"
+        "further to amend certain laws\n"
+        f"1. Short title and commencement.-(1) This Act may be called {title_line}\n"
+        "(2) It shall come into force at once.\n"
+        "\n"
+        "2. Amendment.\n"
+    )
+
+
+def _side_by_side_line(join: str, close: str) -> str:
+    return f"the {_FIRST_ACT}{join}{_SECOND_ACT}{close}."
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("join", _SIDE_BY_SIDE_JOINS)
+@pytest.mark.parametrize("close", _JUNK_CLOSES)
+def test_junk_close_does_not_rename_the_second_act(source_name, listing, join, close):
+    line = _side_by_side_line(join, close)
+    junk = re.sub(r"\s+", " ", line.removeprefix("the ")).rstrip(".")
+    assert is_rejected_assembly_statute_name(junk)
+    out = _with_listing(
+        _side_by_side_body(line),
+        source_name=source_name,
+        listing=listing,
+        title=_SECOND_ACT,
+    )
+    stored = out["statute_name"] or ""
+    assert stored != junk
+    assert "Act, 2025" not in stored
+    if listing == "good":
+        assert stored == _SECOND_ACT
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("join", _LIST_JOINS)
+def test_amending_close_on_a_list_joiner_still_replaces_the_second_act(join):
+    second = "Sales Tax Act, 1990"
+    full = f"Income Tax Ordinance, 2001{join}{second} (Amendment) Act, 2024"
+    out = _with_listing(
+        _side_by_side_body("the " + full + "."),
+        source_name="NationalAssembly",
+        listing="good",
+        title=second,
+    )
+    assert out["statute_name"] == re.sub(r"\s+", " ", full).strip()
+    assert out["year_enacted"] == 2024
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("join", _GAP_JOINS)
+def test_amending_close_without_a_list_joiner_keeps_the_second_act(join):
+    full = f"{_FIRST_ACT}{join}{_SECOND_ACT} (Amendment) Act, 2025"
+    out = _with_listing(
+        _side_by_side_body("the " + full + "."),
+        source_name="NationalAssembly",
+        listing="good",
+        title=_SECOND_ACT,
+    )
+    assert out["statute_name"] == _SECOND_ACT
+    assert not _short_title_supersedes(_SECOND_ACT, re.sub(r"\s+", " ", full).strip())
+
+
+@pytest.mark.no_db
+def test_combined_base_with_a_junk_tail_is_rejected():
+    assert not is_rejected_assembly_statute_name(_COMBINED_BASE)
+    for tail in _REJECTED_ON_COMBINED_BASE:
+        assert is_rejected_assembly_statute_name(_COMBINED_BASE + tail)
+    for tail in _CITATION_WRAPPERS:
+        assert is_rejected_assembly_statute_name(_COMBINED_BASE + tail)
+
+
+@pytest.mark.no_db
+def test_newline_does_not_hand_the_second_act_to_the_amendment():
+    rendered = f"{_FIRST_ACT}\n{_SECOND_ACT} (Amendment) Act, 2025"
+    assert not _short_title_supersedes(_SECOND_ACT, rendered)
+    out = _with_listing(
+        _side_by_side_body("the " + rendered + "."),
+        source_name="NationalAssembly",
+        listing="good",
+        title=_SECOND_ACT,
+    )
+    assert out["statute_name"] == _SECOND_ACT
+
+
+@pytest.mark.no_db
+def test_ampersand_without_an_amending_close_stops():
+    bare = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 "
+        "& Federal Excise Act, 2005.\n"
+    )
+    assert _short_title(bare) == "Finance Act, 2024"
+    buried = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 "
+        "& see Validation Act, 2024.\n"
+    )
+    assert _short_title(buried) == "Finance Act, 2024"
+
+
+@pytest.mark.no_db
+def test_section_number_stops_before_the_later_ordinance():
+    text = (
+        "1. Short title.- This Act may be called the Finance Act "
+        "2. Amendment of the Income Tax Ordinance, 2001.\n"
+    )
+    assert _short_title(text) == "Finance Act"
+    assert "Ordinance" not in (_short_title(text) or "")
+
+
+@pytest.mark.no_db
+def test_enacted_year_ignores_a_later_year_that_does_not_close():
+    assert _enacted_year("Notes 1860 and 1898", 1860) == 1860
+    assert _enacted_year("Finance Act, 2024 (Act V of 1860)", None) == 2024
+
+
+@pytest.mark.no_db
+def test_cited_upstream_requires_a_longer_capture():
+    assert _cited_upstream_name("Finance Act, 2024", "Finance Act, 2024", None) is False
+    assert (
+        _cited_upstream_name("Finance Act, 2024 (Act V of 1860)", "Finance Act, 2024", None)
+        is True
+    )
 
 
 @pytest.mark.no_db
