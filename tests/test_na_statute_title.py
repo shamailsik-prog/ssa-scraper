@@ -18,9 +18,12 @@ from scraper.fetchers import record_provenance, stage_statute, statute_staging_i
 from scraper.models import QuarantineQueue, ScraperSource, Statute
 from scraper.statute_quality.assembly_statute_title import (
     _cited_upstream_name,
+    _combining_suffix_at_end,
     _enacted_year,
+    _listing_is_another_principal,
     _short_title,
     _short_title_supersedes,
+    _title_core,
     apply_rejected_assembly_title,
     is_rejected_assembly_statute_name,
     resolve_assembly_statute_title,
@@ -1942,6 +1945,213 @@ async def test_skipped_truncate_guard_rejects_asyncpg():
 
     with pytest.raises(AssertionError, match="database connection"):
         await asyncpg.connect("postgresql://legal:legal@localhost:5432/legal_scraper_test")
+
+
+# Closes the R12 whitelist missed. A good listing of each one is the title.
+_WIDE_CLOSES = (
+    "(Eleventh Amendment) Act, 2024",
+    "(Twelfth Amendment) Act, 2024",
+    "(Twenty-sixth Amendment) Act, 2024",
+    "(2nd Amendment) Act, 2024",
+    "(3rd Amendment) Act, 2024",
+    "(26th Amendment) Act, 2024",
+    "(Amending) Act, 2024",
+    "Amending Act, 2024",
+    "(Removal of Difficulty) Act, 2024",
+    "(Extension of Validity) Act, 2024",
+    "(Validation of Laws) Act, 2024",
+    "(Amendment, Validation and Repeal) Act, 2024",
+    "(Extension and Amendment) Act, 2024",
+    "(Amendment) (No. 2) Act, 2024",
+    "(Amendment) Act No. 2, 2024",
+)
+# Not combining closes. A good listing that already uses one is kept as written.
+_UNLISTED_WELL_FORMED_CLOSES = (
+    "(Special Provisions)",
+    "(Continuance)",
+    "(Revival)",
+    "(Abolition)",
+)
+_AND_PAIR_JUNK = (
+    " (Amendment and Z) Act, 2025",
+    " (Validation and Omitted) Act, 2025",
+    " (Repeal and Schedule) Act, 2025",
+)
+
+
+def _collapsed_called(rendered: str) -> str:
+    return re.sub(r"\s+", " ", rendered).strip()
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("join", _SIDE_BY_SIDE_JOINS)
+@pytest.mark.parametrize("suffix", _WIDE_CLOSES)
+def test_wide_amending_close_keeps_the_two_act_title(source_name, listing, join, suffix):
+    rendered = f"{_CLOSING_LEFT}{join}{_CLOSING_RIGHT} {suffix}"
+    title = _collapsed_called(rendered)
+    body = _year_then_words_body(rendered, "may", ".", "end")
+    assert not is_rejected_assembly_statute_name(title)
+    assert _combining_suffix_at_end(title)
+    out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert _short_title(body) == title
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("suffix", _WIDE_CLOSES)
+def test_wide_amending_close_keeps_the_single_act_title(source_name, listing, suffix):
+    title = f"Companies Act, 2017 {suffix}"
+    body = _year_then_words_body(title, "may", ".", "end")
+    assert not is_rejected_assembly_statute_name(title)
+    out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert _short_title(body) == title
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("close", _UNLISTED_WELL_FORMED_CLOSES)
+def test_unlisted_well_formed_close_keeps_a_good_listing(close):
+    title = f"Companies Act, 2017 {close} Act, 2024"
+    assert not is_rejected_assembly_statute_name(title)
+    assert not _combining_suffix_at_end(title)
+    body = _year_then_words_body(title, "may", ".", "end")
+    out = _with_listing(body, source_name="NationalAssembly", listing="good", title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    # The reader does not treat the close as combining, so it does not rename
+    # a different Act that merely shares the called line.
+    other = f"Finance Act, 2024 and Federal Excise Act, 2005 {close} Act, 2025"
+    assert not _short_title_supersedes("Federal Excise Act, 2005", _collapsed_called(other))
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("tail", _AND_PAIR_JUNK)
+def test_and_pair_is_junk_unless_both_words_amend(tail):
+    combined = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT}{tail}"
+    assert is_rejected_assembly_statute_name(_collapsed_called(combined))
+    assert not _combining_suffix_at_end(_collapsed_called(combined))
+
+
+@pytest.mark.no_db
+def test_second_instrument_after_a_closed_amendment_is_rejected():
+    closed = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} (Amendment) Act, 2024"
+    assert not is_rejected_assembly_statute_name(closed)
+    assert is_rejected_assembly_statute_name(f"{closed} Repeal Act, 2025")
+    assert is_rejected_assembly_statute_name(f"{closed} Amendment Act, 2025")
+    assert not _combining_suffix_at_end(f"{closed} Repeal Act, 2025")
+    # The bare word is still the close when it is the only one.
+    assert not is_rejected_assembly_statute_name(f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} Repeal Act, 2024")
+    assert not is_rejected_assembly_statute_name(f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} Amendment Act, 2024")
+
+
+@pytest.mark.no_db
+def test_citation_wrapper_is_not_an_amending_close():
+    # ``(2nd Amendment)`` is an ordinal. ``(2 Amendment)`` is a citation.
+    ordinal = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} (2nd Amendment) Act, 2024"
+    cited = f"{_CLOSING_LEFT} and {_CLOSING_RIGHT} (2 Amendment) Act, 2025"
+    assert not is_rejected_assembly_statute_name(ordinal)
+    assert _combining_suffix_at_end(ordinal)
+    assert is_rejected_assembly_statute_name(cited)
+    assert not _combining_suffix_at_end(cited)
+    for tail in _CITATION_WRAPPERS:
+        assert is_rejected_assembly_statute_name(_COMBINED_BASE + tail)
+
+
+@pytest.mark.no_db
+def test_newline_gap_does_not_reach_a_later_amending_act():
+    body = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 and Code\n"
+        "(Amendment) Act, 2025.\n"
+    )
+    assert _short_title(body) == "Finance Act, 2024"
+    out = _with_listing(body, source_name="NationalAssembly", listing="chrome", title="Finance Act, 2024")
+    assert out["statute_name"] == "Finance Act, 2024"
+    assert "2025" not in (out["statute_name"] or "")
+
+
+@pytest.mark.no_db
+def test_combining_suffix_has_to_be_at_the_end():
+    closed = "Finance Act, 2024 (Amendment) Act, 2025"
+    assert _combining_suffix_at_end(closed)
+    assert not _combining_suffix_at_end(f"{closed} and more")
+    assert not _combining_suffix_at_end(f"{closed} Repeal Act, 2026")
+
+
+@pytest.mark.no_db
+def test_listing_keep_guards():
+    text = _side_by_side_body("the Finance Act, 2024, Federal Excise Act, 2005 (Z) Act, 2025.")
+    assert _listing_is_another_principal("Federal Excise Act, 2005", "Finance Act, 2024", text)
+    # Same instrument, including a leading "the".
+    assert not _listing_is_another_principal("the Finance Act, 2024", "Finance Act, 2024", text)
+    # A rejected resolution is not a reason to adopt the listing.
+    assert not _listing_is_another_principal("Federal Excise Act, 2005", "name_unknown", text)
+    assert not _listing_is_another_principal(
+        "Federal Excise Act, 2005", "Finance Act, 2024 (Z) Act, 2025", text
+    )
+    # The core has to be long enough to be a name, not a short token in the line.
+    short = _side_by_side_body("the Finance Act, 2024, Tax Act, 1999 (Z) Act, 2025.")
+    assert not is_rejected_assembly_statute_name("Tax Act, 1999")
+    assert len(_title_core("Tax Act, 1999")) < 8
+    assert not _listing_is_another_principal("Tax Act, 1999", "Finance Act, 2024", short)
+    # Nowhere in the text.
+    absent = "1. Short title.- This Act may be called the Finance Act, 2024.\n"
+    assert not _listing_is_another_principal("Customs Act, 1969", "Finance Act, 2024", absent)
+    # In the document, outside the called clause.
+    outside = "The Customs Act, 1969 is amended by a later instrument.\n"
+    assert not _listing_is_another_principal("Customs Act, 1969", "Finance Act, 2024", outside)
+    # Past the first 100 characters of the called clause, inside the 700-character window.
+    late = _side_by_side_body(
+        "the Finance Act, 2024, " + ("Word " * 40) + "Customs Act, 1969 (Z) Act, 2025."
+    )
+    assert _listing_is_another_principal("Customs Act, 1969", "Finance Act, 2024", late)
+
+
+@pytest.mark.no_db
+def test_listing_keep_uses_the_listing_year():
+    text = _side_by_side_body("the Finance Act, 2024, Federal Excise Act, 2005 (Z) Act, 2025.")
+    name, year, detail = apply_rejected_assembly_title(
+        name="Itr this Act",
+        year=2024,
+        text=text,
+        listing_title="Federal Excise Act, 2005",
+    )
+    assert name == "Federal Excise Act, 2005"
+    assert year == 2005
+    assert detail == ""
+
+
+_SPOT14_TITLES = (
+    "the Constitution (Twenty-sixth Amendment) Act, 2024",
+    "the Pakistan Penal Code (2nd Amendment) Act, 2025",
+    "the Criminal Laws (Amending) Act, 2023",
+    "the Banks (Removal of Difficulty) Act, 2022",
+    "the Ordinances (Validation of Laws) Act, 2021",
+    "the Finance (Amendment) (No. 2) Act, 2024",
+    "the Police (Extension of Validity) Act, 2020",
+)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("title", _SPOT14_TITLES)
+def test_spot14_amending_listing_is_kept(title):
+    assert not is_rejected_assembly_statute_name(title)
+    single = _side_by_side_body(f"{title}.")
+    two = _side_by_side_body(f"the Finance Act, 2024, {title[4:]}.")
+    for body in (single, two):
+        out = _with_listing(body, source_name="NationalAssembly", listing="good", title=title)
+        assert out["statute_name"] == title
+        assert out["year_enacted"] == int(title[-4:])
+        assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert is_rejected_assembly_statute_name("the following Act")
 
 
 @pytest.mark.no_db
