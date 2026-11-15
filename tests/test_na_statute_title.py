@@ -1149,7 +1149,7 @@ def test_inner_year_title_is_kept(
     text = body if layout == "bare" else header + body
     out = _with_listing(text, source_name=source_name, listing=listing, title=title)
     assert out["statute_name"] == title
-    assert out["year_enacted"] in _years_printed(title)
+    assert out["year_enacted"] == later
     assert not (out.get("field_evidence") or {}).get("name_unknown")
     assert not is_rejected_assembly_statute_name(title)
     if listing == "good":
@@ -1449,7 +1449,7 @@ def test_combined_amendment_title_is_kept(
     assert not is_rejected_assembly_statute_name(title)
     out = _with_listing(text, source_name=source_name, listing=listing, title=title)
     assert out["statute_name"] == title
-    assert out["year_enacted"] in _years_printed(title)
+    assert out["year_enacted"] == later
     assert not (out.get("field_evidence") or {}).get("name_unknown")
     assert _short_title(body) == title
 
@@ -1598,6 +1598,165 @@ def test_no_db_with_a_database_fixture_is_a_collection_error(tmp_path):
     assert completed.returncode != 0
     assert "no_db" in blob
     assert "database fixture" in blob
+
+
+# A year-bearing list joined by and / & / and the / , and the, then any capitalised
+# close immediately before the final instrument. Clause connectors stay outside it.
+CLOSING_SUFFIXES = (
+    "(Third Amendment) Act, 2024",
+    "(Fourth Amendment) Act, 2024",
+    "(Fifth Amendment) Act, 2024",
+    "(Second Amendment) Act, 2024",
+    "(Validation) Act, 2024",
+    "(Amendment and Validation) Act, 2024",
+    "(Validation and Amendment) Act, 2024",
+    "(Repeal) Act, 2024",
+    "Repeal Act, 2024",
+    "(Extension) Act, 2024",
+    "(Removal of Difficulties) Act, 2024",
+    "(Amendments) Act, 2024",
+    "Amendments Act, 2024",
+    "Validation Act, 2024",
+    "Amendment Act, 2024",
+)
+CLOSING_JOINS = (" and ", " & ", " and the ", ", and the ")
+_CLOSING_LEFT = "Income Tax Ordinance, 2001"
+_CLOSING_RIGHT = "Sales Tax Act, 1990"
+
+
+def _closing_title(join: str, suffix: str, left: str = _CLOSING_LEFT, right: str = _CLOSING_RIGHT) -> str:
+    return f"{left}{join}{right} {suffix}"
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("join", CLOSING_JOINS)
+@pytest.mark.parametrize("suffix", CLOSING_SUFFIXES)
+def test_any_capitalised_close_keeps_the_combined_title(
+    source_name, listing, layout, verb, section, join, suffix
+):
+    title = _closing_title(join, suffix)
+    body = _year_then_words_body(title, verb, ".", section)
+    header = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    assert not is_rejected_assembly_statute_name(title)
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert _short_title(body) == title
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("suffix", CLOSING_SUFFIXES)
+def test_newline_after_the_first_year_keeps_a_capitalised_close(source_name, listing, suffix):
+    rendered = f"{_CLOSING_LEFT}\nand {_CLOSING_RIGHT} {suffix}"
+    title = re.sub(r"\s+", " ", rendered).strip()
+    body = _year_then_words_body(rendered, "may", ".", "end")
+    out = _with_listing(body, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+    assert _short_title(body) == title
+
+
+CLAUSE_TAILS = (
+    " as amended by the Finance Act, 2023",
+    " and amends the Finance Act, 2023",
+    " under the Finance Act, 2023",
+    " of the Income Tax Ordinance, 2001",
+    " read with the Finance Act, 2023",
+    " in place of the Finance Act, 2023",
+    " repealing the Finance Act, 2023",
+    " made under the Finance Act, 2023",
+    " and the Code of Criminal Procedure, 1898",
+)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("tail", CLAUSE_TAILS)
+def test_clause_connector_still_stops_at_the_earlier_year(source_name, listing, verb, tail):
+    core = "Finance Act, 2024"
+    long = f"{core}{tail}"
+    body = _year_then_words_body(core, verb, tail + ".", "end")
+    # The long form is the listing. Keeping it means the connector check was dropped.
+    assert is_rejected_assembly_statute_name(long)
+    out = _with_listing(body, source_name=source_name, listing=listing, title=long)
+    stored = out["statute_name"] or ""
+    assert stored != long
+    assert "Finance Act, 2023" not in stored
+    if listing == "good":
+        assert stored == core
+    assert _short_title(body) == core
+
+
+@pytest.mark.no_db
+def test_newline_after_the_year_does_not_take_the_next_clause():
+    body = (
+        "1. Short title.- This Act may be called the Finance Act, 2024\n"
+        "amends the Finance Act, 2023.\n"
+    )
+    assert _short_title(body) == "Finance Act, 2024"
+    out = _with_listing(body, source_name="NationalAssembly", listing="chrome", title="Finance Act, 2024")
+    assert out["statute_name"] == "Finance Act, 2024"
+    assert "2023" not in out["statute_name"]
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+def test_bare_section_number_is_not_stored(source_name, listing):
+    body = "1. Short title.- This Act may be called the Finance Act 2. Amendment of section 4.\n"
+    out = _with_listing(body, source_name=source_name, listing=listing, title="Finance Act")
+    stored = out["statute_name"] or ""
+    assert "Amendment of section" not in stored
+    assert "section 4" not in stored
+    assert stored in {"Finance Act", "name_unknown"}
+    assert _short_title(body) == "Finance Act"
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize(
+    "called,core",
+    [
+        ("Finance Act, 2024 (Act No", "Finance Act, 2024"),
+        ("Finance Act, 2024 (Act V of 2", "Finance Act, 2024"),
+        ("Finance Act, 2024 (Passed under Cabi", "Finance Act, 2024"),
+        ("Companies Act, 2017 (Amendment) Act, 2024 (Act No. V of 2024)", "Companies Act, 2017 (Amendment) Act, 2024"),
+        ("Companies Act, 2017 (Amendment) Act, 2024 (Act V of 2024)", "Companies Act, 2017 (Amendment) Act, 2024"),
+        ("Companies Act, 2017 (Amendment) Act, 2024 (XLV of 2024)", "Companies Act, 2017 (Amendment) Act, 2024"),
+        ("Finance Act, 2024 (Act No. V of 2024)", "Finance Act, 2024"),
+        ("Finance Act, 2024 (XLV of 2024)", "Finance Act, 2024"),
+    ],
+)
+def test_citation_tail_on_chrome_stores_the_core(source_name, listing, called, core):
+    body = f"1. Short title.- This Act shall be called the {called}.\n"
+    out = _with_listing(body, source_name=source_name, listing=listing, title=called)
+    if listing == "good":
+        assert out["statute_name"] == called
+    else:
+        assert out["statute_name"] == core
+        assert "(Act" not in out["statute_name"]
+        assert "(XLV" not in out["statute_name"]
+    assert not is_rejected_assembly_statute_name(called)
+
+
+@pytest.mark.no_db
+async def test_skipped_truncate_guard_rejects_asyncpg():
+    import asyncpg
+
+    with pytest.raises(AssertionError, match="database connection"):
+        await asyncpg.connect("postgresql://legal:legal@localhost:5432/legal_scraper_test")
 
 
 @pytest.mark.no_db

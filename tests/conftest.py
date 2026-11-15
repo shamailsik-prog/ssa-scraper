@@ -125,6 +125,20 @@ def _on_db_checkout(*_args) -> None:
 
 sa_event.listen(engine.sync_engine, "checkout", _on_db_checkout)
 
+import asyncpg  # noqa: E402
+
+_original_asyncpg_connect = asyncpg.connect
+
+
+async def _guarded_asyncpg_connect(*args, **kwargs):
+    """A skipped title test must not open a driver connection of its own."""
+    if _forbid_db_checkout:
+        raise AssertionError("a title test opened a database connection")
+    return await _original_asyncpg_connect(*args, **kwargs)
+
+
+asyncpg.connect = _guarded_asyncpg_connect
+
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
     """Migration downgrade tests can leave a 4-column unique; B2/models require unreported in the key."""
