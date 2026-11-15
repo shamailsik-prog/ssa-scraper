@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1359,6 +1360,228 @@ def test_glued_letter_and_nineteenth_century_tail_are_rejected():
 def test_bare_section_number_ends_the_short_title():
     text = "1. Short title.- This Act may be called the Finance Act 2. Amendment of section 4.\n"
     assert _short_title(text) == "Finance Act"
+
+
+# Two principal Acts joined into one amending instrument.
+# A newline may follow the first year, or fall in the middle of the second name.
+COMBINED_AMENDMENTS = (
+    (
+        "Code of Criminal Procedure, 1898",
+        " and ",
+        "Pakistan Penal Code, 1860",
+        "(Amendment) Act, 2016",
+    ),
+    (
+        "Income Tax Ordinance, 2001",
+        " and ",
+        "Sales Tax Act, 1990",
+        "(Amendment) Act, 2024",
+    ),
+    (
+        "Anti-Terrorism Act, 1997",
+        " and ",
+        "Pakistan Penal Code, 1860",
+        "(Amendment) Act, 2020",
+    ),
+    (
+        "Control of Narcotic Substances Act, 1997",
+        " and ",
+        "Customs Act, 1969",
+        "(Amendment) Act, 2022",
+    ),
+    (
+        "Pakistan Penal Code, 1860",
+        " and the ",
+        "Code of Criminal Procedure, 1898",
+        "(Amendment) Act, 2024",
+    ),
+    (
+        "Pakistan Penal Code, 1860",
+        ", and the ",
+        "Qanun-e-Shahadat Order, 1984",
+        "(Amendment) Act, 2024",
+    ),
+    (
+        "Islamabad Capital Territory Trust Act, 2020",
+        " and ",
+        "Societies Registration Act, 1860",
+        "(Amendment) Act, 2021",
+    ),
+)
+
+
+def _combined_forms(left: str, join: str, right: str, suffix: str) -> tuple[str, str, str]:
+    flat = f"{left}{join}{right} {suffix}"
+    after_year = f"{left}\n{join.lstrip()}{right} {suffix}"
+    instrument = re.search(r"\b(?:Act|Code|Ordinance|Order|Regulation),", right)
+    if instrument:
+        mid = f"{left}{join}{right[: instrument.start()]}\n{right[instrument.start() :]} {suffix}"
+    else:
+        mid = flat
+    return flat, after_year, mid
+
+
+_COMBINED_CASES = []
+for _left, _join, _right, _suffix in COMBINED_AMENDMENTS:
+    _flat, _after, _mid = _combined_forms(_left, _join, _right, _suffix)
+    _COMBINED_CASES.append(("flat", _flat))
+    _COMBINED_CASES.append(("after-year", _after))
+    _COMBINED_CASES.append(("mid", _mid))
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("section", ["end", "blank"])
+@pytest.mark.parametrize("break_kind,rendered", _COMBINED_CASES)
+def test_combined_amendment_title_is_kept(
+    source_name, listing, layout, verb, section, break_kind, rendered
+):
+    title = re.sub(r"\s+", " ", rendered).strip()
+    body = _year_then_words_body(rendered, verb, ".", section)
+    later = int(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", title)[-1])
+    header = f"ACT NO. I OF {later}\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    assert not is_rejected_assembly_statute_name(title)
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] in _years_printed(title)
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+    assert _short_title(body) == title
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+def test_shall_citation_on_chrome_stores_the_core_name(source_name, listing):
+    cited = "Finance Act, 2024 (Act V of 2024)"
+    body = f"1. Short title.- This Act shall be called the {cited}.\n"
+    out = _with_listing(body, source_name=source_name, listing=listing, title=cited)
+    if listing == "good":
+        assert out["statute_name"] == cited
+    else:
+        assert out["statute_name"] == "Finance Act, 2024"
+        assert "(Act" not in out["statute_name"]
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Companies Act, 2017 (Act XXII Of",
+        "Finance Act, 2024 (Passed under Cabi",
+        "Elections Act, 2017 (Act",
+        "Finance Act, 2024 (Cabinet Division",
+        "Finance Act, 2024 (ord. XII",
+    ],
+)
+def test_unclosed_citation_fragment_is_not_rejected(name):
+    assert not is_rejected_assembly_statute_name(name)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["chrome", "none"])
+def test_year_period_on_the_same_line_stops_before_section_two(source_name, listing):
+    body = (
+        "1. Short title.- This Act may be called the Finance Act, 2024. "
+        "2. Amendment of the Income Tax Ordinance, 2001.\n"
+    )
+    out = _with_listing(body, source_name=source_name, listing=listing, title="Finance Act, 2024")
+    assert out["statute_name"] == "Finance Act, 2024"
+    assert "2." not in out["statute_name"]
+    assert _short_title(body) == "Finance Act, 2024"
+    # A period on the year is what stops the title. The next instrument is not ``N.``.
+    later = (
+        "1. Short title.- This Act may be called the Finance Act, 2024. "
+        "Income Tax Ordinance, 2001.\n"
+    )
+    later_out = _with_listing(
+        later, source_name=source_name, listing=listing, title="Finance Act, 2024"
+    )
+    assert later_out["statute_name"] == "Finance Act, 2024"
+    assert "Income Tax" not in later_out["statute_name"]
+    assert _short_title(later) == "Finance Act, 2024"
+
+
+@pytest.mark.no_db
+def test_wrapped_amendment_after_the_year_stays_in_the_short_title():
+    body = (
+        "1. Short title.- This Act may be called the Income Tax Ordinance, 2001\n"
+        "(Amendment) Act, 2024.\n"
+    )
+    assert _short_title(body) == "Income Tax Ordinance, 2001 (Amendment) Act, 2024"
+
+
+@pytest.mark.no_db
+def test_ocr_year_token_is_rejected():
+    assert is_rejected_assembly_statute_name("Income Tax Ordinance, 2O24")
+    assert is_rejected_assembly_statute_name("Finance Act, 2O24")
+
+
+@pytest.mark.no_db
+def test_truncate_skip_is_anchored_to_the_title_file():
+    from tests.conftest import _skips_title_truncate
+
+    class Other:
+        path = Path("/tmp/elsewhere/test_na_statute_title.py")
+
+        def get_closest_marker(self, _name):
+            return None
+
+    class Here:
+        path = Path(__file__).resolve()
+
+        def get_closest_marker(self, _name):
+            return None
+
+    assert not _skips_title_truncate(Other(), [])
+    assert _skips_title_truncate(Here(), [])
+    assert not _skips_title_truncate(Here(), ["db"])
+    assert not _skips_title_truncate(Here(), ["source"])
+    assert not _skips_title_truncate(Here(), ["login_source"])
+
+
+@pytest.mark.no_db
+async def test_skipped_truncate_guard_rejects_a_connection():
+    from scraper.database import engine
+
+    with pytest.raises(AssertionError, match="database connection"):
+        async with engine.connect():
+            pass
+
+
+@pytest.mark.no_db
+def test_no_db_with_a_database_fixture_is_a_collection_error(tmp_path):
+    probe = REPO / "tests" / "_r9_no_db_probe.py"
+    probe.write_text(
+        "import pytest\n\n@pytest.mark.no_db\ndef test_bad(db):\n    pass\n",
+        encoding="utf-8",
+    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(probe),
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+            ],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+    blob = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert "no_db" in blob
 
 
 @pytest.mark.no_db

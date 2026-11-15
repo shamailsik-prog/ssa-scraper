@@ -172,11 +172,26 @@ _PAREN_CONTINUES_RE = re.compile(
     r")"
 )
 # A year, then a connector, is the next clause rather than a longer title.
-_CONNECTOR_AFTER_YEAR_RE = re.compile(
+# ``of the`` is separate: a combining amendment may say ``and the``.
+_CLAUSE_CONNECTOR_RE = re.compile(
     r"(?i)\b(?:1[89]\d{2}|20\d{2})\b\s*[, \-–—]*\s*(?:"
     r"as\s+amended\s+by|and\s+amends|amends|made\s+under|in\s+place\s+of|"
-    r"read\s+with|repealing|replacing|of\s+the|under"
+    r"read\s+with|repealing|replacing|under"
     r")\b"
+)
+_OF_THE_AFTER_YEAR_RE = re.compile(
+    r"(?i)\b(?:1[89]\d{2}|20\d{2})\b\s*[, \-–—]*\s*of\s+the\b"
+)
+# ``(Amendment) Act, 2024``, ``Amendment Act, 2024``, ``Validation Act, 1980``.
+_COMBINING_SUFFIX_RE = re.compile(
+    r"(?i)(?:"
+    r"\(\s*(?:second\s+)?amendment\s*\)"
+    r"|(?:amendment|validation)"
+    r")\s+(?:act|ordinance|order|code|regulation)\s*,?\s*(?:1[89]\d{2}|20\d{2})"
+)
+# A cut-off citation at the end of a stored name, with no closing bracket.
+_UNCLOSED_CITATION_RE = re.compile(
+    r"(?i)\s*\((?:act|ord|cabinet|passed)\b[^)]*$"
 )
 _INNER_YEAR_STOP_WORDS = frozenset(
     {"it", "lt", "shall", "extends", "comes", "this", "whereas"}
@@ -660,14 +675,34 @@ def _year_token_closes(token: str) -> bool:
     return bool(match and match.group(2))
 
 
+def _combining_suffix_at_end(name: str) -> bool:
+    """True when the name closes on an amending or validating instrument."""
+    flat = _collapse(name or "").strip()
+    found = None
+    for match in _COMBINING_SUFFIX_RE.finditer(flat):
+        found = match
+    if found is None:
+        return False
+    return flat[found.end() :].strip(" .") == ""
+
+
 def _connector_between_years(name: str) -> bool:
-    """True when a later year is only a connector (``as amended by``, ``and the X Act``)."""
-    if _CONNECTOR_AFTER_YEAR_RE.search(name or ""):
+    """True when a later year is only a connector (``as amended by``, ``and the X Act``).
+
+    ``X, YYYY and the Y, YYYY (Amendment) Act, YYYY`` is one title. ``of the``
+    is a connector unless that combining suffix follows.
+    """
+    text = name or ""
+    if _CLAUSE_CONNECTOR_RE.search(text):
         return True
-    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", name or ""))
+    if _combining_suffix_at_end(text):
+        return False
+    if _OF_THE_AFTER_YEAR_RE.search(text):
+        return True
+    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", text))
     if len(years) < 2:
         return False
-    between = (name or "")[years[0].end() : years[1].start()]
+    between = text[years[0].end() : years[1].start()]
     words = re.findall(r"[A-Za-z]+", between)
     lowered = [word.lower() for word in words]
     joined = " ".join(lowered)
@@ -694,8 +729,9 @@ def _has_ocr_year(name: str) -> bool:
 
 
 def _last_year_match(name: str) -> tuple[str, Optional[re.Match]]:
-    """The last year, after peeling one trailing citation bracket."""
-    peeled = _TRAILING_CITATION_RE.sub("", _collapse(name))
+    """The last year, after peeling one trailing citation or a cut-off fragment."""
+    peeled = _UNCLOSED_CITATION_RE.sub("", _collapse(name))
+    peeled = _TRAILING_CITATION_RE.sub("", peeled)
     years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", peeled))
     if not years:
         return peeled, None
@@ -731,6 +767,36 @@ def _paren_after_year_continues(tokens: list[tuple[str, str]], start: int) -> bo
     return _PAREN_CONTINUES_RE.match(window) is not None
 
 
+def _text_from(tokens: list[tuple[str, str]], start: int) -> str:
+    return _collapse(" ".join(token for _gap, token in tokens[start:]))
+
+
+def _joined_statute_continues(tokens: list[tuple[str, str]], start: int) -> bool:
+    """A newline still joins ``and the Y, YYYY (Amendment) Act, YYYY``.
+
+    One year after the break, as in ``Code`` then ``(Amendment) Act``, does not.
+    """
+    text = _text_from(tokens, start)
+    if not text or _CLAUSE_CONNECTOR_RE.search(text):
+        return False
+    if _COMBINING_SUFFIX_RE.search(text) is None:
+        return False
+    return len(re.findall(r"\b(?:1[89]\d{2}|20\d{2})\b", text)) >= 2
+
+
+def _suffix_is_combining(tokens: list[tuple[str, str]], instrument_index: int) -> bool:
+    """True when this instrument's year is followed by an amending or validating instrument."""
+    nxt = instrument_index + 1
+    if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
+        nxt += 1
+    if nxt >= len(tokens) or not _year_token(tokens[nxt][1]):
+        return False
+    text = _text_from(tokens, nxt + 1).strip()
+    if not text or _CLAUSE_CONNECTOR_RE.search(text):
+        return False
+    return _COMBINING_SUFFIX_RE.match(text) is not None
+
+
 def _gap_is_title_shaped(tokens: list[tuple[str, str]], start: int, instrument_index: int) -> bool:
     """True when every word between an earlier year and the next instrument is part of the name."""
     words: list[str] = []
@@ -761,10 +827,13 @@ def _gap_is_title_shaped(tokens: list[tuple[str, str]], start: int, instrument_i
             continue
         return False
     joined = " ".join(words)
-    if "of the" in joined or "and the" in joined:
+    # The joined Act may sit after another instrument word (``and the Code of …, 1898``).
+    combining = _suffix_is_combining(tokens, instrument_index) or _joined_statute_continues(tokens, start)
+    if ("of the" in joined or "and the" in joined) and not combining:
         return False
     # ``and Code`` continues. ``and Cantonments Order`` names a different instrument.
-    if "and" in words and saw_capital and not saw_paren:
+    # ``and Sales Tax Act, YYYY (Amendment) Act`` is one amending title.
+    if "and" in words and saw_capital and not saw_paren and not combining:
         return False
     return True
 
@@ -778,7 +847,7 @@ def _later_instrument_year(tokens: list[tuple[str, str]], start: int) -> bool:
     """
     for index in range(start, len(tokens)):
         gap, token = tokens[index]
-        if index > start and "\n" in gap:
+        if index > start and "\n" in gap and not _joined_statute_continues(tokens, start):
             return False
         if re.fullmatch(r"[-–—]+", token):
             return False
@@ -913,6 +982,7 @@ def _sentence_closed(tokens: list[tuple[str, str]], index: int) -> bool:
             after < len(tokens)
             and "\n" in tokens[after][0]
             and not _paren_continues_title(tokens[after][1])
+            and not _joined_statute_continues(tokens, after)
         ):
             return True
     # ``Code.\n(Amendment) Act`` is one title. ``Act.\n(2)`` is the end of it.
@@ -1168,11 +1238,36 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
     short_core = _title_core(short_name)
     if not current_core or not short_core or current_core == short_core:
         return False
-    return (
+    if (
         short_core.startswith(current_core + " ")
         or short_core.startswith(current_core + "(")
         or short_core.startswith(current_core + ",")
+    ):
+        return True
+    # The known principal can be the second Act in a combining amendment.
+    return bool(
+        _combining_suffix_at_end(short_name or "")
+        and len(current_core) >= 8
+        and re.search(r"(?<![a-z])" + re.escape(current_core) + r"(?![a-z])", short_core)
     )
+
+
+def _peel_trailing_citation(name: str) -> str:
+    return _collapse(_TRAILING_CITATION_RE.sub("", _collapse(name))).strip(" .")
+
+
+def _cited_upstream_name(current: str, short: str, listing: Optional[str]) -> bool:
+    """True when a called-line capture adds only a trailing citation to the short title.
+
+    A listing that is itself the cited name stays. Chrome and a missing listing
+    store the name without that citation.
+    """
+    current_flat = _collapse(current)
+    listed = _collapse(listing or "")
+    if listed and listed == current_flat:
+        return False
+    peeled = _peel_trailing_citation(current_flat)
+    return bool(peeled) and peeled.lower() == _collapse(short).lower() and len(current_flat) > len(peeled)
 
 
 def _dated_listing_is_complete(current: str, short: str, listing: Optional[str]) -> bool:
@@ -1204,6 +1299,9 @@ def apply_rejected_assembly_title(
             # that only adds a later year must not replace it.
             if _dated_listing_is_complete(current, accepted[0], listing_title):
                 return current, year, ""
+            chosen = accepted[1] if accepted[1] is not None else year
+            return accepted[0], chosen, ""
+        if accepted and _cited_upstream_name(current, accepted[0], listing_title):
             chosen = accepted[1] if accepted[1] is not None else year
             return accepted[0], chosen, ""
         return current, year, ""

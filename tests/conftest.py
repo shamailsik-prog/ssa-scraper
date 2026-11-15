@@ -76,6 +76,7 @@ import asyncio  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
+from sqlalchemy import event as sa_event  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
 from scraper.config import settings  # noqa: E402
@@ -93,6 +94,36 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 from tests.fixtures import FixtureServer  # noqa: E402
 
 TMP = _TMP
+_DB_FIXTURES = frozenset({"db", "source", "login_source"})
+_forbid_db_checkout = False
+
+
+def _title_test_file() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parent / "test_na_statute_title.py"
+
+
+def _skips_title_truncate(node, fixturenames) -> bool:
+    """True when this test does not need a fresh database.
+
+    The statute-title file is matched by its path, not its basename. A ``no_db``
+    test that asks for ``db``, ``source``, or ``login_source`` is rejected at
+    collection and does not skip isolation here.
+    """
+    names = set(fixturenames or ())
+    if _DB_FIXTURES.intersection(names):
+        return False
+    path = getattr(node, "path", None)
+    if path is not None and pathlib.Path(path).resolve() == _title_test_file():
+        return True
+    return node.get_closest_marker("no_db") is not None
+
+
+def _on_db_checkout(*_args) -> None:
+    if _forbid_db_checkout:
+        raise AssertionError("a title test opened a database connection")
+
+
+sa_event.listen(engine.sync_engine, "checkout", _on_db_checkout)
 
 
 async def _ensure_judgment_case_hash_includes_unreported(conn) -> None:
@@ -134,20 +165,15 @@ async def clean_db(request):
     cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB.
 
     Title matrices marked ``no_db`` only call pure functions and the extractor.
+    A skipped test that opens a connection fails.
     """
-    if request.node.get_closest_marker("no_db"):
-        yield
-        return
-    # The rest of the statute-title file calls the extractor only. The three
-    # tests that stage or promote request ``db`` and still truncate.
-    node_path = getattr(request.node, "path", None)
-    names = set(getattr(request, "fixturenames", ()) or ())
-    if (
-        node_path is not None
-        and node_path.name == "test_na_statute_title.py"
-        and "db" not in names
-    ):
-        yield
+    global _forbid_db_checkout
+    if _skips_title_truncate(request.node, request.fixturenames):
+        _forbid_db_checkout = True
+        try:
+            yield
+        finally:
+            _forbid_db_checkout = False
         return
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
@@ -243,6 +269,10 @@ def client():
 def pytest_collection_modifyitems(config, items):
     """Default xdist_group per test file so --dist loadgroup matches loadfile distribution."""
     for item in items:
+        if item.get_closest_marker("no_db") is not None and _DB_FIXTURES.intersection(item.fixturenames):
+            raise pytest.UsageError(
+                f"{item.nodeid} is marked no_db and requests a database fixture"
+            )
         if item.get_closest_marker("xdist_group") is not None:
             continue
         group = pathlib.Path(item.fspath).stem
