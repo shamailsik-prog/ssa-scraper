@@ -446,6 +446,20 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
                 gazette_year = heading.year
                 pab_amendment_label = amendment_label_from_source(source_meta)
                 pab_amended_upto = heading.marker
+    assembly_name_unknown = ""
+    if source_meta.get("source_name") in {"NationalAssembly", "Senate"}:
+        from scraper.statute_quality.assembly_statute_title import apply_rejected_assembly_title
+
+        # A body fragment or listing-chrome title is not the instrument. The
+        # short-title clause, then the Act heading, replaces it before sections
+        # are read. A name that is already a real instrument title is kept.
+        name, gazette_year, assembly_name_unknown = apply_rejected_assembly_title(
+            name=name,
+            year=gazette_year,
+            text=raw_text or "",
+            listing_title=official_title if isinstance(official_title, str) else None,
+            source_url=source_url,
+        )
     sections = [] if unresolved else split_into_sections(body, name)
     from scraper.config import settings as _sq_settings
 
@@ -478,6 +492,8 @@ def extract_statute_deterministic(*, html: Optional[str], text: Optional[str], s
         evidence["bundled_gazette_isolated"] = isolation.act_label
     if name:
         evidence["statute_name"] = raw_text[:160]
+    if assembly_name_unknown:
+        evidence["name_unknown"] = assembly_name_unknown[:500]
     official = re.sub(r"\s+", " ", (official_title or "")).strip()
     name_norm = re.sub(r"\s+", " ", name or "").strip()
     if official and name_norm == official and not listed_title_supported_by_text(official, raw_text):
