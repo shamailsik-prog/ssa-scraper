@@ -154,18 +154,36 @@ _YEAR_THEN_WORDS_RE = re.compile(
 # A citation ``(Act No. V of 2024)`` has no comma before Act and does not match.
 _ACT_NO_RUN_ON_RE = re.compile(r"(?i),\s*act\s+no\b")
 # One trailing citation, so the title year is what remains.
+# ``(Act XLV of 1860)``, ``(Ordinance No. XLIX of 2001)``, ``[XVII of 2024]``,
+# ``(No.XVII of 2024)`` and a trailing full stop are the same bracket.
 _TRAILING_CITATION_RE = re.compile(
-    r"(?i)\s*\((?:act\s+no\.\s*)?(?:[ivxlcdm]+|\d+)\s+of\s+(?:1[89]\d{2}|20\d{2})\)\s*$"
+    r"(?i)\s*[\[(]\s*"
+    r"(?:(?:act|ordinance|president's\s+order|regulation|ord\.|p\.o\.)\s+)?"
+    r"(?:no\.?\s*)?"
+    r"(?:[ivxlcdm]+|\d+)\s+of\s+(?:1[89]\d{2}|20\d{2})"
+    r"\s*[\])]\.?\s*$"
 )
+# ``2O24`` / ``2o24`` is a year the OCR printed with a letter.
+_OCR_YEAR_RE = re.compile(r"\b[12lI][0-9OoIl]{3}\b")
 _PAREN_CONTINUES_RE = re.compile(
     r"(?i)^\((?:"
     r"amendment\)|second\s+amendment\)|no\.\s*\d|"
     r"(?:act\s+no\.\s*)?(?:[ivxlcdm]+|\d+)\s+of\s+(?:1[89]\d{2}|20\d{2})"
     r")"
 )
+# A year, then a connector, is the next clause rather than a longer title.
+_CONNECTOR_AFTER_YEAR_RE = re.compile(
+    r"(?i)\b(?:1[89]\d{2}|20\d{2})\b\s*[, \-–—]*\s*(?:"
+    r"as\s+amended\s+by|and\s+amends|amends|made\s+under|in\s+place\s+of|"
+    r"read\s+with|repealing|replacing|of\s+the|under"
+    r")\b"
+)
 _INNER_YEAR_STOP_WORDS = frozenset(
     {"it", "lt", "shall", "extends", "comes", "this", "whereas"}
 )
+# Words that can sit between an earlier year and the next instrument.
+# ``of the`` and ``and the`` are connectors, not part of the name.
+_TITLE_BRIDGE_WORDS = frozenset({"of", "and", "the", "for"})
 _ROMAN_OF_RE = re.compile(r"(?i)^[IVXLC]{1,12}\s+o[fnr]\b")
 
 
@@ -349,6 +367,10 @@ def _is_clause_like_name(name: str) -> bool:
     if _CLAUSE_RUN_ON_RE.search(flat):
         return True
     if _YEAR_GLUED_TAIL_RE.search(flat):
+        return True
+    if _has_ocr_year(flat):
+        return True
+    if _connector_between_years(flat):
         return True
     if _ACT_NO_RUN_ON_RE.search(flat):
         return True
@@ -568,7 +590,7 @@ def _with_instrument_and_year(title: str, text: str, year: Optional[int]) -> tup
     cleaned = _strip_ocr_closers(title)
     # Drop the gazette formula "the", and keep a capitalised "The" that is part of the name.
     cleaned = re.sub(r"^the\s+", "", cleaned).strip()
-    already_dated = _YEARISH_RE.search(cleaned) is not None
+    already_dated = _YEARISH_RE.search(cleaned) is not None or _has_ocr_year(cleaned)
     title_year = _year_in(cleaned)
     act_year = _act_number_year(text)
     if title_year is not None and act_year is not None and title_year != act_year:
@@ -638,6 +660,39 @@ def _year_token_closes(token: str) -> bool:
     return bool(match and match.group(2))
 
 
+def _connector_between_years(name: str) -> bool:
+    """True when a later year is only a connector (``as amended by``, ``and the X Act``)."""
+    if _CONNECTOR_AFTER_YEAR_RE.search(name or ""):
+        return True
+    years = list(re.finditer(r"\b(?:1[89]\d{2}|20\d{2})\b", name or ""))
+    if len(years) < 2:
+        return False
+    between = (name or "")[years[0].end() : years[1].start()]
+    words = re.findall(r"[A-Za-z]+", between)
+    lowered = [word.lower() for word in words]
+    joined = " ".join(lowered)
+    if "of the" in joined or "and the" in joined:
+        return True
+    if "and" not in lowered or "(" in between or "[" in between:
+        return False
+    # ``and Code of Criminal Procedure`` continues. ``and Cantonments Order``
+    # names a different instrument, so the first capital word is not Code/Act.
+    capitals = [
+        word
+        for word in words
+        if word[:1].isupper() and word.lower() not in _TITLE_BRIDGE_WORDS
+    ]
+    return bool(capitals) and capitals[0].lower() not in _INSTRUMENT_KEYS
+
+
+def _has_ocr_year(name: str) -> bool:
+    """True when a year token contains an OCR letter, as in ``2O24``."""
+    for match in _OCR_YEAR_RE.finditer(name or ""):
+        if re.search(r"[OoIl]", match.group(0)):
+            return True
+    return False
+
+
 def _last_year_match(name: str) -> tuple[str, Optional[re.Match]]:
     """The last year, after peeling one trailing citation bracket."""
     peeled = _TRAILING_CITATION_RE.sub("", _collapse(name))
@@ -676,11 +731,56 @@ def _paren_after_year_continues(tokens: list[tuple[str, str]], start: int) -> bo
     return _PAREN_CONTINUES_RE.match(window) is not None
 
 
+def _gap_is_title_shaped(tokens: list[tuple[str, str]], start: int, instrument_index: int) -> bool:
+    """True when every word between an earlier year and the next instrument is part of the name."""
+    words: list[str] = []
+    saw_paren = False
+    saw_capital = False
+    for index in range(start, instrument_index):
+        _gap, token = tokens[index]
+        if re.fullmatch(r"[-–—]+", token):
+            return False
+        if token[:1] in "([":
+            if not (_paren_continues_title(token) or _paren_after_year_continues(tokens, index)):
+                return False
+            saw_paren = True
+            continue
+        word = re.sub(r"[^A-Za-z]", "", token).lower()
+        if not word:
+            continue
+        if word in _INNER_YEAR_STOP_WORDS:
+            return False
+        if token.rstrip(".,;:").endswith(".") and word != "no":
+            return False
+        if word in _TITLE_BRIDGE_WORDS:
+            words.append(word)
+            continue
+        if token.strip(".,;:()[]")[:1].isupper():
+            saw_capital = True
+            words.append(word)
+            continue
+        return False
+    joined = " ".join(words)
+    if "of the" in joined or "and the" in joined:
+        return False
+    # ``and Code`` continues. ``and Cantonments Order`` names a different instrument.
+    if "and" in words and saw_capital and not saw_paren:
+        return False
+    return True
+
+
 def _later_instrument_year(tokens: list[tuple[str, str]], start: int) -> bool:
-    """A later instrument and its year on this line means the year already seen is inner."""
+    """A later instrument and its year means the year already seen is inner.
+
+    The words between the two years have to be part of the name. A connector
+    (``as amended by``, ``read with``, ``of the``), a dash, or a new line
+    ends the title at the earlier year.
+    """
     for index in range(start, len(tokens)):
         gap, token = tokens[index]
         if index > start and "\n" in gap:
+            return False
+        if re.fullmatch(r"[-–—]+", token):
             return False
         word = re.sub(r"[^A-Za-z]", "", token).lower()
         if word in _INNER_YEAR_STOP_WORDS:
@@ -689,6 +789,8 @@ def _later_instrument_year(tokens: list[tuple[str, str]], start: int) -> bool:
             return False
         if not _INSTRUMENT_KEYS.get(_lookup_key(token)):
             continue
+        if not _gap_is_title_shaped(tokens, start, index):
+            return False
         nxt = index + 1
         if nxt < len(tokens) and re.match(r"(?i)no\.?$", tokens[nxt][1].strip(".,")):
             continue
@@ -721,8 +823,8 @@ def _same_line_words_after_year(tokens: list[tuple[str, str]], index: int) -> bo
     nxt += 1
     if nxt < len(tokens) and tokens[nxt][1].strip() == ",":
         nxt += 1
-    if nxt < len(tokens) and tokens[nxt][1] in {"-", "–", "—"}:
-        nxt += 1
+    if nxt < len(tokens) and re.fullmatch(r"[-–—]+", tokens[nxt][1]):
+        return True
     if nxt >= len(tokens):
         return False
     gap, token = tokens[nxt]
@@ -802,6 +904,17 @@ def _sentence_closed(tokens: list[tuple[str, str]], index: int) -> bool:
     """
     if _commencement_end(tokens, index):
         return True
+    # A year at the end of the line stays the title. A wrapped ``(Amendment)``
+    # on the next line is still the same name.
+    year_at = _year_token_index(tokens, index)
+    if year_at is not None:
+        after = year_at + 1
+        if (
+            after < len(tokens)
+            and "\n" in tokens[after][0]
+            and not _paren_continues_title(tokens[after][1])
+        ):
+            return True
     # ``Code.\n(Amendment) Act`` is one title. ``Act.\n(2)`` is the end of it.
     if tokens[index][1].rstrip().endswith("."):
         nxt = index + 1
@@ -839,7 +952,7 @@ def _render_short_title(tokens: list[tuple[str, str]], end: int) -> str:
             parts.append(_apply_ocr_token(token))
     title = _collapse(" ".join(parts))
     year = _year_after(tokens, end + 1)
-    if year and not re.search(rf"\b{year}\b", title):
+    if year and not re.search(rf"\b{year}\b", title) and not _has_ocr_year(title):
         title = f"{title}, {year}"
     return title.strip(" .")
 
@@ -1035,6 +1148,8 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
     A year glued to the next words (``2024.It``, ``2024.(Z)``) must not either.
     Nor words or a non-title bracket after the final year.
     """
+    if _has_ocr_year(short_name or ""):
+        return False
     if _RUN_ON_SHORT_TITLE_RE.search(short_name or ""):
         return False
     if _YEAR_GLUED_TAIL_RE.search(short_name or ""):
@@ -1060,6 +1175,15 @@ def _short_title_supersedes(current: str, short_name: str) -> bool:
     )
 
 
+def _dated_listing_is_complete(current: str, short: str, listing: Optional[str]) -> bool:
+    """True when the stored name is already the dated listing and the called line only runs on."""
+    listed = _collapse(listing or "")
+    if not listed or listed != _collapse(current) or _year_in(listed) is None:
+        return False
+    longer = _collapse(short or "")
+    return longer.lower().startswith(listed.lower()) and len(longer) > len(listed)
+
+
 def apply_rejected_assembly_title(
     *,
     name: Optional[str],
@@ -1076,6 +1200,10 @@ def apply_rejected_assembly_title(
         short = _short_title(text or "")
         accepted = _accept(short, text or "", year) if short else None
         if accepted and _short_title_supersedes(current, accepted[0]):
+            # A dated listing is already the instrument. A longer called line
+            # that only adds a later year must not replace it.
+            if _dated_listing_is_complete(current, accepted[0], listing_title):
+                return current, year, ""
             chosen = accepted[1] if accepted[1] is not None else year
             return accepted[0], chosen, ""
         return current, year, ""

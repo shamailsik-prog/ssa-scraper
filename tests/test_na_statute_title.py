@@ -1031,6 +1031,7 @@ def _year_then_words_run_on(title: str, year: int, tail: str) -> str:
     return f"{core} {year}{tail}"
 
 
+@pytest.mark.no_db
 @pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
 @pytest.mark.parametrize("listing", ["good", "chrome", "none"])
 @pytest.mark.parametrize("layout", ["bare", "act-no"])
@@ -1080,6 +1081,7 @@ def _paren_after_year_run_on(title: str, year: int, tail: str) -> str:
     return f"{core} {year}{tail}".replace("\n", " ")
 
 
+@pytest.mark.no_db
 @pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
 @pytest.mark.parametrize("listing", ["good", "chrome", "none"])
 @pytest.mark.parametrize("layout", ["bare", "act-no"])
@@ -1128,6 +1130,7 @@ def _years_printed(title: str) -> set[int]:
     return found
 
 
+@pytest.mark.no_db
 @pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
 @pytest.mark.parametrize("listing", ["good", "chrome", "none"])
 @pytest.mark.parametrize("layout", ["bare", "act-no"])
@@ -1150,6 +1153,7 @@ def test_inner_year_title_is_kept(
         assert _short_title(body) == title
 
 
+@pytest.mark.no_db
 @pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
 @pytest.mark.parametrize("listing", ["good", "chrome", "none"])
 @pytest.mark.parametrize("layout", ["bare", "act-no"])
@@ -1181,6 +1185,183 @@ def test_citation_and_numbered_act_stay_titles_and_act_no_run_on_does_not():
     )
 
 
+# A later instrument year is part of the title only when the words between are
+# the name. A connector after the year is the next clause.
+LATER_YEAR_TAILS = (
+    " as amended by the Finance Act, 2023.",
+    ", as amended by the Finance Act, 2023.",
+    " and amends the Finance Act, 2023.",
+    ", and amends the Finance Act, 2023.",
+    " -- amends the Finance Act, 2023.",
+    "\namends the Finance Act, 2023.",
+    " - under the Finance Act, 2023.",
+    " under the Finance Act, 2023.",
+    " and Cantonments Order, 2023.",
+    " and the Finance Act, 2023.",
+    " in place of the Finance Act, 2023.",
+    " of the Finance Act, 2023.",
+    " read with the Income Tax Ordinance, 2001.",
+    " repealing the Finance Act, 2023.",
+    " replacing the Finance Act, 2023.",
+    " made under the Finance Act, 2023.",
+)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("verb", ["may", "shall"])
+@pytest.mark.parametrize("tail", LATER_YEAR_TAILS)
+def test_connector_after_the_year_does_not_extend_the_title(
+    source_name, listing, layout, verb, tail
+):
+    title = "Finance Act, 2024"
+    body = _year_then_words_body(title, verb, tail, "end")
+    header = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    if listing == "good":
+        assert out["statute_name"] == title
+        assert out["year_enacted"] == 2024
+        assert not (out.get("field_evidence") or {}).get("name_unknown")
+        # Continuing past the year, or failing to stop the called line, stores the tail.
+        assert _short_title(body) == title
+    else:
+        assert out["statute_name"] in {title, "name_unknown"}
+        assert "as amended" not in (out["statute_name"] or "").lower()
+        assert "read with" not in (out["statute_name"] or "").lower()
+
+
+@pytest.mark.no_db
+def test_newline_before_a_later_act_does_not_extend_the_title():
+    body = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 and Code\n"
+        "(Amendment) Act, 2025.\n"
+    )
+    assert _short_title(body) == "Finance Act, 2024"
+
+
+# Cited listings. The citation is not part of the called line, so a rejected
+# listing is quarantined or replaced by the core name.
+CITED_LISTINGS = (
+    ("Pakistan Penal Code, 1860 (Act XLV of 1860)", "Pakistan Penal Code, 1860"),
+    ("Code of Criminal Procedure, 1898 (Act V of 1898)", "Code of Criminal Procedure, 1898"),
+    ("Finance Act, 2024 (Act XVII of 2024)", "Finance Act, 2024"),
+    ("Income Tax Ordinance, 2001 (Ordinance No. XLIX of 2001)", "Income Tax Ordinance, 2001"),
+    ("Income Tax Ordinance, 2001 (Ord. XLIX of 2001)", "Income Tax Ordinance, 2001"),
+    ("Finance Act, 2024 (No. XVII of 2024)", "Finance Act, 2024"),
+    ("Finance Act, 2024 [XVII of 2024]", "Finance Act, 2024"),
+    ("Finance Act, 2024 (XVII of 2024).", "Finance Act, 2024"),
+    ("Finance Act, 2024 (Act No XVII of 2024)", "Finance Act, 2024"),
+    ("Pakistan Army Act, 1952 (Act XXXIX of 1952)", "Pakistan Army Act, 1952"),
+    ("Finance Act, 2024 (P.O. No. 1 of 2024)", "Finance Act, 2024"),
+    ("Finance Act, 2024 (No.XVII of 2024)", "Finance Act, 2024"),
+)
+
+
+def _cited_bodies(core: str) -> tuple[str, ...]:
+    return (
+        f"1. Short title.- This Act may be called the {core}.\n",
+        f"1. Short title.- This Act shall be called the {core}.\n",
+        "AN ACT to amend the law.\n",
+        "This Act may be cited as the said Act.\n",
+        "Be it enacted as follows.\n",
+    )
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("layout", ["bare", "act-no"])
+@pytest.mark.parametrize("body_index", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("listing,core", CITED_LISTINGS)
+def test_cited_listing_is_kept(source_name, layout, body_index, listing, core):
+    assert not is_rejected_assembly_statute_name(listing)
+    body = _cited_bodies(core)[body_index]
+    title_year = next(iter(_years_printed(core)))
+    header = f"ACT NO. I OF {title_year}\nAN ACT\nto amend the law\n"
+    text = body if layout == "bare" else header + body
+    out = _with_listing(text, source_name=source_name, listing="good", title=listing)
+    assert out["statute_name"] == listing
+    assert not (out.get("field_evidence") or {}).get("name_unknown")
+
+
+@pytest.mark.no_db
+def test_real_cited_names_are_not_rejected():
+    for name in (
+        "Azad Jammu and Kashmir Legislative Assembly (Elections) Act, 1986 (ACT VI OF 1986)",
+        "Balochistan Local Government Act, 2010 (Act V of 2010)",
+        "Companies Act, 2017 (Act XXII Of 2017)",
+        "The Bank of Azad Jammu and Kashmir Act, 2005 (ACT VI OF 2005)",
+        "Finance Act, 2024 (President's Order No. 5 of 2024)",
+        "Finance Act, 2024 (Regulation No. 3 of 2024)",
+        "Income Tax Ordinance, 2001 (Ordinance No.XLIX of 2001)",
+    ):
+        assert not is_rejected_assembly_statute_name(name)
+
+
+@pytest.mark.no_db
+@pytest.mark.parametrize("source_name", ["NationalAssembly", "Senate"])
+@pytest.mark.parametrize("listing", ["good", "chrome", "none"])
+def test_ocr_year_does_not_overwrite_a_listing(source_name, listing):
+    title = "Finance Act, 2024"
+    body = "1. Short title.- This Act may be called the Finance Act, 2O24.\n"
+    text = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n" + body
+    out = _with_listing(text, source_name=source_name, listing=listing, title=title)
+    if listing == "good":
+        assert out["statute_name"] == title
+        assert out["year_enacted"] == 2024
+        assert not (out.get("field_evidence") or {}).get("name_unknown")
+    else:
+        assert out["statute_name"] in {title, "name_unknown"}
+        assert "2O24" not in (out["statute_name"] or "")
+    assert not _short_title_supersedes(title, "Finance Act, 2O24, 2024")
+    assert "2O24, 2024" not in (_short_title(body) or "")
+
+
+@pytest.mark.no_db
+def test_act_number_year_wins_when_the_title_names_an_older_act():
+    title = "Income Tax Ordinance, 2001 Amendment Act, 2024"
+    body = f"1. Short title.- This Act may be called the {title}.\n"
+    text = "ACT NO. I OF 2024\nAN ACT\nto amend the law\n" + body
+    out = _with_listing(text, source_name="NationalAssembly", listing="chrome", title=title)
+    assert out["statute_name"] == title
+    assert out["year_enacted"] == 2024
+
+
+@pytest.mark.no_db
+def test_continuations_after_the_year_stay_in_the_short_title():
+    second = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 "
+        "(Second Amendment) Act, 2025.\n"
+    )
+    numbered = (
+        "1. Short title.- This Act may be called the Finance Act, 2024 "
+        "(No.2) Amendment Act, 2025.\n"
+    )
+    cited = "1. Short title.- This Act may be called the Pakistan Army Act, 1952 (XXXIX of 1952).\n"
+    assert _short_title(second) == "Finance Act, 2024 (Second Amendment) Act, 2025"
+    assert _short_title(numbered) == "Finance Act, 2024 (No.2) Amendment Act, 2025"
+    assert _short_title(cited) == "Pakistan Army Act, 1952 (XXXIX of 1952)"
+
+
+@pytest.mark.no_db
+def test_glued_letter_and_nineteenth_century_tail_are_rejected():
+    assert is_rejected_assembly_statute_name("Finance Act, 2024It extends to the whole of Pakistan")
+    assert is_rejected_assembly_statute_name("Trusts Act, 1882It extends to the whole of Pakistan")
+    assert not _short_title_supersedes(
+        "Finance Act, 2024",
+        "Finance Act 2024It extends to the whole of Pakistan",
+    )
+
+
+@pytest.mark.no_db
+def test_bare_section_number_ends_the_short_title():
+    text = "1. Short title.- This Act may be called the Finance Act 2. Amendment of section 4.\n"
+    assert _short_title(text) == "Finance Act"
+
+
+@pytest.mark.no_db
 def test_title_repair_does_not_disable_tls():
     blobs = [
         (REPO / "scraper" / "statute_quality" / "assembly_statute_title.py").read_text(encoding="utf-8"),

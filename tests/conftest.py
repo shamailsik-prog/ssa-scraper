@@ -129,9 +129,26 @@ def _initialised_database():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def clean_db():
+async def clean_db(request):
     """Truncate every table except schema_migrations, then re-seed. Per-xdist-worker DB names avoid
-    cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB."""
+    cross-worker contention; session advisory lock serialises truncate+seed on the shared default DB.
+
+    Title matrices marked ``no_db`` only call pure functions and the extractor.
+    """
+    if request.node.get_closest_marker("no_db"):
+        yield
+        return
+    # The rest of the statute-title file calls the extractor only. The three
+    # tests that stage or promote request ``db`` and still truncate.
+    node_path = getattr(request.node, "path", None)
+    names = set(getattr(request, "fixturenames", ()) or ())
+    if (
+        node_path is not None
+        and node_path.name == "test_na_statute_title.py"
+        and "db" not in names
+    ):
+        yield
+        return
     tables = [t for t in Base.metadata.sorted_tables if t.name != "schema_migrations"]
     truncate_sql = text("TRUNCATE " + ", ".join(f'"{t.name}"' for t in tables) + " RESTART IDENTITY CASCADE")
 
