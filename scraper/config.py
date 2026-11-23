@@ -459,7 +459,30 @@ class Settings(BaseSettings):
         description=(
             "When true, a search-harvest tick claims the largest gap_size first, including done and split "
             "rows that still have a gap, and runs an open gap-0 row only after that pass and only on the "
-            "gapped-reopen cooldown. Off keeps claim order as pending|in_progress by priority. Set to 1 or true to enable."
+            "gapped-reopen cooldown. When that pass finds nothing, the tick falls back to pending "
+            "citation-only rows (split across the login slots by a stable hash) and to rows just reclaimed "
+            "from a stale in_progress lease. Off keeps claim order as pending|in_progress by priority, "
+            "with the same fallback. Set to 1 or true to enable."
+        ),
+    )
+    PLS_SEARCH_HARVEST_LEASE_FACTOR: int = Field(
+        default=2,
+        ge=1,
+        le=24,
+        description=(
+            "Reclaim an in_progress search-harvest row that is older than this many tick budgets and is "
+            "not held by a live tick. The lease is PLS_SEARCH_HARVEST_LEASE_FACTOR * PLS_SEARCH_HARVEST_TICK_SECONDS "
+            "(1200 seconds when the tick limit is 0)."
+        ),
+    )
+    PLS_SEARCH_HARVEST_MAX_ATTEMPTS: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "A stale in_progress row that still has last_error is marked failed after this many lease "
+            "reclaims. The first reclaim can be picked at once; later ones wait out a doubling backoff "
+            "capped at 24 hours, so a failing query does not run on every tick."
         ),
     )
     PLS_SEARCH_HARVEST_CONTINUE: bool = Field(

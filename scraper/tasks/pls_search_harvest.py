@@ -19,6 +19,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scraper.auth.session_manager import (
+    LOCK_KEY,
     LoginRequired,
     SessionLock,
     SessionLockHeld,
@@ -656,6 +657,65 @@ def _recent_open_gap0_exists(cutoff: datetime, *, slot: Optional[int], take_over
     return exists(_scoped(stmt, recent, slot=slot, take_over=take_over))
 
 
+def search_harvest_lease() -> timedelta:
+    """How long an in_progress row may sit before a tick that does not hold it may reclaim it."""
+    tick = int(settings.PLS_SEARCH_HARVEST_TICK_SECONDS or 0)
+    if tick <= 0:
+        tick = 1200
+    factor = int(getattr(settings, "PLS_SEARCH_HARVEST_LEASE_FACTOR", 2) or 2)
+    return timedelta(seconds=max(1, tick) * max(1, factor))
+
+
+def search_harvest_max_attempts() -> int:
+    return max(1, int(getattr(settings, "PLS_SEARCH_HARVEST_MAX_ATTEMPTS", 5) or 5))
+
+
+def _lease_backoff(attempts: int, lease: timedelta) -> timedelta:
+    """First reclaim is immediate. Later failures wait lease, 2*lease, 4*lease, … capped at 24 hours."""
+    if attempts <= 1:
+        return timedelta(0)
+    shift = min(max(int(attempts) - 2, 0), 10)
+    return min(lease * (2 ** shift), timedelta(hours=24))
+
+
+def _retry_ready_clause(now: Optional[datetime] = None):
+    now = now or datetime.now(timezone.utc)
+    raw = PlsSearchHarvestQuery.cursor_json["harvest_retry_after"].astext
+    return or_(raw.is_(None), raw == "", raw <= now.isoformat())
+
+
+def _citation_bucket_eq(slot: int, model=None):
+    """True when md5(query_key)'s first byte selects this login. Same rule as citation_backlog_slot."""
+    model = model or PlsSearchHarvestQuery
+    width = len(SEARCH_HARVEST_SLOTS)
+    bucket = func.mod(func.get_byte(func.decode(func.md5(model.query_key), "hex"), 0), width)
+    return bucket == SEARCH_HARVEST_SLOTS.index(int(slot))
+
+
+def _fallback_share_filter(slot: int, model=None):
+    """Reporter share, plus this slot's hash of citation-only rows (slot column NULL until claimed)."""
+    model = model or PlsSearchHarvestQuery
+    citation = citation_only_sql_clause(model)
+    return or_(
+        and_(~citation, _share_filter(slot, model)),
+        and_(citation, _citation_bucket_eq(slot, model)),
+    )
+
+
+def _backlog_fallback_clause():
+    """Pending citation lookups, and rows this tick just returned from a stale in_progress lease.
+
+    Structured gap-0 rows stay on the gap-focus cooldown. The reclaim flag is set only for the
+    lease return, so an old attempt count on a later reopen does not jump the cooldown.
+    """
+    opened = PlsSearchHarvestQuery.cursor_json["harvest_reclaim_open"].astext
+    return and_(
+        PlsSearchHarvestQuery.status == "pending",
+        _retry_ready_clause(),
+        or_(_citation_only_clause(), opened == "true"),
+    )
+
+
 def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
     """Largest remaining gaps first. Open gap-0 rows wait until that pass cools.
 
@@ -690,7 +750,7 @@ def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
         ~_due_positive_gap_exists(cutoff, slot=slot, take_over=take_over),
         ~_recent_open_gap0_exists(cutoff, slot=slot, take_over=take_over),
     )
-    return or_(gap_positive, gap0)
+    return and_(_retry_ready_clause(), or_(gap_positive, gap0))
 
 
 def _gap_focus_order(stmt):
@@ -756,6 +816,134 @@ def _query_lock(row_id, redis_client) -> SessionLock:
     return SessionLock(f"{SOURCE_NAME}:search_harvest:query:{row_id}", redis_client, max_holders=1, **_harvest_lock_options())
 
 
+def _claim_statement(slot: int, *, take_over: bool, fallback: bool):
+    """Pick order: gap-focus (or pending|in_progress) on the reporter share, then the citation / lease fallback.
+
+    The fallback runs only when the first select is empty. GAP_FOCUS still prefers gap>0. Citation-only
+    rows are not in that first select; each belongs to one slot via citation_backlog_slot. A row returned
+    from a stale in_progress lease is pending with harvest_reclaim_open set, so it can be picked inside
+    the gap-0 cooldown instead of sitting until that window ends.
+    """
+    if fallback:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            _backlog_fallback_clause(),
+        )
+        order = _pick_order
+        share = _fallback_share_filter(slot)
+    elif settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            _gap_focus_eligibility(slot=slot, take_over=take_over),
+        )
+        order = _gap_focus_order
+        share = _share_filter(slot)
+    else:
+        stmt = select(PlsSearchHarvestQuery).where(
+            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
+            ~_citation_only_clause(),
+            _retry_ready_clause(),
+        )
+        order = _pick_order
+        share = _share_filter(slot)
+    if not take_over:
+        stmt = stmt.where(share)
+    return order(stmt)
+
+
+async def _query_lock_held(row_id, redis_client) -> bool:
+    """True when this row's per-query lock exists, so a live tick still holds it.
+
+    No redis client (unit tests that do not pass one) means the lease time is the only guard.
+    A redis error fails closed: leave the row in_progress rather than take it from a live tick.
+    """
+    if redis_client is None:
+        return False
+    key = LOCK_KEY.format(source=f"{SOURCE_NAME}:search_harvest:query:{row_id}")
+    try:
+        return bool(await redis_client.exists(key))
+    except Exception:
+        logger.warning("search harvest lease: could not read query lock for %s", row_id)
+        return True
+
+
+def _note_lease_reclaim(row: PlsSearchHarvestQuery, *, now: datetime, lease: timedelta) -> None:
+    cursor = dict(row.cursor_json or {})
+    error = (row.last_error or "").strip()
+    if not error:
+        # A tick that ran out of time has no error. Return it to pending and leave it on the
+        # gap-focus cooldown so a long gap-0 query is not picked on every lease.
+        row.status = "pending"
+        cursor.pop("harvest_retry_after", None)
+        cursor.pop("harvest_reclaim_open", None)
+        row.cursor_json = cursor
+        return
+    attempts = int(cursor.get("harvest_attempts") or 0) + 1
+    cursor["harvest_attempts"] = attempts
+    if attempts >= search_harvest_max_attempts():
+        row.status = "failed"
+        note = "harvest attempts exhausted after stale in_progress lease"
+        row.last_error = f"{note}; {error}"[:1000]
+        cursor.pop("harvest_retry_after", None)
+        cursor.pop("harvest_reclaim_open", None)
+    else:
+        row.status = "pending"
+        delay = _lease_backoff(attempts, lease)
+        if delay.total_seconds() > 0:
+            cursor["harvest_retry_after"] = (now + delay).isoformat()
+        else:
+            cursor.pop("harvest_retry_after", None)
+        cursor["harvest_reclaim_open"] = True
+    row.cursor_json = cursor
+
+
+def _consume_reclaim_flag(row: PlsSearchHarvestQuery) -> None:
+    cursor = dict(row.cursor_json or {})
+    if cursor.pop("harvest_reclaim_open", None) is None:
+        return
+    row.cursor_json = cursor
+
+
+async def reclaim_stale_harvest_queries(
+    db: AsyncSession,
+    *,
+    slot: Optional[int] = None,
+    take_over: bool = False,
+    redis_client=None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Return in_progress rows older than the lease, and not held by a live tick, to pending.
+
+    Rows that still have last_error count an attempt and are eligible on the fallback pass.
+    The first reclaim can be picked at once. Later ones wait out a doubling backoff. At
+    PLS_SEARCH_HARVEST_MAX_ATTEMPTS the row is failed and is not claimed again. A clean
+    in_progress row (no last_error) is returned to pending without counting a failure and
+    without jumping the gap-0 cooldown.
+    """
+    now = now or datetime.now(timezone.utc)
+    lease = search_harvest_lease()
+    cutoff = now - lease
+    stmt = select(PlsSearchHarvestQuery).where(
+        PlsSearchHarvestQuery.source_name == SOURCE_NAME,
+        PlsSearchHarvestQuery.status == "in_progress",
+        or_(PlsSearchHarvestQuery.last_run_at.is_(None), PlsSearchHarvestQuery.last_run_at < cutoff),
+    )
+    if slot in SEARCH_HARVEST_SLOTS and not take_over:
+        stmt = stmt.where(_fallback_share_filter(slot))
+    rows = (await db.execute(stmt)).scalars().all()
+    changed = 0
+    for row in rows:
+        if await _query_lock_held(row.id, redis_client):
+            continue
+        _note_lease_reclaim(row, now=now, lease=lease)
+        changed += 1
+    if changed:
+        await db.flush()
+        logger.info("search harvest lease reclaim: %s row(s) slot=%s", changed, slot if not take_over else "takeover")
+    return changed
+
+
 async def claim_next_query(
     db: AsyncSession,
     slot: int,
@@ -769,39 +957,30 @@ async def claim_next_query(
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
     after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None).
 
-    Claiming a done or split row with a gap marks it in_progress and stamps last_run_at. It does not reset the
-    cursor, the page and row counters, or last_error.
+    Order: gap-focus (or pending|in_progress) on the reporter share, then pending citation-only rows in this
+    slot's hash share and rows reclaimed from a stale in_progress lease. Claiming a done or split row with a
+    gap marks it in_progress and stamps last_run_at. It does not reset the cursor, the page and row counters,
+    or last_error.
     """
-    if settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
-        stmt = select(PlsSearchHarvestQuery).where(
-            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-            _gap_focus_eligibility(slot=slot, take_over=take_over),
-        )
-        order = _gap_focus_order
-    else:
-        stmt = select(PlsSearchHarvestQuery).where(
-            PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-            PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-            ~_citation_only_clause(),
-        )
-        order = _pick_order
-    if not take_over:
-        stmt = stmt.where(_share_filter(slot))
-    rows = (await db.execute(order(stmt).limit(candidates).with_for_update(skip_locked=True))).scalars().all()
-    for row in rows:
-        lock = _query_lock(row.id, redis_client)
-        try:
-            await _acquire_harvest_lock(lock)
-        except SessionLockHeld:
-            await lock.release()
-            continue
-        row.status = "in_progress"
-        row.slot = slot
-        # stamped at once, so a row that ends its run early (an interrupted page) goes behind its equals.
-        # cursor_json, counters, and last_error stay so a done/split gap can resume without a reopen wipe.
-        row.last_run_at = datetime.now(timezone.utc)
-        await db.commit()
-        return row, lock
+    await reclaim_stale_harvest_queries(db, slot=slot, take_over=take_over, redis_client=redis_client)
+    for fallback in (False, True):
+        stmt = _claim_statement(slot, take_over=take_over, fallback=fallback)
+        rows = (await db.execute(stmt.limit(candidates).with_for_update(skip_locked=True))).scalars().all()
+        for row in rows:
+            lock = _query_lock(row.id, redis_client)
+            try:
+                await _acquire_harvest_lock(lock)
+            except SessionLockHeld:
+                await lock.release()
+                continue
+            _consume_reclaim_flag(row)
+            row.status = "in_progress"
+            row.slot = slot
+            # stamped at once, so a row that ends its run early (an interrupted page) goes behind its equals.
+            # cursor_json, counters, and last_error stay so a done/split gap can resume without a reopen wipe.
+            row.last_run_at = datetime.now(timezone.utc)
+            await db.commit()
+            return row, lock
     await db.commit()  # ends the transaction that held the candidates' row locks
     return None, None
 

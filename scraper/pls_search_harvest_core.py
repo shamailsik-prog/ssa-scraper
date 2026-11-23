@@ -55,6 +55,20 @@ def search_harvest_slot_for(query_json: Dict[str, Any], slot1_share: FrozenSet[s
     return 1 if normalise_reporter((query_json or {}).get("reporter")) in slot1_share else 2
 
 
+def citation_backlog_slot(query_key: str, slots: Sequence[int] = SEARCH_HARVEST_SLOTS) -> int:
+    """Login slot that may claim a citation-only ledger row.
+
+    Reporter rows stay on the reporter share. A citation lookup has no reporter, and its
+    slot column stays NULL until a tick takes it, so the logins split that backlog with
+    the first byte of md5(query_key). The claim SQL uses the same byte.
+    """
+    width = len(slots)
+    if width <= 0:
+        raise ValueError("citation backlog slots are empty")
+    first = hashlib.md5(str(query_key).encode("utf-8")).digest()[0]
+    return int(slots[first % width])
+
+
 def make_query_key(query_json: Dict[str, Any]) -> str:
     normalized = normalize_query_json(query_json)
     parts = [f"{key}={normalized[key]}" for key in _QUERY_KEY_ORDER if key in normalized]
