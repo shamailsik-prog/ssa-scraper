@@ -671,6 +671,19 @@ def stamp_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> N
     cursor["unresolved_samples"] = kept
 
 
+_LEASE_CURSOR_KEYS = ("harvest_attempts", "harvest_retry_after", "harvest_reclaim_open")
+
+
+def lease_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Attempt count and backoff that must survive a page-cursor rebuild.
+
+    A repeated-page stop stores a new cursor built from gap_diagnostics_slice.
+    Dropping these keys there made the next lease reclaim start again at attempt 1.
+    """
+    body = dict(cursor or {})
+    return {key: body[key] for key in _LEASE_CURSOR_KEYS if body.get(key) not in (None, "", 0, False)}
+
+
 def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if cursor.get("gap_samples"):
@@ -684,6 +697,7 @@ def gap_diagnostics_slice(cursor: Dict[str, Any]) -> Dict[str, Any]:
     if cursor.get("count_only_gap"):
         out["count_only_gap"] = cursor["count_only_gap"]
     out.update(annexure_cursor_state(cursor))
+    out.update(lease_cursor_state(cursor))
     return out
 
 

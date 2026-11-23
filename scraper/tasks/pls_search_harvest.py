@@ -631,6 +631,7 @@ def _due_positive_gap_exists(cutoff: datetime, *, slot: Optional[int], take_over
         other.source_name == SOURCE_NAME,
         other.gap_size > 0,
         ~citation_only_sql_clause(other),
+        _retry_ready_clause(model=other),
         or_(
             other.status.in_(("pending", "in_progress")),
             and_(
@@ -678,9 +679,10 @@ def _lease_backoff(attempts: int, lease: timedelta) -> timedelta:
     return min(lease * (2 ** shift), timedelta(hours=24))
 
 
-def _retry_ready_clause(now: Optional[datetime] = None):
+def _retry_ready_clause(now: Optional[datetime] = None, model=None):
     now = now or datetime.now(timezone.utc)
-    raw = PlsSearchHarvestQuery.cursor_json["harvest_retry_after"].astext
+    model = model or PlsSearchHarvestQuery
+    raw = model.cursor_json["harvest_retry_after"].astext
     return or_(raw.is_(None), raw == "", raw <= now.isoformat())
 
 
@@ -931,7 +933,9 @@ async def reclaim_stale_harvest_queries(
     )
     if slot in SEARCH_HARVEST_SLOTS and not take_over:
         stmt = stmt.where(_fallback_share_filter(slot))
-    rows = (await db.execute(stmt)).scalars().all()
+    # Lock the row for this transaction. A second slot's reclaim skips it instead of
+    # loading a copy whose later flush would overwrite a claim this slot already committed.
+    rows = (await db.execute(stmt.with_for_update(skip_locked=True))).scalars().all()
     changed = 0
     for row in rows:
         if await _query_lock_held(row.id, redis_client):
