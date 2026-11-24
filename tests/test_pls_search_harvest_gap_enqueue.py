@@ -353,20 +353,31 @@ async def test_pick_prefers_reporter_year_over_a_higher_priority_citation(db):
 
 
 @pytest.mark.asyncio
-async def test_automatic_claim_skips_citation_keys_when_no_reporter_year_is_pending(db):
+async def test_automatic_claim_takes_citation_when_no_reporter_year_is_pending(db):
+    """A citation backlog is claimable once nothing structured is pending, on its hash slot only."""
+    from scraper.pls_search_harvest_core import citation_backlog_slot
+
     citation = PlsSearchHarvestQuery(
         source_name="PakistanLawSite",
         query_key="search:citation=1979 SCMR 625",
         query_json={"citation": "1979 SCMR 625"},
         status="pending",
         priority=1,
+        gap_size=0,
+        slot=None,
     )
     db.add(citation)
     await db.flush()
 
-    row, lock = await harvest.claim_next_query(db, 2, redis_client=None)
-    assert row is None and lock is None
+    slot = citation_backlog_slot(citation.query_key)
+    other = 2 if slot == 1 else 1
+    missed, missed_lock = await harvest.claim_next_query(db, other, redis_client=None)
+    assert missed is None and missed_lock is None
     assert citation.status == "pending"
+    row, lock = await harvest.claim_next_query(db, slot, redis_client=None)
+    assert row is not None and row.query_key == citation.query_key
+    if lock is not None:
+        await lock.release()
     await db.rollback()
 
 
