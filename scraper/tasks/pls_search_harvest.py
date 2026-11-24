@@ -740,10 +740,10 @@ def _lease_backoff(attempts: int, lease: timedelta) -> timedelta:
     return min(lease * (2 ** shift), timedelta(hours=24))
 
 
-def _zero_yield_backoff(attempts: int) -> timedelta:
+def _zero_yield_backoff(empty_passes: int) -> timedelta:
     """Every completed rows_new=0 / staged=0 pass waits. First wait is one lease, then doubles, cap 24h."""
     lease = search_harvest_lease()
-    shift = min(max(int(attempts) - 1, 0), 10)
+    shift = min(max(int(empty_passes) - 1, 0), 10)
     return min(lease * (2 ** shift), timedelta(hours=24))
 
 
@@ -757,10 +757,11 @@ def _note_search_yield(
 ) -> None:
     """Backoff a finished search that staged nothing, and clear that backoff when a later pass yields.
 
-    A tick that stops early (out of time, or still in_progress after staging rows) keeps
-    harvest_attempts / harvest_retry_after so a page-cursor rebuild cannot reset #431's lease.
-    A done/done_unlinked pass that added rows clears the backoff. A pass with rows_new still 0
-    and staged_this_tick 0 increments harvest_attempts and sets harvest_retry_after in the future.
+    Empty passes increment harvest_empty_passes and set harvest_retry_after. They do not
+    touch harvest_attempts: that counter is only for stale-lease failures, and spending it
+    here would fail a real gap after PLS_SEARCH_HARVEST_MAX_ATTEMPTS empty searches.
+    A done/done_unlinked pass that added rows clears the empty counter and the backoff,
+    and leaves harvest_attempts in place. A tick that stops early keeps every lease key.
     """
     if out_of_time:
         return
@@ -769,7 +770,7 @@ def _note_search_yield(
     if gained:
         if row.status in ("done", "done_unlinked"):
             cursor.pop("harvest_retry_after", None)
-            cursor.pop("harvest_attempts", None)
+            cursor.pop("harvest_empty_passes", None)
             row.cursor_json = cursor
         return
     if row.status in ("failed", "skipped", "split"):
@@ -778,9 +779,9 @@ def _note_search_yield(
         return
     if int(staged_this_tick) != 0 or int(rows_new_after) != 0:
         return
-    attempts = int(cursor.get("harvest_attempts") or 0) + 1
-    cursor["harvest_attempts"] = attempts
-    cursor["harvest_retry_after"] = (datetime.now(timezone.utc) + _zero_yield_backoff(attempts)).isoformat()
+    passes = int(cursor.get("harvest_empty_passes") or 0) + 1
+    cursor["harvest_empty_passes"] = passes
+    cursor["harvest_retry_after"] = (datetime.now(timezone.utc) + _zero_yield_backoff(passes)).isoformat()
     row.cursor_json = cursor
 
 

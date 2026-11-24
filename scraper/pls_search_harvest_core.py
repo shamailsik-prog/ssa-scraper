@@ -567,8 +567,10 @@ def annexure_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def fresh_cursor_keeping_annexure_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Page-1 cursor that still remembers annexure stubs, unmatched rows, and lease backoff.
 
-    harvest_attempts, harvest_retry_after, and harvest_reclaim_open are the same keys
-    gap_diagnostics_slice keeps. A reopen that builds a fresh page cursor must not drop them.
+    harvest_attempts, harvest_retry_after, harvest_reclaim_open, and harvest_empty_passes
+    are the same keys gap_diagnostics_slice keeps. A reopen that builds a fresh page
+    cursor must not drop them. harvest_empty_passes is the empty-search backoff count;
+    it is not the failure budget.
     """
     kept = {"page": 1, "row_index": 0, **annexure_cursor_state(cursor), **lease_cursor_state(cursor)}
     samples = list((cursor or {}).get("unresolved_samples") or [])
@@ -675,7 +677,12 @@ def stamp_unresolved_sample(cursor: Dict[str, Any], sample: Dict[str, Any]) -> N
     cursor["unresolved_samples"] = kept
 
 
-_LEASE_CURSOR_KEYS = ("harvest_attempts", "harvest_retry_after", "harvest_reclaim_open")
+_LEASE_CURSOR_KEYS = (
+    "harvest_attempts",
+    "harvest_retry_after",
+    "harvest_reclaim_open",
+    "harvest_empty_passes",
+)
 
 
 def lease_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:

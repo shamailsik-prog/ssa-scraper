@@ -277,14 +277,14 @@ async def test_repeated_zero_yield_is_not_immediately_reclaimed(db, monkeypatch)
     runner = _runner(monkeypatch, db, {"page1": ([], None)})
     await runner.run_query(row, {})
     assert row.rows_new == 0
-    first_attempts = int((row.cursor_json or {}).get("harvest_attempts") or 0)
-    assert first_attempts == 1
+    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 0
+    assert int((row.cursor_json or {}).get("harvest_empty_passes") or 0) == 1
     first_retry = _retry_at(row)
     assert first_retry > datetime.now(timezone.utc)
 
     await runner.run_query(row, {})
-    second_attempts = int((row.cursor_json or {}).get("harvest_attempts") or 0)
-    assert second_attempts == 2
+    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 0
+    assert int((row.cursor_json or {}).get("harvest_empty_passes") or 0) == 2
     second_retry = _retry_at(row)
     assert second_retry > first_retry
 
@@ -293,7 +293,8 @@ async def test_repeated_zero_yield_is_not_immediately_reclaimed(db, monkeypatch)
     assert await _claim(db) is None
     await db.refresh(row)
     assert row.status == "pending"
-    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 2
+    assert int((row.cursor_json or {}).get("harvest_empty_passes") or 0) == 2
+    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 0
 
 
 @pytest.mark.asyncio
@@ -307,7 +308,13 @@ async def test_nonzero_yield_clears_backoff(db, monkeypatch):
         status="in_progress",
         gap_size=263,
         rows_new=0,
-        cursor_json={"page": 1, "row_index": 0, "harvest_attempts": 2, "harvest_retry_after": later},
+        cursor_json={
+            "page": 1,
+            "row_index": 0,
+            "harvest_attempts": 2,
+            "harvest_empty_passes": 4,
+            "harvest_retry_after": later,
+        },
     )
     db.add(row)
     await db.commit()
@@ -325,7 +332,8 @@ async def test_nonzero_yield_clears_backoff(db, monkeypatch):
     assert row.status == "done"
     cursor = row.cursor_json or {}
     assert "harvest_retry_after" not in cursor
-    assert "harvest_attempts" not in cursor
+    assert "harvest_empty_passes" not in cursor
+    assert int(cursor.get("harvest_attempts") or 0) == 2
 
     row.status = "pending"
     row.last_run_at = datetime.now(timezone.utc) - timedelta(hours=8)
@@ -340,6 +348,7 @@ def test_page_cursor_rebuild_keeps_lease_keys():
         "page": 4,
         "row_index": 2,
         "harvest_attempts": 2,
+        "harvest_empty_passes": 4,
         "harvest_retry_after": "2026-11-24T12:00:00+00:00",
         "harvest_reclaim_open": True,
         "unresolved_samples": [{"citation": "1979 SCMR 1"}],
@@ -347,9 +356,41 @@ def test_page_cursor_rebuild_keeps_lease_keys():
     fresh = fresh_cursor_keeping_annexure_state(cursor)
     assert fresh["page"] == 1 and fresh["row_index"] == 0
     assert fresh["harvest_attempts"] == 2
+    assert fresh["harvest_empty_passes"] == 4
     assert fresh["harvest_retry_after"] == "2026-11-24T12:00:00+00:00"
     assert fresh["harvest_reclaim_open"] is True
     assert fresh["unresolved_samples"][0]["citation"] == "1979 SCMR 1"
+
+
+@pytest.mark.asyncio
+async def test_empty_passes_do_not_exhaust_the_failure_budget(db, monkeypatch):
+    """Five empty passes must not make the next stale-lease error mark SCMR|2025 failed."""
+    _enable(monkeypatch, tick_seconds=30)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_MAX_ATTEMPTS", 5)
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 0)
+    row = _year(status="in_progress", gap_size=263, rows_new=0)
+    db.add(row)
+    await db.commit()
+
+    runner = _runner(monkeypatch, db, {"page1": ([], None)})
+    for _ in range(5):
+        await runner.run_query(row, {})
+    assert int((row.cursor_json or {}).get("harvest_empty_passes") or 0) == 5
+    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 0
+    assert _retry_at(row) > datetime.now(timezone.utc)
+
+    monkeypatch.setattr(settings, "PLS_SEARCH_HARVEST_TICK_SECONDS", 30)
+    row.status = "in_progress"
+    row.last_error = "pagination interrupted: timeout"
+    row.last_run_at = datetime.now(timezone.utc) - timedelta(seconds=30 * 2) - timedelta(seconds=5)
+    await db.commit()
+
+    await _claim(db)
+    await db.refresh(row)
+    assert row.status != "failed"
+    assert int((row.cursor_json or {}).get("harvest_attempts") or 0) == 1
+    assert int((row.cursor_json or {}).get("harvest_empty_passes") or 0) == 5
+    assert "exhausted" not in (row.last_error or "")
 
 
 def test_stale_lease_reclaim_keeps_skip_locked():
