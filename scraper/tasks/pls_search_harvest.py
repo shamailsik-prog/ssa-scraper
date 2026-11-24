@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
 from celery.utils.log import get_task_logger
-from sqlalchemy import and_, exists, false, func, or_, select, true
+from sqlalchemy import and_, case, exists, false, func, or_, select, true
 from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -213,6 +213,11 @@ async def seed_search_harvest_plan(
 GAPPED_REOPEN_LIMIT = 24
 REPORTER_YEAR_REOPEN_LIMIT = 4
 GAPPED_REOPEN_COOLDOWN = timedelta(hours=6)
+# A smaller positive gap that has already run is interleaved ahead of a larger gap
+# that ran more recently, once it has waited this many cooldowns (8 * 6h = 48h).
+# Never-run positive gaps stay in the same lane and still sort by size, so a
+# never-run SCMR|2025 is not hidden behind an old size-1 row.
+GAP_PRIORITY_BURST = 8
 
 
 async def reopen_gapped_search_harvest_queries(
@@ -577,16 +582,72 @@ async def gap_report_rows(db: AsyncSession, *, limit: int = 500) -> List[Dict[st
     return out
 
 
-def _pick_order(stmt):
-    # Structured searches (reporter×year and the other planned families) come before citation-only
-    # lookups, even when a citation row was given a higher priority. Within that, priority first
-    # (lower is sooner), then the row that has waited longest since its last run.
-    return stmt.order_by(
-        _citation_only_clause().asc(),
-        PlsSearchHarvestQuery.priority.asc(),
-        PlsSearchHarvestQuery.last_run_at.asc().nulls_first(),
-        PlsSearchHarvestQuery.created_at.asc(),
+def _remaining_gap_sql(model=None):
+    """Remaining gap used for claim order and positive-gap eligibility.
+
+    greatest(stored gap_size, site_total - rows_known, rows_seen - rows_known).
+    Same shape as compute_gap_size, without the JSON unlinked credit. A pending
+    year whose gap_size column was left at 0 still sorts as site_total - rows_known
+    (SCMR|2025 remaining 263 before a size-0 citation).
+    """
+    model = model or PlsSearchHarvestQuery
+    known = func.coalesce(model.rows_known, 0)
+    seen = func.coalesce(model.rows_seen, 0)
+    stored = func.coalesce(model.gap_size, 0)
+    from_total = case(
+        (and_(model.site_total_results.is_not(None), model.site_total_results > known), model.site_total_results - known),
+        else_=0,
     )
+    from_seen = case((seen > known, seen - known), else_=0)
+    return func.greatest(stored, from_total, from_seen)
+
+
+def _gap_priority_columns(model=None):
+    """Exact claim order. See the docstring on _gap_priority_order."""
+    model = model or PlsSearchHarvestQuery
+    gap = _remaining_gap_sql(model)
+    cutoff = datetime.now(timezone.utc) - GAPPED_REOPEN_COOLDOWN * GAP_PRIORITY_BURST
+    long_wait = and_(gap > 0, model.last_run_at.is_not(None), model.last_run_at < cutoff)
+    never_run = and_(gap > 0, model.last_run_at.is_(None))
+    lane = case((or_(long_wait, never_run), 0), else_=1)
+    return lane, gap
+
+
+def _gap_priority_order(stmt, model=None):
+    """Claim rule, largest remaining gap first, without starving smaller due work.
+
+    1. Lane 0, then lane 1. Lane 0 is a positive remaining gap that has never run,
+       or one that has already waited GAP_PRIORITY_BURST cooldowns (48h). Lane 1
+       is everything else, including size-0 citations and a large gap that ran
+       more recently than 48h.
+    2. Remaining gap descending. A due size-263 year therefore precedes a due
+       size-0 citation whenever both are in lane 1, and a never-run size-263
+       stays ahead of an old size-1 row because both are lane 0 and size breaks
+       the tie. The bounded interleave is the lane: after 48h a smaller positive
+       gap moves ahead of a *recently run* larger gap, so the large one cannot
+       hold the slot forever.
+    3. Citation-only rows after structured rows of the same size (stable, the
+       pre-existing tie break).
+    4. priority ascending, then last_run_at ascending NULLS FIRST, then
+       created_at, then id. Equal sizes keep the old priority order, and the
+       oldest due row / lowest id is the stable secondary key so equal gaps
+       are not skipped forever.
+    """
+    model = model or PlsSearchHarvestQuery
+    lane, gap = _gap_priority_columns(model)
+    return stmt.order_by(
+        lane.asc(),
+        gap.desc(),
+        _citation_only_clause().asc() if model is PlsSearchHarvestQuery else citation_only_sql_clause(model).asc(),
+        model.priority.asc(),
+        model.last_run_at.asc().nulls_first(),
+        model.created_at.asc(),
+        model.id.asc(),
+    )
+
+
+def _pick_order(stmt):
+    return _gap_priority_order(stmt)
 
 
 def _reporter_sql(model=None):
@@ -629,7 +690,7 @@ def _due_positive_gap_exists(cutoff: datetime, *, slot: Optional[int], take_over
     cooled = or_(other.last_run_at.is_(None), other.last_run_at < cutoff)
     stmt = select(other.id).where(
         other.source_name == SOURCE_NAME,
-        other.gap_size > 0,
+        _remaining_gap_sql(other) > 0,
         ~citation_only_sql_clause(other),
         _retry_ready_clause(model=other),
         or_(
@@ -650,7 +711,7 @@ def _recent_open_gap0_exists(cutoff: datetime, *, slot: Optional[int], take_over
     stmt = select(recent.id).where(
         recent.source_name == SOURCE_NAME,
         recent.status.in_(("pending", "in_progress")),
-        func.coalesce(recent.gap_size, 0) <= 0,
+        _remaining_gap_sql(recent) <= 0,
         recent.last_run_at.is_not(None),
         recent.last_run_at >= cutoff,
         ~citation_only_sql_clause(recent),
@@ -677,6 +738,50 @@ def _lease_backoff(attempts: int, lease: timedelta) -> timedelta:
         return timedelta(0)
     shift = min(max(int(attempts) - 2, 0), 10)
     return min(lease * (2 ** shift), timedelta(hours=24))
+
+
+def _zero_yield_backoff(attempts: int) -> timedelta:
+    """Every completed rows_new=0 / staged=0 pass waits. First wait is one lease, then doubles, cap 24h."""
+    lease = search_harvest_lease()
+    shift = min(max(int(attempts) - 1, 0), 10)
+    return min(lease * (2 ** shift), timedelta(hours=24))
+
+
+def _note_search_yield(
+    row: PlsSearchHarvestQuery,
+    *,
+    rows_new_at_start: int,
+    rows_new_after: int,
+    staged_this_tick: int,
+    out_of_time: bool,
+) -> None:
+    """Backoff a finished search that staged nothing, and clear that backoff when a later pass yields.
+
+    A tick that stops early (out of time, or still in_progress after staging rows) keeps
+    harvest_attempts / harvest_retry_after so a page-cursor rebuild cannot reset #431's lease.
+    A done/done_unlinked pass that added rows clears the backoff. A pass with rows_new still 0
+    and staged_this_tick 0 increments harvest_attempts and sets harvest_retry_after in the future.
+    """
+    if out_of_time:
+        return
+    cursor = dict(row.cursor_json or {})
+    gained = int(rows_new_after) > int(rows_new_at_start) or int(staged_this_tick) > 0
+    if gained:
+        if row.status in ("done", "done_unlinked"):
+            cursor.pop("harvest_retry_after", None)
+            cursor.pop("harvest_attempts", None)
+            row.cursor_json = cursor
+        return
+    if row.status in ("failed", "skipped", "split"):
+        return
+    if (row.last_error or "").startswith("pagination interrupted"):
+        return
+    if int(staged_this_tick) != 0 or int(rows_new_after) != 0:
+        return
+    attempts = int(cursor.get("harvest_attempts") or 0) + 1
+    cursor["harvest_attempts"] = attempts
+    cursor["harvest_retry_after"] = (datetime.now(timezone.utc) + _zero_yield_backoff(attempts)).isoformat()
+    row.cursor_json = cursor
 
 
 def _retry_ready_clause(now: Optional[datetime] = None, model=None):
@@ -733,7 +838,7 @@ def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
         PlsSearchHarvestQuery.last_run_at < cutoff,
     )
     gap_positive = and_(
-        PlsSearchHarvestQuery.gap_size > 0,
+        _remaining_gap_sql() > 0,
         ~_citation_only_clause(),
         or_(
             PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
@@ -746,7 +851,7 @@ def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
     )
     gap0 = and_(
         PlsSearchHarvestQuery.status.in_(("pending", "in_progress")),
-        func.coalesce(PlsSearchHarvestQuery.gap_size, 0) <= 0,
+        _remaining_gap_sql() <= 0,
         ~_citation_only_clause(),
         cooled,
         ~_due_positive_gap_exists(cutoff, slot=slot, take_over=take_over),
@@ -756,13 +861,35 @@ def _gap_focus_eligibility(*, slot: Optional[int], take_over: bool):
 
 
 def _gap_focus_order(stmt):
-    return stmt.order_by(
-        PlsSearchHarvestQuery.gap_size.desc(),
-        _citation_only_clause().asc(),
-        PlsSearchHarvestQuery.priority.asc(),
-        PlsSearchHarvestQuery.last_run_at.asc().nulls_first(),
-        PlsSearchHarvestQuery.created_at.asc(),
+    return _gap_priority_order(stmt)
+
+
+def _hot_positive_gap_clause():
+    """A positive-gap row the 6h cooldown is still holding (done/split, or any status).
+
+    Split parents that already have shards stay out: the shard is the row to claim.
+    """
+    return and_(
+        _remaining_gap_sql() > 0,
+        ~_citation_only_clause(),
+        _retry_ready_clause(),
+        PlsSearchHarvestQuery.status.in_(("pending", "in_progress", "done", "split")),
+        ~_has_harvest_children(PlsSearchHarvestQuery),
     )
+
+
+def _due_citation_backlog_exists(slot: int, take_over: bool):
+    """A pending citation this slot would otherwise claim on the fallback pass."""
+    other = aliased(PlsSearchHarvestQuery)
+    stmt = select(other.id).where(
+        other.source_name == SOURCE_NAME,
+        other.status == "pending",
+        citation_only_sql_clause(other),
+        _retry_ready_clause(model=other),
+    )
+    if not take_over:
+        stmt = stmt.where(_citation_bucket_eq(slot, other))
+    return exists(stmt)
 
 
 async def pick_next_query(
@@ -827,11 +954,18 @@ def _claim_statement(slot: int, *, take_over: bool, fallback: bool):
     the gap-0 cooldown instead of sitting until that window ends.
     """
     if fallback:
+        # Citations, lease-reclaim rows, and — only while a citation is actually due —
+        # a positive gap the 6h cooldown is still holding. The cooldown still idles
+        # that gap when it is the only row (pick/claim return nothing). It does not
+        # let a size-0 citation cut ahead of SCMR|2025.
+        hot = false()
+        if settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
+            hot = and_(_hot_positive_gap_clause(), _due_citation_backlog_exists(slot, take_over))
         stmt = select(PlsSearchHarvestQuery).where(
             PlsSearchHarvestQuery.source_name == SOURCE_NAME,
-            _backlog_fallback_clause(),
+            or_(_backlog_fallback_clause(), hot),
         )
-        order = _pick_order
+        order = _gap_priority_order
         share = _fallback_share_filter(slot)
     elif settings.PLS_SEARCH_HARVEST_GAP_FOCUS:
         stmt = select(PlsSearchHarvestQuery).where(
@@ -961,10 +1095,13 @@ async def claim_next_query(
     never read the same row, and the row taken is held by a per-row lock for the whole run, since the run commits
     after every judgment and a row lock alone would end at the first commit. Returns (row, row lock) or (None, None).
 
-    Order: gap-focus (or pending|in_progress) on the reporter share, then pending citation-only rows in this
-    slot's hash share and rows reclaimed from a stale in_progress lease. Claiming a done or split row with a
-    gap marks it in_progress and stamps last_run_at. It does not reset the cursor, the page and row counters,
-    or last_error.
+    Order: gap-focus (or pending|in_progress) on the reporter share, ranked by _gap_priority_order
+    (largest remaining gap, with a 48h interleave for a smaller gap that has already waited). Then, only
+    when that pass is empty, pending citation-only rows in this slot's hash share and rows reclaimed from
+    a stale in_progress lease. While such a citation is due, a positive gap the 6h cooldown is still
+    holding is claimed ahead of that citation; with no citation due, the cooldown still leaves the hot
+    gap idle. Claiming a done or split row with a gap marks it in_progress and stamps last_run_at. It
+    does not reset the cursor, the page and row counters, or last_error.
     """
     await reclaim_stale_harvest_queries(db, slot=slot, take_over=take_over, redis_client=redis_client)
     for fallback in (False, True):
@@ -1122,6 +1259,7 @@ class SearchHarvestRunner:
         rows_seen = int(query_row.rows_seen or 0)
         rows_known = int(query_row.rows_known or 0)
         rows_new = int(query_row.rows_new or 0)
+        rows_new_at_start = rows_new
         rows_unlinked = rows_unlinked_from_cursor(cursor)
         site_total = query_row.site_total_results
         start_row_index = int(cursor.get("row_index") or 0)
@@ -1612,6 +1750,15 @@ class SearchHarvestRunner:
                 break
             self.memory.note_window()
             await self._maybe_recycle_browser()
+
+        if not self.dry_run:
+            _note_search_yield(
+                query_row,
+                rows_new_at_start=rows_new_at_start,
+                rows_new_after=rows_new,
+                staged_this_tick=staged_this_tick,
+                out_of_time=out_of_time,
+            )
 
         return {
             "query_key": query_row.query_key,

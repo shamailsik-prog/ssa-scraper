@@ -565,8 +565,12 @@ def annexure_cursor_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def fresh_cursor_keeping_annexure_state(cursor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Page-1 cursor that still remembers annexure stubs and unmatched row identity."""
-    kept = {"page": 1, "row_index": 0, **annexure_cursor_state(cursor)}
+    """Page-1 cursor that still remembers annexure stubs, unmatched rows, and lease backoff.
+
+    harvest_attempts, harvest_retry_after, and harvest_reclaim_open are the same keys
+    gap_diagnostics_slice keeps. A reopen that builds a fresh page cursor must not drop them.
+    """
+    kept = {"page": 1, "row_index": 0, **annexure_cursor_state(cursor), **lease_cursor_state(cursor)}
     samples = list((cursor or {}).get("unresolved_samples") or [])
     if samples:
         kept["unresolved_samples"] = samples
